@@ -1193,13 +1193,13 @@ class TestBatchedCompanionFolds:
 
         from zagg.stats.tdigest import batched_companion_folds
 
-        counts = {"tocs_reduce": 0, "validate_morton": 0}
-        orig_reduce, orig_validate = mortie.tocs_reduce, mortie.validate_morton
+        counts = {"toc_reduce": 0, "validate_morton": 0}
+        orig_reduce, orig_validate = mortie.toc_reduce, mortie.validate_morton
         monkeypatch.setattr(
             mortie,
-            "tocs_reduce",
-            lambda *a: (
-                counts.__setitem__("tocs_reduce", counts["tocs_reduce"] + 1) or orig_reduce(*a)
+            "toc_reduce",
+            lambda *a, **k: (
+                counts.__setitem__("toc_reduce", counts["toc_reduce"] + 1) or orig_reduce(*a, **k)
             ),
         )
         monkeypatch.setattr(
@@ -1213,10 +1213,10 @@ class TestBatchedCompanionFolds:
         with batched_companion_folds():
             for v, lo, t, d in self._cells():
                 build_tdigest(v, delta=d, locations=lo, temporal=t)
-            assert counts == {"tocs_reduce": 0, "validate_morton": 0}, (
+            assert counts == {"toc_reduce": 0, "validate_morton": 0}, (
                 "folds must defer until the context exits"
             )
-        assert counts["tocs_reduce"] == 1
+        assert counts["toc_reduce"] == 1
         assert counts["validate_morton"] == 1
 
     def test_nested_context_is_a_passthrough(self):
@@ -1237,8 +1237,8 @@ class TestBatchedCompanionFolds:
         from zagg.stats.tdigest import batched_companion_folds
 
         calls = []
-        orig = mortie.tocs_reduce
-        monkeypatch.setattr(mortie, "tocs_reduce", lambda *a: calls.append(1) or orig(*a))
+        orig = mortie.toc_reduce
+        monkeypatch.setattr(mortie, "toc_reduce", lambda *a, **k: calls.append(1) or orig(*a, **k))
         with pytest.raises(RuntimeError, match="boom"):
             with batched_companion_folds():
                 v, lo, t, d = self._cells()[0]
@@ -1297,8 +1297,10 @@ class TestBatchedCompanionFolds:
         cells = self._cells()
         plain = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]
         crossings = []
-        orig = mortie.tocs_reduce
-        monkeypatch.setattr(mortie, "tocs_reduce", lambda *a: crossings.append(1) or orig(*a))
+        orig = mortie.toc_reduce
+        monkeypatch.setattr(
+            mortie, "toc_reduce", lambda *a, **k: crossings.append(1) or orig(*a, **k)
+        )
         monkeypatch.setattr(td_mod, "_BATCH_ROW_CAP", 40)
         with batched_companion_folds():
             batched = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]

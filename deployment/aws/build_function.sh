@@ -34,8 +34,36 @@ case "$MACHINE_ARCH" in
     *) echo "ERROR: Unknown architecture: $MACHINE_ARCH"; exit 1 ;;
 esac
 
+# Prefer python3.12 (the Lambda runtime target, and what zagg's
+# requires-python floor accepts) — same intent as build_layer.sh. Scan every
+# PATH match and take the first one that actually carries pip: a uv/venv
+# python shadows the system one but ships without pip, and `python -m pip`
+# there dies with "No module named pip". CI's setup-python 3.12 has pip.
+PYTHON=""
+for cand in $(type -ap python3.12) $(type -ap python3); do
+    if "$cand" -m pip --version >/dev/null 2>&1; then PYTHON="$cand"; break; fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: no python3 with pip on PATH"; exit 1
+fi
+PIP="$PYTHON -m pip"
+
 # Detect Python version
-PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+PY_VER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+
+# Below the floor the zagg install refuses (requires-python >=3.12); ABOVE it
+# nothing refuses, so a 3.13-only host would resolve cp313 wheels and name the
+# artifact lambda_function_<arch>_py313.zip, which the release/deploy globs
+# happily pick up against template.yaml's Runtime: python3.12 — an ABI
+# mismatch that only surfaces as an import error inside a deployed worker.
+if [ "$PY_VER" != "312" ]; then
+    echo "ERROR: selected ${PYTHON} is python${PY_VER}, but the Lambda runtime"
+    echo "       is python3.12 (deployment/aws/template.yaml Runtime) — binary"
+    echo "       wheels would be ABI-mismatched. Put a pip-carrying python3.12"
+    echo "       on PATH and rebuild."
+    exit 1
+fi
+
 ZIP_NAME="lambda_function_${ARCH_LABEL}_py${PY_VER}.zip"
 
 echo "============================================================"
@@ -45,16 +73,64 @@ echo "============================================================"
 
 # --- Copy our code ---
 echo ""
-echo "Copying handler and zagg package..."
+echo "Copying handler..."
 cp "$REPO_ROOT/deployment/aws/lambda_handler.py" "$BUILD_DIR/"
-cp -r "$REPO_ROOT/src/zagg" "$BUILD_DIR/zagg"
+
+# --- Install zagg itself (issue #546) ---
+# A raw `cp -r src/zagg` ships no `_version.py` (hatch-vcs generates that file
+# only during a package build), so every worker-side write recorded
+# `zagg_version: 0.0.0+unknown`. Installing the repo through pip runs the
+# hatchling + hatch-vcs backend, which stamps `zagg/_version.py` from the git
+# tag. A shallow CI checkout (actions/checkout default) carries no tags, so
+# deepen it first; on a full clone `describe` succeeds and nothing is fetched.
+# The deepen MUTATES the caller's repository — it imports every remote tag and
+# un-shallows a clone that may have been made shallow on purpose. It is also
+# the one network step here, so announce it (an unshallow of a large history
+# otherwise reads as a hang) and set GIT_TERMINAL_PROMPT=0: without cached
+# credentials git would block on an interactive prompt inside a
+# non-interactive build instead of falling through to the assertion below.
+if ! git -C "$REPO_ROOT" describe --tags >/dev/null 2>&1; then
+    echo "Deepening checkout for hatch-vcs (no reachable tag; fetches tags into $REPO_ROOT)..."
+    GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" fetch --quiet --tags --unshallow 2>/dev/null \
+        || GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" fetch --quiet --tags 2>/dev/null \
+        || true
+fi
+echo ""
+echo "Installing zagg (hatch-vcs stamps zagg/_version.py)..."
+$PIP install --target "$BUILD_DIR" --no-deps --no-cache-dir "$REPO_ROOT"
+
+# Assert the stamp: 0.0.0* is the zagg/__init__.py fallback sentinel and
+# 0.1.dev* is setuptools-scm's no-tag fallback — either would put an unusable
+# version in every worker-written artifact, undetectable from the store
+# (issue #546). Mirrored in tests/test_lambda_build.py.
+ZAGG_BUILD_VERSION=$($PYTHON -c "
+import runpy, sys
+print(runpy.run_path(sys.argv[1])['__version__'])
+" "$BUILD_DIR/zagg/_version.py")
+echo "zagg version stamped: ${ZAGG_BUILD_VERSION}"
+case "$ZAGG_BUILD_VERSION" in
+    ""|0.0.0*|0.1.dev*)
+        echo "ERROR: zagg version resolved to '${ZAGG_BUILD_VERSION}' — workers built from"
+        echo "       this zip would write zagg_version 0.0.0+unknown-class artifacts"
+        echo "       (issue #546). Make a git tag reachable (git fetch --tags --unshallow)"
+        echo "       or set SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ZAGG before building."
+        exit 1 ;;
+esac
+
+# pip --target materializes [project.scripts] launchers under bin/ — dead
+# weight in a Lambda zip, with shebangs pointing at the build machine. Removed
+# here, before the deps install, and not with the other cleanup below: pip
+# resolves a --target collision by SKIPPING the colliding top-level item with a
+# warning ("Target directory .../bin already exists"), so a surviving bin/ from
+# this install silently drops the next one's.
+rm -rf "$BUILD_DIR/bin"
 
 # --- Install function-level dependencies ---
 # These are packages NOT in the Lambda layer.
 # pip resolves transitive deps automatically — no manual dep hunting.
 echo ""
 echo "Installing function dependencies (pip resolves transitive deps)..."
-pip3 install --target "$BUILD_DIR" --no-cache-dir \
+$PIP install --target "$BUILD_DIR" --no-cache-dir \
     "obstore>=0.8.2" \
     "zarr>=3.1.5" \
     "pydantic-zarr>=0.9.1" \
@@ -97,6 +173,8 @@ done
 
 # --- Clean build artifacts ---
 echo "Cleaning caches and test directories..."
+# bin/ from the deps install (zagg's was removed before it, see above).
+rm -rf "$BUILD_DIR/bin"
 find "$BUILD_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 # Strip dist-info except for packages whose code calls importlib.metadata.version()
 # at runtime. zarr / pydantic_zarr do this for in-package version checks; without
@@ -137,7 +215,12 @@ if [ "$UNZIPPED_BYTES" -gt "$FUNCTION_BUDGET" ]; then
 fi
 
 # --- Create zip ---
+# Remove any previous artifact first: `zip` ADDS to and UPDATES an existing
+# archive, never deleting entries absent from the input tree, so a stale zip in
+# deployment/builds/ (a dev box, a second `pytest -m slow`) would keep whatever
+# an earlier build shipped alongside this one's file set.
 mkdir -p "$OUTPUT_DIR"
+rm -f "${OUTPUT_DIR}/${ZIP_NAME}"
 cd "$BUILD_DIR" && zip -r9q "${OUTPUT_DIR}/${ZIP_NAME}" .
 cd "$SCRIPT_DIR"
 

@@ -527,6 +527,13 @@ accelerator for sibling candidates, never the source of truth — a fleet
 append with no subsequent sweep leaves it stale, and discovery still finds
 the new leaves).
 
+The same sweep also runs **entirely worker-side**, as a fan-out of Lambda
+stage workers with the dispatcher invoking and polling and never writing
+(issue #519) — which is the only way to build the ladder on a store whose
+bucket policy names the fleet execution role as the write identity. The wire
+grammar, the sequencing and the permissions are in
+[`docs/deployment/lambda.md`](deployment/lambda.md#staged-sweep).
+
 **Cadence.** Ladder orders are grouped into dispatch tuples of
 `tuple_width` consecutive orders (default 3: `[8,7,6] → [5,4,3] → [2,1,0]`
 on an o9 store). Each stage worker reads exactly its `4^width` immediate

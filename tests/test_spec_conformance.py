@@ -1214,6 +1214,11 @@ class TestFixtureSemanticHash:
         MULTISCALES,
         "raster_toc",
         "temporal",
+=======
+        "raster_toc",
+        "temporal",
+        "demoted",
+>>>>>>> origin/main
     )
 
     @pytest.mark.parametrize(
@@ -1225,6 +1230,10 @@ class TestFixtureSemanticHash:
             # The §2.0 flux fixture (issue #424) landed after the epoch's
             # phase 3, so its committed digest was pre-epoch until now.
             ("flux", {"kitchen_sink": False, "flux": True}),
+            # The §4.3 demotions fixture (issue #518) is the kitchen-sink
+            # store under a hand-mangled MANIFEST pyramid block — the config
+            # (and so the identity) is kitchen_sink's own.
+            ("demoted", {"kitchen_sink": True}),
         ],
     )
     def test_leaf_fixture_hash_is_reproducible(self, name, kwargs):
@@ -2181,3 +2190,59 @@ class TestRootCoverageTemporalSection:
             )
             for t in internal:
                 assert bool(np.any((start.astype(np.uint64) <= t) & (t < end.astype(np.uint64))))
+
+
+class TestDemotionAttrs:
+    """§4.3 ``demotions``: the packed rail's record, on committed bytes (#518).
+
+    The ``demoted/`` fixture (not in ``FIXTURES``: its expected record is the
+    demotion surface, not the leaf suite's) is the kitchen-sink store swept
+    under a ``/1`` manifest whose ``of`` divisor is mis-declared ``none`` —
+    the exact-from-leaves level folds composition cleanly, the cascade above
+    it cannot, and only the attrs distinguish the two all-fill readings.
+    """
+
+    def _overview(self, exp, which, path=""):
+        store = LocalStore(str(SPEC_DATA / "demoted" / exp[which]["object"]))
+        return zarr.open_group(store, path=path, mode="r", zarr_format=3)
+
+    def test_the_demoted_level_records_the_rail(self):
+        exp = _expected("demoted")
+        block = dict(self._overview(exp, "demoted").attrs)["zagg_overview"]
+        assert block["fold_source"] == "cascade"
+        assert block["demotions"] == exp["demoted"]["demotions"]
+        [record] = block["demotions"]
+        # The record grammar: ``field``/``class``/``reason``/``contributors``
+        # always, ``of`` naming the §3.3 linkage, ``cells`` whenever the
+        # demotion left output cells at the fill word no surviving contributor
+        # covers — the case here, since a cascade's children own disjoint
+        # spans — and readers MUST tolerate additional keys (§4.3).
+        assert record["field"] == "composition" and record["class"] == "packed"
+        assert record["reason"] in ("word-missing", "divisor-missing")
+        assert record["reason"] == "divisor-missing"
+        assert record["contributors"] == 1
+        assert record["of"] == "h_tdigest_signal"
+        # The child's whole span, and the level is one child wide: 4 of the
+        # node's 16 cells, matching the all-fill word slab below.
+        assert record["cells"] == 4
+
+    def test_the_clean_level_carries_no_demotions_key(self):
+        # Absent, never empty: a level the rail did not fire at is
+        # byte-identical to a pre-#518 writer's.
+        exp = _expected("demoted")
+        block = dict(self._overview(exp, "clean").attrs)["zagg_overview"]
+        assert block["fold_source"] == "leaves"
+        assert "demotions" not in block
+
+    def test_the_bytes_alone_cannot_say_why(self):
+        # The record's reason to exist: the divisor is absent from BOTH
+        # levels (class ``none`` never materializes, §4.4), and the demoted
+        # level's composition is all fill while the clean level's is
+        # populated — indistinguishable from emptiness without the attrs.
+        exp = _expected("demoted")
+        clean = self._overview(exp, "clean", path="5")
+        demoted = self._overview(exp, "demoted", path="4")
+        assert "h_tdigest_signal" not in dict(clean.arrays())
+        assert "h_tdigest_signal" not in dict(demoted.arrays())
+        assert int(clean["composition"][:].astype("uint64").sum()) > 0
+        assert int(demoted["composition"][:].astype("uint64").sum()) == 0

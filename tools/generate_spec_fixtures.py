@@ -80,7 +80,7 @@ conformance tests assert decoded values, never object bytes.
   ``end_datetime`` pair) and a single-member group stays an exact TIMESTAMP.
   Written through ``processing.raster.process_and_write_raster_hive`` with
   only the COG *sampling* faked — a committed fixture must regenerate with
-  no network and no GDAL. The other four fixtures, which carry no
+  no network and no GDAL. The other fixtures, which carry no
   ``temporal`` key anywhere, are the absent-key ⇒ legacy pin.
 
 - ``temporal/`` — the §8.2/§8.3/§9 COMPANION surface (issue #410):
@@ -100,10 +100,17 @@ conformance tests assert decoded values, never object bytes.
   (issue #480): the §10 ``zagg-coverage-toc/1`` section, written here by the
   production sweep writer (``MocFamily``'s leaf read + finisher) — and, from
   issue #489, the only one with the §10.5 ``coverage.toc`` word-set cover
-  sibling that same finisher PUTs beside it. The other six declare no
+  sibling that same finisher PUTs beside it. The other fixtures declare no
   temporal field, so a sweep of one produces no section (and no sibling) —
   leaving them without either root object IS §10's absence rule, and keeps
   those trees byte-identical.
+
+- ``demoted/`` — the §4.3 ``demotions`` surface (issue #518):
+  ``kitchen_sink/``'s store swept under a hand-installed ``/1`` cascade
+  manifest whose composition ``of`` divisor is MIS-DECLARED ``class:
+  "none"``. Two committed overviews: the exact-from-leaves level folds
+  composition cleanly (no ``demotions`` key — the absence pin), the
+  cascaded level fires ``divisor-missing`` and records it.
 
 STALE BY DESIGN: some committed bytes deliberately pin an older writer era
 and must NOT be refreshed by a regen — currently ``kitchen_sink/``'s two
@@ -649,6 +656,84 @@ def _expected_multiscales(levels: list, s: int) -> list:
             "fold": {"fold_source": "cascade", "exact_levels": 1},
         }
     ]
+
+def build_demoted(out: Path) -> None:
+    """The §4.3 ``demotions`` fixture (issue #518): the packed rail, recorded.
+
+    The ``kitchen_sink/`` store swept under a hand-installed ``/1`` cascade
+    manifest whose ``of`` divisor digest is MIS-DECLARED ``class: "none"`` —
+    the acceptance shape issue #518 names (a manifest outliving its writer,
+    spec §4.5). The exact-from-leaves level still folds ``composition`` (the
+    leaf ARRAYS carry the digest regardless of its declared class), so its
+    attrs carry no ``demotions`` key; the cascaded level folds a child
+    overview that never materializes the divisor, fires ``divisor-missing``
+    on its one contributor, and records it. ``demoted.expected.json`` pins
+    both levels — the clean level's absent key included — so a reader's
+    zero-open filtering can be asserted against committed bytes.
+    """
+    import zarr
+
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.pyramid import declared_fields
+    from zagg.store import open_object_store, open_store, put_object
+    from zagg.sweep import _node_rel
+    from zagg.sweep_overview import OVERVIEW_ATTR, sweep_overviews
+
+    build(out, kitchen_sink=True)
+    fields, excluded = declared_fields(_config(kitchen_sink=True))
+    assert not excluded, excluded
+    # The mis-declared divisor: composition stays packed-with-of while the
+    # digest it names is declared class ``none``. ``declared_fields`` never
+    # writes this pair (it demotes composition at declare time) — the shape
+    # arises from a manifest written by another era or another tool.
+    fields["h_tdigest_signal"] = {"class": "none"}
+    manifest = read_manifest(str(out))
+    manifest["pyramid"] = {
+        "spec": "zagg-pyramid/1",
+        "overview": {
+            "spacing": 1,
+            "orders": [3, 2],
+            "all_time": False,
+            "fold_source": "cascade",
+            "exact_levels": 1,
+            "fields": fields,
+        },
+    }
+    put_object(open_object_store(str(out)), MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
+    counts = sweep_overviews(str(out), manifest, {SHARD_KEY: {None}})
+    assert counts["failed"] == 0 and counts["written"] == 2, counts
+
+    def _attrs(node):
+        group = zarr.open_group(
+            open_store(f"{out}/{_node_rel(node)}/all.zarr", read_only=True),
+            path="",
+            mode="r",
+            zarr_format=3,
+        )
+        return dict(dict(group.attrs)[OVERVIEW_ATTR])
+
+    clean, demoted = _attrs("1121"), _attrs("112")
+    assert "demotions" not in clean, clean
+    assert demoted.get("demotions"), demoted
+    # MERGED into the leaf record ``build`` wrote (the leaf-identity gates —
+    # semantic hash, granules sibling — key off those fields), plus the
+    # demotion surface this fixture exists for.
+    expected_path = out.parent / f"{out.name}.expected.json"
+    expected = json.loads(expected_path.read_text())
+    expected["orders"] = [3, 2]
+    expected["clean"] = {
+        "node": "1121",
+        "object": f"{_node_rel('1121')}/all.zarr",
+        "fold_source": clean["fold_source"],
+    }
+    expected["demoted"] = {
+        "node": "112",
+        "object": f"{_node_rel('112')}/all.zarr",
+        "fold_source": demoted["fold_source"],
+        "demotions": demoted["demotions"],
+    }
+    expected_path.write_text(json.dumps(expected, indent=1) + "\n")
+    print(f"{out.name}: demotions at node 112 -> {demoted['demotions']}")
 
 
 def build_pyramid(out: Path) -> None:
@@ -1529,6 +1614,7 @@ def main() -> None:
         "column": lambda: build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5}),
         "pyramid": lambda: build_pyramid(args.out / "pyramid"),
         "multiscales": lambda: build_multiscales(args.out / "multiscales"),
+        "demoted": lambda: build_demoted(args.out / "demoted"),
         "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
         "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
         "temporal": lambda: build_temporal(args.out / "temporal"),
