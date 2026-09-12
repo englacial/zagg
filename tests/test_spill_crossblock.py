@@ -252,7 +252,7 @@ def _assert_ancestor_or_equal(locs, contributors):
         assert np.any(clip2order(int(order), contributors) == loc), (
             f"location {loc} is no contributor's ancestor"
         )
-        assert np.uint64(clip2order(hull_order, np.array([loc], dtype=np.uint64))[0]) == hull, (
+        assert np.uint64(clip2order(hull_order, loc)[0]) == hull, (
             f"location {loc} escapes the contributor hull {hull}"
         )
 

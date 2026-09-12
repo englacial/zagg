@@ -215,9 +215,7 @@ class TestHealpixSample:
         grid = HealpixGrid(11, 19)
         to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
         lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
-        cells = np.unique(
-            clip2order(19, geo2mort(np.array([lat]), np.array([lon]), order=29, points=True))
-        )
+        cells = np.unique(clip2order(19, geo2mort(lat, lon, order=29, points=True)))
         rows, cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
         # Independent computation from the cell center coordinates.
         clats, clons = grid.cell_centers(cells)

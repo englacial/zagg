@@ -196,8 +196,8 @@ class HealpixGrid:
         # sub-chunk's block index is its own nested-cell id (fullsphere only).
         sub_chunks = generate_morton_children(int(shard_key), self.chunk_order)
         for sub in np.asarray(sub_chunks):
-            healpix, _ = mort2healpix(np.asarray([int(sub)]))
-            block = (int(healpix[0]),)
+            healpix, _ = mort2healpix(int(sub))  # scalar in → scalar out (mortie ≥1.0)
+            block = (healpix,)
             children = generate_morton_children(int(sub), self.child_order)
             yield (block, children)
 
@@ -356,6 +356,9 @@ class HealpixGrid:
         are unchanged. Encoding rides the numpy-level ``geo2mort(...,
         points=True)`` (mortie 0.8.5, espg/mortie#100 — the issue #87 phase-6
         surface, replacing the pandas ``MortonIndexArray`` wrapper + unwrap).
+
+        Elementwise, per the protocol: N-D input returns the input shape
+        (``geo2mort`` reshapes to its input, mortie >=1.0 / espg/mortie#219).
         """
         from mortie import geo2mort
 
@@ -390,7 +393,11 @@ class HealpixGrid:
         return sample_nearest(lons, lats, "EPSG:4326", crs, transform, shape)
 
     def shards_of(self, leaf_ids) -> np.ndarray:
-        """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`."""
+        """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`.
+
+        Elementwise, per the protocol: N-D input returns the input shape
+        (``clip2order`` reshapes to its input, mortie >=1.0).
+        """
         from mortie import clip2order
 
         return clip2order(self.parent_order, np.asarray(leaf_ids))
@@ -420,8 +427,8 @@ class HealpixGrid:
         """
         from mortie import mort2healpix
 
-        healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
-        return (int(healpix[0]),)
+        healpix, _ = mort2healpix(int(shard_key))  # scalar in → scalar out (mortie ≥1.0)
+        return (healpix,)
 
     def shard_label(self, shard_key) -> str:
         """Decimal morton string for this shard's packed word (issue #199).

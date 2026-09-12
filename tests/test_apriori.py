@@ -187,6 +187,30 @@ class TestChunkShardMask:
 
         assert not _chunk_shard_mask(bdf, _LonBandGrid(-1.0, 1.0), 0, 64)[0]
 
+    def test_real_healpix_grid_masks_per_chunk(self):
+        # The stub grid above is pure numpy, so it cannot catch a backend that
+        # ravels the 2-D (n_chunks, samples) lat/lon pair -- and the mask is
+        # ``.any(axis=1)`` with no reshape since issue #543. One real backend,
+        # three chunks in three different order-2 shards.
+        from zagg.config import default_config
+        from zagg.grids import HealpixGrid
+
+        g = HealpixGrid(parent_order=2, child_order=6, config=default_config("atl06"))
+        chunks = [
+            (-78.5, -132.0, -78.0, -131.0),
+            (12.0, 45.0, 12.5, 45.5),
+            (40.0, 100.0, 40.5, 100.5),
+        ]
+        bdf = pd.DataFrame(
+            [
+                ("gt1l", i, sla, slo, ela, elo, CHUNK)
+                for i, (sla, slo, ela, elo) in enumerate(chunks)
+            ],
+            columns=["beam", "chunk", "start_lat", "start_lon", "end_lat", "end_lon", "n_photons"],
+        )
+        shard = int(np.asarray(g.shards_of(g.assign(np.array([-78.25]), np.array([-131.5]))))[0])
+        assert _chunk_shard_mask(bdf, g, shard, 64).tolist() == [True, False, False]
+
 
 class TestPlanFromBoundaries:
     def _bdf(self):

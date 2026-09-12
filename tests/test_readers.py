@@ -701,7 +701,7 @@ class TestSubtreePerCellReaders:
         kept = []
         for m, (row, col), payload in out:
             cell = int(morton[cell_index(store, field, m, row, col)])
-            if int(clip2order(order, np.asarray([cell], dtype=np.uint64))[0]) == word:
+            if int(clip2order(order, cell)[0]) == word:
                 kept.append((m, (row, col), payload))
         return kept
 
@@ -822,7 +822,7 @@ class TestSubtreePerCellReaders:
         # A word ABOVE the leaf's root: every stored cell is its descendant,
         # so the subtree read equals the unrestricted sweep (the golden filter
         # keeps everything) — no warning, not an empty yield.
-        parent = int(clip2order(3, np.asarray([word], dtype=np.uint64))[0])
+        parent = int(clip2order(3, word)[0])
         got = list(read_raw_values(store, "12/h_tdigest", subtree=parent))
         self._assert_same(got, list(read_raw_values(store, "12/h_tdigest")))
         assert len(got) == 2
@@ -924,9 +924,7 @@ class TestSubtreeReadTensors:
         """Whole-sweep blocks whose morton id descends from ``word``."""
         from mortie import clip2order
 
-        return [
-            o for o in out if int(clip2order(order, np.asarray([o[3]], dtype=np.uint64))[0]) == word
-        ]
+        return [o for o in out if int(clip2order(order, o[3])[0]) == word]
 
     @staticmethod
     def _assert_same(got, expected):
@@ -1096,7 +1094,7 @@ class TestSubtreeReadTensors:
         # block_order floor is the ROOT's order — not the subtree's. That is
         # the documented bound max(subtree_order, axis_root_order) ≤
         # block_order ≤ chunk_order (review, PR #357).
-        above = int(clip2order(4, np.asarray([word], dtype=np.uint64))[0])
+        above = int(clip2order(4, word)[0])
         with pytest.raises(ValueError, match="must be between 6 and the chunk order 8"):
             list(read_tensors(store, "12/h_tdigest", subtree=above, block_order=5))
         assert len(list(read_tensors(store, "12/h_tdigest", subtree=above, block_order=6))) == 1
