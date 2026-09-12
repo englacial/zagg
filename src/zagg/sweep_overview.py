@@ -108,6 +108,65 @@ TDIGEST_LAW = "tdigest_kway"
 #: why ``packed`` is its own class rather than an ``exact`` method.
 COMPOSITION_LAW = "composition_kway"
 
+#: The two ways the ``packed`` guard rail demotes a field at a fold site
+#: (issue #518) — each names which HALF of the ``(word, of-digest)`` pair a
+#: contributor was missing. ``word-missing``: the contributor carried the
+#: §3.3 divisor but not the word, so the output cells its rows reach are
+#: blanked to the fill word (a published word over a denominator it never
+#: covered would be a §3.3 skew — absence over wrongness). ``divisor-missing``:
+#: the contributor carried the word but not its ``of`` digest, so it
+#: contributes nothing for the field (the fold's ``n`` inputs are that
+#: digest's per-cell weights and are never guessed).
+DEMOTION_WORD_MISSING = "word-missing"
+DEMOTION_DIVISOR_MISSING = "divisor-missing"
+
+
+def note_demotion(acc: dict, field: str, reason: str, of, *, cells=None) -> None:
+    """Accumulate one contributor's packed-rail demotion (issue #518).
+
+    ``acc`` is a fold site's ``{(field, reason): {of, contributors, cells}}``
+    scratch map; ``cells`` is the iterable of output-cell indices the
+    contributor left at the fill word that no surviving contributor covers.
+    Always the case in the ``word-missing`` direction (the fold blanks them);
+    in the ``divisor-missing`` direction only where contributors own DISJOINT
+    spans — the cascade, where a skipped child's span stays fill. At a leaf
+    fold (and a stage merge) many contributors share each output cell, so a
+    dropped one blanks nothing and the caller passes no ``cells``: its
+    absence is ordinary under-coverage for the one field.
+    """
+    entry = acc.setdefault((str(field), str(reason)), {"of": of, "contributors": 0, "cells": set()})
+    entry["contributors"] += 1
+    if cells is not None:
+        entry["cells"].update(int(c) for c in cells)
+
+
+def demotion_records(acc: dict) -> list:
+    """The attrs-facing ``demotions`` list: one record per ``(field, reason)``.
+
+    The artifact-visible record of the ``packed`` guard rail firing at this
+    node (issue #518, spec §4.3): without it the only trace of a demoted
+    composition is a log line in an exited worker, and a reader cannot tell
+    a fill cell that is absence-by-design from one the rail blanked. Sorted
+    by ``(field, reason)`` so the recorded list is deterministic; ``cells``
+    is keyed only when the demotion left output cells at the fill word that
+    no surviving contributor covers, and readers MUST tolerate additional
+    keys (the §4.3 posture).
+    """
+    records = []
+    for (field, reason), entry in sorted(acc.items()):
+        record = {
+            "field": field,
+            "class": "packed",
+            "reason": reason,
+            "contributors": int(entry["contributors"]),
+        }
+        if entry.get("of") is not None:
+            record["of"] = str(entry["of"])
+        if entry["cells"]:
+            record["cells"] = len(entry["cells"])
+        records.append(record)
+    return records
+
 
 # ---------------------------------------------------------------------------
 # Phase A: per-field up-aggregation kernels (the D24 merge laws over arrays).
@@ -691,7 +750,11 @@ def declare_pyramid(
     inventory overview artifacts already on disk — overviews at
     now-undeclared orders stay as regenerable-cache debris, D24 option A).
     An ``output.pyramid: false`` config installs the declared-off block:
-    recording absence is a valid retrofit.
+    recording absence is a valid retrofit. The manifest ``multiscales``
+    discovery mirror (issue #392, spec §4.9) is maintained by the same
+    write: installed/refreshed for a ``/2`` block, removed otherwise — so
+    declaring an unchanged ``/2`` config again on a pre-mirror store is the
+    one "identical" case that still PUTs (it adds the missing mirror).
 
     Returns a summary dict carrying ``fold_source`` (the declared fold
     regime, issue #376), ``fields`` (``{name: class}``), ``validated`` (what
@@ -803,6 +866,17 @@ def declare_pyramid(
     materialized = prior_overview.get("materialized") if isinstance(prior_overview, dict) else None
     if materialized is not None:
         block["overview"]["materialized"] = materialized
+    # The issue #392 discovery mirror rides the same RMW: derived from the
+    # block being installed (never authoritative — the pyramid block wins,
+    # §4.9), present exactly when that block is /2, removed otherwise. A /2
+    # store declared before the mirror existed stays idempotent on
+    # the pyramid block yet still gains the key here.
+    from zagg.multiscales import manifest_multiscales
+
+    mirror = manifest_multiscales({**fresh, "pyramid": block})
+    mirror_current = (
+        fresh.get("multiscales") == mirror if mirror is not None else "multiscales" not in fresh
+    )
     summary = {
         # The schedule key of the declared revision, and only that one: this
         # dict is what ``--declare-pyramid`` prints, and an empty ``orders``
@@ -823,18 +897,57 @@ def declare_pyramid(
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
         "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
-        "updated": prior != block,
+        "updated": prior != block or not mirror_current,
+        # Whether the written manifest carries the §4.9 mirror — /2 only.
+        "multiscales": mirror is not None,
     }
-    if prior == block:
+    if prior == block and mirror_current:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
         return summary
     fresh["pyramid"] = block
-    put_object(
-        open_object_store(store_root, **store_kwargs),
-        MANIFEST_NAME,
-        json.dumps(fresh, indent=1).encode(),
-    )
+    store = open_object_store(store_root, **store_kwargs)
+    if mirror is not None:
+        fresh["multiscales"] = mirror
+    else:
+        fresh.pop("multiscales", None)
+    put_object(store, MANIFEST_NAME, json.dumps(fresh, indent=1).encode())
+    if mirror is None:
+        _remove_multiscales_group(store, store_root)
     return summary
+
+
+def _remove_multiscales_group(store, store_root: str) -> None:
+    """Delete the §4.10 companion's commit marker when a store stops being ``/2``.
+
+    The manifest mirror is popped above, but the companion group is the one
+    artifact in the store that asserts ``/2`` WITHOUT consulting the manifest
+    — that is its whole point — so "the manifest wins on disagreement" has no
+    reader to apply it and a retrofit off ``/2`` would leave stock tooling a
+    ladder the manifest no longer declares (the finisher cannot heal it
+    either: :func:`zagg.multiscales.write_multiscales_group` refuses a
+    non-``/2`` store and the finisher swallows that fail-open). Deleting the
+    ROOT document is enough and is all this does: §4.10 makes it the commit
+    marker written LAST, so a prefix without it is debris, and a later
+    companion write overwrites the children in place. Best-effort — the
+    manifest (truth) is already written, so a failed delete warns rather than
+    unwinding it.
+    """
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    from zagg.multiscales import GROUP_NAME
+
+    try:
+        obstore.delete(store, f"{GROUP_NAME}/zarr.json")
+    except (FileNotFoundError, NotFoundError):
+        pass  # no companion on this store — the ordinary case
+    except Exception as e:  # best-effort: the manifest (truth) is already written
+        logger.warning(
+            f"declare_pyramid: the manifest at {store_root} no longer declares /2, but "
+            f"deleting the companion group's {GROUP_NAME}/zarr.json failed ({e}) — stock "
+            f"tooling will keep reading a ladder the manifest does not declare; remove the "
+            f"object by hand"
+        )
 
 
 def _semantic_guard(manifest: dict, config) -> str:
@@ -1661,6 +1774,9 @@ def _fold_node(
     # is the ordinary schema-evolution case (nothing folds from it either way)
     # and poisons nothing.
     packed_poison: dict = {}
+    # The packed rail's artifact record (issue #518): each direction it fires
+    # in, per field, for the ``demotions`` attrs key the writer emits.
+    demoted: dict = {}
     # Per field, per declared companion channel, the accumulated word vectors —
     # index-aligned with ``digests[name]`` cell by cell so the fold merges the
     # payload and every channel in ONE call (issue #410, spec §9.1/§8.3).
@@ -1711,6 +1827,11 @@ def _fold_node(
                 cell_digests: dict = {}
                 leaf_packed: dict = {}
                 leaf_poison: set = set()
+                # The divisor-missing direction's records, collected here and
+                # applied with ``leaf_poison`` below for the same reason: a
+                # leaf that raises on a LATER field is skipped whole, so it
+                # must leave no record either (review finding).
+                leaf_dropped: list = []
                 for name, meta in fields.items():
                     try:
                         arr = group[name]
@@ -1767,6 +1888,9 @@ def _fold_node(
                                 f"sweep[overview]: leaf {leaf} lacks {of_name!r} for "
                                 f"packed field {name!r}"
                             )
+                            # Recorded (issue #518): the field folds short of
+                            # this leaf's rows, and the bytes cannot say so.
+                            leaf_dropped.append((name, of_name))
                             continue
                         of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
                         words_arr = arr[:]
@@ -1824,6 +1948,12 @@ def _fold_node(
             for name, contributions in leaf_packed.items():
                 for i, word, n in contributions:
                     packed[name].setdefault(start + i // fold_factor, []).append((word, n))
+            # BOTH rail directions record only now, for the same reason the
+            # poison applies only now: a leaf that raised is skipped whole and
+            # contributed to nothing, so an attrs record naming it would claim
+            # a contributor this fold never used (review finding).
+            for name, of_name in leaf_dropped:
+                note_demotion(demoted, name, DEMOTION_DIVISOR_MISSING, of_name)
             # The leaf's whole span, which is exactly the output cells its
             # rows reach (``leaf_cells // fold_factor == span`` in both fold
             # geometries). Applied only once the leaf has read cleanly: an
@@ -1831,6 +1961,13 @@ def _fold_node(
             # and the pair stays consistent without poisoning anything.
             for name in leaf_poison:
                 packed_poison[name].update(range(start, start + span))
+                note_demotion(
+                    demoted,
+                    name,
+                    DEMOTION_WORD_MISSING,
+                    fields[name].get("of"),
+                    cells=range(start, start + span),
+                )
             n_leaves += 1
             timestamps.append(stamp.get("written_at"))
             granules += int(stamp.get("granule_count") or 0)
@@ -1871,7 +2008,7 @@ def _fold_node(
         for kwarg, sibling_name in declared:
             slabs[sibling_name] = sibling_slabs[kwarg]
     stamps = [t for t in timestamps if t is not None]
-    return {
+    fold = {
         "slabs": slabs,
         "generation": {
             "n_leaves": int(n_leaves),
@@ -1882,6 +2019,9 @@ def _fold_node(
         "time_range": union_time_range(*ranges) if ranges else None,
         "fold_source": "leaves",
     }
+    if demoted:
+        fold["demotions"] = demotion_records(demoted)
+    return fold
 
 
 def _empty_slab(meta: dict, n_cells: int) -> np.ndarray:
@@ -1962,6 +2102,9 @@ def _cascade_node(
     basename = _overview_basename(key)
     n_sources, n_leaves, timestamps, granules, ranges = 0, 0, [], 0, []
     missing, unreadable = 0, 0
+    # The packed rail's artifact record (issue #518): each child the rail
+    # fired on, per field and direction, for the ``demotions`` attrs key.
+    demoted: dict = {}
     children = sorted({_node_at(d, source_order) for d in node_shards})
     for child in children:
         path = f"{store_root}/{_node_rel(child)}/{basename}"
@@ -1995,13 +2138,22 @@ def _cascade_node(
                     f"morton shape {group['morton'].shape} is not the {n_cells}-cell "
                     f"overview slab of order {source_order}"
                 )
-            partials = _fold_child(group, fields, factor, span, path)
+            partials, notes = _fold_child(group, fields, factor, span, path)
         except Exception as e:
             logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
             counts["failed"] += 1
             unreadable += 1
             continue
         start = _rel_rank(child, node) * span
+        for field, reason, of in notes:
+            # BOTH directions leave the child's whole span at the fill word,
+            # so the span is the record's ``cells`` either way — unlike the
+            # leaf fold, where a dropped contributor blanks nothing because
+            # SIBLING leaves' words cover the same output cells. Children own
+            # DISJOINT spans here (the assignment below), so a child skipped
+            # for the field leaves span cells nothing else can ever cover
+            # (review finding).
+            note_demotion(demoted, field, reason, of, cells=range(start, start + span))
         for name, partial in partials.items():
             # Children own disjoint spans of the parent slab, so this is an
             # assignment — the accumulate-then-merge the leaf fold needs (and
@@ -2031,7 +2183,7 @@ def _cascade_node(
     if n_sources == 0:
         return None
     stamps = [t for t in timestamps if t is not None]
-    return {
+    fold = {
         "slabs": slabs,
         "generation": {
             "n_leaves": int(n_leaves),
@@ -2048,9 +2200,12 @@ def _cascade_node(
             "unreadable": int(unreadable),
         },
     }
+    if demoted:
+        fold["demotions"] = demotion_records(demoted)
+    return fold
 
 
-def _fold_child(group, fields, factor, span, path) -> dict:
+def _fold_child(group, fields, factor, span, path) -> tuple[dict, list]:
     """One child overview's slabs, folded ``factor``-to-one into ``span`` cells.
 
     Digest cells are merged group by group, so at most ``factor`` decoded
@@ -2063,13 +2218,23 @@ def _fold_child(group, fields, factor, span, path) -> dict:
     centroid partition that merge produced, so the pair cannot be folded in two
     passes. The cascade therefore reads and writes both arrays here, and its
     words sit at heterogeneous orders exactly as the leaf fold's do (spec §9.1).
+
+    Returns ``(partials, notes)`` — ``notes`` a ``(field, reason, of)`` list,
+    one entry per packed field this child carried only half of, for the
+    caller's ``demotions`` record (issue #518): a half-paired child leaves
+    its span's word cells at fill, and the bytes alone cannot say why.
     """
     partials: dict = {}
+    notes: list = []
     for name, meta in fields.items():
         try:
             arr = group[name]
         except KeyError:
             logger.debug(f"sweep[overview]: overview {path} lacks field {name!r}")
+            if meta["class"] == "packed" and (meta.get("of") or "") in group:
+                # The skew shape: this child's divisor digest folds below
+                # while its word span stays fill — record it (issue #518).
+                notes.append((name, DEMOTION_WORD_MISSING, meta.get("of")))
             continue
         if meta["class"] == "exact":
             partials[name] = fold_dense(
@@ -2096,6 +2261,11 @@ def _fold_child(group, fields, factor, span, path) -> dict:
                 of_values = group[of_name][:]
             except (KeyError, TypeError):
                 logger.debug(f"sweep[overview]: overview {path} lacks {of_name!r} for {name!r}")
+                # The mis-declared-divisor shape (issue #518): a manifest
+                # still naming an ``of`` no overview materializes (e.g. a
+                # digest demoted to class ``none``) fires this on EVERY
+                # child, and composition silently never cascades — record it.
+                notes.append((name, DEMOTION_DIVISOR_MISSING, of_name))
                 continue
             of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
             words_arr = arr[:]
@@ -2155,7 +2325,7 @@ def _fold_child(group, fields, factor, span, path) -> dict:
         partials[name] = folded
         for kwarg, sibling_name in declared:
             partials[sibling_name] = sibling_slabs[kwarg]
-    return partials
+    return partials, notes
 
 
 def _fold_sources(decl, orders, cell_order, shard_order) -> dict:
@@ -2428,12 +2598,23 @@ def _fold_provenance(fold: dict) -> dict:
     UNDER-COVERS its subtree and a fill cell there is not evidence of
     emptiness: the distinction lives in the artifact rather than in a sweep
     log, which is the only place a later reader can find it.
+
+    ``demotions`` (issue #518) rides the same argument one field deeper:
+    when the packed guard rail demoted a field at this node — a contributor
+    carrying half of the ``(word, of-digest)`` pair — the per-field record
+    says WHICH field folded short and WHY, where ``source_children`` can
+    only count whole contributors. Keyed only when the rail fired.
     """
     entry = {"fold_source": fold.get("fold_source", "leaves")}
     if fold.get("fold_from_order") is not None:
         entry["fold_from_order"] = int(fold["fold_from_order"])
     if fold.get("source_children") is not None:
         entry["source_children"] = dict(fold["source_children"])
+    if fold.get("demotions"):
+        # The packed guard rail fired at this node (issue #518, spec §4.3):
+        # keyed only when non-empty, so a clean level's attrs are
+        # byte-identical to a pre-#518 writer's.
+        entry["demotions"] = [dict(r) for r in fold["demotions"]]
     return entry
 
 

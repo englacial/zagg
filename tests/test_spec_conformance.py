@@ -865,6 +865,187 @@ class TestPyramidV2Declaration:
         assert manifest["cell_order"] == _expected(PYRAMID)["cell_order"]
 
 
+class TestMultiscalesMirror:
+    """§4.9 — the ``multiscales`` discovery mirror (issue #392).
+
+    Every assertion decodes the committed ``pyramid/`` manifest from spec
+    text alone; expected values come from the generator's INPUTS.
+    """
+
+    def _mirror(self):
+        manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())
+        return manifest["multiscales"]
+
+    def test_marker_and_shape(self):
+        # §4.9: a list of ONE multiscale object, spec-marked, name from the
+        # manifest's dataset identity.
+        mirror = self._mirror()
+        assert mirror == _expected(PYRAMID)["multiscales"]
+        (entry,) = mirror
+        assert entry["spec"] == "zagg-multiscales/1"
+        assert entry["name"] == "SPEC_FIXTURE"
+
+    def test_datasets_project_the_pyramid_block(self):
+        # §4.9: datasets mirror pyramid.overviews VERBATIM (finest first),
+        # with the artifact kind by the node-order rule — "column" at the
+        # shard order, "overview" above it. The pyramid block wins on any
+        # disagreement, so agreement here is the conformance claim.
+        exp = _expected(PYRAMID)
+        (entry,) = self._mirror()
+        levels = _pyramid_block()["overviews"]
+        assert [{"order": e["node"], "cells": e["cells"]} for e in levels] == [
+            {"order": d["order"], "cells": d["cells"]} for d in entry["datasets"]
+        ]
+        for d in entry["datasets"]:
+            assert d["artifact"] == ("column" if d["order"] == exp["shard_order"] else "overview")
+
+    def test_order2res_is_the_flat_per_order_lookup(self):
+        # §4.9: string keys (JSON has no int keys), key set exactly the
+        # orders present, values agreeing with datasets entry for entry.
+        (entry,) = self._mirror()
+        assert entry["order2res"] == {str(d["order"]): d["cells"] for d in entry["datasets"]}
+
+    def test_base_is_the_native_resolution_never_a_dataset(self):
+        # §4.9: the native source data is the base key — not a datasets
+        # entry (a member at the base data's own order would BE the data).
+        exp = _expected(PYRAMID)
+        (entry,) = self._mirror()
+        assert entry["base"] == {"order": exp["shard_order"], "cells": [exp["cell_order"]]}
+        # membership, not whole-list inequality: the native resolution is not
+        # a MEMBER of any level entry's cells — least of all the leaf entry's,
+        # which shares the base's order key in order2res (§4.9's union rule).
+        for d in entry["datasets"]:
+            assert exp["cell_order"] not in d["cells"]
+        assert exp["cell_order"] not in entry["order2res"][str(exp["shard_order"])]
+
+    def test_fields_and_fold_project_the_family_dict(self):
+        # §4.9: {name: class} projected from the §4.5 D24 map; declared fold
+        # provenance from the family dict (exact_levels present exactly when
+        # declared there).
+        (entry,) = self._mirror()
+        overview = _pyramid_block()["overview"]
+        assert entry["fields"] == {n: m["class"] for n, m in overview["fields"].items()}
+        assert entry["fold"] == {
+            "fold_source": overview["fold_source"],
+            "exact_levels": overview["exact_levels"],
+        }
+
+    def test_absence_is_the_pre_convention_pin(self):
+        # §4.9: the key is present exactly when the pyramid block is /2 —
+        # column/ (a /2 store committed before §4.9) pins absence as the
+        # legal pre-convention state, and raster_toc/ pins that /1 never
+        # carries it.
+        for name in ("column", "raster_toc"):
+            manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
+            assert "multiscales" not in manifest
+
+
+#: The §4.10 companion-group fixture (issue #394): a /2 manifest + root
+#: coverage + the metadata-only companion tree at the reserved root path.
+MULTISCALES = "multiscales"
+
+
+class TestMultiscalesCompanion:
+    """§4.10 — the stock-tool-legible companion group (issue #394).
+
+    Assertions decode the committed group documents from spec text alone;
+    expected values come from the generator's INPUTS (the occupied shard
+    set and the §4.4 ladder law), never read back through zagg.
+    """
+
+    def _root_doc(self):
+        return json.loads((SPEC_DATA / MULTISCALES / "multiscales" / "zarr.json").read_text())
+
+    def test_metadata_only_reference_layout(self):
+        # §4.10: no arrays, no data bytes, no leaves — the whole store is
+        # the manifest, the root MOC, and the companion group documents.
+        exp = _expected(MULTISCALES)
+        objects = sorted(
+            str(p.relative_to(SPEC_DATA / MULTISCALES))
+            for p in (SPEC_DATA / MULTISCALES).rglob("*")
+            if p.is_file()
+        )
+        assert objects == ["coverage.moc", "morton_hive.json"] + [
+            f"multiscales/{k}/zarr.json" for k in sorted(exp["levels"])
+        ] + ["multiscales/zarr.json"]
+
+    def test_stock_zarr_walks_the_tree(self):
+        # The headline claim, asserted with stock zarr and zero zagg code:
+        # open the reserved root child, list the children, read the attrs.
+        import zarr
+
+        exp = _expected(MULTISCALES)
+        group = zarr.open_group(str(SPEC_DATA / MULTISCALES / "multiscales"), mode="r")
+        assert sorted(k for k, _ in group.members()) == sorted(exp["levels"])
+        for order, level in exp["levels"].items():
+            attrs = group[order].attrs["zagg_multiscales_level"]
+            assert attrs["members"] == level["members"]
+
+    def test_root_document_and_stamp(self):
+        exp = _expected(MULTISCALES)
+        doc = self._root_doc()
+        assert doc["zarr_format"] == 3 and doc["node_type"] == "group"
+        # The §4.9 mirror rides the root attrs, equal to the manifest's own.
+        manifest = json.loads((SPEC_DATA / MULTISCALES / "morton_hive.json").read_text())
+        assert doc["attributes"]["multiscales"] == manifest["multiscales"] == exp["multiscales"]
+        stamp = doc["attributes"]["zagg_multiscales"]
+        assert stamp["spec"] == "zagg-multiscales/1"
+        assert stamp["window"] == exp["window"]
+        assert stamp["members_source"] == exp["members_source"]
+        assert stamp["generated_at"]  # present; value is write-time truth
+        # §4.10: the INPUT's age rides beside it, so a companion written from
+        # a stale root MOC cannot self-certify fresh — on the "coverage.moc"
+        # branch it is that envelope's own stamp, byte-for-byte.
+        envelope = json.loads((SPEC_DATA / MULTISCALES / "coverage.moc").read_text())
+        assert stamp["members_generated_at"] == envelope["generated_at"]
+
+    def test_consolidated_metadata_inlines_the_children(self):
+        # §4.10: one GET of the root document walks the whole tree — the
+        # inlined child documents are identical to the standalone objects.
+        exp = _expected(MULTISCALES)
+        consolidated = self._root_doc()["consolidated_metadata"]
+        assert consolidated["kind"] == "inline" and consolidated["must_understand"] is False
+        assert sorted(consolidated["metadata"]) == sorted(exp["levels"])
+        for order in exp["levels"]:
+            child = json.loads(
+                (SPEC_DATA / MULTISCALES / "multiscales" / order / "zarr.json").read_text()
+            )
+            assert consolidated["metadata"][order] == child
+
+    def test_member_refs_decode_per_spec(self):
+        # §4.10: members map the order-k ancestors of the occupied shards
+        # (decimal-prefix truncation) to {hive_path(node)}/all.zarr/{cells[0]}
+        # — recomputed here from the fixture's recorded shard set, from spec
+        # text alone.
+        exp = _expected(MULTISCALES)
+        for order, level in exp["levels"].items():
+            child = json.loads(
+                (SPEC_DATA / MULTISCALES / "multiscales" / order / "zarr.json").read_text()
+            )
+            attrs = child["attributes"]["zagg_multiscales_level"]
+            assert attrs["spec"] == "zagg-multiscales/1"
+            assert attrs["order"] == int(order) and attrs["window"] == "all"
+            assert attrs["artifact"] == "overview"
+            assert attrs["cells"] == level["cells"]
+            k, (r,) = int(order), level["cells"]
+            nodes = sorted({d[: 2 + k] for d in exp["shards"]})  # southern base: 2 chars
+            assert attrs["members"] == {
+                n: "/".join([n[:2], *n[2:]]) + f"/all.zarr/{r}" for n in nodes
+            }
+            # Coarse ladder only: strictly above the leaf entry, rooted at 0.
+            assert 0 <= k < exp["shard_order"]
+
+    def test_no_companion_group_is_the_absence_pin(self):
+        # §4.10: absence of the whole group is legal — every other fixture,
+        # /2 declarations included, carries none. Derived from the fixture
+        # directory rather than listed, so a fixture added later is pinned
+        # the day it lands (a hardcoded tuple silently exempts it).
+        others = sorted(p for p in SPEC_DATA.iterdir() if p.is_dir() and p.name != MULTISCALES)
+        assert len(others) > 1  # the sweep found fixtures, not an empty tree
+        for fixture in others:
+            assert not (fixture / MULTISCALES).exists()
+
+
 #: The §4.6 leaf-column fixture (issue #383): the ``minimal`` inputs plus an
 #: explicit ``output.pyramid.overviews: 5`` knob, so the committed store holds
 #: a leaf AND the column its worker wrote beside it.
@@ -1024,7 +1205,17 @@ class TestFixtureSemanticHash:
 
     #: Every fixture this class recomputes, and how its config is rebuilt.
     #: ``test_every_fixture_is_covered`` refuses a fixture that is not here.
-    COVERED = ("minimal", "kitchen_sink", "column", "flux", PYRAMID, "raster_toc", "temporal")
+    COVERED = (
+        "minimal",
+        "kitchen_sink",
+        "column",
+        "flux",
+        PYRAMID,
+        MULTISCALES,
+        "raster_toc",
+        "temporal",
+        "demoted",
+    )
 
     @pytest.mark.parametrize(
         "name,kwargs",
@@ -1035,6 +1226,10 @@ class TestFixtureSemanticHash:
             # The §2.0 flux fixture (issue #424) landed after the epoch's
             # phase 3, so its committed digest was pre-epoch until now.
             ("flux", {"kitchen_sink": False, "flux": True}),
+            # The §4.3 demotions fixture (issue #518) is the kitchen-sink
+            # store under a hand-mangled MANIFEST pyramid block — the config
+            # (and so the identity) is kitchen_sink's own.
+            ("demoted", {"kitchen_sink": True}),
         ],
     )
     def test_leaf_fixture_hash_is_reproducible(self, name, kwargs):
@@ -1092,6 +1287,19 @@ class TestFixtureSemanticHash:
             cfg.output["grid"] = dict(gen.PYRAMID_GRID)
         assert semantic_hash(cfg_v1) == semantic_hash(cfg_v2)
         assert self._recorded(PYRAMID) == semantic_hash(cfg_v1)
+
+    def test_the_multiscales_fixture_hash_is_reproducible(self):
+        # The §4.10 fixture is templated directly under the /2 knob on the
+        # pyramid grid — the same semantic core as pyramid/ (the pyramid
+        # block and the companion are both outside it, issue #415).
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        cfg = gen._config(False, pyramid=gen.PYRAMID_KNOB)
+        cfg.aggregation["variables"].update(gen.PYRAMID_EXTRA_VARIABLES)
+        cfg.output["grid"] = dict(gen.PYRAMID_GRID)
+        assert self._recorded(MULTISCALES) == semantic_hash(cfg)
+        assert self._recorded(MULTISCALES) == self._recorded(PYRAMID)
 
 
 class TestFixtureGranuleIdentity:
@@ -1978,3 +2186,59 @@ class TestRootCoverageTemporalSection:
             )
             for t in internal:
                 assert bool(np.any((start.astype(np.uint64) <= t) & (t < end.astype(np.uint64))))
+
+
+class TestDemotionAttrs:
+    """§4.3 ``demotions``: the packed rail's record, on committed bytes (#518).
+
+    The ``demoted/`` fixture (not in ``FIXTURES``: its expected record is the
+    demotion surface, not the leaf suite's) is the kitchen-sink store swept
+    under a ``/1`` manifest whose ``of`` divisor is mis-declared ``none`` —
+    the exact-from-leaves level folds composition cleanly, the cascade above
+    it cannot, and only the attrs distinguish the two all-fill readings.
+    """
+
+    def _overview(self, exp, which, path=""):
+        store = LocalStore(str(SPEC_DATA / "demoted" / exp[which]["object"]))
+        return zarr.open_group(store, path=path, mode="r", zarr_format=3)
+
+    def test_the_demoted_level_records_the_rail(self):
+        exp = _expected("demoted")
+        block = dict(self._overview(exp, "demoted").attrs)["zagg_overview"]
+        assert block["fold_source"] == "cascade"
+        assert block["demotions"] == exp["demoted"]["demotions"]
+        [record] = block["demotions"]
+        # The record grammar: ``field``/``class``/``reason``/``contributors``
+        # always, ``of`` naming the §3.3 linkage, ``cells`` whenever the
+        # demotion left output cells at the fill word no surviving contributor
+        # covers — the case here, since a cascade's children own disjoint
+        # spans — and readers MUST tolerate additional keys (§4.3).
+        assert record["field"] == "composition" and record["class"] == "packed"
+        assert record["reason"] in ("word-missing", "divisor-missing")
+        assert record["reason"] == "divisor-missing"
+        assert record["contributors"] == 1
+        assert record["of"] == "h_tdigest_signal"
+        # The child's whole span, and the level is one child wide: 4 of the
+        # node's 16 cells, matching the all-fill word slab below.
+        assert record["cells"] == 4
+
+    def test_the_clean_level_carries_no_demotions_key(self):
+        # Absent, never empty: a level the rail did not fire at is
+        # byte-identical to a pre-#518 writer's.
+        exp = _expected("demoted")
+        block = dict(self._overview(exp, "clean").attrs)["zagg_overview"]
+        assert block["fold_source"] == "leaves"
+        assert "demotions" not in block
+
+    def test_the_bytes_alone_cannot_say_why(self):
+        # The record's reason to exist: the divisor is absent from BOTH
+        # levels (class ``none`` never materializes, §4.4), and the demoted
+        # level's composition is all fill while the clean level's is
+        # populated — indistinguishable from emptiness without the attrs.
+        exp = _expected("demoted")
+        clean = self._overview(exp, "clean", path="5")
+        demoted = self._overview(exp, "demoted", path="4")
+        assert "h_tdigest_signal" not in dict(clean.arrays())
+        assert "h_tdigest_signal" not in dict(demoted.arrays())
+        assert int(clean["composition"][:].astype("uint64").sum()) > 0
+        assert int(demoted["composition"][:].astype("uint64").sum()) == 0

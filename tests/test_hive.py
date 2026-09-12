@@ -549,6 +549,33 @@ class TestProductRoots:
         assert sorted(products) == ["atl03_tdigest", "atl06"]
         assert products["atl06"]["spec"] == m["spec"]
 
+    def test_legacy_multiscales_product_is_excluded_loudly(self, cfg, tmp_path, caplog):
+        # The §4.10 reservation is retroactive on discovery (issue #394):
+        # a product predating it is filtered out — it cannot be addressed
+        # either — but the filtering is REPORTED, never silent.
+        root = str(tmp_path / "store")
+        m = hive.build_manifest(self._grid(cfg))
+        hive.ensure_manifest(f"{root}/multiscales", m)  # product_root refuses the name
+        with caplog.at_level("WARNING"):
+            assert hive.list_products(root) == {}
+            assert hive.classify_store_root(root) == "empty"
+        assert len([r for r in caplog.records if "is a PRODUCT" in r.message]) == 2
+
+    def test_companion_group_is_not_warned_about(self, cfg, tmp_path, caplog):
+        # The ordinary /2 store: the companion carries no manifest, so
+        # discovery passes over it in silence (the finding-1 lesson — a
+        # warning on the normal shape trains operators to ignore the log).
+        root = tmp_path / "store"
+        (root / "multiscales").mkdir(parents=True)
+        (root / "multiscales" / "zarr.json").write_text("{}")
+        hive.ensure_manifest(
+            hive.product_root(str(root), "atl06"), hive.build_manifest(self._grid(cfg))
+        )
+        with caplog.at_level("WARNING"):
+            assert sorted(hive.list_products(str(root))) == ["atl06"]
+            assert hive.classify_store_root(str(root)) == "products"
+        assert not [r for r in caplog.records if "multiscales" in r.message]
+
 
 class TestLeafTemplateAndStamp:
     def _grid(self, cfg):

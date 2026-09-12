@@ -82,3 +82,6 @@ data/atl03_v007/
 data/**/shardmap_*.json
 data/**/*_submap*.json
 data/**/*.parquet
+
+# source-coop credentials (08_cali_write reads this; never commit)
+demo/source_coop_creds.json
