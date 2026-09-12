@@ -1575,7 +1575,16 @@ class TestRunnerSeam:
 #: byte, every count, every digest payload, every remaining generation key
 #: (``n_leaves``, ``max_leaf_timestamp``), every ``source_children`` tally —
 #: must match exactly.
-_VOLATILE_KEYS = frozenset({"run_id", "run_ids", "written_at", "generated_at", "timestamp"})
+#: ``members_generated_at`` is the §4.10 companion stamp's input-age half
+#: (issue #394): it RELAYS the root ``coverage.moc`` envelope's own
+#: ``generated_at`` — a value this set already blanks where it originates —
+#: so between two correct executors it is clock, not content. Without it the
+#: oracle's companion compare passes only when both arms' finishers land in
+#: the same second (the fast arms did; the multi-tuple/barrier/windowed/
+#: both-channel arms crossed the boundary and failed).
+_VOLATILE_KEYS = frozenset(
+    {"run_id", "run_ids", "written_at", "generated_at", "members_generated_at", "timestamp"}
+)
 
 
 #: Store-root objects that are not ladder artifacts: the input run record the
