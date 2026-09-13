@@ -218,14 +218,16 @@ class TestD24Classification:
                 "method": "tdigest_kway",
                 "dtype": "float32",
                 "inner_shape": [2],
-                # The template's leaf budget and its split pyramid-fold budget
-                # (issue #424), recorded RESOLVED.
-                "delta": 8192,
+                # The template's leaf budget (the live store's δ, issue #547)
+                # and its split pyramid-fold budget (issue #424), recorded
+                # RESOLVED.
+                "delta": 4096,
                 "overview_delta": 512,
                 # Located strata IS the default (espg ruling on PR #334); the
                 # manifest entry is the only description the overview writer
-                # has, so the channel must ride it (issue #410).
+                # has, so both channels must ride it (issue #410).
                 "location": "leaf_id",
+                "temporal": "per-centroid",
             }
 
     def test_class_map_gates_the_leaf_column_write_path(self):

@@ -732,8 +732,8 @@ class TestWaveformPyramidDeclaration:
     """Template-time classification for the waveform digest (issue #508).
 
     The SERC probe shape: ``gedi01b_waveform_healpix_hive`` + ``output.pyramid
-    = {}`` + ``rx_flux.overview_delta = 512`` under the probe's uniform-δ4096
-    override (the packaged template ships δ8192). Classification runs
+    = {}`` + ``rx_flux.overview_delta = 512`` at the packaged δ4096 (the live
+    store's value since issue #547). Classification runs
     worker-side at template time, so this IS the deployed surface the 0.50
     fleet re-runs the probe against.
     """
@@ -748,7 +748,7 @@ class TestWaveformPyramidDeclaration:
         # the OVERVIEW_DELTA_CAP fallback under δ4096 — so this value alone
         # cannot prove the declaration is read. The δ128 variant below does.
         rx["overview_delta"] = 512
-        rx["params"]["delta"] = 4096  # the probe's uniform-δ override
+        assert rx["params"]["delta"] == 4096  # the packaged value IS the probe's
         return cfg
 
     def test_probe_config_declares_the_ladder(self):
@@ -766,6 +766,10 @@ class TestWaveformPyramidDeclaration:
             "delta": 4096,
             "overview_delta": 512,
             "temporal": "per-centroid",
+            # The §2.0 flux declaration + gain provenance ride the manifest
+            # entry (PR #521, landed with issue #547).
+            "weights": "flux",
+            "gain": {"name": "unit", "version": "gedi01b-v002-placeholder", "value": 1.0},
         }
         assert "rx_flux" not in excluded
         # Non-vacuous pin on the SAME probe config: the capped fallback can
@@ -897,9 +901,9 @@ class TestPyramidBlock:
         block = build_pyramid_block(cfg, shard_order=9)
         entry = block["overview"]["fields"]["h_tdigest"]
         assert entry["class"] == "approximate" and entry["method"] == "tdigest_kway"
-        # The packaged split budgets (issues #414/#424): leaf δ 8,192
-        # (loss-free bound), overview folds at 512 (accuracy bound).
-        assert entry["inner_shape"] == [2] and entry["delta"] == 8192
+        # The packaged split budgets (issues #414/#424/#547): leaf δ 4,096
+        # (the live stores' value), overview folds at 512 (accuracy bound).
+        assert entry["inner_shape"] == [2] and entry["delta"] == 4096
         assert entry["overview_delta"] == 512
 
     def test_explicit_orders_and_all_time(self):
