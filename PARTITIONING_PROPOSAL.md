@@ -248,12 +248,13 @@ schedule removes the mechanism itself:
 
 **Gaps (noted, not fixed here):**
 
-- (a) **The original build configs are not in the repo** — a **step 1**
-  blocker only. The store manifests pin δ=4096 (a parent_order-9 config
-  variant); the repo carries δ=8192, and the semantic guard refuses any config
-  that did not build the store, so espg must supply the original ATL03 and
-  GEDI configs for the **re-declaration**. (`output.*` edits — the pyramid
-  knob — do not move the hash.) The **backfill takes no config at all**:
+- (a) **The original build configs — CLOSED.** The store manifests pin δ=4096
+  (a parent_order-9 config variant); the repo templates carry δ=8192, and the
+  semantic guard refuses any config that did not build the store. Both
+  originals were recovered verbatim from the stores' run records and are
+  committed under `data/store_configs/` (hash-pinned by
+  `tests/test_store_configs.py`; dry-run MATCH on both stores 2026-09-13).
+  (`output.*` edits — the pyramid knob — do not move the hash.) The **backfill takes no config at all**:
   `backfill_columns(store_root, manifest, by_shard, ...)` derives its plan
   from the manifest (`plan = manifest_column_plan(manifest)`, then
   `column_structure(plan.fields, ...)`) and consults no semantic hash, and the

@@ -25,9 +25,10 @@ tests). ``--overviews N`` injects ``output.pyramid.overviews: N`` into the
 loaded config, which is exactly the retrofit edit ``declare_pyramid``'s
 semantic guard blesses: ``output.*`` is not in the semantic core, so the
 original config plus the pyramid knob hashes identically. The config must be
-the store's ORIGINAL build config (for the live ATL03 store that is the
-parent_order-9 / delta-4096 variant, which is NOT in the repo — the semantic
-guard refuses the repo's delta-8192 variant by hash).
+the store's ORIGINAL build config — for both live stores the parent_order-9 /
+delta-4096 configs recovered from their run records and committed under
+``data/store_configs/`` (the semantic guard refuses the repo's delta-8192
+templates by hash).
 
 **DRY-RUN is the default.** Without ``--execute`` nothing is written: the
 manifest is read (anonymously with ``--anon``), the replacement block is
