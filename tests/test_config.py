@@ -2267,17 +2267,19 @@ class TestRaggedKind:
 
 
 # ---------------------------------------------------------------------------
-# Packaged δ = 8,192 raise (issues #414/#424)
+# Packaged δ = 4,096 raise (issues #414/#424/#547)
 # ---------------------------------------------------------------------------
 
 
 class TestPackagedDeltaRaise:
     """The four shipped ATL03 t-digest configs carry the split budgets.
 
-    Leaf δ = 8,192 is the measured loss-free bound (issue #422's statewide CA
-    scan); overview_delta = 512 is the pyramid-fold accuracy budget. The
-    packaged configs are EXPLICIT so ``_DEFAULT_DELTA`` never decides an
-    output value for them (the silent-change-under-stable-hash trap).
+    Leaf δ = 4,096 is the live stores' value (espg ruling 2026-09-13, issue
+    #547): issue #422's statewide CA tail scan puts 1e-5 of cells above it, all
+    atmospheric storm artifacts. overview_delta = 512 is the pyramid-fold
+    accuracy budget. The packaged configs are EXPLICIT so ``_DEFAULT_DELTA``
+    never decides an output value for them (the silent-change-under-stable-hash
+    trap).
     """
 
     @pytest.mark.parametrize(
