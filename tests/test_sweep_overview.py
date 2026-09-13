@@ -813,6 +813,8 @@ class TestWaveformPyramidDeclaration:
         assert rx["class"] == "approximate"
         assert rx["temporal"] == "per-centroid"
         assert rx["overview_delta"] == 512
+        # The §2.0 weights declaration rides every level too (PR #521).
+        assert rx["weights"] == "flux"
 
     def test_overview_template_emits_the_times_sibling(self, tmp_path):
         # The companion path at overview levels (issue #410, per-centroid at
