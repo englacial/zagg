@@ -31,9 +31,13 @@ leaf.
   prefix was lifecycled away, looks exactly like a quiesced one — the
   precondition is still yours to confirm.
 - **You have the config the store was built with.** `declare_pyramid` refuses
-  a config whose `semantic_hash` the store's frozen one denies. `output.*` is
-  not in the semantic core, so adding or changing `output.pyramid` on the
-  original config hashes identically.
+  a config whose `semantic_hash` the store's frozen one denies.
+  `output.pyramid` is not in the semantic core, so adding or changing it on
+  the original config hashes identically (the leaf-shaping `output` keys —
+  `aoi_mask`, `windowing`, `time_source`, `grid.sharded` — do move the hash).
+  For the two live demo stores the originals ARE the packaged templates
+  (`atl03_tdigest_strata_healpix`, `gedi01b_waveform_healpix_hive`), hash-pinned
+  to the store manifests in `tests/test_live_store_templates.py` (issue #547).
 - The store's leaves are committed and its run records are at the product root
   (they are what discovery reads — never a recursive LIST).
 

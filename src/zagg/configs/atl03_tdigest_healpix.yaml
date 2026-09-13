@@ -68,7 +68,7 @@ aggregation:
     h_tdigest:
       # Per-cell t-digest of photon heights: a ragged (vlen-bytes) field whose payload
       # is an (n_centroids, 2) array of (mean, weight) centroids. ``build_tdigest``
-      # is called as build_tdigest(h_ph_values, delta=8192); ``inner_shape: [2]``
+      # is called as build_tdigest(h_ph_values, delta=4096); ``inner_shape: [2]``
       # declares the per-element centroid width. To store ONE digest per chunk
       # instead of per cell, add ``resolution: chunk`` (one payload per inner
       # chunk under the chunk-uniform contract).
@@ -77,11 +77,12 @@ aggregation:
       source: h_ph
       inner_shape: [2]
       params:
-        # Leaf centroid budget (issues #414/#424): loss-free while a cell's
-        # count stays <= delta. 8192 covers every real surface cell in the
-        # statewide CA scan (only atmospheric storm artifacts exceed it);
+        # Leaf centroid budget (issues #414/#424; espg ruling 2026-09-13):
+        # loss-free while a cell's count stays <= delta. 4096 is the live
+        # stores' value and covers every real surface cell in the statewide
+        # CA scan -- 1e-5 of cells exceed it, all atmospheric storm artifacts;
         # digest size scales with actual counts, so typical cells are unmoved.
-        delta: 8192
+        delta: 4096
       # Pyramid/overview folds compress at this split budget instead (~1/512
       # quantile accuracy) — overviews are summaries, not loss-free carriers,
       # and the cap bounds the sweep's k-way fold buffers (issue #424).

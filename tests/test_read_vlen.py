@@ -1355,9 +1355,18 @@ class TestGediTemplate:
         assert cfg.output["store_layout"] == "hive"
         assert cfg.output["pyramid"] is False
         flux = cfg.aggregation["variables"]["rx_flux"]
-        assert flux["params"]["delta"] == 8192
+        assert flux["params"]["delta"] == 4096  # the live store's value (issue #547)
         assert "operating_point" in flux["attrs"]  # clip provenance
-        assert flux["attrs"]["gain_name"]
+        # The §2.0 weights declaration (issue #424): the digest's weight column
+        # is calibrated flux, with the required gain-provenance MAPPING (name +
+        # version at minimum) beside it — the shape validate_config enforces
+        # for a flux-declared field.
+        assert flux["weights"] == "flux"
+        assert flux["attrs"]["gain"] == {
+            "name": "unit",
+            "version": "gedi01b-v002-placeholder",
+            "value": 1.0,
+        }
         assert len(cfg.data_source["groups"]) == 8
 
     def test_measured_envelope(self, cfg):
