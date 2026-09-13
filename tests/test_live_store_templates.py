@@ -25,20 +25,34 @@ from zagg.semantics import semantic_hash
 
 CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json"
 
-#: (template, store manifest ``semantic_hash``, digest fields, (parent, child, chunk_inner))
-LIVE_STORES = [
+#: (template, store manifest ``semantic_hash``) — the frozen-identity anchor.
+SEMANTIC_PINS = [
     (
         "atl03_tdigest_strata_healpix",
         json.loads(CA_MANIFEST.read_text())["semantic_hash"],
-        ["h_tdigest_signal", "h_tdigest_noise"],
-        (9, 19, 13),
     ),
     (
         "gedi01b_waveform_healpix_hive",
         # gedi_flux_o9 morton_hive.json, read 2026-09-13 (no vendored manifest).
         "4f8287947a83abd38519372c047e7f4c62c0479d64bc72f6d512eda413d88f63",
+    ),
+]
+
+#: (template, digest fields, (parent, child, chunk_inner), overview_delta) —
+#: the hash-invisible knobs ``redeclare_dense_ladder.py`` consumes. ATL03's
+#: digests declare the 512 fold budget; GEDI's ``rx_flux`` declares none.
+DECLARED_PINS = [
+    (
+        "atl03_tdigest_strata_healpix",
+        ["h_tdigest_signal", "h_tdigest_noise"],
+        (9, 19, 13),
+        512,
+    ),
+    (
+        "gedi01b_waveform_healpix_hive",
         ["rx_flux"],
         (9, 18, 12),
+        None,
     ),
 ]
 
@@ -52,13 +66,13 @@ DIGEST_TEMPLATES = [
 ]
 
 
-@pytest.mark.parametrize(("name", "expected", "_d", "_o"), LIVE_STORES)
-def test_template_reproduces_the_live_store_semantic_hash(name, expected, _d, _o):
+@pytest.mark.parametrize(("name", "expected"), SEMANTIC_PINS)
+def test_template_reproduces_the_live_store_semantic_hash(name, expected):
     assert semantic_hash(default_config(name)) == expected
 
 
-@pytest.mark.parametrize(("name", "_h", "digests", "orders"), LIVE_STORES)
-def test_template_pins_the_live_orders_and_fold_knobs(name, _h, digests, orders):
+@pytest.mark.parametrize(("name", "digests", "orders", "overview_delta"), DECLARED_PINS)
+def test_template_pins_the_live_orders_and_fold_knobs(name, digests, orders, overview_delta):
     cfg = default_config(name)
     grid = cfg.output["grid"]
     assert (grid["parent_order"], grid["child_order"], grid["chunk_inner"]) == orders
@@ -67,7 +81,7 @@ def test_template_pins_the_live_orders_and_fold_knobs(name, _h, digests, orders)
         assert meta["params"]["delta"] == 4096
         assert meta.get("temporal") == "per-centroid"
         # overview_delta is hash-invisible but the redeclare tool writes it.
-        assert meta.get("overview_delta") in (512, None)
+        assert meta.get("overview_delta") == overview_delta
 
 
 @pytest.mark.parametrize("name", DIGEST_TEMPLATES)
