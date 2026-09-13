@@ -9,13 +9,15 @@ spec §4.4's every-order law). Two intended invocations, run by the operator
     # (declared 08-24, never materialized) with the dense ladder.
     uv run python tools/redeclare_dense_ladder.py \\
         s3://<bucket>/<prefix>/atl03_tdigest_o9.zarr \\
-        --config <original-atl03-config>.yaml --overviews 13
+        --config data/store_configs/atl03_tdigest_o9.build_config.yaml \\
+        --overviews 13
 
     # gedi_flux_o9: replaces the declared-off block (``orders: []``,
     # the demo/12 ruling) with the same-shape ladder.
     uv run python tools/redeclare_dense_ladder.py \\
         s3://<bucket>/<prefix>/gedi_flux_o9.zarr \\
-        --config <original-gedi-config>.yaml --overviews 12
+        --config data/store_configs/gedi_flux_o9.build_config.yaml \\
+        --overviews 12
 
 Both go through :func:`zagg.sweep_overview.declare_pyramid` — the issue #358
 retrofit path, whose behavior on a declared-but-never-materialized ``/1``
