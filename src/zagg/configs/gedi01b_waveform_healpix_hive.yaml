@@ -204,10 +204,12 @@ aggregation:
         delta: 4096              # leaf centroid budget (espg ruling 2026-09-13):
                                  # the live store's value, uniform with ATL03.
                                  # The threshold-to-zero clip leaves ~50-200
-                                 # rows per shot; measured on the live store,
-                                 # no cell reaches 1,200 centroids (max 1,146
-                                 # over 243k occupied cells incl. the 3 densest
-                                 # leaves), so 4096 is loss-free with ~4x headroom.
+                                 # rows per shot; measured on ``gedi_flux_o9``
+                                 # (read 2026-09-13: 8 leaves incl. the 3
+                                 # densest, 243,202 occupied cells) no cell
+                                 # reaches 1,200 centroids -- max 1,146,
+                                 # p99.999 1,048 -- so 4096 is loss-free with
+                                 # ~4x headroom. See PR #565.
         counts: rxwaveform       # params-as-column: per-sample ADC values
         noise_mean: noise_mean
         noise_stddev: noise_stddev
