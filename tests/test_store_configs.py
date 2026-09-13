@@ -8,6 +8,7 @@ evolves: a canonicalization change that moves either hash surfaces here, not
 at the operator's console.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,13 @@ from zagg.semantics import semantic_hash
 
 STORE_CONFIGS = Path(__file__).resolve().parents[1] / "data" / "store_configs"
 
+#: The ATL03 anchor is read from the vendored live CA manifest rather than
+#: restated, so the pin below is a cross-check against the frozen value
+#: ``sweep_overview._semantic_guard`` actually compares.
+CA_MANIFEST_HASH = json.loads(
+    (Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json").read_text()
+)["semantic_hash"]
+
 #: (file, manifest ``semantic_hash``, digest fields, ``overview_delta`` on those
 #: fields or ``None``, ``(child_order, chunk_inner)``) — read off the live
 #: manifests / run records on 2026-09-13. Everything past the hash is invisible
@@ -25,7 +33,7 @@ STORE_CONFIGS = Path(__file__).resolve().parents[1] / "data" / "store_configs"
 LIVE_STORES = [
     (
         "atl03_tdigest_o9.build_config.yaml",
-        "b9b15fdde78f147c15c929da8ca93de21930ad5c552ae082c5d8998fb83ada21",
+        CA_MANIFEST_HASH,
         ["h_tdigest_signal", "h_tdigest_noise"],
         512,
         (19, 13),

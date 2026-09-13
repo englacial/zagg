@@ -63,12 +63,13 @@ class TestLiveCaManifestFixture:
         assert manifest["spec"] == "morton-hive/1"
         assert manifest["shard_order"] == 9
         assert manifest["cell_order"] == 19
-        # Identity of the RECORD, not of a config: this hash names the store
-        # the issue is about, and no config in the tree reproduces it — the
-        # shipped template hashes 0ac7d33b..., the benchmark strata config
-        # 5ebf740f.... So the before/after below is pinned against reality
-        # for the per-field DECLARATION only; the store's semantic core is
-        # not rebuildable from here. It is also a FROZEN manifest key
+        # Identity of the RECORD: this hash names the store the issue is
+        # about. The config that reproduces it is now committed —
+        # ``data/store_configs/atl03_tdigest_o9.build_config.yaml``, recovered
+        # from the store's run record and pinned against this same value in
+        # ``tests/test_store_configs.py`` (issue #547); the shipped template
+        # (0ac7d33b...) and the benchmark strata config (5ebf740f...) still do
+        # not. It is also a FROZEN manifest key
         # (``hive._FROZEN_MANIFEST_KEYS``), so the retrofit write the PR body
         # plans against this root needs ``overwrite=True`` or ``ensure_manifest``
         # refuses it.
