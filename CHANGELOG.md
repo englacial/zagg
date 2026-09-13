@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **the packaged templates are the live stores' build configs** (#547)
+  ([#565](https://github.com/englacial/zagg/pull/565)): a default build from
+  `atl03_tdigest_strata_healpix` or `gedi01b_waveform_healpix_hive` now
+  APPENDS to `atl03_tdigest_o9.zarr` / `gedi_flux_o9.zarr` instead of being
+  refused on the frozen `semantic_hash` — the two templates carry, key for key,
+  what those stores' run records hold, pinned in
+  `tests/test_live_store_templates.py` against the store manifests.
+  - **δ = 4,096 is uniform across every packaged digest template**, retiring
+    the 8,192 raise (espg ruling 2026-09-13): the CA tail scan puts 1e-5 of
+    cells above 4,096, all atmospheric storm artifacts, and the GEDI read
+    (`gedi_flux_o9`, 8 leaves incl. the 3 densest, 243,202 occupied cells) tops
+    out at 1,146 centroids. `zagg.stats.waveform._DEFAULT_DELTA` follows.
+  - **`gedi01b_waveform_healpix_hive`'s identity moves**: the template now
+    declares `weights: flux` plus the `gain` provenance
+    ([#521](https://github.com/englacial/zagg/pull/521)), so its semantic hash
+    changes. Stores built from the PRIOR packaged form keep their own frozen
+    hash — appends to them need that form, not this one.
+  - **`atl03_tdigest_strata_healpix`** additionally carries the section-8.3
+    temporal companion (`temporal: per-centroid` on both strata) with its
+    `delta_time` column and `output.time_source`, the write-through sidecar
+    `data_source.index` block, and `parent_order: 9`. The index bucket is
+    account-private (#499): build your own store by deleting or overriding
+    `data_source.index`, which moves the hash — correct for a new store.
+
 - **mortie 1.0 is now the floor** (#559): mortie 1.0.0 retired its plural batch
   names with no aliases (espg/mortie#187), so a fresh install against unpinned
   mortie failed at import — first seen on a Binder build of the reader
