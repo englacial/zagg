@@ -55,6 +55,16 @@ data_source:
   # the semantic core, so this block is part of the store's identity and an
   # append must carry it verbatim; retiring the bucket (issue #499) therefore
   # moves the hash -- see that issue before touching it.
+  #
+  # THE BUCKET BELOW IS NOT ANONYMOUSLY READABLE. Issue #499 (verified
+  # 2026-08-20): ``sliderule-public-cors`` has Block Public Access on all four
+  # flags, so every anonymous GET returns 403, and it is not writable outside
+  # the owning account either. The block is here only because the live store's
+  # identity includes it -- an APPEND to ``atl03_tdigest_o9.zarr`` must present
+  # this exact block or the frozen hash refuses. Anyone building their OWN
+  # store from this template should DELETE or override ``data_source.index``
+  # (which resolves to ``inline``, issue #170, and works everywhere); that
+  # moves the semantic hash, which is correct and harmless for a new store.
   index:
     backend: sidecar
     store: s3://sliderule-public-cors/zagg-index/ATL03/007
