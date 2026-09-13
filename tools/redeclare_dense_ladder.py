@@ -9,14 +9,14 @@ spec §4.4's every-order law). Two intended invocations, run by the operator
     # (declared 08-24, never materialized) with the dense ladder.
     uv run python tools/redeclare_dense_ladder.py \\
         s3://<bucket>/<prefix>/atl03_tdigest_o9.zarr \\
-        --config data/store_configs/atl03_tdigest_o9.build_config.yaml \\
+        --config src/zagg/configs/atl03_tdigest_strata_healpix.yaml \\
         --overviews 13
 
     # gedi_flux_o9: replaces the declared-off block (``orders: []``,
     # the demo/12 ruling) with the same-shape ladder.
     uv run python tools/redeclare_dense_ladder.py \\
         s3://<bucket>/<prefix>/gedi_flux_o9.zarr \\
-        --config data/store_configs/gedi_flux_o9.build_config.yaml \\
+        --config src/zagg/configs/gedi01b_waveform_healpix_hive.yaml \\
         --overviews 12
 
 Both go through :func:`zagg.sweep_overview.declare_pyramid` — the issue #358
@@ -29,10 +29,11 @@ semantic guard blesses: ``output.pyramid`` is not in the semantic core, so the
 original config plus the pyramid knob hashes identically (the leaf-shaping
 ``output`` keys — ``aoi_mask``, ``windowing``, ``time_source``,
 ``grid.sharded`` — do move it). The config must be
-the store's ORIGINAL build config — for both live stores the parent_order-9 /
-delta-4096 configs recovered from their run records and committed under
-``data/store_configs/`` (the semantic guard refuses the repo's delta-8192
-templates by hash).
+the store's ORIGINAL build config — for both live stores that is the packaged
+template itself: ``atl03_tdigest_strata_healpix`` and
+``gedi01b_waveform_healpix_hive`` carry the run-record configs key for key
+(parent_order 9, delta 4096) and ``tests/test_live_store_templates.py`` pins
+their hashes to the store manifests (issue #547).
 
 **DRY-RUN is the default.** Without ``--execute`` nothing is written: the
 manifest is read (anonymously with ``--anon``), the replacement block is

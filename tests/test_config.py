@@ -2298,7 +2298,7 @@ class TestPackagedDeltaRaise:
         }
         assert ragged  # every one of these templates carries digest fields
         for meta in ragged.values():
-            assert meta["params"]["delta"] == 8192
+            assert meta["params"]["delta"] == 4096  # the live stores' value (issue #547)
             assert meta["overview_delta"] == 512
 
 
@@ -2342,6 +2342,24 @@ class TestWeightsDeclaration:
         # attrs transcription could silently disagree, so it is reserved.
         with pytest.raises(ValueError, match="spec-owned"):
             validate_config(_ragged_cfg(inner_shape=[2], attrs={"weights": "flux"}))
+
+    def test_shipped_gedi_template_refuses_the_pre_424_flat_gain(self):
+        # The seam at TEMPLATE level: take the SHIPPED gedi01b template and
+        # revert only its attrs to the flat pre-#424 keys (gain_name /
+        # gain_version / scalar gain) while ``weights: flux`` stays declared.
+        # validate_config must refuse it — a declaration whose validator
+        # demands a shape the template does not ship is the mismatch PR #521
+        # closed, and the packaged config is otherwise only exercised in its
+        # already-correct form.
+        cfg = default_config("gedi01b_waveform_healpix_hive", validate=False)
+        rx = cfg.aggregation["variables"]["rx_flux"]
+        assert rx["weights"] == "flux"
+        del rx["attrs"]["gain"]
+        rx["attrs"].update(
+            {"gain_name": "unit", "gain_version": "gedi01b-v002-placeholder", "gain": 1.0}
+        )
+        with pytest.raises(ValueError, match="requires calibration provenance"):
+            validate_config(cfg)
 
     def test_signature_carries_weights_only_when_set(self):
         entries = output_field_signature(

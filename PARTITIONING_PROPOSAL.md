@@ -249,11 +249,13 @@ schedule removes the mechanism itself:
 **Gaps (noted, not fixed here):**
 
 - (a) **The original build configs — CLOSED.** The store manifests pin δ=4096
-  (a parent_order-9 config variant); the repo templates carry δ=8192, and the
-  semantic guard refuses any config that did not build the store. Both
-  originals were recovered verbatim from the stores' run records and are
-  committed under `data/store_configs/` (hash-pinned by
-  `tests/test_store_configs.py`; dry-run MATCH on both stores 2026-09-13).
+  at parent_order 9, and the semantic guard refuses any config that did not
+  build the store. Both originals were recovered verbatim from the stores' run
+  records and are now the packaged templates themselves
+  (`atl03_tdigest_strata_healpix`, `gedi01b_waveform_healpix_hive` — δ=4096
+  is the uniform packaged value since the 2026-09-13 ruling; hash-pinned to
+  the manifests by `tests/test_live_store_templates.py`; dry-run MATCH on both
+  stores 2026-09-13).
   (`output.pyramid` is not in the semantic core, so the pyramid knob does
   not move the hash; the leaf-shaping `output` keys — `aoi_mask`,
   `windowing`, `time_source`, `grid.sharded` — and top-level

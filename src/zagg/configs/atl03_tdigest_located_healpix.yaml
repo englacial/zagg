@@ -84,7 +84,11 @@ aggregation:
       temporal: per-centroid
       inner_shape: [2]
       params:
-        delta: 8192              # leaf centroid budget: loss-free bound (issues #414/#424)
+        delta: 4096              # leaf centroid budget (espg ruling 2026-09-13): the
+                                 # live stores' value, and loss-free for every
+                                 # surface cell measured -- the CA tail scan on
+                                 # issue #422 puts 1e-5 of cells above it, all
+                                 # cloud/background storm artifacts
       overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
       dtype: float32
       fill_value: 0
