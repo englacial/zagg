@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from zagg.config import load_config
 from zagg.semantics import semantic_hash
@@ -25,43 +26,34 @@ CA_MANIFEST_HASH = json.loads(
     (Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json").read_text()
 )["semantic_hash"]
 
-#: (file, manifest ``semantic_hash``, digest fields, ``overview_delta`` on those
-#: fields or ``None``, ``(child_order, chunk_inner)``) — read off the live
-#: manifests / run records on 2026-09-13. Everything past the hash is invisible
-#: to ``semantic_hash`` (packaging keys, issue #424) yet lands verbatim in the
-#: block ``redeclare_dense_ladder.py`` writes, or gates its derivation.
-LIVE_STORES = [
-    (
-        "atl03_tdigest_o9.build_config.yaml",
-        CA_MANIFEST_HASH,
-        ["h_tdigest_signal", "h_tdigest_noise"],
-        512,
-        (19, 13),
-    ),
+#: (file, manifest ``semantic_hash``) — the anchor the tool's guard compares.
+SEMANTIC_PINS = [
+    ("atl03_tdigest_o9.build_config.yaml", CA_MANIFEST_HASH),
     (
         "gedi_flux_o9.build_config.yaml",
         "4f8287947a83abd38519372c047e7f4c62c0479d64bc72f6d512eda413d88f63",
-        ["rx_flux"],
-        None,
-        (18, 12),
     ),
 ]
 
+#: (file, digest fields, ``overview_delta`` on those fields or ``None``,
+#: ``(child_order, chunk_inner)``) — read off the live manifests / run records
+#: on 2026-09-13. All of it is invisible to ``semantic_hash`` (packaging keys,
+#: issue #424) yet lands verbatim in the block ``redeclare_dense_ladder.py``
+#: writes, or gates its derivation.
+DECLARED_PINS = [
+    ("atl03_tdigest_o9.build_config.yaml", ["h_tdigest_signal", "h_tdigest_noise"], 512, (19, 13)),
+    ("gedi_flux_o9.build_config.yaml", ["rx_flux"], None, (18, 12)),
+]
 
-@pytest.mark.parametrize(("name", "expected", "digests", "overview_delta", "orders"), LIVE_STORES)
-def test_build_config_reproduces_the_store_semantic_hash(
-    name, expected, digests, overview_delta, orders
-):
+
+@pytest.mark.parametrize(("name", "expected"), SEMANTIC_PINS)
+def test_build_config_reproduces_the_store_semantic_hash(name, expected):
     config = load_config(str(STORE_CONFIGS / name))
     assert semantic_hash(config) == expected
 
 
-@pytest.mark.parametrize(("name", "expected", "digests", "overview_delta", "orders"), LIVE_STORES)
-def test_build_config_pins_the_live_delta_and_parent_order(
-    name, expected, digests, overview_delta, orders
-):
-    import yaml
-
+@pytest.mark.parametrize(("name", "digests", "overview_delta", "orders"), DECLARED_PINS)
+def test_build_config_pins_the_live_delta_and_parent_order(name, digests, overview_delta, orders):
     raw = yaml.safe_load((STORE_CONFIGS / name).read_text())
     for field in digests:
         variable = raw["aggregation"]["variables"][field]
