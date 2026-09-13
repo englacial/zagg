@@ -254,7 +254,10 @@ schedule removes the mechanism itself:
   originals were recovered verbatim from the stores' run records and are
   committed under `data/store_configs/` (hash-pinned by
   `tests/test_store_configs.py`; dry-run MATCH on both stores 2026-09-13).
-  (`output.*` edits — the pyramid knob — do not move the hash.) The **backfill takes no config at all**:
+  (`output.pyramid` is not in the semantic core, so the pyramid knob does
+  not move the hash; the leaf-shaping `output` keys — `aoi_mask`,
+  `windowing`, `time_source`, `grid.sharded` — and top-level
+  `time_encoding` do.) The **backfill takes no config at all**:
   `backfill_columns(store_root, manifest, by_shard, ...)` derives its plan
   from the manifest (`plan = manifest_column_plan(manifest)`, then
   `column_structure(plan.fields, ...)`) and consults no semantic hash, and the

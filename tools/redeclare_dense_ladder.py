@@ -25,8 +25,10 @@ block and on a declared-off block is pinned by
 ``tests/test_sweep_overview.py::TestDeclarePyramid`` (the two live-store-shape
 tests). ``--overviews N`` injects ``output.pyramid.overviews: N`` into the
 loaded config, which is exactly the retrofit edit ``declare_pyramid``'s
-semantic guard blesses: ``output.*`` is not in the semantic core, so the
-original config plus the pyramid knob hashes identically. The config must be
+semantic guard blesses: ``output.pyramid`` is not in the semantic core, so the
+original config plus the pyramid knob hashes identically (the leaf-shaping
+``output`` keys — ``aoi_mask``, ``windowing``, ``time_source``,
+``grid.sharded`` — do move it). The config must be
 the store's ORIGINAL build config — for both live stores the parent_order-9 /
 delta-4096 configs recovered from their run records and committed under
 ``data/store_configs/`` (the semantic guard refuses the repo's delta-8192
