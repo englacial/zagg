@@ -82,6 +82,7 @@ class _FakeResponse:
         self.status_code = status_code
         self.headers = {} if content_type is None else {"Content-Type": content_type}
         self.text = json.dumps(doc) if text is None else text
+        self.content = self.text.encode()
 
     def json(self):
         if self._doc is None:
@@ -283,6 +284,16 @@ class TestPageSearch:
             _page_search("https://cmr/search", params={})
         assert "x" * sources._BODY_SNIPPET in str(excinfo.value)
         assert "x" * (sources._BODY_SNIPPET + 1) not in str(excinfo.value)
+
+    def test_exhausted_non_json_raise_bounds_the_body_in_bytes(self, fake_requests, monkeypatch):
+        # The snippet is sliced off resp.content: "e" with an acute accent is
+        # two UTF-8 bytes, so a resp.text slice would echo 400 bytes, not 200.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake_requests([_non_json(text="é" * 5000)] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError) as excinfo:
+            _page_search("https://cmr/search", params={})
+        head = "é".encode() * (sources._BODY_SNIPPET // 2)
+        assert f"body[:{sources._BODY_SNIPPET}]={head!r}" in str(excinfo.value)
 
     def test_gateway_error_after_non_json_still_raises_its_status(self, fake_requests, monkeypatch):
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
