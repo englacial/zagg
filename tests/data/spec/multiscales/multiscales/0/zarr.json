@@ -1,0 +1,18 @@
+{
+ "zarr_format": 3,
+ "node_type": "group",
+ "attributes": {
+  "zagg_multiscales_level": {
+   "spec": "zagg-multiscales/1",
+   "order": 0,
+   "cells": [
+    1
+   ],
+   "artifact": "overview",
+   "window": "all",
+   "members": {
+    "-3": "-3/all.zarr/1"
+   }
+  }
+ }
+}

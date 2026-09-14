@@ -30,3 +30,29 @@ else
     HATCH_VCS_PRETEND_VERSION="0.0.0+binder" \
         python -m pip install --no-cache-dir ".[analysis,catalog,viz]"
 fi
+
+# The reader-only demos (notebooks/hhdc_viewer.ipynb, notebooks/waveform_viewer.ipynb)
+# call no zagg PUBLIC API, so their runtime is NOT a zagg extra -- each notebook
+# carries its own `%pip install` line and stays runnable outside Binder. They are not
+# zagg-free, though: moczarr imports the t-digest algebra from zagg rather than
+# vendoring it, and that is exactly what their `moczarr[zagg]` extra carries.
+#
+# NOTE that extra resolves `zagg>=0.40`, while the tag-less fallback below installs
+# this checkout as `0.0.0+binder`, which does not satisfy it. On a Binder build where
+# no tag is reachable, the notebooks' own `%pip install` will therefore quietly fetch
+# a RELEASED zagg from PyPI and install it over the checkout, in the image's shared
+# site-packages -- so the branch under review stops being what is exercised, silently
+# (`-q`). The `git fetch --tags` above is what normally keeps that from happening.
+#
+# One of those packages must be in the IMAGE rather than installed
+# from a cell, because it ships a Jupyter frontend extension a running kernel cannot
+# pick up: ipympl, the `%matplotlib widget` backend hhdc_viewer's rotatable 3-D view
+# needs. ipywidgets -- the sliders and dropdowns both use -- is NOT named here: it
+# already arrives with the `viz` extra above, because ipyleaflet requires
+# `ipywidgets<9,>=7.6.0`. Naming it again would resolve only the requested set,
+# ignoring that installed cap; the day ipywidgets 9 ships, pip would upgrade past
+# ipyleaflet's ceiling, print a dependency-conflict warning and exit 0 -- which
+# `set -euo pipefail` cannot catch -- leaving a green build with a broken map.
+# moczarr itself is pure Python, so the notebooks' own `%pip install` covers it
+# either way.
+python -m pip install --no-cache-dir ipympl

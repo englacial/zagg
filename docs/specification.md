@@ -20,6 +20,45 @@ coverage-MOC serializations, and the rank-space deinterleave. This page owns
 the **array-level** contracts inside a leaf; it cites mortie's page for path
 and word semantics and never restates them.
 
+**Latitude convention of the words** (*informative* — see
+[Normative language](#normative-language) below; issue
+[#549](https://github.com/englacial/zagg/issues/549)): the packed words are
+produced by mortie's geodetic ingress (`geo2mort`) under **mortie's default
+latitude convention** — zagg passes no `latitude=` override anywhere
+(`zagg.grids.healpix.HealpixGrid.assign`). That default is `authalic-wgs84`
+(geodetic latitude converted to authalic before the spherical HEALPix
+mapping, mortie spec §9) from mortie 0.9.8 on
+([espg/mortie#186](https://github.com/espg/mortie/issues/186), on PyPI
+2026-08-16); earlier mortie encoded `geodetic-spherical`. The convention a
+store carries is therefore mortie's default *at write time*, not a property
+zagg declares: zagg ≥ 0.45.0 floors mortie at ≥ 0.9.8 (issue
+[#438](https://github.com/englacial/zagg/issues/438)), so any environment
+that resolved those declared dependencies encodes authalic — but on the
+fleet mortie comes from the separately built Lambda layer, not from the
+function zip, so a worker whose layer predates the bump would write
+`geodetic-spherical`, and nothing in the store records which. The
+**published o9 stores are authalic-wgs84** on stronger, artifact-level
+evidence: they were written by zagg 0.52.0, whose temporal encode path runs
+`from mortie import TOC_MAX_NS` (a name mortie exports only from 0.9.10
+on), so a worker on a stale layer raises there instead of writing. The two
+conventions are
+non-corresponding partitions of the sphere (mortie spec §9): the offset
+peaks near 45° latitude at 0.12830° (~14.26 km), so a cover or store built
+under one convention does not describe cells under the other, and composing
+them is meaningless (mortie spec §9 is where the prohibition binds). The
+`dggs` attrs block
+(`zagg.grids.healpix.HealpixGrid._dggs_attrs`) does not yet stamp mortie's
+`latitude` token; what it does stamp is `ellipsoid: {name: WGS84,
+semimajor_axis: 6378137.0, inverse_flattening: 298.257223563}` and no sphere
+radius — that entry is the **ingress datum** (the geodetic coordinates fed
+to `geo2mort`, equal-area on that ellipsoid by construction), not an
+instruction to compute cell geometry on the ellipsoid: the words themselves
+live on the R = 6371.0088 km authalic sphere the conversion maps onto.
+Until the token lands, this paragraph is the record for zagg stores, and a
+reader reproducing cell geometry (e.g. a viewer's boundary golden test)
+needs the geodetic ↔ authalic conversion at every geodetic seam, exactly as
+mortie spec §9 prescribes.
+
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
 [`design/sparse_coverage.md`](design/sparse_coverage.md) (the D/O-numbered
@@ -714,6 +753,82 @@ regionally heterogeneous resolution).
   MUST tolerate the key's absence (a `"leaves"` level, or a pre-#376
   artifact) and MUST NOT read absence as `missing: 0`.
 
+  **`demotions` records the `packed` guard rail firing at this node**
+  ([#518](https://github.com/englacial/zagg/issues/518)) — present exactly
+  when the fold that **last wrote this artifact** demoted a `packed`-class
+  field, on **both** attrs revisions (`zagg-overview/1` and `/2`, §4.4):
+
+  ```json
+  "demotions": [
+    {"field": "composition", "class": "packed", "reason": "word-missing",
+     "contributors": 1, "of": "h_tdigest_signal", "cells": 4}
+  ]
+  ```
+
+  One record per `(field, reason)`, sorted by that pair. `reason` is one of:
+
+  - `"word-missing"` — a contributor carried the field's §3.3 **divisor**
+    digest but not the word. The fold blanks the output cells that
+    contributor's rows reach to the fill word (`cells` counts them):
+    publishing the surviving siblings' word over an `N_signal` that counts
+    rows the word never covered would be a §3.3 skew — absence over
+    wrongness;
+  - `"divisor-missing"` — a contributor carried the **word** but not its
+    `of` digest, so it contributes nothing for the field (the fold's `n`
+    inputs are that digest's per-cell weights and are never guessed). This
+    is the shape a **mis-declared divisor** leaves at every level above the
+    leaves: a manifest naming an `of` whose own entry is `class: "none"`
+    (§4.5 — manifests outlive their writer) materializes no divisor array
+    in any overview or column, so every contributor fires this arm and the
+    field silently never folds upward.
+
+  On `zagg-overview/2` the record survives only a level that materializes.
+  The stage fold counts a contributor the rail fired on as `unreadable`, and
+  a level where **no** contributor folded cleanly is not written at all — so
+  the mis-declared-divisor shape above, which fires on *every* contributor,
+  leaves no artifact and therefore no `demotions`. A reader MUST NOT read the
+  key's absence at a `/2` level as evidence the rail did not fire there; the
+  absent level is the evidence. The `/1` fold paths do not share this: a
+  demoted contributor is still a counted leaf (or child), so the level
+  materializes and carries the record.
+
+  `field`/`class`/`reason`/`contributors` are always present. A
+  **contributor** is one *source read* the fold performed: a `(child,
+  window)` staged column on a `/2` merge (so one child missing a half in `W`
+  windows counts `W`), a `(leaf, window)` column read on a `/1` fold from
+  leaves, and one child overview on a `/1` cascade. `contributors` counts the
+  ones this `(field, reason)` fired on, in that unit. `of` names
+  the §3.3 linkage; `cells` is keyed whenever the demotion left output cells
+  at the fill word that no surviving contributor covers — always in the
+  `word-missing` direction, and in the `divisor-missing` direction only where
+  contributors own **disjoint** spans of the level (the `/1` cascade of child
+  overviews, where a child skipped for the field leaves its whole span fill).
+  Where many contributors share each output cell — a `/1` fold from leaves, a
+  `/2` stage merge — a dropped contributor blanks nothing and the key is
+  absent. A reader MUST NOT read its absence as "nothing was blanked".
+  Readers MUST tolerate additional keys, MUST tolerate the key's absence (a
+  clean fold, or any pre-#518 artifact — a clean fold's attrs are
+  byte-identical to a pre-#518 writer's), and MUST NOT read absence as "no
+  demotion ever occurred" on a pre-#518 store. The record is the per-field
+  refinement of `source_children`: those counters say a whole contributor
+  was unusable, this key says **which field** folded short and **why**. The
+  two counters are **not in the same unit** and MUST NOT be compared:
+  `source_children` counts **children**, classifying each child once however
+  many windows it contributed, while `contributors` counts the per-read
+  instances defined above — they coincide only in the single-window,
+  one-read-per-child case. A
+  demoted field's cells hold the fill value, which §3.2 makes
+  byte-indistinguishable from genuine emptiness, so the attrs are the only
+  place the distinction can live. Like `fields`, `source_children` and
+  `fold_from_order` beside it, a `demotions` state is **as current as the
+  artifact's own write** and never a live claim about the manifest in force:
+  the skip-if-current gates key on generations and regime, not on the field
+  declarations, so after a manifest edit (the mis-declared `of` being
+  introduced or corrected — §4.5, manifests outlive their writer) a level
+  whose bytes have not changed stays current carrying the previous fold's
+  answer. The `demoted/` conformance fixture (§7) commits one fired and one
+  clean level.
+
 An overview also carries the standard D4 **commit stamp** as its final
 write: an unstamped overview prefix is debris, exactly as for leaves.
 Write order is pinned — template, arrays, `role`/provenance attrs, stamp
@@ -782,7 +897,9 @@ to the append-later cascade regime), and `source_children` (present in both
 stage regimes: a gather that under-covers says so exactly like a merge) —
 plus `run_id`, the sweep run that wrote the artifact, and a `generation`
 block summing the consumed children (the stage skip gate's ratchet key —
-`{n_leaves, max_leaf_timestamp, run_ids}`, composition in §4.5).
+`{n_leaves, max_leaf_timestamp, run_ids}`, composition in §4.5). §4.3's
+`demotions` key rides `/2` artifacts unchanged (same grammar, same
+present-exactly-when-fired rule).
 The commit stamp of a stage-written artifact carries the same `run_id` key
 (additive to the stamp grammar; fleet-written stamps never carry it, and a
 reader treats its absence as "not a stage artifact", never an error): it is
@@ -1141,9 +1258,41 @@ manifest. A run whose declaration carries no leaf-node levels **deletes** any
 column and sidecar a previous declaration left at that `(leaf, window)`, so a
 column never outlives the declaration that wrote it.
 Like overviews, columns are derived artifacts a reader MUST NOT require;
-unlike overviews they are **not** regenerated by a sweep — the single writer
-of a column is its leaf's worker, ever (no locking anywhere), and repair is
-re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
+unlike overviews they are **not** regenerated by a rollup sweep — the writer
+of a column is its leaf's worker (no locking anywhere), and repair is
+re-invoking the idempotent leaf, never a sweep-side fold from raw cells
+during a rollup pass.
+
+The **one** sanctioned second writer is the `/1 -> /2` **column backfill**
+([#520](https://github.com/englacial/zagg/issues/520)): an explicit upgrade
+pass that recomputes a committed leaf's column from that leaf's own **stored
+arrays**, for stores built before their fields were declared composable —
+which is what lets a published store take the `/2` staged sweep without
+re-aggregation. It writes the same artifact under the same discipline, so it
+inherits the single-writer law rather than repealing it, under two conditions
+a reader MAY assume of any store:
+
+- it is serialized against every other sweep by the §4.8 admission lease,
+  held for the whole pass and heartbeated on the **wall clock** (a beat lands
+  within a fixed fraction of `ttl_s` of the last one, however long a single
+  leaf takes). §4.8's expiry rule is the residual and is not repealed here: a
+  holder that stalls past its `ttl_s` without beating is claimable like any
+  other, so what a reader MAY assume is the lease's guarantee, not a stronger
+  one; and
+- it MUST NOT run while an aggregation run may write the same
+  `(leaf, window)`. This is the one pass for which §4.8's fleet ∥ sweep
+  disjointness does not hold, and no control-plane object can enforce it: it
+  is an operator precondition, and running a backfill against a live fleet
+  risks a chimera column exactly as two concurrent sweeps would.
+
+The backfill changes no byte of this format. A backfilled column is
+byte-identical to the one the leaf's worker would have written from the same
+leaf — the two provenance timestamps (`zagg_column.generated_at` and the
+stamp's `written_at`) aside — and it is written only where the manifest's own
+`/2` declaration (§4.5) carries leaf-node levels **and** at least one
+composable field; a store still declaring `/1`, declared off, or `class:
+"none"` on every field is refused and MUST be re-declared first, never
+guessed at.
 
 - **Naming.** One column per `(node, window)`, and its basename MUST be
   `{window stem}.pyramid.zarr` — the stem derived from the D23 **window
@@ -1266,13 +1415,27 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   the stamp, fail-open: absence reads unverifiable, never tampered.
 - **Failure identity.** A column-write failure fails the worker unit; the
   retry rewrites leaf and column wholesale. A committed leaf whose column
-  is absent or unstamped therefore reads as **either** a torn worker
-  **or** a leaf whose writing declaration carried no column (the gate and
-  the clear above) — and the manifest cannot always separate the two,
-  since its `pyramid` block MAY lag. Readers never require a column, so
-  absence is never an error state; where the **writing** declaration is
-  known to carry leaf-node levels, absence is the torn-worker signature
-  and the repair is re-invoking the idempotent leaf.
+  is absent or unstamped therefore reads as **one of three** things: a torn
+  worker; a leaf whose writing declaration carried no column (the gate and
+  the clear above); or — since the backfill sanctioned above — a leaf that
+  a `/1 -> /2` upgrade pass has not reached, or failed on. The manifest
+  cannot always separate them, since its `pyramid` block MAY lag, and after
+  a re-declaration it necessarily leads the leaves. Readers never require a
+  column, so absence is never an error state; the three differ only in
+  their **repair**:
+  - where the **writing** declaration is known to carry leaf-node levels,
+    absence is the torn-worker signature and the repair is re-invoking the
+    idempotent leaf;
+  - where the leaf-node levels arrived by RE-DECLARATION — the `/1 -> /2`
+    upgrade, whose whole point is that the leaf is not rewritten — absence
+    is the backfill's signature instead, and the repair is re-running the
+    idempotent backfill. Re-invoking the leaf would re-aggregate from
+    source granules, the one cost the upgrade exists to avoid;
+  - and a leaf that predates any column declaration needs no repair at all.
+
+  A backfill counts a leaf it cannot read or fold and carries on, so a
+  partially-completed pass leaves exactly this state on the store; what
+  distinguishes it is the pass's own summary (`failed`), not the artifacts.
 
 **Stage columns (issue #384).** The staged sweep writes the SAME artifact
 shape at its dispatch nodes (`{window}.pyramid.zarr` under an ancestor
@@ -1343,6 +1506,221 @@ written after the run started aborts loudly). The same `run_id` is a **term
 of the skip key** (§4.5): the abort covers a foreign stamp written *since
 this run started*, and the key covers the foreign rewrite that landed
 before it — inside the second the timestamp cannot resolve.
+
+### 4.9 The `multiscales` discovery mirror (`zagg-multiscales/1`)
+
+**Status: contract — issue
+[#392](https://github.com/englacial/zagg/issues/392) (espg re-scope ruling
+2026-09-10: zagg-native convention metadata only).** A `zagg-pyramid/2`
+store is inherently a multiresolution grid (§4 intro), but that identity is
+discoverable only through §4.5's own grammar. The manifest therefore ALSO
+carries a **machine-readable convention declaration** of the ladder — the
+OME/zarr-style multiscales attr grammar adapted to the node-tree reality —
+so a reader discovers the whole ladder from **one metadata read**
+(`morton_hive.json`).
+
+**Contract.** The manifest key `multiscales` (a top-level sibling of
+`pyramid`) is present **exactly when** the manifest's `pyramid` block
+declares `zagg-pyramid/2`: a `/1`, declared-off, or pre-pyramid manifest
+carries no `multiscales` key, and its absence means *pre-convention (or
+single-resolution) store* — never an error, and no `spec` marker bump
+anywhere. The value is a **list of one** multiscale object (the OME-style
+shape: one declared product, one entry):
+
+```json
+"multiscales": [
+  {
+    "spec": "zagg-multiscales/1",
+    "name": "SPEC_FIXTURE",
+    "base": {"order": 3, "cells": [6]},
+    "datasets": [
+      {"order": 3, "cells": [5, 4], "artifact": "column"},
+      {"order": 2, "cells": [3], "artifact": "overview"},
+      {"order": 1, "cells": [2], "artifact": "overview"},
+      {"order": 0, "cells": [1], "artifact": "overview"}
+    ],
+    "order2res": {"3": [5, 4], "2": [3], "1": [2], "0": [1]},
+    "fields": {"count": "exact", "h_min": "exact",
+               "h_tdigest": "approximate", "h_mean": "none"},
+    "fold": {"fold_source": "cascade", "exact_levels": 1}
+  }
+]
+```
+
+- **`spec`** — the revision marker; conformance rule as everywhere
+  (strict-check, fail loudly on an unknown revision).
+- **`name`** — the manifest's `dataset.short_name` (`null` when the
+  manifest records none): identity, not grammar.
+- **`datasets`** — one entry per §4.4 level entry, **finest first**, in the
+  recorded `pyramid.overviews` order: `order` and `cells` are copied
+  **verbatim** from the level entry (`cells` keeps §4.5's vocabulary — the
+  reader-facing cell resolutions stored at that node order), and
+  `artifact` names the kind that carries the level — `"column"` for the
+  leaf entry (`node == shard_order`, the §4.6 per-leaf
+  `{window}.pyramid.zarr`), `"overview"` for every ladder entry (the §4.1
+  ancestor-node `{window}.zarr`). Artifact *paths* are not recorded here:
+  node addressing stays the manifest + mortie hive-path grammar, and
+  declared-but-unmaterialized remains legal (§4.5), so a path list would
+  claim presence this block cannot promise.
+- **`order2res`** — the flat per-order lookup `{str(order): cells}` (JSON
+  has no integer keys): the cell resolutions of the **pyramid levels** at
+  order k, whose key set is exactly the orders present. It is a projection
+  of `datasets` and MUST agree with it entry for entry. It does **not**
+  carry the base's native `cells`: those ride in `base` alone, which shares
+  the shard order's key (in the example above, `order2res["3"]` is
+  `[5, 4]` while `base` adds 6 at that same order 3). So the resolutions
+  readable at order k are `order2res[str(k)]` **unioned with**
+  `base["cells"]` when `k == base["order"]` — a reader assembling a
+  complete per-order map MUST union the base in, never overwrite the entry
+  with it.
+- **`base`** — the native source data (`{"order": shard_order, "cells":
+  [cell_order]}`): the finest rung of the resolution ladder a reader picks
+  from, deliberately **not** a `datasets` entry — it is not a pyramid level
+  (§4.5: a member at the base data's own order would *be* the base data).
+- **`fields`** — `{name: class}` projected from the §4.5 D24 map: the
+  zero-open composability answer (which fields exist at every ladder order,
+  which are exact there, which exist only at native resolution). The class
+  tokens and their meaning are §4.5's; the accuracy contract per class is
+  §4.4's doctrine.
+- **`fold`** — the declared fold provenance: `fold_source` always, and
+  `exact_levels` exactly when the `pyramid` family dict declares it (§4.5's
+  presence rule — the deprecated `leaves` regime records no boundary).
+
+**Derivation and precedence.** The mirror is **derived, never
+authoritative**: zagg computes it from the `pyramid` block in the same
+write that installs that block (`hive.build_manifest` at template time;
+`declare_pyramid` on retrofit, which also installs the mirror on an
+already-`/2` store whose declaration predates this section, and removes it
+when a retrofit leaves `/2`). On ANY disagreement between this block and
+the `pyramid` block, **the `pyramid` block wins** — a reader that consumes
+the mirror MAY cross-check it against `pyramid.overviews` and MUST resolve
+a conflict in the `pyramid` block's favor. Sweep actuals never enter the
+mirror: materialization truth stays in §4.5's `actuals`/`materialized`
+bookkeeping and §4.3's per-artifact attrs. A reader MUST tolerate
+additional keys on the multiscale object and on its entries (additive
+grammar, same rule as §4.5).
+
+### 4.10 The multiscales companion group
+
+**Status: contract — issue
+[#394](https://github.com/englacial/zagg/issues/394) (espg re-scope ruling
+2026-09-10: zagg-native, references only — never data copies).** The §4.9
+mirror makes the ladder *discoverable*; the **companion group** makes it
+*walkable by stock zarr tooling*: one literal zarr v3 group hierarchy at
+the reserved store-root path **`multiscales/`**, mirroring the **coarse
+ladder** — one child group per §4.4 ladder order, `shard_order - 1` down
+to 0 — that a plain zarr reader opens with zero custom code. It holds
+**metadata only**: group documents and attrs. No arrays and no data bytes
+— every entry *references* node artifacts by store-root-relative path.
+
+**Contract.**
+
+- **Layout.** `multiscales/zarr.json` is a zarr v3 group document whose
+  `attributes` carry the §4.9 `multiscales` list (derived fresh from the
+  manifest's `pyramid` block at write time — the block wins over any
+  recorded copy, §4.9) plus the `zagg_multiscales` provenance stamp, and
+  whose `consolidated_metadata` block (`kind: "inline"`, `must_understand:
+  false`) inlines every child group document identically **as JSON** — the
+  inlined copy and the standalone `multiscales/{order}/zarr.json` decode to
+  equal documents, not to equal bytes (the nested copy is indented deeper),
+  so one GET of that object walks the whole tree. Each ladder order additionally has
+  its own `multiscales/{order}/zarr.json` group document, so
+  non-consolidated walkers work too. Write order is child documents first,
+  the root document LAST — the root doc is the commit marker; a prefix
+  without it is debris.
+- **The root stamp** —
+
+  ```json
+  "zagg_multiscales": {
+    "spec": "zagg-multiscales/1",
+    "window": "all",
+    "members_source": "coverage.moc",
+    "generated_at": "2026-09-11T00:00:00+00:00",
+    "members_generated_at": "2026-09-10T23:12:04+00:00"
+  }
+  ```
+
+  `window` is the §4.2 window token the member references resolve —
+  **`"all"` only in this revision**: the companion mirrors the all-time
+  fold (per-window mirrors are a declared non-goal of `/1`, issue #394
+  decision (2)). `members_source` records where the member node set came
+  from: `"coverage.moc"` (the root MOC, one GET) or `"run-records"` (the
+  D22 discovery fallback). `generated_at` is when the companion was
+  WRITTEN; `members_generated_at` is the age of the INPUT the member sets
+  were derived from — the root MOC envelope's own `generated_at`, present
+  exactly when `members_source` is `"coverage.moc"` and that envelope
+  carries the field. The two together are the staleness discriminator (see
+  below). A reader MUST tolerate its absence (a `"run-records"` companion,
+  or a MOC that carries no stamp).
+- **Per-order groups** — the child group named `str(order)` carries
+
+  ```json
+  "zagg_multiscales_level": {
+    "spec": "zagg-multiscales/1",
+    "order": 2, "cells": [3], "artifact": "overview", "window": "all",
+    "members": {"-311": "-3/1/1/all.zarr/3"}
+  }
+  ```
+
+  `order`/`cells`/`artifact` are the §4.9 dataset entry verbatim;
+  `members` maps each **node decimal** the ladder owns at this order —
+  the order-`k` ancestors of the store's occupied shards — to the
+  **store-root-relative path of that node's resolution group**:
+  `{hive_path(node)}/all.zarr/{cells[0]}` (path grammar: mortie's
+  hive-path convention; a ladder entry has exactly one member resolution,
+  §4.4). The leaf entry and the native resolution are deliberately **not**
+  mirrored: their artifact count is the shard count, which is exactly the
+  scale the hive grammar exists to handle — the companion is the coarse,
+  cap-bounded tier (issue #394 decision (1)); both remain declared in the
+  root attrs' §4.9 list.
+- **References claim ownership, never presence.** A member names where the
+  node's overview artifact lives **when materialized**; overviews are
+  regenerable caches (§4.1) and declared-but-unswept is legal (§4.5), so a
+  reader following a member path MUST treat an absent or unstamped
+  artifact as "not materialized", never as a broken store. An empty
+  `members` map (a declared-but-unoccupied store) is likewise legal.
+- **Presence and gating.** The companion is written for a `/2` store whose
+  all-time fold exists by declaration: an unwindowed store always (its
+  single fold IS all-time, §4.2), a windowed store only when
+  `pyramid.overview.all_time` is true. Absence of the whole group is
+  always legal (a pre-convention store, or a gated windowed store). The
+  name `multiscales` is **reserved** at the store root: it is excluded
+  from the D19 product-name grammar (like the base-component exclusion) so
+  a multi-product root walker can never classify it as a product. The
+  reservation is retroactive on a store predating it that holds a product
+  literally named `multiscales`: that product is no longer discoverable or
+  addressable and MUST be renamed — but the exclusion is **reported, not
+  silent** (a product carries a `morton_hive.json` at its root and the
+  companion group never does, so discovery discriminates the two and warns
+  on the collision).
+- **Writers.** The staged sweep's designated finisher refreshes the
+  companion after its manifest RMW, gated on the run having touched shards
+  and **fail-open** (the finisher's load-bearing steps never fail on it);
+  `python -m zagg.sweep <root> --write-multiscales` writes/refreshes it
+  standalone. Single-writer discipline is inherited from the finisher's
+  own (§4.8: one finisher per admitted run).
+- **Removal.** A store that stops declaring `/2` MUST NOT keep a readable
+  companion: the group asserts the ladder *without* consulting the
+  manifest, so the §4.9 precedence rule has no reader to apply. The same
+  write that drops the §4.9 mirror (`declare_pyramid`, on a retrofit that
+  leaves `/2`) therefore deletes `multiscales/zarr.json` — the commit
+  marker, so removing it alone un-commits the tree and any surviving child
+  prefix is debris a later companion write overwrites. The delete is
+  best-effort (the manifest is truth and is already written); a failure is
+  logged, not unwound.
+- **Normativity and staleness.** The manifest + hive remain truth; the
+  companion is a **recorded mirror** (D9 cache class): regenerable at any
+  time, self-healing on the sweep ratchet (the finisher rewrites it each
+  admitted run), and stale-detectable — but the test is
+  `members_generated_at`, not `generated_at`: the write-time stamp only
+  says when the mirror was last rewritten, so a companion derived from a
+  stale root MOC carries a *fresh* `generated_at`. A
+  `members_generated_at` older than the manifest's pyramid declaration or
+  the newest §4.5 `actuals` means the member sets may lag store truth; its
+  absence means the input age is unknown and the member sets carry no
+  freshness proof at all. On any disagreement the manifest wins,
+  exactly as §4.9. A reader MUST tolerate additional keys in both attrs
+  blocks.
 
 ## 5. O11 content hashes
 
@@ -1576,11 +1954,12 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-Six tiny single-shard hive stores plus one manifest-only declaration, all
-on the same deliberately small geometry — shard order 4, inner-chunk order
-5, cell order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the
-hive default; `raster_toc/` is the one exception — a `(time, cells)`
-product is never sharded, §8/#247):
+Seven tiny single-shard hive stores plus two metadata-only ones (the
+`pyramid/` declaration and the `multiscales/` companion), all on the same
+deliberately small geometry — shard order 4, inner-chunk order 5, cell
+order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
+default; `raster_toc/` is the one exception — a `(time, cells)` product is
+never sharded, §8/#247):
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
@@ -1612,7 +1991,10 @@ product is never sharded, §8/#247):
   derived from. It writes no store beneath it on purpose: the pyramid block
   is a template-time manifest artifact, decodable from `morton_hive.json`
   alone — the `/2` artifacts a fleet writes are `column/`'s job below
-  (sweep-side levels are #384's).
+  (sweep-side levels are #384's). The same manifest carries the §4.9
+  `multiscales` discovery mirror the retrofit installs beside a `/2`
+  block; `column/`, committed before §4.9 and unregenerated, is the
+  absent-key ⇒ pre-convention pin.
 - **`column/`** — the `minimal/` inputs plus an explicit
   `output.pyramid.overviews: 5` knob, so the same worker invocation that
   committed the leaf also wrote its §4.6 **column**: `all.pyramid.zarr`
@@ -1632,6 +2014,16 @@ product is never sharded, §8/#247):
   arrives with the sweep-side fixtures of
   [#384](https://github.com/englacial/zagg/issues/384).
 
+- **`multiscales/`** — the §4.10 companion-group surface: METADATA ONLY —
+  a `zagg-pyramid/2` manifest on `pyramid/`'s grid, a production root
+  `coverage.moc` naming two occupied order-3 shards, and the companion
+  tree at the reserved root path `multiscales/`: a consolidated root
+  group document (the §4.9 mirror + the `zagg_multiscales` stamp) plus
+  one child group per coarse ladder order, each mapping the order's
+  ancestor nodes to store-root-relative resolution-group paths. No
+  arrays, no leaves, no overview artifacts — the committed golden pins
+  that §4.10 references claim ownership, never presence, and that the
+  tree opens with stock zarr alone.
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
   `(time, cells)` hive leaf whose `time` coordinate is `uint64` toc words
   carrying `temporal: {"spec": "zagg-toc/1", "shape": "coordinate", …}` and no CF
@@ -1689,7 +2081,7 @@ product is never sharded, §8/#247):
   word it fed the writer, so the writer is pinned rather than self-certified),
   the decoded digest rows read back — the same exception `column/`'s group
   values are — and `obs_total`, the cell plan's own observation count, which
-  §10.3's weight rule says the digest's total weight MUST equal. The other six
+  §10.3's weight rule says the digest's total weight MUST equal. The other
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
   trees are byte-identical to their pre-§10 selves — which is exactly §10's
@@ -1704,8 +2096,22 @@ product is never sharded, §8/#247):
   clocked whole buckets past the rest of the plan, so the cover is a
   MULTI-word set with a real hole in it: a reader that quantized every word
   into one bucket would satisfy the parity and containment claims and fail
-  `gap_ns`. The other six fixtures carry no `coverage.toc` either, the §10.5
+  `gap_ns`. The other fixtures carry no `coverage.toc` either, the §10.5
   absence pin.
+
+- **`demoted/`** — the §4.3 `demotions` surface
+  ([#518](https://github.com/englacial/zagg/issues/518)): the
+  `kitchen_sink/` store swept under a hand-installed `/1` cascade manifest
+  whose composition `of` divisor is **mis-declared** `class: "none"` (§4.5:
+  manifests outlive their writer). Two committed overviews pin the pair of
+  readings: the exact-from-leaves level folds `composition` cleanly (the
+  leaf arrays carry the divisor regardless of its declared class) and
+  carries **no** `demotions` key — the absence pin — while the cascaded
+  level above it fires `divisor-missing` on its one contributor, holds the
+  all-fill word slab, and records the demotion — `cells: 4`, the skipped
+  child's whole disjoint span of the 16-cell level — in its `zagg_overview`
+  attrs. `demoted.expected.json` records both levels' paths, fold sources
+  and the demotions list beside the leaf record.
 
 `minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
@@ -2759,6 +3165,6 @@ decoded word set — derived from the generator's inputs through the
 quantization law above, never transcribed — plus the parity claim on
 committed bytes, the required keys above, and the `gap_ns` interval the
 fixture's two clusters leave uncovered, which is what makes the object a
-test of the never-bridge law rather than of a single bucket. The other six fixtures carry no `coverage.toc` at all,
+test of the never-bridge law rather than of a single bucket. The other fixtures carry no `coverage.toc` at all,
 which pins the absence rule as bytes, exactly as §10's section absence is
 pinned.

@@ -73,7 +73,7 @@ array. See ``zagg/configs/atl03_tdigest_located_healpix.yaml``.
 Adding ``temporal: per-centroid`` (spec §8.3, issue #410) passes the cell's
 per-observation toc words as ``temporal=`` and adds a third element to the
 returned tuple: the ``(k,)`` uint64 per-centroid **temporal envelope** — the
-grammar's semilattice join (``mortie.tocs_reduce``) over each centroid's
+grammar's semilattice join (``mortie.toc_reduce``) over each centroid's
 members' words, an exact nanosecond timestamp for a 1-observation centroid and
 a conservative range otherwise. The two companion channels are independent and
 either may be declared alone; when both are, the returned tuple is
@@ -300,7 +300,7 @@ def batched_companion_folds():
     """Defer the per-centroid companion folds; run each once per channel at exit.
 
     The issue #476 hoist: at CA shard shape the per-cell loop makes ~46k
-    segmented ``mortie.tocs_reduce`` calls (one per populated cell-field) whose
+    segmented ``mortie.toc_reduce`` calls (one per populated cell-field) whose
     cost is Python/FFI dispatch, not reduction — under this context they
     collapse to one call per channel per chunk, byte-identically (see
     :class:`_CompanionBatch`).  Activated by ``_aggregate_chunk_cells`` around
@@ -370,7 +370,7 @@ def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.
     ``temporal`` is member-ordered (aligned with the sorted values / combined
     centroids), ``starts`` the first member index of each centroid.  Each
     centroid's word is the grammar's semilattice join over its members' words
-    (``mortie.tocs_reduce``, the segmented ``toc_merge`` reduce,
+    (``mortie.toc_reduce``, the segmented ``toc_merge`` reduce,
     espg/mortie#177): the conservative envelope containing every observation the
     centroid summarizes.  A single-member centroid returns that member's word
     unchanged, so a 1-observation centroid round-trips its exact nanosecond
@@ -388,7 +388,7 @@ def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.
     exactness does not lift the field's composability class (spec §2.3/§8.3).
 
     Unlike :func:`_centroid_ancestors` there is no per-centroid Python loop:
-    ``starts`` is already the arrow offsets layout ``tocs_reduce`` takes, so the
+    ``starts`` is already the arrow offsets layout ``toc_reduce`` takes, so the
     whole partition crosses into Rust once.  ``_compress`` never emits an empty
     run, which is what the segmented reduce refuses (the join has no identity).
     The reserved-``0`` refusal lives in :func:`_check_words`, which every caller
@@ -396,19 +396,19 @@ def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.
     straight back without reducing it.
 
     Under :func:`batched_companion_folds` the call defers instead (issue
-    #476): one ``tocs_reduce`` then crosses into Rust per batch rather than
+    #476): one ``toc_reduce`` then crosses into Rust per batch rather than
     per cell-field, byte-identically (the reduce is segmented).
     """
     batch = _FOLD_BATCH.get()
     if batch is not None:
         return batch.defer(_centroid_envelopes, temporal, starts, n)
-    from mortie import tocs_reduce
+    from mortie import toc_reduce
 
     starts = np.asarray(starts, dtype=np.int64)
     offsets = np.empty(len(starts) + 1, dtype=np.int64)
     offsets[:-1] = starts
     offsets[-1] = n
-    return np.asarray(tocs_reduce(temporal, offsets), dtype=np.uint64)
+    return np.asarray(toc_reduce(temporal, offsets=offsets), dtype=np.uint64)
 
 
 def _check_words(words, label: str, shape: tuple) -> np.ndarray:
@@ -426,7 +426,7 @@ def _check_words(words, label: str, shape: tuple) -> np.ndarray:
     because this is the one check every arm runs — including the pass-throughs
     (:func:`merge_tdigests` with an empty side, :func:`merge_tdigests_kway` with
     a single contributor), which return their channels unreduced and so never
-    reach ``common_ancestor`` / ``tocs_reduce``.  A leaked fill would otherwise
+    reach ``common_ancestor`` / ``toc_reduce``.  A leaked fill would otherwise
     be stored for an observed cell, which §8.2 forbids outright.
     """
     arr = np.asarray(words)
@@ -486,7 +486,7 @@ def build_tdigest(
         Per-observation ``uint64`` toc words (spec §8.3, issue #410), aligned
         with ``values`` under the same NaN-drop rule as ``locations``.  When
         given, each centroid also carries a temporal envelope: the grammar's
-        join over its members' words (``mortie.tocs_reduce``), which for a
+        join over its members' words (``mortie.toc_reduce``), which for a
         1-obs centroid is that observation's exact nanosecond timestamp.
 
     Returns

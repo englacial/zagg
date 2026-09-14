@@ -126,5 +126,73 @@
     2
    ]
   }
+ ],
+ "multiscales": [
+  {
+   "spec": "zagg-multiscales/1",
+   "name": "SPEC_FIXTURE",
+   "base": {
+    "order": 3,
+    "cells": [
+     6
+    ]
+   },
+   "datasets": [
+    {
+     "order": 3,
+     "cells": [
+      5,
+      4
+     ],
+     "artifact": "column"
+    },
+    {
+     "order": 2,
+     "cells": [
+      3
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 1,
+     "cells": [
+      2
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 0,
+     "cells": [
+      1
+     ],
+     "artifact": "overview"
+    }
+   ],
+   "order2res": {
+    "3": [
+     5,
+     4
+    ],
+    "2": [
+     3
+    ],
+    "1": [
+     2
+    ],
+    "0": [
+     1
+    ]
+   },
+   "fields": {
+    "count": "exact",
+    "h_tdigest": "approximate",
+    "h_min": "exact",
+    "h_mean": "none"
+   },
+   "fold": {
+    "fold_source": "cascade",
+    "exact_levels": 1
+   }
+  }
  ]
 }

@@ -394,11 +394,11 @@ def _intersect_mortie_serial(records, grid, all_shards, order, footprint="swath"
 
     Kept here rather than in ``shardmap.py`` so exactly one implementation ships,
     while the batch rewire is still pinned against the logic it replaced:
-    ``morton_coverage_moc`` once per ring, ``moc_to_order`` + ``np.unique`` per
+    one ring cover per ring, ``moc_to_order`` + ``np.unique`` per
     ring, a scalar ``in all_shards`` test per cell, and a ``dict.fromkeys`` dedup
     per shard (``shardmap.py:307-340`` at ad8aa30, the merge-base of this PR).
     """
-    from mortie import moc_to_order, morton_coverage_moc
+    from mortie import moc_to_order, polygons_to_morton_mocs
 
     from zagg.catalog.shardmap import _granule_footprints
 
@@ -407,7 +407,11 @@ def _intersect_mortie_serial(records, grid, all_shards, order, footprint="swath"
     for i, rec in enumerate(records):
         for rlats, rlons in _granule_footprints(rec, footprint, product):
             try:
-                moc = np.asarray(morton_coverage_moc(rlats, rlons, order=order))
+                moc = np.asarray(
+                    polygons_to_morton_mocs(
+                        rlats, rlons, np.array([0, len(rlats)], dtype=np.int64), order=order
+                    )[0]
+                )
             except Exception:
                 continue
             if moc.size == 0:
@@ -665,7 +669,7 @@ def _intersect_cells_serial(rows, values, offsets, grid, all_shards):
     """The pre-phase-4 per-granule stored-MOC loop, verbatim -- the parity oracle.
 
     Kept here rather than in ``shardmap.py`` so exactly one implementation
-    ships, while the mortie 0.9.6 batch swap (``mocs_and``/``mocs_to_orders``,
+    ships, while the mortie 0.9.6 batch swap (``moc_and``/``moc_to_order``,
     espg/mortie#173) stays pinned against the scalar logic it replaced:
     ``moc_and`` + ``moc_to_order`` + ``np.unique`` once per record
     (``shardmap.py:293-333`` at a74a4fc9, the phase-3 tip of this PR). The one
@@ -888,7 +892,7 @@ class TestFootprintCells:
 
     def test_batched_cells_equal_the_scalar_loop(self, hp_grid, monkeypatch):
         # Phase 4's parity pin -- the PR 400 measurement comment's in-process
-        # assertion made permanent: mortie 0.9.6's ``mocs_and``/``mocs_to_orders``
+        # assertion made permanent: mortie 0.9.6's ``moc_and``/``moc_to_order``
         # over blocks of records return the exact dict (same keys, same granule
         # lists, same order) as the per-granule scalar loop they replaced. The
         # fixture is California-shaped in miniature: a long overlapping granule
@@ -901,7 +905,7 @@ class TestFootprintCells:
         # across many (ragged-tail) blocks, 24 is the one-block case the shipped
         # ``_CELLS_BATCH_RECORDS = 512`` collapses to at this size. The
         # empty-slot assertion below is load-bearing for what it does pin:
-        # some record must be unassigned, so the ``mocs_intersect`` prefilter
+        # some record must be unassigned, so the ``moc_intersects`` prefilter
         # genuinely drops records here and the survivor blocks are cut at
         # *survivor* counts, not record counts. It does **not** pin the owner
         # mapping -- survivors happen to be a contiguous 0-based prefix at both
@@ -911,14 +915,14 @@ class TestFootprintCells:
         # survivors above record 0; the all-empty and all-hit edges live there
         # too.
         #
-        # Both column orders run, because they hit ``mocs_to_orders``
+        # Both column orders run, because they hit ``moc_to_order``
         # differently. At index 11 == ``parent_order`` it only ever refines
         # (62 hit cells -> 77 shards here), so nothing collapses and the case
         # cannot tell "the dedup works" from "there were never any repeats".
         # Index 13 is the collapsing shape: 294 hit cells -> the same 77
         # shards, ~26 cells onto ~7 per granule. That is what the dropped
         # per-granule ``np.unique`` (``shardmap.py``) used to absorb, and
-        # dropping it is a no-op only because mortie's ``mocs_to_orders``
+        # dropping it is a no-op only because mortie's ``moc_to_order``
         # coarsens-and-dedups on densify and returns sorted -- an upstream
         # guarantee this file is now silently dependent on, so pin it here.
         items = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(24)]
@@ -953,7 +957,7 @@ class TestFootprintCells:
                 assert got == oracle, f"order {index_order} block {block} diverged from scalar"
 
     def test_prefilter_edges_all_empty_all_hit_and_middle_run(self, hp_grid, monkeypatch):
-        # The ``mocs_intersect`` prefilter's three edge shapes, each against
+        # The ``moc_intersects`` prefilter's three edge shapes, each against
         # the scalar oracle and swept across survivor-block boundaries. What
         # has to clear a cell is the *gap* between granules, not the spacing:
         # 0.02-deg-wide footprints every 0.15 deg leave 0.13 deg of empty
@@ -1002,7 +1006,7 @@ class TestFootprintCells:
 
     def test_predicate_overreport_still_returns_empty(self, hp_grid, monkeypatch):
         # The survivor loop's ``flat.size`` guard. mortie documents
-        # ``mocs_intersect`` as exact (``hits[i]`` iff ``mocs_and``'s slot ``i``
+        # ``moc_intersects`` as exact (``hits[i]`` iff ``moc_and``'s slot ``i``
         # would be non-empty), so in a correct stack every survivor block
         # materializes something and the guard never fires. Simulate that
         # contract drifting -- over-report every row as a hit against a
@@ -1028,7 +1032,7 @@ class TestFootprintCells:
         assert shards, "the disjoint AOI must be non-empty, or the empty-AOI gate answers"
         assert _intersect_cells_serial(rows, values, offsets, hp_grid, shards) == {}
         monkeypatch.setattr(
-            mortie, "mocs_intersect", lambda _a, _v, off: np.ones(off.size - 1, bool)
+            mortie, "moc_intersects", lambda _a, _v, offsets: np.ones(offsets.size - 1, bool)
         )
         for block in (1, 4, 6):
             monkeypatch.setattr(shardmap, "_CELLS_BATCH_RECORDS", block)
@@ -1036,10 +1040,20 @@ class TestFootprintCells:
 
     def test_batch_refusal_names_the_record_range(self, hp_grid, monkeypatch):
         # mortie's cell-budget ``ValueError`` names the offending MOC by its
-        # index *within the call*, which blocking makes block-local: an
-        # un-rebased "MOC 2" out of the second block of 5 is a plausible record
-        # index and would send the operator to the wrong granule. The wrapper
-        # must re-base it to the block's record range and chain the original.
+        # index *within the call* ("moc 0: moc_to_order would densify to ...",
+        # mortie 1.0), which blocking makes block-local: an un-rebased "moc 2"
+        # out of the second block of 5 is a plausible record index and would
+        # send the operator to the wrong granule. The wrapper must re-base it to
+        # the block's record range and chain the original.
+        #
+        # The refusal here is mortie's own, not a hand-written string: the
+        # second block is re-run at order 20, which blows the cell budget in
+        # microseconds. That pins the index-bearing shape against the live
+        # kernel, so a mortie release that drops the index fails here rather
+        # than leaving the re-base pointing at nothing. The other two refusal
+        # tests stay synthetic.
+        import re
+
         import mortie
 
         cat = _overlapping_catalog().index_footprints(11)
@@ -1047,19 +1061,21 @@ class TestFootprintCells:
         values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
             cat, hp_grid, "mortie", "swath", None
         )
-        real, calls = mortie.mocs_to_orders, []
+        real, calls = mortie.moc_to_order, []
 
-        def boom(*args, **kwargs):
+        def boom(vals, order, **kwargs):
             calls.append(1)
             if len(calls) == 2:
-                raise ValueError("MOC 2 exceeds max_cells")
-            return real(*args, **kwargs)
+                return real(vals, 20, **kwargs)  # mortie's own budget refusal
+            return real(vals, order, **kwargs)
 
         monkeypatch.setattr(shardmap, "_CELLS_BATCH_RECORDS", 5)
-        monkeypatch.setattr(mortie, "mocs_to_orders", boom)
+        monkeypatch.setattr(mortie, "moc_to_order", boom)
         with pytest.raises(ValueError, match=r"records 5-9") as exc:
             shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, all_shards)
-        assert "MOC 2 exceeds max_cells" in str(exc.value)
+        # mortie's own wording, index and all -- chained, not paraphrased.
+        assert re.search(r"moc \d+: moc_to_order would densify to", str(exc.value))
+        assert "exceeding max_cells=" in str(exc.value)
         assert isinstance(exc.value.__cause__, ValueError)
 
     def test_batch_refusal_range_reads_the_survivor_owners(self, hp_grid, monkeypatch):
@@ -1086,10 +1102,13 @@ class TestFootprintCells:
         got = shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, shards)
         assert {g for v in got.values() for g in v} == {3, 6}, "survivors must be [3, 6]"
 
+        # Synthetic here (the shape mortie really emits is pinned in
+        # ``test_batch_refusal_names_the_record_range``); this test is about
+        # which records the wrapper names, not about mortie's wording.
         def boom(*args, **kwargs):
             raise ValueError("MOC 1 exceeds max_cells")
 
-        monkeypatch.setattr(mortie, "mocs_to_orders", boom)
+        monkeypatch.setattr(mortie, "moc_to_order", boom)
         with pytest.raises(ValueError, match=r"records 3-6") as exc:
             shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, shards)
         assert "2 prefilter survivors" in str(exc.value)
@@ -1555,7 +1574,7 @@ class TestLiveCover:
         assert decoded == [assigned], f"decoded {decoded} rows for {assigned} assigned granules"
 
     def test_multipolygon_is_a_superset_of_the_records_path(self, hp_grid, monkeypatch):
-        # The disclosed divergence, now inherited by the live path: ``from_wkbs``
+        # The disclosed divergence, now inherited by the live path: ``from_wkb``
         # covers the union of the parts inside each blob, where
         # ``granule_records`` reads the largest part's exterior ring only. So a
         # multi-part footprint assigns to shards the pre-#445 build never saw --
@@ -1608,10 +1627,13 @@ class TestLiveCover:
         cat = _overlapping_catalog(n=2)
         indexed_cat = cat.index_footprints(11)
 
+        # Synthetic, like the one above: this test is about the remedy text,
+        # and mortie's real refusal wording is pinned in
+        # ``test_batch_refusal_names_the_record_range``.
         def boom(*args, **kwargs):
             raise ValueError("MOC 0 would expand to more than 1048576 cells at order 11")
 
-        monkeypatch.setattr(mortie, "mocs_to_orders", boom)
+        monkeypatch.setattr(mortie, "moc_to_order", boom)
         with pytest.raises(ValueError) as live:
             ShardMap.build(cat, hp_grid, backend="mortie")
         with pytest.raises(ValueError) as stored:
@@ -1626,7 +1648,7 @@ class TestLiveCover:
     def test_empty_catalog_builds_an_empty_map(self, hp_grid):
         # ``filter_bbox`` can cut a catalog to nothing, and the records path
         # handled that by returning ``{}`` out of ``_flatten_rings``. The cover
-        # has to land in the same place: no blob for ``from_wkbs`` to parse, and
+        # has to land in the same place: no blob for ``from_wkb`` to parse, and
         # an offsets array that is still one entry per (zero) row.
         cat = _overlapping_catalog(n=2)
         empty = Catalog(cat.table.slice(0, 0), dict(cat.metadata))

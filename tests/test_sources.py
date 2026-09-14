@@ -476,7 +476,7 @@ class TestFootprintCells:
 
     def test_column_is_the_scalar_cover_of_each_footprint(self):
         # The pin that makes the column trustworthy: each row's stored MOC is
-        # exactly what ``morton_coverage_moc`` returns for the ring
+        # exactly what the one-ring cover returns for the ring
         # ``granule_records`` reads, so a build off the column and a build off
         # the geometry are the same computation.
         import mortie
@@ -486,7 +486,11 @@ class TestFootprintCells:
         assert order == 9
         assert offsets[0] == 0 and offsets[-1] == len(values)
         for i, rec in enumerate(cat.granule_records()):
-            scalar = np.asarray(mortie.morton_coverage_moc(rec["lats"], rec["lons"], order=9))
+            scalar = np.asarray(
+                mortie.polygons_to_morton_mocs(
+                    rec["lats"], rec["lons"], np.array([0, len(rec["lats"])]), order=9
+                )[0]
+            )
             assert np.array_equal(values[offsets[i] : offsets[i + 1]], scalar)
 
     def test_non_polygonal_rows_get_an_empty_moc(self):

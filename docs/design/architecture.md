@@ -195,9 +195,15 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 │       ├── h_q50      (float32, fill=NaN)             │
 │       └── h_q75      (float32, fill=NaN)             │
 │                                                      │
-│ Open with xarray + xdggs for visualization           │
+│ Open with xarray + xdggs (superseded, see below)     │
 └──────────────────────────────────────────────────────┘
 ```
+
+Superseded (issue [#550](https://github.com/englacial/zagg/issues/550)): the
+viewer/reader track is **native-only** — the xdggs line above is o6-era, and
+the standing ruling is in
+[`../morton_arrow.md`](../morton_arrow.md#native-only-viewerreader-track-no-xdggs)
+§ "Native-only viewer/reader track". The rest of this page is left as written.
 
 ## Module Dependency Graph
 

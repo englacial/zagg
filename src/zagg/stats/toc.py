@@ -17,7 +17,7 @@ cell, which is a plain reduction and belongs here:
   and a dense per-cell fold up the ladder run through it.
 
 Both are the grammar's semilattice join (``mortie.toc_merge``, reduced by
-``mortie.toc_reduce`` / ``mortie.tocs_reduce``), so both are associative,
+``mortie.toc_reduce``, scalar and segmented), so both are associative,
 commutative and idempotent: the output word is **bit-identical whatever order
 or tree** the contributors were reduced in — the §8.2 guarantee that lets an
 overview be folded from leaves or cascaded from finer overviews and come out
@@ -90,7 +90,7 @@ def cell_envelopes(words, offsets) -> np.ndarray:
 
     ``offsets`` is the arrow list layout — group ``i`` spans ``[offsets[i],
     offsets[i + 1])``, exactly covering ``words`` — so the whole partition
-    crosses into Rust once (``mortie.tocs_reduce``, espg/mortie#177) instead of
+    crosses into Rust once (``mortie.toc_reduce``, espg/mortie#177) instead of
     a Python loop per cell. Result ``i`` is bit-identical to
     ``cell_envelope(words[offsets[i]:offsets[i + 1]])``, and an empty group is
     an error for the same reason it is there.
@@ -98,4 +98,6 @@ def cell_envelopes(words, offsets) -> np.ndarray:
     import mortie
 
     arr = _checked(words)
-    return np.asarray(mortie.tocs_reduce(arr, np.asarray(offsets, dtype=np.int64)), dtype=np.uint64)
+    return np.asarray(
+        mortie.toc_reduce(arr, offsets=np.asarray(offsets, dtype=np.int64)), dtype=np.uint64
+    )

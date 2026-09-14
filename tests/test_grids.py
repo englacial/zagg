@@ -959,6 +959,35 @@ class TestShardLabel:
         with pytest.raises(ValueError):
             morton_words_from_decimals(["-4211322", "bogus"])
 
+    def test_morton_decimals_from_words_matches_scalar(self):
+        # Issue #394: the batch decode must be the scalar decode, elementwise —
+        # same strings, INPUT order, across both hemispheres and a spread of
+        # orders (the §4.10 member discovery pairs each decimal with nothing
+        # positional, but a future caller zipping it against the words would
+        # silently mis-pair). Base cells 7-11 set bit 63, so the uint64 leg is
+        # exercised by the northern cases.
+        from mortie import geo2mort
+
+        from zagg.grids.morton import morton_decimal, morton_decimals_from_words
+
+        words = [
+            int(geo2mort(np.array([lat]), np.array([lon]), order=order)[0])
+            for lat, lon in [(-78.5, -132.0), (78.3, 12.0), (-72.1, 25.4), (0.1, 0.1)]
+            for order in (0, 6, 9, 18)
+        ]
+        # Python-int input mixing base cells 0-6 (below 2^63) with 7-11 (above)
+        # is the dtype trap: numpy infers float64 and rounds every word to its
+        # base cell, so the coercion must be explicit.
+        assert morton_decimals_from_words(words) == [morton_decimal(w) for w in words]
+        # A uint64 ndarray (what ``root_coverage_words`` hands over) and the
+        # empty set both round-trip; a negative word is the legacy signed
+        # decimal id in the packed slot and raises, same as the scalar.
+        arr = np.asarray(words, dtype=np.uint64)
+        assert morton_decimals_from_words(arr) == [morton_decimal(w) for w in words]
+        assert morton_decimals_from_words([]) == []
+        with pytest.raises(ValueError, match="non-negative"):
+            morton_decimals_from_words([-4211322])
+
     def test_morton_word_returns_python_int(self):
         # Issue #322: the public mortie parse defaults to np.uint64; the
         # boundary pins dtype=int. A silent uint64 return would pass every

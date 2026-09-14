@@ -64,7 +64,7 @@ cells. The processing step consumes this file.
 To inspect the chunking interactively -- shard outlines, granule footprints,
 and a grid that appears on zoom -- use the shard-map viewer
 (`pip install zagg[viz]`). See the
-[shard-map viewer notebook](https://github.com/englacial/zagg/blob/main/notebooks/shardmap_viewer.ipynb),
+[shard-map viewer notebook](https://github.com/englacial/zagg/blob/c56221b4/notebooks/shardmap_viewer.ipynb) (archived),
 which runs on a synthetic example (no network needed) and includes manual
 in-browser verification instructions.
 
@@ -202,7 +202,7 @@ excludes is reported as **not applicable** — `touch_skipped_paths` in the run
 record — never as a failure.
 
 See `src/zagg/configs/atl06.yaml` for a complete example and the
-[custom aggregations notebook](https://github.com/englacial/zagg/blob/main/notebooks/custom_aggregations.ipynb)
+[custom aggregations notebook](https://github.com/englacial/zagg/blob/c56221b4/notebooks/custom_aggregations.ipynb) (archived)
 for customization examples.
 
 ## Reading the output
@@ -212,6 +212,6 @@ reconstructs dense, spatially faithful `(64, 64, n_bins)` tensors — with an
 occupancy mask and a shared `(offset, gain)` z-window per block (the
 [reader contract](ragged_layout.md#spatially-faithful-tensors-deinterleave-blocks-mask))
 — or lossless raw value vectors from the stored digests. The
-[t-digest reader notebook](https://github.com/englacial/zagg/blob/main/notebooks/tdigest_reader_example.ipynb)
+[t-digest reader notebook](https://github.com/englacial/zagg/blob/c56221b4/notebooks/tdigest_reader_example.ipynb) (archived)
 walks through `read_tensors` and `read_raw_values` end to end on a self-contained
 synthetic store.

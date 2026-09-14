@@ -1,0 +1,110 @@
+{
+ "shard_order": 3,
+ "cell_order": 6,
+ "shards": [
+  "-3111",
+  "-3112"
+ ],
+ "group": "multiscales",
+ "window": "all",
+ "members_source": "coverage.moc",
+ "orders": [
+  2,
+  1,
+  0
+ ],
+ "levels": {
+  "2": {
+   "cells": [
+    3
+   ],
+   "members": {
+    "-311": "-3/1/1/all.zarr/3"
+   }
+  },
+  "1": {
+   "cells": [
+    2
+   ],
+   "members": {
+    "-31": "-3/1/all.zarr/2"
+   }
+  },
+  "0": {
+   "cells": [
+    1
+   ],
+   "members": {
+    "-3": "-3/all.zarr/1"
+   }
+  }
+ },
+ "multiscales": [
+  {
+   "spec": "zagg-multiscales/1",
+   "name": "SPEC_FIXTURE",
+   "base": {
+    "order": 3,
+    "cells": [
+     6
+    ]
+   },
+   "datasets": [
+    {
+     "order": 3,
+     "cells": [
+      5,
+      4
+     ],
+     "artifact": "column"
+    },
+    {
+     "order": 2,
+     "cells": [
+      3
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 1,
+     "cells": [
+      2
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 0,
+     "cells": [
+      1
+     ],
+     "artifact": "overview"
+    }
+   ],
+   "order2res": {
+    "3": [
+     5,
+     4
+    ],
+    "2": [
+     3
+    ],
+    "1": [
+     2
+    ],
+    "0": [
+     1
+    ]
+   },
+   "fields": {
+    "count": "exact",
+    "h_tdigest": "approximate",
+    "h_min": "exact",
+    "h_mean": "none"
+   },
+   "fold": {
+    "fold_source": "cascade",
+    "exact_levels": 1
+   }
+  }
+ ]
+}

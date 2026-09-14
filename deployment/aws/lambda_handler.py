@@ -142,6 +142,50 @@ end of run, like coverage mode; also invocable ad hoc):
     "discover": bool (optional) -- re-derive the work set from the store's
         run-record parquets instead (zagg.sweep.discover_leaves; sent when
         the leaves list would overflow the 256 KB Event cap),
+    "stage": dict (optional, issue #519) -- present => this invoke runs one
+        share of the /2 STAGED dense sweep instead of the rollup families
+        (zagg.sweep_stages; the dispatcher is zagg.sweep_fleet). Same event,
+        same credential and work-set plumbing, one extra block:
+        {
+          "role": "stage" | "finisher" (default "stage"),
+          "run_id": str,          # the sweep run's id: lease identity, the
+                                  #   skip-key/foreign-stamp namespace, and
+                                  #   the status prefix all key on it
+          "run_started": str,     # dispatcher-pinned UTC ISO stamp, shared by
+                                  #   every worker of the run (role="stage")
+          "dispatch": int,        # the tuple's dispatch order (role="stage")
+          "nodes": [str, ...],    # this invoke's dispatch nodes, as morton
+                                  #   decimals (role="stage")
+          "batch": int,           # which batch of that tuple this is; names
+                                  #   the record object (role="stage")
+          "tuple_width": int,     # optional; defaults to
+                                  #   zagg.sweep_stage.DEFAULT_TUPLE_WIDTH, the one
+                                  #   source the CLI path uses too -- a copied
+                                  #   literal here would give the fleet a different
+                                  #   tuple grouping, hence a different set of
+                                  #   stage columns, on the same store
+          "partition": {"index": int, "of": int},  # optional, recorded only
+          "lease_ttl_s": int,     # optional
+          "records_from": str,    # REQUIRED, both roles. The run's status prefix
+                                  #   (a store SIBLING,
+                                  #   zagg.client_transport.run_status_prefix):
+                                  #   where this invoke PUTs its record, and
+                                  #   where a finisher reads the run's records
+                                  #   back to rebuild the per-level actuals. A
+                                  #   worker that wrote no record reads to the
+                                  #   dispatcher exactly like a lost invoke, so
+                                  #   both roles refuse by name without it
+          "touch_policy": str,    # optional, role="finisher" (issue #501)
+          "barrier_timed_out": bool,  # optional, role="finisher": the
+                                  #   dispatcher's verdict on its own soft
+                                  #   barrier. Recorded in the store-root run
+                                  #   record, so a run whose per-level actuals
+                                  #   may be short says so durably
+        }
+        All store writes stay worker-side (D8). The work set rides in the
+        SAME "leaves"/"discover" keys the families arm uses -- a stage invoke
+        is sent only the slice under its own nodes, so the batching that keeps
+        "nodes" under the async cap keeps "leaves" under it too.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -1220,6 +1264,13 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
         else:
             leaves = discover_leaves(event["store_path"], store_kwargs=store_kwargs)
             discover_s = time.perf_counter() - t0
+        # The STAGED arm (issue #519) rides the same event: same credential
+        # resolution, same work-set transport, a "stage" block instead of the
+        # rollup families. Routed BEFORE the no-work short circuit -- a finisher
+        # invoke with an empty work set still has a manifest and a lease to
+        # settle, and an empty stage tuple still owes its record.
+        if event.get("stage") is not None:
+            return _handle_stage_sweep(event, leaves, store_kwargs, t0, discover_s)
         if not leaves:
             # Same key set as the swept response: a benchmark driver reading
             # body["duration_s"] must not KeyError on a no-work invoke (#353).
@@ -1267,6 +1318,172 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "sweep"})}
+
+
+#: The per-stage counts the stage arm's envelope totals for a driver.
+_STAGE_COUNTS = ("written", "current", "failed", "under_covered")
+
+
+def _stage_body(
+    role: str,
+    block: Dict[str, Any],
+    out: Optional[Dict[str, Any]],
+    *,
+    n_leaves: int,
+    duration_s: float,
+    discover_s: Optional[float],
+    error: Optional[BaseException] = None,
+) -> Dict[str, Any]:
+    """The stage arm's response envelope: compact scalars, one fixed key set.
+
+    The record itself is NOT echoed. A stage record carries one row per
+    (artifact node, window) -- a finest-tuple batch is tens of thousands of
+    rows, megabytes of JSON -- so embedding it would let a batch that folded
+    correctly and PUT its record correctly come back to a RequestResponse
+    driver as ``ResponseSizeTooLarge``, indistinguishable from the invoke
+    failure the 500 exists to disambiguate. The record is already durable at
+    the status prefix and the finisher reads it from there; the envelope
+    carries only its identity and the totals.
+
+    Two record keys, because they name two different objects: ``record`` is
+    the store-root run record (``sweep_stats_*_stages.json``, the finisher's
+    only -- ``None`` for a stage invoke, matching the families arm's use of
+    that key), and ``stage_record`` is the status-prefix object this invoke
+    PUT. The key SET is identical across both roles and both outcomes, with
+    ``None`` where a role has no such value, so a driver can read any field
+    off any stage response without a KeyError.
+    """
+    out = out or {}
+    rows = out.get("stages") or []
+    body: Dict[str, Any] = {
+        "ok": error is None,
+        "mode": "sweep",
+        "stage": role,
+        "run_id": block.get("run_id"),
+        "dispatch": out.get("dispatch"),
+        "batch": out.get("batch"),
+        "n_nodes": out.get("n_nodes"),
+        "n_leaves": n_leaves,
+        "stage_records": out.get("stage_records"),
+        "lease_released": (out.get("lease") or {}).get("released"),
+        "duration_s": duration_s,
+        "discover_s": discover_s,
+        "record": out.get("record") if role == "finisher" else None,
+        "stage_record": out.get("finisher_record") if role == "finisher" else out.get("record"),
+        "error": None if error is None else str(error),
+        "error_class": None if error is None else type(error).__name__,
+    }
+    body.update({name: sum(int(row.get(name) or 0) for row in rows) for name in _STAGE_COUNTS})
+    return body
+
+
+def _handle_stage_sweep(
+    event: Dict[str, Any],
+    leaves: Any,
+    store_kwargs: Dict[str, Any],
+    t0: float,
+    discover_s: Optional[float],
+) -> Dict[str, Any]:
+    """Run one share of the ``/2`` staged dense sweep worker-side (issue #519).
+
+    The D8 transport for the staged sweep, mirroring how ``mode="sweep"``
+    already carries the rollup families: the dispatcher cannot PUT, so a
+    ``stage`` block on the sweep event hands ONE invoke its share of the run
+    and the worker role does every write. Two roles, keyed by
+    ``stage.role``:
+
+    * ``"stage"`` (the default) -- fold the dispatch nodes in ``stage.nodes``
+      at ``stage.dispatch``, one tuple (``zagg.sweep_stages.run_stage_worker``).
+      Lease admission, run-id skip keys and the foreign-fresh-stamp abort are
+      the in-process pass's, unchanged.
+    * ``"finisher"`` -- the run's last invoke
+      (``zagg.sweep_stages.run_stage_finisher``): aggregate the run's stage
+      records into the manifest's per-level actuals, refresh the root
+      ``coverage.moc``, touch ``aggregation.yaml``, release the lease, write
+      the run record. It takes the lease first, like every other role: it is
+      the invoke that writes the store-root singletons, so a fan-out that
+      outlived its TTL must refuse here rather than finish over a claimant.
+
+    Unlike the families arm this one does NOT fail open in the handler: a
+    staged run is a fan-out with a soft barrier, so a swallowed 500 would read
+    to the dispatcher as a worker that simply never wrote its record -- the
+    same signal as a lost invoke, with none of the cause. The envelope carries
+    the error and CloudWatch carries the traceback; the run itself stays
+    fail-open at the dispatcher's call site (every stage artifact is
+    regenerable, D9, and ``python -m zagg.sweep --stages`` is the backstop).
+    """
+    from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH
+    from zagg.sweep_stages import run_stage_finisher, run_stage_worker
+
+    block = event["stage"]
+    role = block.get("role", "stage")
+    store_path = event["store_path"]
+    logger.info(
+        f"Sweep mode [stage]: role={role} run={block.get('run_id')!r} "
+        f"dispatch={block.get('dispatch')} at {store_path}"
+    )
+    try:
+        if role == "finisher":
+            out = run_stage_finisher(
+                store_path,
+                leaves,
+                run_id=block["run_id"],
+                records_from=block.get("records_from"),
+                touch_policy=block.get("touch_policy", "auto"),
+                lease_ttl_s=block.get("lease_ttl_s"),
+                # The dispatcher's soft-barrier verdict (issue #519 review): it
+                # is the only party that knows whether it stopped waiting, the
+                # finisher cannot tell, and the run record is the only durable
+                # place that can say the per-level actuals may be short.
+                barrier_timed_out=bool(block.get("barrier_timed_out")),
+                store_kwargs=store_kwargs,
+            )
+        elif role == "stage":
+            out = run_stage_worker(
+                store_path,
+                leaves,
+                run_id=block["run_id"],
+                run_started=block["run_started"],
+                dispatch=int(block["dispatch"]),
+                nodes=block.get("nodes") or [],
+                batch=int(block.get("batch", 0)),
+                tuple_width=int(block.get("tuple_width", DEFAULT_TUPLE_WIDTH)),
+                partition=block.get("partition"),
+                records_from=block.get("records_from"),
+                lease_ttl_s=block.get("lease_ttl_s"),
+                store_kwargs=store_kwargs,
+            )
+        else:
+            raise ValueError(f"unknown stage role {role!r} (expected 'stage' or 'finisher')")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                _stage_body(
+                    role,
+                    block,
+                    out,
+                    n_leaves=len(leaves),
+                    duration_s=time.perf_counter() - t0,
+                    discover_s=discover_s,
+                )
+            ),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps(
+                _stage_body(
+                    role,
+                    block,
+                    None,
+                    n_leaves=len(leaves),
+                    duration_s=time.perf_counter() - t0,
+                    discover_s=discover_s,
+                    error=e,
+                )
+            ),
+        }
 
 
 def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:

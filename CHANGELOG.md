@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **mortie 1.0 is now the floor** (#559): mortie 1.0.0 retired its plural batch
+  names with no aliases (espg/mortie#187), so a fresh install against unpinned
+  mortie failed at import — first seen on a Binder build of the reader
+  notebooks (`cannot import name 'decimals_to_words'`, raised inside moczarr;
+  zagg itself has nine such sites). Every call moves to the surviving
+  polymorphic name: `moc_and` / `moc_intersects` / `moc_to_order` /
+  `toc_reduce` take the ragged batch through `offsets=`, `decimal_to_word` and
+  `mortie.arrow.from_wkb` are the array forms, the per-ring fallback in
+  `_batch_ring_mocs` goes through `from_geometry(Polygon(ring), moc=True)` (a
+  different entry point to the same ring kernel), and the
+  ring-parts AOI cover (`healpix_aoi_moc`) goes through
+  `from_geometry(..., moc=True)` on a shapely (Multi)Polygon — bit-identical to
+  the retired multipart ring form, holes included, pinned in
+  `tests/test_aoi_mask.py`. `pyproject` requires `mortie>=1.0.0`, the AOI
+  version guard moves to the same floor, and the reader notebooks pin
+  `mortie>=1.0` with `moczarr[zagg]>=0.8.0` (the moczarr release that carries
+  its own migration, espg/moczarr#59). No behaviour change.
+  **Release order:** zagg 0.53.0 is the first zagg on mortie 1.0, and
+  moczarr 0.8.0's `[zagg]` extra floors on `zagg>=0.53.0` alongside its own
+  `mortie>=1.0.0` (espg/moczarr#61) — so zagg 0.53.0 ships first, then
+  moczarr 0.8.0, then a Binder rebuild.
+
 - every `-disk` worker variant gets Lambda's 10240 MB `/tmp` ceiling (#536)
   ([#537](https://github.com/englacial/zagg/pull/537))
   - The spill block is **disk-bound at every memory tier**:
@@ -76,6 +98,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Reads through `open_object_store` with explicit credentials (the issue #223
     consumer-input channel, e.g. `temporal.open_dataset`'s NetCDF branch) now
     send no ACL header at all rather than an inert one.
+- column backfill for pre-column stores: the `/1 -> /2` upgrade bridge ([#520](https://github.com/englacial/zagg/issues/520))
+  - A store built before its aggregation fields were declared composable has no
+    leaf columns, so it cannot take the `zagg-pyramid/2` staged sweep. A new
+    `columns` sweep family recomputes each committed leaf's column from that
+    leaf's own **stored** arrays and writes it — upgrading a published store
+    **without re-aggregation**, at the cost of one leaf-reading pass. Being a
+    registry entry it needs no new transport or mode — the work-set
+    normalization, `--partitions` and discovery are inherited — and it runs
+    in-process from the CLI or `run_sweep(families=["columns"])`, and
+    worker-side too since the handler's sweep arm began forwarding
+    `families`/`partition` from the event
+    ([#528](https://github.com/englacial/zagg/pull/528)). It is
+    declaration-driven (a store still declaring `/1`, declared off,
+    or `class: "none"` on every field is refused by name and must be
+    re-declared first), idempotent, and takes the sweep-admission lease.
+    Spell it: `python -m zagg.sweep <root> --families columns`.
+  - `declare_pyramid` grows `overviews=` / `chunk_order=` (and the CLI
+    `--overviews`), the `/2` retrofit levers: the grid-less retrofit path
+    otherwise falls back to `/1`, which a store being upgraded must not get.
+    Both are validated against the manifest's own shard/cell orders.
+  - A backfilled column is byte-identical to the one the leaf's worker would
+    have written from the same leaf (the two provenance timestamps aside), and
+    the whole upgrade — re-declare, backfill, staged sweep — lands a ladder
+    byte-equal to a twin store built pyramid-ON from identical inputs. The
+    runbook is `docs/pyramid_upgrade.md`; `docs/specification.md` §4.6 now
+    names the backfill as the one sanctioned second writer of a column, with
+    "no aggregation run in flight" as an operator precondition.
 
 - rename parent_morton event field to shard_key (#24) ([#42](https://github.com/englacial/zagg/pull/42)) by @espg
 - Concurrency-aware Lambda orchestrator: pre-flight probe + FD-exhaustion guard ([#41](https://github.com/englacial/zagg/pull/41)) by @espg

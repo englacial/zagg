@@ -13,7 +13,7 @@ The mask is computed at the **shard-map build stage** (``catalog/shardmap.py``)
 and carried per shard in the manifest JSON:
 
 - **HEALPix** — a compact MOC of the AOI at ``child_order`` via native morton
-  (``morton_coverage_moc``); each worker expands it to a cell-order boolean over
+  (``from_geometry(..., moc=True)``); each worker expands it to a cell-order boolean over
   the shard's ``children()`` with ``moc_to_order`` + membership. No lat/lon-center
   decode.
 - **Rectilinear** — a packed boolean per shard from a shapely cell-center
@@ -23,7 +23,7 @@ and carried per shard in the manifest JSON:
 The AOI polygon may be supplied either as ``[(lats, lons), ...]`` ring parts (the
 ``coverage`` contract) or as a native **WKB/WKT geometry** (issue #101): the
 HEALPix MOC rides mortie's public ``from_wkb`` / ``from_wkt`` cover entry points
-(espg/mortie#89, mortie >= 0.8.3) and the rectilinear path reprojects the
+(espg/mortie#89; mortie >= 1.0.0) and the rectilinear path reprojects the
 shapely-loaded geometry, so a WKB/WKT AOI yields the *identical* mask to the
 equivalent ring. :class:`AOIGeometry` normalizes either form.
 """
@@ -39,20 +39,21 @@ import numpy as np
 # and the WKB/WKT AOI path calls those public entry points — so we assert the
 # resolved mortie is >= 0.8.3 rather than silently mis-sizing the mask against an
 # 18-capped build or reaching for a WKB/WKT API that isn't there.
-MIN_MORTIE_VERSION = "0.8.3"
+MIN_MORTIE_VERSION = "1.0.0"
 
 
 def _assert_mortie_version() -> None:
-    """Fail loudly if the resolved mortie predates the WKB/WKT cover API (0.8.3).
+    """Fail loudly if the resolved mortie predates the 1.0 cover API.
 
-    Against an order-18-capped build ``morton_coverage_moc(..., order=child_order)``
-    raises for any ``child_order > 18``, so the AOI mask would silently come back
-    empty (the swallowing ``except`` paths elsewhere) or wrongly sized. Assert here
-    so a stale environment is a clear error at use, not a quiet bad mask.
+    Against an order-18-capped build a cover at ``order=child_order`` raises for
+    any ``child_order > 18``, so the AOI mask would silently come back empty (the
+    swallowing ``except`` paths elsewhere) or wrongly sized. Assert here so a
+    stale environment is a clear error at use, not a quiet bad mask.
 
-    The WKB/WKT AOI path additionally needs the public ``from_wkb`` / ``from_wkt``
-    cover entry points (espg/mortie#89), which ship in the same 0.8.3 release, so a
-    single ``>= 0.8.3`` gate covers both the MOC cap and the geometry-ingest API.
+    The floor is 1.0.0 (issue #559): the ring-parts path covers through
+    ``from_geometry(..., moc=True)`` and the WKB/WKT path through ``from_wkb`` /
+    ``from_wkt``, and mortie 1.0 retired the pre-1.0 spellings with no aliases
+    (espg/mortie#187), so this module's calls only resolve from 1.0.0 on.
 
     Uses PEP 440 ordering (via ``packaging``) so a pre-release like ``0.8.3.devN``
     — which is *before* the 0.8.3 tag, hence missing the public entry points — is
@@ -85,7 +86,7 @@ def _assert_mortie_version() -> None:
 # The AOI may be supplied two ways (issue #101): the original
 # ``[(lats, lons), ...]`` exterior-ring parts, or a native geometry as WKB bytes /
 # WKT text. WKB/WKT ingest is routed to mortie's public ``from_wkb`` / ``from_wkt``
-# cover entry points on the HEALPix side (espg/mortie#89, mortie >= 0.8.3) and to
+# cover entry points on the HEALPix side (espg/mortie#89; mortie >= 1.0.0) and to
 # shapely's loaders on the rectilinear side, so a WKB/WKT AOI produces *exactly the
 # same* cover/mask as passing the equivalent ``(lats, lons)`` ring. ``AOIGeometry``
 # normalizes either input to a common carrier the shard-map builder consumes; a
@@ -196,12 +197,22 @@ def healpix_aoi_moc(polygon_parts, order: int) -> np.ndarray:
     so the mask resolves at cell resolution.
     """
     _assert_mortie_version()
-    from mortie import morton_coverage_moc
+    from mortie import from_geometry
+    from shapely.geometry import MultiPolygon, Polygon
 
-    lats_parts = [np.asarray(p[0], dtype=float) for p in polygon_parts]
-    lons_parts = [np.asarray(p[1], dtype=float) for p in polygon_parts]
-    moc = np.asarray(morton_coverage_moc(lats_parts, lons_parts, order=order), dtype=np.uint64)
-    return moc
+    # mortie 1.0 retired the multipart ring form of the scalar coverer; the
+    # geometry entry point routes a (Multi)Polygon's rings through the same
+    # one even-odd descent, so this is bit-identical to the pre-1.0 call
+    # (disjoint parts union, a nested part carves a hole) -- pinned in
+    # tests/test_aoi_mask.py. Only the refusals moved: a degenerate ring or an
+    # empty parts list now raises out of shapely's constructor rather than out
+    # of mortie, still ValueError but with shapely's wording.
+    rings = [
+        Polygon(list(zip(np.asarray(p[1], dtype=float), np.asarray(p[0], dtype=float))))
+        for p in polygon_parts
+    ]
+    geom = rings[0] if len(rings) == 1 else MultiPolygon(rings)
+    return np.asarray(from_geometry(geom, order=order, moc=True), dtype=np.uint64)
 
 
 def healpix_aoi_moc_from_geometry(aoi: AOIGeometry, order: int) -> np.ndarray:
@@ -209,7 +220,7 @@ def healpix_aoi_moc_from_geometry(aoi: AOIGeometry, order: int) -> np.ndarray:
 
     A WKB/WKT source rides mortie's public ``from_wkb`` / ``from_wkt`` cover entry
     points (espg/mortie#89) with ``moc=True`` — which decompose the geometry and
-    route Polygon/MultiPolygon to ``morton_coverage_moc``, so the result is *exactly
+    route Polygon/MultiPolygon to the same ring coverer, so the result is *exactly
     the same* compact MOC as calling :func:`healpix_aoi_moc` on the equivalent
     ``(lats, lons)`` ring (verified bit-for-bit in ``tests/test_aoi_mask.py``). A
     parts source falls back to :func:`healpix_aoi_moc`.
@@ -286,7 +297,7 @@ def rectilinear_aoi_polygon(polygon_parts, crs):
     polar / large-extent CRS. Since the mask is the *strict* deliverable, this
     keeps edge-cell membership from drifting by the chord-vs-arc deviation. This is
     a rect-only concern: the HEALPix path tessellates the native ``(lats, lons)``
-    ring on the sphere (``morton_coverage_moc``) and never reprojects a polygon.
+    ring on the sphere (``from_geometry``) and never reprojects a polygon.
     """
     from odc.geo.geom import multipolygon, polygon
 
