@@ -391,6 +391,23 @@ class TestSemanticManifest:
             hive.validate_manifest(root, hive.build_manifest(moved), config=indexed)
         assert "issue #499" not in str(exc.value)
 
+    def test_hint_never_masks_the_refusal(self, cfg, tmp_path, monkeypatch):
+        # The hint is interpolated INTO the refusal message, so a raise from
+        # ``semantic_hash_legacy`` would replace the clear frozen-key refusal
+        # with an unrelated traceback. It is advisory: it fails open to the
+        # config-less wording and the refusal still fires.
+        import zagg.semantics
+
+        root = str(tmp_path / "store")
+        indexed, grid, _ = self._pre_epoch_store(cfg, root)
+
+        def boom(*a, **k):
+            raise TypeError("a fault inside a normalizer")
+
+        monkeypatch.setattr(zagg.semantics, "semantic_hash_legacy", boom)
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, hive.build_manifest(grid), config=indexed)
+
     def test_migration_through_declare_pyramid_unblocks_the_append(self, cfg, tmp_path):
         # The tool's path end to end: declare_pyramid migrates the frozen key,
         # after which the same run's manifest is accepted without a PUT.

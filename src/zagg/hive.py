@@ -436,14 +436,24 @@ def _pre_epoch_hint(existing: dict, manifest: dict, config) -> str:
     if config is not None:
         from zagg.semantics import semantic_hash_legacy
 
-        if semantic_hash_legacy(config) != existing["semantic_hash"]:
+        try:
+            legacy = semantic_hash_legacy(config)
+        except Exception:
+            # This runs WHILE the refusal message is being built, and
+            # ``semantic_core`` is total only for the fault classes it
+            # enumerates (a fault inside a normalizer propagates by design).
+            # An error-message helper must never mask the error it decorates,
+            # so fall through to the conditional wording.
+            legacy = None
+        if legacy is not None and legacy != existing["semantic_hash"]:
             return ""
-        return (
-            f"; the only frozen key that differs is semantic_hash, and the store's is this "
-            f"config's PRE-EPOCH digest (issue #499: data_source.index left the semantic "
-            f"core) — migrate the manifest with {tool}, then rerun; the append path never "
-            f"migrates on its own"
-        )
+        if legacy is not None:
+            return (
+                f"; the only frozen key that differs is semantic_hash, and the store's is "
+                f"this config's PRE-EPOCH digest (issue #499: data_source.index left the "
+                f"semantic core) — migrate the manifest with {tool}, then rerun; the append "
+                f"path never migrates on its own"
+            )
     return (
         f"; the only frozen key that differs is semantic_hash — if this config built the "
         f"store before the issue #499 epoch (data_source.index left the semantic core), "
