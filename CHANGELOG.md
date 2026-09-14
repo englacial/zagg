@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The leaf column's coarse members fold flat from the res-(s+2) member**
+  (#538): the leaf-time column fold merged every resident photon of the shard
+  in one k-way call at the node-order member, at ~95–100 B of peak memory per
+  centroid row — 2.2 GB at the CA ATL03 store's p90 and 6.8 GB at its largest
+  shard, the 0.52 fleet's 47/251 OOMs at 4 GB. Members at `cells >=
+  shard_order + 2` (13/12/11 on an o9/o19 store) keep the from-raw fold; the
+  two coarser members now fold in one flat k-way call per output cell over the
+  res-(s+2) member's already-quantized cells (never chained) and record
+  `merges_from_raw: 2`, so the largest single merge is a sixteenth of the
+  shard. The boundary is the constant `zagg.column.RAW_MEMBER_DEPTH = 2`, not a
+  knob. The `/2` ladder's stage-merge relay member moves from the node-order
+  partial to the res-(s+2) partial (`zagg.column.relay_resolution`), so every
+  stage-merge level stays exactly 2 merges from raw; stage columns relay that
+  member. Exact-class values are unchanged; digest and composition bytes at
+  cells `s`/`s+1` and at every stage-merge level change, the `/2` byte-identity
+  oracle (CLI fold ≡ fleet fold) holds, and the manifest leaf-entry `actuals`
+  record the worst of the entry's declared cells. Spec §4.4/§4.5/§4.6 and the
+  `pyramid/` fixture's actuals updated. The worker also releases the aggregate
+  it no longer needs before the fold.
+
 - **mortie 1.0 is now the floor** (#559): mortie 1.0.0 retired its plural batch
   names with no aliases (espg/mortie#187), so a fresh install against unpinned
   mortie failed at import — first seen on a Binder build of the reader

@@ -865,10 +865,14 @@ group. Concretely, for a member `r` at an order-`k` node:
   words where `r > k`, its **own** word where `r == k`. For a manifest
   **level member** `r > k` always, by the window and ladder rules above;
   the one recorded `r == k` group is the §4.6 column's **node-order
-  member** (the whole-footprint aggregate of #381 point (2) — the leaf's
-  universal partial for every coarser cell), which is a recorded group of
-  that artifact and still never a manifest member. No separate partial
-  grammar or `partial/` path exists anywhere;
+  member** (the whole-footprint aggregate of #381 point (2)), which is a
+  recorded group of that artifact and still never a manifest member. Since
+  [issue #538](https://github.com/englacial/zagg/issues/538) it is not the
+  ladder's merge source: that is the **relay member** — the leaf column's
+  coarsest group still folded from raw: its group at `shard_order + 2`
+  (§4.6's raw-fold boundary) when the declaration's finest leaf resolution
+  reaches it, else the node-order member — so that every above-shard merge
+  stays exactly 2 merges from raw. No separate partial grammar or `partial/` path exists anywhere;
 - each **included** field is the same array kind as at the leaves: dense
   fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
   arrays — §1–§3 of this page apply to overview arrays unchanged, **including
@@ -892,8 +896,10 @@ particular its single scalar `cell_order = c - (s - k)` — is specified for
 formula), the `fold_source`/`fold_from_order` pair replaced by the #381
 point (7) provenance — `regime` (`stage-gather` | `stage-merge`),
 `merges_from_raw` (1 for a gather of gen-1 members, 2 for a merge of the
-relayed gen-1 partials — never 3 for an upfront level; gen 3 belongs only
-to the append-later cascade regime), and `source_children` (present in both
+relayed gen-1 relay-member partials — never 3 for an upfront level, which
+is why the relay is the boundary member and not the node-order one; gen 3
+belongs only to the append-later cascade regime), and `source_children`
+(present in both
 stage regimes: a gather that under-covers says so exactly like a merge) —
 plus `run_id`, the sweep run that wrote the artifact, and a `generation`
 block summing the consumed children (the stage skip gate's ratchet key —
@@ -1194,12 +1200,15 @@ staged sweep's finisher.
                "generated_at": "2026-08-09T00:00:00+00:00"}}
   ```
 
-  — `regime` is `leaf-column` (the leaf entry: the fleet's own column,
-  merges-from-raw 1, no `source_children` — its source is complete by
-  construction), `stage-gather` (a concatenation of gen-1 members,
-  merges-from-raw 1) or `stage-merge` (a k-way fold of the relayed gen-1
-  node-order partials, merges-from-raw 2 — **never 3 for an upfront level**;
-  gen 3 belongs only to the append-later cascade regime). `source_children`
+  — `regime` is `leaf-column` (the leaf entry: the fleet's own column;
+  its `merges_from_raw` is the **maximum** over the entry's declared cells
+  of the §4.6 per-group value — 1 when every declared leaf resolution is at
+  or above the raw-fold boundary, 2 when the entry declares a resolution
+  below it; no `source_children` — its source is complete by construction),
+  `stage-gather` (a concatenation of gen-1 members, merges-from-raw 1) or
+  `stage-merge` (a k-way fold of the relayed gen-1 relay-member partials,
+  §4.4, merges-from-raw 2 — **never 3 for an upfront level**; gen 3 belongs
+  only to the append-later cascade regime). `source_children`
   accumulates the run's per-artifact coverage counts; `run_id` names the
   sweep run (stage entries only). The key is **additive**: a reader MUST
   tolerate additional keys on a level entry, and `actuals` says nothing
@@ -1313,9 +1322,10 @@ guessed at.
   order (the `{order}/{field}` layout of §4.4): every declared leaf
   resolution, every within-footprint rung of the fixed ladder
   (`node < cells ≤ base`), and the **node-order member** — `cells == node`,
-  one cell: the leaf's whole-footprint aggregate, its **universal partial**
-  for every coarser cell (there is no `partial/` grammar; a coarse level
-  declared later never rewrites a leaf). Each group holds the `morton`
+  one cell: the leaf's whole-footprint aggregate (there is no `partial/`
+  grammar; a coarse level declared later never rewrites a leaf; the ladder's
+  merge source is the relay member named under **Fold laws**, not this
+  group). Each group holds the `morton`
   coordinate (the node's order-`r` descendant words, ascending) and one
   array per **composable** field (§4.5 classes; `none` fields are absent),
   plus **every channel sibling** that field's §4.5 entry declares — the
@@ -1333,19 +1343,40 @@ guessed at.
   read from the array metadata as §1.5 requires).
   Under the default `[chunk_inner]` declaration on the 19/13/9 reference
   geometry a column carries groups {13, 12, 11, 10, 9}.
-- **Fold laws.** Every group folds **directly from the leaf's resident cell
-  data** — never group from group: exact classes by their §4.5 merge law
-  (nan-skipping, §4.3), approximate classes by the order-independent k-way
-  digest merge. Column bytes at a resolution MUST equal the sweep-kernel
-  fold of the committed leaf's arrays at that resolution — the from-leaves
-  parity contract, which reads differently per class: for **exact** fields
-  it is checkable from this page (the §4.5 merge law plus §4.3's nan
-  policy, so an external reader can reproduce a group by direct
-  aggregation), while for **approximate** fields the merge algebra is
-  zagg-owned and deliberately unspecified (§2.3), so the MUST binds
-  implementations sharing those kernels and is pinned on committed bytes by
-  the §7 `column/` fixture rather than derivable from spec text.
-  `merges_from_raw` is 1 for every group.
+- **Fold laws.** The leaf tier has a **raw-fold boundary** at resolution
+  `order + 2` (the constant `zagg.column.RAW_MEMBER_DEPTH = 2`; a constant,
+  never a per-store knob —
+  [issue #538](https://github.com/englacial/zagg/issues/538)). Groups at or
+  above it (`cells ≥ order + 2`) fold **directly from the leaf's resident
+  cell data** — exact classes by their §4.5 merge law (nan-skipping, §4.3),
+  approximate classes by the order-independent k-way digest merge, packed
+  classes by §3.4 — and record `merges_from_raw` 1. Column bytes there MUST
+  equal the sweep-kernel fold of the committed leaf's arrays at that
+  resolution — the from-leaves parity contract, which reads differently per
+  class: for **exact** fields it is checkable from this page (the §4.5
+  merge law plus §4.3's nan policy, so an external reader can reproduce a
+  group by direct aggregation), while for **approximate** fields the merge
+  algebra is zagg-owned and deliberately unspecified (§2.3), so the MUST
+  binds implementations sharing those kernels and is pinned on committed
+  bytes by the §7 `column/` fixture rather than derivable from spec text.
+  The groups **below** the boundary (`order + 1` and `order`) fold **flat
+  from the boundary group**: one k-way merge per output cell over the
+  `4^(order + 2 − r)` boundary cells it contains (approximate payloads with
+  their §9/§8.3 channels in the same call; packed words from the boundary
+  group's `(word, n)` pairs, `n` the boundary `of` digest's weight) — never
+  chained through the intermediate group — and record `merges_from_raw` 2.
+  Their bytes MUST equal that flat fold of the column's own boundary group.
+  **Exact** classes are unaffected in value (they reduce from raw at every
+  group; the reductions are associative). Rationale: a from-raw fold of the
+  member `d` orders above the node merges `1/4^d` of the shard's centroid
+  rows in one call, and at the node member that is the whole shard — ~100 B
+  of peak memory per row, the 0.52 fleet's OOMs at 4 GB — whereas the
+  boundary bounds any single merge to a sixteenth of the shard. When the
+  boundary is not strictly below the cell order (`order + 2 ≥ cell order`),
+  or the declaration's finest leaf resolution is `order + 1` (no boundary
+  group exists), every group folds from raw with `merges_from_raw` 1 — the
+  §7 `column/` fixture's 4/6 geometry is the first case, which is why its
+  groups below record 1.
 - **The `role` and `zagg_column` attrs.** `role` is `"column"`;
   `zagg_column` is the versioned provenance block, present exactly when
   `role` is `"column"`:
@@ -1383,7 +1414,10 @@ guessed at.
   provenance slots:
   the fold **regime** (`"leaf-column"` — folded from the leaf's own
   resident cells; `source_children` never rides this regime, its source is
-  complete by construction), the `merges_from_raw` integer, and `n_cells`
+  complete by construction), the `merges_from_raw` integer (1 at or above
+  the raw-fold boundary, 2 below it — on the 19/13/9 reference geometry
+  `{"13": 1, "12": 1, "11": 1, "10": 2, "9": 2}`; the example above is the
+  4/6 fixture geometry, whose boundary is the cell order), and `n_cells`
   — the group's **grid** size `4^(r - order)`, i.e. its arrays' length, not
   its populated-cell count (that is the stamp's `cells_with_data`, for the
   `cells_with_data_order` group only). `n_cells` is derivable and recorded
@@ -1443,9 +1477,13 @@ node's prefix, `zagg-column/1` attrs, D4 order, one commit stamp last, D20
 sidecar after): every group is a **pure gather** of the child columns'
 members at the same resolution — `groups` entries record `regime:
 "stage-gather"` with `merges_from_raw: 1` — and the artifact MUST carry the
-**relay member** (the group at `shard_order`: the subtree's leaf node-order
-partials, the merge-source tier every coarser merge consumes — the espg
-merge-source ruling on the #384 thread). Stage-column attrs additionally
+**relay member** (the leaf columns' coarsest from-raw group for the whole
+subtree — `shard_order + 2`, the raw-fold-boundary partials, when the
+declaration's finest leaf resolution reaches it, else the node-order
+partials — the merge-source tier every coarser merge consumes: the espg
+merge-source ruling on the #384 thread, re-based onto the boundary member
+by issue #538 so that no upfront merge is ever 3 from raw). Stage-column
+attrs additionally
 carry `generation` (`{n_leaves, max_leaf_timestamp, run_ids}` summed over
 the consumed children — the parent's skip-gate key, §4.5), `source_children` (a
 gather that under-covered says so in the artifact), and `run_id`; the

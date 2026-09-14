@@ -757,6 +757,7 @@ def build_pyramid(out: Path) -> None:
     values follow.
     """
     from zagg import hive
+    from zagg.column import leaf_entry_merges_from_raw
     from zagg.grids import HealpixGrid
     from zagg.sweep_overview import _update_manifest_pyramid, declare_pyramid
 
@@ -821,9 +822,16 @@ def build_pyramid(out: Path) -> None:
         },
         # §4.5 per-entry actuals (issue #384) — regimes/counts from the
         # synthetic finisher inputs above; the leaf entry records the
-        # leaf-column law. Timestamp/run-id values are not pinned.
+        # leaf-column law: the worst of its declared cells (issue #538 — 4 is
+        # below this geometry's raw-fold boundary 5, so 2). Timestamp/run-id
+        # values are not pinned.
         "actuals": {
-            str(s): {"regime": "leaf-column", "merges_from_raw": 1},
+            str(s): {
+                "regime": "leaf-column",
+                "merges_from_raw": leaf_entry_merges_from_raw(
+                    levels, s, PYRAMID_GRID["child_order"]
+                ),
+            },
             **{
                 str(k): {
                     "regime": v["regime"],
