@@ -76,6 +76,12 @@ Resources:
       # blocks stay on; only the policy/restrict blocks are relaxed. NOTE: this
       # can't override ACCOUNT-level Block Public Access -- relax that separately
       # (see benchmark-cicd.md §10) if enabled.
+      # HISTORICAL, read this before trusting the block below: the LIVE bucket
+      # has all four Block Public Access flags true and anonymous GET 403s. That
+      # is not drift -- espg closed it deliberately, because NASA buckets have
+      # no clearance to host public data (issue #497). The bucket is being
+      # retired under issue #499; published artifacts go to Source Cooperative
+      # (the PublishToSourceCoop grant below).
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         IgnorePublicAcls: true
@@ -303,6 +309,64 @@ Resources:
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject]
                 Resource: !Sub "arn:aws:s3:::${DistBucketName}/*"
+              # Published destination (issue #497): the release role's half of
+              # the identity model template.yaml's ExecutionRole carries for the
+              # fleet (issue #495). Roles stay separate because the trust domains
+              # differ, and this one already had the right trust (GitHub Actions
+              # OIDC, above) -- it needed S3 permissions, not an identity.
+              #
+              # Why this ACTION SET: see template.yaml's ExecutionRole published
+              # grant. The PutObject/PutObjectAcl pairing (issue #496), the
+              # object-scoped multipart pair covering the abort path, and the
+              # omission of bucket-wide ListBucketMultipartUploads are argued
+              # there once; do not restate them here. What differs on this role:
+              #
+              # - Scope stops at lambda/* plus the two exact repo-root keys
+              #   below. benchmarks/* is question (1) of issue #497 and is
+              #   unresolved, so this grant does not pre-empt it.
+              # - No DeleteObject, unlike the fleet's grant: a re-published minor
+              #   overwrites via PutObject, and the mirror never prunes.
+              # - The owner ACL is not sent by every writer yet.
+              #   distribute_zips.sh sends it, for a published destination only;
+              #   publish_mirror.sh sends none on any of its five PUTs and is the
+              #   ONLY writer of the two repo-root keys, so those are granted but
+              #   unreachable under this role until that changes. Left as it
+              #   stands -- issue #497 does not name publish_mirror.sh -- and
+              #   raised for review instead.
+              - Sid: PublishToSourceCoop
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/lambda/*
+                  # The repo-root metadata publish_mirror.sh writes (its
+                  # MIRROR_REPO_PREFIX block). Exact keys, not an
+                  # englacial/zagg/* wildcard, so the grant cannot reach demo/
+                  # (the fleet's) or benchmarks/ (undecided).
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/README.md
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/LICENSE
+              # Unconditional by intent -- do NOT add an s3:prefix condition
+              # (template.yaml's ListBucket grant carries the mechanism: a GET
+              # evaluation has no s3:prefix context key, so absent objects would
+              # answer 403 instead of 404). Here that decides what
+              # distribute_zips.sh sees on a missing versions.json: only a miss
+              # seeds the index, every other read failure is fatal, so a
+              # conditioned grant would fail each release rather than corrupt the
+              # index.
+              #
+              # Cross-account BOTH sides must grant. Source Cooperative's bucket
+              # policy permits this list for our principal (issue #497 records
+              # unsigned ListObjectsV2 against the bucket); it does not grant the
+              # bucket-wide ListBucketMultipartUploads, which is why that action
+              # is omitted above rather than merely unused.
+              - Sid: ListSourceCoopBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop
 
 Outputs:
   BenchmarkInvokeRoleArn:
