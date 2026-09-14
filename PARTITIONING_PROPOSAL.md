@@ -165,7 +165,9 @@ costs (below), per-leaf work is ~141 s (ATL03) / ~311 s (GEDI) at 4 GB. At
 64-way concurrency: ATL03 ≈ **1.8–2 h**, GEDI ≈ **4 h**. Each *leaf* is far
 inside the 900 s wall; concurrency only moves wall-clock, not cost. Memory per
 leaf is bounded since issue #538: the column fold's largest single merge is one
-res-(s+2) cell (a sixteenth of the shard) rather than the whole shard, so the
+res-(s+2) cell rather than the whole shard — a sixteenth only under uniform
+occupancy; measured across the 39 fattest CA shards the largest such cell holds
+6.04 M rows, 9.8% of its 61.7 M-row shard (p50 9.6%, max 14.0%) — so the
 67.8 M-photon CA maximum fits the 4 GB tier where the node-order-from-raw fold
 (~100 B/photon, 6.8 GB) did not.
 

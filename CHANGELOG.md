@@ -15,9 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shard_order + 2` (13/12/11 on an o9/o19 store) keep the from-raw fold; the
   two coarser members now fold in one flat k-way call per output cell over the
   res-(s+2) member's already-quantized cells (never chained) and record
-  `merges_from_raw: 2`, so the largest single merge is a sixteenth of the
-  shard. The boundary is the constant `zagg.column.RAW_MEMBER_DEPTH = 2`, not a
-  knob. The `/2` ladder's stage-merge relay member moves from the node-order
+  `merges_from_raw: 2`, so the largest single merge is one boundary cell — a
+  sixteenth of the shard only under uniform occupancy; measured across the 39
+  fattest CA ATL03 shards the largest res-(s+2) cell holds 6.04 M rows, 9.8% of
+  its 61.7 M-row shard (p50 9.6%, max 14.0%), i.e. ~0.6 GB at ~100 B/row
+  against the 4 GB tier. The boundary is the constant
+  `zagg.column.RAW_MEMBER_DEPTH = 2`, not a knob. The `/2` ladder's stage-merge relay member moves from the node-order
   partial to the res-(s+2) partial (`zagg.column.relay_resolution`), so every
   stage-merge level stays exactly 2 merges from raw; stage columns relay that
   member. Exact-class values are unchanged; digest and composition bytes at
