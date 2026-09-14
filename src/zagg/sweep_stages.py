@@ -175,7 +175,7 @@ def sweep_stage_pass(
     # ``ladder_entries`` excludes, so it is derived from the full list here.
     from zagg.column import relay_resolution
 
-    relay = relay_resolution(pyramid["overviews"], shard_order)
+    relay = relay_resolution(pyramid["overviews"], shard_order, cell_order)
     # The schedule and the ``only_dispatch`` refusal come FIRST — before the
     # ``fields``/``candidates`` gates below, which both return a clean empty
     # summary. A mistyped dispatch order against a store with nothing to sweep

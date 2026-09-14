@@ -334,7 +334,7 @@ def _value_checks_v2(
         harness, report
     )
     s = harness.shard_order
-    relay = relay_resolution(entries, s)
+    relay = relay_resolution(entries, s, harness.cell_order)
 
     # -- the above-shard ladder, from the leaf-column tier: a gather reads
     # its own member, a merge the relay member (§4.4, issue #538).

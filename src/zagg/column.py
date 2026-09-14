@@ -84,12 +84,13 @@ def raw_fold_boundary(node_order: int, cell_order: int, resolutions) -> int | No
 
     ``node_order + RAW_MEMBER_DEPTH`` when the column carries that member;
     ``None`` when the boundary is not finer than the cells themselves (a
-    fold from it IS a fold from raw) or when the declaration's finest leaf
-    resolution is coarser than it (nothing to fold flat from: every group
-    keeps the from-raw law, merges-from-raw 1, and the #538 memory bound
-    does not apply). Column members are contiguous from the finest declared
-    resolution down to the node (:func:`column_resolutions`), so the second
-    case is exactly a ``node_order + 1`` finest.
+    fold from it IS a fold from raw) or when the column carries no group at
+    it (nothing to fold flat from: every group keeps the from-raw law,
+    merges-from-raw 1, and the #538 memory bound does not apply). The second
+    case is MEMBERSHIP, not a floor on the finest declared resolution: a
+    declaration whose rungs skip the boundary while including something
+    coarser (``overviews: [12, 10]`` on the 19/13/9 geometry — members {12,
+    10, 9}) hits it with a finest resolution well above it.
     """
     boundary = int(node_order) + RAW_MEMBER_DEPTH
     if boundary < int(cell_order) and boundary in {int(r) for r in resolutions}:
@@ -117,25 +118,33 @@ def leaf_entry_merges_from_raw(levels: list, shard_order: int, cell_order: int) 
     return max(member_merges_from_raw(c, boundary) for c in cells)
 
 
-def relay_resolution(levels: list, shard_order: int) -> int:
+def relay_resolution(levels: list, shard_order: int, cell_order: int) -> int:
     """The member every above-shard merge folds from (spec §4.4, issue #538).
 
-    The leaf column's **coarsest member still folded from raw**: the raw-fold
-    boundary ``shard_order + RAW_MEMBER_DEPTH`` when the declaration's finest
-    leaf resolution reaches it (every group below is a flat second merge, so
-    a ladder merge consuming one would sit at gen 3), else the node-order
-    member (no boundary group exists — :func:`raw_fold_boundary` — and every
-    group is from raw). Either way a stage merge consuming it is exactly 2
-    merges from raw. Stage columns relay this member for their subtree
+    The leaf column's **coarsest member still folded from raw**, derived from
+    :func:`raw_fold_boundary` itself so the two can never disagree (review
+    finding): the boundary member when the column CARRIES one (every group
+    below it is a flat second merge, so a ladder merge consuming one would
+    sit at gen 3), else the node-order member — the one group every column
+    carries, and from raw whenever no boundary group exists. Either way a
+    stage merge consuming the relay is exactly 2 merges from raw.
+
+    Membership, not the finest declared resolution, is the predicate: a
+    declaration that straddles the boundary without carrying it
+    (``overviews: [12, 10]`` on the 19/13/9 geometry — members {12, 10, 9},
+    finest 12, no group 11) is legal, and relaying a member the leaf columns
+    do not hold would leave every above-shard merge level at fill. Stage
+    columns relay this member for their subtree
     (:func:`zagg.sweep_stage.column_members`). The leaf entry (``node ==
-    shard_order``) places the boundary; a ``levels`` list without one (a
-    hand-built manifest — ``expand_overviews`` always emits it) relays the
-    node-order member, the one group every column carries.
+    shard_order``) places the members; a ``levels`` list without one (a
+    hand-built manifest — ``expand_overviews`` always emits it) has no
+    column resolutions at all and relays the node-order member.
     """
     shard_order = int(shard_order)
-    boundary = shard_order + RAW_MEMBER_DEPTH
-    cells = [int(c) for e in levels if int(e["node"]) == shard_order for c in e["cells"]]
-    return boundary if cells and max(cells) >= boundary else shard_order
+    boundary = raw_fold_boundary(
+        shard_order, cell_order, column_resolutions(levels, shard_order)
+    )
+    return shard_order if boundary is None else int(boundary)
 
 
 def generation_key(block) -> tuple:
