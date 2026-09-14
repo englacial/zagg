@@ -246,7 +246,7 @@ def _assert_ancestor_or_equal(locs, contributors):
 
     contributors = np.asarray(contributors, dtype=np.uint64)
     hull = np.uint64(common_ancestor(contributors))
-    hull_order = int(orders_of(np.array([hull], dtype=np.uint64))[0])
+    hull_order = int(orders_of(hull)[0])
     loc_orders = np.asarray(orders_of(locs))
     for loc, order in zip(locs, loc_orders):
         assert np.any(clip2order(int(order), contributors) == loc), (
