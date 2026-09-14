@@ -75,19 +75,19 @@ def _cell_slabs(cells: dict, n_cells: int = LEAF_CELLS) -> dict:
     return {"count": count, "h_min": h_min, "h_tdigest": digest}
 
 
-def _make_leaf(root, decimal, cells):
+def _make_leaf(root, decimal, cells, shard_order=SHARD_ORDER, cell_order=CELL_ORDER):
     """One committed leaf on disk; returns its resident slabs (fold inputs)."""
     from mortie import generate_morton_children
 
     from zagg.grids.healpix import HealpixGrid
 
-    grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=_leaf_cfg())
+    grid = HealpixGrid(shard_order, cell_order, config=_leaf_cfg())
     word = morton_word(decimal)
     store = open_store(shard_leaf_path(str(root), word))
     grid.emit_shard_template(store, overwrite=True)
-    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
-    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
-    slabs = _cell_slabs(cells)
+    group = zarr.open_group(store, path=str(cell_order), mode="r+", zarr_format=3)
+    group["morton"][:] = np.asarray(generate_morton_children(word, cell_order), dtype=np.uint64)
+    slabs = _cell_slabs(cells, 4 ** (cell_order - shard_order))
     for name, slab in slabs.items():
         group[name][:] = slab
     stamp_commit(store, cells_with_data=len(cells), granule_count=1)
@@ -851,6 +851,53 @@ class TestSweepParity:
             open_store(f"{tmp_path}/-3/all.zarr"), path=str(SHARD_ORDER), mode="r", zarr_format=3
         )
         _assert_group_matches(node_overview, folded[SHARD_ORDER], 1)
+
+    def test_the_boundary_member_matches_the_sweep_at_a_boundary_geometry(self, tmp_path):
+        # The same oracle at a geometry that HAS a raw-fold boundary (review
+        # finding, issue #538): node 1 / cells 4, column {3, 2, 1}, boundary
+        # 3. A /1 sweep with orders [0] folds the leaf from raw to cells
+        # 0 + (4 - 1) = 3 — the boundary member — so the sweep's own kernels
+        # pin the from-raw law there, while the node member (a flat second
+        # merge of that group) is what the from-raw whole-leaf fold is not.
+        from zagg.sweep import run_sweep
+
+        manifest = {
+            "spec": "morton-hive/1",
+            "dataset": {"short_name": "TEST", "version": "1"},
+            "cell_order": BOUND_CELLS,
+            "shard_order": BOUND_NODE,
+            "split_schedule": [1] * BOUND_NODE,
+            "pyramid": {
+                "spec": PYRAMID_SPEC,
+                "overview": {
+                    "spacing": 1,
+                    "orders": [0],
+                    "fold_source": "leaves",
+                    "all_time": False,
+                    "fields": dict(FIELDS),
+                },
+            },
+            "generated_at": "2026-01-01T00:00:00+00:00",
+        }
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        slabs = _make_leaf(tmp_path, "-31", BOUND_OBS, BOUND_NODE, BOUND_CELLS)
+        result = run_sweep(str(tmp_path), [(morton_word("-31"), None)], families=("overview",))
+        assert result["families"]["overview"]["written"] == 1
+        folded = fold_column(
+            slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=BOUND_NODE
+        )
+        overview = zarr.open_group(
+            open_store(f"{tmp_path}/-3/all.zarr"), path="3", mode="r", zarr_format=3
+        )
+        # Leaf -31 is child 0 of node -3: overview rows 0..15 are its fold.
+        _assert_group_matches(overview, folded[3], 16)
+        # The node member is NOT the from-raw whole-leaf fold any more.
+        whole = merge_tdigests_kway(
+            [decode_digest(slabs["h_tdigest"][i], "float32") for i in sorted(BOUND_OBS)],
+            delta=DELTA,
+        )
+        assert bytes(folded[1]["h_tdigest"][0]) != encode_digest(whole, "float32")
+        np.testing.assert_array_equal(folded[1]["count"], [200 * len(BOUND_OBS)])
 
 
 def _root_meta_sans_timestamps(store) -> dict:
