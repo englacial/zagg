@@ -295,14 +295,17 @@ class TestPageSearch:
     def test_non_json_shares_the_gateway_retry_budget(self, fake_requests, monkeypatch):
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
         fake = fake_requests([_FakeResponse({}, status_code=503), _non_json()] * 2)
-        with pytest.raises(ValueError):
+        # match= is load-bearing: json.JSONDecodeError is itself a ValueError,
+        # so a bare pytest.raises(ValueError) would stay green with the
+        # diagnostic raise deleted and the decode error simply propagating.
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts"):
             _page_search("https://cmr/search", params={})
         assert len(fake.calls) == _RETRY_ATTEMPTS
 
     def test_exhausted_non_json_raise_is_diagnosable(self, fake_requests, monkeypatch):
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
         fake = fake_requests([_non_json()] * _RETRY_ATTEMPTS)
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
             _page_search("https://cmr/search", params={})
         msg = str(excinfo.value)
         assert "https://cmr/search" in msg
@@ -330,7 +333,7 @@ class TestPageSearch:
     def test_exhausted_non_json_raise_truncates_the_body(self, fake_requests, monkeypatch):
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
         fake_requests([_non_json(text="x" * 5000)] * _RETRY_ATTEMPTS)
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
             _page_search("https://cmr/search", params={})
         assert "x" * sources._BODY_SNIPPET in str(excinfo.value)
         assert "x" * (sources._BODY_SNIPPET + 1) not in str(excinfo.value)
@@ -340,7 +343,7 @@ class TestPageSearch:
         # two UTF-8 bytes, so a resp.text slice would echo 400 bytes, not 200.
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
         fake_requests([_non_json(text="é" * 5000)] * _RETRY_ATTEMPTS)
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
             _page_search("https://cmr/search", params={})
         head = "é".encode() * (sources._BODY_SNIPPET // 2)
         assert f"body[:{sources._BODY_SNIPPET}]={head!r}" in str(excinfo.value)
