@@ -1011,7 +1011,17 @@ frozen manifest hashes are pre-epoch:
 (Full digests are pinned in
 `tests/test_semantics.py::TestIndexExclusionEpoch::test_the_live_stores_migrate`
 against the stores' vendored build configs.) A config with no index block
-hashes identically under both epochs, so nothing else moves.
+hashes identically under both epochs, so no other *store* moves.
+
+Two packaged templates do: `atl03_tdigest_healpix_hive` (`1d818cf6…` →
+`818bdd69…`, its block `{backend: inline}`) and
+`gedi01b_waveform_healpix_hive` (`c812c910…` → `b55a152c…`,
+`{backend: hierarchical}`). The first now shares its digest with
+`atl03_tdigest_healpix` (`818bdd69…`): the default-valued `index` block was
+their only core-visible difference, so post-epoch the two templates name one
+D19 product identity — the ruling working as intended, not a defect. No live
+store is built from either template's unmodified digest, so this is a record,
+not a migration.
 
 **The migration — one tool, one write.** `zagg.semantics.semantic_hash_legacy`
 recomputes a config's *pre-epoch* digest (the current core with the index

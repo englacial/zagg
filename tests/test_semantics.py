@@ -780,6 +780,20 @@ class TestIndexExclusionEpoch:
         )
         assert semantic_hash_legacy(_cfg(data_source__index=None)) == semantic_hash(_cfg())
 
+    def test_the_two_atl03_templates_collapse(self):
+        # The packaged surface the epoch also moves: `index: {backend: inline}`
+        # (the absent-key default since #170) was the ONLY core-visible
+        # difference between these two templates, so post-epoch they name one
+        # D19 product identity — intended, and recorded in `hive_layout.md`.
+        from zagg.semantics import semantic_hash_legacy
+
+        flat, hive = (
+            default_config("atl03_tdigest_healpix"),
+            default_config("atl03_tdigest_healpix_hive"),
+        )
+        assert semantic_hash(flat) == semantic_hash(hive)
+        assert semantic_hash_legacy(flat) != semantic_hash_legacy(hive)
+
     def test_unknown_epoch_refuses(self):
         from zagg.semantics import LEGACY_EPOCHS, semantic_hash_legacy
 
