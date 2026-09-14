@@ -183,20 +183,23 @@ class TestV2FixtureE2E:
         assert json.loads(out_json.read_text())["passed"] is True
 
     def test_wide_column_group_declines_payload_parity_in_sampled_mode(self, tmp_path, monkeypatch):
-        # The §4.6 parity leg's span is the GEOMETRY's (one cell of the group
-        # at q covers 4**(cell_order - q) leaf cells), so sample_cells cannot
-        # bound it — a coarse group re-folds a whole leaf per sampled leaf.
-        # Above the bound the payload legs are declined and NAMED; counts
-        # (dense) still run, and full mode is never bounded.
+        # The §4.6 parity leg's span is the GEOMETRY's (one cell of a
+        # from-raw group at q covers 4**(cell_order - q) leaf cells), so
+        # sample_cells cannot bound it. Above the bound the payload legs are
+        # declined and NAMED; counts (dense) still run, and full mode is
+        # never bounded. The groups below the raw-fold boundary (4 and 3
+        # here, folded flat from the boundary group [5] — issue #538) fold
+        # δ-bounded boundary digests and are never declined.
         from zagg import pyramid_check_v2
 
         _build_store(tmp_path)
-        monkeypatch.setattr(pyramid_check_v2, "COLUMN_PARITY_FOLD_MAX", 4)
+        monkeypatch.setattr(pyramid_check_v2, "COLUMN_PARITY_FOLD_MAX", 3)
         report = validate_pyramid(str(tmp_path), sample_nodes=2, sample_cells=3, seed=7)
         assert report["passed"] is True, format_report(report)
-        declined = [w for w in report.get("warnings") or [] if "column group [3]" in w]
+        declined = [w for w in report.get("warnings") or [] if "column group [5]" in w]
         assert declined, format_report(report)
-        assert "64 leaf cells" in declined[0] and "counts still compared" in declined[0]
+        assert "4 leaf cells" in declined[0] and "counts still compared" in declined[0]
+        assert not any("column group [4]" in w or "column group [3]" in w for w in declined)
         assert report["sampled"]["counts"] > 0
         # ... and the bound does not apply in full (fixture) mode.
         full = validate_pyramid(str(tmp_path), full=True)
