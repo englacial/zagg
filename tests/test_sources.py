@@ -1,19 +1,25 @@
 """Tests for the metadata fetch layer (``zagg.catalog.sources``).
 
 Covers the generic ``STACSource`` (issue #218), the shared ``rel=next`` pager
-(CMR GET flow + POST/merge flow), asset subsetting, and the multi-asset /
-datetime extensions to ``granule_records()`` and ShardMap granule entries.
+(CMR GET flow + POST/merge flow, and its retry of gateway errors and of
+2xx-with-non-JSON bodies -- issue #562), asset subsetting, and the multi-asset
+/ datetime extensions to ``granule_records()`` and ShardMap granule entries.
 No network: ``requests`` is replaced with a scripted fake.
 """
+
+import json
+import logging
 
 import numpy as np
 import pyarrow as pa
 import pytest
 import stac_geoparquet.arrow as sga
+from requests.structures import CaseInsensitiveDict
 
 from zagg.catalog import sources
 from zagg.catalog.shardmap import ShardMap, _granule_entry
 from zagg.catalog.sources import (
+    _RETRY_ATTEMPTS,
     Catalog,
     STACQuery,
     STACSource,
@@ -67,17 +73,47 @@ def _page(items, next_link=None):
     return doc
 
 
+#: ``doc=_UNPARSEABLE`` means ``json()`` raises, as CMR's maintenance page does
+#: (#562). Distinct from ``doc=None``, which is a body that parses to ``null``.
+_UNPARSEABLE = object()
+
+
 class _FakeResponse:
-    def __init__(self, doc, status_code=200):
+    """A scripted response; ``doc=_UNPARSEABLE`` will not parse (#562).
+
+    ``content_type=None`` omits the header entirely.
+    """
+
+    def __init__(self, doc, status_code=200, *, text=None, content_type="application/json"):
         self._doc = doc
         self.status_code = status_code
+        # CaseInsensitiveDict, as real requests gives: an HTTP/2 origin sends
+        # "content-type" lowercase, and a plain dict would hide that.
+        self.headers = CaseInsensitiveDict(
+            {} if content_type is None else {"Content-Type": content_type}
+        )
+        if text is None:
+            text = "" if doc is _UNPARSEABLE else json.dumps(doc)
+        self.text = text
+        self.content = self.text.encode()
 
     def json(self):
+        if self._doc is _UNPARSEABLE:
+            raise json.JSONDecodeError("Expecting value", self.text, 0)
         return self._doc
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"status {self.status_code}")
+
+
+def _non_json(text="<html>CMR is down for maintenance</html>"):
+    """A 200 carrying CMR's maintenance page under an ``application/json`` header.
+
+    The exact #562 failure: the content-type is no help, and ``resp.json()``
+    raises ``JSONDecodeError: Expecting value: line 1 column 1``.
+    """
+    return _FakeResponse(_UNPARSEABLE, text=text)
 
 
 class _FakeRequests:
@@ -209,6 +245,148 @@ class TestPageSearch:
         with pytest.raises(RuntimeError, match="status 404"):
             _page_search("https://es/search", params={})
         assert len(fake.calls) == 1
+
+    def test_retries_2xx_non_json_body(self, fake_requests, monkeypatch):
+        # The #562 failure: a 200 maintenance page clears both the status
+        # filter and raise_for_status, so the body must drive the retry.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_non_json(), _page([_item("a", _h5_assets("a"))])])
+        items = _page_search("https://cmr/search", params={"limit": 1})
+        assert [it["id"] for it in items] == ["a"]
+        assert len(fake.calls) == 2
+
+    def test_retries_2xx_json_body_under_non_json_content_type(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests(
+            [_FakeResponse(page, content_type="text/html"), _FakeResponse(page)],
+        )
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 2
+
+    # A gateway banner served correctly as application/json parses fine and
+    # then dies in _page_search on doc.get("features") -- the #562 failure
+    # spelled AttributeError, unretried and with no endpoint named.
+    _WRONG_SHAPES = [(None, "NoneType"), ([], "list"), ("maintenance", "str")]
+
+    @pytest.mark.parametrize(("doc", "kind"), _WRONG_SHAPES)
+    def test_retries_2xx_json_body_of_the_wrong_shape(self, fake_requests, monkeypatch, doc, kind):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests([_FakeResponse(doc), _FakeResponse(page)])
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 2
+
+    @pytest.mark.parametrize(("doc", "kind"), _WRONG_SHAPES)
+    def test_exhausted_wrong_shape_raise_is_diagnosable(
+        self, fake_requests, monkeypatch, doc, kind
+    ):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_FakeResponse(doc)] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        msg = str(excinfo.value)
+        assert f"body parsed to {kind}, not a JSON object" in msg
+        assert "https://cmr/search" in msg
+        assert "status=200" in msg
+        assert "content-type='application/json'" in msg
+        assert len(fake.calls) == _RETRY_ATTEMPTS
+
+    def test_retry_warning_names_the_reason_and_the_attempt(
+        self, fake_requests, monkeypatch, caplog
+    ):
+        # CI-log attribution is the point of #562, so the warning's reason
+        # and its counter are both pinned.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake_requests([_non_json(), _FakeResponse({}, status_code=503), _FakeResponse(page)])
+        with caplog.at_level(logging.WARNING):
+            _page_search("https://cmr/search", params={})
+        lines = [r.getMessage() for r in caplog.records]
+        assert len(lines) == 2
+        assert "no usable JSON body (Expecting value" in lines[0]
+        assert f"(attempt 1/{_RETRY_ATTEMPTS})" in lines[0]
+        assert "status 503" in lines[1]
+        assert f"(attempt 2/{_RETRY_ATTEMPTS})" in lines[1]
+
+    def test_content_type_gate_reads_a_lowercase_header(self, fake_requests, monkeypatch):
+        # HTTP/2 origins send "content-type" lowercase on the wire; requests
+        # normalises, so the gate must not depend on the header's casing.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        html = _FakeResponse(page, content_type=None)
+        html.headers["content-type"] = "text/html"
+        fake = fake_requests([html, _FakeResponse(page)])
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 2
+
+    def test_missing_content_type_accepts_json_body(self, fake_requests):
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests([_FakeResponse(page, content_type=None)])
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 1
+
+    def test_non_json_shares_the_gateway_retry_budget(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_FakeResponse({}, status_code=503), _non_json()] * 2)
+        # match= is load-bearing: json.JSONDecodeError is itself a ValueError,
+        # so a bare pytest.raises(ValueError) would stay green with the
+        # diagnostic raise deleted and the decode error simply propagating.
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts"):
+            _page_search("https://cmr/search", params={})
+        assert len(fake.calls) == _RETRY_ATTEMPTS
+
+    def test_exhausted_non_json_raise_is_diagnosable(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_non_json()] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        msg = str(excinfo.value)
+        assert "https://cmr/search" in msg
+        assert "status=200" in msg
+        assert "content-type='application/json'" in msg
+        assert "CMR is down for maintenance" in msg
+        assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+        assert len(fake.calls) == _RETRY_ATTEMPTS
+
+    def test_exhausted_content_type_raise_names_the_header(self, fake_requests, monkeypatch):
+        # The body here parses; the header is the disqualifier, so the raise
+        # must say so rather than call a visibly-JSON body "non-JSON".
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests([_FakeResponse(page, content_type="text/html")] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        msg = str(excinfo.value)
+        assert "content-type 'text/html' is not JSON" in msg
+        assert "content-type='text/html'" in msg
+        assert isinstance(excinfo.value.__cause__, ValueError)
+        assert not isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+        assert len(fake.calls) == _RETRY_ATTEMPTS
+
+    def test_exhausted_non_json_raise_truncates_the_body(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake_requests([_non_json(text="x" * 5000)] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        assert "x" * sources._BODY_SNIPPET in str(excinfo.value)
+        assert "x" * (sources._BODY_SNIPPET + 1) not in str(excinfo.value)
+
+    def test_exhausted_non_json_raise_bounds_the_body_in_bytes(self, fake_requests, monkeypatch):
+        # The snippet is sliced off resp.content: "e" with an acute accent is
+        # two UTF-8 bytes, so a resp.text slice would echo 400 bytes, not 200.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake_requests([_non_json(text="é" * 5000)] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        head = "é".encode() * (sources._BODY_SNIPPET // 2)
+        assert f"body[:{sources._BODY_SNIPPET}]={head!r}" in str(excinfo.value)
+
+    def test_gateway_error_after_non_json_still_raises_its_status(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake_requests([_non_json()] * (_RETRY_ATTEMPTS - 1) + [_FakeResponse({}, status_code=502)])
+        with pytest.raises(RuntimeError, match="status 502"):
+            _page_search("https://cmr/search", params={})
 
     def test_default_page_size_stays_under_gateway_ceiling(self, fake_requests):
         # Earth Search 502s (not clamps) above ~300 items/page; the default
