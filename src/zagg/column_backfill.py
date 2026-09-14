@@ -82,8 +82,9 @@ logger = logging.getLogger(__name__)
 #: Share of the lease TTL a beat must land inside — the throttle
 #: :mod:`zagg.sweep_stages` uses, and for the same reason. The beat is thrown
 #: by the WALL CLOCK, never by a leaf count: nothing bounds what one leaf
-#: costs (:func:`zagg.column.write_leaf_column`'s node-order k-way merge is
-#: measured in GB, and this pass reads the whole leaf on top of it), so a
+#: costs (:func:`zagg.column.write_leaf_column`'s boundary-member k-way
+#: merges scale with the leaf, and this pass reads the whole leaf on top of
+#: them), so a
 #: count-based interval is an unenforced assumption about seconds per leaf and
 #: a slow run silently outlives the TTL while still writing (review finding,
 #: issue #520). A ``time.monotonic()`` per leaf costs nothing; a PUT per leaf
@@ -580,6 +581,7 @@ def column_from_leaf(
         fields,
         cell_order=int(cell_order),
         resolutions=resolutions,
+        node_order=int(node_order),
     )
 
 
