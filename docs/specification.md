@@ -1371,7 +1371,12 @@ guessed at.
   member `d` orders above the node merges `1/4^d` of the shard's centroid
   rows in one call, and at the node member that is the whole shard — ~100 B
   of peak memory per row, the 0.52 fleet's OOMs at 4 GB — whereas the
-  boundary bounds any single merge to a sixteenth of the shard. When the
+  boundary bounds any single merge to **one boundary cell** — a sixteenth
+  of the shard only under uniform occupancy, and the bound is the cell, not
+  the fraction. Measured across the 39 fattest shards of the CA ATL03
+  store: the largest res-(order+2) cell holds 6.04 M rows, 9.8% of its
+  61.7 M-row shard, with a p50 of 9.6% and a maximum of 14.0% — ~0.6 GB at
+  ~100 B per row, against the 4 GB worker tier. When the
   boundary is not strictly below the cell order (`order + 2 ≥ cell order`),
   or the column carries **no group at `order + 2`** (the declaration's rungs
   skip it — `[12, 10]` on the 19/13/9 geometry gives members {12, 10, 9},
