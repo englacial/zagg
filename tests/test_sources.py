@@ -1,10 +1,13 @@
 """Tests for the metadata fetch layer (``zagg.catalog.sources``).
 
 Covers the generic ``STACSource`` (issue #218), the shared ``rel=next`` pager
-(CMR GET flow + POST/merge flow), asset subsetting, and the multi-asset /
-datetime extensions to ``granule_records()`` and ShardMap granule entries.
+(CMR GET flow + POST/merge flow, and its retry of gateway errors and of
+2xx-with-non-JSON bodies -- issue #562), asset subsetting, and the multi-asset
+/ datetime extensions to ``granule_records()`` and ShardMap granule entries.
 No network: ``requests`` is replaced with a scripted fake.
 """
+
+import json
 
 import numpy as np
 import pyarrow as pa
@@ -14,6 +17,7 @@ import stac_geoparquet.arrow as sga
 from zagg.catalog import sources
 from zagg.catalog.shardmap import ShardMap, _granule_entry
 from zagg.catalog.sources import (
+    _RETRY_ATTEMPTS,
     Catalog,
     STACQuery,
     STACSource,
@@ -68,16 +72,34 @@ def _page(items, next_link=None):
 
 
 class _FakeResponse:
-    def __init__(self, doc, status_code=200):
+    """A scripted response; ``doc=None`` means the body will not parse (#562).
+
+    ``content_type=None`` omits the header entirely.
+    """
+
+    def __init__(self, doc, status_code=200, *, text=None, content_type="application/json"):
         self._doc = doc
         self.status_code = status_code
+        self.headers = {} if content_type is None else {"Content-Type": content_type}
+        self.text = json.dumps(doc) if text is None else text
 
     def json(self):
+        if self._doc is None:
+            raise json.JSONDecodeError("Expecting value", self.text, 0)
         return self._doc
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"status {self.status_code}")
+
+
+def _non_json(text="<html>CMR is down for maintenance</html>"):
+    """A 200 carrying CMR's maintenance page under an ``application/json`` header.
+
+    The exact #562 failure: the content-type is no help, and ``resp.json()``
+    raises ``JSONDecodeError: Expecting value: line 1 column 1``.
+    """
+    return _FakeResponse(None, text=text)
 
 
 class _FakeRequests:
@@ -209,6 +231,64 @@ class TestPageSearch:
         with pytest.raises(RuntimeError, match="status 404"):
             _page_search("https://es/search", params={})
         assert len(fake.calls) == 1
+
+    def test_retries_2xx_non_json_body(self, fake_requests, monkeypatch):
+        # The #562 failure: a 200 maintenance page clears both the status
+        # filter and raise_for_status, so the body must drive the retry.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_non_json(), _page([_item("a", _h5_assets("a"))])])
+        items = _page_search("https://cmr/search", params={"limit": 1})
+        assert [it["id"] for it in items] == ["a"]
+        assert len(fake.calls) == 2
+
+    def test_retries_2xx_json_body_under_non_json_content_type(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests(
+            [_FakeResponse(page, content_type="text/html"), _FakeResponse(page)],
+        )
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 2
+
+    def test_missing_content_type_accepts_json_body(self, fake_requests):
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests([_FakeResponse(page, content_type=None)])
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 1
+
+    def test_non_json_shares_the_gateway_retry_budget(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_FakeResponse({}, status_code=503), _non_json()] * 2)
+        with pytest.raises(ValueError):
+            _page_search("https://cmr/search", params={})
+        assert len(fake.calls) == _RETRY_ATTEMPTS
+
+    def test_exhausted_non_json_raise_is_diagnosable(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_non_json()] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError) as excinfo:
+            _page_search("https://cmr/search", params={})
+        msg = str(excinfo.value)
+        assert "https://cmr/search" in msg
+        assert "status=200" in msg
+        assert "content-type='application/json'" in msg
+        assert "CMR is down for maintenance" in msg
+        assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+        assert len(fake.calls) == _RETRY_ATTEMPTS
+
+    def test_exhausted_non_json_raise_truncates_the_body(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake_requests([_non_json(text="x" * 5000)] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError) as excinfo:
+            _page_search("https://cmr/search", params={})
+        assert "x" * sources._BODY_SNIPPET in str(excinfo.value)
+        assert "x" * (sources._BODY_SNIPPET + 1) not in str(excinfo.value)
+
+    def test_gateway_error_after_non_json_still_raises_its_status(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake_requests([_non_json()] * (_RETRY_ATTEMPTS - 1) + [_FakeResponse({}, status_code=502)])
+        with pytest.raises(RuntimeError, match="status 502"):
+            _page_search("https://cmr/search", params={})
 
     def test_default_page_size_stays_under_gateway_ceiling(self, fake_requests):
         # Earth Search 502s (not clamps) above ~300 items/page; the default

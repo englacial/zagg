@@ -175,25 +175,55 @@ _RETRY_STATUSES = (502, 503, 504)
 _RETRY_ATTEMPTS = 4
 _RETRY_BACKOFF_S = 2.0
 
+#: Bytes of an unparseable body echoed in the exhausted-retry raise (#562), so
+#: a CI log alone attributes the failure to its endpoint and page.
+_BODY_SNIPPET = 200
 
-def _search_request(url, *, params=None, body=None, timeout=60):
-    """One item-search request, retrying transient gateway errors.
 
-    Retries ``_RETRY_STATUSES`` with exponential backoff (``_RETRY_ATTEMPTS``
-    tries total); any other status falls through to ``raise_for_status`` on
-    the first response, an exhausted retry budget on the last.
+def _json_body(resp) -> dict:
+    """Parsed JSON body of a search response.
+
+    Raises ``ValueError`` (``json.JSONDecodeError`` is one) when the body is
+    not JSON. CMR-STAC transiently answers **200 with a maintenance/HTML
+    page**, which clears both ``_RETRY_STATUSES`` and ``raise_for_status``
+    (issue #562). A declared non-JSON content-type is taken at its word; an
+    absent one is not held against an otherwise parseable body.
     """
+    ctype = resp.headers.get("Content-Type", "")
+    if ctype and "json" not in ctype.lower():
+        raise ValueError(f"content-type {ctype!r} is not JSON")
+    return resp.json()
+
+
+def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
+    """One item-search request, retrying transient failures; returns the doc.
+
+    Retries ``_RETRY_STATUSES`` *and* 2xx responses whose body is not JSON
+    (issue #562) with exponential backoff (``_RETRY_ATTEMPTS`` tries total),
+    under one shared budget. Any other status falls through to
+    ``raise_for_status`` on the first response; an exhausted budget raises
+    that status, or -- for a 2xx -- a ValueError naming the status,
+    content-type and head of the body, chained to the decode error.
+    """
+    bad: ValueError | None = None
     for attempt in range(_RETRY_ATTEMPTS):
         if body is not None:
             resp = requests.post(url, json=body, timeout=timeout)
         else:
             resp = requests.get(url, params=params, timeout=timeout)
-        if resp.status_code not in _RETRY_STATUSES or attempt == _RETRY_ATTEMPTS - 1:
+        bad = None
+        if resp.status_code not in _RETRY_STATUSES:
+            resp.raise_for_status()
+            try:
+                return _json_body(resp)
+            except ValueError as exc:
+                bad = exc
+        if attempt == _RETRY_ATTEMPTS - 1:
             break
         wait = _RETRY_BACKOFF_S * 2**attempt
         logging.warning(
             "STAC search got %s from %s; retrying in %.0fs (%d/%d)",
-            resp.status_code,
+            f"a non-JSON body ({bad})" if bad else f"status {resp.status_code}",
             url,
             wait,
             attempt + 1,
@@ -201,7 +231,11 @@ def _search_request(url, *, params=None, body=None, timeout=60):
         )
         time.sleep(wait)
     resp.raise_for_status()
-    return resp
+    raise ValueError(
+        f"STAC search at {url} returned a non-JSON body after {_RETRY_ATTEMPTS} attempts: "
+        f"status={resp.status_code} content-type={resp.headers.get('Content-Type', '')!r} "
+        f"body[:{_BODY_SNIPPET}]={resp.text[:_BODY_SNIPPET]!r}"
+    ) from bad
 
 
 def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
@@ -214,8 +248,7 @@ def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
     """
     items: list[dict] = []
     while True:
-        resp = _search_request(url, params=params, body=body, timeout=timeout)
-        doc = resp.json()
+        doc = _search_request(url, params=params, body=body, timeout=timeout)
         feats = doc.get("features", [])
         items.extend(feats)
         nxt = next((ln for ln in doc.get("links", []) if ln.get("rel") == "next"), None)
