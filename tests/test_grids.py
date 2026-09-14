@@ -1006,7 +1006,7 @@ class TestShardLabel:
         from zagg.grids.morton import morton_decimal, morton_decimals_from_words
 
         words = [
-            int(geo2mort(np.array([lat]), np.array([lon]), order=order)[0])
+            int(geo2mort(lat, lon, order=order)[0])
             for lat, lon in [(-78.5, -132.0), (78.3, 12.0), (-72.1, 25.4), (0.1, 0.1)]
             for order in (0, 6, 9, 18)
         ]
