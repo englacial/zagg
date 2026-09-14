@@ -98,6 +98,42 @@ def member_merges_from_raw(res: int, boundary: int | None) -> int:
     return 2 if boundary is not None and int(res) < boundary else 1
 
 
+def leaf_entry_merges_from_raw(levels: list, shard_order: int, cell_order: int) -> int:
+    """The §4.5 leaf-entry ``actuals`` value: the worst of its declared cells.
+
+    The entry is one record over every declared leaf resolution, so it
+    carries the MAXIMUM of :func:`member_merges_from_raw` over them — 1 when
+    every declared resolution is at or above the raw-fold boundary, 2 when
+    the entry declares one below it (the finisher's record and the
+    pyramid-check expectation share this one definition).
+    """
+    shard_order = int(shard_order)
+    boundary = raw_fold_boundary(shard_order, cell_order, column_resolutions(levels, shard_order))
+    cells = [int(c) for e in levels if int(e["node"]) == shard_order for c in e["cells"]]
+    return max(member_merges_from_raw(c, boundary) for c in cells)
+
+
+def relay_resolution(levels: list, shard_order: int) -> int:
+    """The member every above-shard merge folds from (spec §4.4, issue #538).
+
+    The leaf column's **coarsest member still folded from raw**: the raw-fold
+    boundary ``shard_order + RAW_MEMBER_DEPTH`` when the declaration's finest
+    leaf resolution reaches it (every group below is a flat second merge, so
+    a ladder merge consuming one would sit at gen 3), else the node-order
+    member (no boundary group exists — :func:`raw_fold_boundary` — and every
+    group is from raw). Either way a stage merge consuming it is exactly 2
+    merges from raw. Stage columns relay this member for their subtree
+    (:func:`zagg.sweep_stage.column_members`). The leaf entry (``node ==
+    shard_order``) places the boundary; a ``levels`` list without one (a
+    hand-built manifest — ``expand_overviews`` always emits it) relays the
+    node-order member, the one group every column carries.
+    """
+    shard_order = int(shard_order)
+    boundary = shard_order + RAW_MEMBER_DEPTH
+    cells = [int(c) for e in levels if int(e["node"]) == shard_order for c in e["cells"]]
+    return boundary if cells and max(cells) >= boundary else shard_order
+
+
 def generation_key(block) -> tuple:
     """The staged sweep's skip-gate key over a summed ``generation`` block.
 

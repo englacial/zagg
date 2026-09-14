@@ -625,10 +625,11 @@ class TestV2Corruption:
         assert report["partial_columns"] == ["-3111"]
 
     def test_broken_column_group_fails_leaf_parity(self, tmp_path):
-        # Corrupt a column's node-order partial: the §4.6 from-leaves parity
-        # catches it, and so does the merge level that consumed the original.
+        # Corrupt a column's relay member (the res-5 boundary partial, issue
+        # #538): the §4.6 from-leaves parity catches it, and so does the merge
+        # level that consumed the original.
         _build_store(tmp_path)
-        group = _column_group(tmp_path, "-3/1/1/1", 3)
+        group = _column_group(tmp_path, "-3/1/1/1", 5)
         counts = group["count"][:]
         counts[0] += 5
         group["count"][:] = counts
@@ -637,6 +638,22 @@ class TestV2Corruption:
         mismatches = report["checks"]["counts"]["mismatches"]
         assert any(m.startswith("-3111[") for m in mismatches), mismatches  # column vs leaf
         assert any(m.startswith("-3[") for m in mismatches), mismatches  # merge level vs column
+
+    def test_broken_node_member_fails_parity_at_its_gather(self, tmp_path):
+        # The node-order member is a flat second merge now, consumed by the
+        # cells-3 GATHER at order 2 — never by a merge: the column parity (vs
+        # the boundary group) and that gather level catch it, and the merge
+        # level above, which reads the intact relay, stays clean.
+        _build_store(tmp_path)
+        group = _column_group(tmp_path, "-3/1/1/1", 3)
+        counts = group["count"][:]
+        counts[0] += 5
+        group["count"][:] = counts
+        report = validate_pyramid(str(tmp_path), full=True)
+        mismatches = report["checks"]["counts"]["mismatches"]
+        assert any(m.startswith("-3111[") for m in mismatches), mismatches
+        assert any(m.startswith("-31[") for m in mismatches), mismatches  # gather vs column
+        assert not any(m.startswith("-3[") for m in mismatches), mismatches
 
     def test_stale_column_after_leaf_rewrite(self, tmp_path):
         # Base data moved, the column did not (the repair is the idempotent
