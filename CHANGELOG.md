@@ -20,12 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fattest CA ATL03 shards the largest res-(s+2) cell holds 6.04 M rows, 9.8% of
   its 61.7 M-row shard (p50 9.6%, max 14.0%), i.e. ~0.6 GB at ~100 B/row
   against the 4 GB tier. The boundary is the constant
-  `zagg.column.RAW_MEMBER_DEPTH = 2`, not a knob. The `/2` ladder's stage-merge relay member moves from the node-order
-  partial to the res-(s+2) partial (`zagg.column.relay_resolution`), so every
-  stage-merge level stays exactly 2 merges from raw; stage columns relay that
-  member. Exact-class values are unchanged; digest and composition bytes at
-  cells `s`/`s+1` and at every stage-merge level change, the `/2` byte-identity
-  oracle (CLI fold ≡ fleet fold) holds, and the manifest leaf-entry `actuals`
+  `zagg.column.RAW_MEMBER_DEPTH = 2`, not a knob. The `/2` ladder's stage-merge
+  relay member moves from the node-order partial to the res-(s+2) partial
+  (`zagg.column.relay_resolution`), so every stage-merge level stays exactly 2
+  merges from raw; stage columns relay that member. That trades the leaf-side
+  win for a ~16× ladder tier: a relay member carries 16 δ-bounded digests where
+  the node member carried 1, so a stage merge k-ways 64 sources per output cell
+  where it k-wayed 4, and one T1 stage node over 64 leaves relays ~16 × 64 × 512
+  centroids (~524k rows, tens of MB) — δ-bounded and tiny next to the leaf tier,
+  with no invoke-payload impact (payloads carry node decimals and leaf refs,
+  never partials). Exact-class values are unchanged; digest and composition
+  bytes at cells `s`/`s+1` and at every stage-merge level change, the `/2`
+  byte-identity oracle (CLI fold ≡ fleet fold) holds on the boundary-relay
+  geometry as well as the node-relay one, and the manifest leaf-entry `actuals`
   record the worst of the entry's declared cells. Spec §4.4/§4.5/§4.6 and the
   `pyramid/` fixture's actuals updated. The worker also releases the aggregate
   it no longer needs before the fold.
