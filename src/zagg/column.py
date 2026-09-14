@@ -65,13 +65,17 @@ LEAF_REGIME = "leaf-column"
 #: node_order + RAW_MEMBER_DEPTH`` fold from the leaf's resident cells; the
 #: coarser members fold FLAT from that boundary member — one k-way call per
 #: output cell over its already-quantized boundary cells, never chained —
-#: and record ``merges_from_raw`` 2. A from-raw fold of the member ``d``
-#: orders above the node merges ``1 / 4**d`` of the shard's centroid rows in
-#: one call at ~100 B per row of peak memory (the node-order member merged
-#: the whole shard: 2.2 GB at the CA store's p90, 6.8 GB at its largest
-#: shard — the 0.52 fleet's OOMs); at depth 2 the largest merge is 1/16 of
-#: the shard. A constant, not a knob: polar zones ingest per year, so the
-#: density that would motivate tuning it does not arise (espg ruling).
+#: and record ``merges_from_raw`` 2. The largest single merge is then the
+#: LARGEST BOUNDARY CELL's centroid rows — ``1 / 4**RAW_MEMBER_DEPTH`` of the
+#: shard under uniform occupancy, more where photons concentrate (the bound
+#: is the cell, not the fraction) — at ~100 B per row of peak memory, where
+#: the node-order member merged the whole shard (2.2 GB at the CA store's
+#: p90, 6.8 GB at its largest shard — the 0.52 fleet's OOMs). Measured on
+#: the CA store's 39 fattest shards, the largest res-11 cell holds 6.0 M
+#: rows (14% of its shard at most; ICESat-2 tracks cross every res-11
+#: cell), so the worst boundary merge is ~0.6 GB against the 4 GB tier. A
+#: constant, not a knob: polar zones ingest per year, so the density that
+#: would motivate tuning it does not arise (espg ruling).
 RAW_MEMBER_DEPTH = 2
 
 
@@ -886,19 +890,20 @@ def write_leaf_column(
     retry rewrites leaf and column wholesale (both writers clear their own
     prefix first).
 
-    Memory note (issue #538): the largest single k-way merge is one
-    raw-fold-boundary cell — ``1 / 4**RAW_MEMBER_DEPTH`` of the shard's
-    resident centroid rows (a 16th, on the o9/o19 reference geometry), at
-    ~100 B per row of peak (float64 compress temporaries, the lexsort, the
-    Rust-side companion reducers) — so the fold's transient is ~6 B per
-    shard photon rather than the ~95–100 B the node-order member cost when
-    it merged the whole shard at once (2.2 GB at the CA store's p90 of 21.8 M
-    photons, 6.8 GB at its 67.8 M maximum: the 0.52 fleet's 47/251 OOMs at
-    4 GB). The coarse members then merge δ-bounded boundary digests, which
-    is small by construction. The transient still rides ON TOP of whatever
-    the worker holds at this hook (``staged`` itself, at least): on Lambda
-    that releases only once the handler returns from
-    ``process_and_write_hive``.
+    Memory note (issue #538): the largest single k-way merge is the
+    LARGEST raw-fold-boundary cell's resident centroid rows — a 16th of the
+    shard under uniform occupancy on the o9/o19 reference geometry, up to
+    the whole shard if every photon sat in one res-11 cell; on the CA store's
+    fattest shards the largest res-11 cell is 14% of its shard — at ~100 B
+    per row of peak (float64 compress temporaries, the lexsort, the
+    Rust-side companion reducers), where the node-order member cost that per
+    shard photon when it merged the whole shard at once (2.2 GB at the CA
+    store's p90 of 21.8 M photons, 6.8 GB at its 67.8 M maximum: the 0.52
+    fleet's 47/251 OOMs at 4 GB). The coarse members then merge δ-bounded
+    boundary digests, which is small by construction. The transient still
+    rides ON TOP of whatever the worker holds at this hook (``staged``
+    itself, at least): on Lambda that releases only once the handler
+    returns from ``process_and_write_hive``.
     """
     store_kwargs = dict(store_kwargs or {})
     # The gate re-validates a declaration the templating path already
