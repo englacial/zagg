@@ -236,13 +236,15 @@ def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
         if attempt == _RETRY_ATTEMPTS - 1:
             break
         wait = _RETRY_BACKOFF_S * 2**attempt
+        # Counted in attempts, not retries, so this agrees with the
+        # "after N attempts" the exhausted raise below prints.
         logging.warning(
-            "STAC search got %s from %s; retrying in %.0fs (%d/%d)",
-            f"a non-JSON body ({bad})" if bad else f"status {resp.status_code}",
+            "STAC search got %s from %s; retrying in %.0fs (attempt %d/%d)",
+            f"no usable JSON body ({bad})" if bad else f"status {resp.status_code}",
             url,
             wait,
             attempt + 1,
-            _RETRY_ATTEMPTS - 1,
+            _RETRY_ATTEMPTS,
         )
         time.sleep(wait)
     resp.raise_for_status()
