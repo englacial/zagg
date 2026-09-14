@@ -1357,7 +1357,22 @@ class TestGediTemplate:
         flux = cfg.aggregation["variables"]["rx_flux"]
         assert flux["params"]["delta"] == 8192
         assert "operating_point" in flux["attrs"]  # clip provenance
-        assert flux["attrs"]["gain_name"]
+        # The §2.0 weights declaration (issue #424): the digest's weight column
+        # is calibrated flux, with the required gain-provenance MAPPING (name +
+        # version at minimum) beside it — the shape validate_config enforces
+        # for a flux-declared field.
+        assert flux["weights"] == "flux"
+        assert flux["attrs"]["gain"] == {
+            "name": "unit",
+            "version": "gedi01b-v002-placeholder",
+            "value": 1.0,
+        }
+        # The provenance `value` and the reducer's `params.gain` are two
+        # literals in the YAML; the mirror is what makes the stored provenance
+        # true. Editing one to a real GEDI constant without the other would
+        # ship confidently-wrong calibration provenance, which is worse than
+        # the absent provenance §2.0 exists to outlaw — so pin the mirror.
+        assert flux["params"]["gain"] == flux["attrs"]["gain"]["value"]
         assert len(cfg.data_source["groups"]) == 8
 
     def test_measured_envelope(self, cfg):

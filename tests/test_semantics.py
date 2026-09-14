@@ -705,3 +705,46 @@ class TestTimeSourceHashing:
         for name in ("atl03_tdigest_located_healpix", "gedi01b_waveform_healpix_hive"):
             clock = semantic_core(default_config(name))["output"]["time_source"]
             assert clock["field"] == "delta_time" and clock["scale"] == "gps"
+
+
+class TestGediTemplateFluxDeclaration:
+    """The packaged GEDI template's §2.0 flux declaration is a deliberate
+    identity flip (issue #424; espg-ruled 2026-08-24).
+
+    The rx_flux weight column has ALWAYS been (count - noise_mean) * gain
+    floats; what changed is that the template now says so (``weights: flux``
+    plus the required gain-provenance mapping). ``weights: "flux"`` is
+    output-defining, so the template's semantic hash moves — both forms are
+    pinned as constants so the flip stays visible and cannot recur silently.
+    Stores built from the prior counts-defaulting form (the SERC flux store
+    and probes) keep THEIR configs and THEIR hash; only new builds declare.
+    """
+
+    # The shipped template, weights: flux + attrs.gain mapping (this change).
+    FLUX_HASH = "7e0bf1818efa9259194bb43d0d1eaf7f23b5d9122d00b14797e28f1a5d9d02dd"
+    # The prior counts-defaulting form: no weights key, flat gain_name /
+    # gain_version / gain attrs. This is what the SERC stores were built from,
+    # but `_prior_form()` only RECONSTRUCTS it — from HEAD's template, so it
+    # tracks "this template minus this PR's flip", not a frozen snapshot. The
+    # LITERAL below is the freeze: a later semantic edit to the template (a
+    # `delta` change, a filter, `time_source`) moves the reconstruction, this
+    # constant fails, and whoever makes the edit has to decide deliberately
+    # rather than drift past it.
+    COUNTS_HASH = "c812c910f86057f9899aef3128a685d2ef78c5cbe26e7c90ae044f4d77feb4bd"
+
+    def _prior_form(self) -> PipelineConfig:
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        rx = cfg.aggregation["variables"]["rx_flux"]
+        del rx["weights"]
+        del rx["attrs"]["gain"]
+        rx["attrs"].update(
+            {"gain_name": "unit", "gain_version": "gedi01b-v002-placeholder", "gain": 1.0}
+        )
+        return cfg
+
+    def test_the_shipped_template_hash_is_pinned(self):
+        assert semantic_hash(default_config("gedi01b_waveform_healpix_hive")) == self.FLUX_HASH
+
+    def test_the_prior_counts_form_hashes_differently(self):
+        assert semantic_hash(self._prior_form()) == self.COUNTS_HASH
+        assert self.FLUX_HASH != self.COUNTS_HASH

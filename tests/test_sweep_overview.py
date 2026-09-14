@@ -766,6 +766,12 @@ class TestWaveformPyramidDeclaration:
             "delta": 4096,
             "overview_delta": 512,
             "temporal": "per-centroid",
+            # The template's §2.0 declaration reaches the manifest entry with
+            # its calibration provenance riding along — the ONLY description
+            # the overview writer reconstructs the field from, so every ladder
+            # level is stamped flux instead of defaulting to counts.
+            "weights": "flux",
+            "gain": {"name": "unit", "version": "gedi01b-v002-placeholder", "value": 1.0},
         }
         assert "rx_flux" not in excluded
         # Non-vacuous pin on the SAME probe config: the capped fallback can
@@ -809,6 +815,7 @@ class TestWaveformPyramidDeclaration:
         assert rx["class"] == "approximate"
         assert rx["temporal"] == "per-centroid"
         assert rx["overview_delta"] == 512
+        assert rx["weights"] == "flux"  # §2.0 declaration at every level
 
     def test_overview_template_emits_the_times_sibling(self, tmp_path):
         # The companion path at overview levels (issue #410, per-centroid at

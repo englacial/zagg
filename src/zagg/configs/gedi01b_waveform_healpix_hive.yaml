@@ -184,23 +184,15 @@ aggregation:
       inner_shape: [2]
       dtype: float32
       fill_value: 0
-      # weights: flux            # PR #431 rebase: the section-2.0 weights
-      #                          # declaration lands there; enable on rebase.
-      #                          # Load-bearing for the pyramid below, not just
-      #                          # for the leaf: `zagg.pyramid.declared_fields`
-      #                          # keys `weights` (and the `gain` beside it)
-      #                          # into the manifest entry ONLY when it is set,
-      #                          # and `sweep_overview._overview_config` carries
-      #                          # that pair into every overview level's
-      #                          # template on the same condition. Commented
-      #                          # out, leaf and overview agree by ABSENCE --
-      #                          # which spec section 2.0 makes readers take as
-      #                          # `counts`, i.e. integer observation counts,
-      #                          # while these weights are (count - noise_mean)
-      #                          # * gain floats. Enable this before building a
-      #                          # GEDI ladder anyone will analyze; until then
-      #                          # every level is mis-declared the same way the
-      #                          # leaf already is.
+      # The section-2.0 weights declaration (issue #424): these weights are
+      # (count - noise_mean) * gain floats -- calibrated flux, not integer
+      # observation counts, and the store must say so. Load-bearing for the
+      # pyramid below, not just for the leaf: `zagg.pyramid.declared_fields`
+      # keys `weights` (and the `gain` provenance beside it) into the
+      # manifest entry ONLY when it is set, and
+      # `sweep_overview._overview_config` carries that pair into every
+      # overview level's template on the same condition.
+      weights: flux
       params:
         delta: 8192              # ratified cross-sensor floor (issue #422, decision 7)
         counts: rxwaveform       # params-as-column: per-sample ADC values
@@ -212,10 +204,14 @@ aggregation:
         correlation_length: 5    # receiver noise correlation, samples
       attrs:
         # Provenance (issue #321 field attrs): the named/versioned gain and
-        # the declared operating point the clip threshold derives from.
-        gain_name: "unit"
-        gain_version: "gedi01b-v002-placeholder"
-        gain: 1.0
+        # the declared operating point the clip threshold derives from. The
+        # `gain` mapping is the section-2.0 calibration provenance the flux
+        # declaration above REQUIRES (name + version at minimum, issue #424);
+        # `value` is the constant itself, mirroring params.gain.
+        gain:
+          name: "unit"
+          version: "gedi01b-v002-placeholder"
+          value: 1.0
         clip: "threshold-to-zero"
         operating_point:
           false_positive_rate: 1.0e-3
@@ -284,10 +280,10 @@ output:
   store_layout: hive
   pyramid: false                 # opt-in (runbook: CA builds pyramids-off on
                                  # 0.49); rx_flux classifies approximate since
-                                 # issue #508, so pyramid: {} builds the ladder
-                                 # -- but read rx_flux's `weights: flux` note
-                                 # first: until PR #431 enables it, every level
-                                 # of that ladder declares itself `counts`.
+                                 # issue #508, so pyramid: {} builds the ladder,
+                                 # and every level inherits rx_flux's
+                                 # `weights: flux` declaration + gain provenance
+                                 # via the manifest (declared_fields).
 
 worker:
   memory: 4096                   # optimized probe (run 5d081b68, 4/4 green):
