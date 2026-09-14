@@ -1673,9 +1673,9 @@ def process_and_write_hive(
     # vlen array (the unsharded flat layout) — named here, not built.
     # Sibling envelope (issue #383): when the /2 declaration carries leaf-node
     # levels, the column fold at the TAIL of this function k-way merges this
-    # same resident digest load once more — measured ~+2.0 GB transient at the
-    # o8 scale above, on top of this accumulation, since nothing here is
-    # released before that call (``column.write_leaf_column``'s memory note).
+    # same resident digest load once more — bounded to one raw-fold-boundary
+    # cell per call since issue #538 (``column.write_leaf_column``'s memory
+    # note), and this accumulation is released before that call.
     ragged_chunks: list = []
 
     def _write_chunk(block_index, carrier, ragged):
@@ -1842,6 +1842,16 @@ def process_and_write_hive(
             # the timing rides an existing dict, never seeds one.
             if "phase_timings" in metadata:
                 metadata["phase_timings"]["hash"] = time.time() - _t0
+    # Release the aggregate the column fold does not need (issue #538): the
+    # carrier frame, the K sharded carriers and the streamed ragged blocks
+    # are all written and dead from here — nothing below reads them — so the
+    # fold's transient rides beside ``staged`` alone, not on top of a second
+    # copy of the leaf. The per-cell payload ``bytes`` ``staged`` shares with
+    # them survive by reference; only the containers go.
+    _df_out = None
+    if chunk_results is not None:
+        chunk_results.clear()
+    ragged_chunks.clear()
     # Leaf pyramid column (issue #383): written AFTER the leaf's own commit,
     # from the same resident staged slabs — the fleet side of #381 points
     # (1)-(3). Gated inside on the /2 declaration carrying leaf-node levels
