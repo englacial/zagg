@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import warnings
 
-import numpy as np
 from mortie import rank_to_xy, xy_to_rank
 
 __all__ = ["rank_to_rowcol", "rowcol_to_rank", "normalize_subtree", "subtree_cell_span"]
@@ -136,8 +135,8 @@ def subtree_cell_span(
             f"(a subtree names an ancestor, at any order up to the cell order)"
         )
     d = cell_order - order
-    (h,), _o = mort2healpix(np.asarray([word], dtype=np.uint64))
-    lo = int(h) * 4**d
+    h, _o = mort2healpix(word)  # scalar in → scalar out (mortie ≥1.0, espg/mortie#219)
+    lo = h * 4**d
     n = int(n_cells)
     depth = (n.bit_length() - 1) // 2
     # A fullsphere axis (12·4^c cells) starts at 0 — the nested id IS the axis
@@ -146,15 +145,17 @@ def subtree_cell_span(
     single_root = 4**depth == n
     root_order, root, root_start = cell_order - depth, 0, 0
     if single_root:
-        root = int(clip2order(root_order, np.asarray([anchor], dtype=np.uint64))[0])
-        (rh,), _ro = mort2healpix(np.asarray([root], dtype=np.uint64))
-        root_start = int(rh) * 4**depth
-    (ah,), _ao = mort2healpix(np.asarray([anchor], dtype=np.uint64))
-    if int(ah) - root_start != int(anchor_index):
+        # clip2order's scalar form is length-1-array-out (its documented 1.x
+        # contract, unlike mort2healpix's scalar-out), so the [0] stays.
+        root = int(clip2order(root_order, anchor)[0])
+        rh, _ro = mort2healpix(root)
+        root_start = rh * 4**depth
+    ah, _ao = mort2healpix(anchor)
+    if ah - root_start != int(anchor_index):
         raise ValueError(
             f"{field!r}'s cells axis is not in canonical nested placement: cell "
             f"{int(anchor_index)} carries morton {morton_decimal(int(anchor))}, whose "
-            f"nested id puts it at axis position {int(ah) - root_start}. A subtree "
+            f"nested id puts it at axis position {ah - root_start}. A subtree "
             f"span is derived arithmetically (cell position == nested id minus the "
             f"axis root's start), so this axis would yield the wrong cells"
         )
