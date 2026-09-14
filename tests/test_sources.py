@@ -14,6 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 import stac_geoparquet.arrow as sga
+from requests.structures import CaseInsensitiveDict
 
 from zagg.catalog import sources
 from zagg.catalog.shardmap import ShardMap, _granule_entry
@@ -86,7 +87,11 @@ class _FakeResponse:
     def __init__(self, doc, status_code=200, *, text=None, content_type="application/json"):
         self._doc = doc
         self.status_code = status_code
-        self.headers = {} if content_type is None else {"Content-Type": content_type}
+        # CaseInsensitiveDict, as real requests gives: an HTTP/2 origin sends
+        # "content-type" lowercase, and a plain dict would hide that.
+        self.headers = CaseInsensitiveDict(
+            {} if content_type is None else {"Content-Type": content_type}
+        )
         if text is None:
             text = "" if doc is _UNPARSEABLE else json.dumps(doc)
         self.text = text
@@ -303,6 +308,17 @@ class TestPageSearch:
         assert f"(attempt 1/{_RETRY_ATTEMPTS})" in lines[0]
         assert "status 503" in lines[1]
         assert f"(attempt 2/{_RETRY_ATTEMPTS})" in lines[1]
+
+    def test_content_type_gate_reads_a_lowercase_header(self, fake_requests, monkeypatch):
+        # HTTP/2 origins send "content-type" lowercase on the wire; requests
+        # normalises, so the gate must not depend on the header's casing.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        html = _FakeResponse(page, content_type=None)
+        html.headers["content-type"] = "text/html"
+        fake = fake_requests([html, _FakeResponse(page)])
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 2
 
     def test_missing_content_type_accepts_json_body(self, fake_requests):
         page = _page([_item("a", _h5_assets("a"))])
