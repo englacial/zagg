@@ -277,6 +277,21 @@ class TestPageSearch:
         assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
         assert len(fake.calls) == _RETRY_ATTEMPTS
 
+    def test_exhausted_content_type_raise_names_the_header(self, fake_requests, monkeypatch):
+        # The body here parses; the header is the disqualifier, so the raise
+        # must say so rather than call a visibly-JSON body "non-JSON".
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests([_FakeResponse(page, content_type="text/html")] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        msg = str(excinfo.value)
+        assert "content-type 'text/html' is not JSON" in msg
+        assert "content-type='text/html'" in msg
+        assert isinstance(excinfo.value.__cause__, ValueError)
+        assert not isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+        assert len(fake.calls) == _RETRY_ATTEMPTS
+
     def test_exhausted_non_json_raise_truncates_the_body(self, fake_requests, monkeypatch):
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
         fake_requests([_non_json(text="x" * 5000)] * _RETRY_ATTEMPTS)
