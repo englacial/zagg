@@ -577,8 +577,15 @@ def _merge_slabs(
     Memory bound: exact classes accumulate one dense source vector per
     window (scalars); digest classes stream child by child, holding one
     child's slab plus the open output cells' decoded digests (~``factor``
-    digests per cell — the envelope the ruling priced). Missing candidates
-    contribute fill and are counted (``source_children.missing``).
+    digests per cell — the envelope the ruling priced). Since issue #538
+    ``factor`` is ``4 ** (relay - r)``, not the one-order ``4``: a one-order
+    merge off the res-``shard_order + 2`` relay k-ways 64 δ-bounded digests
+    per output cell where it k-wayed 4, and each child contributes
+    ``src_per_child`` 16 rather than 1. The digests saturate their budget at
+    production scale, so that is a straight 16x in the ladder tier's read and
+    merge bytes — tens of MB per node against a δ-bounded budget, next to a
+    leaf tier measured in GB, which is the trade #538 makes. Missing
+    candidates contribute fill and are counted (``source_children.missing``).
 
     A located field's pair is read together (:func:`_located_pair`) and a
     contributor carrying one half is **skipped for that field and counted
