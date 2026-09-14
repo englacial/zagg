@@ -163,7 +163,11 @@ conservative ~100 MB/node — and every write line below states which it uses.
 The backfill leg is the long pole: anchored on the observed full-store sweep
 costs (below), per-leaf work is ~141 s (ATL03) / ~311 s (GEDI) at 4 GB. At
 64-way concurrency: ATL03 ≈ **1.8–2 h**, GEDI ≈ **4 h**. Each *leaf* is far
-inside the 900 s wall; concurrency only moves wall-clock, not cost.
+inside the 900 s wall; concurrency only moves wall-clock, not cost. Memory per
+leaf is bounded since issue #538: the column fold's largest single merge is one
+res-(s+2) cell (a sixteenth of the shard) rather than the whole shard, so the
+67.8 M-photon CA maximum fits the 4 GB tier where the node-order-from-raw fold
+(~100 B/photon, 6.8 GB) did not.
 
 ## Cost estimate (anchored on observed prior sweeps)
 
