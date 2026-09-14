@@ -8,6 +8,7 @@ No network: ``requests`` is replaced with a scripted fake.
 """
 
 import json
+import logging
 
 import numpy as np
 import pyarrow as pa
@@ -285,6 +286,23 @@ class TestPageSearch:
         assert "status=200" in msg
         assert "content-type='application/json'" in msg
         assert len(fake.calls) == _RETRY_ATTEMPTS
+
+    def test_retry_warning_names_the_reason_and_the_attempt(
+        self, fake_requests, monkeypatch, caplog
+    ):
+        # CI-log attribution is the point of #562, so the warning's reason
+        # and its counter are both pinned.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake_requests([_non_json(), _FakeResponse({}, status_code=503), _FakeResponse(page)])
+        with caplog.at_level(logging.WARNING):
+            _page_search("https://cmr/search", params={})
+        lines = [r.getMessage() for r in caplog.records]
+        assert len(lines) == 2
+        assert "no usable JSON body (Expecting value" in lines[0]
+        assert f"(attempt 1/{_RETRY_ATTEMPTS})" in lines[0]
+        assert "status 503" in lines[1]
+        assert f"(attempt 2/{_RETRY_ATTEMPTS})" in lines[1]
 
     def test_missing_content_type_accepts_json_body(self, fake_requests):
         page = _page([_item("a", _h5_assets("a"))])
