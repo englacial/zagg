@@ -189,6 +189,43 @@ remains the explicit all-cold certification baseline (it needs
 `lambda:UpdateFunctionConfiguration` on the caller — see
 [Warm-container memory and self-recycle](lambda.md#warm-container-memory-and-self-recycle)).
 
+## On demand — the 88°S latitude sweep (issue #148)
+
+Neither cadence above covers the polar worst case, and it is not meant to: the
+88°S ring is where all ~1,387 ICESat-2 RGTs converge, its densest o9 shard holds
+~84× the granules of the NEON one, and a timeout there is a result rather than a
+regression. It runs **on demand** instead, off its own manifest
+(`tests/data/benchmark/targets_88s_latitude_sweep.json`) by explicit
+`--target` — never on merge, never on release, so a red stress run cannot fail
+either series.
+
+The matrix is **7 latitude bands × 2 worker arms**: one o9 shard per 0.3° band at
+85 / 85.5 / 86 / 86.5 / 87 / 87.5 / 88 °S, each on a 4 GB-disk and an 8 GB-disk
+worker (`process-shard-{4096,8192}-disk`). Every arm is the shipped per-merge
+sidecar configuration — hive, sidecar read, spill streaming, sharded, no AOI
+mask, `granule_workers=4` — so **latitude and worker size are the only variables**
+and the numbers are directly comparable to the per-merge series.
+
+What it answers is where the tractable band ends. On zagg 0.36.0 the crossover
+was **85°S at 8 GB** (865 s, 190 M obs, 2,221 MB peak of 8,192 — memory is not
+the wall, spill holds it), with every band poleward timing out and the winning
+run splitting read 671 s / aggregate 194 s / write 10 s. That makes the pole
+**read-bound**, which is why the next lever is granule concurrency (issue #290)
+rather than memory. Those figures are a property of that code point, not of the
+bands: the same sweep on 0.35.0 timed out everywhere, and the store-cache fix
+(issue #287 / PR #288) is what moved it.
+
+Unlike every series above, these figures are **not** derived from a rendered
+artifact — there is no recorded series for an on-demand sweep, so they are
+transcribed. The manifest's own `description` is the record of truth and the
+thing to update when the sweep is next run; treat this section as a copy of it.
+
+Only the 88°S row is pinned today — it reuses the committed stress map and pin
+verbatim. The six equatorward bands need catalog snapshots they do not have yet;
+their rows sit in `pending_targets` with the pinning recipe beside them. See
+[the benchmark matrix README](https://github.com/englacial/zagg/blob/main/tests/data/benchmark/README.md)
+for the band AOIs, the generator, and that recipe.
+
 ## Archived
 
 Retired series and figures are retained on the
