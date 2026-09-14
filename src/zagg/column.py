@@ -141,9 +141,7 @@ def relay_resolution(levels: list, shard_order: int, cell_order: int) -> int:
     column resolutions at all and relays the node-order member.
     """
     shard_order = int(shard_order)
-    boundary = raw_fold_boundary(
-        shard_order, cell_order, column_resolutions(levels, shard_order)
-    )
+    boundary = raw_fold_boundary(shard_order, cell_order, column_resolutions(levels, shard_order))
     return shard_order if boundary is None else int(boundary)
 
 
