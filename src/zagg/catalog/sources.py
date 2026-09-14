@@ -176,7 +176,10 @@ _RETRY_ATTEMPTS = 4
 _RETRY_BACKOFF_S = 2.0
 
 #: Bytes of an unparseable body echoed in the exhausted-retry raise (#562), so
-#: a CI log alone attributes the failure to its endpoint and page.
+#: a CI log alone attributes the failure to its endpoint and page. Sliced off
+#: ``resp.content``, not ``resp.text``: the bound is then the byte bound this
+#: comment advertises, and a multi-MB HTML error page is not decoded whole
+#: (charset sniffing included) just to take its head.
 _BODY_SNIPPET = 200
 
 
@@ -234,7 +237,7 @@ def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
     raise ValueError(
         f"STAC search at {url} returned a non-JSON body after {_RETRY_ATTEMPTS} attempts: "
         f"status={resp.status_code} content-type={resp.headers.get('Content-Type', '')!r} "
-        f"body[:{_BODY_SNIPPET}]={resp.text[:_BODY_SNIPPET]!r}"
+        f"body[:{_BODY_SNIPPET}]={resp.content[:_BODY_SNIPPET]!r}"
     ) from bad
 
 
