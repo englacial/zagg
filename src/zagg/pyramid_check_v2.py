@@ -28,9 +28,10 @@ spec §4.4/§4.6 make normative:
   held to the same regime law when present;
 - **counts / digests / composition** — the same value laws as the ``/1``
   arm (shared ``_check_node``), re-folded from the LEAF COLUMNS: the level
-  at resolution ``r`` reads each contributing leaf's column group at
-  ``max(r, shard_order)`` — its own cells for a gather, its node-order
-  partial for a merge — which is byte-what the staged sweep consumed (the
+  at resolution ``r`` reads each contributing leaf's column group at ``r``
+  for a gather and at the relay member (:func:`zagg.column.relay_resolution`
+  — the res-``shard_order + 2`` partials, issue #538) for a merge — which
+  is byte-what the staged sweep consumed (the
   merge-source law makes tuple grouping irrelevant *for the folded values*;
   see :func:`_value_checks_v2` for the §3.3 poison-unit caveat). A gather level's
   packed word is compared as ASSIGNED gen-1 content, not re-merged (§3.4
@@ -323,7 +324,7 @@ def _value_checks_v2(
     is not reachable from a sweep that wrote its pairs; the law is quoted
     here for values only, not for the poison span (review finding).
     """
-    from zagg.column import column_resolutions, raw_fold_boundary
+    from zagg.column import column_resolutions, raw_fold_boundary, relay_resolution
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import STAGE_GATHER, classify_level
 
@@ -333,11 +334,13 @@ def _value_checks_v2(
         harness, report
     )
     s = harness.shard_order
+    relay = relay_resolution(entries, s)
 
-    # -- the above-shard ladder, from the leaf-column tier.
+    # -- the above-shard ladder, from the leaf-column tier: a gather reads
+    # its own member, a merge the relay member (§4.4, issue #538).
     for k, r in ladder:
         gather = classify_level(r, shard_order=s) == STAGE_GATHER
-        q = max(r, s)
+        q = r if gather else relay
         tier = (s, q, leaves, lambda dec, q=q: harness.column_group(dec, q))
         nodes = [n for n in declared[k] if probes[k].get(n) is not None]
         if not full and len(nodes) > harness.sample_nodes:
@@ -625,8 +628,10 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
     (review finding): a block that is not a mapping, or whose counters do
     not read as integers, is a read-back error by name.
     """
+    from zagg.column import leaf_entry_merges_from_raw
     from zagg.sweep_stage import STAGE_GATHER, STAGE_MERGE, classify_level
 
+    leaf_mfr = leaf_entry_merges_from_raw(entries, s, harness.cell_order)
     for e in entries:
         node, a = int(e["node"]), e.get("actuals")
         if a is None:
@@ -648,10 +653,11 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
             )
             continue
         if node == s:
-            if a.get("regime") != "leaf-column" or _as_int(a.get("merges_from_raw")) != 1:
+            if a.get("regime") != "leaf-column" or _as_int(a.get("merges_from_raw")) != leaf_mfr:
                 errors["readback"].append(
                     f"manifest actuals for the leaf entry (node {node}): "
-                    f"({a.get('regime')!r}, {a.get('merges_from_raw')!r}) != ('leaf-column', 1)"
+                    f"({a.get('regime')!r}, {a.get('merges_from_raw')!r}) != "
+                    f"('leaf-column', {leaf_mfr}) — the worst of its declared cells (§4.5)"
                 )
             continue
         r = int(e["cells"][0])

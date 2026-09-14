@@ -16,8 +16,11 @@ ownership, same disjointness.
 **The merge-source law (espg ruling, 2026-08-09, issue #384).** A stage
 worker reads exactly its ``4^width`` immediate child columns, ``width``
 orders down — nothing ever reads deeper. Each worker's own column carries,
-as a pure gather, the **leaf node-order partial set for its whole subtree**
-(the relay) alongside whatever gatherable members the parent tuple needs.
+as a pure gather, the **leaf relay-member partial set for its whole
+subtree** (the relay: the leaf columns' res-``shard_order + 2`` member —
+:func:`zagg.column.relay_resolution`, the coarsest member still folded from
+raw since issue #538 moved the leaf tier's coarser members onto a flat
+second merge) alongside whatever gatherable members the parent tuple needs.
 Every merge, at every level, in every tuple, consumes **only the relayed
 gen-1 partials** — never the worker's own outputs, never a previously merged
 tier — so the merge tree is a fixed function of the store, independent of
@@ -188,30 +191,37 @@ def classify_level(cells: int, *, shard_order: int) -> str:
     Derived, never hardcoded: cells at or finer than the shard order nest
     within single child footprints (leaf columns carry those members, stage
     columns relay them) — concatenation. Coarser cells span leaves — a k-way
-    merge of the relayed gen-1 node-order partials.
+    merge of the relayed gen-1 partials (:func:`zagg.column.relay_resolution`).
     """
     return STAGE_GATHER if int(cells) >= int(shard_order) else STAGE_MERGE
 
 
-def column_members(levels: list, node_order: int, *, shard_order: int) -> list[int]:
+def column_members(
+    levels: list, node_order: int, *, shard_order: int, relay: int | None = None
+) -> list[int]:
     """Resolutions a stage column at ``node_order`` carries, finest first.
 
-    The relay member (``shard_order`` — the subtree's leaf node-order
-    partials, the ruled merge-source tier) unconditionally, plus every
-    gatherable member (``cells >= shard_order``) some coarser level
-    (``node < node_order``) will gather. All members are pure gathers of the
-    child columns' members at the same resolution — gen-1 content, untouched,
-    so ``merges_from_raw`` stays 1 for every group and a parent merge that
-    consumes the relay is exactly 2 merges from raw.
+    The ``relay`` member (:func:`zagg.column.relay_resolution` — the
+    subtree's leaf res-``shard_order + 2`` partials, the ruled merge-source
+    tier; derived from ``levels`` when they carry the leaf entry, else
+    passed by the sweep, whose :func:`ladder_entries` exclude it)
+    unconditionally, plus every gatherable member (``cells >= shard_order``)
+    some coarser level (``node < node_order``) will gather. All members are
+    pure gathers of the child columns' members at the same resolution —
+    gen-1 content, untouched, so ``merges_from_raw`` stays 1 for every group
+    and a parent merge that consumes the relay is exactly 2 merges from raw.
     """
+    from zagg.column import relay_resolution
+
     node_order, shard_order = int(node_order), int(shard_order)
+    relay = relay_resolution(levels, shard_order) if relay is None else int(relay)
     gatherable = {
         int(c)
         for e in levels
         for c in e["cells"]
         if int(e["node"]) < node_order and int(c) >= shard_order
     }
-    return sorted(gatherable | {shard_order}, reverse=True)
+    return sorted(gatherable | {relay}, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -549,13 +559,14 @@ def _merge_slabs(
 
     ``rows`` is the DENSE rank-ordered child range (``None`` for uninhabited
     children, else ``[reader-or-None per window]``). The sources are the
-    relayed node-order partials (``res_src == shard_order``) or, for the
-    all-time fold on a windowed store, the per-window members at the level's
-    own resolution (``factor == 1``, windows folding across). Either way the
-    inputs are gen-1 leaf-tier content, and each output cell folds in ONE
-    flat k-way call — what makes the merge tree independent of
-    ``tuple_width`` (the merge-source law; ``merge_tdigests_kway`` is
-    order-independent by its sort, #370).
+    relayed partials (``res_src`` the relay member —
+    :func:`zagg.column.relay_resolution`, the leaf columns' res-``shard_order
+    + 2`` member) or, for the all-time fold on a windowed store, the
+    per-window members at the level's own resolution (``factor == 1``,
+    windows folding across). Either way the inputs are gen-1 leaf-tier
+    content, and each output cell folds in ONE flat k-way call — what makes
+    the merge tree independent of ``tuple_width`` (the merge-source law;
+    ``merge_tdigests_kway`` is order-independent by its sort, #370).
 
     Memory bound: exact classes accumulate one dense source vector per
     window (scalars); digest classes stream child by child, holding one
@@ -807,18 +818,20 @@ def _stage_fold(
     *,
     shard_order: int,
     child_order: int,
+    relay: int,
     all_time: bool,
 ) -> dict | None:
     """Fold one ``(artifact node, level)`` from the dispatch worker's readers.
 
     ``readers`` is the dispatch node's ``{child decimal: [reader per
     window]}``; this densifies to the rank range under ``node`` and folds per
-    the level's derived regime. Returns the fold dict (slabs + generation +
-    provenance) or ``None`` when no child contributed. The all-time fold on
-    a windowed store is ALWAYS a merge — its inputs are the per-window gen-1
-    members at the level's own resolution (never a merged all-time relay,
-    which would breach the merge-source law) — so it records ``stage-merge``
-    at gen 2 even where the per-window level is a gather.
+    the level's derived regime; ``relay`` is the member a merge reads
+    (:func:`zagg.column.relay_resolution`). Returns the fold dict (slabs +
+    generation + provenance) or ``None`` when no child contributed. The
+    all-time fold on a windowed store is ALWAYS a merge — its inputs are the
+    per-window gen-1 members at the level's own resolution (never a merged
+    all-time relay, which would breach the merge-source law) — so it records
+    ``stage-merge`` at gen 2 even where the per-window level is a gather.
     """
     from zagg.sweep_overview import _content_hash
     from zagg.windows import union_time_range
@@ -832,7 +845,7 @@ def _stage_fold(
         )
         merges_from_raw = 1
     else:
-        res_src = r if (all_time and regime == STAGE_GATHER) else shard_order
+        res_src = r if (all_time and regime == STAGE_GATHER) else int(relay)
         slabs, folded, missing, unreadable, demotions = _merge_slabs(
             rows,
             fields,
@@ -1003,7 +1016,7 @@ def write_stage_column(
     fields: dict,
     *,
     node_order: int,
-    shard_order: int,
+    relay: int,
     cell_order: int,
     generation: dict,
     source_children: dict,
@@ -1017,12 +1030,13 @@ def write_stage_column(
 
     The §4.6 column artifact shape (``zagg-column/1``) with the stage
     regime: every group is a PURE GATHER of the child columns' members at
-    the same resolution — the relay (``shard_order``: the subtree's leaf
-    node-order partials, the ruled merge-source tier) plus the gatherable
-    members coarser tuples need — so ``merges_from_raw`` stays 1 for every
-    group and the artifact carries gen-1 content only. The relay member is
-    the one group a parent merge may assume; a ``folded`` without it is
-    refused by name. Attrs additionally record the summed ``generation``
+    the same resolution — the ``relay`` (:func:`zagg.column.relay_resolution`:
+    the subtree's leaf res-``shard_order + 2`` partials, the ruled
+    merge-source tier) plus the gatherable members coarser tuples need — so
+    ``merges_from_raw`` stays 1 for every group and the artifact carries
+    gen-1 content only. The relay member is the one group a parent merge may
+    assume; a ``folded`` without it is refused by name. Attrs additionally
+    record the summed ``generation``
     (the parent's skip-gate basis), ``source_children`` (a gather that
     under-covered says so in the artifact), and the run id; the commit stamp
     carries ``run_id`` too (lease backstop). D4 order throughout; the D20
@@ -1059,10 +1073,10 @@ def write_stage_column(
     node_order = int(node_order)
     fields = composable_fields(fields)
     resolutions = sorted((int(r) for r in folded), reverse=True)
-    if int(shard_order) not in resolutions:
+    if int(relay) not in resolutions:
         raise ValueError(
-            f"a stage column must carry the relay member ({shard_order} — the subtree's "
-            f"leaf node-order partials, the ruled merge-source tier); got {resolutions}"
+            f"a stage column must carry the relay member ({relay} — the subtree's leaf "
+            f"raw-fold-boundary partials, the ruled merge-source tier); got {resolutions}"
         )
     node_prefix = f"{store_root}/{_node_rel(node)}"
     basename = column_name(window)
@@ -1184,6 +1198,7 @@ def stage_node(
     windowed,
     shard_order,
     cell_order,
+    relay,
     candidates,
     run_id,
     run_started,
@@ -1192,6 +1207,11 @@ def stage_node(
     level_actuals=None,
 ) -> None:
     """One stage worker: fold a dispatch node's tuple for one window item.
+
+    ``relay`` is the merge-source member (:func:`zagg.column.relay_resolution`
+    over the manifest's FULL ``overviews`` list — ``levels`` here are the
+    above-shard :func:`ladder_entries`, which exclude the leaf entry that
+    places it).
 
     Reads the node's candidate child columns once (stamp-validated), then per
     tuple order materializes every dirty artifact node beneath the dispatch
@@ -1208,6 +1228,7 @@ def stage_node(
     from zagg.windows import union_time_range
 
     dispatch, child_order = int(stage["dispatch"]), int(stage["child_order"])
+    relay = int(relay)
     level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
     orders = [k for k in stage["orders"] if k in level_by_order]
     children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
@@ -1266,6 +1287,7 @@ def stage_node(
                 fields,
                 shard_order=shard_order,
                 child_order=child_order,
+                relay=relay,
                 all_time=all_time,
             )
             if fold is None:
@@ -1333,7 +1355,7 @@ def stage_node(
     )
     if dispatch == 0 or (windowed and all_time):
         return
-    members = column_members(levels, dispatch, shard_order=shard_order)
+    members = column_members(levels, dispatch, shard_order=shard_order, relay=relay)
     fresh_gen = _summed_generation(list(readers.values()))
     if dispatch_level_current and _stage_column_current(
         store_root, node, fold_windows[0], fresh_gen, run_id, run_started, store_kwargs
@@ -1351,7 +1373,7 @@ def stage_node(
             n_out=4 ** (res - dispatch),
         )
         folded[res] = slabs
-        if res == shard_order:
+        if res == relay:
             relay_sc = {
                 "folded": int(folded_n),
                 "missing": int(missing),
@@ -1373,7 +1395,7 @@ def stage_node(
             folded,
             fields,
             node_order=dispatch,
-            shard_order=shard_order,
+            relay=relay,
             cell_order=cell_order,
             generation=fresh_gen,
             source_children=relay_sc,
