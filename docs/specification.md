@@ -1855,8 +1855,11 @@ specification: its derivation is the D19 record
 canonicalized subset moves every digest by design — the 2026-08-17 epoch,
 issue #415, and the 2026-09-13 **index-exclusion epoch**, issue #499, under
 which `data_source.index` is read machinery outside the core), and no
-fixture under §7 records one. A reader MUST treat it as an opaque frozen
-manifest key: compare it for equality, never recompute it. Operator
+fixture's `*.expected.json` records one — the committed §7 fixture manifests
+do carry the digest, and `tests/test_spec_conformance.py` reproduces each
+from its build config, so an epoch that moves a fixture config's digest
+regenerates those manifests. A reader should treat it as an opaque frozen
+manifest key: compare it for equality rather than recomputing it. Operator
 consequences of an epoch live in
 [`hive_layout.md`](hive_layout.md#migration-the-index-exclusion-epoch-issue-499).
 
