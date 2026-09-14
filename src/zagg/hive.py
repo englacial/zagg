@@ -1843,12 +1843,15 @@ def process_and_write_hive(
             if "phase_timings" in metadata:
                 metadata["phase_timings"]["hash"] = time.time() - _t0
     # Release the aggregate the column fold does not need (issue #538): the
-    # carrier frame, the K sharded carriers and the streamed ragged blocks
-    # are all written and dead from here — nothing below reads them — so the
-    # fold's transient rides beside ``staged`` alone, not on top of a second
-    # copy of the leaf. The per-cell payload ``bytes`` ``staged`` shares with
-    # them survive by reference; only the containers go.
-    _df_out = None
+    # K sharded carriers and the streamed ragged blocks are written and dead
+    # from here — nothing below reads them — so the fold's transient rides
+    # beside ``staged`` alone, not on top of a second copy of the leaf. The
+    # per-cell payload ``bytes`` ``staged`` shares with them survive by
+    # reference; only the containers go. Exactly one clear does work per
+    # path: ``chunk_results`` is the sharded sink, ``ragged_chunks`` the
+    # streaming one, and the two are exclusive. (``_df_out`` needs no
+    # release — ``process_shard`` returns an empty frame whenever either
+    # sink is in play, which here is always; review finding.)
     if chunk_results is not None:
         chunk_results.clear()
     ragged_chunks.clear()
