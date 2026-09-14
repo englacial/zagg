@@ -197,14 +197,20 @@ def classify_level(cells: int, *, shard_order: int) -> str:
 
 
 def column_members(
-    levels: list, node_order: int, *, shard_order: int, relay: int | None = None
+    levels: list,
+    node_order: int,
+    *,
+    shard_order: int,
+    cell_order: int,
+    relay: int | None = None,
 ) -> list[int]:
     """Resolutions a stage column at ``node_order`` carries, finest first.
 
     The ``relay`` member (:func:`zagg.column.relay_resolution` — the
     subtree's leaf res-``shard_order + 2`` partials, the ruled merge-source
-    tier; derived from ``levels`` when they carry the leaf entry, else
-    passed by the sweep, whose :func:`ladder_entries` exclude it)
+    tier; derived from ``levels`` and ``cell_order`` when the levels carry
+    the leaf entry that places the members, else passed by the sweep, whose
+    :func:`ladder_entries` exclude it)
     unconditionally, plus every gatherable member (``cells >= shard_order``)
     some coarser level (``node < node_order``) will gather. All members are
     pure gathers of the child columns' members at the same resolution —
@@ -214,7 +220,7 @@ def column_members(
     from zagg.column import relay_resolution
 
     node_order, shard_order = int(node_order), int(shard_order)
-    relay = relay_resolution(levels, shard_order) if relay is None else int(relay)
+    relay = relay_resolution(levels, shard_order, cell_order) if relay is None else int(relay)
     gatherable = {
         int(c)
         for e in levels
@@ -1355,7 +1361,9 @@ def stage_node(
     )
     if dispatch == 0 or (windowed and all_time):
         return
-    members = column_members(levels, dispatch, shard_order=shard_order, relay=relay)
+    members = column_members(
+        levels, dispatch, shard_order=shard_order, cell_order=cell_order, relay=relay
+    )
     fresh_gen = _summed_generation(list(readers.values()))
     if dispatch_level_current and _stage_column_current(
         store_root, node, fold_windows[0], fresh_gen, run_id, run_started, store_kwargs
