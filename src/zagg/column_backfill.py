@@ -75,6 +75,8 @@ from zagg.column import (
     column_resolutions,
     composable_fields,
     fold_column,
+    member_merges_from_raw,
+    raw_fold_boundary,
 )
 
 logger = logging.getLogger(__name__)
@@ -679,7 +681,9 @@ def column_is_current(
        ``None`` for both, so both are taken by value and neither is
        dereferenced before the guard (review finding, issue #520).
     2. **Declaration** — the recorded ``zagg_column`` block's node/cell orders,
-       group set, and per-field provenance (:func:`zagg.column._column_provenance`, which
+       group set, per-group ``merges_from_raw`` (the raw-fold boundary law,
+       issue #538 — a pre-#538 column records 1 below the boundary and is
+       drift) and per-field provenance (:func:`zagg.column._column_provenance`, which
        carries the fold law, the digest budget and the §3.3 linkage) must be
        the ones this run would write. A narrowed, widened or re-classed
        declaration is exactly the #383 case where the artifact must not
@@ -724,18 +728,30 @@ def column_is_current(
     if not isinstance(leaf_stamp, dict) or not isinstance(column_stamp, dict):
         return False, "absent-or-unstamped"
     block = column_attrs if isinstance(column_attrs, dict) else {}
+    # The per-group ``merges_from_raw`` is a declaration term too (issue
+    # #538, review finding): a column the fleet wrote under the all-from-raw
+    # law records 1 at every member, and its coarse members are different
+    # bytes from the flat boundary fold this run would write — drift, so the
+    # upgrade path is this pass and not ``force=True`` over every leaf.
+    boundary = raw_fold_boundary(node_order, cell_order, resolutions)
+    groups = block.get("groups") if isinstance(block.get("groups"), dict) else {}
     expected = {
         "spec": COLUMN_SPEC,
         "order": int(node_order),
         "source_cell_order": int(cell_order),
         "groups": sorted(int(r) for r in resolutions),
+        "merges": {str(int(r)): member_merges_from_raw(r, boundary) for r in resolutions},
         "fields": {n: _column_provenance(m) for n, m in composable_fields(fields).items()},
     }
     recorded = {
         "spec": block.get("spec"),
         "order": block.get("order"),
         "source_cell_order": block.get("source_cell_order"),
-        "groups": sorted(int(r) for r in (block.get("groups") or {})),
+        "groups": sorted(int(r) for r in groups),
+        "merges": {
+            str(r): (g.get("merges_from_raw") if isinstance(g, dict) else None)
+            for r, g in groups.items()
+        },
         "fields": block.get("fields") or {},
     }
     # Round-tripped JSON on one side, freshly derived Python on the other
