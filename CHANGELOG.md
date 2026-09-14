@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     value in the same manifest write — the one place a frozen key moves. The
     tool's dry run prints `semantic guard: legacy MATCH (b9b15f…) → will
     rewrite to aacfe1…` before `--execute`; an identical declaration is no
-    longer a no-op while a migration is pending.
+    longer a no-op while a migration is pending. The same write re-renders the
+    store's D19 core sidecar (`aggregation.yaml`), which nothing else
+    regenerates, so it does not keep asserting the pre-epoch core.
   - **The append path does not migrate.** `hive._frozen_matches` compares
     current-epoch digests only; a not-yet-migrated store refuses an
     aggregation run up front with a message naming the tool.

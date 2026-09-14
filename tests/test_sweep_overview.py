@@ -3338,6 +3338,7 @@ class TestDeclarePyramid:
     def test_identical_declaration_still_puts_for_a_migration(self, tmp_path, monkeypatch):
         # The "identical declaration -> no PUT" short-circuit must yield to a
         # pending migration: the frozen key moves exactly here or never.
+        from zagg.hive import AGGREGATION_CORE_NAME
         from zagg.semantics import semantic_hash, semantic_hash_legacy
 
         cfg = self._pre_epoch_store(tmp_path)
@@ -3350,7 +3351,9 @@ class TestDeclarePyramid:
         monkeypatch.setattr(obstore, "put", lambda *a, **k: (puts.append(a), real_put(*a, **k))[1])
         summary = declare_pyramid(str(tmp_path), cfg)
         assert summary["previous"] == "identical" and summary["updated"] is True
-        assert len(puts) == 1
+        # The manifest exactly once, plus the core sidecar the migration
+        # re-renders beside it.
+        assert [a[1] for a in puts] == [MANIFEST_NAME, AGGREGATION_CORE_NAME]
         assert read_manifest(str(tmp_path))["semantic_hash"] == semantic_hash(cfg)
 
     def test_a_foreign_pre_epoch_hash_still_refuses(self, tmp_path):
@@ -3361,6 +3364,29 @@ class TestDeclarePyramid:
         with pytest.raises(ValueError, match="config semantics .* != the store's frozen"):
             declare_pyramid(str(tmp_path), cfg)
         assert "pyramid" not in read_manifest(str(tmp_path))
+
+    def test_migration_rewrites_the_core_sidecar(self, tmp_path):
+        # The D19 core sidecar is written only by ``ensure_manifest``'s PUT
+        # branch, so without this the migrated store would keep asserting the
+        # PRE-epoch core (index block and all) beside a post-epoch hash.
+        import yaml
+
+        from zagg.hive import AGGREGATION_CORE_NAME
+        from zagg.semantics import semantic_core
+
+        cfg = self._pre_epoch_store(tmp_path)
+        declare_pyramid(str(tmp_path), cfg)
+        sidecar = tmp_path / AGGREGATION_CORE_NAME
+        assert sidecar.read_text() == yaml.safe_dump(semantic_core(cfg), sort_keys=True)
+        assert "index" not in yaml.safe_load(sidecar.read_text())["data_source"]
+        # A non-migrating declaration does not write it, even when it PUTs the
+        # manifest: the store is already at the current epoch, and this is not
+        # a sidecar regenerator.
+        sidecar.unlink()
+        cfg.output["pyramid"] = False
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["semantic_hash_migration"] is None
+        assert not sidecar.exists()
 
     def test_migration_refuses_a_hash_stripped_under_the_window(self, tmp_path, monkeypatch):
         # ``_frozen_matches`` EXEMPTS ``semantic_hash`` when EITHER side lacks

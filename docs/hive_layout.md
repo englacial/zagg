@@ -1021,7 +1021,11 @@ block re-inserted). `declare_pyramid` — the retrofit path behind
 digest is **accepted** (this config built the store) and the same manifest
 PUT rewrites `semantic_hash` to the current digest, even when the pyramid
 declaration itself is unchanged. That is the one place a frozen key ever
-moves. The tool's dry run prints the migration before `--execute`:
+moves. The same call re-renders the store's D19 core sidecar
+(`aggregation.yaml`) from that config — nothing else regenerates it, so a
+migrated store would otherwise go on showing a pre-epoch core (with its
+`data_source.index` block) beside a post-epoch hash. The tool's dry run prints
+the migration before `--execute`:
 
 ```
 semantic guard: legacy MATCH (b9b15fdde78f) → will rewrite to aacfe1e387d2 (pre-epoch hash; ...)

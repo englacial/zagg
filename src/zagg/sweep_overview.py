@@ -770,8 +770,11 @@ def declare_pyramid(
     the self-migrating case), the same PUT rewrites it to the current digest —
     even for an otherwise identical declaration, which is then NOT a no-op —
     and the summary's ``semantic_hash_migration`` records ``{"from", "to"}``
-    (``None`` when no migration happened). This is the only path that moves
-    the frozen key; the append path refuses a pre-epoch store until it has run.
+    (``None`` when no migration happened). The store's D19 core sidecar
+    (``aggregation.yaml``) is re-rendered from the same config right after, so
+    it does not go on asserting the pre-epoch core. This is the only path that
+    moves the frozen key; the append path refuses a pre-epoch store until it
+    has run.
     """
 
     from zagg.hive import MANIFEST_NAME, _frozen_matches, read_manifest
@@ -943,6 +946,16 @@ def declare_pyramid(
     else:
         fresh.pop("multiscales", None)
     put_object(store, MANIFEST_NAME, json.dumps(fresh, indent=1).encode())
+    if migrate_to is not None:
+        # The store's D19 core sidecar still renders the PRE-epoch core (it is
+        # written only by ``ensure_manifest``'s PUT branch and nothing else
+        # regenerates it), so a migrated store would assert two different cores
+        # — the frozen hash without ``data_source.index``, the sidecar beside it
+        # with. Rewriting it here is the same config the guard verified, and the
+        # call is fail-open by construction (D9 cache class: the hash is truth).
+        from zagg.hive import write_semantic_core
+
+        write_semantic_core(store_root, config, **store_kwargs)
     if mirror is None:
         _remove_multiscales_group(store, store_root)
     return summary
