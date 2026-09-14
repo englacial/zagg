@@ -71,8 +71,13 @@ def _page(items, next_link=None):
     return doc
 
 
+#: ``doc=_UNPARSEABLE`` means ``json()`` raises, as CMR's maintenance page does
+#: (#562). Distinct from ``doc=None``, which is a body that parses to ``null``.
+_UNPARSEABLE = object()
+
+
 class _FakeResponse:
-    """A scripted response; ``doc=None`` means the body will not parse (#562).
+    """A scripted response; ``doc=_UNPARSEABLE`` will not parse (#562).
 
     ``content_type=None`` omits the header entirely.
     """
@@ -81,11 +86,13 @@ class _FakeResponse:
         self._doc = doc
         self.status_code = status_code
         self.headers = {} if content_type is None else {"Content-Type": content_type}
-        self.text = json.dumps(doc) if text is None else text
+        if text is None:
+            text = "" if doc is _UNPARSEABLE else json.dumps(doc)
+        self.text = text
         self.content = self.text.encode()
 
     def json(self):
-        if self._doc is None:
+        if self._doc is _UNPARSEABLE:
             raise json.JSONDecodeError("Expecting value", self.text, 0)
         return self._doc
 
@@ -100,7 +107,7 @@ def _non_json(text="<html>CMR is down for maintenance</html>"):
     The exact #562 failure: the content-type is no help, and ``resp.json()``
     raises ``JSONDecodeError: Expecting value: line 1 column 1``.
     """
-    return _FakeResponse(None, text=text)
+    return _FakeResponse(_UNPARSEABLE, text=text)
 
 
 class _FakeRequests:
@@ -250,6 +257,34 @@ class TestPageSearch:
         )
         assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
         assert len(fake.calls) == 2
+
+    # A gateway banner served correctly as application/json parses fine and
+    # then dies in _page_search on doc.get("features") -- the #562 failure
+    # spelled AttributeError, unretried and with no endpoint named.
+    _WRONG_SHAPES = [(None, "NoneType"), ([], "list"), ("maintenance", "str")]
+
+    @pytest.mark.parametrize(("doc", "kind"), _WRONG_SHAPES)
+    def test_retries_2xx_json_body_of_the_wrong_shape(self, fake_requests, monkeypatch, doc, kind):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _page([_item("a", _h5_assets("a"))])
+        fake = fake_requests([_FakeResponse(doc), _FakeResponse(page)])
+        assert [it["id"] for it in _page_search("https://cmr/search", params={})] == ["a"]
+        assert len(fake.calls) == 2
+
+    @pytest.mark.parametrize(("doc", "kind"), _WRONG_SHAPES)
+    def test_exhausted_wrong_shape_raise_is_diagnosable(
+        self, fake_requests, monkeypatch, doc, kind
+    ):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_FakeResponse(doc)] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        msg = str(excinfo.value)
+        assert f"body parsed to {kind}, not a JSON object" in msg
+        assert "https://cmr/search" in msg
+        assert "status=200" in msg
+        assert "content-type='application/json'" in msg
+        assert len(fake.calls) == _RETRY_ATTEMPTS
 
     def test_missing_content_type_accepts_json_body(self, fake_requests):
         page = _page([_item("a", _h5_assets("a"))])
