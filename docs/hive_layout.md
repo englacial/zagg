@@ -971,6 +971,94 @@ digest the run never wrote and rewritten forever without self-healing. After
 the epoch that comparison is sound, and the second post-epoch run over an
 unchanged store is the no-op the gate was built for.
 
+## Migration: the index-exclusion epoch (issue #499)
+
+> **Every `semantic_hash` of a store whose config carried a
+> `data_source.index` block stops reproducing** — and both deployed stores
+> do. Nothing on disk changed; the *derivation* of the digest did, exactly as
+> in [the D19 hash epoch](#migration-the-d19-hash-epoch) above. Unlike that
+> epoch, this one has a tool-driven migration and a store it applies to.
+
+**What changed** (espg-ruled 2026-09-13; refs
+[issue #499](https://github.com/englacial/zagg/issues/499),
+[issue #547](https://github.com/englacial/zagg/issues/547),
+[PR #565](https://github.com/englacial/zagg/pull/565)): the chunk-index block —
+`data_source.index`: `backend` (`inline`/`hierarchical`/`sidecar`), the
+sidecar `store` location, `on_miss` — is **read machinery**, the same D19
+class as `reader` and `read_plan`, and now sits in
+`zagg.semantics.DATA_SOURCE_PACKAGING_KEYS`. A sidecar miss *processes the
+file* (`on_miss: build` populates a cache, it never filters an observation),
+and a different sidecar location yields byte-identical leaves. Hashing the
+block therefore split one product across every relocation of its index
+cache — and the relocation is exactly what #499 is doing: the sidecars move
+to a public bucket, and a digest that named the old location would have
+refused every append to the store they index.
+
+**Why re-hashing is correct, not a defect**: the argument of the D19 epoch
+holds unchanged — the pre-epoch digest answered "do these two configs
+produce the same leaves" wrongly (a relocated index cache read as a
+different product), and a wrong answer cannot be preserved for
+compatibility. No leaf byte moves; only the label is restated.
+
+**Who it hits.** Both live stores were built with an index block, so their
+frozen manifest hashes are pre-epoch:
+
+| store | `data_source.index` | frozen `semantic_hash` today | migrates to |
+|---|---|---|---|
+| `atl03_tdigest_o9` | `{backend: sidecar, store: s3://sliderule-public-cors/zagg-index/ATL03/007, on_miss: build}` | `b9b15fdde78f…` | `aacfe1e387d2…` |
+| `gedi_flux_o9` | `{backend: hierarchical}` | `4f8287947a83…` | `337b2c3acac9…` |
+
+(Full digests are pinned in
+`tests/test_semantics.py::TestIndexExclusionEpoch::test_the_live_stores_migrate`
+against the stores' vendored build configs.) A config with no index block
+hashes identically under both epochs, so nothing else moves.
+
+**The migration — one tool, one write.** `zagg.semantics.semantic_hash_legacy`
+recomputes a config's *pre-epoch* digest (the current core with the index
+block re-inserted). `declare_pyramid` — the retrofit path behind
+`tools/redeclare_dense_ladder.py` and `python -m zagg.sweep --declare-pyramid`
+— consults it: a store whose frozen hash is the supplied config's pre-epoch
+digest is **accepted** (this config built the store) and the same manifest
+PUT rewrites `semantic_hash` to the current digest, even when the pyramid
+declaration itself is unchanged. That is the one place a frozen key ever
+moves. The tool's dry run prints the migration before `--execute`:
+
+```
+semantic guard: legacy MATCH (b9b15fdde78f) → will rewrite to aacfe1e387d2 (pre-epoch hash; ...)
+```
+
+**The append path does not migrate.** `zagg.hive._frozen_matches` compares
+current-epoch digests only, so an aggregation run into a not-yet-migrated
+store refuses up front, and the refusal names the tool:
+
+```
+morton_hive.json at s3://bucket/store does not match this run (...); the only
+frozen key that differs is semantic_hash, and the store's is this config's
+PRE-EPOCH digest (issue #499: data_source.index left the semantic core) —
+migrate the manifest with tools/redeclare_dense_ladder.py (dry-run prints the
+migration; --execute writes it), then rerun; the append path never migrates
+on its own
+```
+
+Accepting legacy digests there would make every append a silent migration
+point and the manifest would never actually move; refusing by name keeps the
+operator's `--execute` the single event. Restamping by hand (path (3) of the
+D19 epoch note) is not needed and not recommended: the tool verifies that
+the config *is* the store's own before it writes.
+
+**Skip-gate consequence — deliberate, not fixed.** `zagg.dedup` compares the
+hash strings stamped in run records and leaf sidecars against the current
+digest, and those stamps on the two live stores are pre-epoch. After the
+epoch they read as **stale**: a same-shard re-dispatch into either store
+**rewrites** the leaf instead of skipping it (the `semantic-mismatch`
+classification), exactly the D19 epoch's "first post-epoch run is a full
+rewrite of everything it touches". New-AOI appends (no prior leaf to
+compare) and the column backfill (which reads leaves, not stamps) are
+unaffected. Rewriting is the safe direction — the gate cannot certify a
+leaf as current against an identity computed by a different rule — and the
+manifest migration does not touch leaf stamps, so it neither causes nor
+cures this.
+
 ## Re-runs: skip-if-current, the contraction guard, and the lifecycle touch
 
 Re-dispatching a shard used to mean an unconditional wholesale rewrite (D4)

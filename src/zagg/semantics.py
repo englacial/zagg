@@ -689,7 +689,7 @@ def semantic_hash(config: PipelineConfig) -> str:
     return hashlib.sha256(canonical_semantic_json(config).encode()).hexdigest()
 
 
-#: The pre-epoch canonicalizations :func:`semantic_hash_legacy` reproduces:
+#: The pre-epoch canonicalization rules :func:`semantic_hash_legacy` reproduces:
 #: ``1`` is the index-in-core rule every store built before the issue #499
 #: epoch carries (the 2026-08-17 epoch left no store behind — its stores aged
 #: out on the 30-day cycle — so there is nothing older to reproduce).
