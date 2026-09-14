@@ -187,22 +187,32 @@ def _json_body(resp) -> dict:
     """Parsed JSON body of a search response.
 
     Raises ``ValueError`` (``json.JSONDecodeError`` is one) when the body is
-    not JSON. CMR-STAC transiently answers **200 with a maintenance/HTML
-    page**, which clears both ``_RETRY_STATUSES`` and ``raise_for_status``
-    (issue #562). A declared non-JSON content-type is taken at its word; an
-    absent one is not held against an otherwise parseable body.
+    not a JSON object. CMR-STAC transiently answers **200 with a
+    maintenance/HTML page**, which clears both ``_RETRY_STATUSES`` and
+    ``raise_for_status`` (issue #562). A declared non-JSON content-type is
+    taken at its word; an absent one is not held against an otherwise
+    parseable body.
+
+    Shape is checked too, not just parseability: ``null``, ``[]`` or a bare
+    JSON string served as ``application/json`` parse fine and then die a
+    frame later on ``doc.get("features", ...)``, unretried and with no
+    endpoint in the traceback -- the same #562 failure spelled
+    ``AttributeError``.
     """
     ctype = resp.headers.get("Content-Type", "")
     if ctype and "json" not in ctype.lower():
         raise ValueError(f"content-type {ctype!r} is not JSON")
-    return resp.json()
+    doc = resp.json()
+    if not isinstance(doc, dict):
+        raise ValueError(f"body parsed to {type(doc).__name__}, not a JSON object")
+    return doc
 
 
 def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
     """One item-search request, retrying transient failures; returns the doc.
 
-    Retries ``_RETRY_STATUSES`` *and* 2xx responses whose body is not JSON
-    (issue #562) with exponential backoff (``_RETRY_ATTEMPTS`` tries total),
+    Retries ``_RETRY_STATUSES`` *and* 2xx responses whose body is not a JSON
+    object (issue #562) with exponential backoff (``_RETRY_ATTEMPTS`` tries total),
     under one shared budget. Any other status falls through to
     ``raise_for_status`` on the first response; an exhausted budget raises
     that status, or -- for a 2xx -- a ValueError naming the status,
