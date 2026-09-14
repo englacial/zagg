@@ -19,9 +19,9 @@ Included (the semantic core):
   photon ``base_level``/``levels``, raster ``bands``/``nodata``/
   ``collections``/``static_data``) — minus the read machinery, the credential
   mechanism, the byte-movement bounds and fan-out sizing (``reader``,
-  ``driver``, ``read_plan``, ``anonymous``, ``credentials_provider``,
-  ``source_region``, ``shard_workers``/``granule_workers``, ``read_workers``,
-  ``write_buffer``);
+  ``driver``, ``read_plan``, ``index``, ``anonymous``,
+  ``credentials_provider``, ``source_region``,
+  ``shard_workers``/``granule_workers``, ``read_workers``, ``write_buffer``);
 - the grid **type + indexing scheme** (D19: cell order is a resolution axis
   (D24), parent/shard order and chunking are packaging — hashing the whole
   template would have made o8 and o9 runs different products and blocked
@@ -54,7 +54,9 @@ Excluded as packaging: all orders (``parent_order``/``child_order``/
 ``chunk_inner`` — the D24 resolution axis, which the epoch deliberately did
 NOT touch: hashing them would still make o8 and o9 runs different products and
 block mixed-order processing), store layout/path/name, ``coverage_moc`` and
-``sweep`` (run triggers over regenerable D9 caches), ``consolidate_metadata``
+``sweep`` (run triggers over regenerable D9 caches), the chunk-index block
+(``data_source.index`` — the issue #499 epoch, espg-ruled 2026-09-13: read
+machinery; see :data:`DATA_SOURCE_PACKAGING_KEYS`), ``consolidate_metadata``
 (a derived finalize blob), the whole ``pyramid`` block (D11 keeps it out of
 the manifest's frozen keys because the §7 sweep populates it; the leaf column
 it declares is verified by READING the artifact instead — see
@@ -184,10 +186,26 @@ from zagg.time_axis import DEFAULT_TIME_ENCODING
 #: Ruled at the epoch deliberately: the digest moves once here, and excluding
 #: them later would cost a second epoch for knobs that never belonged in the
 #: core.
+#:
+#: ``index`` — the chunk-index block (``backend`` inline/hierarchical/sidecar,
+#: the sidecar ``store`` location, ``on_miss``) — joined at the **issue #499
+#: epoch, espg-ruled 2026-09-13** (refs #547, PR #565): it is READ MACHINERY
+#: in exactly the ``reader``/``read_plan`` sense. A sidecar miss processes the
+#: file (``on_miss: build`` is a cache-population policy, not a filter), and a
+#: different sidecar location yields byte-identical leaves — so hashing the
+#: block split one product in two across every relocation of its index cache.
+#: The live case is the one issue #499 is about: the sidecars move to a public
+#: bucket, and a hash that named the old location would have refused every
+#: append to the store they index. Unlike the 2026-08-17 epoch this one moves
+#: digests that outlive it — both deployed stores carry an ``index`` block, so
+#: their frozen manifest hashes stop reproducing (:func:`semantic_hash_legacy`
+#: is the self-migrating guard; the migration note is in
+#: ``docs/hive_layout.md``, "Migration: the index-exclusion epoch").
 DATA_SOURCE_PACKAGING_KEYS = (
     "reader",
     "driver",
     "read_plan",
+    "index",
     "anonymous",
     "credentials_provider",
     "source_region",
@@ -648,15 +666,17 @@ def semantic_core(config: PipelineConfig) -> dict:
     return _prune_nulls(core)
 
 
+def _canonical_json(core: dict) -> str:
+    return json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
 def canonical_semantic_json(config: PipelineConfig) -> str:
     """The canonical serialized form the hash is computed over.
 
     Sorted keys, compact separators, ASCII-escaped: syntactic YAML edits
     (comments, whitespace, key order) cannot reach this string.
     """
-    return json.dumps(
-        semantic_core(config), sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    )
+    return _canonical_json(semantic_core(config))
 
 
 def semantic_hash(config: PipelineConfig) -> str:
@@ -667,6 +687,40 @@ def semantic_hash(config: PipelineConfig) -> str:
     compare the FULL digest; display via :func:`semantic_fingerprint`.
     """
     return hashlib.sha256(canonical_semantic_json(config).encode()).hexdigest()
+
+
+#: The pre-epoch canonicalizations :func:`semantic_hash_legacy` reproduces:
+#: ``1`` is the index-in-core rule every store built before the issue #499
+#: epoch carries (the 2026-08-17 epoch left no store behind — its stores aged
+#: out on the 30-day cycle — so there is nothing older to reproduce).
+LEGACY_EPOCHS = (1,)
+
+
+def semantic_hash_legacy(config: PipelineConfig, *, epoch: int = 1) -> str:
+    """The digest a PRE-epoch zagg computed for ``config`` — the migration probe.
+
+    Epoch 1 (issue #499) is the current core plus ``data_source.index``
+    re-inserted and canonicalized the same way (null-pruned, sorted, compact),
+    which is exactly what :func:`semantic_core` produced before the block left
+    :data:`DATA_SOURCE_PACKAGING_KEYS`. For a config with no ``index`` block the
+    two epochs agree, so this equals :func:`semantic_hash`.
+
+    Its one consumer is the retrofit guard (:func:`zagg.sweep_overview.
+    _semantic_guard`): a store whose frozen ``semantic_hash`` matches THIS
+    digest was built by this config under the old rule, and ``declare_pyramid``
+    migrates the manifest to the current digest in the same write. The append
+    path deliberately does NOT consult it (:func:`zagg.hive._frozen_matches`
+    compares current-epoch digests only) — the redeclare tool is the single
+    migration point, so a pre-epoch store refuses an append by name until an
+    operator has run it.
+    """
+    if epoch not in LEGACY_EPOCHS:
+        raise ValueError(f"unknown semantic-hash epoch {epoch!r}; known: {LEGACY_EPOCHS}")
+    core = semantic_core(config)
+    index = (config.data_source or {}).get("index")
+    if index is not None:
+        core = {**core, "data_source": {**core["data_source"], "index": _prune_nulls(index)}}
+    return hashlib.sha256(_canonical_json(core).encode()).hexdigest()
 
 
 def semantic_fingerprint(digest: str) -> str:
@@ -685,6 +739,7 @@ __all__ = [
     "FINGERPRINT_HEX",
     "GRID_LEAF_SHAPING_KEYS",
     "GRID_SPATIAL_KEYS",
+    "LEGACY_EPOCHS",
     "OUTPUT_LEAF_SHAPING_KEYS",
     "canonical_semantic_json",
     "composability_classes",
@@ -692,4 +747,5 @@ __all__ = [
     "semantic_core",
     "semantic_fingerprint",
     "semantic_hash",
+    "semantic_hash_legacy",
 ]
