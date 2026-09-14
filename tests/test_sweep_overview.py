@@ -3362,6 +3362,33 @@ class TestDeclarePyramid:
             declare_pyramid(str(tmp_path), cfg)
         assert "pyramid" not in read_manifest(str(tmp_path))
 
+    def test_migration_refuses_a_hash_stripped_under_the_window(self, tmp_path, monkeypatch):
+        # ``_frozen_matches`` EXEMPTS ``semantic_hash`` when EITHER side lacks
+        # it (pre-#299 stores), so the RMW recheck alone would let a migration
+        # stamp the current digest onto a manifest whose own hash vanished
+        # inside the validation window — un-exempting a pre-#299 store on the
+        # strength of a different manifest's verification. The migration
+        # compares the exact digest the guard saw.
+        import zagg.sweep_overview as so
+
+        cfg = self._pre_epoch_store(tmp_path)
+        real = so._validate_block_against_store
+
+        def strip_the_hash(store_root, manifest, block, store_kwargs):
+            note = real(store_root, manifest, block, store_kwargs)
+            on_disk = read_manifest(str(tmp_path))
+            on_disk.pop("semantic_hash")
+            obstore.put(
+                open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(on_disk).encode()
+            )
+            return note
+
+        monkeypatch.setattr(so, "_validate_block_against_store", strip_the_hash)
+        with pytest.raises(ValueError, match="changed its semantic_hash under"):
+            declare_pyramid(str(tmp_path), cfg)
+        after = read_manifest(str(tmp_path))
+        assert "semantic_hash" not in after and "pyramid" not in after
+
     def test_declared_off_preserves_prior_materialized(self, tmp_path):
         # The intended shape (D24 option A): overviews already on disk are real
         # regenerable-cache debris, so a declared-OFF block still inventories

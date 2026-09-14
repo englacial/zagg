@@ -866,6 +866,18 @@ def declare_pyramid(
             f"validation window (frozen keys differ, or it vanished) — nothing was "
             f"written; re-run against the settled store"
         )
+    if migrate_to is not None and fresh.get("semantic_hash") != manifest.get("semantic_hash"):
+        # ``_frozen_matches`` EXEMPTS ``semantic_hash`` when either side lacks
+        # it (pre-#299 stores), so the recheck above does not by itself prove
+        # ``fresh`` carries the digest :func:`_semantic_guard` verified — and a
+        # migration must never stamp the current hash onto a manifest whose own
+        # was stripped inside the window. Only the migration needs the stricter
+        # test; a non-migrating write leaves the key alone.
+        raise ValueError(
+            f"the {MANIFEST_NAME} at {store_root} changed its semantic_hash under "
+            f"declare_pyramid's validation window — nothing was written; re-run "
+            f"against the settled store"
+        )
     prior = fresh.get("pyramid")
     # A non-dict prior (hand-edited ``"pyramid": "off"``) is not an error: it is
     # not this module's grammar, so it carries no actuals to preserve and is
@@ -921,8 +933,9 @@ def declare_pyramid(
     if migrate_to is not None:
         # The ONE place a frozen key moves (issue #499): the guard above proved
         # this config built the store under the pre-epoch canonicalization, and
-        # ``_frozen_matches`` re-checked ``fresh`` against the manifest the guard
-        # saw, so the digest being replaced is the one that was verified.
+        # the re-read re-checked ``fresh``'s frozen keys AND its semantic_hash
+        # against the manifest the guard saw, so the digest being replaced is
+        # the one that was verified.
         fresh["semantic_hash"] = migrate_to
     store = open_object_store(store_root, **store_kwargs)
     if mirror is not None:
