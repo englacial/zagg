@@ -650,7 +650,9 @@ class OutputGrid(Protocol):
         planner feeds a 2-D ``(n_chunks, samples_per_chunk)`` lat/lon pair
         straight through ``assign`` -> :meth:`shards_of` and reduces with
         ``.any(axis=1)`` (``processing.apriori._chunk_shard_mask``, issue
-        #543), so a backend that ravels would mis-plan silently.
+        #543), so a backend that ravels raises ``AxisError`` at that
+        ``.any(axis=1)`` rather than returning a wrong plan. Do not reshape
+        defensively inside a backend — the loud failure is the contract.
         """
         ...
 
