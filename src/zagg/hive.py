@@ -419,8 +419,11 @@ def _pre_epoch_hint(existing: dict, manifest: dict, config) -> str:
     hash here would make every append a silent migration point, and the hash
     would then never move in the manifest. So a pre-epoch store refuses, but
     by name: with ``config`` in hand the legacy digest is recomputed and the
-    verdict is definite; without it (the ping's manifest-only precheck) the
-    hint is conditional. Empty when some other frozen key differs.
+    verdict is definite; for a caller that does not forward the config (today
+    the Lambda ping precheck, which holds one but does not pass it) the hint
+    is conditional — it fires on ANY hash-only frozen-key mismatch, including
+    the ordinary D19 case of a genuinely different aggregation config. Empty
+    when some other frozen key differs.
     """
     fa, fb = _frozen(existing), _frozen(manifest)
     if fa["semantic_hash"] is None or fb["semantic_hash"] is None:

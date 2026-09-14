@@ -371,8 +371,8 @@ class TestSemanticManifest:
         fresh = hive.build_manifest(grid)
         with pytest.raises(ValueError, match="PRE-EPOCH digest.*redeclare_dense_ladder"):
             hive.validate_manifest(root, fresh, config=indexed)
-        # Without the config (the ping's manifest-only precheck) the hint is
-        # conditional, and still names the tool.
+        # For a caller that does not forward the config (today the Lambda ping
+        # precheck) the hint is conditional, and still names the tool.
         with pytest.raises(ValueError, match="if this config built the store.*issue #499"):
             hive.validate_manifest(root, fresh)
         with pytest.raises(ValueError, match="never migrates on its own"):
