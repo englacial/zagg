@@ -206,7 +206,9 @@ def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
     under one shared budget. Any other status falls through to
     ``raise_for_status`` on the first response; an exhausted budget raises
     that status, or -- for a 2xx -- a ValueError naming the status,
-    content-type and head of the body, chained to the decode error.
+    content-type and head of the body, quoting and chained to whichever
+    rejection ``_json_body`` last raised (a decode error, or the
+    content-type refusal, which prints a body that does parse).
     """
     bad: ValueError | None = None
     for attempt in range(_RETRY_ATTEMPTS):
@@ -235,8 +237,9 @@ def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
         time.sleep(wait)
     resp.raise_for_status()
     raise ValueError(
-        f"STAC search at {url} returned a non-JSON body after {_RETRY_ATTEMPTS} attempts: "
-        f"status={resp.status_code} content-type={resp.headers.get('Content-Type', '')!r} "
+        f"STAC search at {url} gave no usable JSON body after {_RETRY_ATTEMPTS} attempts "
+        f"({bad}): status={resp.status_code} "
+        f"content-type={resp.headers.get('Content-Type', '')!r} "
         f"body[:{_BODY_SNIPPET}]={resp.content[:_BODY_SNIPPET]!r}"
     ) from bad
 
