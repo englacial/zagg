@@ -870,9 +870,9 @@ group. Concretely, for a member `r` at an order-`k` node:
   [issue #538](https://github.com/englacial/zagg/issues/538) it is not the
   ladder's merge source: that is the **relay member** — the leaf column's
   coarsest group still folded from raw: its group at `shard_order + 2`
-  (§4.6's raw-fold boundary) when the declaration's finest leaf resolution
-  reaches it, else the node-order member — so that every above-shard merge
-  stays exactly 2 merges from raw. No separate partial grammar or `partial/` path exists anywhere;
+  (§4.6's raw-fold boundary) when the column CARRIES that group, else the
+  node-order member — so that every above-shard merge stays exactly 2
+  merges from raw. No separate partial grammar or `partial/` path exists anywhere;
 - each **included** field is the same array kind as at the leaves: dense
   fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
   arrays — §1–§3 of this page apply to overview arrays unchanged, **including
@@ -1373,8 +1373,10 @@ guessed at.
   of peak memory per row, the 0.52 fleet's OOMs at 4 GB — whereas the
   boundary bounds any single merge to a sixteenth of the shard. When the
   boundary is not strictly below the cell order (`order + 2 ≥ cell order`),
-  or the declaration's finest leaf resolution is `order + 1` (no boundary
-  group exists), every group folds from raw with `merges_from_raw` 1 — the
+  or the column carries **no group at `order + 2`** (the declaration's rungs
+  skip it — `[12, 10]` on the 19/13/9 geometry gives members {12, 10, 9},
+  finest 12 and still no boundary group; so does a finest of `order + 1`),
+  every group folds from raw with `merges_from_raw` 1 — the
   §7 `column/` fixture's 4/6 geometry is the first case, which is why its
   groups below record 1.
 - **The `role` and `zagg_column` attrs.** `role` is `"column"`;
@@ -1479,8 +1481,8 @@ members at the same resolution — `groups` entries record `regime:
 "stage-gather"` with `merges_from_raw: 1` — and the artifact MUST carry the
 **relay member** (the leaf columns' coarsest from-raw group for the whole
 subtree — `shard_order + 2`, the raw-fold-boundary partials, when the
-declaration's finest leaf resolution reaches it, else the node-order
-partials — the merge-source tier every coarser merge consumes: the espg
+columns carry that group, else the node-order partials — the merge-source
+tier every coarser merge consumes: the espg
 merge-source ruling on the #384 thread, re-based onto the boundary member
 by issue #538 so that no upfront merge is ever 3 from raw). Stage-column
 attrs additionally
