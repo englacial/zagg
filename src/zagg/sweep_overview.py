@@ -764,6 +764,14 @@ def declare_pyramid(
     block itself: ``orders`` under ``/1``, ``overviews`` (the normalized
     grouped form, issue #382) under ``/2``. An empty ``orders`` is ``/1``'s
     declared-off signal, so a ``/2`` summary must not carry the key at all.
+
+    **Hash-epoch migration** (issue #499): when the store's frozen
+    ``semantic_hash`` is this config's PRE-epoch digest (:func:`_semantic_guard`,
+    the self-migrating case), the same PUT rewrites it to the current digest —
+    even for an otherwise identical declaration, which is then NOT a no-op —
+    and the summary's ``semantic_hash_migration`` records ``{"from", "to"}``
+    (``None`` when no migration happened). This is the only path that moves
+    the frozen key; the append path refuses a pre-epoch store until it has run.
     """
 
     from zagg.hive import MANIFEST_NAME, _frozen_matches, read_manifest
@@ -843,7 +851,7 @@ def declare_pyramid(
             f"declared orders {bad} are not ancestor orders of the manifest "
             f"shard_order {shard_order} — the config does not match this store"
         )
-    semantic = _semantic_guard(manifest, config)
+    semantic, migrate_to = _semantic_guard(manifest, config)
     validated = _validate_block_against_store(store_root, manifest, block, store_kwargs)
     # Re-read immediately before the RMW, the same discipline
     # :func:`_update_manifest_pyramid` uses: validation above is slow (run-record
@@ -897,14 +905,25 @@ def declare_pyramid(
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
         "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
-        "updated": prior != block or not mirror_current,
+        "updated": prior != block or not mirror_current or migrate_to is not None,
         # Whether the written manifest carries the §4.9 mirror — /2 only.
         "multiscales": mirror is not None,
+        # The issue #499 hash-epoch migration, when this write performs one:
+        # ``{"from": <pre-epoch digest>, "to": <current digest>}``.
+        "semantic_hash_migration": (
+            {"from": fresh["semantic_hash"], "to": migrate_to} if migrate_to else None
+        ),
     }
-    if prior == block and mirror_current:
+    if prior == block and mirror_current and migrate_to is None:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
         return summary
     fresh["pyramid"] = block
+    if migrate_to is not None:
+        # The ONE place a frozen key moves (issue #499): the guard above proved
+        # this config built the store under the pre-epoch canonicalization, and
+        # ``_frozen_matches`` re-checked ``fresh`` against the manifest the guard
+        # saw, so the digest being replaced is the one that was verified.
+        fresh["semantic_hash"] = migrate_to
     store = open_object_store(store_root, **store_kwargs)
     if mirror is not None:
         fresh["multiscales"] = mirror
@@ -950,7 +969,7 @@ def _remove_multiscales_group(store, store_root: str) -> None:
         )
 
 
-def _semantic_guard(manifest: dict, config) -> str:
+def _semantic_guard(manifest: dict, config) -> tuple[str, str | None]:
     """Refuse a config whose semantics the store's frozen ``semantic_hash`` denies.
 
     The leaf probe (:func:`_field_drift`) can falsify TYPING only — no leaf
@@ -968,9 +987,21 @@ def _semantic_guard(manifest: dict, config) -> str:
     false-refuse on the pyramid edit itself. It compares only when the manifest
     declares the key, the same both-sides-present exemption
     :func:`zagg.hive._frozen_matches` gives pre-#299 stores (a pre-#344 retrofit
-    target may well be one). Returns the note recorded in the summary.
+    target may well be one).
+
+    **The self-migrating case** (the issue #499 hash epoch): a store whose
+    frozen hash is this config's PRE-epoch digest
+    (:func:`zagg.semantics.semantic_hash_legacy` — the index-in-core
+    canonicalization) was built by this config, so it is ACCEPTED, and the
+    current digest is returned as the value :func:`declare_pyramid` rewrites
+    into the manifest in the same PUT. This is the one path that may move the
+    frozen key: the append path (:func:`zagg.hive._frozen_matches`) refuses a
+    pre-epoch store by name until this has run.
+
+    Returns ``(note, migrate_to)`` — the note recorded in the summary, and the
+    current digest when the manifest's must migrate (``None`` otherwise).
     """
-    from zagg.semantics import semantic_fingerprint, semantic_hash
+    from zagg.semantics import semantic_fingerprint, semantic_hash, semantic_hash_legacy
 
     stored = manifest.get("semantic_hash")
     if not stored:
@@ -979,8 +1010,19 @@ def _semantic_guard(manifest: dict, config) -> str:
             "the config's aggregation semantics could NOT be verified against the store; "
             "the declared fold methods are taken on trust"
         )
-        return "semantic_hash absent (pre-#299 store — fold methods unverified)"
+        return "semantic_hash absent (pre-#299 store — fold methods unverified)", None
     supplied = semantic_hash(config)
+    if supplied != stored and semantic_hash_legacy(config) == stored:
+        logger.info(
+            f"declare_pyramid: pre-epoch semantic_hash {semantic_fingerprint(stored)} — this "
+            f"config built the store under the index-in-core canonicalization (issue #499); "
+            f"the manifest migrates to {semantic_fingerprint(supplied)} in this write"
+        )
+        return (
+            f"pre-epoch semantic_hash {semantic_fingerprint(stored)} (this config built the "
+            f"store under the index-in-core canonicalization, issue #499) — migrated to "
+            f"{semantic_fingerprint(supplied)}"
+        ), supplied
     if supplied != stored:
         raise ValueError(
             f"config semantics {semantic_fingerprint(supplied)} != the store's frozen "
@@ -990,7 +1032,7 @@ def _semantic_guard(manifest: dict, config) -> str:
             f"Retrofit with the ORIGINAL config: output.* is not in the semantic core, so "
             f"adding output.pyramid to it hashes identically"
         )
-    return f"semantic_hash {semantic_fingerprint(stored)}"
+    return f"semantic_hash {semantic_fingerprint(stored)}", None
 
 
 def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> str:

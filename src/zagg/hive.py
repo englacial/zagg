@@ -412,8 +412,45 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     return manifest
 
 
+def _pre_epoch_hint(existing: dict, manifest: dict, config) -> str:
+    """Name the issue #499 migration when a frozen-key mismatch is the hash alone.
+
+    The append path compares CURRENT-epoch digests only — accepting a legacy
+    hash here would make every append a silent migration point, and the hash
+    would then never move in the manifest. So a pre-epoch store refuses, but
+    by name: with ``config`` in hand the legacy digest is recomputed and the
+    verdict is definite; without it (the ping's manifest-only precheck) the
+    hint is conditional. Empty when some other frozen key differs.
+    """
+    fa, fb = _frozen(existing), _frozen(manifest)
+    if fa["semantic_hash"] is None or fb["semantic_hash"] is None:
+        return ""
+    fa.pop("semantic_hash")
+    fb.pop("semantic_hash")
+    if fa != fb:
+        return ""
+    tool = "tools/redeclare_dense_ladder.py (dry-run prints the migration; --execute writes it)"
+    if config is not None:
+        from zagg.semantics import semantic_hash_legacy
+
+        if semantic_hash_legacy(config) != existing["semantic_hash"]:
+            return ""
+        return (
+            f"; the only frozen key that differs is semantic_hash, and the store's is this "
+            f"config's PRE-EPOCH digest (issue #499: data_source.index left the semantic "
+            f"core) — migrate the manifest with {tool}, then rerun; the append path never "
+            f"migrates on its own"
+        )
+    return (
+        f"; the only frozen key that differs is semantic_hash — if this config built the "
+        f"store before the issue #499 epoch (data_source.index left the semantic core), "
+        f"migrate the manifest with {tool}, then rerun; the append path never migrates on "
+        f"its own"
+    )
+
+
 def validate_manifest(
-    store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs
+    store_root: str, manifest: dict, *, overwrite: bool = False, config=None, **store_kwargs
 ) -> dict | None:
     """Read-only frozen-key precheck — the fail-fast half of the manifest guard.
 
@@ -447,6 +484,7 @@ def validate_manifest(
                 f"(existing {existing!r} vs {manifest!r}); this store was templated "
                 f"for different orders/identity — clear the store root (or pick a "
                 f"new one) before writing with this configuration"
+                f"{_pre_epoch_hint(existing, manifest, config)}"
             )
         return existing
     if overwrite and existing is not None and not frozen_matches:
@@ -553,7 +591,9 @@ def ensure_manifest(
     """
 
     store = open_object_store(store_root, **store_kwargs)
-    existing = validate_manifest(store_root, manifest, overwrite=overwrite, **store_kwargs)
+    existing = validate_manifest(
+        store_root, manifest, overwrite=overwrite, config=config, **store_kwargs
+    )
     if existing is not None and not overwrite:
         return existing
     put_object(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
@@ -624,7 +664,10 @@ def _frozen_matches(existing: dict | None, manifest: dict) -> bool:
     pre-#299 manifest lacks the key, and refusing every append to an
     existing store on its absence would brick resumes — the orders/schedule
     keys still guard those stores. Two hash-carrying manifests must match
-    exactly (D19: the hash is a frozen key).
+    exactly (D19: the hash is a frozen key) — at the CURRENT epoch: a
+    pre-epoch digest (issue #499) is never matched here, so a not-yet-migrated
+    store refuses until :func:`zagg.sweep_overview.declare_pyramid` has
+    rewritten its manifest (see :func:`_pre_epoch_hint`).
     """
     if existing is None:
         return False

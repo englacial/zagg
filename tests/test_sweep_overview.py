@@ -3294,6 +3294,74 @@ class TestDeclarePyramid:
         )
         assert "could NOT be verified" in caplog.text
 
+    #: The live ATL03 store's chunk-index block — read machinery (issue #499).
+    INDEX = {
+        "backend": "sidecar",
+        "store": "s3://sliderule-public-cors/zagg-index/ATL03/007",
+        "on_miss": "build",
+    }
+
+    def _pre_epoch_store(self, root):
+        """A store built before the issue #499 epoch: its manifest carries the
+        INDEX-IN-CORE digest of a config that declares an index block."""
+        from zagg.semantics import semantic_hash_legacy
+
+        cfg = _leaf_cfg()
+        cfg.data_source["index"] = dict(self.INDEX)
+        self._pre_declaration_store(root)
+        manifest = read_manifest(str(root))
+        manifest["semantic_hash"] = semantic_hash_legacy(cfg)
+        obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
+        return cfg
+
+    def test_pre_epoch_hash_migrates_in_the_same_write(self, tmp_path):
+        # The self-migrating guard (issue #499): the store's frozen hash is this
+        # config's PRE-epoch digest, so the declaration is accepted with a note
+        # and the same PUT rewrites the frozen key to the current digest.
+        from zagg.semantics import semantic_fingerprint, semantic_hash, semantic_hash_legacy
+
+        cfg = self._pre_epoch_store(tmp_path)
+        legacy, current = semantic_hash_legacy(cfg), semantic_hash(cfg)
+        assert legacy != current
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True
+        assert summary["semantic_hash_migration"] == {"from": legacy, "to": current}
+        assert f"pre-epoch semantic_hash {semantic_fingerprint(legacy)}" in summary["validated"]
+        assert summary["validated"].endswith(f"migrated to {semantic_fingerprint(current)}")
+        after = read_manifest(str(tmp_path))
+        assert after["semantic_hash"] == current and "pyramid" in after
+        # From here the store is a current-epoch store: the retrofit is
+        # idempotent again, and no second migration is reported.
+        again = declare_pyramid(str(tmp_path), cfg)
+        assert again["updated"] is False and again["semantic_hash_migration"] is None
+
+    def test_identical_declaration_still_puts_for_a_migration(self, tmp_path, monkeypatch):
+        # The "identical declaration -> no PUT" short-circuit must yield to a
+        # pending migration: the frozen key moves exactly here or never.
+        from zagg.semantics import semantic_hash, semantic_hash_legacy
+
+        cfg = self._pre_epoch_store(tmp_path)
+        declare_pyramid(str(tmp_path), cfg)  # installs the block AND migrates
+        manifest = read_manifest(str(tmp_path))
+        manifest["semantic_hash"] = semantic_hash_legacy(cfg)  # re-stamp the old digest
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        puts = []
+        real_put = obstore.put
+        monkeypatch.setattr(obstore, "put", lambda *a, **k: (puts.append(a), real_put(*a, **k))[1])
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "identical" and summary["updated"] is True
+        assert len(puts) == 1
+        assert read_manifest(str(tmp_path))["semantic_hash"] == semantic_hash(cfg)
+
+    def test_a_foreign_pre_epoch_hash_still_refuses(self, tmp_path):
+        # The legacy probe recognizes THIS config's old digest only: a store a
+        # different config built under the old rule is refused, not migrated.
+        cfg = self._pre_epoch_store(tmp_path)
+        cfg.aggregation["variables"]["h_min"]["function"] = "max"
+        with pytest.raises(ValueError, match="config semantics .* != the store's frozen"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
     def test_declared_off_preserves_prior_materialized(self, tmp_path):
         # The intended shape (D24 option A): overviews already on disk are real
         # regenerable-cache debris, so a declared-OFF block still inventories
