@@ -162,6 +162,70 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
+def _carry_auxiliary(entry: dict, source: dict) -> dict:
+    """``entry`` plus the per-entry keys :func:`_granule_entry`'s fixed set omits.
+
+    ``reproject`` rebuilds every entry through :func:`_granule_entry`, whose key
+    set is closed, so a per-entry key a *builder* attached to the map was dropped
+    from the derived map. The closest-observation pairing provenance
+    (``paired_epochs`` / ``epoch_offsets_ns``, issue #509) is the case in hand:
+    without it a reprojected paired map stays spatially valid but can no longer
+    say why any granule is in it (issue #517).
+
+    A generic passthrough rather than an allowlist — the next builder's keys ride
+    through without a second edit here. Recognized keys are never overwritten:
+    :func:`_granule_entry` (and, in the refine arm, the identity carry of issue
+    #512) has already settled those.
+
+    What that costs, for the next builder to know: ``reproject`` mints new shard
+    membership, so a per-entry key whose meaning depends on the SOURCE order or
+    shard is stale the moment it rides through, and a generic passthrough carries
+    it anyway. Map-level state gets the opposite default a few hundred lines down
+    — ``total_shards``/``total_pairs``/``granules_assigned`` recomputed,
+    ``aoi_mask`` and ``build_wall_s`` popped — precisely because a derived map
+    must not inherit them. Per-entry state is not examined that way; a key that
+    needs to change with the grid has to be handled where it is attached.
+    :func:`_union_auxiliary` covers the one case reproject can see, a granule
+    reaching one coarsened shard from several children.
+    """
+    for key, value in source.items():
+        if key not in entry:
+            entry[key] = value
+    return entry
+
+
+def _union_auxiliary(banked: dict, entry: dict) -> None:
+    """Fold ``entry``'s auxiliary rows into ``banked`` -- the coarsen union.
+
+    Coarsening merges sibling shards, so a granule reaching one parent from
+    several children arrives once per child, each time with that child's own
+    auxiliary payload. Last-wins on the entry kept only the final child's, and
+    the payloads differ by construction: ``closest_obs_shardmap`` accumulates
+    the pairing provenance PER SHARD, so the discard silently lost the very
+    record issue #517 exists to keep.
+
+    The equal-length list-valued keys are read as parallel columns of one table
+    -- ``paired_epochs`` beside its row-aligned ``epoch_offsets_ns`` -- so the
+    union is over whole ROWS. Row-wise keeps the pairing aligned (a per-key
+    union would not: two children agreeing on the epoch but not the offset
+    would leave the two columns different lengths), drops the rows two children
+    genuinely share, and rebuilds rather than extends, so the source map's own
+    lists are never mutated. Columns that do not line up are not guessed at:
+    the banked value stands.
+    """
+    cols = [k for k, v in entry.items() if isinstance(v, list) and isinstance(banked.get(k), list)]
+    if (
+        not cols
+        or len({len(entry[k]) for k in cols}) > 1
+        or len({len(banked[k]) for k in cols}) > 1
+    ):
+        return
+    rows = list(zip(*(banked[k] for k in cols)))
+    rows += [row for row in zip(*(entry[k] for k in cols)) if row not in rows]
+    for j, key in enumerate(cols):
+        banked[key] = [row[j] for row in rows]
+
+
 def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[tuple[str, str], ...], tuple]:
     """``(canonicals, distinguishing)`` for one shard entry.
 
@@ -326,16 +390,21 @@ def _warn_loaded_collisions(sm: "ShardMap", path: str) -> "ShardMap":
     ``from_json`` / ``from_parquet`` read manifests built before the #468 guard
     existed; refusing would make a historical map unreadable (PR #482 question
     (2) ruling). The hazard the warning names: a leaf gate reading this map
-    records fewer granules than it reads, and ``refine`` silently drops one
-    collided member (issue #512).
+    records fewer granules than it reads. ``refine`` used to silently drop one
+    collided member on top of that; it now carries the map's own hrefs through,
+    so the pair reaches ``_refuse_basename_collisions`` and the arms that mint
+    new shard membership — coarsen and refine — refuse instead of deriving
+    (issue #512). A same-order ``reproject`` is exempt because it is identity:
+    it returns both members and loses nothing, so there is nothing to refuse.
     """
     message = _basename_collision_message(sm.shard_keys, sm.granules, stacklevel=4, source=path)
     if message is not None:
         warnings.warn(
             f"{path}: this manifest predates the construction-time identity guard "
             f"and would be refused by it; loading anyway (historical maps stay "
-            f"readable), but note refine silently drops a collided member "
-            f"(issue #512). {message}",
+            f"readable), but note deriving from it at another order -- reproject's "
+            f"coarsen and refine -- is refused rather than silently dropping a "
+            f"collided member (issue #512). {message}",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -1846,7 +1915,10 @@ class ShardMap:
             return ShardMap(
                 target_grid.spatial_signature(),
                 list(self.shard_keys),
-                [[_granule_entry(g) for g in shard] for shard in self.granules],
+                [
+                    [_carry_auxiliary(_granule_entry(g), g) for g in shard]
+                    for shard in self.granules
+                ],
                 meta,
                 self.aoi_mask,
             )
@@ -1868,11 +1940,21 @@ class ShardMap:
                 # in-shard here, and an id-keyed dedup would drop one of the two
                 # rather than let the check below name it (issue #468). A
                 # granule spanning several children still counts once.
+                # A granule arriving from several children brings one auxiliary
+                # payload per child, and the closest-obs provenance is built per
+                # shard, so those payloads differ. Last-wins on the entry kept
+                # the final child's alone; the rows are unioned instead (issue
+                # #517). The identity fields are settled by the first arrival --
+                # they are what the key already matched on.
                 seen: dict = {}
                 for i in groups[k]:
                     for g in self.granules[i]:
-                        entry = _granule_entry(g)
-                        seen[_recorded_identity(entry)[1]] = entry
+                        entry = _carry_auxiliary(_granule_entry(g), g)
+                        identity = _recorded_identity(entry)[1]
+                        if identity in seen:
+                            _union_auxiliary(seen[identity], entry)
+                        else:
+                            seen[identity] = entry
                 new_granules.append(list(seen.values()))
             method = "coarsen"
         else:
@@ -1920,7 +2002,26 @@ class ShardMap:
                 for k, idxs in shard_to_idx.items():
                     bucket = new_granules_map.setdefault(int(k), {})
                     for i in idxs:
-                        entry = _granule_entry(sub_records[i])
+                        # The MAP entry's own IDENTITY keys win over the catalog
+                        # record's. Rebuilt from the record alone, a legacy
+                        # collided pair (two entries, one id, two href prefixes)
+                        # arrived as one IDENTICAL entry and the two collapsed
+                        # into one bucket slot -- a granule lost silently,
+                        # upstream of the guard below, which then had nothing
+                        # left to see (issue #512). Carrying the map's own hrefs
+                        # keeps the pair distinct so the guard refuses loudly.
+                        # Scoped to what ``_recorded_identity`` distinguishes on,
+                        # ``datetime`` included: the raster form of the same
+                        # collision is two acquisitions under one item id,
+                        # separated by nothing else (issue #468). Everything the
+                        # catalog is authoritative for -- the time metadata --
+                        # stays the record's, so a refine against a corrected
+                        # catalog still picks the correction up. (``assets``
+                        # already rides in via ``sub_records`` above.)
+                        src = gran_list[i]
+                        identity = {k: src[k] for k in ("s3", "https", "datetime") if k in src}
+                        entry = _granule_entry({**sub_records[i], **identity})
+                        entry = _carry_auxiliary(entry, src)
                         bucket[_recorded_identity(entry)[1]] = entry
 
             new_keys = sorted(new_granules_map)

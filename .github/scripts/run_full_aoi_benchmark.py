@@ -504,6 +504,7 @@ def run_target(
     _apply_target_axes(config, target)
     handoff = target.get("handoff") or get_handoff(config)
     grid = from_config(config)
+    parent_order, child_order = bench_metrics.shard_cell_orders(grid)
 
     sm_path = Path(artifacts_dir) / f"sm_{name}.json"
     build_s, aoi_mask_s, sm = build_shardmap(target, manifest, base, catalog_path, grid, sm_path)
@@ -542,8 +543,8 @@ def run_target(
             if target.get("index_backend") == "sidecar" and not dry_run
             else None
         ),
-        "parent_order": int(grid.parent_order),
-        "child_order": int(grid.child_order),
+        "parent_order": parent_order,
+        "child_order": child_order,
         "mortie_moc_order": sm.metadata.get("mortie_order"),
         "shard_area_km2": area,
         "memory_gb": LAMBDA_MEMORY_GB,

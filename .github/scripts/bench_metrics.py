@@ -227,6 +227,20 @@ def shard_area_km2(grid) -> float:
     raise TypeError(f"unsupported grid type for area: {type(grid).__name__}")
 
 
+def shard_cell_orders(grid) -> tuple[int, int]:
+    """``(parent_order, child_order)`` -- the shard and cell orders of a run.
+
+    Only the HEALPix grid carries them; the rectilinear grid states its shard
+    geometry as ``chunk_h``/``chunk_w`` instead (see :func:`shard_area_km2`).
+    The drivers recording these into the series dispatch HEALPix targets only,
+    so an unsupported grid is a manifest error and is named as one here rather
+    than surfacing as an ``AttributeError`` at the record site.
+    """
+    if isinstance(grid, HealpixGrid):
+        return int(grid.parent_order), int(grid.child_order)
+    raise TypeError(f"unsupported grid type for shard/cell orders: {type(grid).__name__}")
+
+
 def _runtime_s(summary: dict) -> float | None:
     """Single-shard runtime: the lone worker's wall, falling back to the rollup."""
     for key in ("worker_max_s", "lambda_time_s", "wall_time_s"):
