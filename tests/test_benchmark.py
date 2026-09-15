@@ -71,6 +71,28 @@ def test_unknown_grid_area_raises():
         bench_metrics.shard_area_km2(object())
 
 
+# --- shard_cell_orders ----------------------------------------------------
+
+
+def test_healpix_shard_cell_orders():
+    g = HealpixGrid(parent_order=9, child_order=17)
+    assert bench_metrics.shard_cell_orders(g) == (9, 17)
+
+
+def test_rect_shard_cell_orders_raises():
+    # The rectilinear grid has no shard/cell orders at all -- the drivers
+    # recording them dispatch HEALPix targets only, so this is named rather
+    # than left to surface as an AttributeError at the record site.
+    g = RectilinearGrid(
+        crs="EPSG:32618",
+        resolution=10,
+        bounds=[358300, 4299600, 370300, 4311600],
+        chunk_shape=(300, 300),
+    )
+    with pytest.raises(TypeError, match="shard/cell orders"):
+        bench_metrics.shard_cell_orders(g)
+
+
 # --- build_record ---------------------------------------------------------
 
 

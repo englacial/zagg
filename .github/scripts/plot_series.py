@@ -358,13 +358,13 @@ def _panel_layout(hist: pd.DataFrame) -> tuple[list[list[str | None]], int, int]
     meta = hist.dropna(subset=["target"]).drop_duplicates("target")
     rows = []
     for _, r in meta.iterrows():
-        grid = str(r.get("grid_type", ""))
-        col = 0 if grid.startswith("rect") else 1
+        grid_type = str(r.get("grid_type", ""))
+        col = 0 if grid_type.startswith("rect") else 1
         rows.append(
             {
                 "target": r["target"],
                 "col": col,
-                "grid": grid,
+                "grid": grid_type,
                 "size": str(r.get("grid_size", "")),
                 "agg": str(r.get("aggregator", "")),
                 "area": float(r.get("shard_area_km2") or 0.0),
