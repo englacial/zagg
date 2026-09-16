@@ -129,34 +129,61 @@ class TestClassifyLevel:
 class TestColumnMembers:
     def test_reference_geometry(self):
         levels = expand_overviews([13], parent_order=9)
-        # o6 column: relay (9) plus the members nodes 5..0 gather — cells
-        # {9..12} from nodes {5,4,3,2,1,0} intersect >= 9 -> {9} only at
-        # node 5; nodes 4.. are merges. Members: {9} == relay alone... plus
-        # gatherable cells strictly: node 5 gathers 9 (the relay itself).
-        assert column_members(levels, 6, shard_order=9) == [9]
+        # o6 column: the relay (11 — the leaf columns' res-(shard + 2)
+        # member, issue #538) plus the members nodes 5..0 gather — cells
+        # {9..12} from nodes {5,4,3,2,1,0} intersect >= 9 -> {9} at node 5
+        # only; nodes 4.. are merges.
+        assert column_members(levels, 6, shard_order=9, cell_order=19) == [11, 9]
         # o3 column: coarser levels' gatherable cells (7..2 + 4) are all < 9,
         # so the relay is the only member.
-        assert column_members(levels, 3, shard_order=9) == [9]
+        assert column_members(levels, 3, shard_order=9, cell_order=19) == [11]
+
+    def test_relay_is_the_coarsest_member_folded_from_raw(self):
+        from zagg.column import relay_resolution
+
+        assert relay_resolution(expand_overviews([13], parent_order=9), 9, 19) == 11
+        assert relay_resolution(expand_overviews([16, 13], parent_order=9), 9, 19) == 11
+        # A finest leaf resolution of shard + 1 carries no boundary member:
+        # every group is from raw and the node-order member stays the relay.
+        assert relay_resolution(expand_overviews([10], parent_order=9), 9, 19) == 9
+        assert relay_resolution(expand_overviews([4], parent_order=3), 3, 8) == 3
+
+    def test_a_gapped_declaration_relays_the_node_member(self):
+        # A ladder that straddles the boundary WITHOUT carrying it (members
+        # {12, 10, 9} — finest 12, no group 11) must relay a member the leaf
+        # columns actually hold: membership is the predicate, not the finest
+        # declared resolution (review finding — relaying an absent group left
+        # every above-shard merge level at fill, silently).
+        from zagg.column import column_resolutions, relay_resolution
+
+        for ov in ([12, 10], [13, 10]):
+            levels = expand_overviews(ov, parent_order=9)
+            assert 11 not in column_resolutions(levels, 9)
+            assert relay_resolution(levels, 9, 19) == 9
+            assert column_members(levels, 6, shard_order=9, cell_order=19) == [9]
 
     def test_finer_declaration_widens_the_gather_tier(self):
-        # d=1 (overviews [10] on o9): node-8 level gathers cells 9 == relay;
+        # d=1 (overviews [10] on o9): node-8 level gathers cells 9 == relay
+        # (no res-11 member exists, so the node-order member stays the relay);
         # a width-3 column at 6 carries relay only; nothing else >= shard.
         levels = expand_overviews([10], parent_order=9)
-        assert column_members(levels, 6, shard_order=9) == [9]
+        assert column_members(levels, 6, shard_order=9, cell_order=19) == [9]
 
     def test_multi_resolution_leaf_declaration(self):
         # overviews [16, 13] on o9: d = 13 - 9 = 4; ladder unchanged, and the
-        # finer 16 member is leaf-only (no coarser level gathers it).
+        # finer 16 member is leaf-only (no coarser level gathers it); the
+        # relay is the res-11 member, not the finest declared.
         levels = expand_overviews([16, 13], parent_order=9)
-        assert column_members(levels, 6, shard_order=9) == [9]
+        assert column_members(levels, 6, shard_order=9, cell_order=19) == [11, 9]
 
     def test_wide_window_carries_gather_members(self):
         # d=5 on o6 (overviews [11]): coarser levels than the o3 column with
         # gatherable cells are node 2 (cells 7) and node 1 (cells 6); its own
-        # level (cells 8) is an artifact, never one of its members.
+        # level (cells 8) is an artifact, never one of its members; the relay
+        # is the res-8 member.
         levels = expand_overviews([11], parent_order=6)
-        assert column_members(levels, 3, shard_order=6) == [7, 6]
-        assert column_members(levels, 1, shard_order=6) == [6]
+        assert column_members(levels, 3, shard_order=6, cell_order=19) == [8, 7, 6]
+        assert column_members(levels, 1, shard_order=6, cell_order=19) == [8]
 
 
 class TestScope:
@@ -395,6 +422,106 @@ def _ladder_arrays(root):
 
 def _payload_equal(x, y):
     return all(bytes(p or b"") == bytes(q or b"") for p, q in zip(x, y, strict=True))
+
+
+#: The issue #538 geometry: shard 3 / cells 6 (64 cells per leaf), overviews
+#: [5] — the leaf column carries {5, 4, 3} with 5 the raw-fold boundary, so
+#: 4 and 3 are flat second merges and the relay member is 5.
+WIDE_CELL_ORDER = 6
+
+
+def _wide_leaf_slabs(i):
+    counts = (np.arange(64, dtype="int32") + 1) * (i + 1)
+    dig = np.full(64, b"", dtype=object)
+    for j in range(64):
+        dig[j] = encode_digest(np.asarray([[float(i * 100 + j), 1.0]], dtype=np.float32), "float32")
+    return {"count": counts, "h_tdigest": dig}
+
+
+def _wide_store(root, leaves=LEAVES):
+    from zagg.column import column_resolutions, fold_column, write_column
+    from zagg.pyramid import expand_overviews
+
+    manifest = json.loads(json.dumps(_stage_store(root, leaves=(), write_moc=False)))
+    manifest["cell_order"] = WIDE_CELL_ORDER
+    levels = expand_overviews([5], parent_order=3)
+    manifest["pyramid"]["overviews"] = levels
+    (root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=1))
+    res = column_resolutions(levels, 3)
+    for i, dec in enumerate(leaves):
+        folded = fold_column(
+            _wide_leaf_slabs(i), FIELDS, cell_order=WIDE_CELL_ORDER, resolutions=res, node_order=3
+        )
+        write_column(
+            str(root),
+            morton_word(dec),
+            folded,
+            FIELDS,
+            node_order=3,
+            cell_order=WIDE_CELL_ORDER,
+            granule_count=1,
+        )
+    write_root_coverage(str(root), build_root_coverage([morton_word(d) for d in leaves], 3))
+    return manifest
+
+
+class TestRelayMember:
+    """Issue #538: merges read the res-(shard + 2) partials, never the node member.
+
+    The leaf column's node-order member is now a flat second merge, so a
+    ladder merge consuming it would sit at gen 3; the relay moves to the
+    coarsest member still folded from raw and every stage-merge level stays
+    exactly 2 merges from raw (spec §4.4).
+    """
+
+    def test_merge_is_one_kway_call_over_the_relay_partials(self, tmp_path):
+        from zagg.sweep_overview import decode_digest, fold_digests
+
+        m = _wide_store(tmp_path / "s")
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        assert row["failed"] == 0
+        # d = 2: node 2 carries 4 and node 1 carries 3 (gathers); node 0 —
+        # the base cell '1' — carries cells 2, the one merge level.
+        level = _artifact(tmp_path / "s", "1/all.zarr")
+        attrs = dict(level.attrs)["zagg_overview"]
+        assert attrs["regime"] == "stage-merge" and attrs["merges_from_raw"] == 2
+        # Cell 0 of order 2 is '111', covering leaves 1111 and 1112: ONE
+        # k-way call over their 32 res-5 boundary cells ...
+        parts = [
+            decode_digest(p, "float32")
+            for leaf in ("1/1/1/1", "1/1/1/2")
+            for p in _artifact(tmp_path / "s", f"{leaf}/all.pyramid.zarr")["5"]["h_tdigest"][:]
+        ]
+        stored = level["2"]["h_tdigest"][:]
+        assert bytes(stored[0]) == fold_digests(parts, delta=16, dtype="float32")
+        # ... and NOT the pre-#538 fold of their node-order partials, which
+        # since #538 are themselves second merges.
+        node_parts = [
+            decode_digest(p, "float32")
+            for leaf in ("1/1/1/1", "1/1/1/2")
+            for p in _artifact(tmp_path / "s", f"{leaf}/all.pyramid.zarr")["3"]["h_tdigest"][:]
+        ]
+        assert bytes(stored[0]) != fold_digests(node_parts, delta=16, dtype="float32")
+        # Exact fields are unaffected by the source tier.
+        assert list(level["2"]["count"][:]) == [2080 * (1 + 2), 2080 * 3] + [0] * 14
+
+    def test_stage_columns_relay_the_boundary_member(self, tmp_path):
+        m = _wide_store(tmp_path / "s")
+        summary = _sweep(tmp_path / "s", m, width=1)
+        assert all(s["failed"] == 0 for s in summary["stages"])
+        g = _artifact(tmp_path / "s", "1/1/all.pyramid.zarr")  # the order-1 dispatch column
+        attrs = dict(g.attrs)["zagg_column"]
+        assert attrs["groups"] == {
+            "5": {"regime": "stage-gather", "merges_from_raw": 1, "n_cells": 256}
+        }
+        leaf = _artifact(tmp_path / "s", "1/1/1/1/all.pyramid.zarr")
+        # '1111' ranks 0 under '11': its 16 res-5 cells ARE column cells 0..15.
+        assert [bytes(p) for p in g["5"]["h_tdigest"][:16]] == [
+            bytes(p) for p in leaf["5"]["h_tdigest"][:]
+        ]
+        # The root fold reads the relayed res-5 tier and lands at gen 2.
+        root_attrs = dict(_artifact(tmp_path / "s", "1/all.zarr").attrs)["zagg_overview"]
+        assert root_attrs["regime"] == "stage-merge" and root_attrs["merges_from_raw"] == 2
 
 
 class TestStagePass:
