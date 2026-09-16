@@ -342,6 +342,90 @@ class TestSemanticManifest:
         with pytest.raises(ValueError, match="does not match this run"):
             hive.validate_manifest(root, other)
 
+    def _pre_epoch_store(self, cfg, root):
+        """A store built before the issue #499 epoch: its manifest carries the
+        INDEX-IN-CORE digest of a config that declares a chunk-index block.
+        Returns ``(indexed config, grid, the stored manifest)``."""
+        import copy
+
+        from zagg.semantics import semantic_hash, semantic_hash_legacy
+
+        indexed = copy.deepcopy(cfg)
+        indexed.data_source["index"] = {"backend": "sidecar", "store": "s3://public/zagg-index"}
+        grid = self._grid(indexed)
+        old = hive.build_manifest(grid)
+        old["semantic_hash"] = semantic_hash_legacy(indexed)
+        assert old["semantic_hash"] != semantic_hash(indexed)
+        hive.ensure_manifest(root, old)
+        return indexed, grid, old
+
+    def test_pre_epoch_store_refuses_append_by_name(self, cfg, tmp_path):
+        # Issue #499: the append path compares CURRENT-epoch digests only. A
+        # store whose manifest carries this config's pre-epoch digest refuses
+        # — never silently migrates — and the refusal names the one migration
+        # point, the redeclare tool.
+        import copy
+
+        root = str(tmp_path / "store")
+        indexed, grid, old = self._pre_epoch_store(cfg, root)
+        fresh = hive.build_manifest(grid)
+        with pytest.raises(ValueError, match="PRE-EPOCH digest.*redeclare_dense_ladder"):
+            hive.validate_manifest(root, fresh, config=indexed)
+        # For a caller that does not forward the config (today the Lambda ping
+        # precheck) the hint is conditional, and still names the tool.
+        with pytest.raises(ValueError, match="if this config built the store.*issue #499"):
+            hive.validate_manifest(root, fresh)
+        with pytest.raises(ValueError, match="never migrates on its own"):
+            hive.ensure_manifest(root, fresh, config=indexed)
+        assert hive.read_manifest(root) == old  # nothing moved
+        # A DIFFERENT config's pre-epoch digest earns no hint: the probe
+        # recognizes this config's own old digest only.
+        other = copy.deepcopy(indexed)
+        other.aggregation["variables"]["count"]["dtype"] = "int64"
+        with pytest.raises(ValueError) as exc:
+            hive.validate_manifest(root, hive.build_manifest(self._grid(other)), config=other)
+        assert "issue #499" not in str(exc.value)
+        # Nor does a mismatch that is not the hash alone (orders moved too).
+        moved = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=indexed)
+        with pytest.raises(ValueError) as exc:
+            hive.validate_manifest(root, hive.build_manifest(moved), config=indexed)
+        assert "issue #499" not in str(exc.value)
+
+    def test_hint_never_masks_the_refusal(self, cfg, tmp_path, monkeypatch):
+        # The hint is interpolated INTO the refusal message, so a raise from
+        # ``semantic_hash_legacy`` would replace the clear frozen-key refusal
+        # with an unrelated traceback. It is advisory: it fails open to the
+        # config-less wording and the refusal still fires.
+        import zagg.semantics
+
+        root = str(tmp_path / "store")
+        indexed, grid, _ = self._pre_epoch_store(cfg, root)
+
+        def boom(*a, **k):
+            raise TypeError("a fault inside a normalizer")
+
+        monkeypatch.setattr(zagg.semantics, "semantic_hash_legacy", boom)
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, hive.build_manifest(grid), config=indexed)
+
+    def test_migration_through_declare_pyramid_unblocks_the_append(self, cfg, tmp_path):
+        # The tool's path end to end: declare_pyramid migrates the frozen key,
+        # after which the same run's manifest is accepted without a PUT.
+        from zagg.semantics import semantic_hash
+        from zagg.sweep_overview import declare_pyramid
+
+        root = str(tmp_path / "store")
+        indexed, grid, old = self._pre_epoch_store(cfg, root)
+        summary = declare_pyramid(root, indexed)
+        assert summary["semantic_hash_migration"] == {
+            "from": old["semantic_hash"],
+            "to": semantic_hash(indexed),
+        }
+        fresh = hive.build_manifest(grid)
+        accepted = hive.ensure_manifest(root, fresh, config=indexed)
+        assert accepted["semantic_hash"] == semantic_hash(indexed) == fresh["semantic_hash"]
+        assert accepted["pyramid"] == hive.read_manifest(root)["pyramid"]
+
     def test_overwrite_semantic_mismatch_refuses_over_existing_shards(self, cfg, tmp_path):
         # Issue #341 hash-guard ruling: overwrite does NOT bypass the
         # semantic-hash refusal — the hash is a frozen key, so a changed

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **BREAKING — hash epoch: `data_source.index` leaves the semantic core**
+  (#499 phase 2, refs #547, [#565](https://github.com/englacial/zagg/pull/565);
+  espg-ruled 2026-09-13). The chunk-index block (`backend`
+  inline/hierarchical/sidecar, the sidecar `store` location, `on_miss`) is
+  read machinery: a sidecar miss processes the file and a different sidecar
+  location yields identical bytes, so it joins `DATA_SOURCE_PACKAGING_KEYS`
+  beside `reader`/`read_plan`. **Every pre-epoch `semantic_hash` of a store
+  whose config carried an `index` block stops reproducing** — both live
+  stores do (`atl03_tdigest_o9` `b9b15fdd…` → `aacfe1e3…`, `gedi_flux_o9`
+  `4f828794…` → `337b2c3a…`; pairs pinned in `tests/test_semantics.py`).
+  - **Migration is the redeclare tool, and only it.**
+    `zagg.semantics.semantic_hash_legacy` recomputes a config's pre-epoch
+    digest; `declare_pyramid` (behind `tools/redeclare_dense_ladder.py` and
+    `--declare-pyramid`) accepts a store whose frozen hash is the supplied
+    config's pre-epoch digest and rewrites `semantic_hash` to the current
+    value in the same manifest write — the one place a frozen key moves. The
+    tool's dry run prints `semantic guard: legacy MATCH (b9b15f…) → will
+    rewrite to aacfe1…` before `--execute`; an identical declaration is no
+    longer a no-op while a migration is pending. The same write re-renders the
+    store's D19 core sidecar (`aggregation.yaml`), which nothing else
+    regenerates, so it does not keep asserting the pre-epoch core.
+  - **The append path does not migrate.** `hive._frozen_matches` compares
+    current-epoch digests only; a not-yet-migrated store refuses an
+    aggregation run up front with a message naming the tool.
+  - **Skip-gate consequence (deliberate):** `dedup` compares stamped hash
+    strings, so pre-epoch stamps on the two live stores read as stale — a
+    same-shard re-dispatch **rewrites** instead of skipping. New-AOI appends
+    and the column backfill are unaffected. Migration note:
+    `docs/hive_layout.md`, "Migration: the index-exclusion epoch".
+
 - **The leaf column's coarse members fold flat from the res-(s+2) member**
   (#538): the leaf-time column fold merged every resident photon of the shard
   in one k-way call at the node-order member, at ~95–100 B of peak memory per

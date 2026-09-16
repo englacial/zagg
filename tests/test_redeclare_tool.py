@@ -61,9 +61,9 @@ def _store(root, *, orders=(1, 0)):
     _run_record(root, ("-311",))
 
 
-def _config_yaml(tmp_path) -> str:
+def _config_yaml(tmp_path, config: dict = CONFIG_DICT) -> str:
     path = tmp_path / "config.yaml"
-    path.write_text(yaml.safe_dump(CONFIG_DICT))
+    path.write_text(yaml.safe_dump(config))
     return str(path)
 
 
@@ -74,15 +74,37 @@ def _other_config() -> dict:
     return other
 
 
-def _stamp_semantic_hash(root, config_dict: dict) -> None:
-    """Give the fixture manifest a ``semantic_hash`` — the live stores carry one,
-    so without this every ``--execute`` test runs the unverified (pre-#299) branch."""
-    from zagg.config import load_config_from_dict
-    from zagg.semantics import semantic_hash
+def _indexed_config() -> dict:
+    """The live-store shape: the same config carrying a chunk-index block (issue #499)."""
+    indexed = json.loads(json.dumps(CONFIG_DICT))
+    indexed["data_source"]["index"] = {
+        "backend": "sidecar",
+        "store": "s3://sliderule-public-cors/zagg-index/ATL03/007",
+        "on_miss": "build",
+    }
+    return indexed
 
+
+def _stamp_semantic_hash(root, config_dict: dict, *, legacy: bool = False) -> None:
+    """Give the fixture manifest a ``semantic_hash`` — the live stores carry one,
+    so without this every ``--execute`` test runs the unverified (pre-#299) branch.
+    ``legacy=True`` stamps the PRE-epoch (index-in-core) digest, issue #499."""
+    from zagg.config import load_config_from_dict
+    from zagg.semantics import semantic_hash, semantic_hash_legacy
+
+    digest = semantic_hash_legacy if legacy else semantic_hash
     manifest = json.loads((root / MANIFEST_NAME).read_text())
-    manifest["semantic_hash"] = semantic_hash(load_config_from_dict(config_dict))
+    manifest["semantic_hash"] = digest(load_config_from_dict(config_dict))
     (root / MANIFEST_NAME).write_text(json.dumps(manifest))
+
+
+def _fingerprints(config_dict: dict) -> tuple[str, str]:
+    """``(pre-epoch, current)`` 12-hex fingerprints of ``config_dict``."""
+    from zagg.config import load_config_from_dict
+    from zagg.semantics import semantic_fingerprint, semantic_hash, semantic_hash_legacy
+
+    cfg = load_config_from_dict(config_dict)
+    return semantic_fingerprint(semantic_hash_legacy(cfg)), semantic_fingerprint(semantic_hash(cfg))
 
 
 class TestDryRun:
@@ -173,6 +195,33 @@ class TestDryRun:
         assert "MISMATCH" in capsys.readouterr().out
         assert (tmp_path / MANIFEST_NAME).read_bytes() == before
 
+    def test_pre_epoch_hash_prints_the_migration(self, tmp_path, capsys):
+        # Issue #499: the operator sees the frozen-key rewrite BEFORE --execute.
+        _store(tmp_path)
+        _stamp_semantic_hash(tmp_path, _indexed_config(), legacy=True)
+        before = (tmp_path / MANIFEST_NAME).read_bytes()
+        config = _config_yaml(tmp_path, _indexed_config())
+        rc = tool.main([str(tmp_path), "--config", config, "--overviews", "3"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        old, new = _fingerprints(_indexed_config())
+        assert f"semantic guard: legacy MATCH ({old}) → will rewrite to {new}" in out
+        assert "DRY-RUN: nothing was written" in out
+        assert (tmp_path / MANIFEST_NAME).read_bytes() == before
+
+    def test_identical_block_under_a_migration_is_not_a_no_op(self, tmp_path, capsys):
+        # A store whose ladder is already installed but whose hash is pre-epoch
+        # still PUTs once on --execute; the dry run must not call it a no-op.
+        _store(tmp_path)
+        config = _config_yaml(tmp_path, _indexed_config())
+        tool.main([str(tmp_path), "--config", config, "--overviews", "3", "--execute"])
+        _stamp_semantic_hash(tmp_path, _indexed_config(), legacy=True)
+        capsys.readouterr()
+        assert tool.main([str(tmp_path), "--config", config, "--overviews", "3"]) == 0
+        out = capsys.readouterr().out
+        assert "IDENTICAL — but --execute still PUTs once" in out
+        assert "would be a no-op" not in out
+
 
 class TestExecute:
     def test_installs_the_dense_ladder_over_v1(self, tmp_path):
@@ -221,6 +270,26 @@ class TestExecute:
         )
         block = read_manifest(str(tmp_path))["pyramid"]
         assert [e["node"] for e in block["overviews"]] == [2, 1, 0]
+
+    def test_execute_migrates_the_pre_epoch_hash(self, tmp_path, capsys):
+        # The one migration point (issue #499): --execute installs the ladder
+        # AND rewrites the frozen semantic_hash to the current digest.
+        from zagg.config import load_config_from_dict
+        from zagg.semantics import semantic_hash, semantic_hash_legacy
+
+        _store(tmp_path)
+        _stamp_semantic_hash(tmp_path, _indexed_config(), legacy=True)
+        config = _config_yaml(tmp_path, _indexed_config())
+        assert tool.main([str(tmp_path), "--config", config, "--overviews", "3", "--execute"]) == 0
+        cfg = load_config_from_dict(_indexed_config())
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["semantic_hash_migration"] == {
+            "from": semantic_hash_legacy(cfg),
+            "to": semantic_hash(cfg),
+        }
+        manifest = read_manifest(str(tmp_path))
+        assert manifest["semantic_hash"] == semantic_hash(cfg)
+        assert [e["node"] for e in manifest["pyramid"]["overviews"]] == [2, 1, 0]
 
     def test_execute_refuses_anon(self, tmp_path):
         _store(tmp_path)
