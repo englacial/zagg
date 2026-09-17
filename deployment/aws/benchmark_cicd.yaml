@@ -326,6 +326,14 @@ Resources:
               #   unresolved, so this grant does not pre-empt it.
               # - No DeleteObject, unlike the fleet's grant: a re-published minor
               #   overwrites via PutObject, and the mirror never prunes.
+              # - Unlike the fleet's, this role's writes really ARE multipart, so
+              #   the abort/list-parts pair is exercised here rather than merely
+              #   held: distribute_zips.sh drives `aws s3 cp`, which splits the
+              #   >50 MB layer zips at its 8 MB multipart_threshold and puts the
+              #   canned ACL on CreateMultipartUpload only, never on UploadPart
+              #   (issue #534 -- the fleet's own handle is single-PUT since then).
+              #   Swapping the CLI for zagg.store.put_object here would change
+              #   that; do not, without re-reading this pair.
               # - The owner ACL is not sent by every writer yet.
               #   distribute_zips.sh sends it, for a published destination only;
               #   publish_mirror.sh sends none on any of its five PUTs and is the
