@@ -5,10 +5,14 @@ key for key, the configs that built ``atl03_tdigest_o9`` and ``gedi_flux_o9``
 (recovered from the stores' run records; espg ruling 2026-09-13: the packaged
 template matches what is live, so a default build APPENDS instead of refusing
 on the frozen ``semantic_hash``). The anchor is the store MANIFEST's frozen
-hash — what ``sweep_overview._semantic_guard`` and ``hive._frozen_matches``
-compare — vendored for ATL03 in ``tests/data/ca_atl03_tdigest_o9_morton_hive.json``.
-A canonicalization change or a template edit that moves either hash surfaces
-here, not at the operator's console.
+hash, vendored for ATL03 in
+``tests/data/ca_atl03_tdigest_o9_morton_hive.json``. Since the issue #499
+index epoch that anchor is the template's LEGACY digest: what
+``sweep_overview._semantic_guard`` and ``hive._frozen_matches`` compare is the
+current one, so each pin carries both columns and the append lands after
+``declare_pyramid`` migrates the store. A canonicalization change or a
+template edit that moves either hash surfaces here, not at the operator's
+console.
 
 The knob pins cover what the hash cannot see but the redeclare tool consumes
 (``overview_delta``, the orders) and the uniform-δ ruling across every
@@ -21,20 +25,28 @@ from pathlib import Path
 import pytest
 
 from zagg.config import default_config
-from zagg.semantics import semantic_hash
+from zagg.semantics import semantic_hash, semantic_hash_legacy
 
 CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json"
 
-#: (template, store manifest ``semantic_hash``) — the frozen-identity anchor.
+#: (template, store manifest ``semantic_hash``, epoch-2 hash) — the
+#: frozen-identity anchor, read across the issue #499 index epoch. The stored
+#: column is what ``morton_hive.json`` carries on disk today and what the
+#: template's LEGACY digest still reproduces; the second is what a default
+#: build hashes to now and what ``declare_pyramid`` migrates the store to.
+#: Same known-answer pairs ``tests/test_semantics.py`` pins from the run
+#: records — here they anchor the TEMPLATES rather than the vendored configs.
 SEMANTIC_PINS = [
     (
         "atl03_tdigest_strata_healpix",
         json.loads(CA_MANIFEST.read_text())["semantic_hash"],
+        "aacfe1e387d2289276572ac941449d4042a174ccc9976528af530d2993b2258a",
     ),
     (
         "gedi01b_waveform_healpix_hive",
         # gedi_flux_o9 morton_hive.json, read 2026-09-13 (no vendored manifest).
         "4f8287947a83abd38519372c047e7f4c62c0479d64bc72f6d512eda413d88f63",
+        "337b2c3acac928c4b1b708e5895081b407d03001325ca756eb6c600c02b11e96",
     ),
 ]
 
@@ -66,9 +78,16 @@ DIGEST_TEMPLATES = [
 ]
 
 
-@pytest.mark.parametrize(("name", "expected"), SEMANTIC_PINS)
-def test_template_reproduces_the_live_store_semantic_hash(name, expected):
-    assert semantic_hash(default_config(name)) == expected
+@pytest.mark.parametrize(("name", "stored", "migrated"), SEMANTIC_PINS)
+def test_template_reproduces_the_live_store_semantic_hash(name, stored, migrated):
+    # The template still IS the config that built the store: its pre-epoch
+    # digest is the hash the manifest carries on disk. Issue #499 moved the
+    # index block off the core, so a default build now hashes to the migration
+    # target instead -- the append lands once ``declare_pyramid`` has rewritten
+    # the frozen key, which is the one place that value moves.
+    cfg = default_config(name)
+    assert semantic_hash_legacy(cfg) == stored
+    assert semantic_hash(cfg) == migrated
 
 
 @pytest.mark.parametrize(("name", "digests", "orders", "overview_delta"), DECLARED_PINS)
