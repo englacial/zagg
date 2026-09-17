@@ -68,6 +68,28 @@ def test_bullets_are_windowed_filtered_deduplicated_and_sorted():
     ]
 
 
+def test_only_branch_sync_shapes_are_dropped_not_titles_starting_with_merge():
+    # The filter sees a PR title, not a merge-commit subject, so a bare ^Merge\b
+    # would silently eat real release notes -- and a dropped PR leaves no trace.
+    keep = [
+        "Merge the dense and sparse readers into one path",
+        "Merged shard maps are now cached",
+        "MERGE sort for t-digest centroids",
+        "merge-order law for k-way t-digest",
+    ]
+    drop = [
+        "merge main into claude/x",
+        "Merge main",
+        "Merge branch 'main' into y",
+        "Merge remote-tracking branch 'origin/main'",
+        "Merge pull request #12 from espg/x",
+        "merge origin/main into claude/x",
+        "Merge upstream into fork",
+    ]
+    assert [t for t in keep if cs._SYNC_TITLE.match(t)] == []
+    assert [t for t in drop if not cs._SYNC_TITLE.match(t)] == []
+
+
 def _numbers(bullets):
     return [ln.split("[#")[1].split("]")[0] for ln in bullets]
 

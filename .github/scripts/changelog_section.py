@@ -22,7 +22,8 @@ are counted into a ``::warning::``, since GitHub's search index lags a merge and
 an unindexed PR would otherwise vanish silently. Branch-sync merges
 (``merge main ...`` / ``Merge ...``) and duplicates are dropped; when no PR
 survives, ``--fallback`` (pre-rendered bullets, e.g. commit subjects) fills the
-list. Re-running for a tag already in the file is a no-op (exit 0, nothing
+list; a title merely *starting* with the word ("Merge the dense and sparse
+readers...") is kept. Re-running for a tag already in the file is a no-op (exit 0, nothing
 written), so a ``workflow_dispatch`` replay cannot duplicate a section. Stdlib
 only: the runner calls it with bare python3.
 """
@@ -37,8 +38,13 @@ from datetime import datetime
 from pathlib import Path
 
 UNRELEASED = "## [Unreleased]"
-#: Branch-sync noise, not release notes.
-_SYNC_TITLE = re.compile(r"(?i:merge main)|Merge\b")
+#: Branch-sync noise, not release notes. Matched against a PR *title*, so it
+#: pins the shapes git and GitHub actually generate rather than the bare word:
+#: "Merge the dense and sparse readers into one path" is a real release note.
+_SYNC_TITLE = re.compile(
+    r"^merge (main|origin/main|upstream)\b|^merge (branch|remote-tracking branch|pull request)\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_time(value: str) -> datetime:
