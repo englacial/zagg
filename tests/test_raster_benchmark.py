@@ -222,6 +222,11 @@ def test_run_target_dispatches_via_agg_and_records_summary(monkeypatch, tmp_path
     assert run["max_memory_mb"] == 2890.0
     assert run["stage_max"]["fetch"] == 512.0
     assert run["stage_counts"]["tiles"] == 1300
+    # Pin the unpack ORDER at the call site, not just shard_cell_orders' own
+    # return: configs/s2_neon_o9.yaml declares parent_order 9 / child_order 19,
+    # distinct, so a transposed unpack in run_target fails here instead of
+    # silently swapping the orders in every retained release row.
+    assert (run["parent_order"], run["child_order"]) == (9, 19)
     # The nested dicts flatten into the series columns downstream.
     df = rs.records_to_frame([run])
     assert df.iloc[0]["stage_fetch_s"] == 512.0
