@@ -51,24 +51,17 @@
 data_source:
   reader: h5coro
   driver: s3
-  # Write-through sidecar chunk index (issue #460). ``data_source.index`` is in
-  # the semantic core, so this block is part of the store's identity and an
-  # append must carry it verbatim; retiring the bucket (issue #499) therefore
-  # moves the hash -- see that issue before touching it.
-  #
-  # THE BUCKET BELOW IS NOT ANONYMOUSLY READABLE. Issue #499 (verified
-  # 2026-08-20): ``sliderule-public-cors`` has Block Public Access on all four
-  # flags, so every anonymous GET returns 403, and it is not writable outside
-  # the owning account either. The block is here because it is how the live
-  # store is READ, not because it is part of the store's identity: the issue
-  # #499 epoch moved ``data_source.index`` out of the semantic core, so an
-  # APPEND to ``atl03_tdigest_o9.zarr`` neither needs this exact block nor is
-  # refused for changing it. Anyone building their OWN store from this
-  # template should DELETE or override it (it resolves to ``inline``, issue
-  # #170, and works everywhere); that leaves the semantic hash untouched.
+  # Sidecar chunk index (issue #460): read machinery, outside the semantic
+  # core since the issue #499 epoch, so ``store`` moves no hash. The cache is
+  # public + anonymously readable (Source Cooperative, copied 2026-09-17).
+  # ``on_miss: build`` populates a missing entry and needs write access (the
+  # fleet role or the proxy credentials); without it use ``on_miss: fallback``
+  # or drop the block -- a metadata walk per granule, not a correctness loss.
+  # The backend treats only a 404 as a miss (a 403 raises, issue #502); a
+  # missing key 404s here (verified 2026-09-17), so ``fallback`` works anonymously.
   index:
     backend: sidecar
-    store: s3://sliderule-public-cors/zagg-index/ATL03/007
+    store: s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007
     on_miss: build
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
   coordinates:

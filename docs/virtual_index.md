@@ -20,7 +20,7 @@ data_source:
   index:
     backend: inline           # compute the chunk map at read time
     write_back: true          # optional (default false): persist manifests
-    store: s3://sliderule-public-cors/zagg-index/ATL03/007/   # required with write_back
+    store: s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007/   # required with write_back
 ```
 
 Keys other than `backend` are **backend-specific**: a key the named backend

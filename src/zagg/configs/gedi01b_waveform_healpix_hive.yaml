@@ -217,6 +217,7 @@ aggregation:
         false_positive_rate: 1.0e-3
         samples_per_record: 1420 # nominal GEDI rx window length
         correlation_length: 5    # receiver noise correlation, samples
+      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
       attrs:
         # Provenance (issue #321 field attrs): the named/versioned gain and
         # the declared operating point the clip threshold derives from. The
