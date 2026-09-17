@@ -599,3 +599,48 @@ def test_role_statements_enumerate_exact_arns():
             assert "*" not in arn, (
                 f"{role}.{sid} in {CICD} must enumerate exact ARNs, found wildcard: {arn}"
             )
+
+
+# --- prefix coupling: distribute stages the key deploy-prod reads back --------
+# LAMBDA_DIST_PREFIX is hand-typed, and distribute_zips.sh trims its --prefix
+# (issue #497 / PR #504), so a raw `vars.LAMBDA_DIST_PREFIX` in deploy-prod's
+# --layer-key builds a DIFFERENT key from the one `distribute` staged -- and the
+# failure lands after PyPI has published. publish.yml normalizes once, in
+# github-release's outputs. The script half of --prefix is not on this branch
+# (it arrives with PR #504), so this pins the workflow expression rather than
+# running both sides end to end.
+PUBLISH_WORKFLOW = REPO / ".github" / "workflows" / "publish.yml"
+
+NORMALIZED_PREFIX = "needs.github-release.outputs.prefix"
+
+
+def _publish_jobs():
+    import yaml
+
+    return yaml.safe_load(PUBLISH_WORKFLOW.read_text())["jobs"]
+
+
+def test_github_release_normalizes_the_dist_prefix_once():
+    step = next(s for s in _publish_jobs()["github-release"]["steps"] if s.get("id") == "get_tag")
+    assert step["env"]["DIST_PREFIX"] == "${{ vars.LAMBDA_DIST_PREFIX }}"
+    # Both ends trimmed, mirroring distribute_zips.sh's own --prefix handling.
+    assert 'P="${DIST_PREFIX#/}"; P="${P%/}"' in step["run"]
+    assert 'echo "prefix=$P" >> "$GITHUB_OUTPUT"' in step["run"]
+    assert _publish_jobs()["github-release"]["outputs"]["prefix"] == "${{ %s }}" % (
+        "steps.get_tag.outputs.prefix"
+    )
+
+
+def test_distribute_and_deploy_prod_read_the_same_normalized_prefix():
+    jobs = _publish_jobs()
+    distribute = "".join(str(s.get("run", "")) for s in jobs["distribute"]["steps"])
+    prod_step = next(
+        s for s in jobs["deploy-prod"]["steps"] if "--layer-key" in str(s.get("run", ""))
+    )
+    assert f'--prefix "${{{{ {NORMALIZED_PREFIX} }}}}"' in distribute
+    assert prod_step["env"]["DIST_PREFIX"] == "${{ %s }}" % NORMALIZED_PREFIX
+    # deploy-prod builds distribute's key out of that same value.
+    assert '--layer-key "${DIST_PREFIX:+$DIST_PREFIX/}${MINOR}/' in prod_step["run"]
+    # Neither job may reach past the normalization for the raw variable.
+    assert "vars.LAMBDA_DIST_PREFIX" not in distribute
+    assert "vars.LAMBDA_DIST_PREFIX" not in str(prod_step)

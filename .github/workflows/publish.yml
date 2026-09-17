@@ -197,6 +197,12 @@ jobs:
     outputs:
       tag: ${{ steps.get_tag.outputs.tag }}
       minor: ${{ steps.get_tag.outputs.minor }}
+      # LAMBDA_DIST_PREFIX is hand-typed, so a leading/trailing slash is a
+      # natural thing to type. Normalize it ONCE here and have both `distribute`
+      # and `deploy-prod` read this output, so the key one stages and the key
+      # the other reads back can never diverge (distribute_zips.sh trims its
+      # --prefix the same way).
+      prefix: ${{ steps.get_tag.outputs.prefix }}
 
     steps:
     - uses: actions/checkout@v5
@@ -205,6 +211,8 @@ jobs:
         fetch-depth: 0
     - name: Get tag name
       id: get_tag
+      env:
+        DIST_PREFIX: ${{ vars.LAMBDA_DIST_PREFIX }}
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           TAG="${{ inputs.tag }}"
@@ -213,6 +221,11 @@ jobs:
         fi
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
         echo "minor=$(echo "$TAG" | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
+        P="${DIST_PREFIX#/}"; P="${P%/}"
+        if [ "$P" != "$DIST_PREFIX" ]; then
+          echo "::warning::LAMBDA_DIST_PREFIX '$DIST_PREFIX' has stray slashes; using '$P'"
+        fi
+        echo "prefix=$P" >> "$GITHUB_OUTPUT"
     - name: Download Lambda zips
       uses: actions/download-artifact@v4
       with:
@@ -282,7 +295,7 @@ jobs:
           --minor "${{ needs.github-release.outputs.minor }}" \
           --tag "${{ needs.github-release.outputs.tag }}" \
           --bucket "${{ vars.LAMBDA_DIST_BUCKET }}" \
-          --prefix "${{ vars.LAMBDA_DIST_PREFIX }}" \
+          --prefix "${{ needs.github-release.outputs.prefix }}" \
           --region "${{ vars.LAMBDA_AWS_REGION }}" \
           --dir zips
 
@@ -327,7 +340,10 @@ jobs:
       env:
         FUNCTION_NAME: ${{ vars.LAMBDA_PROD_FUNCTION_NAME }}
         DIST_BUCKET: ${{ vars.LAMBDA_DIST_BUCKET }}
-        DIST_PREFIX: ${{ vars.LAMBDA_DIST_PREFIX }}
+        # The SAME normalized prefix `distribute` passed to distribute_zips.sh
+        # (github-release trims it): a raw vars.LAMBDA_DIST_PREFIX here would
+        # build a different key from the one that was staged.
+        DIST_PREFIX: ${{ needs.github-release.outputs.prefix }}
         MINOR: ${{ needs.github-release.outputs.minor }}
         REGION: ${{ vars.LAMBDA_AWS_REGION }}
       run: |
