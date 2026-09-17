@@ -20,7 +20,19 @@ data_source:
   index:
     backend: inline           # compute the chunk map at read time
     write_back: true          # optional (default false): persist manifests
-    store: s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007/   # required with write_back
+    store: s3://your-bucket/zagg-index/ATL03/007/   # required with write_back
+```
+
+Reading a store someone else populated is the `sidecar` backend — no
+`write_back`, and the store only has to be readable. The ATL03 sidecars the
+shipped template uses (`atl03_tdigest_strata_healpix.yaml`, issue #499):
+
+```yaml
+data_source:
+  index:
+    backend: sidecar
+    store: s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007
+    on_miss: fallback         # build | fallback (build needs write on the store)
 ```
 
 Keys other than `backend` are **backend-specific**: a key the named backend
