@@ -501,9 +501,17 @@ gh variable set BENCHMARK_TEST_STAGE_BUCKET  --body "sliderule-public"
 # Release (tier 3)
 gh variable set LAMBDA_RELEASE_ROLE_ARN   --body "arn:aws:iam::ACCOUNT_ID:role/zagg-lambda-release"
 gh variable set LAMBDA_PROD_FUNCTION_NAME --body "process-shard"
-gh variable set LAMBDA_DIST_BUCKET        --body "sliderule-public-cors"
+gh variable set LAMBDA_DIST_BUCKET        --body "us-west-2.opendata.source.coop"
+gh variable set LAMBDA_DIST_PREFIX        --body "englacial/zagg/lambda"
 gh variable set LAMBDA_AWS_REGION         --body "us-west-2"
 ```
+
+`LAMBDA_DIST_BUCKET`/`LAMBDA_DIST_PREFIX` point `distribute` at the Source
+Cooperative mirror (issue #497; `distribute_zips.sh --prefix`, and `deploy-prod`
+publishes the layer from the same prefixed key). Set them only **after** Source
+Cooperative has granted `zagg-lambda-release` write access at `englacial/*`;
+until every variable exists both jobs skip and the release still attaches the
+zips to the GitHub Release.
 
 Protect the production deploy:
 
