@@ -994,7 +994,13 @@ and a different sidecar location yields byte-identical leaves. Hashing the
 block therefore split one product across every relocation of its index
 cache — and the relocation is exactly what #499 is doing: the sidecars move
 to a public bucket, and a digest that named the old location would have
-refused every append to the store they index.
+refused every append to the store they index. That copy landed 2026-09-17:
+the ATL03 sidecars are at
+`s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007/`
+(same keys, anonymously readable; a missing key 404s, so `on_miss: fallback`
+works unsigned — the issue #502 403 is moot there), and the packaged template
+reads from it. The table below keeps the store's build-time block, which is
+what its frozen digest was derived from.
 
 **Why re-hashing is correct, not a defect**: the argument of the D19 epoch
 holds unchanged — the pre-epoch digest answered "do these two configs
