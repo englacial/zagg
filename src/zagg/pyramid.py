@@ -82,6 +82,14 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
     strictly between ``parent_order`` and ``child_order`` — a member at the
     shard's own order is the writer-side whole-footprint aggregate (never
     declared), and a member at the base data's own order IS the base data.
+    Then the contiguity rule (espg ruling on the PR #567 thread, 2026-09-17):
+    the §4.6 column tier — every ladder cell at or above the shard order —
+    MUST step by one from the finest leaf resolution down to the shard
+    order. The fixed ladder fills ``[parent_order, base)`` by itself, so a
+    gap can only come from the leaf list, and it would leave the raw-fold
+    boundary member (``parent_order + zagg.column.RAW_MEMBER_DEPTH``) absent
+    while coarser members are declared. Levels whose cells are BELOW the
+    shard order (the stage merges) MAY gap; they are not checked here.
     """
     parent_order, child_order = int(parent_order), int(child_order)
     if any(b >= a for a, b in zip(resolutions, resolutions[1:])):
@@ -98,6 +106,34 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
                 f"(the base data itself is order {child_order}; the shard-order "
                 f"aggregate is writer-side, never declared)"
             )
+    tier, missing = column_tier_gaps(
+        expand_overviews(resolutions, parent_order=parent_order), parent_order
+    )
+    if missing:
+        raise ValueError(
+            f"output.pyramid.overviews {resolutions}: column tier must be contiguous: "
+            f"cells at or above shard order {parent_order} are {tier}, missing {missing} "
+            f"(every such level is a leaf column member, spec §4.4/§4.6, so the leaf "
+            f"resolutions must step by one down to the shard order)"
+        )
+
+
+def column_tier_gaps(levels: list, shard_order: int) -> tuple[list[int], list[int]]:
+    """The §4.6 leaf column tier of an expanded list, and the orders it skips.
+
+    ``(tier, missing)``: the tier is :func:`zagg.column.column_resolutions`
+    — every cell at or above ``shard_order`` from any level plus the
+    node-order member, finest first — and ``missing`` every order between
+    the shard order and the tier's finest member that no level carries.
+    Empty ``missing`` is the contiguity the ruling requires; cells below the
+    shard order never contribute, so a ladder that skips stage-merge levels
+    reports none.
+    """
+    from zagg.column import column_resolutions
+
+    tier = column_resolutions(levels, shard_order)
+    missing = sorted(set(range(int(shard_order), tier[0])) - set(tier)) if tier else []
+    return tier, missing
 
 
 def expand_overviews(resolutions: list, *, parent_order: int) -> list[dict]:

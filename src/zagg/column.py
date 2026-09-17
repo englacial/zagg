@@ -88,9 +88,13 @@ def raw_fold_boundary(node_order: int, cell_order: int, resolutions) -> int | No
     it (nothing to fold flat from: every group keeps the from-raw law,
     merges-from-raw 1, and the #538 memory bound does not apply). The second
     case is MEMBERSHIP, not a floor on the finest declared resolution: a
-    declaration whose rungs skip the boundary while including something
-    coarser (``overviews: [12, 10]`` on the 19/13/9 geometry — members {12,
-    10, 9}) hits it with a finest resolution well above it.
+    list whose rungs skip the boundary while including something coarser
+    (``overviews: [12, 10]`` on the 19/13/9 geometry — members {12, 10, 9})
+    hits it with a finest resolution well above it. Such a list is refused
+    at declaration since the contiguity ruling (PR #567 thread, 2026-09-17;
+    :func:`zagg.pyramid.validate_overviews`), so for a validated store the
+    case reduces to a finest resolution of ``node_order + 1``; a hand-built
+    manifest can still carry the gap, and membership stays the predicate.
     """
     boundary = int(node_order) + RAW_MEMBER_DEPTH
     if boundary < int(cell_order) and boundary in {int(r) for r in resolutions}:
@@ -130,11 +134,13 @@ def relay_resolution(levels: list, shard_order: int, cell_order: int) -> int:
     stage merge consuming the relay is exactly 2 merges from raw.
 
     Membership, not the finest declared resolution, is the predicate: a
-    declaration that straddles the boundary without carrying it
-    (``overviews: [12, 10]`` on the 19/13/9 geometry — members {12, 10, 9},
-    finest 12, no group 11) is legal, and relaying a member the leaf columns
-    do not hold would leave every above-shard merge level at fill. Stage
-    columns relay this member for their subtree
+    list that straddles the boundary without carrying it (``overviews: [12,
+    10]`` on the 19/13/9 geometry — members {12, 10, 9}, finest 12, no group
+    11) is refused at declaration since the contiguity ruling (PR #567
+    thread, 2026-09-17), but a hand-built manifest can still carry it, and
+    relaying a member the leaf columns do not hold would leave every
+    above-shard merge level at fill. Stage columns relay this member for
+    their subtree
     (:func:`zagg.sweep_stage.column_members`). The leaf entry (``node ==
     shard_order``) places the members; a ``levels`` list without one (a
     hand-built manifest — ``expand_overviews`` always emits it) has no

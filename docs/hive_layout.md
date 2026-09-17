@@ -295,14 +295,16 @@ The declaration also comes in a second revision
 [issue #381](https://github.com/englacial/zagg/issues/381), as collapsed by
 the espg grammar ruling on the declaring PR): **`overviews`** — the **leaf
 cell resolutions**, and nothing else. A scalar is sugar for one resolution;
-a list is strictly descending, each member strictly between `parent_order`
-and `child_order`; omitted, the default is one resolution at the grid's
-resolved chunk order:
+a list is strictly descending and consecutive (the column tier — every
+ladder cell at or above the shard order — must step by one down to the
+shard order; `[16, 13]` is refused, naming `missing [14, 15]`), each member
+strictly between `parent_order` and `child_order`; omitted, the default is
+one resolution at the grid's resolved chunk order:
 
 ```yaml
 output:
   pyramid:
-    overviews: [16, 13]   # leaf cell resolutions; replaces orders/spacing WHOLESALE
+    overviews: [14, 13]   # leaf cell resolutions (consecutive); replaces orders/spacing WHOLESALE
     # overviews: 13       # scalar sugar for [13]
 ```
 

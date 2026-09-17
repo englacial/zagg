@@ -934,14 +934,14 @@ class TestPyramidBlock:
         from zagg.pyramid import PYRAMID_SPEC_V2
         from zagg.sweep_overview import build_pyramid_block
 
-        cfg = self._cfg(pyramid={"overviews": [9, 7]})
+        cfg = self._cfg(pyramid={"overviews": [8, 7]})
         block = build_pyramid_block(cfg, shard_order=6)
         assert block["spec"] == PYRAMID_SPEC_V2
         overview = block["overview"]
         # The FULLY EXPANDED list at BLOCK level (the espg shape + collapse
         # rulings): the leaf entry carries every declared resolution, then
         # the fixed every-order ladder (d = 7 - 6 = 1) runs down to node 0.
-        assert block["overviews"] == [{"node": 6, "cells": [9, 7]}] + [
+        assert block["overviews"] == [{"node": 6, "cells": [8, 7]}] + [
             {"node": k, "cells": [k + 1]} for k in range(5, -1, -1)
         ]
         # The list REPLACES the /1 schedule keys wholesale — they must not

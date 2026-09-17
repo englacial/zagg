@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A gapped column tier above the shard order is refused at declaration**
+  (refs #538, PR #567; espg ruling 2026-09-17). `output.pyramid.overviews`
+  must now be consecutive: every `/2` ladder level whose cells are at or
+  above the shard order IS the leaf column tier (spec §4.6), so it must be
+  contiguous from the finest leaf resolution down to the shard order —
+  `[13, 12, 11, 10, 9]` on an o9/o19 store, never `[13, 12, 10, 9]` or
+  `[12, 10]`. `validate_overviews` refuses by name, listing the tier and the
+  gap (`column tier must be contiguous: cells at or above shard order 9 are
+  [13, 12, 10, 9], missing [11]`), through `validate_config`,
+  `build_pyramid_block`, `declare_pyramid` and the `/2` pyramid check's
+  declaration leg; `zagg.pyramid.column_tier_gaps` is the one definition.
+  Levels below the shard order (the stage merges) may still gap. The default
+  dense declaration and both live stores (`--overviews 13` on 9/19,
+  `--overviews 12` on 9/18) are one-member lists and pass unchanged.
+  Contiguity guarantees the raw-fold boundary member (`shard_order + 2`,
+  `zagg.column.RAW_MEMBER_DEPTH`) exists whenever anything coarser is
+  declared, so `relay_resolution`'s node-member fallback is reachable for a
+  validated store only at a finest resolution of `shard_order + 1`; a
+  hand-built manifest can still gap and keeps the backstop. Spec §4.4/§4.5/§4.6
+  updated; no fixture declared a gapped tier.
+
 - **BREAKING — hash epoch: `data_source.index` leaves the semantic core**
   (#499 phase 2, refs #547, [#565](https://github.com/englacial/zagg/pull/565);
   espg-ruled 2026-09-13). The chunk-index block (`backend`

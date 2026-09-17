@@ -846,7 +846,14 @@ law:
 
 - the **leaf entry** — `node == shard_order` (not an ancestor artifact at
   all: the leaf's own level column, #381 point (2)) carries every declared
-  leaf resolution, each strictly between `shard_order` and `cell_order`;
+  leaf resolution, each strictly between `shard_order` and `cell_order`.
+  The set of levels whose cells are **at or above the shard order** MUST be
+  contiguous from the finest leaf resolution down to the shard order
+  (increments of one — `[13, 12, 11, 10, 9]` on the 19/13/9 geometry, never
+  `[13, 12, 10, 9]`): that set is the §4.6 column tier, and contiguity
+  guarantees the raw-fold boundary member exists whenever anything coarser
+  is declared. Levels whose cells are **below** the shard order (the
+  stage merges) MAY gap;
 - the **fixed every-order ladder** — with `d = base - shard_order` (`base`
   the coarsest leaf resolution, so `d >= 1`), every order `k` from
   `shard_order - 1` down to **0 inclusive** carries exactly one member at
@@ -1011,7 +1018,10 @@ staged sweep's finisher.
   a strictly descending list of ints, each **strictly between**
   `shard_order` and `cell_order` (a member at the shard's own order is the
   writer-side aggregate, never declared; a member at the base data's own
-  order would *be* the base data); omitted, the default is one resolution
+  order would *be* the base data), and **consecutive** — the fixed ladder
+  fills every order from the coarsest leaf resolution down to the shard
+  order by itself, so a gap in the list is a gap in the §4.4/§4.6 column
+  tier and is refused by name (`missing [11]`); omitted, the default is one resolution
   at the grid's resolved chunk order — normative since the issue #384
   default flip: a default declaration emits this `/2` block for every new
   store whose resolved chunk order is strictly interior (raster configs,
@@ -1322,7 +1332,10 @@ guessed at.
   order (the `{order}/{field}` layout of §4.4): every declared leaf
   resolution, every within-footprint rung of the fixed ladder
   (`node < cells ≤ base`), and the **node-order member** — `cells == node`,
-  one cell: the leaf's whole-footprint aggregate (there is no `partial/`
+  one cell: the leaf's whole-footprint aggregate. This tier MUST be
+  contiguous from the finest declared resolution down to the node order
+  (§4.4's contiguity rule; only the stage-merge levels below the shard
+  order MAY gap). (There is no `partial/`
   grammar; a coarse level declared later never rewrites a leaf; the ladder's
   merge source is the relay member named under **Fold laws**, not this
   group). Each group holds the `morton`
@@ -1378,10 +1391,12 @@ guessed at.
   61.7 M-row shard, with a p50 of 9.6% and a maximum of 14.0% — ~0.6 GB at
   ~100 B per row, against the 4 GB worker tier. When the
   boundary is not strictly below the cell order (`order + 2 ≥ cell order`),
-  or the column carries **no group at `order + 2`** (the declaration's rungs
-  skip it — `[12, 10]` on the 19/13/9 geometry gives members {12, 10, 9},
-  finest 12 and still no boundary group; so does a finest of `order + 1`),
-  every group folds from raw with `merges_from_raw` 1 — the
+  or the column carries **no group at `order + 2`** (a finest declared
+  resolution of `order + 1`; under the §4.4 contiguity rule a validated
+  declaration cannot skip the boundary while declaring something coarser —
+  `[12, 10]` on the 19/13/9 geometry, members {12, 10, 9}, is refused, though
+  a hand-built manifest may still carry it and membership stays the
+  predicate), every group folds from raw with `merges_from_raw` 1 — the
   §7 `column/` fixture's 4/6 geometry is the first case, which is why its
   groups below record 1.
 - **The `role` and `zagg_column` attrs.** `role` is `"column"`;

@@ -13,6 +13,7 @@ behavior lives in ``tests/test_sweep_overview.py``; the spec fixture in
 import pytest
 
 from zagg.pyramid import (
+    column_tier_gaps,
     default_overviews,
     expand_overviews,
     normalize_overviews,
@@ -63,8 +64,48 @@ class TestNormalizeOverviews:
 class TestValidateOverviews:
     def test_single_and_multi_resolution_lists_are_valid(self):
         validate_overviews([13], **REF)
-        validate_overviews([16, 13], **REF)
-        validate_overviews([18, 15, 10], **REF)
+        validate_overviews([14, 13], **REF)
+        validate_overviews([18, 17, 16], **REF)
+
+    def test_dense_default_and_live_store_shapes_are_contiguous(self):
+        # The omitted-knob default (one resolution at the chunk order) and the
+        # two live stores (`--overviews 13` on 9/19, `--overviews 12` on 9/18)
+        # are one-member lists: the fixed ladder fills [shard, base) by
+        # itself, so the column tier steps by one down to the shard order.
+        default_overviews(9, 13, child_order=19)
+        validate_overviews([13], **REF)
+        validate_overviews([12], parent_order=9, child_order=18)
+        validate_overviews([13, 12, 11, 10], **REF)
+
+    @pytest.mark.parametrize(
+        "resolutions, tier, missing",
+        [
+            ([13, 12, 10], [13, 12, 10, 9], [11]),
+            ([12, 10], [12, 10, 9], [11]),
+            ([13, 11], [13, 11, 10, 9], [12]),
+            ([16, 13], [16, 13, 12, 11, 10, 9], [14, 15]),
+        ],
+    )
+    def test_gapped_column_tier_refused_by_name(self, resolutions, tier, missing):
+        # espg ruling (PR #567 thread, 2026-09-17): every ladder level whose
+        # cells are at or above the shard order IS the leaf column tier
+        # (§4.6), so it must be contiguous from the finest leaf resolution
+        # down to the shard order; the message names the tier and the gap.
+        with pytest.raises(ValueError, match="column tier must be contiguous") as exc:
+            validate_overviews(resolutions, **REF)
+        assert f"cells at or above shard order 9 are {tier}, missing {missing}" in str(exc.value)
+
+    def test_gaps_below_the_shard_order_are_not_the_tier(self):
+        # The stage-merge levels (cells < shard order) MAY gap: a hand-built
+        # ladder missing node 1 has a contiguous tier and reports nothing.
+        levels = [
+            {"node": 3, "cells": [6, 5, 4]},
+            {"node": 2, "cells": [3]},
+            {"node": 0, "cells": [1]},
+        ]
+        assert column_tier_gaps(levels, 3) == ([6, 5, 4, 3], [])
+        assert column_tier_gaps(expand_overviews([6, 4], parent_order=3), 3) == ([6, 4, 3], [5])
+        assert column_tier_gaps([{"node": 1, "cells": [2]}], 3) == ([], [])
 
     @pytest.mark.parametrize("resolutions", [[13, 16], [13, 13]])
     def test_not_strictly_descending_refused(self, resolutions):
@@ -103,8 +144,8 @@ class TestExpandOverviews:
     def test_multi_resolution_leaf_entry(self):
         # Every declared resolution materializes at the leaf; the ladder is
         # fixed by the COARSEST one (the base).
-        levels = expand_overviews([16, 13], parent_order=9)
-        assert levels[0] == {"node": 9, "cells": [16, 13]}
+        levels = expand_overviews([14, 13], parent_order=9)
+        assert levels[0] == {"node": 9, "cells": [14, 13]}
         assert levels[1:] == expand_overviews([13], parent_order=9)[1:]
 
     def test_every_order_no_parity_cases(self):
@@ -164,7 +205,7 @@ class TestConfigWiring:
         validate_config(self._cfg(store_layout="hive", pyramid=pyramid))
 
     def test_valid_overviews_knob(self):
-        self._validate({"overviews": [9, 7]})
+        self._validate({"overviews": [8, 7]})
         self._validate({"overviews": 8})  # scalar sugar
 
     def test_overviews_with_orders_or_spacing_refused(self):
@@ -183,6 +224,8 @@ class TestConfigWiring:
             self._validate({"overviews": [6]})  # == parent_order
         with pytest.raises(ValueError, match="not strictly between"):
             self._validate({"overviews": [12]})  # == child_order
+        with pytest.raises(ValueError, match=r"column tier must be contiguous.*missing \[8\]"):
+            self._validate({"overviews": [9, 7]})  # tier [9, 7, 6] skips 8
 
     def test_overviews_require_hive_layout(self):
         from zagg.config import validate_config

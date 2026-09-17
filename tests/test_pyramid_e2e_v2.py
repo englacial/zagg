@@ -24,6 +24,7 @@ import json
 
 import numpy as np
 import obstore
+import pytest
 import zarr
 from mortie import generate_morton_children
 
@@ -41,7 +42,7 @@ from zagg.hive import (
     stamp_commit,
     write_root_coverage,
 )
-from zagg.pyramid import expand_overviews
+from zagg.pyramid import expand_overviews, validate_overviews
 from zagg.pyramid_check import CHECKS_V2, format_report, main, validate_pyramid
 from zagg.store import open_object_store, open_store
 from zagg.sweep_overview import encode_digest
@@ -89,7 +90,8 @@ def _build_store(
     the under-coverage arm (a sweep over a store whose backfill has not
     reached every leaf must record it, never guess through it).
     ``overviews``/``cell_order`` override the module geometry (``[5]`` on
-    3/6); a deeper ``cell_order`` is what lets a declaration straddle the
+    3/6). The manifest is hand-built from ``expand_overviews`` — no
+    declaration-time validation — which is what lets a ladder straddle the
     raw-fold boundary without carrying it.
     """
     n_cells = 4 ** (cell_order - SHARD_ORDER)
@@ -171,27 +173,33 @@ class TestV2FixtureE2E:
             assert name in printed
         assert printed.endswith("VERDICT: PASS")
 
-    def test_a_gapped_declaration_populates_every_merge_level(self, tmp_path):
-        # Review finding (issue #538): a ladder that straddles the raw-fold
-        # boundary WITHOUT carrying it — members {6, 4, 3} on a 3/8
-        # geometry, no group 5 — used to relay res 5, a group no leaf column
-        # holds, so ``_gather_slabs`` read nothing and every above-shard
-        # MERGE level silently stayed at fill while the harness, deriving its
-        # expectation from the same relay, agreed. The relay now comes from
-        # ``raw_fold_boundary`` itself, so it is always a member.
+    def test_a_gapped_column_tier_is_refused_and_the_backstop_holds(self, tmp_path):
+        # espg ruling (PR #567 thread, 2026-09-17): a ladder that straddles
+        # the raw-fold boundary WITHOUT carrying it — members {6, 4, 3} on a
+        # 3/8 geometry, no group 5 — is refused at DECLARATION by name.
+        with pytest.raises(ValueError, match=r"column tier must be contiguous.*missing \[5\]"):
+            validate_overviews([6, 4], parent_order=SHARD_ORDER, child_order=8)
+        # A hand-built manifest bypasses that gate. Review finding (issue
+        # #538): such a store used to relay res 5, a group no leaf column
+        # holds, so ``_gather_slabs`` read nothing and every above-shard MERGE
+        # level silently stayed at fill. The relay comes from
+        # ``raw_fold_boundary`` itself, so the backstop still populates every
+        # merge level — and the harness's declaration leg names the gap.
         from zagg.column import column_resolutions, relay_resolution
 
         manifest = _build_store(tmp_path, overviews=[6, 4], cell_order=8)
         levels = manifest["pyramid"]["overviews"]
         assert 5 not in column_resolutions(levels, SHARD_ORDER)
+        assert relay_resolution(levels, SHARD_ORDER, 8) == SHARD_ORDER
         # ladder: (2, [3]) gathers, (1, [2]) and (0, [1]) MERGE the relay —
         # the merge levels are the ones the absent relay left all-zero.
         for rel, order in (("-3/1/1", 3), ("-3/1", 2), ("-3", 1), ("-4", 1)):
             counts = _node_group(tmp_path, rel, order, mode="r")["count"][:]
             assert int(counts.sum()) > 0, (rel, order, counts)
-        report = validate_pyramid(str(tmp_path), full=True, resweep=True)
-        assert report["passed"] is True, format_report(report)
-        assert relay_resolution(levels, SHARD_ORDER, 8) == SHARD_ORDER
+        report = validate_pyramid(str(tmp_path), full=True)
+        entry = report["checks"]["declaration"]
+        assert entry["status"] == "fail" and "missing [5]" in entry["detail"], format_report(report)
+        assert report["passed"] is False
 
     def test_sampled_mode_matches_full(self, tmp_path):
         _build_store(tmp_path)
