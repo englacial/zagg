@@ -87,9 +87,17 @@ jobs:
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git add CHANGELOG.md
         git commit -q -m "changelog for $TAG"
-        # main may have moved since checkout: one rebase, never a force.
-        git pull --rebase -q origin main || true
-        if git push origin HEAD:main; then
+        # main may have moved since checkout: one rebase, never a force. A
+        # CONFLICTED rebase leaves HEAD at upstream WITHOUT our commit, so the
+        # push would be an up-to-date no-op that still exits 0 -- abort it and
+        # fall through to the PR path rather than reporting a success that
+        # recorded nothing.
+        if ! git pull --rebase -q origin main; then
+          git rebase --abort || true
+          echo "::warning::could not rebase the changelog commit for $TAG onto main; landing it as a PR instead"
+        # Success is the section being ON the commit we push, never the push's
+        # own exit code (an up-to-date no-op also exits 0): verify, then push.
+        elif git show HEAD:CHANGELOG.md | grep -q "^## \[$TAG\]" && git push origin HEAD:main; then
           echo "pushed changelog for $TAG to main"
           exit 0
         fi
