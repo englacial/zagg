@@ -16,9 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[12, 10]`. `validate_overviews` refuses by name, listing the tier and the
   gap (`column tier must be contiguous: cells at or above shard order 9 are
   [13, 12, 10, 9], missing [11]`), through `validate_config`,
-  `build_pyramid_block`, `declare_pyramid` and the `/2` pyramid check's
-  declaration leg; `zagg.pyramid.column_tier_gaps` is the one definition.
-  Levels below the shard order (the stage merges) may still gap. The default
+  `build_pyramid_block` (both arms — the contiguity leg needs no child
+  order, so the grid-less retrofit config is checked too),
+  `declare_pyramid` and the `/2` pyramid check's declaration leg;
+  `zagg.pyramid.column_tier_gaps` is the one definition, reporting the tier
+  and the gap finest-first. Where the coarsest leaf resolution clears twice
+  the shard order the ladder's own floor gaps the tier instead (node 0
+  carries cells `base - shard_order`), and the refusal names that
+  constraint. Levels below the shard order are the ladder's own, derived by
+  the §4.4 every-order law, so no gap can arise there. Writer-side only:
+  the `/2` marker does not bump and a reader still decodes a stored gapped
+  declaration by its recorded `overviews` list. The default
   dense declaration and both live stores (`--overviews 13` on 9/19,
   `--overviews 12` on 9/18) are one-member lists and pass unchanged.
   Contiguity guarantees the raw-fold boundary member (`shard_order + 2`,
