@@ -166,6 +166,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
     args = ap.parse_args(argv)
 
+    # Ordering needs an N.N.N to place the section; anything else silently
+    # becomes "newest" and DRAINS [Unreleased] into it. The tag filter
+    # (`*.*.*`) is an unanchored glob and workflow_dispatch's input is free
+    # text, so 'v0.55.0' / '0.54.0.1' can reach here -- refuse rather than
+    # guess (the job's never-fail promise starts past generation).
+    if _version(f"## [{args.tag}]") is None:
+        raise SystemExit(f"--tag {args.tag!r} is not N.N.N; refusing to guess where it belongs")
     revs = set(args.revs.read_text().split()) if args.revs else None
     prs = json.loads(args.prs.read_text())
     bullets = pr_bullets(prs, args.prev_tag_time, args.tag_time, revs)

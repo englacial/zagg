@@ -196,6 +196,23 @@ def test_main_writes_once_and_uses_the_fallback(tmp_path):
     assert changelog.read_text() == first
 
 
+@pytest.mark.parametrize("tag", ["v0.55.0", "0.54.0.1", "0.55", "latest"])
+def test_main_refuses_a_tag_it_cannot_place(tag, tmp_path):
+    # Without N.N.N the insert point is 0 -- top of the file AND the
+    # [Unreleased] notes drained into it. A mistyped workflow_dispatch replay
+    # must fail red, not steal the next release's notes.
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(CHANGELOG)
+    prs = tmp_path / "prs.json"
+    prs.write_text("[]")
+    with pytest.raises(SystemExit, match="is not N.N.N"):
+        cs.main([
+            "--tag", tag, "--tag-time", TAG_TIME,
+            "--prs", str(prs), "--changelog", str(changelog),
+        ])  # fmt: skip
+    assert changelog.read_text() == CHANGELOG
+
+
 def test_unmatched_revs_are_reported_for_a_warning(capsys, tmp_path):
     # GitHub's search index lags a merge, so the PR the tag sits on can be
     # absent from the rows entirely. Membership is only ever evaluated over the
