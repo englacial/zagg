@@ -142,21 +142,26 @@ class TestColumnMembers:
         from zagg.column import relay_resolution
 
         assert relay_resolution(expand_overviews([13], parent_order=9), 9, 19) == 11
-        assert relay_resolution(expand_overviews([16, 13], parent_order=9), 9, 19) == 11
+        assert relay_resolution(expand_overviews([14, 13], parent_order=9), 9, 19) == 11
         # A finest leaf resolution of shard + 1 carries no boundary member:
         # every group is from raw and the node-order member stays the relay.
         assert relay_resolution(expand_overviews([10], parent_order=9), 9, 19) == 9
         assert relay_resolution(expand_overviews([4], parent_order=3), 3, 8) == 3
 
-    def test_a_gapped_declaration_relays_the_node_member(self):
+    def test_a_gapped_ladder_relays_the_node_member(self):
         # A ladder that straddles the boundary WITHOUT carrying it (members
         # {12, 10, 9} — finest 12, no group 11) must relay a member the leaf
         # columns actually hold: membership is the predicate, not the finest
         # declared resolution (review finding — relaying an absent group left
-        # every above-shard merge level at fill, silently).
+        # every above-shard merge level at fill, silently). Such a list is
+        # refused at DECLARATION since the contiguity ruling (PR #567 thread),
+        # so only a hand-built manifest reaches this backstop.
         from zagg.column import column_resolutions, relay_resolution
+        from zagg.pyramid import validate_overviews
 
         for ov in ([12, 10], [13, 10]):
+            with pytest.raises(ValueError, match="column tier must be contiguous"):
+                validate_overviews(ov, parent_order=9, child_order=19)
             levels = expand_overviews(ov, parent_order=9)
             assert 11 not in column_resolutions(levels, 9)
             assert relay_resolution(levels, 9, 19) == 9
@@ -170,10 +175,10 @@ class TestColumnMembers:
         assert column_members(levels, 6, shard_order=9, cell_order=19) == [9]
 
     def test_multi_resolution_leaf_declaration(self):
-        # overviews [16, 13] on o9: d = 13 - 9 = 4; ladder unchanged, and the
-        # finer 16 member is leaf-only (no coarser level gathers it); the
+        # overviews [14, 13] on o9: d = 13 - 9 = 4; ladder unchanged, and the
+        # finer 14 member is leaf-only (no coarser level gathers it); the
         # relay is the res-11 member, not the finest declared.
-        levels = expand_overviews([16, 13], parent_order=9)
+        levels = expand_overviews([14, 13], parent_order=9)
         assert column_members(levels, 6, shard_order=9, cell_order=19) == [11, 9]
 
     def test_wide_window_carries_gather_members(self):
