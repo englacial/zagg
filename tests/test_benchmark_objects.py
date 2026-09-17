@@ -792,7 +792,11 @@ def test_flat_model_requires_fullsphere(tmp_path):
             bench_objects.expected_object_counts(grid, n_shards=1)
         with pytest.raises(NotImplementedError, match="fullsphere"):
             bench_objects.store_object_counts(str(tmp_path), grid=grid, shard_keys=[])
-    # The hive path attributes by leaf prefix (layout-agnostic) -- unaffected.
+    # The hive path ATTRIBUTION is by leaf prefix (layout-agnostic), but its
+    # leaf model needs the shard/cell orders, so it fences on those instead --
+    # named via bench_metrics.shard_cell_orders, not a bare AttributeError.
+    with pytest.raises(TypeError, match="shard/cell orders"):
+        bench_objects.expected_object_counts(rect, n_shards=1, store_layout="hive")
     assert bench_objects.expected_object_counts(
         _grid(sharded=False), n_shards=1, store_layout="hive"
     )

@@ -93,6 +93,12 @@ def test_rect_shard_cell_orders_raises():
         bench_metrics.shard_cell_orders(g)
 
 
+def test_unknown_grid_cell_orders_raises():
+    # A duck-typed non-grid is named too, not just the two real backends.
+    with pytest.raises(TypeError):
+        bench_metrics.shard_cell_orders(object())
+
+
 # --- build_record ---------------------------------------------------------
 
 
