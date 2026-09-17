@@ -38,6 +38,19 @@ leaf.
   For the two live demo stores the originals ARE the packaged templates
   (`atl03_tdigest_strata_healpix`, `gedi01b_waveform_healpix_hive`), hash-pinned
   to the store manifests in `tests/test_live_store_templates.py` (issue #547).
+  **A store built before the
+  [index-exclusion epoch](hive_layout.md#migration-the-index-exclusion-epoch-issue-499)**
+  (issue #499 — `data_source.index` left the semantic core) is accepted on
+  the same terms, and step 1 is also its migration: `declare_pyramid`
+  recognizes the config's *pre-epoch* digest and rewrites the frozen
+  `semantic_hash` in the same manifest write. The
+  `tools/redeclare_dense_ladder.py` dry run says so before anything is
+  written — read for the line
+  `semantic guard: legacy MATCH (b9b15f…) → will rewrite to aacfe1…`
+  (a plain `MATCH` means no migration; a `MISMATCH` means `--execute` will
+  refuse). Until that write has happened the store refuses **appends** by
+  name — the append path never migrates on its own — so run this step
+  before any post-epoch aggregation run into the store.
 - The store's leaves are committed and its run records are at the product root
   (they are what discovery reads — never a recursive LIST).
 

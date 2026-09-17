@@ -55,17 +55,17 @@ LEAF_CELLS = 4 ** (CELL_ORDER - SHARD_ORDER)
 LEAVES = ["-3111", "-3112", "-3121", "-3211", "-4111"]
 
 
-def _write_leaf(root, dec, per_cell):
-    grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=_leaf_cfg())
+def _write_leaf(root, dec, per_cell, cell_order=CELL_ORDER):
+    grid = HealpixGrid(SHARD_ORDER, cell_order, config=_leaf_cfg())
     word = morton_word(dec)
     store = open_store(shard_leaf_path(str(root), word))
     grid.emit_shard_template(store, overwrite=True)
-    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
-    assert len(per_cell) == LEAF_CELLS
-    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
+    group = zarr.open_group(store, path=str(cell_order), mode="r+", zarr_format=3)
+    assert len(per_cell) == 4 ** (cell_order - SHARD_ORDER)
+    group["morton"][:] = np.asarray(generate_morton_children(word, cell_order), dtype=np.uint64)
     group["count"][:] = np.array([c["n_signal"] + c["n_noise"] for c in per_cell], dtype=np.int32)
     for field, key in (("h_sig", "sig"), ("h_noise", "noise")):
-        slab = np.full(LEAF_CELLS, b"", dtype=object)
+        slab = np.full(len(per_cell), b"", dtype=object)
         for i, c in enumerate(per_cell):
             slab[i] = c[key]
         group[field][:] = slab
@@ -73,24 +73,37 @@ def _write_leaf(root, dec, per_cell):
     stamp_commit(store, cells_with_data=sum(1 for c in per_cell if c["n_signal"]), granule_count=1)
 
 
-def _build_store(root, *, leaves=LEAVES, backfill=True, sweep=True, backfill_only=()):
+def _build_store(
+    root,
+    *,
+    leaves=LEAVES,
+    backfill=True,
+    sweep=True,
+    backfill_only=(),
+    overviews=(5,),
+    cell_order=CELL_ORDER,
+):
     """The #547 campaign sequence on a fixture store; returns the manifest.
 
     ``backfill_only`` restricts the column backfill to a subset of leaves —
     the under-coverage arm (a sweep over a store whose backfill has not
     reached every leaf must record it, never guess through it).
+    ``overviews``/``cell_order`` override the module geometry (``[5]`` on
+    3/6); a deeper ``cell_order`` is what lets a declaration straddle the
+    raw-fold boundary without carrying it.
     """
+    n_cells = 4 ** (cell_order - SHARD_ORDER)
     for i, dec in enumerate(leaves):
-        _write_leaf(root, dec, _cells(LEAF_CELLS, 40, seed=100 + i))
+        _write_leaf(root, dec, _cells(n_cells, 40, seed=100 + i), cell_order=cell_order)
     manifest = {
         "spec": "morton-hive/1",
         "dataset": {"short_name": "TEST", "version": "1"},
-        "cell_order": CELL_ORDER,
+        "cell_order": cell_order,
         "shard_order": SHARD_ORDER,
         "split_schedule": [1] * SHARD_ORDER,
         "pyramid": {
             "spec": "zagg-pyramid/2",
-            "overviews": expand_overviews([5], parent_order=SHARD_ORDER),
+            "overviews": expand_overviews(list(overviews), parent_order=SHARD_ORDER),
             "overview": {
                 "all_time": False,
                 "fold_source": "cascade",
@@ -158,6 +171,28 @@ class TestV2FixtureE2E:
             assert name in printed
         assert printed.endswith("VERDICT: PASS")
 
+    def test_a_gapped_declaration_populates_every_merge_level(self, tmp_path):
+        # Review finding (issue #538): a ladder that straddles the raw-fold
+        # boundary WITHOUT carrying it — members {6, 4, 3} on a 3/8
+        # geometry, no group 5 — used to relay res 5, a group no leaf column
+        # holds, so ``_gather_slabs`` read nothing and every above-shard
+        # MERGE level silently stayed at fill while the harness, deriving its
+        # expectation from the same relay, agreed. The relay now comes from
+        # ``raw_fold_boundary`` itself, so it is always a member.
+        from zagg.column import column_resolutions, relay_resolution
+
+        manifest = _build_store(tmp_path, overviews=[6, 4], cell_order=8)
+        levels = manifest["pyramid"]["overviews"]
+        assert 5 not in column_resolutions(levels, SHARD_ORDER)
+        # ladder: (2, [3]) gathers, (1, [2]) and (0, [1]) MERGE the relay —
+        # the merge levels are the ones the absent relay left all-zero.
+        for rel, order in (("-3/1/1", 3), ("-3/1", 2), ("-3", 1), ("-4", 1)):
+            counts = _node_group(tmp_path, rel, order, mode="r")["count"][:]
+            assert int(counts.sum()) > 0, (rel, order, counts)
+        report = validate_pyramid(str(tmp_path), full=True, resweep=True)
+        assert report["passed"] is True, format_report(report)
+        assert relay_resolution(levels, SHARD_ORDER, 8) == SHARD_ORDER
+
     def test_sampled_mode_matches_full(self, tmp_path):
         _build_store(tmp_path)
         report = validate_pyramid(
@@ -183,20 +218,23 @@ class TestV2FixtureE2E:
         assert json.loads(out_json.read_text())["passed"] is True
 
     def test_wide_column_group_declines_payload_parity_in_sampled_mode(self, tmp_path, monkeypatch):
-        # The §4.6 parity leg's span is the GEOMETRY's (one cell of the group
-        # at q covers 4**(cell_order - q) leaf cells), so sample_cells cannot
-        # bound it — a coarse group re-folds a whole leaf per sampled leaf.
-        # Above the bound the payload legs are declined and NAMED; counts
-        # (dense) still run, and full mode is never bounded.
+        # The §4.6 parity leg's span is the GEOMETRY's (one cell of a
+        # from-raw group at q covers 4**(cell_order - q) leaf cells), so
+        # sample_cells cannot bound it. Above the bound the payload legs are
+        # declined and NAMED; counts (dense) still run, and full mode is
+        # never bounded. The groups below the raw-fold boundary (4 and 3
+        # here, folded flat from the boundary group [5] — issue #538) fold
+        # δ-bounded boundary digests and are never declined.
         from zagg import pyramid_check_v2
 
         _build_store(tmp_path)
-        monkeypatch.setattr(pyramid_check_v2, "COLUMN_PARITY_FOLD_MAX", 4)
+        monkeypatch.setattr(pyramid_check_v2, "COLUMN_PARITY_FOLD_MAX", 3)
         report = validate_pyramid(str(tmp_path), sample_nodes=2, sample_cells=3, seed=7)
         assert report["passed"] is True, format_report(report)
-        declined = [w for w in report.get("warnings") or [] if "column group [3]" in w]
+        declined = [w for w in report.get("warnings") or [] if "column group [5]" in w]
         assert declined, format_report(report)
-        assert "64 leaf cells" in declined[0] and "counts still compared" in declined[0]
+        assert "4 leaf cells" in declined[0] and "counts still compared" in declined[0]
+        assert not any("column group [4]" in w or "column group [3]" in w for w in declined)
         assert report["sampled"]["counts"] > 0
         # ... and the bound does not apply in full (fixture) mode.
         full = validate_pyramid(str(tmp_path), full=True)
@@ -622,10 +660,11 @@ class TestV2Corruption:
         assert report["partial_columns"] == ["-3111"]
 
     def test_broken_column_group_fails_leaf_parity(self, tmp_path):
-        # Corrupt a column's node-order partial: the §4.6 from-leaves parity
-        # catches it, and so does the merge level that consumed the original.
+        # Corrupt a column's relay member (the res-5 boundary partial, issue
+        # #538): the §4.6 from-leaves parity catches it, and so does the merge
+        # level that consumed the original.
         _build_store(tmp_path)
-        group = _column_group(tmp_path, "-3/1/1/1", 3)
+        group = _column_group(tmp_path, "-3/1/1/1", 5)
         counts = group["count"][:]
         counts[0] += 5
         group["count"][:] = counts
@@ -634,6 +673,22 @@ class TestV2Corruption:
         mismatches = report["checks"]["counts"]["mismatches"]
         assert any(m.startswith("-3111[") for m in mismatches), mismatches  # column vs leaf
         assert any(m.startswith("-3[") for m in mismatches), mismatches  # merge level vs column
+
+    def test_broken_node_member_fails_parity_at_its_gather(self, tmp_path):
+        # The node-order member is a flat second merge now, consumed by the
+        # cells-3 GATHER at order 2 — never by a merge: the column parity (vs
+        # the boundary group) and that gather level catch it, and the merge
+        # level above, which reads the intact relay, stays clean.
+        _build_store(tmp_path)
+        group = _column_group(tmp_path, "-3/1/1/1", 3)
+        counts = group["count"][:]
+        counts[0] += 5
+        group["count"][:] = counts
+        report = validate_pyramid(str(tmp_path), full=True)
+        mismatches = report["checks"]["counts"]["mismatches"]
+        assert any(m.startswith("-3111[") for m in mismatches), mismatches
+        assert any(m.startswith("-31[") for m in mismatches), mismatches  # gather vs column
+        assert not any(m.startswith("-3[") for m in mismatches), mismatches
 
     def test_stale_column_after_leaf_rewrite(self, tmp_path):
         # Base data moved, the column did not (the repair is the idempotent

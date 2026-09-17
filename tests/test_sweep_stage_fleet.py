@@ -29,7 +29,13 @@ import pytest
 
 # The staged-sweep fixtures live with the in-process suite; the fleet arm is
 # the SAME store and the SAME expectations, reached over the wire.
-from test_sweep_stage import LEAVES, _artifact, _stage_store, _write_leaf  # noqa: E402
+from test_sweep_stage import (  # noqa: E402
+    LEAVES,
+    _artifact,
+    _stage_store,
+    _wide_store,
+    _write_leaf,
+)
 
 from zagg.grids.morton import morton_word
 from zagg.sweep_stages import (
@@ -2114,6 +2120,7 @@ class TestByteIdentityOracle:
         squeeze=False,
         windows=None,
         max_nodes="default",
+        wide=False,
     ):
         """CLI sweep -> snapshot -> reset -> fleet sweep -> snapshot.
 
@@ -2127,12 +2134,19 @@ class TestByteIdentityOracle:
         exercise. ``max_nodes`` (an int or ``None``) overrides the fleet's
         ``max_nodes_per_invoke``; ``"default"`` leaves the dispatcher's own
         default in force. ``windows`` swaps in the windowed/all-time store so
-        the leaf refs carry a window rather than ``None``.
+        the leaf refs carry a window rather than ``None``. ``wide`` swaps in the
+        issue #538 boundary geometry (3/6, leaf members {5, 4, 3}) whose
+        relay is the res-5 partial rather than the node member — the arm
+        that puts the relay itself on the wire.
         Returns ``(cli, fleet, summary, client)``.
         """
         mod = _handler_module()
         root = tmp_path / "s"
-        if windows is None:
+        if wide:
+            assert windows is None and fields is None, "the wide store is its own geometry"
+            _wide_store(root)
+            refs = None
+        elif windows is None:
             _stage_store(root, **({} if fields is None else {"fields": fields}))
             refs = None
         else:
@@ -2210,6 +2224,40 @@ class TestByteIdentityOracle:
         assert sum(_is_group_metadata(r) for r in rels) == 7
         assert sum(r.endswith("overview.rollup.json") for r in rels) == 7
         assert len(rels) == objects
+
+    def test_the_fleet_build_is_byte_identical_on_the_boundary_relay(self, tmp_path):
+        # The parametrized arm above runs the 3/5 store, whose relay IS the
+        # node member — so reverting ``relay_resolution`` to ``shard_order``
+        # left the whole fleet suite green (review finding). This arm is the
+        # 3/6 boundary geometry: the relay is the res-5 partial, so the
+        # stage columns the fleet ships between tuples carry member 5 and
+        # every merge k-ways ``4 ** (5 - r)`` sources per output cell. Width
+        # 1 is the width that writes stage columns at all (a width-3 build
+        # folds the whole o3 ladder from one tuple and needs none).
+        cli, fleet, summary, _ = self._both_arms(tmp_path, width=1, wide=True)
+        assert summary["finisher"]["landed"] and not summary["barrier_timed_out"]
+        _assert_identical(cli, fleet)
+        # Never vacuous: the relay member has to be ON the wire, not merely
+        # agreed on. The stage columns the dispatch nodes write carry group
+        # 5 — under the node-order relay they would carry group 3.
+        cols = {rel.split("/all.pyramid.zarr/")[0] for rel in fleet if "all.pyramid.zarr/" in rel}
+        stage_cols = sorted(c for c in cols if c.count("/") < 3)  # above the shard order
+        assert stage_cols, sorted(cols)
+        for node in stage_cols:
+            assert f"{node}/all.pyramid.zarr/5/zarr.json" in fleet, node
+        # ... and the merge levels they feed are populated, not fill: the
+        # ladder's one stage-MERGE level here is (0, [2]), the base-cell
+        # nodes, which read the relay member out of those stage columns.
+        merges = sorted(
+            rel.split("/all.zarr/")[0]
+            for rel in fleet
+            if _is_group_metadata(rel) and rel.count("/") == 2
+        )
+        assert merges, sorted(rel for rel in fleet if _is_group_metadata(rel))
+        for node in merges:
+            g = _artifact(tmp_path / "s", f"{node}/all.zarr")
+            r = dict(g.attrs)["zagg_overview"]["cell_order"]
+            assert int(g[str(r)]["count"][:].sum()) > 0, node
 
     def test_both_arms_leave_one_run_record_and_no_lease(self, tmp_path):
         cli, fleet, _, _ = self._both_arms(tmp_path)

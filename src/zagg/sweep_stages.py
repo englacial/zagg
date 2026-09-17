@@ -171,6 +171,11 @@ def sweep_stage_pass(
     shard_order = int(manifest["shard_order"])
     cell_order = int(manifest["cell_order"])
     levels = ladder_entries(pyramid, shard_order)
+    # The merge-source member (issue #538): placed by the LEAF entry, which
+    # ``ladder_entries`` excludes, so it is derived from the full list here.
+    from zagg.column import relay_resolution
+
+    relay = relay_resolution(pyramid["overviews"], shard_order, cell_order)
     # The schedule and the ``only_dispatch`` refusal come FIRST — before the
     # ``fields``/``candidates`` gates below, which both return a clean empty
     # summary. A mistyped dispatch order against a store with nothing to sweep
@@ -253,6 +258,7 @@ def sweep_stage_pass(
                     windowed=windowed,
                     shard_order=shard_order,
                     cell_order=cell_order,
+                    relay=relay,
                     candidates=candidates,
                     run_id=run_id,
                     run_started=run_started,
@@ -361,10 +367,21 @@ def run_finisher(
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — cannot record actuals")
     now = _utcnow()
     changed = False
-    for entry in (fresh.get("pyramid") or {}).get("overviews") or []:
+    levels = (fresh.get("pyramid") or {}).get("overviews") or []
+    for entry in levels:
         node = int(entry.get("node", -1))
         if node == shard_order and level_actuals:
-            actuals = {"regime": "leaf-column", "merges_from_raw": 1, "generated_at": now}
+            # The leaf tier's own law (§4.5/§4.6): 1 unless the entry
+            # declares a resolution below the raw-fold boundary (issue #538).
+            from zagg.column import leaf_entry_merges_from_raw
+
+            actuals = {
+                "regime": "leaf-column",
+                "merges_from_raw": leaf_entry_merges_from_raw(
+                    levels, shard_order, int(fresh["cell_order"])
+                ),
+                "generated_at": now,
+            }
         elif node in level_actuals:
             a = level_actuals[node]
             actuals = {

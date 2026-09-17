@@ -62,11 +62,11 @@ def _leaf_cfg():
     )
 
 
-def _cell_slabs(cells: dict) -> dict:
+def _cell_slabs(cells: dict, n_cells: int = LEAF_CELLS) -> dict:
     """The leaf's resident per-cell slabs (``{leaf row: observations}``)."""
-    count = np.zeros(LEAF_CELLS, np.int32)
-    h_min = np.full(LEAF_CELLS, np.nan, np.float32)
-    digest = np.full(LEAF_CELLS, b"", dtype=object)
+    count = np.zeros(n_cells, np.int32)
+    h_min = np.full(n_cells, np.nan, np.float32)
+    digest = np.full(n_cells, b"", dtype=object)
     for i, obs in cells.items():
         obs = np.asarray(obs, dtype=np.float64)
         count[i] = len(obs)
@@ -75,19 +75,19 @@ def _cell_slabs(cells: dict) -> dict:
     return {"count": count, "h_min": h_min, "h_tdigest": digest}
 
 
-def _make_leaf(root, decimal, cells):
+def _make_leaf(root, decimal, cells, shard_order=SHARD_ORDER, cell_order=CELL_ORDER):
     """One committed leaf on disk; returns its resident slabs (fold inputs)."""
     from mortie import generate_morton_children
 
     from zagg.grids.healpix import HealpixGrid
 
-    grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=_leaf_cfg())
+    grid = HealpixGrid(shard_order, cell_order, config=_leaf_cfg())
     word = morton_word(decimal)
     store = open_store(shard_leaf_path(str(root), word))
     grid.emit_shard_template(store, overwrite=True)
-    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
-    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
-    slabs = _cell_slabs(cells)
+    group = zarr.open_group(store, path=str(cell_order), mode="r+", zarr_format=3)
+    group["morton"][:] = np.asarray(generate_morton_children(word, cell_order), dtype=np.uint64)
+    slabs = _cell_slabs(cells, 4 ** (cell_order - shard_order))
     for name, slab in slabs.items():
         group[name][:] = slab
     stamp_commit(store, cells_with_data=len(cells), granule_count=1)
@@ -354,7 +354,9 @@ BOTH_CHANNEL_FIELDS = {
 _CHANNELS = {"location": ("locations", "locations"), "temporal": ("temporal", "times")}
 
 
-def _located_cell_slabs(cells: dict, fields: dict = LOCATED_FIELDS) -> tuple[dict, dict]:
+def _located_cell_slabs(
+    cells: dict, fields: dict = LOCATED_FIELDS, n_cells: int = LEAF_CELLS
+) -> tuple[dict, dict]:
     """``_cell_slabs`` plus every companion sibling ``fields`` declares.
 
     Both are built in ONE ``build_tdigest`` call per cell, so the siblings
@@ -364,8 +366,8 @@ def _located_cell_slabs(cells: dict, fields: dict = LOCATED_FIELDS) -> tuple[dic
     from conftest import TOC_BASE, point_words, toc_words
 
     declared = [key for key in _CHANNELS if fields["h_tdigest"].get(key) is not None]
-    slabs = _cell_slabs(cells)
-    sibs = {key: np.full(LEAF_CELLS, b"", dtype=object) for key in declared}
+    slabs = _cell_slabs(cells, n_cells)
+    sibs = {key: np.full(n_cells, b"", dtype=object) for key in declared}
     truth: dict = {_CHANNELS[key][0]: {} for key in declared}
     for i, obs in cells.items():
         kw = {}
@@ -559,6 +561,233 @@ class TestBothChannelsColumn:
         assert all("h_tdigest_locations" not in group for group in folded.values())
 
 
+#: The issue #538 geometry: node 1 / cells 4 (64 leaf cells), column {3, 2, 1},
+#: raw-fold boundary 3 — the coarse members 2 and 1 fold FLAT from the 3
+#: member. Every order-3 cell is populated and over the δ budget, so every
+#: merge on the way re-compresses and the boundary is visible in the bytes.
+BOUND_NODE, BOUND_CELLS = 1, 4
+BOUND_N = 4 ** (BOUND_CELLS - BOUND_NODE)
+BOUND_OBS = {i: np.arange(200.0) * (1 + i % 7) + i for i in range(0, BOUND_N, 3)}
+#: A packed composition beside the digest it is ``of`` (issue #515): two
+#: distinct lane words, so a merge is a genuine weighted blend.
+PACKED_FIELDS = {
+    **FIELDS,
+    "composition": {"class": "packed", "of": "h_tdigest", "dtype": "uint64", "fill_value": 0},
+}
+
+
+def _bound_slabs(fields=FIELDS):
+    if "location" in fields["h_tdigest"] or "temporal" in fields["h_tdigest"]:
+        slabs, _truth = _located_cell_slabs(BOUND_OBS, fields, BOUND_N)
+    else:
+        slabs = _cell_slabs(BOUND_OBS, BOUND_N)
+    if "composition" in fields:
+        words = np.zeros(BOUND_N, np.uint64)
+        for i in BOUND_OBS:
+            words[i] = 0xFF000000FF0000FF if i % 2 else 0x00FF00FF00FF0000
+        slabs["composition"] = words
+    return slabs
+
+
+def _flat_oracle(group: dict, rows: list, fields: dict):
+    """One k-way call over ``group``'s ``rows`` — the boundary member as source."""
+    from zagg.sweep_overview import field_companions
+
+    rows = [i for i in rows if len(group["h_tdigest"][i])]
+    channels = {
+        kwarg: [decode_digest(group[sib][i], "uint64", ()) for i in rows]
+        for kwarg, sib in field_companions("h_tdigest", fields["h_tdigest"])
+    }
+    return merge_tdigests_kway(
+        [decode_digest(group["h_tdigest"][i], "float32") for i in rows], delta=DELTA, **channels
+    )
+
+
+class TestRawFoldBoundary:
+    """The issue #538 leaf-tier law.
+
+    Members at ``cells >= node + RAW_MEMBER_DEPTH`` fold from raw; the two
+    coarser members fold flat from the boundary member — one k-way call per
+    output cell over the boundary cells it contains, never chained — and
+    record ``merges_from_raw`` 2. Exact fields are unaffected in value.
+    """
+
+    def test_boundary_placement(self):
+        from zagg.column import RAW_MEMBER_DEPTH, member_merges_from_raw, raw_fold_boundary
+
+        assert RAW_MEMBER_DEPTH == 2
+        assert raw_fold_boundary(BOUND_NODE, BOUND_CELLS, [3, 2, 1]) == 3
+        assert raw_fold_boundary(9, 19, [13, 12, 11, 10, 9]) == 11
+        # The boundary IS the cell order: a fold from it is a fold from raw.
+        assert raw_fold_boundary(SHARD_ORDER, CELL_ORDER, [3, SHARD_ORDER]) is None
+        # A finest leaf resolution coarser than the boundary: nothing to fold
+        # flat from, so every group keeps the from-raw law.
+        assert raw_fold_boundary(9, 19, [10, 9]) is None
+        assert [member_merges_from_raw(r, 11) for r in (13, 12, 11, 10, 9)] == [1, 1, 1, 2, 2]
+        assert [member_merges_from_raw(r, None) for r in (10, 9)] == [1, 1]
+
+    def test_coarse_groups_are_the_flat_fold_of_the_boundary_member(self):
+        slabs = _bound_slabs()
+        folded = fold_column(
+            slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=BOUND_NODE
+        )
+        # The boundary member itself is the from-raw fold (the #383 law).
+        for j in range(16):
+            raw = [decode_digest(slabs["h_tdigest"][i], "float32") for i in range(4 * j, 4 * j + 4)]
+            raw = [d for d in raw if len(d)]
+            assert bytes(folded[3]["h_tdigest"][j]) == encode_digest(
+                merge_tdigests_kway(raw, delta=DELTA), "float32"
+            )
+        # Resolution 2: each cell is ONE k-way call over its 4 boundary cells;
+        # resolution 1: one call over all 16 — not 2 folded from 3 and then 1
+        # from 2 (that would be 3 merges from raw for the node member).
+        for j in range(4):
+            oracle = _flat_oracle(folded[3], list(range(4 * j, 4 * j + 4)), FIELDS)
+            assert bytes(folded[2]["h_tdigest"][j]) == encode_digest(oracle, "float32")
+        oracle = _flat_oracle(folded[3], list(range(16)), FIELDS)
+        assert bytes(folded[1]["h_tdigest"][0]) == encode_digest(oracle, "float32")
+        chained = _flat_oracle(folded[2], list(range(4)), FIELDS)
+        assert bytes(folded[1]["h_tdigest"][0]) != encode_digest(chained, "float32")
+        # ... and the boundary is visible: the from-raw fold of the same cells
+        # is different bytes (a merge of merges re-quantizes at δ).
+        from_raw = merge_tdigests_kway(
+            [decode_digest(slabs["h_tdigest"][i], "float32") for i in sorted(BOUND_OBS)],
+            delta=DELTA,
+        )
+        assert bytes(folded[1]["h_tdigest"][0]) != encode_digest(from_raw, "float32")
+
+    def test_companions_ride_the_same_boundary_call(self):
+        slabs = _bound_slabs(BOTH_CHANNEL_FIELDS)
+        folded = fold_column(
+            slabs,
+            BOTH_CHANNEL_FIELDS,
+            cell_order=BOUND_CELLS,
+            resolutions=[3, 2, 1],
+            node_order=BOUND_NODE,
+        )
+        oracle, ow_l, ow_t = _flat_oracle(folded[3], list(range(16)), BOTH_CHANNEL_FIELDS)
+        assert bytes(folded[1]["h_tdigest"][0]) == encode_digest(oracle, "float32")
+        assert bytes(folded[1]["h_tdigest_locations"][0]) == encode_digest(ow_l, "uint64")
+        assert bytes(folded[1]["h_tdigest_times"][0]) == encode_digest(ow_t, "uint64")
+        for res in (2, 1):
+            for payload, raw_l, raw_t in zip(
+                folded[res]["h_tdigest"],
+                folded[res]["h_tdigest_locations"],
+                folded[res]["h_tdigest_times"],
+                strict=True,
+            ):
+                n = decode_digest(payload, "float32").shape[0]
+                assert decode_digest(raw_l, "uint64", ()).shape == (n,)
+                assert decode_digest(raw_t, "uint64", ()).shape == (n,)
+
+    def test_packed_words_fold_from_the_boundary_pairs(self):
+        from zagg.stats.composition import merge_composition_kway
+        from zagg.sweep_overview import payload_weight
+
+        slabs = _bound_slabs(PACKED_FIELDS)
+        folded = fold_column(
+            slabs, PACKED_FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=1
+        )
+        # The node member's word is one k-way word merge over the boundary
+        # member's (word, n) pairs, n the boundary ``of`` digest's weight.
+        parts = [
+            (int(folded[3]["composition"][i]), n)
+            for i in range(16)
+            if (n := payload_weight(folded[3]["h_tdigest"][i], "float32")) > 0
+        ]
+        assert int(folded[1]["composition"][0]) == merge_composition_kway(parts)
+
+    def test_exact_fields_are_unaffected(self):
+        slabs = _bound_slabs()
+        folded = fold_column(
+            slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=BOUND_NODE
+        )
+        for res in (3, 2, 1):
+            factor = 4 ** (BOUND_CELLS - res)
+            np.testing.assert_array_equal(
+                folded[res]["count"], fold_dense(slabs["count"], factor, "sum", 0)
+            )
+            np.testing.assert_array_equal(
+                folded[res]["h_min"], fold_dense(slabs["h_min"], factor, "min", "NaN")
+            )
+        assert folded[1]["count"][0] == 200 * len(BOUND_OBS)
+
+    def test_no_boundary_member_means_every_group_folds_from_raw(self):
+        # A declaration whose finest leaf resolution is node + 1 carries no
+        # boundary member: the pre-#538 law stands for every group.
+        slabs = _bound_slabs()
+        folded = fold_column(
+            slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[2, 1], node_order=BOUND_NODE
+        )
+        for res in (2, 1):
+            factor = 4 ** (BOUND_CELLS - res)
+            for j in range(4 ** (res - BOUND_NODE)):
+                raw = [
+                    decode_digest(slabs["h_tdigest"][i], "float32")
+                    for i in range(j * factor, (j + 1) * factor)
+                    if len(slabs["h_tdigest"][i])
+                ]
+                assert bytes(folded[res]["h_tdigest"][j]) == encode_digest(
+                    merge_tdigests_kway(raw, delta=DELTA), "float32"
+                )
+
+    def test_node_order_defaults_to_the_coarsest_member(self):
+        slabs = _bound_slabs()
+        a = fold_column(slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1])
+        b = fold_column(slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=1)
+        for res in (3, 2, 1):
+            assert [bytes(p) for p in a[res]["h_tdigest"]] == [
+                bytes(p) for p in b[res]["h_tdigest"]
+            ]
+
+    def test_the_largest_merge_is_one_boundary_cell(self, monkeypatch):
+        # The memory shape the ruling buys: no k-way call ever concatenates
+        # more rows than the largest boundary cell holds — never the shard.
+        import zagg.stats.tdigest as tdigest_mod
+
+        real = tdigest_mod.merge_tdigests_kway
+        seen: list = []
+
+        def recording(digests, *args, **kwargs):
+            seen.append(sum(len(d) for d in digests))
+            return real(digests, *args, **kwargs)
+
+        monkeypatch.setattr(tdigest_mod, "merge_tdigests_kway", recording)
+        slabs = _bound_slabs()
+        folded = fold_column(
+            slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=BOUND_NODE
+        )
+        per_cell = [len(decode_digest(slabs["h_tdigest"][i], "float32")) for i in range(BOUND_N)]
+        largest_boundary_cell = max(sum(per_cell[4 * j : 4 * j + 4]) for j in range(16))
+        # The coarse members merge δ-compressed boundary digests: 16 of them
+        # at most, each capped by the budget — never the shard's raw rows.
+        boundary_rows = sum(len(decode_digest(p, "float32")) for p in folded[3]["h_tdigest"])
+        assert seen and max(seen) <= max(largest_boundary_cell, boundary_rows) < sum(per_cell)
+        assert largest_boundary_cell < sum(per_cell) / 4  # the raw tier is a fraction
+
+    def test_provenance_records_two_merges_below_the_boundary(self, tmp_path):
+        from zagg.column import COLUMN_ATTR, LEAF_REGIME, write_column
+
+        slabs = _bound_slabs()
+        folded = fold_column(
+            slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=BOUND_NODE
+        )
+        basename = write_column(
+            str(tmp_path),
+            morton_word("-31"),
+            folded,
+            FIELDS,
+            node_order=BOUND_NODE,
+            cell_order=BOUND_CELLS,
+        )
+        root = zarr.open_group(open_store(f"{tmp_path}/-3/1/{basename}"), mode="r", zarr_format=3)
+        assert dict(root.attrs[COLUMN_ATTR])["groups"] == {
+            "3": {"regime": LEAF_REGIME, "merges_from_raw": 1, "n_cells": 16},
+            "2": {"regime": LEAF_REGIME, "merges_from_raw": 2, "n_cells": 4},
+            "1": {"regime": LEAF_REGIME, "merges_from_raw": 2, "n_cells": 1},
+        }
+
+
 def _assert_group_matches(overview, group: dict, n: int) -> None:
     """The leaf's ``n`` overview rows are byte-equal to its column group."""
     for name, meta in FIELDS.items():
@@ -622,6 +851,53 @@ class TestSweepParity:
             open_store(f"{tmp_path}/-3/all.zarr"), path=str(SHARD_ORDER), mode="r", zarr_format=3
         )
         _assert_group_matches(node_overview, folded[SHARD_ORDER], 1)
+
+    def test_the_boundary_member_matches_the_sweep_at_a_boundary_geometry(self, tmp_path):
+        # The same oracle at a geometry that HAS a raw-fold boundary (review
+        # finding, issue #538): node 1 / cells 4, column {3, 2, 1}, boundary
+        # 3. A /1 sweep with orders [0] folds the leaf from raw to cells
+        # 0 + (4 - 1) = 3 — the boundary member — so the sweep's own kernels
+        # pin the from-raw law there, while the node member (a flat second
+        # merge of that group) is what the from-raw whole-leaf fold is not.
+        from zagg.sweep import run_sweep
+
+        manifest = {
+            "spec": "morton-hive/1",
+            "dataset": {"short_name": "TEST", "version": "1"},
+            "cell_order": BOUND_CELLS,
+            "shard_order": BOUND_NODE,
+            "split_schedule": [1] * BOUND_NODE,
+            "pyramid": {
+                "spec": PYRAMID_SPEC,
+                "overview": {
+                    "spacing": 1,
+                    "orders": [0],
+                    "fold_source": "leaves",
+                    "all_time": False,
+                    "fields": dict(FIELDS),
+                },
+            },
+            "generated_at": "2026-01-01T00:00:00+00:00",
+        }
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        slabs = _make_leaf(tmp_path, "-31", BOUND_OBS, BOUND_NODE, BOUND_CELLS)
+        result = run_sweep(str(tmp_path), [(morton_word("-31"), None)], families=("overview",))
+        assert result["families"]["overview"]["written"] == 1
+        folded = fold_column(
+            slabs, FIELDS, cell_order=BOUND_CELLS, resolutions=[3, 2, 1], node_order=BOUND_NODE
+        )
+        overview = zarr.open_group(
+            open_store(f"{tmp_path}/-3/all.zarr"), path="3", mode="r", zarr_format=3
+        )
+        # Leaf -31 is child 0 of node -3: overview rows 0..15 are its fold.
+        _assert_group_matches(overview, folded[3], 16)
+        # The node member is NOT the from-raw whole-leaf fold any more.
+        whole = merge_tdigests_kway(
+            [decode_digest(slabs["h_tdigest"][i], "float32") for i in sorted(BOUND_OBS)],
+            delta=DELTA,
+        )
+        assert bytes(folded[1]["h_tdigest"][0]) != encode_digest(whole, "float32")
+        np.testing.assert_array_equal(folded[1]["count"], [200 * len(BOUND_OBS)])
 
 
 def _root_meta_sans_timestamps(store) -> dict:

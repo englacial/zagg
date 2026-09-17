@@ -28,17 +28,21 @@ spec §4.4/§4.6 make normative:
   held to the same regime law when present;
 - **counts / digests / composition** — the same value laws as the ``/1``
   arm (shared ``_check_node``), re-folded from the LEAF COLUMNS: the level
-  at resolution ``r`` reads each contributing leaf's column group at
-  ``max(r, shard_order)`` — its own cells for a gather, its node-order
-  partial for a merge — which is byte-what the staged sweep consumed (the
+  at resolution ``r`` reads each contributing leaf's column group at ``r``
+  for a gather and at the relay member (:func:`zagg.column.relay_resolution`
+  — the res-``shard_order + 2`` partials, issue #538) for a merge — which
+  is byte-what the staged sweep consumed (the
   merge-source law makes tuple grouping irrelevant *for the folded values*;
   see :func:`_value_checks_v2` for the §3.3 poison-unit caveat). A gather level's
   packed word is compared as ASSIGNED gen-1 content, not re-merged (§3.4
   quantization drift is per merge). The column tier itself is validated
-  against the leaf's own cell arrays — the §4.6 from-leaves parity, whose
-  per-cell fold factor is set by the geometry rather than by ``sample_cells``
-  and is therefore bounded by :data:`COLUMN_PARITY_FOLD_MAX` outside full
-  mode;
+  against the leaf's own cell arrays at and above the raw-fold boundary
+  (:func:`zagg.column.raw_fold_boundary`) — the §4.6 from-leaves parity,
+  whose per-cell fold factor is set by the geometry rather than by
+  ``sample_cells`` and is therefore bounded by
+  :data:`COLUMN_PARITY_FOLD_MAX` outside full mode — and against the
+  column's own boundary group below it, the flat fold those members are
+  (issue #538);
 - **idempotency** (fixture mode) — an immediate
   :func:`zagg.sweep_stages.sweep_stage_pass` re-run is a no-op (the #417
   generation ratchet), refused for ``s3://`` roots like the ``/1`` arm's.
@@ -320,7 +324,7 @@ def _value_checks_v2(
     is not reachable from a sweep that wrote its pairs; the law is quoted
     here for values only, not for the poison span (review finding).
     """
-    from zagg.column import column_resolutions
+    from zagg.column import column_resolutions, raw_fold_boundary, relay_resolution
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import STAGE_GATHER, classify_level
 
@@ -330,11 +334,13 @@ def _value_checks_v2(
         harness, report
     )
     s = harness.shard_order
+    relay = relay_resolution(entries, s, harness.cell_order)
 
-    # -- the above-shard ladder, from the leaf-column tier.
+    # -- the above-shard ladder, from the leaf-column tier: a gather reads
+    # its own member, a merge the relay member (§4.4, issue #538).
     for k, r in ladder:
         gather = classify_level(r, shard_order=s) == STAGE_GATHER
-        q = max(r, s)
+        q = r if gather else relay
         tier = (s, q, leaves, lambda dec, q=q: harness.column_group(dec, q))
         nodes = [n for n in declared[k] if probes[k].get(n) is not None]
         if not full and len(nodes) > harness.sample_nodes:
@@ -366,23 +372,30 @@ def _value_checks_v2(
                 values=values,
             )
 
-    # -- the leaf-column tier, from the leaves' own cell arrays (§4.6 parity).
+    # -- the leaf-column tier (§4.6 parity): groups at or finer than the
+    # raw-fold boundary from the leaves' own cell arrays, the coarser groups
+    # from the column's boundary group — the flat fold they are (issue #538).
     resolutions = column_resolutions(entries, s)
+    boundary = raw_fold_boundary(s, harness.cell_order, resolutions)
     leaf_tier = (s, harness.cell_order, leaves, harness.leaf_group)
+    boundary_tier = (s, boundary, leaves, lambda dec: harness.column_group(dec, boundary))
     col_nodes = [d for d in leaves if col_probes.get(d) is not None]
     if not full and len(col_nodes) > harness.sample_nodes:
         picks = harness.rng.choice(len(col_nodes), harness.sample_nodes, replace=False)
         col_nodes = sorted(col_nodes[int(p)] for p in picks)
     for dec in col_nodes:
         attrs = col_probes[dec]
-        errors["readback"].extend(_column_attrs_errors(dec, s, attrs, resolutions))
+        errors["readback"].extend(_column_attrs_errors(dec, s, attrs, resolutions, boundary))
         for q in resolutions:
-            # Bound the fold: one cell of the group at ``q`` covers
+            from_raw = boundary is None or q >= boundary
+            # Bound the fold: one cell of a from-raw group at ``q`` covers
             # ``4 ** (cell_order - q)`` leaf cells, whatever ``sample_cells``
             # says, so the payload legs are declined (and NAMED) above
-            # :data:`COLUMN_PARITY_FOLD_MAX` outside full mode.
+            # :data:`COLUMN_PARITY_FOLD_MAX` outside full mode. A coarse
+            # group's fold is over at most ``4 ** RAW_MEMBER_DEPTH``
+            # δ-bounded boundary digests — never a sample problem.
             fold = 4 ** (harness.cell_order - q)
-            refold = full or fold <= COLUMN_PARITY_FOLD_MAX
+            refold = full or not from_raw or fold <= COLUMN_PARITY_FOLD_MAX
             if not refold:
                 harness.warn(
                     f"column group [{q}]: each cell folds {fold} leaf cells "
@@ -395,7 +408,7 @@ def _value_checks_v2(
                 dec,
                 s,
                 q,
-                leaf_tier,
+                leaf_tier if from_raw else boundary_tier,
                 attrs,
                 count_meta,
                 exact_fields,
@@ -543,14 +556,17 @@ def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
     return errs
 
 
-def _column_attrs_errors(dec, s, attrs, resolutions) -> list:
+def _column_attrs_errors(dec, s, attrs, resolutions, boundary) -> list:
     """One leaf column's ``zagg_column`` attrs vs the §4.6 contract.
 
     Absent is :func:`_check_node`'s read-back leg (one line, not two);
     present-but-not-a-mapping is an error HERE, since that leg tests key
-    presence only and cannot see it (review finding).
+    presence only and cannot see it (review finding). Each group's
+    ``merges_from_raw`` is held to the DERIVED value — 1 at or finer than
+    the raw-fold ``boundary``, 2 below it (issue #538) — never to a
+    constant.
     """
-    from zagg.column import COLUMN_ATTR, COLUMN_SPEC
+    from zagg.column import COLUMN_ATTR, COLUMN_SPEC, member_merges_from_raw
 
     block = attrs.get(COLUMN_ATTR)
     if block is None:
@@ -578,11 +594,13 @@ def _column_attrs_errors(dec, s, attrs, resolutions) -> list:
     for res, g in groups.items():
         if not isinstance(g, dict):
             continue
-        if g.get("regime") != "leaf-column" or int(g.get("merges_from_raw", 0)) != 1:
+        mfr = member_merges_from_raw(int(res), boundary)
+        if g.get("regime") != "leaf-column" or int(g.get("merges_from_raw", 0)) != mfr:
             errs.append(
                 f"{dec}[{res}]: group provenance ({g.get('regime')!r}, "
-                f"{g.get('merges_from_raw')}) != ('leaf-column', 1) — every column group "
-                f"folds directly from the leaf's resident cells (§4.6)"
+                f"{g.get('merges_from_raw')}) != ('leaf-column', {mfr}) — a column group "
+                f"folds from the leaf's resident cells, or flat from the boundary member "
+                f"{boundary} below it (§4.6)"
             )
         expected_cells = 4 ** (int(res) - int(s))
         if int(g.get("n_cells", -1)) != expected_cells:
@@ -610,8 +628,10 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
     (review finding): a block that is not a mapping, or whose counters do
     not read as integers, is a read-back error by name.
     """
+    from zagg.column import leaf_entry_merges_from_raw
     from zagg.sweep_stage import STAGE_GATHER, STAGE_MERGE, classify_level
 
+    leaf_mfr = leaf_entry_merges_from_raw(entries, s, harness.cell_order)
     for e in entries:
         node, a = int(e["node"]), e.get("actuals")
         if a is None:
@@ -633,10 +653,11 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
             )
             continue
         if node == s:
-            if a.get("regime") != "leaf-column" or _as_int(a.get("merges_from_raw")) != 1:
+            if a.get("regime") != "leaf-column" or _as_int(a.get("merges_from_raw")) != leaf_mfr:
                 errors["readback"].append(
                     f"manifest actuals for the leaf entry (node {node}): "
-                    f"({a.get('regime')!r}, {a.get('merges_from_raw')!r}) != ('leaf-column', 1)"
+                    f"({a.get('regime')!r}, {a.get('merges_from_raw')!r}) != "
+                    f"('leaf-column', {leaf_mfr}) — the worst of its declared cells (§4.5)"
                 )
             continue
         r = int(e["cells"][0])

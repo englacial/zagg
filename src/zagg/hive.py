@@ -412,8 +412,58 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     return manifest
 
 
+def _pre_epoch_hint(existing: dict, manifest: dict, config) -> str:
+    """Name the issue #499 migration when a frozen-key mismatch is the hash alone.
+
+    The append path compares CURRENT-epoch digests only — accepting a legacy
+    hash here would make every append a silent migration point, and the hash
+    would then never move in the manifest. So a pre-epoch store refuses, but
+    by name: with ``config`` in hand the legacy digest is recomputed and the
+    verdict is definite; for a caller that does not forward the config (today
+    the Lambda ping precheck, which holds one but does not pass it) the hint
+    is conditional — it fires on ANY hash-only frozen-key mismatch, including
+    the ordinary D19 case of a genuinely different aggregation config. Empty
+    when some other frozen key differs.
+    """
+    fa, fb = _frozen(existing), _frozen(manifest)
+    if fa["semantic_hash"] is None or fb["semantic_hash"] is None:
+        return ""
+    fa.pop("semantic_hash")
+    fb.pop("semantic_hash")
+    if fa != fb:
+        return ""
+    tool = "tools/redeclare_dense_ladder.py (dry-run prints the migration; --execute writes it)"
+    if config is not None:
+        from zagg.semantics import semantic_hash_legacy
+
+        try:
+            legacy = semantic_hash_legacy(config)
+        except Exception:
+            # This runs WHILE the refusal message is being built, and
+            # ``semantic_core`` is total only for the fault classes it
+            # enumerates (a fault inside a normalizer propagates by design).
+            # An error-message helper must never mask the error it decorates,
+            # so fall through to the conditional wording.
+            legacy = None
+        if legacy is not None and legacy != existing["semantic_hash"]:
+            return ""
+        if legacy is not None:
+            return (
+                f"; the only frozen key that differs is semantic_hash, and the store's is "
+                f"this config's PRE-EPOCH digest (issue #499: data_source.index left the "
+                f"semantic core) — migrate the manifest with {tool}, then rerun; the append "
+                f"path never migrates on its own"
+            )
+    return (
+        f"; the only frozen key that differs is semantic_hash — if this config built the "
+        f"store before the issue #499 epoch (data_source.index left the semantic core), "
+        f"migrate the manifest with {tool}, then rerun; the append path never migrates on "
+        f"its own"
+    )
+
+
 def validate_manifest(
-    store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs
+    store_root: str, manifest: dict, *, overwrite: bool = False, config=None, **store_kwargs
 ) -> dict | None:
     """Read-only frozen-key precheck — the fail-fast half of the manifest guard.
 
@@ -447,6 +497,7 @@ def validate_manifest(
                 f"(existing {existing!r} vs {manifest!r}); this store was templated "
                 f"for different orders/identity — clear the store root (or pick a "
                 f"new one) before writing with this configuration"
+                f"{_pre_epoch_hint(existing, manifest, config)}"
             )
         return existing
     if overwrite and existing is not None and not frozen_matches:
@@ -553,7 +604,9 @@ def ensure_manifest(
     """
 
     store = open_object_store(store_root, **store_kwargs)
-    existing = validate_manifest(store_root, manifest, overwrite=overwrite, **store_kwargs)
+    existing = validate_manifest(
+        store_root, manifest, overwrite=overwrite, config=config, **store_kwargs
+    )
     if existing is not None and not overwrite:
         return existing
     put_object(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
@@ -624,7 +677,10 @@ def _frozen_matches(existing: dict | None, manifest: dict) -> bool:
     pre-#299 manifest lacks the key, and refusing every append to an
     existing store on its absence would brick resumes — the orders/schedule
     keys still guard those stores. Two hash-carrying manifests must match
-    exactly (D19: the hash is a frozen key).
+    exactly (D19: the hash is a frozen key) — at the CURRENT epoch: a
+    pre-epoch digest (issue #499) is never matched here, so a not-yet-migrated
+    store refuses until :func:`zagg.sweep_overview.declare_pyramid` has
+    rewritten its manifest (see :func:`_pre_epoch_hint`).
     """
     if existing is None:
         return False
@@ -1673,9 +1729,9 @@ def process_and_write_hive(
     # vlen array (the unsharded flat layout) — named here, not built.
     # Sibling envelope (issue #383): when the /2 declaration carries leaf-node
     # levels, the column fold at the TAIL of this function k-way merges this
-    # same resident digest load once more — measured ~+2.0 GB transient at the
-    # o8 scale above, on top of this accumulation, since nothing here is
-    # released before that call (``column.write_leaf_column``'s memory note).
+    # same resident digest load once more — bounded to one raw-fold-boundary
+    # cell per call since issue #538 (``column.write_leaf_column``'s memory
+    # note), and this accumulation is released before that call.
     ragged_chunks: list = []
 
     def _write_chunk(block_index, carrier, ragged):
@@ -1842,6 +1898,19 @@ def process_and_write_hive(
             # the timing rides an existing dict, never seeds one.
             if "phase_timings" in metadata:
                 metadata["phase_timings"]["hash"] = time.time() - _t0
+    # Release the aggregate the column fold does not need (issue #538): the
+    # K sharded carriers and the streamed ragged blocks are written and dead
+    # from here — nothing below reads them — so the fold's transient rides
+    # beside ``staged`` alone, not on top of a second copy of the leaf. The
+    # per-cell payload ``bytes`` ``staged`` shares with them survive by
+    # reference; only the containers go. Exactly one clear does work per
+    # path: ``chunk_results`` is the sharded sink, ``ragged_chunks`` the
+    # streaming one, and the two are exclusive. (``_df_out`` needs no
+    # release — ``process_shard`` returns an empty frame whenever either
+    # sink is in play, which here is always; review finding.)
+    if chunk_results is not None:
+        chunk_results.clear()
+    ragged_chunks.clear()
     # Leaf pyramid column (issue #383): written AFTER the leaf's own commit,
     # from the same resident staged slabs — the fleet side of #381 points
     # (1)-(3). Gated inside on the /2 declaration carrying leaf-node levels

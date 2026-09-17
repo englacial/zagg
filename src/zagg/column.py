@@ -9,14 +9,21 @@ node-order member (``cells == node`` — the leaf's whole-footprint aggregate,
 its **universal partial** for every coarser cell; there is no ``partial/``
 grammar, #381 point (2)).
 
-Every group folds directly from the leaf's raw resident cell slabs —
-merges-from-raw 1 for all leaf-written content, the #381 point (1) regime
-law; a group is never folded from another group. Exact classes reduce via
-:func:`zagg.sweep_overview.fold_dense`, approximate (t-digest) classes via
-the order-independent k-way merge (:func:`zagg.sweep_overview.fold_digests`,
-the issue #370 fold law) — the same kernels the sweep's from-leaves fold
-runs over the same per-cell inputs in the same ascending order, so column
-bytes are parity-equal with that fold by construction.
+Groups at or finer than the **raw-fold boundary** (``node_order +``
+:data:`RAW_MEMBER_DEPTH`) fold directly from the leaf's raw resident cell
+slabs — merges-from-raw 1, the #381 point (1) regime law. The coarser
+members fold FLAT from the boundary member (issue #538): one k-way call per
+output cell over the boundary cells it contains, never chained group from
+group, so they record merges-from-raw 2 and the peak memory of any single
+merge is bounded by one boundary cell's rows rather than the whole shard.
+Exact classes always reduce from raw via :func:`zagg.sweep_overview.fold_dense`
+(dense and cheap — their values are unaffected); approximate (t-digest)
+classes via the order-independent k-way merge
+(:func:`zagg.sweep_overview.fold_digests`, the issue #370 fold law) — the
+same kernels the sweep's from-leaves fold runs over the same per-cell inputs
+in the same ascending order, so from-raw column bytes are parity-equal with
+that fold by construction, and the coarse members are parity-equal with a
+flat fold over the boundary member.
 
 This module owns the fold core (pure functions over in-memory slabs), the
 column writer (one artifact per ``(leaf, window)``, D4 write discipline: a
@@ -49,10 +56,93 @@ COLUMN_ATTR = "zagg_column"
 #: source — and the sweep's overview family keeps its own ``overview`` role).
 COLUMN_ROLE = "column"
 #: The #381 point (7) regime every leaf-written group records: folded from
-#: the leaf's own resident cells. No ``source_children`` rides this regime
-#: (PR #379 precedent: coverage counts ride ``cascade``) — a leaf column's
-#: source is complete by construction, and its merges-from-raw is 1.
+#: the leaf's own resident cells, directly or flat through the boundary
+#: member. No ``source_children`` rides this regime (PR #379 precedent:
+#: coverage counts ride ``cascade``) — a leaf column's source is complete by
+#: construction; its merges-from-raw is :func:`member_merges_from_raw`.
 LEAF_REGIME = "leaf-column"
+#: The leaf tier's raw-fold boundary (issue #538): members at ``cells >=
+#: node_order + RAW_MEMBER_DEPTH`` fold from the leaf's resident cells; the
+#: coarser members fold FLAT from that boundary member — one k-way call per
+#: output cell over its already-quantized boundary cells, never chained —
+#: and record ``merges_from_raw`` 2. The largest single merge is then the
+#: LARGEST BOUNDARY CELL's centroid rows — ``1 / 4**RAW_MEMBER_DEPTH`` of the
+#: shard under uniform occupancy, more where photons concentrate (the bound
+#: is the cell, not the fraction) — at ~100 B per row of peak memory, where
+#: the node-order member merged the whole shard (2.2 GB at the CA store's
+#: p90, 6.8 GB at its largest shard — the 0.52 fleet's OOMs). Measured on
+#: the CA store's 39 fattest shards, the largest res-11 cell holds 6.0 M
+#: rows (14% of its shard at most; ICESat-2 tracks cross every res-11
+#: cell), so the worst boundary merge is ~0.6 GB against the 4 GB tier. A
+#: constant, not a knob: polar zones ingest per year, so the density that
+#: would motivate tuning it does not arise (espg ruling).
+RAW_MEMBER_DEPTH = 2
+
+
+def raw_fold_boundary(node_order: int, cell_order: int, resolutions) -> int | None:
+    """The member the coarse groups fold flat from, or ``None`` (all from raw).
+
+    ``node_order + RAW_MEMBER_DEPTH`` when the column carries that member;
+    ``None`` when the boundary is not finer than the cells themselves (a
+    fold from it IS a fold from raw) or when the column carries no group at
+    it (nothing to fold flat from: every group keeps the from-raw law,
+    merges-from-raw 1, and the #538 memory bound does not apply). The second
+    case is MEMBERSHIP, not a floor on the finest declared resolution: a
+    declaration whose rungs skip the boundary while including something
+    coarser (``overviews: [12, 10]`` on the 19/13/9 geometry — members {12,
+    10, 9}) hits it with a finest resolution well above it.
+    """
+    boundary = int(node_order) + RAW_MEMBER_DEPTH
+    if boundary < int(cell_order) and boundary in {int(r) for r in resolutions}:
+        return boundary
+    return None
+
+
+def member_merges_from_raw(res: int, boundary: int | None) -> int:
+    """A column group's ``merges_from_raw``: 2 below the boundary, else 1."""
+    return 2 if boundary is not None and int(res) < boundary else 1
+
+
+def leaf_entry_merges_from_raw(levels: list, shard_order: int, cell_order: int) -> int:
+    """The §4.5 leaf-entry ``actuals`` value: the worst of its declared cells.
+
+    The entry is one record over every declared leaf resolution, so it
+    carries the MAXIMUM of :func:`member_merges_from_raw` over them — 1 when
+    every declared resolution is at or above the raw-fold boundary, 2 when
+    the entry declares one below it (the finisher's record and the
+    pyramid-check expectation share this one definition).
+    """
+    shard_order = int(shard_order)
+    boundary = raw_fold_boundary(shard_order, cell_order, column_resolutions(levels, shard_order))
+    cells = [int(c) for e in levels if int(e["node"]) == shard_order for c in e["cells"]]
+    return max(member_merges_from_raw(c, boundary) for c in cells)
+
+
+def relay_resolution(levels: list, shard_order: int, cell_order: int) -> int:
+    """The member every above-shard merge folds from (spec §4.4, issue #538).
+
+    The leaf column's **coarsest member still folded from raw**, derived from
+    :func:`raw_fold_boundary` itself so the two can never disagree (review
+    finding): the boundary member when the column CARRIES one (every group
+    below it is a flat second merge, so a ladder merge consuming one would
+    sit at gen 3), else the node-order member — the one group every column
+    carries, and from raw whenever no boundary group exists. Either way a
+    stage merge consuming the relay is exactly 2 merges from raw.
+
+    Membership, not the finest declared resolution, is the predicate: a
+    declaration that straddles the boundary without carrying it
+    (``overviews: [12, 10]`` on the 19/13/9 geometry — members {12, 10, 9},
+    finest 12, no group 11) is legal, and relaying a member the leaf columns
+    do not hold would leave every above-shard merge level at fill. Stage
+    columns relay this member for their subtree
+    (:func:`zagg.sweep_stage.column_members`). The leaf entry (``node ==
+    shard_order``) places the members; a ``levels`` list without one (a
+    hand-built manifest — ``expand_overviews`` always emits it) has no
+    column resolutions at all and relays the node-order member.
+    """
+    shard_order = int(shard_order)
+    boundary = raw_fold_boundary(shard_order, cell_order, column_resolutions(levels, shard_order))
+    return shard_order if boundary is None else int(boundary)
 
 
 def generation_key(block) -> tuple:
@@ -228,20 +318,40 @@ def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> 
     return slabs
 
 
-def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list) -> dict:
+def fold_column(
+    slabs: dict,
+    fields: dict,
+    *,
+    cell_order: int,
+    resolutions: list,
+    node_order: int | None = None,
+) -> dict:
     """Fold the leaf's resident cell slabs into ``{resolution: {field: slab}}``.
 
-    Each resolution group folds INDEPENDENTLY from the raw cell slabs (never
-    group from group — merges-from-raw stays 1 for every group, #381 point
-    (1)): ``4^(cell_order - resolution)`` consecutive leaf cells share one
-    target cell (the ascending packed-word leaf invariant). Exact fields
-    reduce under their declared merge law; approximate fields decode each
-    child cell's payload and k-way merge the non-empty digests per target
-    cell, in ascending cell order — input-identical to the sweep's
-    from-leaves fold (:func:`zagg.sweep_overview._fold_node` +
+    ``4^(source - resolution)`` consecutive source cells share one target
+    cell (the ascending packed-word leaf invariant). Groups at or finer than
+    the raw-fold boundary (:func:`raw_fold_boundary` — ``node_order +``
+    :data:`RAW_MEMBER_DEPTH`) fold from the raw cell slabs, merges-from-raw
+    1 (#381 point (1)): approximate fields decode each child cell's payload
+    and k-way merge the non-empty digests per target cell, in ascending cell
+    order — input-identical to the sweep's from-leaves fold
+    (:func:`zagg.sweep_overview._fold_node` +
     :func:`zagg.sweep_overview.fold_digests`) of the committed leaf, which is
-    the issue #383 byte-parity contract. The node-order resolution is the
-    degenerate 1-cell group: the leaf's whole-footprint aggregate.
+    the issue #383 byte-parity contract. The coarser groups fold FLAT from
+    the boundary group (issue #538): the same k-way call per target cell,
+    over the ``4^(boundary - resolution)`` boundary cells it contains — never
+    chained through an intermediate group, so every such group is exactly 2
+    merges from raw and the largest single merge is one boundary cell's rows
+    rather than the shard's. Exact fields always reduce from raw under their
+    declared merge law (dense, cheap, and their values do not depend on it).
+    The node-order resolution is the degenerate 1-cell group: the leaf's
+    whole-footprint aggregate.
+
+    ``node_order`` places the boundary; a column always carries its node
+    member as the coarsest group, so it defaults to ``min(resolutions)`` and
+    a whole-column caller may omit it — a partial fold that must place the
+    boundary where the whole column would (the boundary member absent from
+    ``resolutions`` means every requested group folds from raw) passes it.
 
     ``fields`` is filtered to the composable classes (:func:`composable_fields`)
     — a D24 ``none`` field has no coarser fold and never becomes a group. A
@@ -261,22 +371,10 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     name rather than defaulted: the words are keyed on the centroid partition
     the merge produces (spec §9.1), so the pair may never be folded apart.
     """
-    from zagg.stats.composition import merge_composition_kway
-    from zagg.sweep_overview import (
-        _empty_slab,
-        decode_digest,
-        field_companions,
-        fold_dense,
-        fold_digests,
-        overview_fold_delta,
-        payload_weight,
-    )
-
     cell_order = int(cell_order)
     fields = composable_fields(fields)
-    out: dict = {}
+    resolutions = [int(r) for r in resolutions]
     for res in resolutions:
-        res = int(res)
         if res > cell_order:
             raise ValueError(
                 f"cannot fold a column group at resolution {res}: it is FINER than the "
@@ -284,91 +382,133 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
                 f"4^({cell_order} - {res}) is fractional — a column group is a fold of "
                 f"the leaf's own cells, never an upsample of them"
             )
-        factor = 4 ** (cell_order - res)
-        groups: dict = {}
-        for name, meta in fields.items():
-            slab = slabs[name]
-            if meta["class"] == "exact":
-                groups[name] = fold_dense(
-                    slab, factor, meta.get("method"), meta.get("fill_value", "NaN")
-                )
-                continue
-            if meta["class"] == "packed":
-                # The packed composition fold (issue #515, spec §3.4): each
-                # child cell contributes its ``(word, n)`` pair, ``n`` being
-                # the ``of`` digest's weight at the SAME cell — required by
-                # name, like a companion sibling: the word is uninterpretable
-                # without its divisor, so the pair may never fold apart.
-                of_name = meta.get("of")
-                of_slab = slabs.get(of_name)
-                if of_slab is None:
-                    raise ValueError(
-                        f"field {name!r} declares the packed composition fold over "
-                        f"{of_name!r} but no such slab was supplied — the fold's n "
-                        f"inputs are that digest's per-cell weights (spec §3.3/§3.4)"
-                    )
-                if slab.shape[0] % factor:
-                    raise ValueError(
-                        f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}"
-                    )
-                of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
-                folded = _empty_slab(meta, slab.shape[0] // factor)
-                for j in range(folded.shape[0]):
-                    parts = [
-                        (int(slab[i]), n)
-                        for i in range(j * factor, (j + 1) * factor)
-                        if (n := payload_weight(of_slab[i], of_dtype)) > 0
-                    ]
-                    if parts:
-                        folded[j] = merge_composition_kway(parts)
-                groups[name] = folded
-                continue
-            dtype = meta.get("dtype") or "float32"
-            inner = tuple(meta.get("inner_shape") or (2,))
-            delta = overview_fold_delta(meta)
-            if slab.shape[0] % factor:
-                raise ValueError(f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}")
-            declared = field_companions(name, meta)
-            for kwarg, sibling in declared:
-                if slabs.get(sibling) is None:
-                    raise ValueError(
-                        f"field {name!r} declares a {kwarg} channel but no {sibling!r} slab "
-                        f"was supplied — the words are keyed on the centroid partition the "
-                        f"merge produces (spec §9.1/§8.3), so the pair cannot be folded apart"
-                    )
-            folded = np.full(slab.shape[0] // factor, b"", dtype=object)
-            sibling_slabs = {
-                kwarg: np.full(folded.shape[0], b"", dtype=object) for kwarg, _ in declared
-            }
-            for j in range(folded.shape[0]):
-                rows = [
-                    i
-                    for i in range(j * factor, (j + 1) * factor)
-                    if slab[i] is not None and len(slab[i])
-                ]
-                if not rows:
-                    continue
-                cell = [decode_digest(slab[i], dtype, inner) for i in rows]
-                if not declared:
-                    folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
-                    continue
-                payload, *words = fold_digests(
-                    cell,
-                    delta=delta,
-                    dtype=dtype,
-                    channels={
-                        kwarg: [decode_digest(slabs[sibling][i], "uint64", ()) for i in rows]
-                        for kwarg, sibling in declared
-                    },
-                )
-                folded[j] = payload
-                for (kwarg, _), encoded in zip(declared, words, strict=True):
-                    sibling_slabs[kwarg][j] = encoded
-            groups[name] = folded
-            for kwarg, sibling in declared:
-                groups[sibling] = sibling_slabs[kwarg]
-        out[res] = groups
+    node_order = min(resolutions) if node_order is None else int(node_order)
+    boundary = raw_fold_boundary(node_order, cell_order, resolutions)
+    out: dict = {}
+    if boundary is not None:
+        out[boundary] = {
+            **_fold_exact(slabs, fields, 4 ** (cell_order - boundary)),
+            **_fold_ragged(slabs, fields, 4 ** (cell_order - boundary)),
+        }
+    for res in resolutions:
+        if res == boundary:
+            continue
+        source, order = (
+            (slabs, cell_order)
+            if boundary is None or res >= boundary
+            else (out[boundary], boundary)
+        )
+        out[res] = {
+            **_fold_exact(slabs, fields, 4 ** (cell_order - res)),
+            **_fold_ragged(source, fields, 4 ** (order - res)),
+        }
     return out
+
+
+def _fold_exact(slabs: dict, fields: dict, factor: int) -> dict:
+    """The exact-class groups, ``factor``-to-one under each declared law."""
+    from zagg.sweep_overview import fold_dense
+
+    return {
+        name: fold_dense(slabs[name], factor, meta.get("method"), meta.get("fill_value", "NaN"))
+        for name, meta in fields.items()
+        if meta["class"] == "exact"
+    }
+
+
+def _fold_ragged(slabs: dict, fields: dict, factor: int) -> dict:
+    """The approximate and packed groups, ``factor``-to-one from ``slabs``.
+
+    ``slabs`` is either the leaf's raw cell slabs or a folded group (the
+    boundary member) — both are ``{field: cell slab}`` plus every companion
+    sibling, one row per source cell, so the one body serves both tiers.
+    """
+    from zagg.stats.composition import merge_composition_kway
+    from zagg.sweep_overview import (
+        _empty_slab,
+        decode_digest,
+        field_companions,
+        fold_digests,
+        overview_fold_delta,
+        payload_weight,
+    )
+
+    groups: dict = {}
+    for name, meta in fields.items():
+        if meta["class"] == "exact":
+            continue
+        slab = slabs[name]
+        if slab.shape[0] % factor:
+            raise ValueError(f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}")
+        if meta["class"] == "packed":
+            # The packed composition fold (issue #515, spec §3.4): each
+            # child cell contributes its ``(word, n)`` pair, ``n`` being
+            # the ``of`` digest's weight at the SAME cell — required by
+            # name, like a companion sibling: the word is uninterpretable
+            # without its divisor, so the pair may never fold apart.
+            of_name = meta.get("of")
+            of_slab = slabs.get(of_name)
+            if of_slab is None:
+                raise ValueError(
+                    f"field {name!r} declares the packed composition fold over "
+                    f"{of_name!r} but no such slab was supplied — the fold's n "
+                    f"inputs are that digest's per-cell weights (spec §3.3/§3.4)"
+                )
+            of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
+            folded = _empty_slab(meta, slab.shape[0] // factor)
+            for j in range(folded.shape[0]):
+                parts = [
+                    (int(slab[i]), n)
+                    for i in range(j * factor, (j + 1) * factor)
+                    if (n := payload_weight(of_slab[i], of_dtype)) > 0
+                ]
+                if parts:
+                    folded[j] = merge_composition_kway(parts)
+            groups[name] = folded
+            continue
+        dtype = meta.get("dtype") or "float32"
+        inner = tuple(meta.get("inner_shape") or (2,))
+        delta = overview_fold_delta(meta)
+        declared = field_companions(name, meta)
+        for kwarg, sibling in declared:
+            if slabs.get(sibling) is None:
+                raise ValueError(
+                    f"field {name!r} declares a {kwarg} channel but no {sibling!r} slab "
+                    f"was supplied — the words are keyed on the centroid partition the "
+                    f"merge produces (spec §9.1/§8.3), so the pair cannot be folded apart"
+                )
+        folded = np.full(slab.shape[0] // factor, b"", dtype=object)
+        sibling_slabs = {
+            kwarg: np.full(folded.shape[0], b"", dtype=object) for kwarg, _ in declared
+        }
+        for j in range(folded.shape[0]):
+            rows = [
+                i
+                for i in range(j * factor, (j + 1) * factor)
+                if slab[i] is not None and len(slab[i])
+            ]
+            if not rows:
+                continue
+            cell = [decode_digest(slab[i], dtype, inner) for i in rows]
+            if not declared:
+                folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
+                continue
+            payload, *words = fold_digests(
+                cell,
+                delta=delta,
+                dtype=dtype,
+                channels={
+                    kwarg: [decode_digest(slabs[sibling][i], "uint64", ()) for i in rows]
+                    for kwarg, sibling in declared
+                },
+            )
+            folded[j] = payload
+            for (kwarg, _), encoded in zip(declared, words, strict=True):
+                sibling_slabs[kwarg][j] = encoded
+        groups[name] = folded
+        for kwarg, sibling in declared:
+            groups[sibling] = sibling_slabs[kwarg]
+    return groups
 
 
 def _column_provenance(meta: dict) -> dict:
@@ -514,6 +654,7 @@ def write_column(
             f"universal partial for every coarser cell (#381 point (2)), and no coarse level "
             f"ever rewrites a leaf; got resolutions {resolutions}"
         )
+    boundary = raw_fold_boundary(node_order, cell_order, resolutions)
     leaf_path = shard_leaf_path(store_root, shard_key, window=window)
     node_prefix = leaf_path.rstrip("/").rsplit("/", 1)[0]
     basename = column_name(window)
@@ -555,7 +696,7 @@ def write_column(
                 "groups": {
                     str(res): {
                         "regime": LEAF_REGIME,
-                        "merges_from_raw": 1,
+                        "merges_from_raw": member_merges_from_raw(res, boundary),
                         "n_cells": 4 ** (res - node_order),
                     }
                     for res in resolutions
@@ -756,23 +897,20 @@ def write_leaf_column(
     retry rewrites leaf and column wholesale (both writers clear their own
     prefix first).
 
-    Memory note (the PR #391 phase 1 review measurement): the node-order
-    member's k-way merge concatenates every resident digest once — at the
-    ~17.6M-centroid scale ``hive.process_and_write_hive`` already cites for
-    its ~200 MB ragged accumulation, the fold measured ~2.0 GB (float64
-    copies + sort temporaries inside ``merge_tdigests_kway``). That is a
-    DELTA over a bare build-the-slabs harness, and it rides ON TOP of what
-    the worker is still holding at this hook: ``chunk_results`` (never
-    cleared after the leaf write), ``ragged_chunks`` on the streaming path,
-    ``_df_out``, and ``staged`` itself — on Lambda those release only once
-    the handler returns from ``process_and_write_hive``. The overlap is
-    smaller than that list of live names suggests (the per-cell payload
-    ``bytes`` are shared references between ``chunk_results`` and
-    ``staged``), and the bound is transient, single-threaded, and dies with
-    the call — but it is 4 GB workers (issue #193) absorbing ~2.0 GB on top
-    of a loaded heap, not beside an empty one. A digest load ~2x that scale
-    does not fit and needs the kernel-side preallocation named on the PR
-    thread before the column can carry it.
+    Memory note (issue #538): the largest single k-way merge is the
+    LARGEST raw-fold-boundary cell's resident centroid rows — a 16th of the
+    shard under uniform occupancy on the o9/o19 reference geometry, up to
+    the whole shard if every photon sat in one res-11 cell; on the CA store's
+    fattest shards the largest res-11 cell is 14% of its shard — at ~100 B
+    per row of peak (float64 compress temporaries, the lexsort, the
+    Rust-side companion reducers), where the node-order member cost that per
+    shard photon when it merged the whole shard at once (2.2 GB at the CA
+    store's p90 of 21.8 M photons, 6.8 GB at its 67.8 M maximum: the 0.52
+    fleet's 47/251 OOMs at 4 GB). The coarse members then merge δ-bounded
+    boundary digests, which is small by construction. The transient still
+    rides ON TOP of whatever the worker holds at this hook (``staged``
+    itself, at least): on Lambda that releases only once the handler
+    returns from ``process_and_write_hive``.
     """
     store_kwargs = dict(store_kwargs or {})
     # The gate re-validates a declaration the templating path already
@@ -788,7 +926,13 @@ def write_leaf_column(
         return None
     resolutions, fields = plan
     slabs = leaf_slabs(staged, fields, group_path=grid.group_path, n_cells=grid.cells_per_shard)
-    folded = fold_column(slabs, fields, cell_order=grid.child_order, resolutions=resolutions)
+    folded = fold_column(
+        slabs,
+        fields,
+        cell_order=grid.child_order,
+        resolutions=resolutions,
+        node_order=grid.parent_order,
+    )
     return write_column(
         store_root,
         shard_key,

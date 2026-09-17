@@ -110,20 +110,31 @@ def _derive_block(config, manifest: dict) -> dict:
     return block
 
 
-def _semantic_verdict(manifest: dict, config) -> str:
-    from zagg.semantics import semantic_fingerprint, semantic_hash
+def _semantic_verdict(manifest: dict, config) -> tuple[str, bool]:
+    """``(verdict line, migrates)`` — the guard's answer, and whether ``--execute``
+    will rewrite the frozen ``semantic_hash`` (the issue #499 epoch migration)."""
+    from zagg.semantics import semantic_fingerprint, semantic_hash, semantic_hash_legacy
 
     stored = manifest.get("semantic_hash")
     if not stored:
-        return "semantic_hash ABSENT (pre-#299 store) — fold methods will be taken on trust"
+        return "semantic_hash ABSENT (pre-#299 store) — fold methods will be taken on trust", False
     supplied = semantic_hash(config)
     if supplied == stored:
-        return f"semantic_hash MATCH ({semantic_fingerprint(stored)})"
+        return f"semantic_hash MATCH ({semantic_fingerprint(stored)})", False
+    if semantic_hash_legacy(config) == stored:
+        # The self-migrating case: this config built the store under the
+        # index-in-core canonicalization; declare_pyramid rewrites the frozen
+        # key in the same PUT as the declaration.
+        return (
+            f"legacy MATCH ({semantic_fingerprint(stored)}) → will rewrite to "
+            f"{semantic_fingerprint(supplied)} (pre-epoch hash; this config built the store "
+            f"under the index-in-core canonicalization, issue #499)"
+        ), True
     return (
         f"semantic_hash MISMATCH — config {semantic_fingerprint(supplied)} vs store "
         f"{semantic_fingerprint(stored)}; --execute WILL REFUSE. Supply the store's "
         f"ORIGINAL build config (output.* edits do not change the hash)"
-    )
+    ), False
 
 
 def _leaf_probe_verdict(store_root: str, manifest: dict, block: dict, store_kwargs: dict) -> str:
@@ -160,7 +171,9 @@ def _preserving_materialized(prior, block: dict) -> dict:
     return merged
 
 
-def _print_dry_run(manifest: dict, block: dict, verdict: str, leaf_probe: str) -> None:
+def _print_dry_run(
+    manifest: dict, block: dict, verdict: str, leaf_probe: str, *, migrates: bool = False
+) -> None:
     prior = manifest.get("pyramid")
     print(f"semantic guard: {verdict}")
     print(f"leaf probe: {leaf_probe}")
@@ -182,7 +195,15 @@ def _print_dry_run(manifest: dict, block: dict, verdict: str, leaf_probe: str) -
         print("prior 'materialized' actuals present — declare_pyramid preserves them verbatim")
     print()
     if prior == compare:
-        print("manifest pyramid block: IDENTICAL — --execute would be a no-op (no PUT)")
+        if migrates:
+            # An identical block is still a PUT when the frozen hash migrates
+            # (issue #499): the operator must not read this as "nothing to do".
+            print(
+                "manifest pyramid block: IDENTICAL — but --execute still PUTs once, to "
+                "rewrite the pre-epoch semantic_hash (see the semantic guard line)"
+            )
+        else:
+            print("manifest pyramid block: IDENTICAL — --execute would be a no-op (no PUT)")
         return
     before = json.dumps(prior, indent=1, sort_keys=True).splitlines()
     after = json.dumps(compare, indent=1, sort_keys=True).splitlines()
@@ -246,11 +267,13 @@ def main(argv=None) -> int:
     block = _derive_block(config, manifest)
 
     if not args.execute:
+        verdict, migrates = _semantic_verdict(manifest, config)
         _print_dry_run(
             manifest,
             block,
-            _semantic_verdict(manifest, config),
+            verdict,
             _leaf_probe_verdict(args.store_root, manifest, block, store_kwargs),
+            migrates=migrates,
         )
         return 0
 

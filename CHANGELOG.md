@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   APPENDS to `atl03_tdigest_o9.zarr` / `gedi_flux_o9.zarr` instead of being
   refused on the frozen `semantic_hash` — the two templates carry, key for key,
   what those stores' run records hold, pinned in
-  `tests/test_live_store_templates.py` against the store manifests.
+  `tests/test_live_store_templates.py` against the store manifests. Ordering
+  with the index epoch below: the templates reproduce those manifests at their
+  *pre-epoch* digest, so each store takes the append once `declare_pyramid`
+  has migrated its frozen key — the pins carry both columns.
   - **δ = 4,096 is uniform across every packaged digest template**, retiring
     the 8,192 raise (espg ruling 2026-09-13): the CA tail scan puts 1e-5 of
     cells above 4,096, all atmospheric storm artifacts, and the GEDI read
@@ -29,7 +32,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `delta_time` column and `output.time_source`, the write-through sidecar
     `data_source.index` block, and `parent_order: 9`. The index bucket is
     account-private (#499): build your own store by deleting or overriding
-    `data_source.index`, which moves the hash — correct for a new store.
+    `data_source.index` — which, since the epoch below took that block out of
+    the core, leaves the hash untouched.
+
+- **BREAKING — hash epoch: `data_source.index` leaves the semantic core**
+  (#499 phase 2, refs #547, [#565](https://github.com/englacial/zagg/pull/565);
+  espg-ruled 2026-09-13). The chunk-index block (`backend`
+  inline/hierarchical/sidecar, the sidecar `store` location, `on_miss`) is
+  read machinery: a sidecar miss processes the file and a different sidecar
+  location yields identical bytes, so it joins `DATA_SOURCE_PACKAGING_KEYS`
+  beside `reader`/`read_plan`. **Every pre-epoch `semantic_hash` of a store
+  whose config carried an `index` block stops reproducing** — both live
+  stores do (`atl03_tdigest_o9` `b9b15fdd…` → `aacfe1e3…`, `gedi_flux_o9`
+  `4f828794…` → `337b2c3a…`; pairs pinned in `tests/test_semantics.py`).
+  - **Migration is the redeclare tool, and only it.**
+    `zagg.semantics.semantic_hash_legacy` recomputes a config's pre-epoch
+    digest; `declare_pyramid` (behind `tools/redeclare_dense_ladder.py` and
+    `--declare-pyramid`) accepts a store whose frozen hash is the supplied
+    config's pre-epoch digest and rewrites `semantic_hash` to the current
+    value in the same manifest write — the one place a frozen key moves. The
+    tool's dry run prints `semantic guard: legacy MATCH (b9b15f…) → will
+    rewrite to aacfe1…` before `--execute`; an identical declaration is no
+    longer a no-op while a migration is pending. The same write re-renders the
+    store's D19 core sidecar (`aggregation.yaml`), which nothing else
+    regenerates, so it does not keep asserting the pre-epoch core.
+  - **The append path does not migrate.** `hive._frozen_matches` compares
+    current-epoch digests only; a not-yet-migrated store refuses an
+    aggregation run up front with a message naming the tool.
+  - **Skip-gate consequence (deliberate):** `dedup` compares stamped hash
+    strings, so pre-epoch stamps on the two live stores read as stale — a
+    same-shard re-dispatch **rewrites** instead of skipping. New-AOI appends
+    and the column backfill are unaffected. Migration note:
+    `docs/hive_layout.md`, "Migration: the index-exclusion epoch".
+
+- **The leaf column's coarse members fold flat from the res-(s+2) member**
+  (#538): the leaf-time column fold merged every resident photon of the shard
+  in one k-way call at the node-order member, at ~95–100 B of peak memory per
+  centroid row — 2.2 GB at the CA ATL03 store's p90 and 6.8 GB at its largest
+  shard, the 0.52 fleet's 47/251 OOMs at 4 GB. Members at `cells >=
+  shard_order + 2` (13/12/11 on an o9/o19 store) keep the from-raw fold; the
+  two coarser members now fold in one flat k-way call per output cell over the
+  res-(s+2) member's already-quantized cells (never chained) and record
+  `merges_from_raw: 2`, so the largest single merge is one boundary cell — a
+  sixteenth of the shard only under uniform occupancy; measured across the 39
+  fattest CA ATL03 shards the largest res-(s+2) cell holds 6.04 M rows, 9.8% of
+  its 61.7 M-row shard (p50 9.6%, max 14.0%), i.e. ~0.6 GB at ~100 B/row
+  against the 4 GB tier. The boundary is the constant
+  `zagg.column.RAW_MEMBER_DEPTH = 2`, not a knob. The `/2` ladder's stage-merge
+  relay member moves from the node-order partial to the res-(s+2) partial
+  (`zagg.column.relay_resolution`), so every stage-merge level stays exactly 2
+  merges from raw; stage columns relay that member. That trades the leaf-side
+  win for a ~16× ladder tier: a relay member carries 16 δ-bounded digests where
+  the node member carried 1, so a stage merge k-ways 64 sources per output cell
+  where it k-wayed 4, and one T1 stage node over 64 leaves relays ~16 × 64 × 512
+  centroids (~524k rows, tens of MB) — δ-bounded and tiny next to the leaf tier,
+  with no invoke-payload impact (payloads carry node decimals and leaf refs,
+  never partials). Exact-class values are unchanged; digest and composition
+  bytes at cells `s`/`s+1` and at every stage-merge level change, the `/2`
+  byte-identity oracle (CLI fold ≡ fleet fold) holds on the boundary-relay
+  geometry as well as the node-relay one, and the manifest leaf-entry `actuals`
+  record the worst of the entry's declared cells. Spec §4.4/§4.5/§4.6 and the
+  `pyramid/` fixture's actuals updated. The worker also releases the aggregate
+  it no longer needs before the fold.
 
 - **mortie 1.0 is now the floor** (#559): mortie 1.0.0 retired its plural batch
   names with no aliases (espg/mortie#187), so a fresh install against unpinned

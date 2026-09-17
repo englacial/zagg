@@ -116,6 +116,7 @@ class TestStageArtifactDemotions:
             tsc._STRATA_FIELDS,
             shard_order=NODE_ORDER,
             child_order=NODE_ORDER,
+            relay=NODE_ORDER,
             all_time=False,
         )
 
