@@ -153,7 +153,9 @@ def column_tier_gaps(levels: list, shard_order: int) -> tuple[list[int], list[in
     ``(tier, missing)``: the tier is :func:`zagg.column.column_resolutions`
     — every cell at or above ``shard_order`` from any level plus the
     node-order member, finest first — and ``missing`` every order between
-    the shard order and the tier's finest member that no level carries.
+    the shard order and the tier's finest member that no level carries,
+    finest first as well (both halves of the refusal read in the same
+    direction the declaration is written in).
     Empty ``missing`` is the contiguity the ruling requires. Cells below the
     shard order never contribute, so a ``levels`` list that skips
     stage-merge levels reports none — and no conformant manifest carries
@@ -164,7 +166,9 @@ def column_tier_gaps(levels: list, shard_order: int) -> tuple[list[int], list[in
     from zagg.column import column_resolutions
 
     tier = column_resolutions(levels, shard_order)
-    missing = sorted(set(range(int(shard_order), tier[0])) - set(tier)) if tier else []
+    missing = (
+        sorted(set(range(int(shard_order), tier[0])) - set(tier), reverse=True) if tier else []
+    )
     return tier, missing
 
 

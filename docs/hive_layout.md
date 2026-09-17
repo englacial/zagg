@@ -297,7 +297,7 @@ the espg grammar ruling on the declaring PR): **`overviews`** — the **leaf
 cell resolutions**, and nothing else. A scalar is sugar for one resolution;
 a list is strictly descending and consecutive (the column tier — every
 ladder cell at or above the shard order — must step by one down to the
-shard order; `[16, 13]` is refused, naming `missing [14, 15]`), each member
+shard order; `[16, 13]` is refused, naming `missing [15, 14]`), each member
 strictly between `parent_order` and `child_order`; omitted, the default is
 one resolution at the grid's resolved chunk order:
 

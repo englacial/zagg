@@ -84,21 +84,23 @@ class TestValidateOverviews:
             ([13, 12, 10], [13, 12, 10, 9], [11]),
             ([12, 10], [12, 10, 9], [11]),
             ([13, 11], [13, 11, 10, 9], [12]),
-            ([16, 13], [16, 13, 12, 11, 10, 9], [14, 15]),
+            ([16, 13], [16, 13, 12, 11, 10, 9], [15, 14]),
         ],
     )
     def test_gapped_column_tier_refused_by_name(self, resolutions, tier, missing):
         # espg ruling (PR #567 thread, 2026-09-17): every ladder level whose
         # cells are at or above the shard order IS the leaf column tier
         # (§4.6), so it must be contiguous from the finest leaf resolution
-        # down to the shard order; the message names the tier and the gap.
+        # down to the shard order; the message names the tier and the gap —
+        # both finest-first, the direction the declaration is written in, so
+        # the missing orders splice straight into the list.
         with pytest.raises(ValueError, match="column tier must be contiguous") as exc:
             validate_overviews(resolutions, **REF)
         assert f"cells at or above shard order 9 are {tier}, missing {missing}" in str(exc.value)
 
     @pytest.mark.parametrize(
         "resolutions, parent, missing",
-        [([18], 8, [9]), ([16], 7, [8]), ([10], 3, [4, 5, 6])],
+        [([18], 8, [9]), ([16], 7, [8]), ([10], 3, [6, 5, 4])],
     )
     def test_ladder_floor_gap_names_the_base_not_the_leaf_list(self, resolutions, parent, missing):
         # The ladder's coarsest cell is node 0's, d == base - shard, so where
