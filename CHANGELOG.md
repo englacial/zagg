@@ -15,6 +15,34 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ### Notes
 
+- **A gapped column tier above the shard order is refused at declaration**
+  (refs #538, PR #567; espg ruling 2026-09-17). `output.pyramid.overviews`
+  must now be consecutive: every `/2` ladder level whose cells are at or
+  above the shard order IS the leaf column tier (spec §4.6), so it must be
+  contiguous from the finest leaf resolution down to the shard order —
+  `[13, 12, 11, 10, 9]` on an o9/o19 store, never `[13, 12, 10, 9]` or
+  `[12, 10]`. `validate_overviews` refuses by name, listing the tier and the
+  gap (`column tier must be contiguous: cells at or above shard order 9 are
+  [13, 12, 10, 9], missing [11]`), through `validate_config`,
+  `build_pyramid_block` (both arms — the contiguity leg needs no child
+  order, so the grid-less retrofit config is checked too),
+  `declare_pyramid` and the `/2` pyramid check's declaration leg;
+  `zagg.pyramid.column_tier_gaps` is the one definition, reporting the tier
+  and the gap finest-first. Where the coarsest leaf resolution clears twice
+  the shard order the ladder's own floor gaps the tier instead (node 0
+  carries cells `base - shard_order`), and the refusal names that
+  constraint. Levels below the shard order are the ladder's own, derived by
+  the §4.4 every-order law, so no gap can arise there. Writer-side only:
+  the `/2` marker does not bump and a reader still decodes a stored gapped
+  declaration by its recorded `overviews` list. The default
+  dense declaration and both live stores (`--overviews 13` on 9/19,
+  `--overviews 12` on 9/18) are one-member lists and pass unchanged.
+  Contiguity guarantees the raw-fold boundary member (`shard_order + 2`,
+  `zagg.column.RAW_MEMBER_DEPTH`) exists whenever anything coarser is
+  declared, so `relay_resolution`'s node-member fallback is reachable for a
+  validated store only at a finest resolution of `shard_order + 1`; a
+  hand-built manifest can still gap and keeps the backstop. Spec §4.4/§4.5/§4.6
+  updated; no fixture declared a gapped tier.
 - **the packaged templates are the live stores' build configs** (#547)
   ([#565](https://github.com/englacial/zagg/pull/565)): a default build from
   `atl03_tdigest_strata_healpix` or `gedi01b_waveform_healpix_hive` now
