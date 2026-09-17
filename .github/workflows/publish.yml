@@ -97,7 +97,10 @@ jobs:
           echo "::warning::could not rebase the changelog commit for $TAG onto main; landing it as a PR instead"
         # Success is the section being ON the commit we push, never the push's
         # own exit code (an up-to-date no-op also exits 0): verify, then push.
-        elif git show HEAD:CHANGELOG.md | grep -q "^## \[$TAG\]" && git push origin HEAD:main; then
+        # (git grep, not `show | grep`: under pipefail a grep -q that exits on
+        # the first match can SIGPIPE the producer once the file outgrows the
+        # pipe buffer, which would read as "section missing".)
+        elif git grep -q "^## \[$TAG\]" HEAD -- CHANGELOG.md && git push origin HEAD:main; then
           echo "pushed changelog for $TAG to main"
           exit 0
         fi
