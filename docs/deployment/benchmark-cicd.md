@@ -516,29 +516,35 @@ gh variable set BENCHMARK_TEST_STAGE_BUCKET  --body "sliderule-public"
 # Release (tier 3)
 gh variable set LAMBDA_RELEASE_ROLE_ARN   --body "arn:aws:iam::ACCOUNT_ID:role/zagg-lambda-release"
 gh variable set LAMBDA_PROD_FUNCTION_NAME --body "process-shard"
-gh variable set LAMBDA_DIST_BUCKET        --body "sliderule-public-cors"
+gh variable set LAMBDA_DIST_BUCKET        --body "us-west-2.opendata.source.coop"
+gh variable set LAMBDA_DIST_PREFIX        --body "englacial/zagg/lambda"
 gh variable set LAMBDA_AWS_REGION         --body "us-west-2"
-# When the mirror lands (issue #497), the destination becomes these two instead
-# of LAMBDA_DIST_BUCKET above. Not set yet -- publish.yml does not pass a prefix.
-# gh variable set LAMBDA_DIST_BUCKET --body "us-west-2.opendata.source.coop"
-# gh variable set LAMBDA_DIST_PREFIX --body "englacial/zagg/lambda"
 ```
 
-Until every variable above exists, `distribute` (and with it `deploy-prod`)
-skips, and a release still attaches the zips to the GitHub Release. The
-distribution destination moves to the Source Cooperative mirror under issue #497
-— `distribute_zips.sh` already takes the `--prefix` that mirror needs, and
-`sliderule-public-cors` cannot host public data under NASA's clearance posture
-(issue #499) — but `publish.yml` is not yet pointed at it.
+`LAMBDA_DIST_BUCKET`/`LAMBDA_DIST_PREFIX` point `distribute` at the Source
+Cooperative mirror (issue #497; `distribute_zips.sh --prefix`, and `deploy-prod`
+publishes the layer from the same prefixed key) — `sliderule-public-cors` cannot
+host public data under NASA's clearance posture (issue #499). Set them only
+**after** Source Cooperative has granted `zagg-lambda-release` write access;
+until every variable above exists, `distribute` (and with it `deploy-prod`)
+skips, and the release still attaches the zips to the GitHub Release.
 
 `LAMBDA_DIST_PREFIX` must be `englacial/zagg/lambda` **exactly** — no leading and
 no trailing `/`. §9's grant hard-codes that same prefix in its ARN
 (`…/englacial/zagg/lambda/*`), and the two have to agree byte for byte: a prefix
 that does not match the grant fails the release with an `AccessDenied` after PyPI
-has already published. `distribute_zips.sh` trims a stray leading or trailing
-slash and refuses a prefix that is only slashes, but it cannot know what the
-grant says — which is also why the variables are set only after the grant is
-confirmed.
+has already published. Two layers trim a stray slash and neither can know what
+the grant says — which is also why the variables are set only after the grant is
+confirmed:
+
+- `publish.yml`'s `github-release` job normalizes `vars.LAMBDA_DIST_PREFIX` once
+  (stripping one leading and one trailing `/`, warning when it had to) and
+  exports it as `outputs.prefix`. **Both** `distribute` and `deploy-prod` read
+  that single output — neither job reads `vars.LAMBDA_DIST_PREFIX` directly, so
+  the key `distribute` writes and the key `deploy-prod` publishes the layer from
+  cannot drift apart.
+- `distribute_zips.sh` trims a leading or trailing slash off its own `--prefix`
+  too, and refuses a prefix that is only slashes.
 
 Protect the production deploy:
 
