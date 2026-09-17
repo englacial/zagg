@@ -101,11 +101,23 @@ jobs:
           echo "pushed changelog for $TAG to main"
           exit 0
         fi
-        # Branch protection (or a race) refused the bot: land it as a PR.
+        # Branch protection (or a race) refused the bot: land it as a PR. A
+        # re-run rebuilds the commit on today's main, so it is NOT a descendant
+        # of an earlier attempt's branch tip: reuse that attempt's open PR when
+        # there is one, else give this run its own branch -- never a force-push
+        # over the old tip (CLAUDE.md section 1).
         BRANCH="changelog/$TAG"
-        if ! git push origin "HEAD:refs/heads/$BRANCH"; then
-          echo "::warning::could not push $BRANCH either; the CHANGELOG.md section for $TAG was NOT recorded"
+        if [ -n "$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" \
+                     --state open --json number --jq '.[].number')" ]; then
+          echo "::warning::$BRANCH already has an open PR with the $TAG section; merge it to record the section"
           exit 0
+        fi
+        if ! git push origin "HEAD:refs/heads/$BRANCH"; then
+          BRANCH="changelog/$TAG-$GITHUB_RUN_ID"
+          if ! git push origin "HEAD:refs/heads/$BRANCH"; then
+            echo "::warning::could not push $BRANCH either; the CHANGELOG.md section for $TAG was NOT recorded"
+            exit 0
+          fi
         fi
         # No --label: `implement` would put a bot PR into the routine's
         # actionable set (CLAUDE.md section 5), and an agent could not push to a
