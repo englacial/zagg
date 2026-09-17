@@ -229,6 +229,50 @@ def test_refuses_a_published_bucket_without_a_prefix(tmp_path):
     assert "--prefix is required" in result.stderr
 
 
+def test_a_leading_slash_on_the_prefix_is_stripped(tmp_path):
+    # Fold review: `--prefix` trimmed a trailing slash but not a leading one, so
+    # `/englacial/zagg/lambda` built `s3://BUCKET//englacial/...`. The empty
+    # first segment is a real key, and PublishToSourceCoop grants
+    # `.../englacial/zagg/lambda/*` with NO leading slash, so all six PUTs would
+    # 403 mid-release -- the failure class the no-prefix guard exists to remove,
+    # arriving from the other end. LAMBDA_DIST_PREFIX is hand-typed, where a
+    # leading slash is a natural thing to type.
+    argv, env, root = _prepare(tmp_path)
+    argv[argv.index("--prefix") + 1] = f"/{MIRROR_PREFIX}"
+    subprocess.run(argv, check=True, env=env, cwd=tmp_path)
+    log = (tmp_path / "aws.log").read_text()
+    targets = {arg for ln in log.splitlines() for arg in ln.split() if arg.startswith("s3://")}
+    assert targets, "the stub logged no s3:// targets"
+    for target in targets:
+        assert "//" not in target.removeprefix("s3://"), f"empty key segment: {target}"
+        assert target.startswith(f"s3://{MIRROR_BUCKET}/{MIRROR_PREFIX}/"), target
+    assert (root / "versions.json").exists()
+    assert (root / "0.3" / "SHA256SUMS").exists()
+
+
+def test_refuses_a_prefix_that_is_only_slashes(tmp_path):
+    # ...and the trim must not quietly turn `--prefix /` into the bucket root,
+    # which is what the guard above refuses when no prefix is given at all.
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--minor",
+            "0.3",
+            "--bucket",
+            MIRROR_BUCKET,
+            "--prefix",
+            "/",
+            "--dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "--prefix must name a key prefix" in result.stderr
+
+
 def test_errors_when_zip_count_wrong(tmp_path):
     if not shutil.which("sha256sum"):
         pytest.skip("sha256sum not available")

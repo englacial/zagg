@@ -36,7 +36,19 @@ while [ $# -gt 0 ]; do
     --minor) MINOR="$2"; shift 2 ;;
     --tag) TAG="$2"; shift 2 ;;
     --bucket) BUCKET="$2"; shift 2 ;;
-    --prefix) PREFIX="${2%/}"; shift 2 ;;
+    # Both ends are trimmed. The grant's ARNs carry no leading slash
+    # (benchmark_cicd.yaml: .../englacial/zagg/lambda/*), but LAMBDA_DIST_PREFIX
+    # is hand-typed, and a leading one builds `s3://BUCKET//englacial/...` --
+    # a real key, outside the grant, so all six PUTs AccessDenied mid-release.
+    # A prefix that is nothing but slashes means the bucket root; refuse it here
+    # so the message names the cause rather than the guard below.
+    --prefix)
+      PREFIX="${2#/}"; PREFIX="${PREFIX%/}"
+      if [ -z "$PREFIX" ]; then
+        echo "--prefix must name a key prefix, not the bucket root: '$2'" >&2
+        exit 2
+      fi
+      shift 2 ;;
     --dir) DIR="$2"; shift 2 ;;
     --region) REGION="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
