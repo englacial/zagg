@@ -31,6 +31,7 @@ These conventions govern both interactive sessions and **unattended routine runs
 - **No long commit bodies.** The explanation of *what* a commit does and *why* belongs in the **PR description / PR comments**, not the commit message.
 - Small, coherent commits with imperative subject lines. No "wip"/"fixup" left in the final history.
 - Never commit secrets, credentials, `.env` files, large binaries, or generated artifacts. Respect `.gitignore`.
+- **Never edit `CHANGELOG.md` in a PR** — the `changelog-guard` job in `lint.yml` refuses it. The `changelog` job in `publish.yml` writes each `## [TAG]` section at release from the merged PR titles (`.github/scripts/changelog_section.py`), so **make the PR title the release-note line** and put the substance in the PR body. A deliberate hand note goes under `## [Unreleased]` only, in a PR carrying the `changelog` label (the guard's escape hatch); the next release drains it into that tag's `### Notes`.
 - **Do not claim authorship credit in commit messages** (or PR descriptions). See §6 for where Claude does take credit.
 
 ## 4. Code quality & testing

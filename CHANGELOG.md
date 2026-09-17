@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Release sections are generated at tag time from merged pull-request titles
+(`.github/workflows/publish.yml` → `.github/scripts/changelog_section.py`); do not
+edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-labelled PR.
+
 ## [Unreleased]
 
 - **the packaged templates are the live stores' build configs** (#547)
