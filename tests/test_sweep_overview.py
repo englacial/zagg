@@ -1012,12 +1012,12 @@ class TestPyramidBlock:
         with pytest.raises(ValueError, match="not strictly between"):
             build_pyramid_block(cfg, shard_order=6)
 
-    def test_levels_skip_validation_without_a_grid_block(self):
+    def test_levels_skip_range_validation_without_a_grid_block(self):
         """A grid-less retrofit config templates; ``declare_pyramid`` re-validates.
 
-        There is no child order to check against here, so the check is skipped
-        rather than guessed at — the store's own manifest orders win at
-        declare time (``TestDeclarePyramid``).
+        There is no child order to check the RANGE rule against here, so that
+        leg alone is skipped rather than guessed at — the store's own manifest
+        orders win at declare time (``TestDeclarePyramid``).
         """
         from zagg.pyramid import PYRAMID_SPEC_V2
         from zagg.sweep_overview import build_pyramid_block
@@ -1028,6 +1028,21 @@ class TestPyramidBlock:
         assert block["spec"] == PYRAMID_SPEC_V2
         assert block["overviews"][0] == {"node": 6, "cells": [8]}
         assert block["overviews"][-1] == {"node": 0, "cells": [2]}
+
+    def test_gapped_tier_refused_without_a_grid_block(self):
+        """The contiguity leg needs only the shard order, so it runs here too.
+
+        Review finding: with the check under the ``grid_child`` guard the
+        retrofit arm still templated a gapped ``/2`` block (``[13, 10]`` on
+        shard order 9 — tier ``[13, 10, 9]``, no group at the raw-fold
+        boundary 11), leaving ``declare_pyramid`` as the only gate.
+        """
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"overviews": [13, 10]})
+        cfg.output.pop("grid")
+        with pytest.raises(ValueError, match=r"column tier must be contiguous.*missing"):
+            build_pyramid_block(cfg, shard_order=9)
 
     def test_validate_rejects_bad_grammar(self):
         from zagg.config import validate_config

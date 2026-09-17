@@ -527,6 +527,7 @@ def build_pyramid_block(config, shard_order: int, chunk_order: int | None = None
         expand_overviews,
         normalize_overviews,
         overview_block_v2,
+        validate_column_tier,
         validate_overviews,
         warn_excluded,
     )
@@ -557,15 +558,19 @@ def build_pyramid_block(config, shard_order: int, chunk_order: int | None = None
         # gets: the Lambda worker builds its config with ``load_config_from_dict``,
         # which never calls ``validate_config``, then goes straight to
         # ``build_manifest``. A grid-less retrofit config (no ``output.grid``,
-        # the ``declare_pyramid`` shape) is the one case skipped: there is no
-        # child order to check against here, and ``declare_pyramid``
-        # re-validates against the MANIFEST's own shard_order/cell_order before
-        # anything is written.
+        # the ``declare_pyramid`` shape) has no child order to check the RANGE
+        # rule against, so that leg alone is deferred to ``declare_pyramid``,
+        # which re-validates against the MANIFEST's own shard_order/cell_order
+        # before anything is written. The §4.6 column tier needs only the shard
+        # order, so its contiguity runs on both arms (review finding) — no arm
+        # templates a gapped ``/2`` block.
         grid_child = (config.output.get("grid") or {}).get("child_order")
         if grid_child is not None:
             validate_overviews(
                 resolutions, parent_order=int(shard_order), child_order=int(grid_child)
             )
+        else:
+            validate_column_tier(resolutions, parent_order=int(shard_order))
         # The manifest records the FULLY EXPANDED list — the leaf entry plus
         # the fixed every-order ladder to 0 (espg ruling; readers never
         # re-derive).

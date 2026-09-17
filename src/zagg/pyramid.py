@@ -113,6 +113,21 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
                 f"(the base data itself is order {child_order}; the shard-order "
                 f"aggregate is writer-side, never declared)"
             )
+    validate_column_tier(resolutions, parent_order=parent_order)
+
+
+def validate_column_tier(resolutions: list, *, parent_order: int) -> None:
+    """Refuse a leaf list whose §4.6 column tier gaps — the contiguity half.
+
+    Split out of :func:`validate_overviews` because it needs no
+    ``child_order`` (review finding): the grid-less retrofit config has none
+    to check the range rule against, but its tier is still fully determined
+    by ``parent_order``, so ``build_pyramid_block`` runs this leg on that arm
+    rather than templating a gapped ``/2`` block for ``declare_pyramid`` to
+    refuse later.
+    """
+    parent_order = int(parent_order)
+    resolutions = [int(r) for r in resolutions]
     tier, missing = column_tier_gaps(
         expand_overviews(resolutions, parent_order=parent_order), parent_order
     )
