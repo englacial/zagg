@@ -131,6 +131,25 @@ def test_render_with_empty_unreleased_omits_notes():
     )
 
 
+def test_replaying_an_older_tag_inserts_in_version_order_without_draining_notes():
+    # The 0.47.0-0.53.0 gap: a workflow_dispatch replay for a skipped tag must
+    # land below the newer sections and leave [Unreleased] alone.
+    out = cs.render(CHANGELOG, "0.52.0", "2026-08-25", ["- old ([#450](u)) by @espg"])
+    assert out is not None
+    assert "### Notes" not in out
+    assert "- hand note two\n\n## [0.53.0] - 2026-09-10" in out  # Unreleased intact
+    assert out.endswith(
+        "## [0.53.0] - 2026-09-10\n\n- older ([#500](https://x/pull/500)) by @espg\n\n"
+        "## [0.52.0] - 2026-08-25\n\n### Merged pull requests\n\n- old ([#450](u)) by @espg\n"
+    )
+    # ...and the oldest of all goes last.
+    out = cs.render(CHANGELOG, "0.1.0", "2026-01-01", [])
+    assert out is not None
+    assert out.endswith(
+        "## [0.1.0] - 2026-01-01\n\n### Merged pull requests\n\n- (none recorded)\n"
+    )
+
+
 def test_render_refuses_a_changelog_without_unreleased():
     with pytest.raises(SystemExit, match="Unreleased"):
         cs.render("# Changelog\n\n## [0.1.0] - 2026-01-01\n", "0.2.0", "2026-01-02", [])

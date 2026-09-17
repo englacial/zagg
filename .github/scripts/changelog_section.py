@@ -97,17 +97,40 @@ def _strip_blank(lines: list[str]) -> list[str]:
     return lines
 
 
+_VERSION_HEADING = re.compile(r"^## \[(\d+)\.(\d+)\.(\d+)\]")
+
+
+def _version(line: str) -> tuple[int, ...] | None:
+    m = _VERSION_HEADING.match(line)
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
 def render(text: str, tag: str, date: str, bullets: list[str]) -> str | None:
-    """The changelog with ``## [tag]`` inserted, or None if it already has one."""
+    """The changelog with ``## [tag]`` inserted, or None if it already has one.
+
+    The section goes above the first older release heading (a ``workflow_dispatch``
+    replay for a skipped tag lands in version order); the ``[Unreleased]`` body
+    drains into it only when it is the newest, so a backfill never steals the
+    notes waiting for the next release.
+    """
     if re.search(rf"^## \[{re.escape(tag)}\]", text, re.MULTILINE):
         return None
     head, unreleased, rest = _split_unreleased(text)
-    notes = _strip_blank(unreleased)
+    mine = _version(f"## [{tag}]")
+    at = next(
+        (i for i, ln in enumerate(rest) if (v := _version(ln)) is not None and mine and v < mine),
+        len(rest) if mine else 0,
+    )
+    newest = at == 0
+    notes = _strip_blank(unreleased) if newest else []
     section = [f"## [{tag}] - {date}", ""]
     if notes:
         section += ["### Notes", "", *notes, ""]
     section += ["### Merged pull requests", "", *(bullets or ["- (none recorded)"]), ""]
-    return "\n".join([*head, "", *section, *rest]).rstrip("\n") + "\n"
+    above = [*head] if newest else [*head, *unreleased, *rest[:at]]
+    while above and not above[-1].strip():
+        above.pop()
+    return "\n".join([*above, "", *section, *rest[at:]]).rstrip("\n") + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
