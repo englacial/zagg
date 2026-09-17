@@ -284,7 +284,9 @@ class TestTemplateEnvironment:
         # The shared execution role gets Get/Put/Delete on the whole public
         # sliderule-public-cors bucket -- deliberate scope (espg, PR #176):
         # virtual-index write-back + sidecar reads (zagg-index/*, issue #160)
-        # AND worker-written output zarr stores (e.g. zagg-examples/*). This is
+        # AND worker-written output zarr stores (e.g. zagg-examples/*). Since
+        # issue #499 the packaged template no longer reads sidecars from
+        # sliderule-public-cors, so the output-store half now carries it. This is
         # the STAGING half of the identity model in issue #495; the published
         # half is asserted in the next test.
         arn = "arn:aws:s3:::sliderule-public-cors/*"
@@ -351,8 +353,9 @@ class TestTemplateEnvironment:
 
         # Nothing outside demo/ -- lambda/* and benchmarks/* belong to the CI
         # release role under issue #497, not to the fleet, and the sidecar
-        # index cache is NOT moving here (espg, 2026-08-20: a different bucket
-        # under a different org, post-MVP).
+        # index cache, copied here 2026-09-17 under issue #499, sits
+        # deliberately OUTSIDE the fleet's grant: widening it to
+        # englacial/zagg/sidecar/* is an espg decision, not a drift fix.
         reachable = {r for s in stmts for r in _statement_resources(s) if "source.coop/" in r}
         assert reachable == {published}
 
