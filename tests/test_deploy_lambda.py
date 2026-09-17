@@ -732,10 +732,18 @@ def test_published_list_bucket_is_unconditional():
     )
 
 
-def test_release_role_does_not_pre_empt_the_benchmarks_prefix():
-    # Whether zagg-bench-*/zagg-examples/* migrate to englacial/zagg/benchmarks/
-    # is question (1) of issue #497 and is unresolved, so the grant must not
-    # reach it -- nor the fleet's demo/ prefix (template.yaml, issue #495).
+def test_release_role_reaches_nothing_outside_the_argued_grant():
+    # An ALLOWLIST, not a denylist of two spellings (fold review): the earlier
+    # form named `benchmarks` and two exact org wildcards, so a later
+    # .../englacial/zagg/demo/*, .../englacial/zagg* or .../englacial/*zagg/*
+    # passed a guard whose whole purpose is catching them. Anything on any
+    # provisioned role that reaches source.coop must be one of the three ARNs
+    # issue #497 argues for -- lambda/* plus the two exact repo-root keys -- so
+    # this pins in one line that the grant does not pre-empt benchmarks/
+    # (question (1), unresolved) and cannot reach the fleet's demo/
+    # (template.yaml, issue #495), and it fails loudly the day either is ruled
+    # on, which is when you want to be asked. The bare bucket ARN is the
+    # ListSourceCoopBucket grant.
     reachable = {
         arn
         for role in _cicd_roles()
@@ -743,10 +751,13 @@ def test_release_role_does_not_pre_empt_the_benchmarks_prefix():
         for arn in _arns(stmt)
         if isinstance(arn, str) and "source.coop" in arn
     }
-    assert not any(
-        arn.startswith(f"{SOURCE_COOP}/englacial/zagg/benchmarks") for arn in reachable
-    ), "issue #497 question (1) is unresolved -- the grant must not pre-empt benchmarks/"
-    assert not any(
-        arn in (f"{SOURCE_COOP}/englacial/*", f"{SOURCE_COOP}/englacial/zagg/*")
-        for arn in reachable
-    ), "the fine-grained split lives on our side -- do not grant the whole org prefix"
+    allowed = {
+        SOURCE_COOP,
+        f"{SOURCE_COOP}/englacial/zagg/lambda/*",
+        f"{SOURCE_COOP}/englacial/zagg/README.md",
+        f"{SOURCE_COOP}/englacial/zagg/LICENSE",
+    }
+    assert reachable <= allowed, (
+        "a CI/CD role reaches source.coop outside the issue #497 grant: "
+        f"{sorted(reachable - allowed)}"
+    )
