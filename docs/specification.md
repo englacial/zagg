@@ -1893,6 +1893,21 @@ says they *are* byte-identical — and doubles as the mismatch localizer
 stamped-but-torn leaves under the concurrency contract's out-of-contract
 case.
 
+*(Informative.)* The `semantic_hash` itself is **not** part of this
+specification: its derivation is the D19 record
+([`design/sparse_coverage.md`](design/sparse_coverage.md)) as implemented by
+`zagg.semantics`, it is subject to hash **epochs** (a change to the
+canonicalized subset moves every digest by design — the 2026-08-17 epoch,
+issue #415, and the 2026-09-13 **index-exclusion epoch**, issue #499, under
+which `data_source.index` is read machinery outside the core), and no
+fixture's `*.expected.json` records one — the committed §7 fixture manifests
+do carry the digest, and `tests/test_spec_conformance.py` reproduces each
+from its build config, so an epoch that moves a fixture config's digest
+regenerates those manifests. A reader should treat it as an opaque frozen
+manifest key: compare it for equality rather than recomputing it. Operator
+consequences of an epoch live in
+[`hive_layout.md`](hive_layout.md#migration-the-index-exclusion-epoch-issue-499).
+
 ## 6. `zagg-ragged/2`
 
 **Status: specified, implementation pending

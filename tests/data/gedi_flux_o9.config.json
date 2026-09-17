@@ -1,0 +1,221 @@
+{
+ "data_source": {
+  "shard_workers": 4,
+  "reader": "h5coro",
+  "driver": "s3",
+  "credentials_provider": "lpdaac",
+  "index": {
+   "backend": "hierarchical"
+  },
+  "groups": [
+   "BEAM0000",
+   "BEAM0001",
+   "BEAM0010",
+   "BEAM0011",
+   "BEAM0101",
+   "BEAM0110",
+   "BEAM1000",
+   "BEAM1011"
+  ],
+  "coordinates": {
+   "latitude": "/{group}/geolocation/latitude_bin0",
+   "longitude": "/{group}/geolocation/longitude_bin0",
+   "level": "shots"
+  },
+  "variables": {
+   "rxwaveform": "/{group}/rxwaveform",
+   "elevation": {
+    "synthesize": "linspace",
+    "level": "shots",
+    "start": "/{group}/geolocation/elevation_bin0",
+    "stop": "/{group}/geolocation/elevation_lastbin"
+   }
+  },
+  "base_level": "samples",
+  "levels": {
+   "samples": {
+    "path": "/{group}",
+    "link": null
+   },
+   "shots": {
+    "path": "/{group}/geolocation",
+    "coordinates": {
+     "latitude": "latitude_bin0",
+     "longitude": "longitude_bin0"
+    },
+    "link": {
+     "to": "samples",
+     "index_beg": "/{group}/rx_sample_start_index",
+     "count": "/{group}/rx_sample_count",
+     "index_base": 1
+    },
+    "variables": {
+     "shot_number": "/{group}/shot_number",
+     "delta_time": "/{group}/geolocation/delta_time",
+     "noise_mean": "/{group}/noise_mean_corrected",
+     "noise_stddev": "/{group}/noise_stddev_corrected",
+     "rx_energy": "/{group}/rx_energy",
+     "elevation_bin0": "/{group}/geolocation/elevation_bin0",
+     "elevation_lastbin": "/{group}/geolocation/elevation_lastbin",
+     "digital_elevation_model": {
+      "asset": "l2a",
+      "path": "/{group}/digital_elevation_model"
+     }
+    }
+   }
+  },
+  "assets": {
+   "l2a": {
+    "join": {
+     "left": "/{group}/shot_number",
+     "right": "/{group}/shot_number"
+    }
+   }
+  },
+  "filters": [
+   {
+    "level": "shots",
+    "dataset": "/{group}/geolocation/degrade",
+    "op": "eq",
+    "value": 0
+   },
+   {
+    "asset": "l2a",
+    "dataset": "/{group}/rx_assess/rx_clipbin_count",
+    "op": "le",
+    "value": 0
+   },
+   {
+    "expression": "abs((elevation_bin0 + elevation_lastbin)/2 - digital_elevation_model) <= 200"
+   }
+  ],
+  "read_plan": {
+   "spatial_index": "shots",
+   "pad": 1
+  }
+ },
+ "aggregation": {
+  "streaming": {
+   "mode": "spill",
+   "buffer_granules": 8
+  },
+  "coordinates": {
+   "morton": {
+    "dtype": "uint64",
+    "fill_value": 0
+   }
+  },
+  "variables": {
+   "count": {
+    "function": "len",
+    "source": "rxwaveform",
+    "dtype": "int32",
+    "fill_value": 0
+   },
+   "rx_flux": {
+    "kind": "ragged",
+    "function": "zagg.stats.waveform.build_waveform_digest",
+    "source": "elevation",
+    "temporal": "per-centroid",
+    "inner_shape": [
+     2
+    ],
+    "dtype": "float32",
+    "fill_value": 0,
+    "params": {
+     "delta": 4096,
+     "counts": "rxwaveform",
+     "noise_mean": "noise_mean",
+     "noise_stddev": "noise_stddev",
+     "gain": 1.0,
+     "false_positive_rate": 0.001,
+     "samples_per_record": 1420,
+     "correlation_length": 5
+    },
+    "attrs": {
+     "gain": {
+      "name": "unit",
+      "version": "gedi01b-v002-placeholder",
+      "value": 1.0
+     },
+     "clip": "threshold-to-zero",
+     "operating_point": {
+      "false_positive_rate": 0.001,
+      "samples_per_record": 1420,
+      "correlation_length": 5
+     }
+    },
+    "weights": "flux"
+   },
+   "shot_count": {
+    "function": "zagg.stats.waveform.shot_count",
+    "source": "shot_number",
+    "dtype": "int32",
+    "fill_value": 0
+   },
+   "shot_number": {
+    "function": "zagg.stats.waveform.shot_number",
+    "source": "shot_number",
+    "dtype": "uint64",
+    "fill_value": 0
+   },
+   "noise_mean": {
+    "function": "zagg.stats.waveform.single_shot_value",
+    "source": "noise_mean",
+    "dtype": "float32",
+    "fill_value": "NaN"
+   },
+   "noise_stddev": {
+    "function": "zagg.stats.waveform.single_shot_value",
+    "source": "noise_stddev",
+    "dtype": "float32",
+    "fill_value": "NaN"
+   },
+   "rx_energy": {
+    "function": "zagg.stats.waveform.single_shot_value",
+    "source": "rx_energy",
+    "dtype": "float32",
+    "fill_value": "NaN"
+   },
+   "elevation_bin0": {
+    "function": "zagg.stats.waveform.single_shot_value",
+    "source": "elevation_bin0",
+    "dtype": "float64",
+    "fill_value": "NaN"
+   },
+   "elevation_lastbin": {
+    "function": "zagg.stats.waveform.single_shot_value",
+    "source": "elevation_lastbin",
+    "dtype": "float64",
+    "fill_value": "NaN"
+   }
+  }
+ },
+ "output": {
+  "time_source": {
+   "field": "delta_time",
+   "epoch": "2018-01-01T00:00:00",
+   "scale": "gps",
+   "units": "seconds"
+  },
+  "grid": {
+   "type": "healpix",
+   "indexing_scheme": "nested",
+   "parent_order": 9,
+   "chunk_inner": 12,
+   "sharded": true,
+   "child_order": 18
+  },
+  "store_layout": "hive",
+  "pyramid": false
+ },
+ "catalog": null,
+ "bounds": null,
+ "pipeline": {
+  "type": "spatial"
+ },
+ "worker": {
+  "memory": 4096,
+  "extra_disk": true
+ }
+}
