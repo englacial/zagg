@@ -51,17 +51,17 @@
 data_source:
   reader: h5coro
   driver: s3
-  # Sidecar chunk index (issue #460): read machinery, outside the semantic
-  # core since the issue #499 epoch, so ``store`` moves no hash. The cache is
-  # publicly readable (Source Cooperative, copied 2026-09-17), but zagg's sidecar
-  # read signs with ambient credentials -- an unauthenticated reader should drop
-  # this block (an absent block resolves to inline) rather than rely on
-  # ``fallback``. No principal holds write on this prefix today, so ``on_miss:
-  # build`` is inert here and fails open to inline (the value is kept because it
-  # is the live store's). Only a 404 is a miss (a 403 raises, issue #502).
+  # Sidecar chunk index (issue #460): read machinery outside the semantic core
+  # (issue #499 epoch), so ``store`` moves no hash. Public copy on Source
+  # Cooperative (moved 2026-09-17), in-region and inside the fleet's ``demo/*``
+  # grant: the fleet reads it signed and ``on_miss: build`` fills misses via its
+  # write. The read signs with ambient credentials (no unsigned seam): a reader
+  # without credentials drops this block (absent resolves to inline), one without
+  # write sets ``on_miss: fallback`` (fails open, per-granule metadata walk). Only
+  # a 404 is a miss (403 raises, issue #502); the sliderule-public-cors cache is retired.
   index:
     backend: sidecar
-    store: s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007
+    store: s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007
     on_miss: build
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
   coordinates:

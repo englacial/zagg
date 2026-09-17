@@ -201,7 +201,7 @@ def _apply_target_axes(config, target):
         config.data_source["index"] = {
             "backend": "sidecar",
             "on_miss": "build",
-            "store": "s3://sliderule-public-cors/zagg-index/ATL03/007",
+            "store": "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007",
         }
     elif backend == "inline":
         config.data_source["index"] = {"backend": "inline"}

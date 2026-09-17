@@ -285,8 +285,8 @@ class TestTemplateEnvironment:
         # sliderule-public-cors bucket -- deliberate scope (espg, PR #176):
         # virtual-index write-back + sidecar reads (zagg-index/*, issue #160)
         # AND worker-written output zarr stores (e.g. zagg-examples/*). Since
-        # issue #499 the packaged template no longer reads sidecars from
-        # sliderule-public-cors, so the output-store half now carries it. This is
+        # issue #499 the packaged template reads its sidecars from the published
+        # demo/sidecar/* prefix instead, so the output-store half now carries it. This is
         # the STAGING half of the identity model in issue #495; the published
         # half is asserted in the next test.
         arn = "arn:aws:s3:::sliderule-public-cors/*"
@@ -352,10 +352,10 @@ class TestTemplateEnvironment:
         assert [s["Resource"] for s in acl_grants] == [published]
 
         # Nothing outside demo/ -- lambda/* and benchmarks/* belong to the CI
-        # release role under issue #497, not to the fleet, and the sidecar
-        # index cache, copied here 2026-09-17 under issue #499, sits
-        # deliberately OUTSIDE the fleet's grant: widening it to
-        # englacial/zagg/sidecar/* is an espg decision, not a drift fix.
+        # release role under issue #497, not to the fleet. The sidecar index
+        # cache moved 2026-09-17 (issue #499) to englacial/zagg/demo/sidecar/*,
+        # INSIDE this grant, so the fleet's signed sidecar read and its
+        # ``on_miss: build`` write-back need no widening.
         reachable = {r for s in stmts for r in _statement_resources(s) if "source.coop/" in r}
         assert reachable == {published}
 

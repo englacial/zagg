@@ -87,9 +87,9 @@ to hand-assemble zips or wire up the IAM role yourself.
   statement: `Get/Put/DeleteObject` **and** `ListBucket` on the output bucket;
   `Get/Put/DeleteObject` on the public `sliderule-public-cors` bucket
   (whole-bucket, by intent -- PR #176; that bucket is being retired, issue
-  #499 -- its sidecar cache was copied 2026-09-17 to the Source Cooperative
-  `englacial/zagg/sidecar/*` prefix, which the grant below does **not**
-  cover); and, on Source Cooperative, `Get/Put/PutObjectAcl/DeleteObject`
+  #499 -- its sidecar cache moved 2026-09-17 to the Source Cooperative
+  `englacial/zagg/demo/sidecar/*` prefix, inside the published grant below);
+  and, on Source Cooperative, `Get/Put/PutObjectAcl/DeleteObject`
   plus the multipart pair on the published object prefix
   `englacial/zagg/demo/*`, with plain `ListBucket` granted on the **bucket**
   rather than the prefix, unconditioned on purpose, because S3 answers a GET

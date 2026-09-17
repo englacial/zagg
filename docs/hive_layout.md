@@ -996,10 +996,12 @@ cache — and the relocation is exactly what #499 is doing: the sidecars move
 to a public bucket, and a digest that named the old location would have
 refused every append to the store they index. That copy landed 2026-09-17:
 the ATL03 sidecars are at
-`s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007/`
-(same keys, publicly readable; zagg's sidecar read still signs with ambient
-credentials, so an unauthenticated reader should drop the index block rather
-than rely on `on_miss: fallback`), and the packaged template reads from it.
+`s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007/`
+(same keys, publicly readable, and inside the fleet execution role's
+`englacial/zagg/demo/*` grant, so the fleet reads and populates it; zagg's
+sidecar read still signs with ambient credentials, so a credential-less
+reader should drop the index block rather than rely on `on_miss: fallback`),
+and the packaged template reads from it.
 The table below keeps the store's build-time block, which is what its frozen
 digest was derived from.
 
