@@ -31,8 +31,9 @@ shipped template uses (`atl03_tdigest_strata_healpix.yaml`, issue #499):
 data_source:
   index:
     backend: sidecar
-    store: s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007
-    on_miss: fallback         # build | fallback (build needs write on the store)
+    store: s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007
+    on_miss: fallback         # build | fallback (build needs write on the store;
+                              # the fleet holds it on demo/*, so the template says build)
 ```
 
 Keys other than `backend` are **backend-specific**: a key the named backend

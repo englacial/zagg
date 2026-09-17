@@ -38,7 +38,7 @@ CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.
 #: run records — here they anchor the TEMPLATES rather than the vendored
 #: configs. The legacy digest hashed the sidecar ``store`` URL, so ATL03's is
 #: pinned under the location the store was BUILT from: the packaged template
-#: reads the 2026-09-17 source.coop copy instead (``SIDECAR_PREFIX``).
+#: reads the source.coop copy instead (``SIDECAR_STORE``, moved 2026-09-17).
 SEMANTIC_PINS = [
     (
         "atl03_tdigest_strata_healpix",
@@ -73,8 +73,9 @@ DECLARED_PINS = [
     ),
 ]
 
-#: The anonymously readable sidecar cache (issue #499, copied 2026-09-17).
-SIDECAR_PREFIX = "s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/"
+#: The public sidecar cache (issue #499, moved 2026-09-17): a ``demo/*`` key,
+#: inside the fleet execution role's source.coop grant.
+SIDECAR_STORE = "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007"
 
 #: Every packaged template carrying a digest field shares one centroid budget.
 DIGEST_TEMPLATES = [
@@ -118,9 +119,10 @@ def test_template_pins_the_live_orders_and_fold_knobs(name, digests, orders, ove
 
 def test_atl03_template_reads_its_sidecars_from_source_coop():
     # Read machinery outside the semantic core (issue #499): the hash pins
-    # above hold across the relocation, and this is the public copy.
+    # above hold across the relocation. Pinned exactly: the value must stay
+    # under demo/*, the prefix the fleet can read and write.
     cfg = default_config("atl03_tdigest_strata_healpix")
-    assert cfg.data_source["index"]["store"].startswith(SIDECAR_PREFIX)
+    assert cfg.data_source["index"]["store"] == SIDECAR_STORE
 
 
 @pytest.mark.parametrize("name", DIGEST_TEMPLATES)
