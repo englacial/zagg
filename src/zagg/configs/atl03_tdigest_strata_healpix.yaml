@@ -38,11 +38,38 @@
 # quantization however many blocks close).
 # ``mode: merge`` still rejects them (its per-flush fold would degrade
 # locations continuously and has no ``where`` state).
-# Grid geometry matches atl03_tdigest_healpix.yaml (o11 shard / o13 inner
-# chunk / o19 cells).
+# Grid geometry: o9 shard / o13 inner chunk / o19 cells.
+#
+# THIS TEMPLATE IS THE BUILD CONFIG OF THE LIVE STORE
+# ``englacial/zagg/demo/atl03_tdigest_o9.zarr`` (issue #547): every key in the
+# D19 semantic core below is what that store's run records carry, and
+# ``tests/test_live_store_templates.py`` pins the template's ``semantic_hash``
+# to the store manifest's frozen value. That is what lets a build from this
+# file APPEND to the live store rather than refuse on the frozen hash -- so a
+# change to any hashed key here (deltas, filters, variables, the index block,
+# ``time_source``) is a new product, and the pin says so.
 data_source:
   reader: h5coro
   driver: s3
+  # Write-through sidecar chunk index (issue #460). ``data_source.index`` is in
+  # the semantic core, so this block is part of the store's identity and an
+  # append must carry it verbatim; retiring the bucket (issue #499) therefore
+  # moves the hash -- see that issue before touching it.
+  #
+  # THE BUCKET BELOW IS NOT ANONYMOUSLY READABLE. Issue #499 (verified
+  # 2026-08-20): ``sliderule-public-cors`` has Block Public Access on all four
+  # flags, so every anonymous GET returns 403, and it is not writable outside
+  # the owning account either. The block is here because it is how the live
+  # store is READ, not because it is part of the store's identity: the issue
+  # #499 epoch moved ``data_source.index`` out of the semantic core, so an
+  # APPEND to ``atl03_tdigest_o9.zarr`` neither needs this exact block nor is
+  # refused for changing it. Anyone building their OWN store from this
+  # template should DELETE or override it (it resolves to ``inline``, issue
+  # #170, and works everywhere); that leaves the semantic hash untouched.
+  index:
+    backend: sidecar
+    store: s3://sliderule-public-cors/zagg-index/ATL03/007
+    on_miss: build
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
   coordinates:
     latitude: "/{group}/heights/lat_ph"
@@ -54,6 +81,9 @@ data_source:
     signal_conf_sea_ice: {path: "/{group}/heights/signal_conf_ph", column: 2}
     signal_conf_land_ice: {path: "/{group}/heights/signal_conf_ph", column: 3}
     signal_conf_inland_water: {path: "/{group}/heights/signal_conf_ph", column: 4}
+    # The per-photon clock the section-8.3 temporal companion encodes from
+    # (issue #410); ``output.time_source`` below declares its convention.
+    delta_time: "/{group}/heights/delta_time"
   filters:
     - dataset: "/{group}/heights/signal_conf_ph"
       column: 0                  # possible_tep is uniform across columns
@@ -95,9 +125,17 @@ aggregation:
       function: "zagg.stats.tdigest.build_tdigest_where"
       source: h_ph
       location: leaf_id
+      # Per-centroid toc words beside the located words (spec section 8.3,
+      # issue #410): each centroid carries its photon's instant, so a cell's
+      # digest is queryable in time as well as position.
+      temporal: per-centroid
       inner_shape: [2]
       params:
-        delta: 8192              # leaf centroid budget: loss-free bound (issues #414/#424)
+        delta: 4096              # leaf centroid budget (espg ruling 2026-09-13): the
+                                 # live stores' value, and loss-free for every
+                                 # surface cell measured -- the CA tail scan on
+                                 # issue #422 puts 1e-5 of cells above it, all
+                                 # cloud/background storm artifacts
         where: >-
           (signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
           (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
@@ -113,9 +151,14 @@ aggregation:
       function: "zagg.stats.tdigest.build_tdigest_where"
       source: h_ph
       location: leaf_id
+      temporal: per-centroid
       inner_shape: [2]
       params:
-        delta: 8192              # leaf centroid budget: loss-free bound (issues #414/#424)
+        delta: 4096              # leaf centroid budget (espg ruling 2026-09-13): the
+                                 # live stores' value, and loss-free for every
+                                 # surface cell measured -- the CA tail scan on
+                                 # issue #422 puts 1e-5 of cells above it, all
+                                 # cloud/background storm artifacts
         where: >-
           ~((signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
           (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
@@ -144,14 +187,31 @@ aggregation:
           lanes: [land, ocean, sea_ice, land_ice, inland_water, low, med, high]
           of: h_tdigest_signal        # N_signal = this digest's total weight
           threshold: 2
+  streaming:
+    mode: spill                  # the live build's regime (issue #370); not in
+                                 # the semantic core (every regime shares one
+                                 # identity under the law-equivalence contract)
 
 output:
+  # The store's per-observation clock (issue #410): ATL03 ``delta_time`` is
+  # seconds on the CONTINUOUS GPS scale since 2018-01-01 (spec section 8.3).
+  time_source:
+    field: delta_time
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
   grid:
     type: healpix
     indexing_scheme: nested
-    parent_order: 11             # shard / dispatch unit: 4^(19-11) = 256x256 cells
+    parent_order: 9              # shard / dispatch unit: 4^(19-9) = 1024x1024 cells
+                                 # (the live store's shard order -- a FROZEN
+                                 # manifest key on append)
     chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=16)
     sharded: true
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive
   pyramid: false                 # overview sweep opted out pending Phase E fleet sizing (issue #201)
+
+worker:
+  memory: 4096                   # the live build's tier: 4096-disk (issue #460)
+  extra_disk: true

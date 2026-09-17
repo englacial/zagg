@@ -35,6 +35,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validated store only at a finest resolution of `shard_order + 1`; a
   hand-built manifest can still gap and keeps the backstop. Spec §4.4/§4.5/§4.6
   updated; no fixture declared a gapped tier.
+- **the packaged templates are the live stores' build configs** (#547)
+  ([#565](https://github.com/englacial/zagg/pull/565)): a default build from
+  `atl03_tdigest_strata_healpix` or `gedi01b_waveform_healpix_hive` now
+  APPENDS to `atl03_tdigest_o9.zarr` / `gedi_flux_o9.zarr` instead of being
+  refused on the frozen `semantic_hash` — the two templates carry, key for key,
+  what those stores' run records hold, pinned in
+  `tests/test_live_store_templates.py` against the store manifests. Ordering
+  with the index epoch below: the templates reproduce those manifests at their
+  *pre-epoch* digest, so each store takes the append once `declare_pyramid`
+  has migrated its frozen key — the pins carry both columns.
+  - **δ = 4,096 is uniform across every packaged digest template**, retiring
+    the 8,192 raise (espg ruling 2026-09-13): the CA tail scan puts 1e-5 of
+    cells above 4,096, all atmospheric storm artifacts, and the GEDI read
+    (`gedi_flux_o9`, 8 leaves incl. the 3 densest, 243,202 occupied cells) tops
+    out at 1,146 centroids. `zagg.stats.waveform._DEFAULT_DELTA` follows.
+  - **`gedi01b_waveform_healpix_hive`'s identity moves**: the template now
+    declares `weights: flux` plus the `gain` provenance
+    ([#521](https://github.com/englacial/zagg/pull/521)), so its semantic hash
+    changes. Stores built from the PRIOR packaged form keep their own frozen
+    hash — appends to them need that form, not this one.
+  - **`atl03_tdigest_strata_healpix`** additionally carries the section-8.3
+    temporal companion (`temporal: per-centroid` on both strata) with its
+    `delta_time` column and `output.time_source`, the write-through sidecar
+    `data_source.index` block, and `parent_order: 9`. The index bucket is
+    account-private (#499): build your own store by deleting or overriding
+    `data_source.index` — which, since the epoch below took that block out of
+    the core, leaves the hash untouched.
 
 - **BREAKING — hash epoch: `data_source.index` leaves the semantic core**
   (#499 phase 2, refs #547, [#565](https://github.com/englacial/zagg/pull/565);

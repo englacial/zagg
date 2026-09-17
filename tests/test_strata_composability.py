@@ -63,12 +63,12 @@ class TestLiveCaManifestFixture:
         assert manifest["spec"] == "morton-hive/1"
         assert manifest["shard_order"] == 9
         assert manifest["cell_order"] == 19
-        # Identity of the RECORD, not of a config: this hash names the store
-        # the issue is about, and no config in the tree reproduces it — the
-        # shipped template hashes 0ac7d33b..., the benchmark strata config
-        # 5ebf740f.... So the before/after below is pinned against reality
-        # for the per-field DECLARATION only; the store's semantic core is
-        # not rebuildable from here. It is also a FROZEN manifest key
+        # Identity of the RECORD: this hash names the store the issue is
+        # about. The shipped ``atl03_tdigest_strata_healpix`` template now
+        # reproduces it (it IS the store's build config, recovered from the
+        # run record — pinned in ``tests/test_live_store_templates.py``, issue
+        # #547); the benchmark strata config (5ebf740f...) still does not. It
+        # is also a FROZEN manifest key
         # (``hive._FROZEN_MANIFEST_KEYS``), so the retrofit write the PR body
         # plans against this root needs ``overwrite=True`` or ``ensure_manifest``
         # refuses it.
@@ -218,14 +218,16 @@ class TestD24Classification:
                 "method": "tdigest_kway",
                 "dtype": "float32",
                 "inner_shape": [2],
-                # The template's leaf budget and its split pyramid-fold budget
-                # (issue #424), recorded RESOLVED.
-                "delta": 8192,
+                # The template's leaf budget (the live store's δ, issue #547)
+                # and its split pyramid-fold budget (issue #424), recorded
+                # RESOLVED.
+                "delta": 4096,
                 "overview_delta": 512,
                 # Located strata IS the default (espg ruling on PR #334); the
                 # manifest entry is the only description the overview writer
-                # has, so the channel must ride it (issue #410).
+                # has, so both channels must ride it (issue #410).
                 "location": "leaf_id",
+                "temporal": "per-centroid",
             }
 
     def test_class_map_gates_the_leaf_column_write_path(self):
