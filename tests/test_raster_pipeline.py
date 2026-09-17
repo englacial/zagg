@@ -771,7 +771,7 @@ def _healpix_setup(tmp_path, time_encoding=None):
 
     to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
     lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
-    leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+    leaf = geo2mort(lat, lon, order=29, points=True)
     shard = int(clip2order(10, leaf)[0])
     cfg = _raster_config(
         bands={"red": {"asset": "red", "dtype": "uint16", "scale": 0.0001, "offset": -0.1}},
@@ -887,7 +887,7 @@ class TestTemplateAndSlabs:
 
         to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
         lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
-        leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+        leaf = geo2mort(lat, lon, order=29, points=True)
         shard = int(clip2order(4, leaf)[0])
         cfg = _raster_config(
             bands={"red": {"asset": "red", "dtype": "uint16"}},
@@ -1809,7 +1809,7 @@ class TestRasterHivePopcount:
 
         def shard_at(dx, dy):
             lon, lat = to_wgs.transform(ORIGIN[0] + dx, ORIGIN[1] - dy)
-            leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+            leaf = geo2mort(lat, lon, order=29, points=True)
             return int(clip2order(14, leaf)[0])
 
         return cfg, granules, shard_at, str(tmp_path / "store")
