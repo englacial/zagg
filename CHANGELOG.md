@@ -11,6 +11,10 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-09-17
+
+### Notes
+
 - **the packaged templates are the live stores' build configs** (#547)
   ([#565](https://github.com/englacial/zagg/pull/565)): a default build from
   `atl03_tdigest_strata_healpix` or `gedi01b_waveform_healpix_hive` now
@@ -225,6 +229,19 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 - docs: mark SSO execution-role path out of date ([#35](https://github.com/englacial/zagg/pull/35)) by @espg
 - sort/hash grouping refactor (#30) ([#33](https://github.com/englacial/zagg/pull/33)) by @espg
 - Rectilinear grid: chunk-driven auto-padding + run enablement ([#32](https://github.com/englacial/zagg/pull/32)) by @espg
+
+### Merged pull requests
+
+- choropleth: rollup->GeoJSON exporter for gridlook vectorChoropleth (issue #301) ([#554](https://github.com/englacial/zagg/pull/554)) by @espg
+- record composition demotion in the store: zagg_overview demotions attrs when the packed rail fires (issue #518) ([#557](https://github.com/englacial/zagg/pull/557)) by @espg
+- multiscales convention metadata: the manifest discovery mirror of the /2 ladder (issue #392) ([#555](https://github.com/englacial/zagg/pull/555)) by @espg
+- multiscales companion group: stock-tool-legible zarr tree of the coarse ladder (issue #394) ([#558](https://github.com/englacial/zagg/pull/558)) by @espg
+- pyramid sweep runbook prep: dense-ladder re-declaration tool + partitioning proposal ([#551](https://github.com/englacial/zagg/pull/551)) by @espg
+- 0.44.0 overview pipeline E2E validation harness (issue #434) ([#556](https://github.com/englacial/zagg/pull/556)) by @espg
+- Fold the coarse column members flat from the res-(s+2) member (issue #538) ([#567](https://github.com/englacial/zagg/pull/567)) by @espg
+- index leaves the semantic core: the issue #499 hash epoch ([#566](https://github.com/englacial/zagg/pull/566)) by @espg
+- small fixes 2026-09-13: packaged templates match the live stores (δ 4096 uniform, issue #547) ([#565](https://github.com/englacial/zagg/pull/565)) by @espg
+- small fix: refuse a gapped column tier above the shard order (issue #538) ([#569](https://github.com/englacial/zagg/pull/569)) by @espg
 
 ## [0.46.0] - 2026-08-17
 
