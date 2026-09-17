@@ -1026,13 +1026,21 @@ staged sweep's finisher.
   §4.4/§4.6 column tier and is refused by name (`missing [11]`). Where the
   ladder's floor is the coarser of the two — `base > 2 * shard_order + 1`,
   so `d` clears `shard_order` by more than one — the tier gaps below it
-  whatever the list says, and the refusal names `base` instead; omitted, the default is one resolution
-  at the grid's resolved chunk order — normative since the issue #384
-  default flip: a default declaration emits this `/2` block for every new
-  store whose resolved chunk order is strictly interior (raster configs,
-  explicit legacy `orders`/`spacing` schedules, and K == 1 grids keep
-  `/1`), and the worker column gate (§4.6) derives the SAME default from
-  the grid, so declaration and artifact can never disagree. There is no
+  whatever the list says, and the refusal names `base` instead; omitted,
+  the default is one resolution at the grid's resolved chunk order —
+  normative since the issue #384 default flip: a default declaration emits
+  this `/2` block for every new store whose resolved chunk order is
+  strictly interior (raster configs, explicit legacy `orders`/`spacing`
+  schedules, and K == 1 grids keep `/1`), and the worker column gate (§4.6)
+  derives the SAME default from the grid, so declaration and artifact can
+  never disagree. Consecutiveness is a **writer-side** rule and carries
+  **no marker bump** — the `/2` wire grammar is unchanged, only the
+  declaration it admits is narrower — so a reader MUST still decode a
+  stored declaration whose tier gaps (one written before the rule) by its
+  recorded `overviews` list, member for member, exactly as always: such a
+  store is not retroactively non-conformant. Only the acceptance harness's
+  *declaration* leg reports the gap, and it reports it as a declaration
+  finding. There is no
   above-shard configurability: no per-node spelling, no gather declaration,
   no member promotion — the ladder makes every within-footprint member
   spec-guaranteed (espg grammar-collapse ruling on the declaring PR).
