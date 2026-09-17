@@ -118,8 +118,11 @@ class TestValidateOverviews:
         validate_overviews([2 * parent + 1], parent_order=parent, child_order=19)
 
     def test_gaps_below_the_shard_order_are_not_the_tier(self):
-        # The stage-merge levels (cells < shard order) MAY gap: a hand-built
-        # ladder missing node 1 has a contiguous tier and reports nothing.
+        # Cells below the shard order are outside the tier and never
+        # contribute. The `levels` list below — a ladder missing node 1 — is
+        # NOT a legal manifest (the §4.4 every-order law is enforced by
+        # byte-equality against `expand_overviews`); it is a helper-level
+        # unit, pinning that the scan looks only at the tier.
         levels = [
             {"node": 3, "cells": [6, 5, 4]},
             {"node": 2, "cells": [3]},

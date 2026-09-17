@@ -94,9 +94,10 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
     parent_order + 1``, else the ladder's own floor, which no leaf list can
     fix (every declared resolution is at or above ``base``, the gap is
     below it) — there the constraint is on ``base``, which must be at most
-    ``2 * parent_order + 1``. Levels whose cells are BELOW the shard order
-    are the fixed ladder's own, derived by the every-order law, and are not
-    checked here.
+    ``2 * parent_order + 1``. The rule scopes to the tier: levels whose
+    cells are BELOW the shard order are the ladder's own, DERIVED by the
+    every-order law of :func:`expand_overviews`, so no gap can arise there
+    and none is checked here.
     """
     parent_order, child_order = int(parent_order), int(child_order)
     if any(b >= a for a, b in zip(resolutions, resolutions[1:])):
@@ -153,9 +154,12 @@ def column_tier_gaps(levels: list, shard_order: int) -> tuple[list[int], list[in
     — every cell at or above ``shard_order`` from any level plus the
     node-order member, finest first — and ``missing`` every order between
     the shard order and the tier's finest member that no level carries.
-    Empty ``missing`` is the contiguity the ruling requires; cells below the
-    shard order never contribute, so a ladder that skips stage-merge levels
-    reports none.
+    Empty ``missing`` is the contiguity the ruling requires. Cells below the
+    shard order never contribute, so a ``levels`` list that skips
+    stage-merge levels reports none — and no conformant manifest carries
+    such a skip anyway: those levels are DERIVED by the §4.4 every-order
+    law, which ``pyramid_check_v2`` enforces by byte-equality against
+    :func:`expand_overviews`.
     """
     from zagg.column import column_resolutions
 

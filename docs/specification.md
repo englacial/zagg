@@ -852,8 +852,10 @@ law:
   (increments of one — `[13, 12, 11, 10, 9]` on the 19/13/9 geometry, never
   `[13, 12, 10, 9]`): that set is the §4.6 column tier, and contiguity
   guarantees the raw-fold boundary member exists whenever anything coarser
-  is declared. Levels whose cells are **below** the shard order (the
-  stage merges) MAY gap;
+  is declared. The requirement scopes to that tier and nothing else:
+  levels whose cells are **below** the shard order are the ladder's own,
+  DERIVED by the every-order law below, so no gap can arise there to
+  permit or forbid;
 - the **fixed every-order ladder** — with `d = base - shard_order` (`base`
   the coarsest leaf resolution, so `d >= 1`), every order `k` from
   `shard_order - 1` down to **0 inclusive** carries exactly one member at
