@@ -11,6 +11,15 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-09-17
+
+### Merged pull requests
+
+- Publish Lambda zips to Source Cooperative (issue #497 phases 1-2) ([#504](https://github.com/englacial/zagg/pull/504)) by @espg
+- small fix: keep every package's dist-info in the function zip (0.54.0 fleet import failure) ([#572](https://github.com/englacial/zagg/pull/572)) by @espg
+- small fix: point the sidecar index at source.coop; declare GEDI's overview budget (issues #499, #547) ([#571](https://github.com/englacial/zagg/pull/571)) by @espg
+- changelog cicd: release-time CHANGELOG generation, PR guard, and Source Cooperative publication ([#570](https://github.com/englacial/zagg/pull/570)) by @espg
+
 ## [0.54.0] - 2026-09-17
 
 ### Notes
