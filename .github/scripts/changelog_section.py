@@ -146,7 +146,12 @@ def render(text: str, tag: str, date: str, bullets: list[str]) -> str | None:
     newest = at == 0
     notes = _strip_blank(unreleased) if newest else []
     section = [f"## [{tag}] - {date}", ""]
-    if notes:
+    if notes and notes[0].startswith("### "):
+        # The drain is verbatim, so Keep-a-Changelog sub-headings (### Added,
+        # ### Fixed) would land as siblings UNDER an empty "### Notes". They are
+        # already their own headings: keep them and skip ours.
+        section += [*notes, ""]
+    elif notes:
         section += ["### Notes", "", *notes, ""]
     section += ["### Merged pull requests", "", *(bullets or ["- (none recorded)"]), ""]
     above = [*head] if newest else [*head, *unreleased, *rest[:at]]

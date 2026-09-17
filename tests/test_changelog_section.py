@@ -133,6 +133,27 @@ def test_render_drains_unreleased_into_notes_above_the_pr_list():
     assert not any(ln.strip() for ln in body)
 
 
+def test_keep_a_changelog_subheadings_drain_without_an_empty_notes_heading():
+    # CHANGELOG.md says the format is based on Keep a Changelog, so ### Added /
+    # ### Fixed under [Unreleased] is the obvious thing to reach for. They are
+    # headings already: nesting them under an empty "### Notes" flattens the
+    # grouping it was meant to express.
+    kac = CHANGELOG.replace(
+        "- **hand note one** (#1)\n  continuation line\n  - nested bullet\n\n- hand note two\n",
+        "### Added\n\n- a thing\n\n### Fixed\n\n- a bug\n",
+    )
+    out = cs.render(kac, "0.54.0", "2026-09-17", ["- later fix ([#570](u)) by @espg"])
+    assert out is not None
+    assert "### Notes" not in out
+    assert (
+        "## [0.54.0] - 2026-09-17\n\n"
+        "### Added\n\n- a thing\n\n### Fixed\n\n- a bug\n\n"
+        "### Merged pull requests\n\n- later fix ([#570](u)) by @espg\n" in out
+    )
+    # Plain bullets still get the Notes heading.
+    assert "### Notes" in (cs.render(CHANGELOG, "0.54.0", "2026-09-17", []) or "")
+
+
 def test_render_is_idempotent_once_the_tag_is_present():
     once = cs.render(CHANGELOG, "0.54.0", "2026-09-17", ["- x ([#1](u)) by @a"])
     assert once is not None
