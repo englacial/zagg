@@ -333,6 +333,20 @@ Resources:
               #   unreachable under this role until that changes. Left as it
               #   stands -- issue #497 does not name publish_mirror.sh -- and
               #   raised for review instead.
+              #
+              # THE OTHER SIDE'S GRANT, without which this statement does
+              # nothing: cross-account write needs Source Cooperative's bucket
+              # policy to name our principal too. template.yaml line 254 records
+              # that grant as landed on 2026-08-20 -- "Source Cooperative granted
+              # englacial/* to both ARNs" (issues #495/#496), which would cover
+              # this role's half as well. That is REPORTED, not verified here: no
+              # live-AWS call was made from this branch, and the corroboration is
+              # only for the other ARN (the fleet's own source.coop writes, issue
+              # #534). So before LAMBDA_DIST_BUCKET/LAMBDA_DIST_PREFIX are set
+              # (benchmark-cicd.md section 11), confirm this role's half
+              # operator-side with one anonymous-vs-role PUT probe under
+              # englacial/zagg/lambda/ -- a release that learns it from an
+              # AccessDenied learns it after PyPI has already published.
               - Sid: PublishToSourceCoop
                 Effect: Allow
                 Action:
