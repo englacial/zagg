@@ -1019,9 +1019,12 @@ staged sweep's finisher.
   `shard_order` and `cell_order` (a member at the shard's own order is the
   writer-side aggregate, never declared; a member at the base data's own
   order would *be* the base data), and **consecutive** — the fixed ladder
-  fills every order from the coarsest leaf resolution down to the shard
-  order by itself, so a gap in the list is a gap in the §4.4/§4.6 column
-  tier and is refused by name (`missing [11]`); omitted, the default is one resolution
+  fills `[max(shard_order, d), base)` by itself (its coarsest cell is node
+  0's, `d = base - shard_order`), so a gap in the list is a gap in the
+  §4.4/§4.6 column tier and is refused by name (`missing [11]`). Where the
+  ladder's floor is the coarser of the two — `base > 2 * shard_order + 1`,
+  so `d` clears `shard_order` by more than one — the tier gaps below it
+  whatever the list says, and the refusal names `base` instead; omitted, the default is one resolution
   at the grid's resolved chunk order — normative since the issue #384
   default flip: a default declaration emits this `/2` block for every new
   store whose resolved chunk order is strictly interior (raster configs,

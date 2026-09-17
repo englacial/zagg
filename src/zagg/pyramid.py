@@ -85,11 +85,18 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
     Then the contiguity rule (espg ruling on the PR #567 thread, 2026-09-17):
     the §4.6 column tier — every ladder cell at or above the shard order —
     MUST step by one from the finest leaf resolution down to the shard
-    order. The fixed ladder fills ``[parent_order, base)`` by itself, so a
-    gap can only come from the leaf list, and it would leave the raw-fold
-    boundary member (``parent_order + zagg.column.RAW_MEMBER_DEPTH``) absent
-    while coarser members are declared. Levels whose cells are BELOW the
-    shard order (the stage merges) MAY gap; they are not checked here.
+    order, or the raw-fold boundary member (``parent_order +
+    zagg.column.RAW_MEMBER_DEPTH``) can be absent while coarser members are
+    declared. The ladder's coarsest cell is node 0's, ``d = base -
+    parent_order``, so it fills ``[max(parent_order, d), base)`` — NOT
+    ``[parent_order, base)``. A gap therefore has two possible causes, and
+    the refusal names which: a gap in the leaf list when ``d <=
+    parent_order + 1``, else the ladder's own floor, which no leaf list can
+    fix (every declared resolution is at or above ``base``, the gap is
+    below it) — there the constraint is on ``base``, which must be at most
+    ``2 * parent_order + 1``. Levels whose cells are BELOW the shard order
+    are the fixed ladder's own, derived by the every-order law, and are not
+    checked here.
     """
     parent_order, child_order = int(parent_order), int(child_order)
     if any(b >= a for a, b in zip(resolutions, resolutions[1:])):
@@ -110,11 +117,17 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
         expand_overviews(resolutions, parent_order=parent_order), parent_order
     )
     if missing:
+        d = resolutions[-1] - parent_order
+        why = (
+            f"the fixed ladder bottoms out at cells {d} (node 0), so the coarsest leaf "
+            f"resolution must be at most {2 * parent_order + 1} on this geometry"
+            if d > parent_order + 1
+            else "the leaf resolutions must step by one down to the shard order"
+        )
         raise ValueError(
             f"output.pyramid.overviews {resolutions}: column tier must be contiguous: "
             f"cells at or above shard order {parent_order} are {tier}, missing {missing} "
-            f"(every such level is a leaf column member, spec §4.4/§4.6, so the leaf "
-            f"resolutions must step by one down to the shard order)"
+            f"(every such level is a leaf column member, spec §4.4/§4.6, so {why})"
         )
 
 

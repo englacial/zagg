@@ -70,8 +70,9 @@ class TestValidateOverviews:
     def test_dense_default_and_live_store_shapes_are_contiguous(self):
         # The omitted-knob default (one resolution at the chunk order) and the
         # two live stores (`--overviews 13` on 9/19, `--overviews 12` on 9/18)
-        # are one-member lists: the fixed ladder fills [shard, base) by
-        # itself, so the column tier steps by one down to the shard order.
+        # are one-member lists: the fixed ladder fills [max(shard, d), base)
+        # by itself — here [shard, base), since d == 4 is below the shard
+        # order — so the column tier steps by one down to the shard order.
         default_overviews(9, 13, child_order=19)
         validate_overviews([13], **REF)
         validate_overviews([12], parent_order=9, child_order=18)
@@ -94,6 +95,27 @@ class TestValidateOverviews:
         with pytest.raises(ValueError, match="column tier must be contiguous") as exc:
             validate_overviews(resolutions, **REF)
         assert f"cells at or above shard order 9 are {tier}, missing {missing}" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "resolutions, parent, missing",
+        [([18], 8, [9]), ([16], 7, [8]), ([10], 3, [4, 5, 6])],
+    )
+    def test_ladder_floor_gap_names_the_base_not_the_leaf_list(self, resolutions, parent, missing):
+        # The ladder's coarsest cell is node 0's, d == base - shard, so where
+        # d clears the shard order by more than one the tier gaps between the
+        # shard order and d — a hole NO leaf list can fill, since every
+        # declared resolution is at or above base. The refusal names that
+        # constraint (base <= 2 * shard + 1) instead of advising a
+        # finer-first ladder that cannot fix it.
+        with pytest.raises(ValueError, match="column tier must be contiguous") as exc:
+            validate_overviews(resolutions, parent_order=parent, child_order=19)
+        msg = str(exc.value)
+        assert f"missing {missing}" in msg
+        assert f"bottoms out at cells {resolutions[0] - parent} (node 0)" in msg
+        assert f"coarsest leaf resolution must be at most {2 * parent + 1}" in msg
+        assert "step by one down to the shard order" not in msg
+        # One order finer at the base clears the floor on the same geometry.
+        validate_overviews([2 * parent + 1], parent_order=parent, child_order=19)
 
     def test_gaps_below_the_shard_order_are_not_the_tier(self):
         # The stage-merge levels (cells < shard order) MAY gap: a hand-built
