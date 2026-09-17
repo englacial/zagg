@@ -31,12 +31,12 @@ x86_64 / py3.12 is available for local/testing parity.
   `sliderule-public-cors` bucket (whole-bucket, by intent — PR #176; being
   retired, issue #499 — its sidecar cache was copied 2026-09-17 to
   `us-west-2.opendata.source.coop/englacial/zagg/sidecar/*`, a prefix this
-  role's grant below does **not** cover), and zagg's published prefix on Source Cooperative
-  (`us-west-2.opendata.source.coop/englacial/zagg/demo/*`, plus bucket-level
-  `ListBucket`). (The dependency layer is named `<FunctionName>-deps`, default
-  `process-shard-deps`. The legacy `deploy.sh` in-place updater still defaults
-  `ZAGG_S3_BUCKET=xagg` for its >50MB staging copies; that is the updater's
-  staging bucket, not the output bucket.)
+  role's grant below does **not** cover), and zagg's published prefix on
+  Source Cooperative (`us-west-2.opendata.source.coop/englacial/zagg/demo/*`,
+  plus bucket-level `ListBucket`). (The dependency layer is named
+  `<FunctionName>-deps`, default `process-shard-deps`. The legacy `deploy.sh`
+  in-place updater still defaults `ZAGG_S3_BUCKET=xagg` for its >50MB staging
+  copies; that is the updater's staging bucket, not the output bucket.)
 
 ### What's in the layer vs function code
 
