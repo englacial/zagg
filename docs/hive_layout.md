@@ -997,10 +997,11 @@ to a public bucket, and a digest that named the old location would have
 refused every append to the store they index. That copy landed 2026-09-17:
 the ATL03 sidecars are at
 `s3://us-west-2.opendata.source.coop/englacial/zagg/sidecar/ATL03/007/`
-(same keys, anonymously readable; a missing key 404s, so `on_miss: fallback`
-works unsigned — the issue #502 403 is moot there), and the packaged template
-reads from it. The table below keeps the store's build-time block, which is
-what its frozen digest was derived from.
+(same keys, publicly readable; zagg's sidecar read still signs with ambient
+credentials, so an unauthenticated reader should drop the index block rather
+than rely on `on_miss: fallback`), and the packaged template reads from it.
+The table below keeps the store's build-time block, which is what its frozen
+digest was derived from.
 
 **Why re-hashing is correct, not a defect**: the argument of the D19 epoch
 holds unchanged — the pre-epoch digest answered "do these two configs
