@@ -17,7 +17,9 @@ right after ``## [Unreleased]``. A PR belongs to the release iff its merge
 commit is in ``--revs`` (``git rev-list PREV..TAG``) -- exact, and immune to
 GitHub stamping ``mergedAt`` a second after the merge commit's own time, which
 a time window would drop for the PR the tag sits on. Rows without a merge
-commit fall back to ``(prev-tag-time, tag-time]``. Branch-sync merges
+commit fall back to ``(prev-tag-time, tag-time]``; revs no returned row claims
+are counted into a ``::warning::``, since GitHub's search index lags a merge and
+an unindexed PR would otherwise vanish silently. Branch-sync merges
 (``merge main ...`` / ``Merge ...``) and duplicates are dropped; when no PR
 survives, ``--fallback`` (pre-rendered bullets, e.g. commit subjects) fills the
 list. Re-running for a tag already in the file is a no-op (exit 0, nothing
@@ -76,6 +78,20 @@ def pr_bullets(
         author = (pr.get("author") or {}).get("login") or "unknown"
         kept.append((when, number, f"- {title} ([#{number}]({pr['url']})) by @{author}"))
     return [line for _, _, line in sorted(kept)]
+
+
+def unmatched_revs(prs: list[dict], revs: set[str]) -> set[str]:
+    """Commits in ``PREV..TAG`` that no returned PR row claims as its merge commit.
+
+    ``gh pr list --search`` reads GitHub's issue index, which lags a merge by
+    seconds to minutes -- and the PR the tag sits on is the likeliest to be
+    missing, because the tag is pushed right after it merges. Membership is only
+    ever evaluated over rows the search returned, so an unindexed PR is simply
+    absent from the section with no error. Most unmatched revs are ordinary
+    intermediate commits of a merge-commit merge, so the caller warns rather than
+    gates -- but a count that jumps on release day is the signal to look.
+    """
+    return revs - {(pr.get("mergeCommit") or {}).get("oid") for pr in prs}
 
 
 def _split_unreleased(text: str) -> tuple[list[str], list[str], list[str]]:
@@ -147,6 +163,17 @@ def main(argv: list[str] | None = None) -> int:
     revs = set(args.revs.read_text().split()) if args.revs else None
     prs = json.loads(args.prs.read_text())
     bullets = pr_bullets(prs, args.prev_tag_time, args.tag_time, revs)
+    if revs:
+        missing = unmatched_revs(prs, revs)
+        if missing:
+            print(
+                f"::warning::{len(missing)}/{len(revs)} commits in the tag range are claimed by "
+                "no merged-PR row; if the search index lagged a merge, that PR is missing from "
+                f"this section: {' '.join(sorted(missing)[:10])}"
+            )
+    # The fallback fires on the REV-LIST-filtered set being empty (bullets is
+    # already that set), not on the search returning zero rows: a search that
+    # returns only out-of-range PRs still gets commit subjects.
     if not bullets and args.fallback and args.fallback.exists():
         bullets = [ln for ln in args.fallback.read_text().splitlines() if ln.startswith("- ")]
     date = _parse_time(args.tag_time).date().isoformat()

@@ -172,3 +172,48 @@ def test_main_writes_once_and_uses_the_fallback(tmp_path):
     assert "## [0.54.0] - 2026-09-17" in first
     assert cs.main(argv) == 0
     assert changelog.read_text() == first
+
+
+def test_unmatched_revs_are_reported_for_a_warning(capsys, tmp_path):
+    # GitHub's search index lags a merge, so the PR the tag sits on can be
+    # absent from the rows entirely. Membership is only ever evaluated over the
+    # rows returned, so the gap has to be counted separately or it is silent.
+    on_tag = _pr(569, "indexed", "2026-09-17T12:00:01Z") | {"mergeCommit": {"oid": "aaa"}}
+    assert cs.unmatched_revs([on_tag], {"aaa", "bbb", "ccc"}) == {"bbb", "ccc"}
+    assert cs.unmatched_revs([on_tag], {"aaa"}) == set()
+
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(CHANGELOG)
+    prs = tmp_path / "prs.json"
+    prs.write_text(json.dumps([on_tag]))
+    revs = tmp_path / "revs.txt"
+    revs.write_text("aaa\nbbb\n")
+    assert cs.main([
+        "--tag", "0.54.0", "--tag-time", TAG_TIME, "--prev-tag-time", PREV_TIME,
+        "--prs", str(prs), "--revs", str(revs), "--changelog", str(changelog),
+    ]) == 0  # fmt: skip
+    out = capsys.readouterr().out
+    assert "::warning::1/2 commits in the tag range" in out
+    assert "bbb" in out
+
+
+def test_fallback_fires_when_the_rev_list_set_is_empty_not_the_search(tmp_path):
+    # The search returned rows -- they are just all outside PREV..TAG. The
+    # fallback keys off the rev-list-filtered set, so the pre-rendered subjects
+    # still fill the section instead of "(none recorded)".
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(CHANGELOG)
+    prs = tmp_path / "prs.json"
+    other = _pr(560, "another release", "2026-09-16T09:00:00Z") | {"mergeCommit": {"oid": "zzz"}}
+    prs.write_text(json.dumps([other]))
+    revs = tmp_path / "revs.txt"
+    revs.write_text("aaa\n")
+    fallback = tmp_path / "commits.txt"
+    fallback.write_text("- a subject (abc1234)\n")
+    assert cs.main([
+        "--tag", "0.54.0", "--tag-time", TAG_TIME, "--prev-tag-time", PREV_TIME,
+        "--prs", str(prs), "--revs", str(revs), "--fallback", str(fallback),
+        "--changelog", str(changelog),
+    ]) == 0  # fmt: skip
+    assert "- a subject (abc1234)" in changelog.read_text()
+    assert "another release" not in changelog.read_text()
