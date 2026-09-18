@@ -368,12 +368,21 @@ class _Harness:
 
     @contextlib.contextmanager
     def capture(self):
-        """Buffer this thread's :meth:`warn` calls; yields the buffer list."""
+        """Buffer this thread's :meth:`warn` calls; yields the buffer list.
+
+        Restores the PREVIOUS buffer rather than clearing, so the block
+        nests (review finding): at ``workers=1`` a task runs on the calling
+        thread, so a nested pooled leg would otherwise drop the outer
+        buffer's warnings and the outer merge would replay an empty list —
+        losing exactly the "what I declined to check" record :meth:`warn`
+        exists to keep.
+        """
+        prev = getattr(self._local, "buffer", None)
         self._local.buffer = buffer = []
         try:
             yield buffer
         finally:
-            self._local.buffer = None
+            self._local.buffer = prev
 
     def _open(self, rel: str, inner: int):
         """Cached resolution group, opened OUTSIDE any lock (review finding).

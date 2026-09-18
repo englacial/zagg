@@ -578,6 +578,30 @@ class TestHarnessHandles:
             assert counted == {"counts": 3, "declined": 6}, workers
             assert errors == {"counts": []}
 
+    def test_capture_nests(self, tmp_path):
+        """A nested ``capture`` gives the outer buffer back, not ``None``.
+
+        At ``workers=1`` the task runs on the CALLING thread, so a future
+        nested pooled leg would drop the outer buffer's warnings silently
+        (review finding); after the outer block the warnings go back to the
+        report's own list.
+        """
+        from zagg.pyramid_check_core import _Harness
+
+        manifest = _build_store(tmp_path)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=1
+        )
+        with harness.capture() as outer:
+            harness.warn("outer before")
+            with harness.capture() as inner:
+                harness.warn("inner")
+            harness.warn("outer after")
+        harness.warn("unbuffered")
+        assert inner == ["inner"]
+        assert outer == ["outer before", "outer after"]
+        assert harness.warnings == ["unbuffered"]
+
     def test_cold_group_opens_do_not_serialize(self, tmp_path, monkeypatch):
         """A cold group open is a NETWORK round trip: no lock may span it.
 
