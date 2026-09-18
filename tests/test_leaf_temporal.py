@@ -688,9 +688,14 @@ class TestSweepRoute:
             assert moc.get("finish_deferred", True) is True
             assert "root_moc_written" not in moc
             # The route telemetry rides the deferred pass too — that is where
-            # the backfill happens (phase 3, issue #575).
-            materialized += moc.get("temporal_routes", {}).get("materialized", 0)
-            assert moc.get("temporal_routes", {}).get("records", 0) == 0
+            # the backfill happens (phase 3, issue #575) — and a partition that
+            # visited no leaf carries no block at all. Both fixture shards are
+            # ``1121*``, so at ``of=4`` (split order 1) they land in partition
+            # 0 deterministically: the split is on the leading morton digit.
+            assert ("temporal_routes" in moc) == (index == 0)
+            if index == 0:
+                materialized += moc["temporal_routes"]["materialized"]
+                assert moc["temporal_routes"]["records"] == 0
         assert materialized == 2
         assert not (Path(root) / "coverage.moc").exists()
         for decimal in (SHARD, other):
