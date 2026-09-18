@@ -2378,6 +2378,120 @@ class TestReproject:
         with pytest.raises(ValueError, match="HEALPix"):
             sm.reproject(hp)
 
+    def _tagged(self, sm):
+        """``sm`` with an auxiliary key on every entry -- the shape a builder
+        attaches that ``_granule_entry``'s closed key set does not know."""
+        granules = [
+            [{**g, "paired_epochs": [f"epoch-{g['id']}"]} for g in shard] for shard in sm.granules
+        ]
+        return ShardMap(sm.grid_signature, list(sm.shard_keys), granules, dict(sm.metadata))
+
+    @pytest.mark.parametrize("method", ["noop", "coarsen", "refine"])
+    def test_auxiliary_entry_keys_ride_through_every_arm(
+        self, catalog, fine_grid, coarse_grid, method
+    ):
+        # Every arm rebuilds its entries through _granule_entry, whose key set is
+        # closed, so a builder's per-entry keys were dropped from the derived map
+        # (issue #517 -- the closest-obs pairing provenance is the case in hand).
+        source = self._tagged(ShardMap.build(catalog, coarse_grid, backend="mortie"))
+        target, kwargs = {
+            "noop": (coarse_grid, {}),
+            "coarsen": (HealpixGrid(10, 14, layout="fullsphere"), {}),
+            "refine": (fine_grid, {"catalog": catalog}),
+        }[method]
+        derived = source.reproject(target, **kwargs)
+        assert derived.metadata["reproject"]["method"] == method
+        entries = [g for shard in derived.granules for g in shard]
+        assert entries
+        assert all(g["paired_epochs"] == [f"epoch-{g['id']}"] for g in entries)
+
+    @pytest.mark.parametrize("method", ["noop", "coarsen", "refine"])
+    def test_a_plain_map_gains_nothing_from_the_passthrough(
+        self, catalog, fine_grid, coarse_grid, method
+    ):
+        # The other half of #517's acceptance: a map with no auxiliary keys must
+        # reproject to exactly what it reprojected to before.
+        source = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        target, kwargs = {
+            "noop": (coarse_grid, {}),
+            "coarsen": (HealpixGrid(10, 14, layout="fullsphere"), {}),
+            "refine": (fine_grid, {"catalog": catalog}),
+        }[method]
+        derived = source.reproject(target, **kwargs)
+        # Derived from _granule_entry rather than hand-copied from it: the claim
+        # is that the passthrough added nothing BEYOND what _granule_entry
+        # produces, so a snapshot of its key set would fail in the wrong file
+        # the day that set changes.
+        known = set().union(*(set(shardmap._granule_entry(r)) for r in catalog.granule_records()))
+        assert all(set(g) <= known for shard in derived.granules for g in shard)
+
+    def _tagged_per_shard(self, sm):
+        """``sm`` with provenance that DIFFERS shard by shard.
+
+        The shape ``closest_obs_shardmap`` emits: it accumulates ``chosen``
+        inside its per-shard loop, so one granule sitting in several shards
+        carries a different ``paired_epochs`` in each.
+        """
+        granules = [
+            [{**g, "paired_epochs": [f"e-{k}"], "epoch_offsets_ns": [int(k) % 997]} for g in shard]
+            for k, shard in zip(sm.shard_keys, sm.granules)
+        ]
+        return ShardMap(sm.grid_signature, list(sm.shard_keys), granules, dict(sm.metadata))
+
+    def test_coarsen_unions_the_provenance_of_every_contributing_child(self, catalog, coarse_grid):
+        # Coarsening merges sibling shards, and the union was last-wins on the
+        # entry: a granule reaching one parent from four children kept the
+        # fourth's provenance and dropped three, silently -- issue #517's loss
+        # reappearing on the arm the first pass left alone.
+        from mortie import clip2order
+
+        source = self._tagged_per_shard(ShardMap.build(catalog, coarse_grid, backend="mortie"))
+        keys = [int(k) for k in source.shard_keys]
+        parents = clip2order(10, np.asarray(keys, dtype=np.uint64)).tolist()
+        expected: dict = {}
+        for parent, key, shard in zip(parents, keys, source.granules):
+            for g in shard:
+                expected.setdefault((int(parent), g["id"]), []).append(key)
+        assert any(len(v) > 1 for v in expected.values()), "need a multi-child granule to test"
+
+        coarse = source.reproject(HealpixGrid(10, 14, layout="fullsphere"))
+        assert coarse.metadata["reproject"]["method"] == "coarsen"
+        seen = set()
+        for parent, shard in zip(coarse.shard_keys, coarse.granules):
+            for g in shard:
+                children = expected[(int(parent), g["id"])]
+                assert g["paired_epochs"] == [f"e-{k}" for k in children]
+                # The sibling column has to move row for row with it.
+                assert g["epoch_offsets_ns"] == [k % 997 for k in children]
+                seen.add((int(parent), g["id"]))
+        assert seen == set(expected)
+
+    def test_the_coarsen_union_drops_the_rows_two_children_share(self, catalog, coarse_grid):
+        # Row-wise, not per-key: two children that paired the same granule to the
+        # same epoch contribute one row, not two, and a per-key union would leave
+        # the columns different lengths the moment they agreed on one and not the
+        # other (issue #517).
+        built = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        granules = [
+            [{**g, "paired_epochs": ["shared", f"own-{k}"], "epoch_offsets_ns": [0, 1]} for g in s]
+            for k, s in zip(built.shard_keys, built.granules)
+        ]
+        source = ShardMap(built.grid_signature, list(built.shard_keys), granules, {})
+        coarse = source.reproject(HealpixGrid(10, 14, layout="fullsphere"))
+        for shard in coarse.granules:
+            for g in shard:
+                assert g["paired_epochs"].count("shared") == 1
+                assert len(g["paired_epochs"]) == len(g["epoch_offsets_ns"])
+
+    def test_the_coarsen_union_leaves_the_source_map_untouched(self, catalog, coarse_grid):
+        # The union rebuilds the columns rather than extending them: the derived
+        # map's entries still share the source's list objects (as ``assets``
+        # always has), so an in-place merge would rewrite the map it was handed.
+        source = self._tagged_per_shard(ShardMap.build(catalog, coarse_grid, backend="mortie"))
+        before = [[dict(g) for g in shard] for shard in source.granules]
+        source.reproject(HealpixGrid(10, 14, layout="fullsphere"))
+        assert source.granules == before
+
 
 class TestIsBeamProduct:
     def test_known_beam_products(self):
@@ -2842,35 +2956,99 @@ class TestBasenameCollisions:
         a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
         shardmap._refuse_basename_collisions([7], [[a, dict(a)]])
 
-    def test_refine_rebuilds_hrefs_from_the_catalog_so_it_cannot_collide(
-        self, catalog, fine_grid, coarse_grid
-    ):
-        # The refine arm looks each entry up in the catalog by id and rebuilds
-        # the entry from THAT record, so a source map's per-entry hrefs never
-        # reach the new map: a collided pair arrives as one identical entry and
-        # the check has nothing left to see. Pinning it because it bounds what
-        # the guard can promise -- only ``build`` and coarsen can surface an
-        # href collision (issue #468 review finding (2)).
-        sm = ShardMap.build(
-            _catalog([_item("Gdup", -76.62, -76.57)]), coarse_grid, backend="mortie"
-        )
+    def _legacy_collided_source(self, coarse_grid):
+        """A one-shard map holding a collided pair: one id, two href prefixes.
+
+        The shape a pre-#468 manifest takes -- refused at construction today, so
+        it can only reach ``refine`` through a loader, which warns rather than
+        refuses (PR #482 question (2)).
+        """
         cat = _catalog([_item("Gdup", -76.62, -76.57)])
+        sm = ShardMap.build(cat, coarse_grid, backend="mortie")
         collided = [
             {"id": "Gdup", "s3": f"s3://b/{p}/Gdup.h5", "https": f"https://h/{p}/Gdup.h5"}
             for p in ("p1", "p2")
         ]
-        source = ShardMap(
-            sm.grid_signature,
-            list(sm.shard_keys),
-            [collided] + [list(g) for g in sm.granules[1:]],
-            dict(sm.metadata),
-        )
+        source = ShardMap(sm.grid_signature, [sm.shard_keys[0]], [collided], dict(sm.metadata))
+        return cat, source
+
+    def test_refine_carries_the_map_hrefs_so_a_collision_survives_to_the_guard(
+        self, fine_grid, coarse_grid
+    ):
+        # The refine arm looks each entry up in the catalog by id. Rebuilt from
+        # THAT record alone, a collided pair arrived as one identical entry and
+        # the two collapsed into one -- a granule lost silently, upstream of a
+        # guard that then had nothing left to see (issue #512; the bound issue
+        # #468 review finding (2) recorded). The map's own hrefs now win over
+        # the record's, so the pair stays distinct and the guard refuses.
+        cat, source = self._legacy_collided_source(coarse_grid)
+        with pytest.raises(ValueError, match="identity collision") as excinfo:
+            source.reproject(fine_grid, catalog=cat)
+        message = str(excinfo.value)
+        assert "s3://b/p1/Gdup.h5" in message and "s3://b/p2/Gdup.h5" in message
+
+    def test_refine_of_a_loaded_legacy_collision_never_changes_the_count_silently(
+        self, fine_grid, coarse_grid, tmp_path
+    ):
+        # The acceptance path of issue #512: the loader is the one door left
+        # open onto a colliding map, so the refine behind it must not lose a
+        # member quietly. Before the fix this returned a map holding ONE entry
+        # per shard where two went in, with both prefixes rewritten to the
+        # catalog's single href.
+        cat, source = self._legacy_collided_source(coarse_grid)
+        path = str(tmp_path / "legacy.json")
+        source.to_json(path)
+        with pytest.warns(RuntimeWarning, match="identity collision"):
+            loaded = ShardMap.from_json(path)
+        with pytest.raises(ValueError, match="identity collision"):
+            loaded.reproject(fine_grid, catalog=cat)
+
+    def test_refine_leaves_the_catalog_authoritative_for_the_time_metadata(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        # The href carry is scoped to the identity keys. Widening it to every
+        # _granule_entry key would quietly invert authority for the time
+        # metadata too -- reproject never checks that ``catalog`` is the one the
+        # map was built from, so a refine against a re-fetched catalog would
+        # keep the map's stale value instead of the correction (issue #512).
+        item = _item("Gwest", -76.62, -76.57)
+        item["properties"]["start_datetime"] = "2025-06-01T00:00:00Z"
+        item["properties"]["end_datetime"] = "2025-06-01T00:10:00Z"
+        cat = _catalog([item])
+        built = ShardMap.build(cat, coarse_grid, backend="mortie")
+        recorded = built.granules[0][0]["time_start"]
+        assert recorded and recorded != "1999-01-01T00:00:00Z"
+        stale = [
+            [{**g, "time_start": "1999-01-01T00:00:00Z"} for g in shard] for shard in built.granules
+        ]
+        source = ShardMap(built.grid_signature, list(built.shard_keys), stale, dict(built.metadata))
         refined = source.reproject(fine_grid, catalog=cat)
         entries = [g for shard in refined.granules for g in shard]
-        assert all(g["s3"] == "s3://b/Gdup.h5" for g in entries), "hrefs come from the catalog"
-        # One granule out, not two: the prefixes -- and with them the collision
-        # -- were discarded upstream of the check, not by it.
-        assert {g["id"] for g in entries} == {"Gdup"}
+        assert entries
+        assert all(g["time_start"] == recorded for g in entries)
+
+    def test_a_same_order_reproject_of_a_collision_keeps_both_members(self, coarse_grid):
+        # The loader's warning tells an operator which derivations are refused,
+        # so the exemption has to be true too: the same-order arm returns before
+        # the guard, and is entitled to because it is identity -- both members
+        # come out, nothing is dropped, so there is nothing to refuse (issue
+        # #512). Pinned because the warning names it.
+        _cat, source = self._legacy_collided_source(coarse_grid)
+        same_order = source.reproject(coarse_grid)
+        entries = [g for shard in same_order.granules for g in shard]
+        assert [g["s3"] for g in entries] == ["s3://b/p1/Gdup.h5", "s3://b/p2/Gdup.h5"]
+
+    def test_refine_of_a_clean_map_is_unchanged_by_the_href_carry(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        # The overlay must be a no-op wherever there is no collision: a normal
+        # map's entries came from these same records, so refine still produces
+        # exactly what it produced before (issue #512).
+        sm_coarse = ShardMap.build(catalog, coarse_grid, backend="mortie")
+        refined = sm_coarse.reproject(fine_grid, catalog=catalog)
+        direct = ShardMap.build(catalog, fine_grid, backend="mortie")
+        assert refined.shard_keys == direct.shard_keys
+        assert refined.granules == direct.granules
 
     def test_an_id_that_canonicalizes_to_empty_warns_and_is_skipped(self):
         # ``canonical_granule_id("/")`` strips the separator down to "", which
