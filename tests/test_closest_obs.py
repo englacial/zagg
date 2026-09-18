@@ -124,13 +124,22 @@ class TestWordMidpoints:
         assert _nearest_gap(mids, _utc(inst)) <= HALF_BUCKET
 
     def test_a_contiguous_campaign_yields_one_epoch_per_covered_bucket(self):
-        """A two-hour campaign sampled every 5 min is one word — and ~13 buckets."""
+        """A two-hour campaign sampled every 5 min is one word — and 14 buckets.
+
+        The literal is the point: both sides of the equality below are derived
+        from the same instants, so only a hand-checked number tests the
+        expansion rather than the derivation. At order 24 a bucket is 2^39 ns
+        = 549,755,813,888 ns; ``BASE_NS`` sits 204,811,010,048 ns into its
+        own, leaving 344,944,803,840 ns of it, and the remaining
+        7,200,000,000,000 − 344,944,803,840 = 6,855,055,196,160 ns of the
+        campaign spill into ⌈6,855,055,196,160 / 549,755,813,888⌉ = 13 more.
+        """
         inst = np.array([BASE_NS + i * 5 * 60 * 10**9 for i in range(25)], dtype=np.uint64)
         words = quantize_words(time2toc(inst))
         assert len(words) == 1
         covered = {int(t) >> (63 - TEMPORAL_COVER_ORDER) for t in inst}
         mids = np.sort(_word_midpoints(words))
-        assert mids.size == len(covered) > 1
+        assert mids.size == len(covered) == 1 + 13
         assert _nearest_gap(mids, _utc(inst)) <= HALF_BUCKET
 
     def test_a_pass_straddling_a_bucket_edge_yields_two_epochs(self):
