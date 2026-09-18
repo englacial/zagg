@@ -134,7 +134,10 @@ class SweepFamily:
 
         A partitioned pass defers ``finish`` (issue #377) but still did per-leaf
         work worth recording — the issue #575 backfill happens exactly there —
-        so this rides every pass's family result, partitioned or not.
+        so this rides every pass that goes through the bottom-up walk,
+        partitioned or not. A family overriding :attr:`sweep_store` (the
+        whole-tree runner :func:`run_sweep` dispatches to instead of
+        ``_sweep_family``) never reaches this hook and folds its own telemetry.
         """
         return {}
 
