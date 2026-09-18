@@ -17,8 +17,11 @@ raised on the PR); the public surface stays on ``zagg.pyramid_check``.
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
 import json
 import logging
+import threading
 
 import numpy as np
 
@@ -37,6 +40,33 @@ WEIGHT_RTOL = 1e-6
 
 def _entry(status: str, detail: str, **extra) -> dict:
     return {"status": status, "detail": detail, **extra}
+
+
+def _map_concurrent(fn, items, workers: int) -> list:
+    """``[fn(x) for x in items]``, at most ``workers`` at a time, in INPUT order.
+
+    The one concurrency primitive of the harness (issue #434 follow-up): the
+    checker's legs are dominated by independent small GETs — one per node,
+    per leaf, per sampled cell — that a sequential loop serializes at S3
+    latency. ``workers <= 1`` IS the sequential loop. The pool path uses
+    ``Executor.map``, never ``as_completed``: results come back in input
+    order, so the printed report and the JSON are the same at any pool
+    size, and a raised exception is the first FAILING item's in input order
+    (later items are cancelled where still pending) — the loop's own
+    contract. Only results are retained, so the pool bounds the NUMBER of
+    cells in flight (at most ``workers``) — not the size of any one of
+    them: a cell's working set is set by its contributor span, which is
+    ladder geometry, not by ``--sample-cells``. The one cap on that span is
+    :data:`COLUMN_PARITY_FOLD_MAX`, and it applies to the §4.6 column-parity
+    leg alone. Peak memory is therefore ``workers`` x the WIDEST cell of the
+    pass (review finding; see the memory note in
+    :mod:`zagg.pyramid_check`'s module header).
+    """
+    items = list(items)
+    if workers <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+        return list(pool.map(fn, items))
 
 
 def _rank(tail: str) -> int:
@@ -150,7 +180,9 @@ def _declared_nodes(leaves: list[str], k: int) -> list[str]:
     return sorted({d[: _base_len(d) + k] for d in leaves})
 
 
-def _probe_nodes(store_root, nodes, store_kwargs, *, rel=_node_object_rel) -> tuple[dict, dict]:
+def _probe_nodes(
+    store_root, nodes, store_kwargs, *, rel=_node_object_rel, workers: int = 8
+) -> tuple[dict, dict]:
     """``({node: attrs | None}, {node: error})`` — one small GET per node.
 
     ``rel`` maps a node decimal to its artifact's relative zarr root — the
@@ -162,10 +194,9 @@ def _probe_nodes(store_root, nodes, store_kwargs, *, rel=_node_object_rel) -> tu
     never be reported as "declared but unmaterialized" (review finding): a
     credential mistake and an unswept store are opposite diagnoses and must
     not print the same sentence. An unparsable ``zarr.json`` keeps its parse
-    error alongside the empty-attrs (partial) verdict.
+    error alongside the empty-attrs (partial) verdict. The GETs are issued
+    ``workers`` at a time (:func:`_map_concurrent`).
     """
-    import concurrent.futures
-
     import obstore
     from obstore.exceptions import NotFoundError
 
@@ -185,8 +216,7 @@ def _probe_nodes(store_root, nodes, store_kwargs, *, rel=_node_object_rel) -> tu
         except Exception as exc:
             return node, {}, f"unparsable zarr.json: {type(exc).__name__}: {exc}"
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(probe, nodes))
+    results = _map_concurrent(probe, nodes, workers)
     return (
         {node: attrs for node, attrs, _ in results},
         {node: err for node, _, err in results if err is not None},
@@ -275,15 +305,28 @@ def _digest_mismatch(stored: np.ndarray, ref: np.ndarray) -> str | None:
 
 
 class _Harness:
-    """One validation pass's shared context: store handles + group cache."""
+    """One validation pass's shared context: store handles + group cache.
 
-    def __init__(self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells):
+    ``workers`` is the read concurrency of the per-cell value legs
+    (:func:`_run_cells`); the handle caches and the warning list are safe to
+    share across those threads (race-tolerant publishing, a per-thread
+    warning buffer so the merge keeps cell order). No lock is ever held
+    across a store open: a duplicate open is harmless, a serialized one
+    costs ``workers``x (:meth:`_open`, :meth:`array`).
+    """
+
+    def __init__(
+        self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells, workers=8
+    ):
+        from zagg.store import open_store
+
         self.store_root = str(store_root).rstrip("/")
         self.manifest = manifest
         self.store_kwargs = dict(store_kwargs)
         self.rng = rng
         self.sample_nodes = sample_nodes
         self.sample_cells = sample_cells
+        self.workers = int(workers)
         self.shard_order = int(manifest["shard_order"])
         self.cell_order = int(manifest["cell_order"])
         self.fields = _composable_fields(manifest)
@@ -299,7 +342,18 @@ class _Harness:
             if meta.get("class") == "approximate"
             for _kwarg, sibling in _field_companions(name, meta)
         }
+        # ONE object store for the whole pass, every artifact addressed by
+        # zarr's ``path=`` (review finding). ``open_store`` builds a FRESH
+        # obstore ``S3Store`` per call — its own connection pool and TLS
+        # handshake — and the ambient-store cache in :mod:`zagg.store`
+        # belongs to ``open_object_store``, not to this route; a per-leaf
+        # store therefore shared nothing across a 2,918-leaf roster.
+        self.store = open_store(self.store_root, read_only=True, **self.store_kwargs)
         self._groups: dict = {}
+        self._arrays: dict = {}
+        self._gates: dict = {}
+        self._lock = threading.Lock()
+        self._local = threading.local()
         self.warnings: list = []
 
     def warn(self, message: str) -> None:
@@ -307,21 +361,88 @@ class _Harness:
 
         Skipping quietly is the failure mode the negative suite exists to
         rule out: everything the pass could not validate is named here and
-        printed by :func:`zagg.pyramid_check.format_report`.
+        printed by :func:`zagg.pyramid_check.format_report`. Inside a
+        :meth:`capture` block the message goes to that thread's buffer
+        instead, for the caller to replay in a deterministic order.
         """
-        if message not in self.warnings and len(self.warnings) < 200:
+        buffer = getattr(self._local, "buffer", None)
+        if buffer is not None:
+            buffer.append(message)
+        elif message not in self.warnings and len(self.warnings) < 200:
             self.warnings.append(message)
 
+    @contextlib.contextmanager
+    def capture(self):
+        """Buffer this thread's :meth:`warn` calls; yields the buffer list.
+
+        Restores the PREVIOUS buffer rather than clearing, so the block
+        nests (review finding): at ``workers=1`` a task runs on the calling
+        thread, so a nested pooled leg would otherwise drop the outer
+        buffer's warnings and the outer merge would replay an empty list —
+        losing exactly the "what I declined to check" record :meth:`warn`
+        exists to keep.
+        """
+        prev = getattr(self._local, "buffer", None)
+        self._local.buffer = buffer = []
+        try:
+            yield buffer
+        finally:
+            self._local.buffer = prev
+
     def _open(self, rel: str, inner: int):
+        """Cached resolution group, opened OUTSIDE any lock (review finding).
+
+        A cold open is a NETWORK round trip (``{rel}/{inner}/zarr.json``),
+        not a local constructor, and holding a mutex across it serialized
+        every cold open across all ``workers`` — the one place the pool was
+        fully undone, and it scales with the roster (4 leaves on the canary,
+        2,918 on CA). Two threads racing the same group cost one wasted GET;
+        ``setdefault`` publishes whichever handle arrived first and both
+        callers use that one, so the cache still holds exactly one handle
+        per group. Per-ARRAY opens are gated instead of raced
+        (:meth:`array`): those are the hot ones.
+        """
         import zarr
 
-        from zagg.store import open_store
+        key = f"{rel}/{int(inner)}"  # == the opened group's ``path``
+        group = self._groups.get(key)
+        if group is None:
+            group = self._groups.setdefault(
+                key, zarr.open_group(self.store, path=key, mode="r", zarr_format=3)
+            )
+        return group
 
-        key = (rel, int(inner))
-        if key not in self._groups:
-            store = open_store(f"{self.store_root}/{rel}", read_only=True, **self.store_kwargs)
-            self._groups[key] = zarr.open_group(store, path=str(inner), mode="r", zarr_format=3)
-        return self._groups[key]
+    def array(self, group, name: str):
+        """Memoized ``group[name]`` handle, or ``None`` when the array is absent.
+
+        zarr re-reads an array's ``zarr.json`` on EVERY ``group[name]``, so
+        the per-cell legs were paying a full round trip per (cell, field,
+        container) for a handful of distinct objects: on a profiled canary
+        run 2,667 of 4,807 round trips were array metadata, against 2,140
+        for actual chunks (review finding). A handle is immutable for a
+        read-only pass, so one open per (group, field) serves every cell and
+        the metadata cost drops to one GET per array. Absence is cached too
+        — a contributor lacking a declared field is asked once per artifact,
+        not once per cell (``contributions``, ``paired_contributions``).
+
+        The gate is PER ARRAY, never the harness lock: threads racing the
+        same cold handle wait for the one GET they would each have issued,
+        and threads on any other array do not wait at all. Racing on
+        ``setdefault`` alone would leave that first burst duplicating the
+        open ``workers`` times over (measured on the fixture pass: 45 opens
+        sequentially, 124 raced, against 244 with no cache at all).
+        """
+        key = (group.path, name)
+        if key not in self._arrays:
+            with self._lock:
+                gate = self._gates.setdefault(key, threading.Lock())
+            with gate:
+                if key not in self._arrays:
+                    try:
+                        self._arrays[key] = group[name]
+                    except KeyError:
+                        self._arrays[key] = None
+        return self._arrays[key]
 
     def node_group(self, node: str, t: int):
         return self._open(_node_object_rel(node), t)
@@ -373,9 +494,8 @@ class _Harness:
                 self.warn(f"contributor {container} unreadable ({exc}) — cells it covers skipped")
                 complete = False
                 continue
-            try:
-                arr = group[field]
-            except KeyError:
+            arr = self.array(group, field)
+            if arr is None:
                 self.warn(f"contributor {container} lacks field {field!r} — contributes fill")
                 continue
             start, n = self.span(cell_dec, container, src_cell_order)
@@ -404,17 +524,18 @@ class _Harness:
                 self.warn(f"contributor {container} unreadable ({exc}) — cells it covers skipped")
                 complete = False
                 continue
-            has_word, has_of = word_field in group, of_field in group
-            if has_of and not has_word:
+            word_arr = self.array(group, word_field)
+            of_arr = self.array(group, of_field)
+            if of_arr is not None and word_arr is None:
                 poisoned = True
                 continue
-            if not has_of:
+            if of_arr is None:
                 continue
             start, n = self.span(cell_dec, container, src_cell_order)
             parts.append(
                 (
-                    np.asarray(group[word_field][start : start + n]),
-                    np.asarray(group[of_field][start : start + n]),
+                    np.asarray(word_arr[start : start + n]),
+                    np.asarray(of_arr[start : start + n]),
                 )
             )
         return parts, poisoned, complete
@@ -560,6 +681,36 @@ def _declared_subset(node, t, attrs, provenance_attr, arrays, harness, errors):
     return absent
 
 
+def _run_cells(harness, fn, cells, errors, counted) -> None:
+    """``fn(j, errors, counted)`` over ``cells``, ``harness.workers`` at a time.
+
+    Each cell runs against its own error lists / comparison counters and its
+    own warning buffer (:meth:`_Harness.capture`); the merge is in cell
+    order, so the mismatch lists (``first:`` and the ``mismatches`` head),
+    the ``sampled`` counters and the warning list read exactly as the
+    sequential loop's whatever the pool size. The two accumulators are
+    merged over their OWN keys (review finding): a counter with no matching
+    error list would otherwise stay at zero, and
+    ``_settle_value_checks`` reads a zero counter as "NOTHING was
+    validated" — a false red on the acceptance gate, not an undercount.
+    """
+
+    def task(j):
+        errs = {name: [] for name in errors}
+        cnt = dict.fromkeys(counted, 0)
+        with harness.capture() as warned:
+            fn(j, errs, cnt)
+        return errs, cnt, warned
+
+    for errs, cnt, warned in _map_concurrent(task, cells, harness.workers):
+        for name in errors:
+            errors[name].extend(errs[name])
+        for name in counted:  # NOT driven by ``errors``: a leg may count
+            counted[name] += cnt[name]  # something it cannot fail
+        for message in warned:
+            harness.warn(message)
+
+
 def _check_node(
     harness,
     node,
@@ -650,17 +801,18 @@ def _check_node(
     for sibling, owner in harness.companions.items():
         if owner in absent:
             continue
-        if group[sibling].shape != group[owner].shape:
+        sibling_arr, owner_arr = harness.array(group, sibling), harness.array(group, owner)
+        if sibling_arr.shape != owner_arr.shape:
             errors["readback"].append(
-                f"{node}: companion {sibling} shape {group[sibling].shape} != "
-                f"{owner} {group[owner].shape}"
+                f"{node}: companion {sibling} shape {sibling_arr.shape} != "
+                f"{owner} {owner_arr.shape}"
             )
 
     # Populated-cell sample from the count array (count is the presence law).
     if count_meta is None:
         return
     fill = count_meta.get("fill_value", 0)
-    counts = np.asarray(group["count"][:])
+    counts = np.asarray(harness.array(group, "count")[:])
     populated = np.flatnonzero(~_missing_mask(counts, fill))
     cells = populated
     if not full and len(populated) > harness.sample_cells:
@@ -679,7 +831,7 @@ def _check_node(
     if len(cells):
         j = int(cells[0])
         cell_dec = node + _tail(j, t - k)
-        word = int(np.asarray(group["morton"][j]))
+        word = int(np.asarray(harness.array(group, "morton")[j]))
         if word != morton_word(cell_dec):
             errors["readback"].append(
                 f"{node}[{j}]: morton {word} != {morton_word(cell_dec)} for {cell_dec}"
@@ -689,7 +841,7 @@ def _check_node(
     # Composition §3.3 attrs block, once per artifact group.
     for name, meta in packed_fields.items():
         try:
-            block = dict(group[name].attrs.get("composition") or {})
+            block = dict(harness.array(group, name).attrs.get("composition") or {})
         except Exception as exc:
             errors["composition"].append(f"{node}/{name}: attrs unreadable: {exc}")
             continue
@@ -706,12 +858,15 @@ def _check_node(
     if not values:
         return
 
-    for j in cells:
+    # The per-cell legs below are independent reads: they run
+    # ``harness.workers`` at a time (:func:`_run_cells`), each cell against
+    # its own accumulators, merged in cell order.
+    def check_cell(j, errors, counted):
         cell_dec = node + _tail(int(j), t - k)
         # Counts: exact conservation.
         parts, complete = harness.contributions(cell_dec, source, "count")
         if not complete:
-            continue  # an unreadable contributor: this cell is not validated
+            return  # an unreadable contributor: this cell is not validated
         counted["counts"] += 1
         expected = _exact_expected(
             np.concatenate(parts) if parts else np.array([], dtype=counts.dtype),
@@ -733,12 +888,12 @@ def _check_node(
             vals = (
                 np.concatenate(parts)
                 if parts
-                else np.array([], dtype=np.asarray(group[name][int(j)]).dtype)
+                else np.array([], dtype=np.asarray(harness.array(group, name)[int(j)]).dtype)
             )
             expected = _exact_expected(
                 vals, meta.get("method", "sum"), meta.get("fill_value", "NaN")
             )
-            stored = np.asarray(group[name][int(j)])[()]
+            stored = np.asarray(harness.array(group, name)[int(j)])[()]
             counted["counts"] += 1
             if expected is None:
                 if not _missing_mask(np.asarray([stored]), meta.get("fill_value", "NaN"))[0]:
@@ -753,7 +908,7 @@ def _check_node(
             if not complete:
                 continue
             payloads = [p for chunk in chunks for p in chunk.tolist() if p is not None and len(p)]
-            raw = _payload_bytes(group[name][int(j) : int(j) + 1][0])
+            raw = _payload_bytes(harness.array(group, name)[int(j) : int(j) + 1][0])
             counted["digests"] += 1
             if not payloads:
                 if len(raw):
@@ -800,7 +955,7 @@ def _check_node(
                 expected_word = parts[0][0]
             else:
                 expected_word = merge_composition_kway(parts)
-            stored_word = int(np.asarray(group[name][int(j)]))
+            stored_word = int(np.asarray(harness.array(group, name)[int(j)]))
             counted["composition"] += 1
             if stored_word != expected_word:
                 errors["composition"].append(
@@ -808,21 +963,23 @@ def _check_node(
                     f"{'gathered gen-1 word' if gather else 'k-way merge'} {expected_word}"
                 )
 
+    _run_cells(harness, check_cell, cells, errors, counted)
+
     # One empty cell keeps its fills across every field.
     if empty_cell is not None:
         for name in packed_fields:
-            if int(np.asarray(group[name][empty_cell])) != 0:
+            if int(np.asarray(harness.array(group, name)[empty_cell])) != 0:
                 errors["composition"].append(f"{node}[{empty_cell}]/{name}: empty cell word != 0")
         for name in digest_fields:
-            if len(_payload_bytes(group[name][empty_cell : empty_cell + 1][0])):
+            if len(_payload_bytes(harness.array(group, name)[empty_cell : empty_cell + 1][0])):
                 errors["digests"].append(f"{node}[{empty_cell}]/{name}: empty cell has a digest")
 
     # ... and the fill side of the presence law: no contributor may carry data.
-    for j in empty_probe:
+    def probe_empty(j, errors, counted):
         cell_dec = node + _tail(int(j), t - k)
         parts, complete = harness.contributions(cell_dec, source, "count")
         if not complete:
-            continue
+            return
         got = _exact_expected(
             np.concatenate(parts) if parts else np.array([], dtype=counts.dtype), "sum", fill
         )
@@ -833,15 +990,20 @@ def _check_node(
                 f"the fold dropped data (blank/short node)"
             )
 
+    _run_cells(harness, probe_empty, empty_probe, errors, counted)
 
-def _ladder_materialization(store_root, ladder, leaves, store_kwargs, checks, report) -> tuple:
+
+def _ladder_materialization(
+    store_root, ladder, leaves, store_kwargs, checks, report, *, workers: int = 8
+) -> tuple:
     """The declared-roster ↔ committed-artifacts check, shared by both arms.
 
-    Probes one ``zarr.json`` per declared above-shard node and settles the
-    ``materialization`` check. Returns ``(probes, declared, state)`` with
-    ``state`` one of ``"ok"`` (value checks may proceed), ``"baseline"``
-    (declared but 0 materialized — the pre-sweep report), or ``"errors"``
-    (probe transport failures: node state is UNKNOWN, never a sweep verdict).
+    Probes one ``zarr.json`` per declared above-shard node (``workers`` GETs
+    at a time) and settles the ``materialization`` check. Returns
+    ``(probes, declared, state)`` with ``state`` one of ``"ok"`` (value
+    checks may proceed), ``"baseline"`` (declared but 0 materialized — the
+    pre-sweep report), or ``"errors"`` (probe transport failures: node state
+    is UNKNOWN, never a sweep verdict).
     """
     declared = {k: _declared_nodes(leaves, k) for k, _ in ladder}
     probes: dict = {}
@@ -850,7 +1012,7 @@ def _ladder_materialization(store_root, ladder, leaves, store_kwargs, checks, re
     partial: list = []
     probe_errors: list = []
     for k, _t in ladder:
-        probed, errored = _probe_nodes(store_root, declared[k], store_kwargs)
+        probed, errored = _probe_nodes(store_root, declared[k], store_kwargs, workers=workers)
         probe_errors.extend(f"{n}: {e}" for n, e in sorted(errored.items()))
         probes[k] = {n: attrs if _committed(attrs) else None for n, attrs in probed.items()}
         found = [n for n, attrs in probes[k].items() if attrs is not None]

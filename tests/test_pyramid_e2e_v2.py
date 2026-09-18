@@ -173,6 +173,20 @@ class TestV2FixtureE2E:
             assert name in printed
         assert printed.endswith("VERDICT: PASS")
 
+    def test_report_is_identical_at_any_pool_size(self, tmp_path):
+        # Issue #434 follow-up: the per-node/per-leaf probes and the per-cell
+        # value legs run ``workers`` at a time, and the pool must be invisible
+        # in the report — sampled and full, JSON byte-for-byte against the
+        # ``workers=1`` (sequential) run. Both /2 tiers go through it: the
+        # ladder from the columns and the §4.6 column-vs-leaf parity.
+        _build_store(tmp_path)
+        for kwargs in ({"sample_nodes": 2, "sample_cells": 3, "seed": 7}, {"full": True}):
+            sequential = json.dumps(validate_pyramid(str(tmp_path), workers=1, **kwargs))
+            assert '"passed": true' in sequential
+            for workers in (8, 16):
+                pooled = json.dumps(validate_pyramid(str(tmp_path), workers=workers, **kwargs))
+                assert pooled == sequential, (workers, kwargs)
+
     def test_a_gapped_column_tier_is_refused_and_the_backstop_holds(self, tmp_path):
         # espg ruling (PR #567 thread, 2026-09-17): a ladder that straddles
         # the raw-fold boundary WITHOUT carrying it — members {6, 4, 3} on a

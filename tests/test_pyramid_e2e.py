@@ -17,6 +17,7 @@ import json
 
 import numpy as np
 import obstore
+import pytest
 import zarr
 from mortie import generate_morton_children
 
@@ -388,6 +389,264 @@ class TestContributorDefects:
         assert not group["composition"][0:4].any()  # the poisoned span
         report = validate_pyramid(str(tmp_path), full=True)
         assert report["checks"]["composition"]["status"] == "pass", format_report(report)
+
+
+class TestReadConcurrency:
+    """The independent reads run ``workers`` at a time; the report cannot tell.
+
+    Issue #434 follow-up: the sampled canary run was 94% S3 wait on
+    sequential GETs. One pool primitive (``_map_concurrent``) wraps the
+    per-node / per-leaf probes and the per-cell value legs — in INPUT order,
+    with the sequential loop's exception contract — and ``workers=1`` IS the
+    old loop.
+    """
+
+    def test_map_concurrent_keeps_input_order(self):
+        import time
+
+        from zagg.pyramid_check_core import _map_concurrent
+
+        def later_items_finish_first(x):
+            time.sleep(0.01 * (5 - x))
+            return x * x
+
+        expected = [x * x for x in range(5)]
+        assert _map_concurrent(later_items_finish_first, range(5), 8) == expected
+        assert _map_concurrent(later_items_finish_first, range(5), 1) == expected
+        assert _map_concurrent(later_items_finish_first, [], 8) == []
+
+    def test_map_concurrent_raises_the_first_failure_in_input_order(self):
+        # The loop's contract: the exception is the first FAILING item's, with
+        # its own message — even when a later item fails first on the pool.
+        import time
+
+        from zagg.pyramid_check_core import _map_concurrent
+
+        def fn(x):
+            if x in (2, 3):
+                time.sleep(0.05 * (4 - x))  # item 3 raises before item 2 does
+                raise ValueError(f"item {x} broke")
+            return x
+
+        for workers in (1, 8):
+            with pytest.raises(ValueError, match=r"^item 2 broke$"):
+                _map_concurrent(fn, range(5), workers)
+
+    def test_workers_one_is_the_calling_thread(self):
+        import threading
+
+        from zagg.pyramid_check_core import _map_concurrent
+
+        here = threading.get_ident()
+        assert _map_concurrent(lambda _x: threading.get_ident(), range(4), 1) == [here] * 4
+        assert here not in _map_concurrent(lambda _x: threading.get_ident(), range(4), 4)
+
+    def test_report_is_identical_at_any_pool_size(self, tmp_path):
+        # A leaf the moc still names but whose object is gone: the harness
+        # warns from INSIDE the per-cell legs (``contributions``), the one
+        # place a pool could reorder or duplicate — so the warning list, the
+        # mismatch lists and the ``sampled`` counters are all compared, JSON
+        # byte-for-byte, sampled and full.
+        import shutil
+
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        shutil.rmtree(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        for kwargs in ({"sample_nodes": 2, "sample_cells": 3, "seed": 7}, {"full": True}):
+            sequential = validate_pyramid(str(tmp_path), workers=1, **kwargs)
+            if kwargs.get("full"):  # the sample may not reach the gone leaf; full does
+                assert any("-311" in w and "unreadable" in w for w in sequential["warnings"])
+            for workers in (8, 16):
+                pooled = validate_pyramid(str(tmp_path), workers=workers, **kwargs)
+                assert json.dumps(pooled) == json.dumps(sequential), (workers, kwargs)
+
+    def test_cli_workers_flag(self, tmp_path, capsys):
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        out_json = tmp_path / "report.json"
+        assert main([str(tmp_path), "--full", "--workers", "1", "--json", str(out_json)]) == 0
+        printed = capsys.readouterr().out
+        assert printed.splitlines()[0].endswith("(workers 1)")
+        assert "workers" not in json.loads(out_json.read_text())  # how it was read, not what
+        with pytest.raises(SystemExit):
+            main([str(tmp_path), "--workers", "0"])
+
+
+class TestHarnessHandles:
+    """What the harness opens, and how often (issue #434 follow-up).
+
+    The report is the same whatever these do — that is
+    ``test_report_is_identical_at_any_pool_size``'s job. These pin the READ
+    COST the profile found: one object store per pass rather than one per
+    leaf, one array handle per (group, field) rather than one per access,
+    and no lock held across a network open.
+    """
+
+    def test_one_store_serves_the_whole_roster(self, tmp_path, monkeypatch):
+        """Every artifact opens on ONE store, addressed by zarr's ``path=``.
+
+        ``open_store`` builds a FRESH obstore ``S3Store`` per call — its own
+        connection pool and TLS handshake — and the ambient-store cache in
+        ``zagg.store`` belongs to ``open_object_store``, not to this route
+        (review finding). So a per-leaf store shared nothing across the
+        roster.
+        """
+        import zagg.store as zagg_store
+        from zagg.pyramid_check_core import _Harness
+
+        manifest = _build_store(tmp_path)
+        opened, real_open_store = [], zagg_store.open_store
+
+        def counting_open_store(path, **kwargs):
+            opened.append(path)
+            return real_open_store(path, **kwargs)
+
+        monkeypatch.setattr(zagg_store, "open_store", counting_open_store)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=8
+        )
+        groups = [harness.leaf_group(dec) for dec in LEAVES]
+        assert opened == [str(tmp_path)]  # one store, built once, at the root
+        assert {id(g.store_path.store) for g in groups} == {id(harness.store)}
+        assert len({g.path for g in groups}) == len(LEAVES)  # ... distinct groups on it
+
+    def test_array_handles_are_memoized(self, tmp_path, monkeypatch):
+        """One ``group[name]`` per (group, field), not one per cell.
+
+        zarr re-reads the array's ``zarr.json`` on every ``group[name]``, and
+        the per-cell legs do one per (cell, field, container): 2,667 of 4,807
+        round trips on a profiled canary run were array metadata (review
+        finding). The handle is immutable for a read-only pass, so it is
+        opened once — absence included, which ``contributions`` asks per
+        container per cell.
+        """
+        from zagg.pyramid_check_core import _Harness
+
+        manifest = _build_store(tmp_path)
+        gets = []
+        real_getitem = zarr.Group.__getitem__
+
+        def counting_getitem(self, name):
+            gets.append((self.path, name))
+            return real_getitem(self, name)
+
+        monkeypatch.setattr(zarr.Group, "__getitem__", counting_getitem)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=8
+        )
+        group = harness.leaf_group("-311")
+        handles = [harness.array(group, "count") for _ in range(5)]
+        assert len({id(h) for h in handles}) == 1
+        assert gets == [(group.path, "count")]
+        assert [harness.array(group, "no_such_field") for _ in range(3)] == [None] * 3
+        assert gets.count((group.path, "no_such_field")) == 1  # absence is cached too
+        # ... and a second group's field is its own entry, never the first's.
+        other = harness.leaf_group("-312")
+        assert harness.array(other, "count") is not handles[0]
+
+    def test_run_cells_merges_a_counter_with_no_error_list(self, tmp_path):
+        """``counted`` merges over its OWN keys, not over ``errors``'.
+
+        The two dicts are built side by side from the same names today, so
+        this is latent — but a leg that counts something it cannot FAIL (a
+        declined/unchecked tally) would merge to zero, and
+        ``_settle_value_checks`` reads a zero counter as "0 comparison(s)
+        performed — NOTHING was validated", i.e. a false red on the
+        acceptance gate (review finding).
+        """
+        from zagg.pyramid_check_core import _Harness, _run_cells
+
+        manifest = _build_store(tmp_path)
+        for workers in (1, 8):
+            harness = _Harness(
+                str(tmp_path),
+                manifest,
+                {},
+                rng=None,
+                sample_nodes=1,
+                sample_cells=1,
+                workers=workers,
+            )
+            errors: dict = {"counts": []}
+            counted = {"counts": 0, "declined": 0}
+
+            def fn(j, errs, cnt):
+                cnt["counts"] += 1
+                cnt["declined"] += int(j)
+
+            _run_cells(harness, fn, [1, 2, 3], errors, counted)
+            assert counted == {"counts": 3, "declined": 6}, workers
+            assert errors == {"counts": []}
+
+    def test_capture_nests(self, tmp_path):
+        """A nested ``capture`` gives the outer buffer back, not ``None``.
+
+        At ``workers=1`` the task runs on the CALLING thread, so a future
+        nested pooled leg would drop the outer buffer's warnings silently
+        (review finding); after the outer block the warnings go back to the
+        report's own list.
+        """
+        from zagg.pyramid_check_core import _Harness
+
+        manifest = _build_store(tmp_path)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=1
+        )
+        with harness.capture() as outer:
+            harness.warn("outer before")
+            with harness.capture() as inner:
+                harness.warn("inner")
+            harness.warn("outer after")
+        harness.warn("unbuffered")
+        assert inner == ["inner"]
+        assert outer == ["outer before", "outer after"]
+        assert harness.warnings == ["unbuffered"]
+
+    def test_cold_group_opens_do_not_serialize(self, tmp_path, monkeypatch):
+        """A cold group open is a NETWORK round trip: no lock may span it.
+
+        Eight distinct leaves at ``workers=8``, each open sleeping 50 ms:
+        under a mutex that is 8 x 50 ms, concurrently it is one 50 ms wait
+        (review finding — the penalty was exactly ``workers``x, and the
+        roster it scales with is 2,918 leaves on CA, not the canary's 4).
+        The bound asserted is the SERIAL floor, not the concurrent one, so
+        the test pins the lock rather than the scheduler.
+        """
+        import time
+
+        from zagg.pyramid_check_core import _Harness, _map_concurrent
+
+        def slow_open_group(_store, *, path, **_kwargs):
+            time.sleep(0.05)
+            return path
+
+        manifest = _build_store(tmp_path)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=8
+        )
+        monkeypatch.setattr(zarr, "open_group", slow_open_group)
+        leaves = [f"-3{a}{b}" for a in "12" for b in "1234"]
+        start = time.perf_counter()
+        opened = _map_concurrent(harness.leaf_group, leaves, 8)
+        elapsed = time.perf_counter() - start
+        assert len(set(opened)) == len(leaves)  # eight distinct groups...
+        assert elapsed < 8 * 0.05 / 2  # ... opened concurrently, not one by one
+
+    def test_a_full_pass_opens_each_array_once(self, tmp_path, monkeypatch):
+        """The property that matters at roster scale: no repeated handle opens."""
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        gets = []
+        real_getitem = zarr.Group.__getitem__
+
+        def counting_getitem(self, name):
+            gets.append((self.path, name))
+            return real_getitem(self, name)
+
+        monkeypatch.setattr(zarr.Group, "__getitem__", counting_getitem)
+        report = validate_pyramid(str(tmp_path), full=True, workers=8)
+        assert report["passed"], format_report(report)
+        assert gets and len(gets) == len(set(gets))
 
 
 class TestLadderGrammars:

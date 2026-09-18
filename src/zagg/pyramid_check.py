@@ -53,6 +53,20 @@ which validates the ``/2`` declaration grammar, the §4.6 leaf-column tier,
 and the ladder against the gen-1 columns under the derived
 stage-gather/stage-merge regimes. The grammar-independent machinery both
 arms share lives in :mod:`zagg.pyramid_check_core`.
+
+**Read bounds, including memory.** The store-wide reads are the ones named
+above; everything else is sampled. ``--workers`` bounds how many cells are
+read CONCURRENTLY, not how large a cell is: one ``check_cell`` holds, per
+field, the raw contributor slabs, the extracted payloads and their float64
+decode at once, and that footprint is set by the cell's CONTRIBUTOR SPAN —
+every roster member under the output cell — which ``--sample-cells`` does
+not bound (at a ladder level coarser than ``shard_order`` a single output
+cell's contributor set is roster-sized). ``COLUMN_PARITY_FOLD_MAX`` caps
+that span for the §4.6 column-parity leg only; the ladder legs re-fold
+unconditionally. So peak RSS is roughly ``workers`` x the widest single
+cell of the pass — 157 MB (``--workers 1``) to 183 MB (``--workers 8``) on
+the 4-leaf canary, and a number to record on the first CA acceptance run
+before a large roster leans on the default.
 """
 
 from __future__ import annotations
@@ -139,6 +153,7 @@ def validate_pyramid(
     full: bool = False,
     resweep: bool = False,
     roster: str = "auto",
+    workers: int = 8,
 ) -> dict:
     """Run the issue #434 checklist against a store; return the report dict.
 
@@ -151,6 +166,12 @@ def validate_pyramid(
     #547). The report's ``checks`` map carries one ``status``/``detail``
     entry per :data:`CHECKS` phase (:data:`CHECKS_V2` on a ``/2`` store);
     ``passed`` is True iff no check failed.
+
+    ``workers`` bounds the read concurrency of the independent legs — the
+    per-node / per-leaf metadata probes and the per-cell value reads — via
+    :func:`zagg.pyramid_check_core._map_concurrent`; ``1`` is the plain
+    sequential walk. The checklist itself stays sequential (each leg's
+    verdict gates the next), and the report is identical at any pool size.
 
     ``full=True`` is REFUSED for ``s3://`` roots, like ``resweep``: it voids
     every bound in the module header — ``_ladder_totals`` alone reads every
@@ -255,6 +276,7 @@ def validate_pyramid(
             full=full,
             resweep=resweep,
             roster=roster,
+            workers=workers,
         )
     detail = (
         f"{report['pyramid_spec']} ladder {[k for k, _ in ladder]}; composable fields "
@@ -277,7 +299,7 @@ def validate_pyramid(
     # write (the aborted 2026-08-25 sweep's debris, issue #547 forensics):
     # unmaterialized, reported separately.
     probes, declared, state = _ladder_materialization(
-        store_root, ladder, leaves, store_kwargs, checks, report
+        store_root, ladder, leaves, store_kwargs, checks, report, workers=workers
     )
     if state == "errors":
         skip_rest("node probes failed", after="materialization")
@@ -295,6 +317,7 @@ def validate_pyramid(
         rng=rng,
         sample_nodes=sample_nodes,
         sample_cells=sample_cells,
+        workers=workers,
     )
     _value_checks(harness, ladder, declared, probes, leaves, checks, report, full=full)
 
@@ -426,7 +449,7 @@ def _ladder_totals(harness, ladder, materialized, leaves, count_meta, errors, co
         out, complete = 0, True
         for name in names:
             try:
-                values = np.asarray(opener(name)["count"][:])
+                values = np.asarray(harness.array(opener(name), "count")[:])
             except Exception as exc:
                 # A stale root MOC can name a leaf that is gone (D9 cache):
                 # skipped and named, never a traceback out of a read-only run.
@@ -462,9 +485,17 @@ def _resweep_check(store_root, manifest, leaves, store_kwargs) -> dict:
     return _entry("pass", f"immediate re-sweep is a no-op ({counts.get('current', 0)} current)")
 
 
-def format_report(report: dict) -> str:
-    """The printed checklist, mirroring issue #434's phases (either arm)."""
-    lines = [f"overview-pyramid E2E validation — {report['store']}"]
+def format_report(report: dict, *, workers: int | None = None) -> str:
+    """The printed checklist, mirroring issue #434's phases (either arm).
+
+    ``workers`` (the CLI's pool size) is printed on the header line only:
+    like the sampling flags, how the store was READ is not part of the
+    report dict, which is the same at any pool size.
+    """
+    header = f"overview-pyramid E2E validation — {report['store']}"
+    if workers is not None:
+        header += f" (workers {workers})"
+    lines = [header]
     if report.get("spec"):
         ladder = ", ".join(f"o{e['node']}→cells {e['cells']}" for e in report.get("ladder", []))
         lines.append(
@@ -525,7 +556,16 @@ def main(argv=None) -> int:
         help="Leaf roster source: root coverage.moc, a flat store list, or auto (default)",
     )
     parser.add_argument("--json", default=None, metavar="PATH", help="Also write the report JSON")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Concurrent reads for the independent legs — node/leaf probes and "
+        "sampled-cell reads (default: 8; 1 = sequential)",
+    )
     args = parser.parse_args(argv)
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     store_kwargs: dict = {}
     if args.store_root.startswith("s3://"):
@@ -549,8 +589,9 @@ def main(argv=None) -> int:
         seed=args.seed,
         full=args.full,
         roster=args.roster,
+        workers=args.workers,
     )
-    print(format_report(report))
+    print(format_report(report, workers=args.workers))
     if args.json:
         with open(args.json, "w") as f:
             json.dump(report, f, indent=1)
