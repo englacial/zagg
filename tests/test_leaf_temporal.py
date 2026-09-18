@@ -351,6 +351,26 @@ class TestRecordGrammar:
         with pytest.raises(ValueError, match="derive"):
             leaf_temporal_contribution(record)
 
+    @pytest.mark.parametrize("key", ["temporal_order", "count", "obs_total"])
+    @pytest.mark.parametrize("junk", [None, "5", 1.5, True])
+    def test_a_non_integer_counts_key_is_refused_as_a_value_error(self, key, junk):
+        """§10.3's MUST-checks refuse, they do not coerce.
+
+        ``int(None)`` would leak a bare ``TypeError`` where the spec states a
+        refusal — and the message is what moczarr implements the check from.
+        """
+        record = self._record()
+        record["counts"][key] = junk
+        with pytest.raises(ValueError, match="counted cover declares"):
+            leaf_temporal_contribution(record)
+
+    def test_both_blocks_decode_against_the_records_own_pin(self):
+        """§10.6: the record declares one pin, and BOTH blocks answer to it."""
+        record = self._record()
+        record["temporal_order"] = COUNT_ORDER - 1
+        with pytest.raises(ValueError, match="outside"):
+            leaf_temporal_contribution(record)
+
     def test_a_wrong_n_obs_is_refused(self):
         record = self._record()
         record["n_obs"] += 1

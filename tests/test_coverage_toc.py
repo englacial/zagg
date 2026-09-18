@@ -265,7 +265,10 @@ class TestAbsence:
             {"temporal_order": TEMPORAL_COVER_ORDER + 1},
         ):
             envelope = {"temporal": {**section, "counts": {**block, **bad}}}
-            with pytest.raises((ValueError, TypeError)):
+            # ValueError with the spec's own wording, never a bare TypeError
+            # out of a coercion: §10.3 states each of these as a MUST on the
+            # block, and the message is what an external reader implements.
+            with pytest.raises(ValueError, match="counted cover declares"):
                 coverage_toc_counts(envelope)
 
     def test_a_section_without_counts_still_prunes(self):

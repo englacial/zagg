@@ -208,30 +208,49 @@ def encode_counts(counts: CountedCover) -> dict:
     }
 
 
+def _counted_int(block: dict, key: str) -> int:
+    """One of §10.3's integer keys, refused (``ValueError``) if it is not one.
+
+    Coercing first would leak a bare ``TypeError`` out of ``int()`` for a
+    ``null`` or a string, where §10.3 states the check as a MUST on the block
+    — and an external reader implementing the refusal from this module would
+    then implement one zagg does not.
+    """
+    value = block.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"counted cover declares {key} {value!r}, which is not an integer (spec §10.3)"
+        )
+    return value
+
+
 def decode_counts(block, pin: int = TEMPORAL_COVER_ORDER) -> CountedCover:
     """Decode a counted-cover block, MUST-checked.
 
-    Refuses (``ValueError``) buffers disagreeing with ``count`` or with each
-    other, an ``obs_total`` that is not the sum, and an order outside
-    ``[0, pin]`` — this revision's producers write at most the §10.5 pin.
+    Refuses (``ValueError``) a non-integer ``temporal_order``/``count``/
+    ``obs_total``, buffers disagreeing with ``count`` or with each other, an
+    ``obs_total`` that is not the sum, and an order outside ``[0, pin]`` —
+    this revision's producers write at most the §10.5 pin.
     """
     from zagg.sweep_overview import decode_digest
 
     if not isinstance(block, dict):
         raise ValueError("counted cover block is not an object (spec §10.3)")
-    order = int(block["temporal_order"])
+    order = _counted_int(block, "temporal_order")
+    count = _counted_int(block, "count")
+    obs_total = _counted_int(block, "obs_total")
     if not 0 <= order <= int(pin):
         raise ValueError(f"counted cover declares temporal_order {order}, outside [0, {pin}]")
     words = decode_digest(base64.b64decode(block["words"]), "uint64", ())
     obs = decode_digest(base64.b64decode(block["obs"]), "uint64", ())
-    if len(words) != len(obs) or int(block["count"]) != len(words):
+    if len(words) != len(obs) or count != len(words):
         raise ValueError(
-            f"counted cover declares {block.get('count')!r} buckets and decodes {len(words)} "
+            f"counted cover declares {count!r} buckets and decodes {len(words)} "
             f"words with {len(obs)} counts — the buffers must agree (spec §10.3)"
         )
-    if int(block["obs_total"]) != int(obs.sum()):
+    if obs_total != int(obs.sum()):
         raise ValueError(
-            f"counted cover declares obs_total {block.get('obs_total')!r} but its counts sum "
+            f"counted cover declares obs_total {obs_total!r} but its counts sum "
             f"to {int(obs.sum())} (spec §10.3)"
         )
     return CountedCover(np.asarray(words, np.uint64), np.asarray(obs, np.uint64), order)
@@ -384,8 +403,12 @@ def leaf_temporal_contribution(record: dict) -> tuple[int, CountedCover]:
     from zagg.coverage_toc import quantize_words
 
     word = int(record["word"])
-    counts = decode_counts(record["counts"])
-    cover, order = _decode_cover_block("leaf", record["cover"], _object_pin(record))
+    # Both blocks decode against the RECORD's own declared pin (§10.6 gives
+    # the record one), not against whatever this build's default happens to
+    # be — one rule for the two blocks, as §10.5's `_object_pin` intends.
+    pin = _object_pin(record)
+    counts = decode_counts(record["counts"], pin)
+    cover, order = _decode_cover_block("leaf", record["cover"], pin)
     derived, derived_order = cover_from_counts(counts)
     if order != derived_order or not np.array_equal(cover, derived):
         raise ValueError(
