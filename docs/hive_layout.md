@@ -777,8 +777,17 @@ materializes too (`source: "refresh"`) unless called with
    per-leaf cost — the backfill is precisely the regime where every leaf pays a
    column read, ~60 s/leaf measured, so CA's 2,726 leaves need 1,024 ways, not
    the 16 that died. `_handle_sweep` in `deployment/aws/lambda_handler.py`
-   states the rule and works that arithmetic; re-fire only the leaves still
-   without a record until none remain;
+   states the rule and works that arithmetic. Re-fire the leaves still without
+   a record, and stop on the pass's OWN records: when every partition's
+   `sweep_stats_{ts}_p{index}of{of}.json` reports `temporal_routes.materialized
+   == 0`, the backfill is done. "Until no record-less leaf remains" is not a
+   terminating condition — a leaf holding no temporal row never gets a record
+   (§10.6: an empty leaf publishes no temporal claim) and that is not an error,
+   so such a store never converges on it. Each re-fire also carries all four
+   default families (`stats`, `moc`, `submap`, `overview`):
+   `runner._build_sweep_event` never sets the event's `families` key, so this
+   entry point cannot scope the pass to `moc` ([issue
+   #527](https://github.com/englacial/zagg/issues/527));
 2. fire **one unpartitioned** families pass (`partitions=1`, what the runner
    tail fires anyway): it composes `coverage.moc`'s `temporal` section and
    `coverage.toc` from the records alone, in seconds;
