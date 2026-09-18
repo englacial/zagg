@@ -343,6 +343,8 @@ class _Harness:
         # store therefore shared nothing across a 2,918-leaf roster.
         self.store = open_store(self.store_root, read_only=True, **self.store_kwargs)
         self._groups: dict = {}
+        self._arrays: dict = {}
+        self._gates: dict = {}
         self._lock = threading.Lock()
         self._local = threading.local()
         self.warnings: list = []
@@ -382,6 +384,38 @@ class _Harness:
                         self.store, path=key, mode="r", zarr_format=3
                     )
         return self._groups[key]
+
+    def array(self, group, name: str):
+        """Memoized ``group[name]`` handle, or ``None`` when the array is absent.
+
+        zarr re-reads an array's ``zarr.json`` on EVERY ``group[name]``, so
+        the per-cell legs were paying a full round trip per (cell, field,
+        container) for a handful of distinct objects: on a profiled canary
+        run 2,667 of 4,807 round trips were array metadata, against 2,140
+        for actual chunks (review finding). A handle is immutable for a
+        read-only pass, so one open per (group, field) serves every cell and
+        the metadata cost drops to one GET per array. Absence is cached too
+        — a contributor lacking a declared field is asked once per artifact,
+        not once per cell (``contributions``, ``paired_contributions``).
+
+        The gate is PER ARRAY, never the harness lock: threads racing the
+        same cold handle wait for the one GET they would each have issued,
+        and threads on any other array do not wait at all. Racing on
+        ``setdefault`` alone would leave that first burst duplicating the
+        open ``workers`` times over (measured on the fixture pass: 45 opens
+        sequentially, 124 raced, against 244 with no cache at all).
+        """
+        key = (group.path, name)
+        if key not in self._arrays:
+            with self._lock:
+                gate = self._gates.setdefault(key, threading.Lock())
+            with gate:
+                if key not in self._arrays:
+                    try:
+                        self._arrays[key] = group[name]
+                    except KeyError:
+                        self._arrays[key] = None
+        return self._arrays[key]
 
     def node_group(self, node: str, t: int):
         return self._open(_node_object_rel(node), t)
@@ -433,9 +467,8 @@ class _Harness:
                 self.warn(f"contributor {container} unreadable ({exc}) — cells it covers skipped")
                 complete = False
                 continue
-            try:
-                arr = group[field]
-            except KeyError:
+            arr = self.array(group, field)
+            if arr is None:
                 self.warn(f"contributor {container} lacks field {field!r} — contributes fill")
                 continue
             start, n = self.span(cell_dec, container, src_cell_order)
@@ -464,17 +497,18 @@ class _Harness:
                 self.warn(f"contributor {container} unreadable ({exc}) — cells it covers skipped")
                 complete = False
                 continue
-            has_word, has_of = word_field in group, of_field in group
-            if has_of and not has_word:
+            word_arr = self.array(group, word_field)
+            of_arr = self.array(group, of_field)
+            if of_arr is not None and word_arr is None:
                 poisoned = True
                 continue
-            if not has_of:
+            if of_arr is None:
                 continue
             start, n = self.span(cell_dec, container, src_cell_order)
             parts.append(
                 (
-                    np.asarray(group[word_field][start : start + n]),
-                    np.asarray(group[of_field][start : start + n]),
+                    np.asarray(word_arr[start : start + n]),
+                    np.asarray(of_arr[start : start + n]),
                 )
             )
         return parts, poisoned, complete
@@ -735,17 +769,18 @@ def _check_node(
     for sibling, owner in harness.companions.items():
         if owner in absent:
             continue
-        if group[sibling].shape != group[owner].shape:
+        sibling_arr, owner_arr = harness.array(group, sibling), harness.array(group, owner)
+        if sibling_arr.shape != owner_arr.shape:
             errors["readback"].append(
-                f"{node}: companion {sibling} shape {group[sibling].shape} != "
-                f"{owner} {group[owner].shape}"
+                f"{node}: companion {sibling} shape {sibling_arr.shape} != "
+                f"{owner} {owner_arr.shape}"
             )
 
     # Populated-cell sample from the count array (count is the presence law).
     if count_meta is None:
         return
     fill = count_meta.get("fill_value", 0)
-    counts = np.asarray(group["count"][:])
+    counts = np.asarray(harness.array(group, "count")[:])
     populated = np.flatnonzero(~_missing_mask(counts, fill))
     cells = populated
     if not full and len(populated) > harness.sample_cells:
@@ -764,7 +799,7 @@ def _check_node(
     if len(cells):
         j = int(cells[0])
         cell_dec = node + _tail(j, t - k)
-        word = int(np.asarray(group["morton"][j]))
+        word = int(np.asarray(harness.array(group, "morton")[j]))
         if word != morton_word(cell_dec):
             errors["readback"].append(
                 f"{node}[{j}]: morton {word} != {morton_word(cell_dec)} for {cell_dec}"
@@ -774,7 +809,7 @@ def _check_node(
     # Composition §3.3 attrs block, once per artifact group.
     for name, meta in packed_fields.items():
         try:
-            block = dict(group[name].attrs.get("composition") or {})
+            block = dict(harness.array(group, name).attrs.get("composition") or {})
         except Exception as exc:
             errors["composition"].append(f"{node}/{name}: attrs unreadable: {exc}")
             continue
@@ -821,12 +856,12 @@ def _check_node(
             vals = (
                 np.concatenate(parts)
                 if parts
-                else np.array([], dtype=np.asarray(group[name][int(j)]).dtype)
+                else np.array([], dtype=np.asarray(harness.array(group, name)[int(j)]).dtype)
             )
             expected = _exact_expected(
                 vals, meta.get("method", "sum"), meta.get("fill_value", "NaN")
             )
-            stored = np.asarray(group[name][int(j)])[()]
+            stored = np.asarray(harness.array(group, name)[int(j)])[()]
             counted["counts"] += 1
             if expected is None:
                 if not _missing_mask(np.asarray([stored]), meta.get("fill_value", "NaN"))[0]:
@@ -841,7 +876,7 @@ def _check_node(
             if not complete:
                 continue
             payloads = [p for chunk in chunks for p in chunk.tolist() if p is not None and len(p)]
-            raw = _payload_bytes(group[name][int(j) : int(j) + 1][0])
+            raw = _payload_bytes(harness.array(group, name)[int(j) : int(j) + 1][0])
             counted["digests"] += 1
             if not payloads:
                 if len(raw):
@@ -888,7 +923,7 @@ def _check_node(
                 expected_word = parts[0][0]
             else:
                 expected_word = merge_composition_kway(parts)
-            stored_word = int(np.asarray(group[name][int(j)]))
+            stored_word = int(np.asarray(harness.array(group, name)[int(j)]))
             counted["composition"] += 1
             if stored_word != expected_word:
                 errors["composition"].append(
@@ -901,10 +936,10 @@ def _check_node(
     # One empty cell keeps its fills across every field.
     if empty_cell is not None:
         for name in packed_fields:
-            if int(np.asarray(group[name][empty_cell])) != 0:
+            if int(np.asarray(harness.array(group, name)[empty_cell])) != 0:
                 errors["composition"].append(f"{node}[{empty_cell}]/{name}: empty cell word != 0")
         for name in digest_fields:
-            if len(_payload_bytes(group[name][empty_cell : empty_cell + 1][0])):
+            if len(_payload_bytes(harness.array(group, name)[empty_cell : empty_cell + 1][0])):
                 errors["digests"].append(f"{node}[{empty_cell}]/{name}: empty cell has a digest")
 
     # ... and the fill side of the presence law: no contributor may carry data.

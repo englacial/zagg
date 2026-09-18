@@ -435,7 +435,7 @@ def _ladder_totals(harness, ladder, materialized, leaves, count_meta, errors, co
         out, complete = 0, True
         for name in names:
             try:
-                values = np.asarray(opener(name)["count"][:])
+                values = np.asarray(harness.array(opener(name), "count")[:])
             except Exception as exc:
                 # A stale root MOC can name a leaf that is gone (D9 cache):
                 # skipped and named, never a traceback out of a read-only run.

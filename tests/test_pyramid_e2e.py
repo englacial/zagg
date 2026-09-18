@@ -510,6 +510,56 @@ class TestHarnessHandles:
         assert {id(g.store_path.store) for g in groups} == {id(harness.store)}
         assert len({g.path for g in groups}) == len(LEAVES)  # ... distinct groups on it
 
+    def test_array_handles_are_memoized(self, tmp_path, monkeypatch):
+        """One ``group[name]`` per (group, field), not one per cell.
+
+        zarr re-reads the array's ``zarr.json`` on every ``group[name]``, and
+        the per-cell legs do one per (cell, field, container): 2,667 of 4,807
+        round trips on a profiled canary run were array metadata (review
+        finding). The handle is immutable for a read-only pass, so it is
+        opened once — absence included, which ``contributions`` asks per
+        container per cell.
+        """
+        from zagg.pyramid_check_core import _Harness
+
+        manifest = _build_store(tmp_path)
+        gets = []
+        real_getitem = zarr.Group.__getitem__
+
+        def counting_getitem(self, name):
+            gets.append((self.path, name))
+            return real_getitem(self, name)
+
+        monkeypatch.setattr(zarr.Group, "__getitem__", counting_getitem)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=8
+        )
+        group = harness.leaf_group("-311")
+        handles = [harness.array(group, "count") for _ in range(5)]
+        assert len({id(h) for h in handles}) == 1
+        assert gets == [(group.path, "count")]
+        assert [harness.array(group, "no_such_field") for _ in range(3)] == [None] * 3
+        assert gets.count((group.path, "no_such_field")) == 1  # absence is cached too
+        # ... and a second group's field is its own entry, never the first's.
+        other = harness.leaf_group("-312")
+        assert harness.array(other, "count") is not handles[0]
+
+    def test_a_full_pass_opens_each_array_once(self, tmp_path, monkeypatch):
+        """The property that matters at roster scale: no repeated handle opens."""
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        gets = []
+        real_getitem = zarr.Group.__getitem__
+
+        def counting_getitem(self, name):
+            gets.append((self.path, name))
+            return real_getitem(self, name)
+
+        monkeypatch.setattr(zarr.Group, "__getitem__", counting_getitem)
+        report = validate_pyramid(str(tmp_path), full=True, workers=8)
+        assert report["passed"], format_report(report)
+        assert gets and len(gets) == len(set(gets))
+
 
 class TestLadderGrammars:
     """The read-side follows either pyramid grammar's ladder."""
