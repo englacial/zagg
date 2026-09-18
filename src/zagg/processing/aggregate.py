@@ -990,7 +990,14 @@ def _aggregate_chunk_cells(
         else None
     )
     if temporal_out is not None and cell_toc:
-        temporal_out.add_words(np.concatenate(list(cell_toc.values())))
+        # Feed the per-cell VIEWS the encode above already sliced, not a
+        # concatenation of them: ``_chunk_toc_words`` built the chunk's words
+        # in one flat pass, so concatenating its slices back together bought a
+        # second chunk-sized uint64 array for bytes that are already
+        # contiguous. The accumulator batches the feeds itself and folds at
+        # ``FOLD_ROWS``, so the only array built here is that bounded fold's.
+        for cell_words in cell_toc.values():
+            temporal_out.add_words(cell_words)
 
     # Batch the per-centroid companion folds across the loop (issue #476): each
     # ``build_tdigest`` inside defers its ``toc_reduce``/``common_ancestor``

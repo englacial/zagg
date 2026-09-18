@@ -1235,7 +1235,7 @@ class TestLeafTemporalFold:
         assert int(acc.finish()[1].obs.sum()) == meta["total_obs"] == 750
         assert len(sizes) > 1 and max(sizes) <= 64 + 50 < meta["total_obs"]
 
-    def test_k_gt_1_pooled_feeds_one_array_per_populated_chunk(self, monkeypatch):
+    def test_k_gt_1_pooled_feeds_are_bounded_by_the_chunk(self, monkeypatch):
         from zagg.leaf_temporal import LeafTemporalAccumulator
 
         cfg = _config(variables=_companion_variables(), output=_TIME_SOURCE)
@@ -1251,7 +1251,15 @@ class TestLeafTemporalFold:
         _run(monkeypatch, cfg, grid, key, list(dfs), chunk_results=sink, temporal_out=acc)
         expected = self._expected(dfs)
         self._assert_fold(acc.finish(), dfs, expected, expected[2])
-        assert len(fed) == 4 and max(fed) < expected[2]  # one feed per chunk, none the shard
+        # The feeds are the per-cell VIEWS of each chunk's one flat encode (no
+        # concatenated copy of the chunk), so there is one per populated cell:
+        # cells 0 and 5 in chunk 0, 20 in chunk 1, 40 in chunk 2, 60 and 63 in
+        # chunk 3, at 50 rows per cell per granule. Every feed is bounded by
+        # its own chunk's rows — the fattest chunk is 0's 150 — and none is the
+        # shard; what the accumulator actually folds is bounded separately, by
+        # ``FOLD_ROWS`` (``test_the_fold_never_sees_the_whole_shard``).
+        assert len(fed) == 6 and sum(fed) == expected[2]
+        assert max(fed) <= 150 < expected[2]
 
     def test_two_temporal_fields_count_once_per_observation(self, monkeypatch):
         """The two §10 producers disagree on `n_obs` for a MULTI-field store.
