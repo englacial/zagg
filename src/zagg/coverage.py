@@ -281,12 +281,12 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         build_cover_section,
         build_temporal_section,
         read_cover,
-        read_leaf_temporal,
         temporal_cell_order,
         temporal_fields,
         write_cover,
     )
     from zagg.grids.morton import morton_words_from_decimals
+    from zagg.leaf_temporal import leaf_contribution
     from zagg.store import open_store, put_object
 
     manifest = read_manifest(store_root, **store_kwargs)
@@ -386,7 +386,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 decimals.append(decimal)
                 if toc_fields and decimal not in toc_failed:
                     try:
-                        got = read_leaf_temporal(
+                        got, _route = leaf_contribution(
                             f"{root}/{rel}", cell_order, toc_fields, **store_kwargs
                         )
                     except Exception as e:  # fail-open: the section is a cache

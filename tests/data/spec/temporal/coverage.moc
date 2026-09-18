@@ -3,7 +3,7 @@
  "encoding": "ranges",
  "order": 4,
  "source": "sweep",
- "generated_at": "2026-09-18T03:25:23+00:00",
+ "generated_at": "2026-09-18T04:22:19+00:00",
  "ranges": [
   [
    "11213",
@@ -13,7 +13,7 @@
  "temporal": {
   "spec": "zagg-coverage-toc/1",
   "source": "sweep",
-  "generated_at": "2026-09-18T03:25:23+00:00",
+  "generated_at": "2026-09-18T04:22:19+00:00",
   "fields": [
    "h_tdigest"
   ],
@@ -31,7 +31,7 @@
    },
    "encoding": "base64",
    "words": "AO0rSgDZV5SA7StKANpXlIB2LUoA7FqUAHctSgDtWpSAdy1KAO5alA==",
-   "obs": "KQAAAAAAAAAFAAAAAAAAAFQAAAAAAAAAtwAAAAAAAAAhAAAAAAAAAA==",
+   "obs": "KQAAAAAAAAAFAAAAAAAAAFkAAAAAAAAAuAAAAAAAAAAbAAAAAAAAAA==",
    "count": 5,
    "obs_total": 346
   },

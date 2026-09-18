@@ -2020,32 +2020,37 @@ class TestRootCoverageTemporalSection:
         for t in internal:
             assert bool(np.asarray(toc_overlaps(np.array([word]), int(t), int(t) + 1))[0])
 
-    def test_every_centroid_lands_in_the_bucket_of_its_representative_instant(self):
-        """§10.3: a centroid counts at its §8.3 word's representative instant.
+    def test_the_root_block_is_the_leaf_records_exact_counts(self):
+        """§10.3 via §10.6: the sweep composes the root from the leaf record.
 
-        On this fixture the sweep's raw route built the block from the leaf's
-        per-centroid companions: a weight-1 centroid is an exact timestamp
-        and a merged one counts, whole, at its envelope's midpoint. Derived
-        here from the committed leaf words and weights — never from the
-        block — so a writer that bucketed the wrong thing fails.
+        On this one-leaf store the root block therefore IS the worker's
+        counted cover — every observation in its own exact bucket (the
+        generator's per-instant expectation, never read back) — and NOT the
+        midpoint-bucketed fold a raw-route backfill would produce from the
+        per-centroid companions: on this fixture the two differ on three of
+        the five buckets, which is what makes the record-first route visible.
         """
         from mortie import toc2time
 
         from zagg.leaf_temporal import count_words
 
         exp = _expected("temporal")
+        block = self._envelope()["temporal"]["counts"]
+        counts = coverage_toc_counts(self._envelope())
+        assert [str(int(w)) for w in counts.words] == exp["leaf_temporal"]["counts"]["words"]
+        assert counts.obs.tolist() == exp["leaf_temporal"]["counts"]["obs"]
+        assert block["obs_total"] == exp["leaf_temporal"]["n_obs"]
         words = np.concatenate(
             [np.array(cell["h_tdigest_times"], dtype=np.uint64) for cell in exp["cells"]]
         )
         weights = np.concatenate(
             [np.array(cell["h_tdigest"], dtype=np.float64)[:, 1] for cell in exp["cells"]]
         )
-        block = self._envelope()["temporal"]["counts"]
-        expect = count_words(words, weights, block["temporal_order"])
-        counts = coverage_toc_counts(self._envelope())
-        np.testing.assert_array_equal(counts.words, expect.words)
-        np.testing.assert_array_equal(counts.obs, expect.obs)
-        # ... and every one of those instants overlaps a counted bucket.
+        backfill = count_words(words, weights, block["temporal_order"])
+        np.testing.assert_array_equal(counts.words, backfill.words)  # same buckets ...
+        assert not np.array_equal(counts.obs, backfill.obs)  # ... exact, not midpoint, counts
+        assert int(backfill.obs.sum()) == int(counts.obs.sum())
+        # And every centroid's representative instant overlaps a counted bucket.
         start, end = (np.atleast_1d(np.asarray(x, np.uint64)) for x in toc2time(words))
         mid = start + (end - start) // np.uint64(2)
         b_start, b_end = (np.atleast_1d(np.asarray(x, np.uint64)) for x in toc2time(counts.words))

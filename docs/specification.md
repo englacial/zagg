@@ -3434,7 +3434,10 @@ which is that rule pinned as bytes.
 - **`fields`** (required) — the sorted payload field names whose clock the
   record folds: for a worker record every `"per-centroid"` field the config
   declares, for a sweep record the fields it read. Provenance, with §10.1
-  `fields` semantics.
+  `fields` semantics — and a staleness gate: a reader MAY treat a record
+  whose `fields` omit a field the manifest declares as absent (the field
+  postdates it) and re-derive over the union; zagg's sweep does, and
+  materializes the re-derived record in its place.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
   MUST equal the counts block's `obs_total`: for a worker record the number
   of clocked observations the leaf aggregated, **once per observation** (the

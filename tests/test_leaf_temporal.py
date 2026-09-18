@@ -13,6 +13,7 @@ regimes) is in ``test_spill.py``.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,7 @@ from zagg.leaf_temporal import (
     cover_from_counts,
     decode_counts,
     encode_counts,
+    leaf_contribution,
     leaf_temporal_contribution,
     load_leaf_temporal,
     merge_counts,
@@ -437,3 +439,240 @@ class TestArming:
             "temporal": "per-cell",
         }
         assert armed(cfg) is False
+
+
+# ── the sweep's route: record first, chunked raw fallback, materialize once ──
+
+SPEC_DATA = Path(__file__).parent / "data" / "spec"
+SHARD = "11213"
+
+
+def _fixture_copy(tmp_path) -> str:
+    dst = tmp_path / "temporal"
+    shutil.copytree(SPEC_DATA / "temporal", dst)
+    return str(dst)
+
+
+def _leaf_of(root: str, decimal: str = SHARD) -> str:
+    from zagg.grids.morton import morton_word
+    from zagg.hive import shard_leaf_path
+
+    return shard_leaf_path(root, int(morton_word(decimal)))
+
+
+def _declared(root: str):
+    from zagg.coverage_toc import temporal_cell_order, temporal_fields
+
+    manifest = json.loads((Path(root) / "morton_hive.json").read_text())
+    return temporal_cell_order(manifest), temporal_fields(manifest)
+
+
+def _boom(*_a, **_k):
+    raise AssertionError("the raw route must not run here")
+
+
+class TestSweepRoute:
+    """§10.6 as the sweep sees it: one GET per leaf, the leaf only when it must."""
+
+    def test_the_record_is_read_first_and_no_array_is_opened(self, tmp_path, monkeypatch):
+        import zagg.coverage_toc as toc
+
+        root = _fixture_copy(tmp_path)
+        cell_order, fields = _declared(root)
+        monkeypatch.setattr(toc, "read_leaf_temporal", _boom)
+        got, route = leaf_contribution(_leaf_of(root), cell_order, fields)
+        assert route == "record"
+        word, counts = leaf_temporal_contribution(read_leaf_temporal_record(_leaf_of(root)))
+        assert got[0] == word
+        _same(got[1], counts)
+
+    def test_the_section_composes_from_the_record_alone(self, tmp_path, monkeypatch):
+        import zagg.coverage_toc as toc
+        from zagg.coverage_toc import cover_words, coverage_toc, coverage_toc_counts, read_cover
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        root = _fixture_copy(tmp_path)
+        (Path(root) / "coverage.moc").unlink()
+        (Path(root) / "coverage.toc").unlink()
+        monkeypatch.setattr(toc, "read_leaf_temporal", _boom)
+        summary = run_sweep(root, [(int(morton_word(SHARD)), None)], families=["moc"], record=False)
+        assert summary["families"]["moc"]["temporal_shards"] == 1
+        record = read_leaf_temporal_record(_leaf_of(root))
+        word, counts = leaf_temporal_contribution(record)
+        envelope = read_root_coverage(root)
+        assert coverage_toc(envelope) == {SHARD: word}
+        _same(coverage_toc_counts(envelope), counts)
+        cover, _order = cover_from_counts(counts)
+        np.testing.assert_array_equal(cover_words(read_cover(root))[SHARD], cover)
+
+    def test_a_missing_record_is_materialized_once(self, tmp_path, monkeypatch):
+        import zagg.coverage_toc as toc
+
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        (Path(leaf) / LEAF_TEMPORAL_NAME).unlink()
+        raw = toc.read_leaf_temporal(leaf, cell_order, fields)
+        got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "materialized"
+        assert got[0] == raw[0]
+        _same(got[1], raw[1])
+        record = read_leaf_temporal_record(leaf)
+        assert record["source"] == "sweep" and record["fields"] == sorted(fields)
+        assert record["n_obs"] == int(raw[1].obs.sum())
+        # The next pass finds it and never opens an array.
+        monkeypatch.setattr(toc, "read_leaf_temporal", _boom)
+        again, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "record" and again[0] == got[0]
+        _same(again[1], got[1])
+
+    def test_materialize_off_reads_raw_and_writes_nothing(self, tmp_path):
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        (Path(leaf) / LEAF_TEMPORAL_NAME).unlink()
+        got, route = leaf_contribution(leaf, cell_order, fields, materialize=False)
+        assert route == "raw" and got is not None
+        assert not (Path(leaf) / LEAF_TEMPORAL_NAME).exists()
+
+    def test_a_foreign_revision_record_is_preserved_and_bypassed(self, tmp_path):
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        future = {"spec": "zagg-leaf-temporal/9", "word": "1"}
+        (Path(leaf) / LEAF_TEMPORAL_NAME).write_text(json.dumps(future))
+        got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "raw" and got is not None
+        assert read_leaf_temporal_record(leaf) == future
+
+    @pytest.mark.parametrize("damage", ["not json {", "n_obs", "fields", "unmarked"])
+    def test_debris_and_stale_records_are_replaced(self, tmp_path, damage, caplog):
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        path = Path(leaf) / LEAF_TEMPORAL_NAME
+        if damage == "not json {":
+            path.write_bytes(damage.encode())
+        else:
+            record = json.loads(path.read_text())
+            if damage == "n_obs":
+                record["n_obs"] += 1  # inconsistent with its own counts
+            elif damage == "fields":
+                record["fields"] = []  # predates the declared field
+            else:
+                record.pop("spec")  # claims no revision at all
+            path.write_text(json.dumps(record))
+        got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "materialized" and got is not None
+        fresh = read_leaf_temporal_record(leaf)
+        assert fresh["source"] == "sweep" and fresh["fields"] == sorted(fields)
+        assert leaf_temporal_contribution(fresh)[0] == got[0]
+
+    def test_a_materialization_failure_is_fail_open(self, tmp_path, monkeypatch, caplog):
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        (Path(leaf) / LEAF_TEMPORAL_NAME).unlink()
+
+        def refuse(*_a, **_k):
+            raise OSError("access denied")
+
+        monkeypatch.setattr(leaf_temporal, "write_leaf_temporal", refuse)
+        with caplog.at_level("WARNING"):
+            got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "raw" and got is not None
+        assert "fail-open" in caplog.text
+        assert not (Path(leaf) / LEAF_TEMPORAL_NAME).exists()
+
+    def test_the_raw_route_reads_one_chunk_at_a_time(self, tmp_path, monkeypatch):
+        """The memory shape issue #575 fixes: never a whole column, one chunk."""
+        import zarr
+
+        from zagg.coverage_toc import read_leaf_temporal
+
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        fed: list[int] = []
+        add = LeafTemporalAccumulator.add_weighted
+        monkeypatch.setattr(
+            LeafTemporalAccumulator,
+            "add_weighted",
+            lambda self, w, x: (fed.append(len(w)), add(self, w, x)),
+        )
+        slices: list[int] = []
+        getitem = zarr.Array.__getitem__
+
+        def spy(self, key):
+            if isinstance(key, slice):
+                slices.append((key.stop or self.shape[0]) - (key.start or 0))
+            return getitem(self, key)
+
+        monkeypatch.setattr(zarr.Array, "__getitem__", spy)
+        word, counts = read_leaf_temporal(leaf, cell_order, fields)
+        expected = json.loads((SPEC_DATA / "temporal.expected.json").read_text())
+        chunk_rows = expected["cells_per_chunk"]
+        populated_chunks = {c["index"] // chunk_rows for c in expected["cells"]}
+        # One feed per populated chunk, every slice at most one chunk long.
+        assert len(fed) == len(populated_chunks) and slices
+        assert max(slices) <= chunk_rows
+        assert sum(fed) == sum(len(c["h_tdigest_times"]) for c in expected["cells"])
+        assert int(counts.obs.sum()) == expected["root_coverage"]["obs_total"]
+
+    def test_a_partitioned_pass_backfills_and_the_unpartitioned_pass_composes(
+        self, tmp_path, monkeypatch
+    ):
+        """The operator path for a store written before the record (issue #575).
+
+        A partitioned families pass cannot write the section (its finish is
+        deferred) but it CAN materialize every leaf's record; the
+        unpartitioned pass the runner tail fires then composes the section
+        from records alone — no raw column read at all.
+        """
+        import zagg.coverage_toc as toc
+        from zagg.coverage_toc import coverage_toc_counts
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        root = _fixture_copy(tmp_path)
+        other = "11214"
+        shutil.copytree(_leaf_of(root), _leaf_of(root, other))
+        for decimal in (SHARD, other):
+            (Path(_leaf_of(root, decimal)) / LEAF_TEMPORAL_NAME).unlink()
+        (Path(root) / "coverage.moc").unlink()
+        (Path(root) / "coverage.toc").unlink()
+        leaves = [(int(morton_word(SHARD)), None), (int(morton_word(other)), None)]
+        for index in range(4):
+            summary = run_sweep(
+                root, leaves, families=["moc"], record=False, partition={"index": index, "of": 4}
+            )
+            assert summary["families"]["moc"].get("finish_deferred", True) is True
+            assert "root_moc_written" not in summary["families"]["moc"]
+        assert not (Path(root) / "coverage.moc").exists()
+        for decimal in (SHARD, other):
+            record = read_leaf_temporal_record(_leaf_of(root, decimal))
+            assert record is not None and record["source"] == "sweep"
+        monkeypatch.setattr(toc, "read_leaf_temporal", _boom)
+        summary = run_sweep(root, leaves, families=["moc"], record=False)
+        assert summary["families"]["moc"]["root_moc_written"] is True
+        assert summary["families"]["moc"]["temporal_shards"] == 2
+        envelope = read_root_coverage(root)
+        assert set(envelope["temporal"]["shards"]) == {SHARD, other}
+        expected = json.loads((SPEC_DATA / "temporal.expected.json").read_text())
+        assert (
+            int(coverage_toc_counts(envelope).obs.sum())
+            == 2 * expected["root_coverage"]["obs_total"]
+        )
+
+    def test_refresh_reads_records_too(self, tmp_path, monkeypatch):
+        import zagg.coverage_toc as toc
+        from zagg.coverage import refresh_root_coverage
+
+        root = _fixture_copy(tmp_path)
+        monkeypatch.setattr(toc, "read_leaf_temporal", _boom)
+        envelope = refresh_root_coverage(root)
+        assert envelope["temporal"]["source"] == "refresh"
+        assert set(envelope["temporal"]["shards"]) == {SHARD}

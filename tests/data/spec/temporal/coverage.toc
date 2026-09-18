@@ -1,7 +1,7 @@
 {
  "spec": "zagg-coverage-toc-cover/1",
  "source": "sweep",
- "generated_at": "2026-09-18T03:25:23+00:00",
+ "generated_at": "2026-09-18T04:22:19+00:00",
  "order": 4,
  "temporal_order": 24,
  "cap": 512,

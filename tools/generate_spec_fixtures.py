@@ -657,6 +657,7 @@ def _expected_multiscales(levels: list, s: int) -> list:
         }
     ]
 
+
 def build_demoted(out: Path) -> None:
     """The §4.3 ``demotions`` fixture (issue #518): the packed rail, recorded.
 
@@ -1575,13 +1576,16 @@ def build_temporal(out: Path) -> None:
     # every one of its words overlaps the root sibling's word set.
     for lo, hi in zip(*(np.atleast_1d(x) for x in toc2time(leaf_cover)), strict=True):
         assert bool(np.any(np.atleast_1d(toc_overlaps(expect_cover, int(lo), int(hi)))))
-    # The §10.3 root tier, from this one leaf's raw companions (the sweep's
-    # route in this revision): the writer's own block read back, pinned like
-    # the digest before it — with its total DERIVED from the cell plan.
+    # The §10.3 root tier composes from the leaf record (the sweep's
+    # record-first route, issue #575), so on this one-leaf store it IS the
+    # record's counted cover — derived from the instants above, never read
+    # back — and its total is the cell plan's.
     from zagg.coverage_toc import coverage_toc_counts
 
     root_counts = coverage_toc_counts(envelope)
     assert root_counts is not None and root_counts.order == TEMPORAL_COVER_ORDER
+    assert np.array_equal(root_counts.words, expect_counts.words), root_counts
+    assert np.array_equal(root_counts.obs, expect_counts.obs), root_counts
     assert int(root_counts.obs.sum()) == sum(c["count"] for c in expected_cells)
 
     expected = {
@@ -1605,9 +1609,9 @@ def build_temporal(out: Path) -> None:
             "shards": {SHARD_KEY: str(shard_word)},
             "obs_total": sum(c["count"] for c in expected_cells),
             "counts": {
-                "temporal_order": root_counts.order,
-                "words": [str(int(w)) for w in root_counts.words],
-                "obs": [int(n) for n in root_counts.obs],
+                "temporal_order": TEMPORAL_COVER_ORDER,
+                "words": [str(int(w)) for w in expect_counts.words],
+                "obs": [int(n) for n in expect_counts.obs],
             },
         },
         # The §10.5 sibling: the object name, its markers, and the DERIVED

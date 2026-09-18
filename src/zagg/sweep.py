@@ -176,8 +176,10 @@ class MocFamily(SweepFamily):
 
     The spec §10 TEMPORAL section (issue #480) rides this same walk: every
     stamped leaf of a temporal-declaring store also yields its §8.3 toc
-    envelope word and its §10.3 counted cover
-    (:func:`zagg.coverage_toc.read_leaf_temporal`), accumulated on the family
+    envelope word and its §10.3 counted cover — from the leaf's own
+    ``temporal.toc`` record where one stands, else read back from its raw
+    companions one chunk at a time and materialized as that record
+    (:func:`zagg.leaf_temporal.leaf_contribution`, issue #575) — accumulated on the family
     INSTANCE — one per run, since :func:`get_family` constructs a fresh one —
     and folded into the section :meth:`finish` writes. It stays OUT of the
     per-node rollup payloads on purpose: those are the skip-if-current
@@ -197,6 +199,9 @@ class MocFamily(SweepFamily):
         #: Shards whose temporal read failed: dropped from the map entirely,
         #: never published from the window leaves that did read (issue #480).
         self._temporal_failed: set[str] = set()
+        #: How each leaf's contribution was obtained (issue #575): from its
+        #: record, from the raw route and materialized, or raw only.
+        self._temporal_routes: dict[str, int] = {"record": 0, "materialized": 0, "raw": 0}
         #: Resolved once, on the first leaf read; ``None`` until then.
         self._temporal_fields: dict | None = None
         self._cell_order = 0
@@ -218,7 +223,8 @@ class MocFamily(SweepFamily):
         candidate), which is always safe, while a shard listed with a partial
         word is not.
         """
-        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.coverage_toc import temporal_cell_order, temporal_fields
+        from zagg.leaf_temporal import leaf_contribution
 
         if self._temporal_fields is None:
             from zagg.hive import read_manifest
@@ -236,7 +242,9 @@ class MocFamily(SweepFamily):
         if not self._temporal_fields or decimal in self._temporal_failed:
             return
         try:
-            got = read_leaf_temporal(leaf, self._cell_order, self._temporal_fields, **store_kwargs)
+            got, route = leaf_contribution(
+                leaf, self._cell_order, self._temporal_fields, **store_kwargs
+            )
         except Exception as e:
             logger.warning(
                 f"sweep[moc]: dropping shard {decimal} from the temporal section — "
@@ -245,6 +253,7 @@ class MocFamily(SweepFamily):
             self._temporal_failed.add(decimal)
             self._temporal.pop(decimal, None)
             return
+        self._temporal_routes[route] += 1
         if got is not None:
             self._temporal.setdefault(decimal, []).append(got)
 

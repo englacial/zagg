@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 from mortie import span2toc, time2toc, toc_merge, toc_overlaps, toc_reduce
 
+from zagg import leaf_temporal as leaf_temporal_module
 from zagg.coverage import refresh_root_coverage
 from zagg.coverage_toc import (
     COVER_CAP,
@@ -74,6 +75,22 @@ def _leaf(seed: int, n: int = 12):
 
 def _total(contributions) -> int:
     return sum(int(part[1].obs.sum()) for parts in contributions.values() for part in parts)
+
+
+def _route(reader):
+    """Install ``reader`` at the sweep's per-leaf seam (``leaf_contribution``).
+
+    A reader returning a bare contribution is reported as the record route;
+    one returning ``(contribution, route)`` (the real seam) passes through.
+    """
+
+    def seam(leaf, *args, **kwargs):
+        got = reader(leaf, *args, **kwargs)
+        if isinstance(got, tuple) and len(got) == 2 and isinstance(got[1], str):
+            return got
+        return got, "record"
+
+    return seam
 
 
 def _contributions(seeds):
@@ -301,7 +318,6 @@ class TestPartialReadsDropTheShard:
     """
 
     def test_a_failed_window_leaf_drops_its_whole_shard(self, monkeypatch):
-        import zagg.coverage_toc as toc_module
         from zagg.sweep import MocFamily
 
         def reader(leaf, *args, **kwargs):
@@ -309,7 +325,7 @@ class TestPartialReadsDropTheShard:
                 raise OSError("truncated companion")
             return _leaf(1)
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         family = MocFamily()
         family._temporal_fields = {"h_tdigest": {"sibling": "h_tdigest_times"}}
         family._accumulate_temporal("root", "11213", "root/11213_2019.zarr", {})
@@ -746,18 +762,17 @@ class TestOnCommittedStores:
             read_leaf_temporal(leaf, int(manifest["cell_order"]), fields)
 
     def test_refresh_drops_only_the_shard_whose_leaf_failed(self, tmp_path, monkeypatch):
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         self._clone_shard(root)
-        real = toc_module.read_leaf_temporal
+        real = leaf_temporal_module.leaf_contribution
 
         def reader(leaf, *args, **kwargs):
             if "11214" in leaf:
                 raise OSError("truncated companion")
             return real(leaf, *args, **kwargs)
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         envelope = refresh_root_coverage(root)
         # The spatial walk still lists both shards; the temporal map lists
         # only the one it could read whole (§10.2's unknown-not-empty rule).
@@ -854,7 +869,6 @@ class TestOnCommittedStores:
         with the ``temporal`` key gone — during exactly the incident an
         operator reached for refresh to repair.
         """
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         standing = json.loads((Path(root) / "coverage.moc").read_text())["temporal"]
@@ -863,7 +877,7 @@ class TestOnCommittedStores:
         def reader(*args, **kwargs):
             raise OSError("credentials expired mid-walk")
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         envelope = refresh_root_coverage(root)
         assert envelope["ranges"]  # the spatial refresh still succeeded
         assert envelope["temporal"] == standing
@@ -881,7 +895,6 @@ class TestOnCommittedStores:
         would be this revision editing another's bytes at the one seam a
         mixed-version fleet actually meets.
         """
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         moc = Path(root) / "coverage.moc"
@@ -894,7 +907,7 @@ class TestOnCommittedStores:
         def reader(*args, **kwargs):
             raise OSError("credentials expired mid-walk")
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         rebuilt = refresh_root_coverage(root)["temporal"]
         assert rebuilt == standing  # byte for byte, marker included
         assert COVER_KEY not in rebuilt
@@ -902,20 +915,19 @@ class TestOnCommittedStores:
     def test_refresh_composes_a_partial_rebuild_with_the_standing_section(
         self, tmp_path, monkeypatch
     ):
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         self._clone_shard(root)
         refresh_root_coverage(root)  # both shards land in the standing section
         standing_cover = read_cover(root)
-        real = toc_module.read_leaf_temporal
+        real = leaf_temporal_module.leaf_contribution
 
         def reader(leaf, *args, **kwargs):
             if "11214" in leaf:
                 raise OSError("truncated companion")
             return real(leaf, *args, **kwargs)
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         envelope = refresh_root_coverage(root)
         # The shard the walk could not read keeps the word the last whole walk
         # published: a partial rebuild composes, it does not overwrite.

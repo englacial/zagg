@@ -455,6 +455,64 @@ def read_leaf_temporal_record(leaf_root: str, **store_kwargs) -> dict | None:
     return _read_json(open_object_store(leaf_root, **store_kwargs), LEAF_TEMPORAL_NAME)
 
 
+def leaf_contribution(
+    leaf_root: str, cell_order: int, fields: dict, *, materialize: bool = True, **store_kwargs
+):
+    """One leaf's ``(word, counts)`` — record first — and the route it took.
+
+    The families sweep's per-leaf read (issue #575). Returns
+    ``(contribution, route)``: the decoded record with ``"record"`` when the
+    leaf carries a readable ``temporal.toc`` at this revision whose
+    ``fields`` cover every declared field (one small GET, no array opened);
+    otherwise the raw route — :func:`zagg.coverage_toc.read_leaf_temporal`,
+    one ragged chunk at a time — with ``"raw"``, or ``"materialized"`` when
+    ``materialize`` is set and the record it computed was written back
+    (``source: "sweep"``), so a store written before the record existed
+    backfills once and converges across partitioned re-fires.
+    ``contribution`` is ``None`` for a leaf holding no temporal row.
+
+    Succession and debris follow §10.4/§10.6: a record at a FOREIGN revision
+    is preserved (raw route, never overwritten); an unparsable or
+    inconsistent one is debris the materialized record replaces; one whose
+    ``fields`` omit a declared field is stale (the field postdates it) and
+    is re-derived over the union. Materialization is fail-open (D9): a write
+    that fails is logged and the contribution still returns.
+    """
+    from zagg.coverage_toc import read_leaf_temporal
+
+    foreign = False
+    try:
+        raw = read_leaf_temporal_record(leaf_root, **store_kwargs)
+    except ValueError as e:
+        logger.warning(f"leaf temporal: {leaf_root} record is not JSON ({e}) — re-deriving")
+        raw = None
+    record = load_leaf_temporal(raw)
+    if record is not None:
+        if set(record.get("fields") or []) >= set(fields):
+            try:
+                return leaf_temporal_contribution(record), "record"
+            except (KeyError, TypeError, ValueError) as e:
+                logger.warning(f"leaf temporal: {leaf_root} record is debris ({e}) — re-deriving")
+        else:
+            logger.info(
+                f"leaf temporal: {leaf_root} record predates a declared field — re-deriving"
+            )
+    elif isinstance(raw, dict) and isinstance(raw.get("spec"), str) and raw["spec"]:
+        # An unknown revision: read the leaf, and leave the object alone.
+        foreign = True
+    got = read_leaf_temporal(leaf_root, cell_order, fields, **store_kwargs)
+    if got is None or not materialize or foreign:
+        return got, "raw"
+    try:
+        write_leaf_temporal(
+            leaf_root, build_leaf_temporal(*got, fields, source="sweep"), **store_kwargs
+        )
+    except Exception as e:
+        logger.warning(f"leaf temporal: could not materialize {leaf_root} (fail-open, D9): {e}")
+        return got, "raw"
+    return got, "materialized"
+
+
 __all__ = [
     "FOLD_ROWS",
     "LEAF_TEMPORAL_NAME",
@@ -469,6 +527,7 @@ __all__ = [
     "cover_from_counts",
     "decode_counts",
     "encode_counts",
+    "leaf_contribution",
     "leaf_temporal_contribution",
     "load_leaf_temporal",
     "merge_counts",
