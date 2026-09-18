@@ -272,8 +272,10 @@ class MocFamily(SweepFamily):
             self._temporal.setdefault(decimal, []).append(got)
 
     def summary(self) -> dict:
-        # ``temporal: {records, materialized, raw}`` (issue #575): how this pass
-        # obtained each leaf's contribution. Gated on the DECLARATION, not on
+        # ``temporal_routes: {records, materialized, raw}`` (issue #575): how
+        # this pass obtained each leaf's contribution — named apart from the
+        # root object's §10 ``temporal`` section and from ``temporal_shards``,
+        # neither of which it reconciles with. Gated on the DECLARATION, not on
         # the tally: ``_temporal_fields`` is ``None`` until the first leaf read
         # and ``{}`` on a non-temporal store, so a non-temporal store's sweep
         # record stays as it was and a partition that visited no leaf still
@@ -285,7 +287,7 @@ class MocFamily(SweepFamily):
             return {}
         routes = self._temporal_routes
         return {
-            "temporal": {
+            "temporal_routes": {
                 "records": routes["record"],
                 "materialized": routes["materialized"],
                 "raw": routes["raw"],

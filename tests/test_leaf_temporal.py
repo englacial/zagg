@@ -689,8 +689,8 @@ class TestSweepRoute:
             assert "root_moc_written" not in moc
             # The route telemetry rides the deferred pass too — that is where
             # the backfill happens (phase 3, issue #575).
-            materialized += moc.get("temporal", {}).get("materialized", 0)
-            assert moc.get("temporal", {}).get("records", 0) == 0
+            materialized += moc.get("temporal_routes", {}).get("materialized", 0)
+            assert moc.get("temporal_routes", {}).get("records", 0) == 0
         assert materialized == 2
         assert not (Path(root) / "coverage.moc").exists()
         for decimal in (SHARD, other):
@@ -700,7 +700,7 @@ class TestSweepRoute:
         summary = run_sweep(root, leaves, families=["moc"], record=False)
         assert summary["families"]["moc"]["root_moc_written"] is True
         assert summary["families"]["moc"]["temporal_shards"] == 2
-        assert summary["families"]["moc"]["temporal"] == {
+        assert summary["families"]["moc"]["temporal_routes"] == {
             "records": 2,
             "materialized": 0,
             "raw": 0,
@@ -776,7 +776,7 @@ class TestSweepRoute:
         summary = run_sweep(
             str(root), [(int(morton_word(SHARD)), None)], families=["moc"], record=False
         )
-        assert "temporal" not in summary["families"]["moc"]
+        assert "temporal_routes" not in summary["families"]["moc"]
         assert "temporal_shards" not in summary["families"]["moc"]
 
     def test_a_pass_that_published_nothing_still_reports_zeros(self, tmp_path, monkeypatch):
@@ -797,7 +797,7 @@ class TestSweepRoute:
         monkeypatch.setattr(leaf_temporal, "leaf_contribution", boom)
         summary = run_sweep(root, [(int(morton_word(SHARD)), None)], families=["moc"], record=False)
         moc = summary["families"]["moc"]
-        assert moc["temporal"] == {"records": 0, "materialized": 0, "raw": 0}
+        assert moc["temporal_routes"] == {"records": 0, "materialized": 0, "raw": 0}
         # Nothing composed, so no section and no shard count — the route block
         # is the only thing separating this from the non-temporal store above.
         assert "temporal_shards" not in moc

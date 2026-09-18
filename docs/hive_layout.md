@@ -763,7 +763,9 @@ materializes too (`source: "refresh"`) unless called with
 [`specification.md`](specification.md) §10.6.
 
 *Backfilling a store written before the record existed* (the sweep record's
-`temporal: {records, materialized, raw}` block shows the split per pass):
+`temporal_routes: {records, materialized, raw}` block shows the split per
+pass — named apart from the root object's `temporal` SECTION, which step 3
+below reads):
 
 1. fire a **partitioned** families pass over the record-less leaves
    (`runner._invoke_lambda_sweep(..., partitions=4**k)`, issue #377 — a morton
