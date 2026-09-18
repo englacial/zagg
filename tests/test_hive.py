@@ -1151,6 +1151,104 @@ class TestProcessAndWriteHive:
         # sidecar is debris like everything else in it.
         assert ops == ["dense", "ragged", "sidecar", "stamp"]
 
+    def _temporal_cfg(self, cfg):
+        """Arm the §10.6 record: one per-centroid field plus its clock."""
+        cfg.aggregation["variables"]["h"] = {
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [2],
+            "dtype": "float32",
+            "fill_value": 0,
+            "temporal": "per-centroid",
+        }
+        cfg.output["time_source"] = {
+            "field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        return cfg
+
+    def test_temporal_record_lands_between_the_sidecar_and_the_stamp(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issue #575: a per-centroid config writes the leaf's ``temporal.toc``
+        from the words the worker fed the accumulator, in the bitmap's slot —
+        after the arrays, before the stamp (D4) — and a non-temporal config
+        writes none and takes the code path it always did."""
+        from mortie import time2toc, toc_reduce
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.coverage_toc import quantize_words
+        from zagg.leaf_temporal import count_words, cover_from_counts
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(7)],
+            dtype=np.uint64,
+        )
+        ops: list = []
+
+        def rec(name, fn):
+            def wrapped(*a, **k):
+                ops.append(name)
+                return fn(*a, **k)
+
+            return wrapped
+
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 7.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words[:4])
+            kwargs["temporal_out"].add_words(words[4:])
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(
+            hive, "write_coverage_sidecar", rec("sidecar", hive.write_coverage_sidecar)
+        )
+        monkeypatch.setattr(
+            leaf_temporal, "write_leaf_temporal", rec("temporal", leaf_temporal.write_leaf_temporal)
+        )
+        monkeypatch.setattr(hive, "stamp_commit", rec("stamp", hive.stamp_commit))
+        root = str(tmp_path / "store")
+        hive.process_and_write_hive(shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={})
+        assert ops == ["sidecar", "temporal", "stamp"]
+        leaf = hive.shard_leaf_path(root, shard)
+        record = leaf_temporal.read_leaf_temporal_record(leaf)
+        word, counts = leaf_temporal.leaf_temporal_contribution(record)
+        assert record["source"] == "worker" and record["fields"] == ["h"]
+        assert word == int(toc_reduce(words)) and record["n_obs"] == 7
+        expect = count_words(words)
+        np.testing.assert_array_equal(counts.words, expect.words)
+        np.testing.assert_array_equal(counts.obs, expect.obs)
+        np.testing.assert_array_equal(cover_from_counts(counts)[0], quantize_words(words))
+        from zagg.store import open_store
+
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_non_temporal_config_writes_no_record(self, monkeypatch, cfg, tmp_path):
+        from zagg import leaf_temporal
+
+        grid_probe = self._grid(cfg)
+        seen: dict = {}
+
+        def fake(g, shard_key, urls, **kwargs):
+            seen["temporal_out"] = kwargs.get("temporal_out")
+            carrier = self._carrier(grid_probe, shard_key)
+            kwargs["write_chunk"](grid_probe.block_index(int(shard_key)), carrier, {})
+            return pd.DataFrame(), self._meta(shard_key)
+
+        _grid, shard, root, _meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        assert seen["temporal_out"] is None
+        assert leaf_temporal.read_leaf_temporal_record(hive.shard_leaf_path(root, shard)) is None
+
 
 # ── leaf skip-if-current + contraction guard (issue #388 phase 2) ────────────
 

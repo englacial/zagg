@@ -176,24 +176,23 @@ class MocFamily(SweepFamily):
 
     The spec §10 TEMPORAL section (issue #480) rides this same walk: every
     stamped leaf of a temporal-declaring store also yields its §8.3 toc
-    envelope word and a per-leaf time digest
+    envelope word and its §10.3 counted cover
     (:func:`zagg.coverage_toc.read_leaf_temporal`), accumulated on the family
     INSTANCE — one per run, since :func:`get_family` constructs a fresh one —
     and folded into the section :meth:`finish` writes. It stays OUT of the
     per-node rollup payloads on purpose: those are the skip-if-current
-    currency, compared byte for byte, and a per-node k-way fold would
-    describe a different centroid partition at every node (the fold-tree
-    caveat on :func:`zagg.stats.tdigest.merge_tdigests_kway`). A store
-    declaring no temporal field accumulates nothing, and its root object is
-    byte-identical to a pre-#480 one.
+    currency, compared byte for byte, and the root section composes at its
+    own GET-union-PUT seam (§10.4). A store declaring no temporal field
+    accumulates nothing, and its root object is byte-identical to a pre-#480
+    one.
     """
 
     name = "moc"
 
     def __init__(self):
-        #: ``{shard decimal: [(word, digest, times, cover), ...]}`` — one
-        #: entry per window leaf this run visited (issues #480, #489; the
-        #: fourth element is the leaf's §10.5 word-set cover).
+        #: ``{shard decimal: [(word, counts), ...]}`` — one entry per window
+        #: leaf this run visited (issues #480, #489, #575): the leaf's §10.2
+        #: envelope word and its §10.3 counted cover.
         self._temporal: dict[str, list] = {}
         #: Shards whose temporal read failed: dropped from the map entirely,
         #: never published from the window leaves that did read (issue #480).

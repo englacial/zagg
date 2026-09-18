@@ -9,14 +9,18 @@ bootstrap discovery (``{store_root}/coverage.moc``):
    store's temporal-carrying fields). This is the spatiotemporal pruning
    tier: "which shards hold data DURING my window" resolves from metadata,
    before any leaf is opened;
-2. **the optional root time-digest** — a t-digest whose weights are
-   observation counts and whose value axis is the §8.3 per-centroid toc
-   envelopes' MIDPOINTS (:func:`_centroid_times`), with those same envelopes
-   as its companion, in the store's NATIVE ragged ``(k, 2)`` + word-sibling
-   form (base64 of the §1.4 element bytes), so a reader needs no grammar it
-   does not already implement for the leaves. Its total weight is exact; the
-   placement of that weight is only as time-resolved as the leaf digest's own
-   centroid partition, which is a partition of VALUE (§10.3).
+2. **the optional root counted cover** — observation counts per aligned
+   time bucket (:class:`zagg.leaf_temporal.CountedCover`, §10.3; espg ruling
+   of 2026-09-17 on issue #575, replacing the root time-digest): exact
+   counts on the §10.5 bucket grid, composed by plain addition and coarsened
+   by ancestor sums under the cap, so "how MUCH data in this window" answers
+   exactly to bucket resolution with no merge law and no mass placed where
+   nothing was observed.
+
+Both are composed from per-leaf contributions — the leaf's own
+``temporal.toc`` record where the worker wrote one (:mod:`zagg.leaf_temporal`),
+else the leaf's raw §8.3 companions read back chunk by chunk
+(:func:`read_leaf_temporal`).
 
 A third surface lives BESIDE the bootstrap object (issue #489): the
 **word-set cover sibling** ``{store_root}/coverage.toc`` — per shard, the
@@ -58,11 +62,6 @@ TEMPORAL_COVERAGE_SPEC = "zagg-coverage-toc/1"
 #: The section's key on the root coverage envelope.
 TEMPORAL_KEY = "temporal"
 
-#: Compression budget for the root time-digest (the issue's δ≈64): coarse by
-#: design — the digest answers "how MUCH data in this window", while the
-#: per-centroid companion words carry the exact temporal claim.
-ROOT_TOC_DELTA = 64
-
 #: The §8.3 shape this section is derived from. A ``"per-cell"`` or
 #: ``"coordinate"`` declaration is a different array grammar and contributes
 #: nothing here (see the §10 open question).
@@ -82,16 +81,21 @@ COVER_NAME = "coverage.toc"
 #: the sidecar staleness posture, never a promise.
 COVER_KEY = "cover"
 
-#: The §10.5 cover order: temporal order ``o`` partitions the toc scale into
-#: ``2**o`` aligned buckets of ``2**(63 - o)`` ns. The pin is order 18 (span
-#: 2^45 ns ≈ 9.77 h; espg ruling on issue #489, 2026-08-24): correctness is
-#: order-independent (quantization only widens) and storage is flat at ~one
-#: word per pass, so the pin is chosen for the CONSUMER — it resolves
-#: consecutive-day revisits and holds the cover-midpoint epoch error to
-#: ±half a span ≈ ±4.9 h against the closest-observation Sentinel-2
-#: consumer's ~4.3-day cadence. Bucket bounds stay exactly representable on
-#: the grammar's own encoding grids for every order ≤ 31 (§10.5).
-TEMPORAL_COVER_ORDER = 18
+#: The §10.5 temporal order — the ONE rung the leaf record's counted cover,
+#: the root cover sibling and the §10.3 root tier share: temporal order
+#: ``o`` partitions the toc scale into ``2**o`` aligned buckets of
+#: ``2**(63 - o)`` ns, and the pin is order 24 (span 2^39 ns ≈ 9.2 min;
+#: espg amendment on issue #575, 2026-09-17, retiring the order-18 pin of
+#: issue #489). Correctness is order-independent (quantization only widens)
+#: and the sources are spikes — a pass crosses a shard in ~1 s, so a shard
+#: has the same ~50 words at order 24 as at 18 — so the rung is chosen for
+#: the CONSUMER: a gap floor of 2 × 2^39 ns ≈ 18.3 min and a cover-midpoint
+#: epoch error of ±4.6 min keep consecutive orbits distinct and make the
+#: closest-observation argmin (issue #509) exact. The 512-word cap is the
+#: only coarsening mechanism; coarser effective rungs are data-driven, never
+#: pinned. Bucket bounds stay exactly representable on the grammar's own
+#: encoding grids for every order ≤ 31 (§10.5).
+TEMPORAL_COVER_ORDER = 24
 
 #: The §10.5 overflow cap: a shard's cover holds at most this many words.
 #: A cover that lands above it coarsens by order (each step halves the
@@ -144,77 +148,40 @@ def temporal_cell_order(manifest: dict | None) -> int | None:
         return None
 
 
-def _centroid_times(words: np.ndarray) -> np.ndarray:
-    """Representative instants (internal ns, float64) for toc words.
-
-    ``mortie.toc2time`` decodes a timestamp to ``(t, t)`` and a range to its
-    conservative ``[start, end)`` envelope, so the midpoint is the instant
-    itself for a timestamp and the envelope's centre for a range. The
-    digest's value axis is approximate by construction (§10): the word
-    beside each centroid stays the exact claim.
-    """
-    from mortie import toc2time
-
-    start, end = toc2time(np.asarray(words, dtype=np.uint64))
-    return (np.asarray(start, dtype=np.float64) + np.asarray(end, dtype=np.float64)) / 2.0
-
-
 def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kwargs):
-    """One leaf's contribution: ``(envelope_word, digest, times, cover)`` or ``None``.
+    """One leaf's contribution from its raw companions: ``(word, counts)`` or ``None``.
 
     Reads each declared field's payload and its §8.3 sibling by NAME (never a
-    member enumeration), row-aligned per §1.1. The envelope word is
+    member enumeration), row-aligned per §1.1, ONE ragged chunk at a time
+    (issue #575): the arrays are chunked at 4,096 rows, and each chunk is
+    decoded, folded into a :class:`zagg.leaf_temporal.LeafTemporalAccumulator`
+    and released, so memory is bounded by the chunk rather than the leaf — a
+    CA-scale leaf is a million rows per field, which read whole is what
+    killed the families pass at the 4 GB tier. The envelope word is
     ``toc_reduce`` over every sibling word the leaf holds, unioned across the
-    declared fields — coverage as "any data", the issue's proposed default.
-    The digest is one flat k-way merge over the leaf's per-cell time digests,
-    each built from that cell's centroid instants (:func:`_centroid_times`)
-    weighted by the payload's own centroid weights, so its total weight is
-    the leaf's temporal observation count. ``cover`` is the leaf's §10.5
-    word-set cover — :func:`quantize_words` over every sibling word the leaf
-    holds, at the pinned cover order — reduced here (a few dozen words per
-    leaf) so the accumulator never holds the raw word multiset: a CA-scale
-    shard carries millions of words, and the cover of a union is the
-    normalize of the union of covers, exactly. ``None`` when the leaf holds
-    no temporal row at all (an unpopulated or pre-companion leaf), which is
-    absence, not failure.
+    declared fields — coverage as "any data". ``counts`` is the leaf's §10.3
+    counted cover: each centroid counted at its envelope's representative
+    instant (exact for a weight-1 centroid, the midpoint for a merged one)
+    with the payload's own weight, so its total is the leaf's temporal
+    observation count — where ``fields`` names more than one field, once per
+    field. ``None`` when the leaf holds no temporal row at all (an unpopulated
+    or pre-companion leaf), which is absence, not failure.
 
-    **Cost.** One leaf-sized read per declared field — ``payload[:]`` plus its
-    sibling — and a per-cell decode before the merge, the same shape as the
-    overview family's own leaf read (:func:`zagg.sweep_overview._fold_node`,
-    which reads ``arr[:]`` per field and accumulates per-cell centroid lists
-    the same way). The §10.5 fold is now the dominant CPU term of the
-    non-I/O work, and it is unconditional — every ``moc`` sweep pays it, on
-    stores that will never publish a cover too. At the CA shard shape (2.7 M
-    words over 49 pass-days) the two reductions measure ``toc_reduce``
-    ~0.002 s against ``quantize_words`` ~0.105 s, the latter returning ~45
-    words, with a transient of a few full-length ``uint64`` temporaries
-    (~130 MB at that shape) on top of the ``raw`` concatenation that already
-    exists. Accepted: it sits beside seconds of leaf array I/O, and the
-    alternative — handing the accumulator the raw word multiset and
-    quantizing once at the root — is exactly the ``n_leaves × n_cells × k``
-    memory blowup this fold exists to avoid.
-
-    What it returns is bounded regardless: the k-way merge here
-    compresses the whole leaf to ~``ROOT_TOC_DELTA`` centroids, so the caller
-    accumulating leaves (:func:`build_temporal_section`) holds
-    ``n_leaves × ~δ`` rows, not ``n_leaves × n_cells × k``. For a
-    2,726-shard store that is ~1.4 MB of centroids plus ~1.4 MB of companion
-    words — plus a few dozen cover words per leaf — which is why the root
-    fold needs no chunk batching of its own.
+    This is the sweep's RAW route, for leaves written before the worker
+    record existed; a leaf carrying ``temporal.toc`` is read from that
+    instead (one small GET), and what this computes is what that record
+    holds under ``source: "sweep"``.
     """
     import zarr
-    from mortie import toc_reduce
 
-    from zagg.stats.tdigest import merge_tdigests_kway
+    from zagg.leaf_temporal import LeafTemporalAccumulator
     from zagg.store import open_store
     from zagg.sweep_overview import decode_digest
 
     group = zarr.open_group(
         open_store(leaf_root, **store_kwargs), path=str(cell_order), mode="r", zarr_format=3
     )
-    all_words: list[np.ndarray] = []
-    digests: list[np.ndarray] = []
-    times: list[np.ndarray] = []
+    acc = LeafTemporalAccumulator()
     for name in sorted(fields):
         meta = fields[name]
         try:
@@ -225,83 +192,73 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
             logger.debug(f"coverage[toc]: leaf {leaf_root} lacks field {name!r}")
             continue
         dtype = meta.get("dtype") or "float32"
-        raw_words, raw_payload = sibling[:], payload[:]
-        if len(raw_words) != len(raw_payload):
+        n = int(payload.shape[0])
+        if int(sibling.shape[0]) != n:
             # A SHORT companion aligns row for row over its own length, so the
             # per-cell check below never fires: the leaf would publish a word
             # joined over a PREFIX of its cells and be listed as complete. This
             # is the truncated-array shape the read path refuses everywhere
             # else (issue #452); refuse it here too, per shard (§10.2).
             raise ValueError(
-                f"{meta['sibling']} has {len(raw_words)} rows for a "
-                f"{len(raw_payload)}-row {name} payload — the companion must be "
+                f"{meta['sibling']} has {int(sibling.shape[0])} rows for a "
+                f"{n}-row {name} payload — the companion must be "
                 f"row-aligned with its digest (spec §1.1)"
             )
-        for i, row in enumerate(raw_words):
-            if row is None or not len(row):
-                continue
-            words = decode_digest(row, "uint64", ())
-            cell = decode_digest(raw_payload[i], dtype, (2,))
-            if len(cell) != len(words):
-                raise ValueError(
-                    f"{meta['sibling']} cell {i} has {len(words)} words for a "
-                    f"{len(cell)}-centroid payload — the companion must be row-aligned "
-                    f"with its digest (spec §1.1)"
-                )
-            all_words.append(words)
-            t = _centroid_times(words)
-            # Sort into value (= time) order: the stored rows are in the
-            # payload's own value order (§8.3), which is not time order, and a
-            # digest's rows MUST ascend by mean (§2.1). The word breaks ties so
-            # the per-cell array is a function of its contents, not of row order.
-            order = np.lexsort((words, t))
-            arr = np.empty((len(t), 2), dtype=np.float32)
-            arr[:, 0] = t[order]
-            arr[:, 1] = cell[order, 1]
-            digests.append(arr)
-            times.append(np.asarray(words, dtype=np.uint64)[order])
-    if not all_words:
-        return None
-    raw = np.concatenate(all_words)
-    word = int(toc_reduce(raw))
-    digest, folded = merge_tdigests_kway(digests, delta=ROOT_TOC_DELTA, temporal=times)
-    return word, digest, folded, quantize_words(raw)
+        step = int(sibling.chunks[0]) or n
+        for start in range(0, n, step):
+            raw_words = sibling[start : start + step]
+            raw_payload = payload[start : start + step]
+            words_parts: list[np.ndarray] = []
+            weight_parts: list[np.ndarray] = []
+            for i, row in enumerate(raw_words):
+                if row is None or not len(row):
+                    continue
+                words = decode_digest(row, "uint64", ())
+                cell = decode_digest(raw_payload[i], dtype, (2,))
+                if len(cell) != len(words):
+                    raise ValueError(
+                        f"{meta['sibling']} cell {start + i} has {len(words)} words for a "
+                        f"{len(cell)}-centroid payload — the companion must be row-aligned "
+                        f"with its digest (spec §1.1)"
+                    )
+                words_parts.append(words)
+                weight_parts.append(cell[:, 1])
+            if words_parts:
+                acc.add_weighted(np.concatenate(words_parts), np.concatenate(weight_parts))
+    return acc.finish()
 
 
 def build_temporal_section(contributions: dict, fields, *, source: str = "sweep") -> dict | None:
     """The ``zagg-coverage-toc/1`` section from per-leaf contributions.
 
     ``contributions`` maps a shard's D1 decimal id to the LIST of
-    ``(word, digest, times, cover)`` tuples :func:`read_leaf_temporal`
-    returned for it — one per window leaf, so a windowed shard's several
-    leaves reduce to the one envelope word the shard-keyed map holds (the
-    ``cover`` element is :func:`build_cover_section`'s input and is ignored
-    here). Returns ``None`` for an
+    ``(word, counts)`` tuples — :func:`read_leaf_temporal`'s return, or a
+    leaf record's (:func:`zagg.leaf_temporal.leaf_temporal_contribution`) —
+    one per window leaf, so a windowed shard's several leaves reduce to the
+    one envelope word the shard-keyed map holds. Returns ``None`` for an
     empty map: a store with no temporal channel gets no section, and its root
     object stays byte-identical to a pre-#480 one.
 
-    The root digest is ONE flat k-way merge over the per-leaf digests
-    (:func:`zagg.stats.tdigest.merge_tdigests_kway` with the ``temporal``
-    channel), so it is permutation-independent in the leaf order and its
-    companion words are the envelopes of the centroid partition that merge
-    produced — the shipped law, not a second pass over it.
+    The root counted cover is the per-word SUM over every leaf's counts
+    (:func:`zagg.leaf_temporal.merge_counts` — exact, order-independent, no
+    merge law) coarsened by whole orders to the §10.5 cap
+    (:func:`zagg.leaf_temporal.cap_counts`, ancestor sums — exact at the
+    coarser rung). Every leaf of a shard contributes, so the total is the
+    store's temporal observation count.
     """
     from mortie import toc_reduce
 
     from zagg.hive import _utcnow
-    from zagg.stats.tdigest import merge_tdigests_kway
+    from zagg.leaf_temporal import cap_counts, encode_counts, merge_counts
 
     if not contributions:
         return None
     shards: dict[str, int] = {}
-    digests, times = [], []
+    parts = []
     for decimal in sorted(contributions):
-        parts = contributions[decimal]
-        shards[decimal] = int(toc_reduce(np.asarray([p[0] for p in parts], dtype=np.uint64)))
-        for _word, digest, folded, _cover in parts:
-            if len(digest):
-                digests.append(np.asarray(digest, dtype=np.float32))
-                times.append(np.asarray(folded, dtype=np.uint64))
+        leaves = contributions[decimal]
+        shards[decimal] = int(toc_reduce(np.asarray([p[0] for p in leaves], dtype=np.uint64)))
+        parts.extend(p[1] for p in leaves)
     section = {
         "spec": TEMPORAL_COVERAGE_SPEC,
         "source": source,
@@ -309,36 +266,10 @@ def build_temporal_section(contributions: dict, fields, *, source: str = "sweep"
         "fields": sorted(fields),
         "shards": {d: str(w) for d, w in sorted(shards.items())},
     }
-    if digests:
-        payload, words = merge_tdigests_kway(digests, delta=ROOT_TOC_DELTA, temporal=times)
-        section["digest"] = _encode_digest_block(payload, words)
+    counts = cap_counts(merge_counts(parts))
+    if counts.words.size:
+        section["counts"] = encode_counts(counts)
     return section
-
-
-def _encode_digest_block(payload: np.ndarray, words: np.ndarray) -> dict:
-    """The tier-2 block: the native ragged ``(k, 2)`` + word sibling, base64'd.
-
-    The bytes are exactly what the same digest would occupy as a
-    ``zagg-ragged/1`` element and its §8.3 companion row — little-endian
-    C-order at the declared dtype (§1.4) — so a reader decodes them with the
-    leaf decoder it already has, base64 being the only wrapper a JSON
-    carrier forces.
-    """
-    from zagg.sweep_overview import encode_digest
-
-    payload = np.asarray(payload, dtype=np.float32)
-    words = np.asarray(words, dtype=np.uint64)
-    return {
-        "delta": ROOT_TOC_DELTA,
-        "weights": "counts",
-        "value": "toc-ns",
-        "element": {"dtype": "float32", "shape": [-1, 2]},
-        "encoding": "base64",
-        "centroids": int(len(payload)),
-        "weight_total": float(payload[:, 1].sum()) if len(payload) else 0.0,
-        "payload": base64.b64encode(encode_digest(payload, "float32")).decode("ascii"),
-        "times": base64.b64encode(encode_digest(words, "uint64")).decode("ascii"),
-    }
 
 
 def merge_temporal_sections(existing, incoming) -> dict | None:
@@ -346,18 +277,18 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
 
     Tier 1 unions elementwise under the grammar's ``toc_merge`` join —
     idempotent and exact, so a re-sweep of unchanged leaves reproduces the
-    same words. Tier 2 is deliberately NOT unioned: its weights are
-    observation counts, and merging two digests over overlapping shard sets
-    would double-count them. It is REPLACED instead, and only by a producer
-    that covered every shard the merged map lists; a partial producer drops
-    it and leaves tier 1 standing (§10).
+    same words. Tier 2 is deliberately NOT summed at this seam: its values
+    are observation counts, and adding two covers over overlapping shard
+    sets would double-count them. It is REPLACED instead, and only by a
+    producer that covered every shard the merged map lists; a partial
+    producer drops it and leaves tier 1 standing (§10).
 
     ``fields`` unions with tier 1, because it is the provenance of the SHARD
     MAP and the map is the thing that unions. It is deliberately not narrowed
-    to the surviving digest's own fields: doing so would describe the map with
+    to the surviving counts' own fields: doing so would describe the map with
     a list that no longer covers it. §10.1 says so, and makes the list an
-    upper bound for the once-per-field weight rule rather than an exact
-    description of the installed digest.
+    upper bound for the once-per-field count rule rather than an exact
+    description of the installed block.
 
     An unknown-spec section on the INCOMING side contributes nothing — the
     same strict gate the enclosing envelope uses. On the EXISTING side it is
@@ -394,11 +325,11 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
         "shards": {d: str(w) for d, w in sorted(shards.items())},
     }
     # Whole-coverage test, newest producer first: only a section whose own map
-    # listed every shard in the union can vouch for a store-wide digest.
+    # listed every shard in the union can vouch for store-wide counts.
     listed = set(merged["shards"])
     for side in (b, a):
-        if side.get("digest") is not None and set(side.get("shards") or {}) >= listed:
-            merged["digest"] = side["digest"]
+        if side.get("counts") is not None and set(side.get("shards") or {}) >= listed:
+            merged["counts"] = side["counts"]
             break
     # The §10.5 presence marker carries through the seam (§10.4): the sibling
     # object composes under its own merge, so a producer that wrote no cover
@@ -426,12 +357,12 @@ def section_unchanged(existing, incoming) -> bool:
     re-sweep of a temporal store must write no root object either. The test is
     on what would actually be **written** — :func:`merge_temporal_sections`'s
     own output — compared against the standing section on CONTENT (the shard
-    words, the digest block, the field list), never on the whole section:
+    words, the counts block, the field list), never on the whole section:
     ``source`` and ``generated_at`` churn per pass by construction.
 
     Testing the merge rather than the inputs is what makes it converge. A
-    producer that walked only part of the store always builds a digest, and
-    §10.4 always drops that digest at the seam; a test asking "does the
+    producer that walked only part of the store always builds counts, and
+    §10.4 always drops that block at the seam; a test asking "does the
     standing section already carry everything this one holds" therefore
     answers *no* forever on any store with more than one shard, and every
     incremental sweep re-PUTs a byte-identical object.
@@ -446,7 +377,7 @@ def _content(section) -> tuple | None:
         return None
     return (
         {d: str(w) for d, w in (section.get("shards") or {}).items()},
-        section.get("digest"),
+        section.get("counts"),
         sorted(section.get("fields") or []),
         section.get(COVER_KEY),
     )
@@ -559,25 +490,27 @@ def build_cover_section(contributions: dict, fields, shard_order: int, *, source
     """The ``zagg-coverage-toc-cover/1`` object body from per-leaf contributions.
 
     Same ``contributions`` mapping :func:`build_temporal_section` folds —
-    this consumes the tuples' ``cover`` element: per shard, the union of its
-    window leaves' covers, requantized at the pinned cover order (canonical,
-    and exact: quantization commutes with union) and coarsened to the cap.
-    ``None`` for an empty map — the standing absence rule, so a store with
-    no temporal channel gets no sibling object at all.
+    this derives each shard's word set from its leaves' counted covers: the
+    per-word sum over the window leaves, capped, then coarsened to the pinned
+    cover order and normalized (:func:`zagg.leaf_temporal.cover_from_counts`
+    — byte-equal to :func:`quantize_words` over the same instants, so the
+    §10.5 bytes are what they were before the counts existed). ``None`` for
+    an empty map — the standing absence rule, so a store with no temporal
+    channel gets no sibling object at all.
 
     A shard that had to coarsen below :data:`TEMPORAL_COVER_ORDER` records the
     order it landed at in its own block (``temporal_order``), and the
     coarsening is logged — §10.5's "widening only, loudly recorded".
     """
     from zagg.hive import _utcnow
+    from zagg.leaf_temporal import cap_counts, cover_from_counts, merge_counts
 
     if not contributions:
         return None
     shards: dict[str, dict] = {}
     for decimal in sorted(contributions):
-        cover = np.concatenate([np.asarray(p[3], dtype=np.uint64) for p in contributions[decimal]])
-        cover = quantize_words(cover, TEMPORAL_COVER_ORDER)
-        cover, order = _cap_cover(cover, TEMPORAL_COVER_ORDER)
+        counts = cap_counts(merge_counts([p[1] for p in contributions[decimal]]))
+        cover, order = cover_from_counts(counts)
         if order != TEMPORAL_COVER_ORDER:
             logger.warning(
                 f"coverage[toc]: shard {decimal} cover coarsened to temporal order {order} "
@@ -945,34 +878,23 @@ def coverage_toc(envelope) -> dict[str, int] | None:
     return {d: int(w) for d, w in (section.get("shards") or {}).items()}
 
 
-def coverage_toc_digest(envelope):
-    """The root time-digest as ``(payload, words)``, or ``None``.
+def coverage_toc_counts(envelope):
+    """The root counted cover as a :class:`zagg.leaf_temporal.CountedCover`, or ``None``.
 
-    ``payload`` is the §2.1 ``(k, 2)`` float32 centroid array whose value
-    column is an instant on the §8 internal-ns scale and whose weight column
-    is an observation count; ``words`` is its row-aligned §8.3 companion.
-
-    §10.3's MUST-check is on all THREE: the two buffers against each other and
-    both against the block's declared ``centroids``. A ``k`` that agrees with
-    neither is a broken block, not a decorative field — and a reference
-    accessor that skipped the check would leave the external reader
-    (moczarr) implementing one zagg does not.
+    §10.3's MUST-checks ride :func:`zagg.leaf_temporal.decode_counts`: the
+    two buffers against each other and against the block's ``count``, the
+    counts against ``obs_total``, the order against the pin. A block that
+    fails them is broken, not decorative — and a reference accessor that
+    skipped the check would leave the external reader (moczarr) implementing
+    one zagg does not.
     """
     section = load_temporal_coverage(envelope)
-    block = (section or {}).get("digest")
+    block = (section or {}).get("counts")
     if not isinstance(block, dict):
         return None
-    from zagg.sweep_overview import decode_digest
+    from zagg.leaf_temporal import decode_counts
 
-    payload = decode_digest(base64.b64decode(block["payload"]), "float32", (2,))
-    words = decode_digest(base64.b64decode(block["times"]), "uint64", ())
-    if len(payload) != len(words) or block.get("centroids") != len(payload):
-        raise ValueError(
-            f"root time-digest declares {block.get('centroids')!r} centroids and decodes "
-            f"{len(payload)} of them with {len(words)} companion words — the companion "
-            f"must be row-aligned with its digest at the declared k (spec §1.1, §10.3)"
-        )
-    return payload, words
+    return decode_counts(block)
 
 
 def load_cover(obj) -> dict | None:
@@ -994,7 +916,7 @@ def cover_words(obj) -> dict[str, np.ndarray] | None:
     query path (:func:`shards_overlapping`) degrades that one shard to tier 1
     instead. Each block's ``count`` is
     MUST-checked against its own buffer (§10.5) — the same rule
-    :func:`coverage_toc_digest` applies to the digest block's ``centroids``.
+    :func:`coverage_toc_counts` applies to the counts block's ``count``.
     A block that omits ``temporal_order`` decodes at the OBJECT's declared
     pin (not this build's), and one declaring an order above that pin is
     refused: §10.5's "always ≤ the object's ``temporal_order``".
@@ -1138,7 +1060,6 @@ __all__ = [
     "COVER_NAME",
     "COVER_SPEC",
     "PER_CENTROID",
-    "ROOT_TOC_DELTA",
     "TEMPORAL_COVER_ORDER",
     "TEMPORAL_COVERAGE_SPEC",
     "TEMPORAL_KEY",
@@ -1147,7 +1068,7 @@ __all__ = [
     "cover_unchanged",
     "cover_words",
     "coverage_toc",
-    "coverage_toc_digest",
+    "coverage_toc_counts",
     "delete_cover",
     "load_cover",
     "load_temporal_coverage",

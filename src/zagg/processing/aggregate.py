@@ -911,6 +911,7 @@ def _aggregate_chunk_cells(
     data_vars,
     agg_fields: dict,
     chunk_pooled: dict | None = None,
+    temporal_out=None,
 ):
     """Compute per-cell stats for one chunk's ``children`` (default numpy path).
 
@@ -935,6 +936,11 @@ def _aggregate_chunk_cells(
     ``chunk_pooled`` is the caller's :func:`_pool_chunk_columns` output for these
     same ``children`` (both worker call sites build it for the chunk precompute
     anyway); it lets the toc hoist reuse that gather instead of rebuilding it.
+
+    ``temporal_out`` is the leaf's :class:`zagg.leaf_temporal.LeafTemporalAccumulator`
+    (issue #575): the chunk's toc words are folded into it here, once, right
+    where they are encoded — per chunk, never a whole-shard array — so the
+    leaf's temporal record costs no second pass over the observations.
     """
     children = np.asarray(children)
     n_cells = len(children)
@@ -983,6 +989,8 @@ def _aggregate_chunk_cells(
         if _temporal_fields(agg_fields)
         else None
     )
+    if temporal_out is not None and cell_toc:
+        temporal_out.add_words(np.concatenate(list(cell_toc.values())))
 
     # Batch the per-centroid companion folds across the loop (issue #476): each
     # ``build_tdigest`` inside defers its ``toc_reduce``/``common_ancestor``

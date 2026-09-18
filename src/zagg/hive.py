@@ -1747,6 +1747,13 @@ def process_and_write_hive(
     # Occupied-cell sink (issue #200): the worker already holds the shard's
     # populated cell words; collect them here to derive the stamp's coverage.
     occupied: list = []
+    # Temporal-record sink (issue #575): armed only by a §8.3 per-centroid
+    # declaration, so a store with no temporal channel writes no record and
+    # takes the code path it always did. The worker folds each chunk's toc
+    # words into it as it encodes them; the leaf write below drains it.
+    from zagg import leaf_temporal
+
+    temporal_acc = leaf_temporal.LeafTemporalAccumulator() if leaf_temporal.armed(config) else None
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
@@ -1761,6 +1768,7 @@ def process_and_write_hive(
         occupied_out=occupied,
         time_range_of=time_range_of,
         profile=profile,
+        temporal_out=temporal_acc,
     )
     # Windowed stamp truth (D15): convert the worker's dataset-unit extent to
     # ISO-8601 UTC once, here — the same strings feed the stamp below and the
@@ -1822,6 +1830,19 @@ def process_and_write_hive(
         if words is not None and not full and depth > 0:
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
             write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
+        # The leaf temporal record (issue #575): the same slot as the bitmap
+        # — a per-leaf sidecar PUT before the stamp, so an unstamped prefix's
+        # record is debris with everything else. Absent when the fold saw no
+        # clocked observation (an empty leaf publishes no temporal claim).
+        folded = temporal_acc.finish() if temporal_acc is not None else None
+        if folded is not None:
+            leaf_temporal.write_leaf_temporal(
+                leaf_path,
+                leaf_temporal.build_leaf_temporal(
+                    *folded, leaf_temporal.temporal_field_names(config), source="worker"
+                ),
+                **store_kwargs,
+            )
         stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),
@@ -1884,10 +1905,14 @@ def process_and_write_hive(
 
             group = zarr.open_group(box["store"], path="", mode="r", zarr_format=3)
             with warnings.catch_warnings():
-                # The leaf's own coverage sidecar is the one known non-zarr
-                # object under the prefix; ``members()`` warn-skips it (the
-                # ``process_and_write_raster_hive`` suppression precedent).
+                # The leaf's own sidecars (the coverage bitmap and, on a
+                # temporal store, the issue #575 record) are the known
+                # non-zarr objects under the prefix; ``members()`` warn-skips
+                # them (the ``process_and_write_raster_hive`` precedent).
                 warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
+                warnings.filterwarnings(
+                    "ignore", message=f"Object at {leaf_temporal.LEAF_TEMPORAL_NAME}"
+                )
                 metadata["content_hashes"] = content_hashes_record(
                     hash_arrays(group, staged=staged)
                 )

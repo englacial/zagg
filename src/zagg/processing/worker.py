@@ -204,6 +204,7 @@ def process_shard(
     occupied_out: list | None = None,
     time_range_of: str | None = None,
     profile: bool = False,
+    temporal_out=None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -295,6 +296,12 @@ def process_shard(
         appended after the shard's reads are grouped. The hive write path uses
         it to derive the commit stamp's coverage payload; ``None`` (default)
         records nothing — byte-for-byte unchanged.
+    temporal_out : LeafTemporalAccumulator, optional
+        The leaf's temporal-record accumulator (issue #575). When given, every
+        chunk's toc words are folded into it as they are encoded — on the
+        pooled path and both spill regimes — so the hive write path can
+        write the leaf's ``temporal.toc`` record with no second pass;
+        ``None`` (default) folds nothing.
     time_range_of : str, optional
         Column name whose observed ``[min, max]`` is reported as
         ``metadata["time_range"]`` (issue #246): the ACTUAL dataset-unit time
@@ -488,6 +495,7 @@ def process_shard(
             handoff,
             streaming_cfg["buffer_granules"],
             block_bytes=streaming_cfg["block_bytes"],
+            temporal_out=temporal_out,
         )
     else:
         buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
@@ -933,6 +941,7 @@ def process_shard(
                 # Already gathered for the precompute above — the toc hoist reuses
                 # it instead of rebuilding the same index (review finding, PR #478).
                 chunk_pooled=chunk_pooled,
+                temporal_out=temporal_out,
             )
         cells_with_data += cwd
         # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload

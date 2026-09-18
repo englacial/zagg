@@ -2793,7 +2793,7 @@ already carry:
 | tier | key | what | answers |
 |---|---|---|---|
 | 1 | `shards` | one toc word per populated shard — the join over that shard's sibling words | *which* shards hold data during a window |
-| 2 | `digest` | a weighted t-digest over acquisition times — mass placed at the per-centroid toc envelope midpoints that are also its companion | *how much* data falls in a window |
+| 2 | `counts` | the store-wide counted cover — the exact observation count in every aligned time bucket the store's observations fall in (§10.3) | *how much* data falls in a window |
 
 Neither tier is new information and neither is truth: like the spatial ranges
 beside them they are a **regenerable accelerator** over the leaf arrays (§8.3,
@@ -2806,7 +2806,7 @@ carries no `temporal` key, and its root object is byte-identical to one
 written before this revision. A reader MUST read that absence as "this store
 publishes no temporal coverage" and MUST NOT refuse the store, the sidecar, or
 a windowed query because of it — the standing absence posture of §8/§9,
-restated here with its force. Absence of the `digest` sub-block alone says the
+restated here with its force. Absence of the `counts` sub-block alone says the
 same thing one tier down: tier 1 stands without it.
 
 **Versioned key discipline.** The section carries its own `spec` marker,
@@ -2830,16 +2830,15 @@ new section here; keys are never repurposed in place.
   "fields": ["h_tdigest"],
   "cover": "zagg-coverage-toc-cover/1",
   "shards": {"11213": "10689250968998768172"},
-  "digest": {
-    "delta": 64,
-    "weights": "counts",
-    "value": "toc-ns",
-    "element": {"dtype": "float32", "shape": [-1, 2]},
+  "counts": {
+    "temporal_order": 24,
+    "cap": 512,
+    "element": {"dtype": "uint64", "shape": [-1]},
     "encoding": "base64",
-    "centroids": 35,
-    "weight_total": 346.0,
-    "payload": "…",
-    "times": "…"
+    "words": "…",
+    "obs": "…",
+    "count": 5,
+    "obs_total": 346
   }
 }
 ```
@@ -2855,12 +2854,14 @@ new section here; keys are never repurposed in place.
   companions the **`shards` map** was derived from. It is the map's
   provenance, and it composes as a **union** across producers (§10.4): after a
   merge it names every field any contributing producer read, which is not
-  necessarily the set the installed `digest` was built over. A reader MUST
-  therefore treat it as an upper bound when applying the once-per-field weight
-  rule of §10.3, not as a per-digest field list. Informative for tier 1 (the
+  necessarily the set the installed `counts` was built over. A reader MUST
+  therefore treat it as an upper bound when applying the once-per-field count
+  rule of §10.3, not as a per-block field list. Informative for tier 1 (the
   words are already unioned across fields by construction).
 - **`shards`** (required) — tier 1, below.
-- **`digest`** (optional) — tier 2, below.
+- **`counts`** (optional) — tier 2, below (a `digest` key under this `spec`
+  is the block this revision retired before any published store carried
+  one; a reader MUST ignore it under the unknown-keys rule).
 - **`cover`** (optional, added under this revision — issue
   [#489](https://github.com/englacial/zagg/issues/489)) — the **presence
   marker** for the word-set cover *sibling object* (§10.5): its value is
@@ -2927,79 +2928,104 @@ still whole.
 > `shards_by_field`) in a later revision — `shards` keeps this meaning
 > unchanged.
 
-### 10.3 Tier 2 — the root time-digest
+### 10.3 Tier 2 — the root counted cover
 
-**Contract, optional.** The `digest` block is a t-digest over acquisition
-times, carried in the store's **native** forms so a reader needs no grammar it
-does not already implement for the leaves:
+**Contract, optional** (espg ruling of 2026-09-17 on
+[issue #575](https://github.com/englacial/zagg/issues/575), replacing the
+root time-digest this block carried under the same `spec` — no published
+store carried a section at the time, and the §7 fixtures regenerate). The
+`counts` block is the store-wide **counted cover**: the observation count in
+every aligned time bucket the store's temporal observations fall in, carried
+in the §10.5 word grammar so a reader needs no decoder it does not already
+have for the cover sibling:
 
-- **`payload`** is base64 of a §2.1 centroid array's bytes — the `(k, 2)`
-  little-endian C-order `float32` buffer of §1.4, exactly what one ragged
-  element holds — declared by `element` and `encoding` in the block. Rows MUST
-  be sorted ascending by mean, as §2.1 requires.
-- **`times`** is base64 of the row-aligned §8.3 companion: `k` little-endian
-  `uint64` toc words, one per centroid, carrying the same claim §8.3 gives
-  them (a single-observation centroid an exact timestamp, a merged one the
-  `toc_merge` join over its members). `centroids` records `k`; a reader MUST
-  refuse a block whose two buffers disagree on it (§1.1's row alignment,
-  broken).
-- **Column 0 is an instant on §8's internal nanosecond scale** (`value:
-  "toc-ns"`), directly comparable with `toc2time` output and needing no unit
-  conversion. It is **derived from the companion words, not measured from the
-  observations**: each contributing centroid enters the fold at the MIDPOINT
-  of its own §8.3 word's `toc2time` envelope, and a merged centroid's mean is
-  the weight-weighted mean of those midpoints. Two consequences a reader MUST
-  plan for:
-  - a **weight-1 centroid is exact**. Its word is a timestamp under §8.3's
-    kind-keyed semantics, `toc2time` returns `(t, t)`, and the midpoint is
-    that instant. This is the one exact arm of the value axis.
-  - every other mean is a **convex combination of envelope midpoints**, so it
-    lies inside that centroid's own word but at no particular observation.
-    The partition is the one the **value** distribution produced (zagg re-keys
-    each §8.3 companion's existing digest onto its words), so a centroid's
-    members are grouped by payload value, not by time: a heavy centroid whose
-    members straddle a campaign gap places all of its mass at a point inside
-    that gap, where the store may hold no data at all.
+```json
+"counts": {
+  "temporal_order": 24,
+  "cap": 512,
+  "element": {"dtype": "uint64", "shape": [-1]},
+  "encoding": "base64",
+  "words": "…",
+  "obs": "…",
+  "count": 5,
+  "obs_total": 346
+}
+```
 
-  Column 0 is also `float32`, carrying ~2^-24 **relative** precision — near
-  present-day magnitudes a quantum of roughly ten minutes, enough that both
-  statements above hold only up to that rounding. It is the smaller half of
-  the same approximation, and deliberate: the **companion word beside each
-  centroid is the exact temporal claim**, and a reader needing exactness MUST
-  use the words, never the means.
-- **Column 1 is a weight under the §2.0 `"counts"` declaration** (`weights`,
-  restated in the block): observation counts, so `sum(weights)` — recorded as
-  `weight_total` — is the total number of temporal observations the listed
-  fields contributed, under §2.1's float32 representability bound. Where
-  `fields` names more than one field, an observation that contributes to
-  several of them is counted **once per field**; this is the same open
-  question §10.2 flags, seen from the weight side. `fields` bounds that set
-  from above rather than naming it exactly (§10.1): a digest installed by one
-  producer sits beside a field list unioned over all of them.
-- **`delta`** records the compression budget the fold used (64 in zagg's
-  writer). It is provenance, not a promise about `k`.
+- **`temporal_order`** (required) — the bucket order of `words`, on §10.5's
+  grid: aligned buckets of `2^(63 − o)` ns. Producers under this revision
+  count at §10.5's one pinned order, **24** (`2^39` ns ≈ 9.2 min), and
+  coarsen below it only under `cap`; a block declaring an order above the
+  pin was written by a producer this revision does not know, and a reader
+  MUST refuse it.
+- **`cap`** (required) — the overflow cap the producer enforced, with
+  §10.5's meaning: the block holds at most `cap` words.
+- **`element`** / **`encoding`** (required) — the one byte grammar for BOTH
+  buffers: `count` little-endian `uint64` values each, base64'd.
+- **`words`** (required) — the bucket words: the aligned order-`temporal_order`
+  bucket **range words** (§10.5's quantization of an instant is exactly one
+  such word), sorted, unique, and **un-coalesced** — abutting occupied
+  buckets stay distinct words with their own counts. `toc_normalize`'s
+  coalescing is never applied to this buffer: a coalesced range would no
+  longer name a bucket a count could belong to.
+- **`obs`** (required) — the observation count in each bucket, row-aligned
+  with `words`. Exact integers.
+- **`count`** (required) — the bucket count `k`. A reader MUST refuse a
+  block whose buffers disagree with it or with each other (§1.1's row
+  alignment, broken).
+- **`obs_total`** (required) — the sum of `obs`, which a reader MUST refuse
+  a block for disagreeing with. It is the number of temporal observations
+  the listed fields contributed; where `fields` names more than one field,
+  an observation that contributes to several of them is counted **once per
+  field** — the open question §10.2 flags, seen from the count side.
+  `fields` bounds that set from above rather than naming it exactly (§10.1).
 
-The digest MUST be produced by ONE k-way merge over its contributors
-(zagg: `zagg.stats.tdigest.merge_tdigests_kway` with the `temporal` channel),
-so that it is permutation-independent in the contributors' order and its
-companion words describe **the centroid partition that merge produced** — the
-§8.3 exactness-given-the-partition rule, which is why the payload and its
-companion MUST come from one call and MUST NOT be folded in separate passes.
+**How an observation lands in a bucket.** Its instant is its §8.3 word's
+*representative instant*: the instant itself for a timestamp word, the
+envelope's midpoint for a range word. Under the worker-written leaf record
+(§10.6) every observation enters as a timestamp, so the buckets are exact.
+Under a sweep backfill from a leaf's per-centroid companions (a leaf written
+before the record existed — §10.6's `source: "sweep"`), a merged centroid's
+whole weight lands in the bucket of its envelope midpoint; that is the one
+approximation this tier carries, and it is confined to such leaves.
 
-Density over a window is then the existing algebra: a CDF difference over the
-payload, with the companion words available to bound (and, near a window edge,
-to correct) which centroids may legitimately contribute. Total weight is
-**exact** — the fold conserves it, so `weight_total` is the observation count
-however coarse the value axis is — while the placement of that weight along
-the axis is only as time-resolved as the centroid partition above.
+**Laws (normative).** All exact, none a merge law:
 
-Gaps between campaign clusters stay visible in the **envelope words**: `k`
-centroids carry `k` words, and a gap between two clusters shows as the
-absence of any word covering it. That is a claim about the `times` buffer,
-not about column 0 — the means can and do land inside a gap when a single
-centroid's members straddle one. A reader answering "is there data in this
-window at all" MUST read the words; the CDF answers "roughly how much",
-resolved to the partition, and nothing finer.
+- **Merge** of two covers on one grid — the window leaves of one shard, the
+  partitions of a sweep, the children of a ladder node: the per-word **sum**
+  over the union of keys. Same order ⇒ same grid ⇒ no rounding. Covers at
+  two orders merge by first coarsening the finer to the coarser.
+- **Coarsen** to an order `o' < o`: each word maps to its order-`o'` ancestor
+  bucket, and counts sum per ancestor — exact at the coarser rung. A
+  producer applies it only to fit `cap`, by whole orders, recording the
+  surviving order in `temporal_order`; it MUST NOT truncate the word list
+  instead (§10.5's rule, the same reason: silently dropped coverage).
+- **The §10.5 cover is derived from it**: take the keys, `toc_normalize`.
+  This MUST equal §10.5's quantization over the same instants at the same
+  order — the two are one law on one grid — so a cover is never computed
+  separately from its counts.
+
+**Why a counted cover and not a digest.** The sources are spikes: a pass
+crosses an order-9 shard in about a second, so a shard's time distribution
+is a weighted point set of tens (ATL03) to a few hundred (GEDI) instants. A
+t-digest keeps *approximate* density in adaptive bins and places merged mass
+at midpoints where nothing was observed; the counted cover keeps *exact*
+occupancy and exact counts per bucket, composes by addition, and coarsens
+exactly. Because a pass is ~1 s wide, the word count does not grow with
+finer order until buckets approach pass duration (about order 33): 49
+passes are 49 words at order 18 and still 49 at order 24, so the one pinned
+order (§10.5) costs nothing over a coarser one and answers "within the
+hour?" from the block alone; a time-dense source hits the cap sooner and
+coarsens exactly as §10.5 specifies.
+Everything the digest answered is derivable from the counted cover — the
+mass in a window is the sum of `obs` over the buckets it covers, with at
+most one partial bucket at each edge, and a reader that wants a digest
+builds one from `(bucket midpoint, count)` — and the reverse is not true.
+
+Gaps stay visible exactly as in §10.5: a bucket with no data has no word.
+"Is there data in this window at all" reads the words; "how much" sums
+`obs` over the buckets the window covers, resolved to the bucket and
+nothing finer.
 
 ### 10.4 Composition
 
@@ -3011,12 +3037,14 @@ that seam as follows:
   merges to the join of its two words, a shard on one side carries over
   unchanged. The join is idempotent, so re-walking unchanged leaves reproduces
   the identical map.
-- **Tier 2 is never unioned.** Its weights are counts, and merging two digests
-  over overlapping shard sets would double-count them. It is **replaced**, and
-  only by a producer whose own map covered every shard the merged map lists;
-  a producer that covered only part of the store publishes no digest and
-  leaves the standing one alone, and a merge that can find no whole-covering
-  digest on either side drops the block rather than publish a partial one.
+- **Tier 2 is never summed at this seam.** Its values are counts, and
+  adding two covers over overlapping shard sets would double-count them
+  (§10.3's merge law is for DISJOINT contributors — window leaves,
+  partitions, children). It is **replaced**, and only by a producer whose
+  own map covered every shard the merged map lists; a producer that covered
+  only part of the store publishes no counts and leaves the standing block
+  alone, and a merge that can find no whole-covering block on either side
+  drops it rather than publish a partial one.
 - **A producer with no temporal contribution at all leaves an existing section
   untouched** — it is not evidence of absence, only of a walk that did not
   look. Conversely a producer that overwrites the carrier wholesale (an
@@ -3048,8 +3076,8 @@ that seam as follows:
 
 Conformance for an external reader is §7's `temporal/` fixture: its root
 `coverage.moc` carries this section, and the fixture's `temporal.expected.json`
-records the shard word and the decoded digest so the containment and weight
-claims above are pinned on committed bytes.
+records the shard word and the decoded counted cover so the containment and
+count claims above are pinned on committed bytes.
 
 ### 10.5 The word-set cover sibling — `zagg-coverage-toc-cover/1`
 
@@ -3142,21 +3170,33 @@ rounding of its own; the one exception is the scale ceiling, where the top
 bucket's end clamps to the grammar's maximum encodable end (`TOC_MAX_NS`) —
 still containing every encodable input word.
 
-The pinned **cover order is 18**: bucket span `2^45` ns ≈ 9.77 h
-(espg-ruled on [issue #489](https://github.com/englacial/zagg/issues/489),
-2026-08-24). The ladder is the grammar's own power-of-two structure; the
-rung on it is chosen for the *consumer*, because nothing else constrains
-it: correctness is order-independent (quantization only widens at any
-order), and storage is flat (a pass is ~one word at any rung near this
-one). Order 18 resolves consecutive-day revisits that ≥-day spans fuse,
-and holds the epoch error of a cover-bucket midpoint to ±half a span
-≈ ±4.9 h — small against the closest-observation Sentinel-2 consumer's
-~4.3-day revisit cadence, where a ±19.5 h midpoint error (the ≥-1-day
-rung, order 16) would not be. A future time-dense source is absorbed by
-the cap below, never by re-pinning. Note the bucket span is not the *gap*
+The pinned **temporal order is 24**: bucket span `2^39` ns ≈ 9.2 min
+(espg-ruled on [issue #575](https://github.com/englacial/zagg/issues/575),
+2026-09-17, retiring the order-18 pin of
+[issue #489](https://github.com/englacial/zagg/issues/489)). It is the ONE
+rung of the temporal path: the leaf record's counted cover (§10.6), the
+root counted cover (§10.3) and this object all quantize at it, and the cap
+below is the only coarsening mechanism — coarser *effective* rungs (a
+root over years of daily passes, a coarse ladder node) are data-driven,
+recorded per block, never pinned. The ladder is the grammar's own
+power-of-two structure; the rung on it is chosen for the *consumer*,
+because nothing else constrains it: correctness is order-independent
+(quantization only widens at any order), and storage does not depend on
+it, because the sources are **spikes** — a pass crosses an order-9 shard in
+about a second, so a shard's time distribution is a point set of tens to a
+few hundred instants and holds the same ~50–60 words at order 24 as at 18
+(the word count only grows once buckets approach pass duration, near
+order 33). Order 24 keeps consecutive orbits (~95 min) and a day's
+ascending and descending passes distinct, resolves time-of-day, and holds
+the epoch error of a cover-bucket midpoint to ±half a span ≈ ±4.6 min — so
+the closest-observation consumer's argmin over `|t_other − t_epoch|` cannot
+flip on a pass that falls near the midpoint between two acquisitions, and
+"within a day of the other sensor" is answered by the candidate set
+itself. A time-dense source (hourly data hits the cap in months rather
+than years) is absorbed by the cap below, coarsening by whole orders as
+specified there, never by re-pinning. Note the bucket span is not the *gap*
 promise: a surviving gap needs a whole aligned bucket to itself (below),
-so the **guaranteed gap floor is two spans**, `2 × 2^45` ns ≈ 19.5 h ≈
-0.81 days.
+so the **guaranteed gap floor is two spans**, `2 × 2^39` ns ≈ 18.3 min.
 
 Three consequences, all normative:
 
@@ -3176,12 +3216,16 @@ Three consequences, all normative:
   survives only when it happens to straddle a bucket boundary the right
   way — alignment, i.e. data-dependent, so a consumer MUST NOT reason on it.
   The guaranteed floor a consumer may rely on is therefore `2 × 2^(63 − o)`
-  ns — at the pinned order 18, ≈ 19.5 h. "Is there data in `[t0, t1)`"
+  ns — at the pinned order 24, ≈ 18.3 min. "Is there data in `[t0, t1)`"
   answers per shard from this object alone, down to that floor.
 - **Quantization commutes with union and with the envelope join**, which is
   what makes the per-leaf fold exact (the cover of a union of leaves is the
   normalize of the union of their covers) and the parity invariant below
   well-defined.
+- **The cover is the counted cover's key set** (§10.3, §10.6): a producer
+  holding a leaf's or a shard's counted cover derives this object's words by
+  taking its keys and normalizing, and MUST get exactly what quantizing the
+  instants directly gives at the same order — one law on one grid.
 
 **The cap.** A shard's block holds at most `cap` words. A producer whose
 cover lands above it MUST coarsen **by order** — re-quantize at `o − 1`,
@@ -3193,12 +3237,18 @@ which would silently drop coverage.
 **Parity invariant.** For every shard listed both here and in §10.2's map,
 the words MUST satisfy
 
-> `toc_reduce(words)` = `toc_reduce(quantize({§10.2 word}, o))`
+> `toc_reduce(words)` ⊆ `toc_reduce(quantize({§10.2 word}, o))`
 
-at the shard's effective order `o` — the cover's own envelope is exactly the
-quantized tier-1 envelope. This follows from the commutation above and is
-the cross-object consistency check a reader MAY apply cheaply; zagg's suite
-asserts it on every shard it writes. (Plain equality with the §10.2 word
+at the shard's effective order `o` — the cover's own envelope lies inside
+the quantized tier-1 envelope — with **equality** whenever every leaf behind
+the shard contributed per-observation words (a worker-written §10.6 record,
+or a raw read of a leaf whose centroids are all weight-1): the cover and the
+quantized join are then one law over one set, which is the commutation
+above. A sweep backfill from per-centroid companions counts a merged
+centroid at its envelope's midpoint (§10.3), so such a shard's cover may sit
+strictly inside its tier-1 envelope. Either way it is the cross-object
+consistency check a reader MAY apply cheaply; zagg's suite asserts equality
+on every shard the fixture writes. (Plain equality with the §10.2 word
 itself does NOT hold: that word lives on the grammar's native 2^31/2^32
 grids, the cover on the bucket grid.)
 
@@ -3256,3 +3306,146 @@ fixture's two clusters leave uncovered, which is what makes the object a
 test of the never-bridge law rather than of a single bucket. The other fixtures carry no `coverage.toc` at all,
 which pins the absence rule as bytes, exactly as §10's section absence is
 pinned.
+
+### 10.6 The leaf temporal record — `zagg-leaf-temporal/1`
+
+**Status: contract** ([issue #575](https://github.com/englacial/zagg/issues/575);
+espg ruling of 2026-09-17 on the record's channels).
+
+§10.2, §10.3 and §10.5 describe the root section's *outputs*; this section
+describes where their per-leaf *inputs* are kept. All three were originally
+derived at sweep time by reading every leaf's raw §8.3 companion column
+back, which at the published California store's shape (a million-row
+ragged array per field per leaf, ~2,964 leaves) cannot finish inside one
+invoke at all — while the worker that wrote the leaf held every
+observation's toc word in memory, per chunk, and threw it away. The record
+keeps what that worker knew: **one small JSON object per shard leaf,
+`{leaf}/temporal.toc`**, beside the leaf's `coverage.moc` occupancy bitmap
+(`hive_layout.md`), carrying the leaf's §10.2 envelope word, its §10.3
+counted cover, and the §10.5 cover derived from it.
+
+It has the bitmap's whole posture. It is a **regenerable accelerator** (D9)
+over the leaf's own arrays, never truth; it is written **before** the commit
+stamp, so an unstamped prefix's record is debris with everything else (D4)
+and the stamp stays the leaf's final write; and it is **additive** — a leaf
+written before this revision simply lacks it, a reader treats absence as
+"read the leaf", and a sweep that had to take the raw route MAY write the
+record it computed so the store converges. Like the bitmap it is a foreign
+key inside the otherwise-vanilla leaf: zarr data reads are unaffected, and
+member enumeration warn-skips it.
+
+**Absence is the rule for non-temporal stores.** A leaf is written with a
+record **iff** its config declares a §8.3 `"per-centroid"` field and the
+leaf holds at least one clocked observation. A `"per-cell"` or
+`"coordinate"` declaration alone arms nothing (it is a different array
+grammar and contributes nothing to §10), and an empty leaf publishes no
+temporal claim. Every other fixture leaf under §7 carries no such object,
+which is that rule pinned as bytes.
+
+**Contract.**
+
+```json
+{
+  "spec": "zagg-leaf-temporal/1",
+  "source": "worker",
+  "generated_at": "2026-09-17T18:02:11+00:00",
+  "fields": ["h_tdigest"],
+  "n_obs": 346,
+  "word": "10689250968998868755",
+  "temporal_order": 24,
+  "cap": 512,
+  "counts": {
+    "temporal_order": 24,
+    "cap": 512,
+    "element": {"dtype": "uint64", "shape": [-1]},
+    "encoding": "base64",
+    "words": "…",
+    "obs": "…",
+    "count": 5,
+    "obs_total": 346
+  },
+  "cover": {
+    "element": {"dtype": "uint64", "shape": [-1]},
+    "encoding": "base64",
+    "words": "…",
+    "count": 2
+  }
+}
+```
+
+- **`spec`** (required) — `"zagg-leaf-temporal/1"`, the object's OWN marker
+  (it gates itself, as the §10.5 sibling does). A reader MUST strict-check
+  it; an unknown revision reads as **absent** — read the leaf — never as a
+  refusal, and a producer that meets one MUST preserve it rather than
+  overwrite it (§10.4's succession rule, per leaf). An unmarked or
+  unparsable body is debris a producer MAY replace.
+- **`source`** (required) — `"worker"` when the leaf's own worker wrote the
+  record from per-observation words at commit; `"sweep"` when a sweep
+  materialized it from the leaf's committed §8.3 companions (the backfill
+  route for leaves written before this revision). The vocabulary is open.
+- **`generated_at`** (required) — ISO-8601 UTC, the object's own clock.
+- **`fields`** (required) — the sorted payload field names whose clock the
+  record folds: for a worker record every `"per-centroid"` field the config
+  declares, for a sweep record the fields it read. Provenance, with §10.1
+  `fields` semantics.
+- **`n_obs`** (required) — the leaf's temporal observation count, which
+  MUST equal the counts block's `obs_total`: for a worker record the number
+  of clocked observations the leaf aggregated, for a sweep record the total
+  weight of the companions it folded (once per field, §10.3). The two agree
+  except where a clocked observation carried a non-finite payload value,
+  which the payload digest drops and the worker's clock does not.
+- **`word`** (required) — the §10.2 envelope word for THIS leaf, as a
+  decimal string: the grammar's join (`toc_reduce`) over every observation
+  word the leaf holds. Because the join is a semilattice, it is identical
+  whether folded over the per-observation words (the worker) or over the
+  leaf's per-centroid companions (the sweep), and a shard's §10.2 word is the
+  join over its window leaves' records.
+- **`temporal_order`** / **`cap`** (required) — the §10.5 pin and cap the
+  record was written against, with §10.5's meanings verbatim (24 and 512
+  under this revision). One rung serves both blocks: `counts` is counted at
+  it, and `cover` is its key set.
+- **`counts`** (required) — the leaf's counted cover, in §10.3's block
+  grammar verbatim: `temporal_order` (the record's pin, lower only when
+  coarsened under `cap`), `cap`, the two row-aligned buffers, `count` and
+  `obs_total`, with §10.3's MUST-checks. Counted from the per-observation
+  words (worker: each instant its own bucket, exact) or from the
+  per-centroid companions with the centroid weights as counts (sweep: a
+  merged centroid at its envelope midpoint, §10.3).
+- **`cover`** (required) — the leaf's §10.5 word set, **derived from
+  `counts`** by §10.3's law (its keys, `toc_normalize`d, at its order) and
+  carried so a reader wanting only the word set needs no decoding of the
+  counts. In the §10.5 block grammar (`words` base64 of `count`
+  little-endian `uint64` words; `temporal_order` present **iff** the leaf
+  coarsened below the record's pin, absence meaning that pin, never an
+  order above it) plus its own `element`/`encoding` declaration, since the
+  record carries no object-level one. A reader MUST refuse a block whose
+  buffer disagrees with its `count`, and MAY check the derivation; zagg's
+  reader does, and treats a record failing it as debris.
+
+**Per-leaf containment.** §10.5's parity relation holds on every record at
+the cover block's effective order `o`: `toc_reduce(cover)` lies inside
+`toc_reduce(quantize({word}, o))`, with **equality** for a worker record
+(every instant is an observation word, so the cover and the quantized join
+are one law over one set) and possibly strict containment for a sweep
+record (a merged centroid counted at its midpoint may leave the edges of
+its own envelope uncovered). A reader MAY check it and MUST treat a record
+that fails it as debris.
+
+**Composition into the root.** A record is one leaf's contribution to the
+§10 section and its §10.5 sibling, composing exactly as a raw-read leaf
+does: a shard's `shards` word is the join over its window leaves' `word`s;
+the root `counts` and each shard's cover block come from the per-word **sum**
+of the leaves' `counts` (§10.3's merge law), capped, the cover then derived.
+A producer that reads records MAY mix them with raw-read leaves in one walk
+— the two feeds meet the same laws — and the whole-word rule of §10.2
+applies unchanged: a shard any of whose leaves failed to read (record or
+raw) is omitted, never published partial.
+
+Conformance is §7's `temporal/` fixture: its one leaf carries the record,
+written by the production worker path, and `temporal.expected.json`'s
+`leaf_temporal` block records the object name, the required keys, the
+envelope word (derived from the generator's per-observation instants, and
+equal to the root section's shard word), the decoded counted cover and the
+decoded cover — each derived through §10.3's laws from those same instants,
+never transcribed — so the record is pinned against the generator's inputs,
+not against itself.
