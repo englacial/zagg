@@ -3433,10 +3433,13 @@ which is that rule pinned as bytes.
 - **`generated_at`** (required) — ISO-8601 UTC, the object's own clock.
 - **`fields`** (required) — the sorted payload field names whose clock the
   record folds: for a worker record every `"per-centroid"` field the config
-  declares, for a sweep record the fields it read. Provenance, with §10.1
-  `fields` semantics — and a staleness gate: a reader MAY treat a record
-  whose `fields` omit a field the manifest declares as absent (the field
-  postdates it) and re-derive over the union; zagg's sweep does, and
+  declares, for a sweep record the fields the manifest declared when it was
+  written, ones the leaf itself lacks included (they contribute nothing, and
+  recording only the fields actually read would make the gate below
+  re-derive that leaf on every pass). Provenance, with §10.1 `fields`
+  semantics — and a staleness gate: a reader MAY treat a record whose
+  `fields` omit a field the manifest declares as absent (the field postdates
+  it) and re-derive over the manifest's declared set; zagg's sweep does, and
   materializes the re-derived record in its place.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
   MUST equal the counts block's `obs_total`: for a worker record the number
