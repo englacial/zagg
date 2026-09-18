@@ -789,8 +789,15 @@ materializes too (`source: "refresh"`) unless called with
    entry point cannot scope the pass to `moc` ([issue
    #527](https://github.com/englacial/zagg/issues/527));
 2. fire **one unpartitioned** families pass (`partitions=1`, what the runner
-   tail fires anyway): it composes `coverage.moc`'s `temporal` section and
-   `coverage.toc` from the records alone, in seconds;
+   tail fires anyway) over the **whole store's** work set — every leaf
+   (`discover: true`, i.e. `zagg.sweep.discover_leaves`), **not** step 1's
+   leftovers: `MocFamily.finish` builds the section from THIS pass's
+   accumulator composed with whatever stands at the root, and on a store being
+   backfilled nothing is standing, so a pass carrying only the record-less
+   leaves publishes a section listing only those shards and step 3 then fails.
+   It composes `coverage.moc`'s `temporal` section and `coverage.toc` from the
+   records alone — one small GET per leaf plus the serial rollup walk, which is
+   the claim step 3 rests on: inside one invoke;
 3. accept when `temporal.shards` and the cover's `shards` both list the
    store's expected coverage (the distinct successful shard keys across its
    run records).
