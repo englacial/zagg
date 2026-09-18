@@ -3109,7 +3109,7 @@ is *unknown*, a candidate — never *empty*.
   "source": "sweep",
   "generated_at": "2026-08-23T02:41:00+00:00",
   "order": 4,
-  "temporal_order": 18,
+  "temporal_order": 24,
   "cap": 512,
   "fields": ["h_tdigest"],
   "element": {"dtype": "uint64", "shape": [-1]},
@@ -3132,7 +3132,7 @@ is *unknown*, a candidate — never *empty*.
   the carrier's `order` is; keys are D1 decimal shard ids at that order,
   exactly as §10.2's are.
 - **`temporal_order`** (required) — the object's pinned quantization order,
-  below. This revision's producers write **18**.
+  below. This revision's producers write **24**.
 - **`cap`** (required) — the overflow cap the producer enforced, below. This
   revision's producers write **512**.
 - **`fields`** (required) — provenance, with §10.1 `fields` semantics

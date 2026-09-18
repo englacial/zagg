@@ -436,7 +436,7 @@ def quantize_words(words, order: int = TEMPORAL_COVER_ORDER) -> np.ndarray:
     buckets, and ``toc_normalize`` coalesces ranges that merely abut, so a
     gap of one bucket span never survives (its two buckets abut) and only a
     gap that leaves an entire bucket uncovered does. The guaranteed floor is
-    therefore TWO bucket spans — at the pinned cover order, 2 × 2^45 ns ≈ 19.5 h
+    therefore TWO bucket spans — at the pinned cover order, 2 × 2^39 ns ≈ 18.3 min
     — with the ``[1, 2)``-span band decided by where the data falls on the
     grid, not by the gap's length. The one clamp is the scale ceiling:
     the top bucket's end exceeds the grammar's maximum encodable end
