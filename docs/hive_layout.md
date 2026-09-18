@@ -766,10 +766,19 @@ materializes too (`source: "refresh"`) unless called with
 `temporal: {records, materialized, raw}` block shows the split per pass):
 
 1. fire a **partitioned** families pass over the record-less leaves
-   (`runner._invoke_lambda_sweep(..., partitions=2**n)`, issue #377) — it
-   cannot write the root section (its finish is deferred) but it lands every
-   leaf's record, one chunk at a time, bounded by the chunk rather than the
-   leaf; re-fire only the leaves still without a record until none remain;
+   (`runner._invoke_lambda_sweep(..., partitions=4**k)`, issue #377 — a morton
+   digit is two bits, so `sweep_partition.partition_split_order` refuses 2, 8,
+   32 and every other odd power of two) — it cannot write the root section (its
+   finish is deferred) but it lands every leaf's record, one chunk at a time,
+   bounded by the chunk rather than the leaf. **Pick the width against the
+   wall, not against the store**: a partition does 1/N-th of the work but faces
+   the same 900 s invoke, so `leaves × s_per_leaf / N` must fit inside one,
+   rounded up to the next power of four. Here `s_per_leaf` is the RAW-route
+   per-leaf cost — the backfill is precisely the regime where every leaf pays a
+   column read, ~60 s/leaf measured, so CA's 2,726 leaves need 1,024 ways, not
+   the 16 that died. `_handle_sweep` in `deployment/aws/lambda_handler.py`
+   states the rule and works that arithmetic; re-fire only the leaves still
+   without a record until none remain;
 2. fire **one unpartitioned** families pass (`partitions=1`, what the runner
    tail fires anyway): it composes `coverage.moc`'s `temporal` section and
    `coverage.toc` from the records alone, in seconds;
