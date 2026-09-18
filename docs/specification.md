@@ -3429,7 +3429,9 @@ which is that rule pinned as bytes.
 - **`source`** (required) — `"worker"` when the leaf's own worker wrote the
   record from per-observation words at commit; `"sweep"` when a sweep
   materialized it from the leaf's committed §8.3 companions (the backfill
-  route for leaves written before this revision). The vocabulary is open.
+  route for leaves written before this revision), `"refresh"` when the
+  explicit whole-store refresh walk did — the walk that wrote it, so an
+  operator can tell which pass backfilled a leaf. The vocabulary is open.
 - **`generated_at`** (required) — ISO-8601 UTC, the object's own clock.
 - **`fields`** (required) — the sorted payload field names whose clock the
   record folds: for a worker record every `"per-centroid"` field the config

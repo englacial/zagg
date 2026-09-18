@@ -400,6 +400,10 @@ def refresh_root_coverage(
                             cell_order,
                             toc_fields,
                             materialize=materialize,
+                            # This walk's own provenance (§10.6): a record
+                            # the refresh backfilled must not claim the
+                            # sweep wrote it, like every other object here.
+                            source="refresh",
                             **store_kwargs,
                         )
                     except Exception as e:  # fail-open: the section is a cache

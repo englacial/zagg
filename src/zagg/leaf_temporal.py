@@ -456,7 +456,13 @@ def read_leaf_temporal_record(leaf_root: str, **store_kwargs) -> dict | None:
 
 
 def leaf_contribution(
-    leaf_root: str, cell_order: int, fields: dict, *, materialize: bool = True, **store_kwargs
+    leaf_root: str,
+    cell_order: int,
+    fields: dict,
+    *,
+    materialize: bool = True,
+    source: str = "sweep",
+    **store_kwargs,
 ):
     """One leaf's ``(word, counts)`` — record first — and the route it took.
 
@@ -466,9 +472,11 @@ def leaf_contribution(
     ``fields`` cover every declared field (one small GET, no array opened);
     otherwise the raw route — :func:`zagg.coverage_toc.read_leaf_temporal`,
     one ragged chunk at a time — with ``"raw"``, or ``"materialized"`` when
-    ``materialize`` is set and the record it computed was written back
-    (``source: "sweep"``), so a store written before the record existed
-    backfills once and converges across partitioned re-fires.
+    ``materialize`` is set and the record it computed was written back, so a
+    store written before the record existed backfills once and converges
+    across partitioned re-fires. ``source`` is the §10.6 provenance the
+    materialized record carries — the caller's own walk, ``"sweep"`` here and
+    ``"refresh"`` from :func:`zagg.coverage.refresh_root_coverage`.
     ``contribution`` is ``None`` for a leaf holding no temporal row.
 
     Succession and debris follow §10.4/§10.6: a record at a FOREIGN revision
@@ -517,7 +525,7 @@ def leaf_contribution(
         return got, "raw"
     try:
         write_leaf_temporal(
-            leaf_root, build_leaf_temporal(*got, fields, source="sweep"), **store_kwargs
+            leaf_root, build_leaf_temporal(*got, fields, source=source), **store_kwargs
         )
     except Exception as e:
         logger.warning(f"leaf temporal: could not materialize {leaf_root} (fail-open, D9): {e}")

@@ -735,6 +735,16 @@ class TestSweepRoute:
         assert envelope["temporal"]["source"] == "refresh"
         assert set(envelope["temporal"]["shards"]) == {SHARD}
 
+    def test_a_refresh_materialized_record_says_refresh(self, tmp_path):
+        """§10.6 ``source`` is the walk that wrote it, not always the sweep."""
+        from zagg.coverage import refresh_root_coverage
+
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        (Path(leaf) / LEAF_TEMPORAL_NAME).unlink()
+        refresh_root_coverage(root)
+        assert read_leaf_temporal_record(leaf)["source"] == "refresh"
+
     def test_refresh_materialize_off_writes_no_leaf_record(self, tmp_path):
         """The escape hatch stays usable on a store the caller can only read."""
         from zagg.coverage import refresh_root_coverage
