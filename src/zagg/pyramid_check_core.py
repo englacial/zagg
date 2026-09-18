@@ -17,8 +17,11 @@ raised on the PR); the public surface stays on ``zagg.pyramid_check``.
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
 import json
 import logging
+import threading
 
 import numpy as np
 
@@ -37,6 +40,28 @@ WEIGHT_RTOL = 1e-6
 
 def _entry(status: str, detail: str, **extra) -> dict:
     return {"status": status, "detail": detail, **extra}
+
+
+def _map_concurrent(fn, items, workers: int) -> list:
+    """``[fn(x) for x in items]``, at most ``workers`` at a time, in INPUT order.
+
+    The one concurrency primitive of the harness (issue #434 follow-up): the
+    checker's legs are dominated by independent small GETs — one per node,
+    per leaf, per sampled cell — that a sequential loop serializes at S3
+    latency. ``workers <= 1`` IS the sequential loop. The pool path uses
+    ``Executor.map``, never ``as_completed``: results come back in input
+    order, so the printed report and the JSON are the same at any pool
+    size, and a raised exception is the first FAILING item's in input order
+    (later items are cancelled where still pending) — the loop's own
+    contract. Only results are retained; in-flight work is bounded by the
+    pool size, so a task that decodes payloads holds at most ``workers`` of
+    them at once.
+    """
+    items = list(items)
+    if workers <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+        return list(pool.map(fn, items))
 
 
 def _rank(tail: str) -> int:
@@ -150,7 +175,9 @@ def _declared_nodes(leaves: list[str], k: int) -> list[str]:
     return sorted({d[: _base_len(d) + k] for d in leaves})
 
 
-def _probe_nodes(store_root, nodes, store_kwargs, *, rel=_node_object_rel) -> tuple[dict, dict]:
+def _probe_nodes(
+    store_root, nodes, store_kwargs, *, rel=_node_object_rel, workers: int = 8
+) -> tuple[dict, dict]:
     """``({node: attrs | None}, {node: error})`` — one small GET per node.
 
     ``rel`` maps a node decimal to its artifact's relative zarr root — the
@@ -162,10 +189,9 @@ def _probe_nodes(store_root, nodes, store_kwargs, *, rel=_node_object_rel) -> tu
     never be reported as "declared but unmaterialized" (review finding): a
     credential mistake and an unswept store are opposite diagnoses and must
     not print the same sentence. An unparsable ``zarr.json`` keeps its parse
-    error alongside the empty-attrs (partial) verdict.
+    error alongside the empty-attrs (partial) verdict. The GETs are issued
+    ``workers`` at a time (:func:`_map_concurrent`).
     """
-    import concurrent.futures
-
     import obstore
     from obstore.exceptions import NotFoundError
 
@@ -185,8 +211,7 @@ def _probe_nodes(store_root, nodes, store_kwargs, *, rel=_node_object_rel) -> tu
         except Exception as exc:
             return node, {}, f"unparsable zarr.json: {type(exc).__name__}: {exc}"
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(probe, nodes))
+    results = _map_concurrent(probe, nodes, workers)
     return (
         {node: attrs for node, attrs, _ in results},
         {node: err for node, _, err in results if err is not None},
@@ -275,15 +300,24 @@ def _digest_mismatch(stored: np.ndarray, ref: np.ndarray) -> str | None:
 
 
 class _Harness:
-    """One validation pass's shared context: store handles + group cache."""
+    """One validation pass's shared context: store handles + group cache.
 
-    def __init__(self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells):
+    ``workers`` is the read concurrency of the per-cell value legs
+    (:func:`_run_cells`); the group cache and the warning list are safe to
+    share across those threads (a lock around the one-time opens, a
+    per-thread warning buffer so the merge keeps cell order).
+    """
+
+    def __init__(
+        self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells, workers=8
+    ):
         self.store_root = str(store_root).rstrip("/")
         self.manifest = manifest
         self.store_kwargs = dict(store_kwargs)
         self.rng = rng
         self.sample_nodes = sample_nodes
         self.sample_cells = sample_cells
+        self.workers = int(workers)
         self.shard_order = int(manifest["shard_order"])
         self.cell_order = int(manifest["cell_order"])
         self.fields = _composable_fields(manifest)
@@ -300,6 +334,8 @@ class _Harness:
             for _kwarg, sibling in _field_companions(name, meta)
         }
         self._groups: dict = {}
+        self._lock = threading.Lock()
+        self._local = threading.local()
         self.warnings: list = []
 
     def warn(self, message: str) -> None:
@@ -307,10 +343,24 @@ class _Harness:
 
         Skipping quietly is the failure mode the negative suite exists to
         rule out: everything the pass could not validate is named here and
-        printed by :func:`zagg.pyramid_check.format_report`.
+        printed by :func:`zagg.pyramid_check.format_report`. Inside a
+        :meth:`capture` block the message goes to that thread's buffer
+        instead, for the caller to replay in a deterministic order.
         """
-        if message not in self.warnings and len(self.warnings) < 200:
+        buffer = getattr(self._local, "buffer", None)
+        if buffer is not None:
+            buffer.append(message)
+        elif message not in self.warnings and len(self.warnings) < 200:
             self.warnings.append(message)
+
+    @contextlib.contextmanager
+    def capture(self):
+        """Buffer this thread's :meth:`warn` calls; yields the buffer list."""
+        self._local.buffer = buffer = []
+        try:
+            yield buffer
+        finally:
+            self._local.buffer = None
 
     def _open(self, rel: str, inner: int):
         import zarr
@@ -319,8 +369,14 @@ class _Harness:
 
         key = (rel, int(inner))
         if key not in self._groups:
-            store = open_store(f"{self.store_root}/{rel}", read_only=True, **self.store_kwargs)
-            self._groups[key] = zarr.open_group(store, path=str(inner), mode="r", zarr_format=3)
+            with self._lock:  # one open per group, whichever thread gets there first
+                if key not in self._groups:
+                    store = open_store(
+                        f"{self.store_root}/{rel}", read_only=True, **self.store_kwargs
+                    )
+                    self._groups[key] = zarr.open_group(
+                        store, path=str(inner), mode="r", zarr_format=3
+                    )
         return self._groups[key]
 
     def node_group(self, node: str, t: int):
@@ -560,6 +616,31 @@ def _declared_subset(node, t, attrs, provenance_attr, arrays, harness, errors):
     return absent
 
 
+def _run_cells(harness, fn, cells, errors, counted) -> None:
+    """``fn(j, errors, counted)`` over ``cells``, ``harness.workers`` at a time.
+
+    Each cell runs against its own error lists / comparison counters and its
+    own warning buffer (:meth:`_Harness.capture`); the merge is in cell
+    order, so the mismatch lists (``first:`` and the ``mismatches`` head),
+    the ``sampled`` counters and the warning list read exactly as the
+    sequential loop's whatever the pool size.
+    """
+
+    def task(j):
+        errs = {name: [] for name in errors}
+        cnt = dict.fromkeys(counted, 0)
+        with harness.capture() as warned:
+            fn(j, errs, cnt)
+        return errs, cnt, warned
+
+    for errs, cnt, warned in _map_concurrent(task, cells, harness.workers):
+        for name in errors:
+            errors[name].extend(errs[name])
+            counted[name] += cnt[name]
+        for message in warned:
+            harness.warn(message)
+
+
 def _check_node(
     harness,
     node,
@@ -706,12 +787,15 @@ def _check_node(
     if not values:
         return
 
-    for j in cells:
+    # The per-cell legs below are independent reads: they run
+    # ``harness.workers`` at a time (:func:`_run_cells`), each cell against
+    # its own accumulators, merged in cell order.
+    def check_cell(j, errors, counted):
         cell_dec = node + _tail(int(j), t - k)
         # Counts: exact conservation.
         parts, complete = harness.contributions(cell_dec, source, "count")
         if not complete:
-            continue  # an unreadable contributor: this cell is not validated
+            return  # an unreadable contributor: this cell is not validated
         counted["counts"] += 1
         expected = _exact_expected(
             np.concatenate(parts) if parts else np.array([], dtype=counts.dtype),
@@ -808,6 +892,8 @@ def _check_node(
                     f"{'gathered gen-1 word' if gather else 'k-way merge'} {expected_word}"
                 )
 
+    _run_cells(harness, check_cell, cells, errors, counted)
+
     # One empty cell keeps its fills across every field.
     if empty_cell is not None:
         for name in packed_fields:
@@ -818,11 +904,11 @@ def _check_node(
                 errors["digests"].append(f"{node}[{empty_cell}]/{name}: empty cell has a digest")
 
     # ... and the fill side of the presence law: no contributor may carry data.
-    for j in empty_probe:
+    def probe_empty(j, errors, counted):
         cell_dec = node + _tail(int(j), t - k)
         parts, complete = harness.contributions(cell_dec, source, "count")
         if not complete:
-            continue
+            return
         got = _exact_expected(
             np.concatenate(parts) if parts else np.array([], dtype=counts.dtype), "sum", fill
         )
@@ -833,15 +919,20 @@ def _check_node(
                 f"the fold dropped data (blank/short node)"
             )
 
+    _run_cells(harness, probe_empty, empty_probe, errors, counted)
 
-def _ladder_materialization(store_root, ladder, leaves, store_kwargs, checks, report) -> tuple:
+
+def _ladder_materialization(
+    store_root, ladder, leaves, store_kwargs, checks, report, *, workers: int = 8
+) -> tuple:
     """The declared-roster ↔ committed-artifacts check, shared by both arms.
 
-    Probes one ``zarr.json`` per declared above-shard node and settles the
-    ``materialization`` check. Returns ``(probes, declared, state)`` with
-    ``state`` one of ``"ok"`` (value checks may proceed), ``"baseline"``
-    (declared but 0 materialized — the pre-sweep report), or ``"errors"``
-    (probe transport failures: node state is UNKNOWN, never a sweep verdict).
+    Probes one ``zarr.json`` per declared above-shard node (``workers`` GETs
+    at a time) and settles the ``materialization`` check. Returns
+    ``(probes, declared, state)`` with ``state`` one of ``"ok"`` (value
+    checks may proceed), ``"baseline"`` (declared but 0 materialized — the
+    pre-sweep report), or ``"errors"`` (probe transport failures: node state
+    is UNKNOWN, never a sweep verdict).
     """
     declared = {k: _declared_nodes(leaves, k) for k, _ in ladder}
     probes: dict = {}
@@ -850,7 +941,7 @@ def _ladder_materialization(store_root, ladder, leaves, store_kwargs, checks, re
     partial: list = []
     probe_errors: list = []
     for k, _t in ladder:
-        probed, errored = _probe_nodes(store_root, declared[k], store_kwargs)
+        probed, errored = _probe_nodes(store_root, declared[k], store_kwargs, workers=workers)
         probe_errors.extend(f"{n}: {e}" for n, e in sorted(errored.items()))
         probes[k] = {n: attrs if _committed(attrs) else None for n, attrs in probed.items()}
         found = [n for n, attrs in probes[k].items() if attrs is not None]

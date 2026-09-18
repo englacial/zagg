@@ -17,6 +17,7 @@ import json
 
 import numpy as np
 import obstore
+import pytest
 import zarr
 from mortie import generate_morton_children
 
@@ -388,6 +389,87 @@ class TestContributorDefects:
         assert not group["composition"][0:4].any()  # the poisoned span
         report = validate_pyramid(str(tmp_path), full=True)
         assert report["checks"]["composition"]["status"] == "pass", format_report(report)
+
+
+class TestReadConcurrency:
+    """The independent reads run ``workers`` at a time; the report cannot tell.
+
+    Issue #434 follow-up: the sampled canary run was 94% S3 wait on
+    sequential GETs. One pool primitive (``_map_concurrent``) wraps the
+    per-node / per-leaf probes and the per-cell value legs — in INPUT order,
+    with the sequential loop's exception contract — and ``workers=1`` IS the
+    old loop.
+    """
+
+    def test_map_concurrent_keeps_input_order(self):
+        import time
+
+        from zagg.pyramid_check_core import _map_concurrent
+
+        def later_items_finish_first(x):
+            time.sleep(0.01 * (5 - x))
+            return x * x
+
+        expected = [x * x for x in range(5)]
+        assert _map_concurrent(later_items_finish_first, range(5), 8) == expected
+        assert _map_concurrent(later_items_finish_first, range(5), 1) == expected
+        assert _map_concurrent(later_items_finish_first, [], 8) == []
+
+    def test_map_concurrent_raises_the_first_failure_in_input_order(self):
+        # The loop's contract: the exception is the first FAILING item's, with
+        # its own message — even when a later item fails first on the pool.
+        import time
+
+        from zagg.pyramid_check_core import _map_concurrent
+
+        def fn(x):
+            if x in (2, 3):
+                time.sleep(0.05 * (4 - x))  # item 3 raises before item 2 does
+                raise ValueError(f"item {x} broke")
+            return x
+
+        for workers in (1, 8):
+            with pytest.raises(ValueError, match=r"^item 2 broke$"):
+                _map_concurrent(fn, range(5), workers)
+
+    def test_workers_one_is_the_calling_thread(self):
+        import threading
+
+        from zagg.pyramid_check_core import _map_concurrent
+
+        here = threading.get_ident()
+        assert _map_concurrent(lambda _x: threading.get_ident(), range(4), 1) == [here] * 4
+        assert here not in _map_concurrent(lambda _x: threading.get_ident(), range(4), 4)
+
+    def test_report_is_identical_at_any_pool_size(self, tmp_path):
+        # A leaf the moc still names but whose object is gone: the harness
+        # warns from INSIDE the per-cell legs (``contributions``), the one
+        # place a pool could reorder or duplicate — so the warning list, the
+        # mismatch lists and the ``sampled`` counters are all compared, JSON
+        # byte-for-byte, sampled and full.
+        import shutil
+
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        shutil.rmtree(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        for kwargs in ({"sample_nodes": 2, "sample_cells": 3, "seed": 7}, {"full": True}):
+            sequential = validate_pyramid(str(tmp_path), workers=1, **kwargs)
+            if kwargs.get("full"):  # the sample may not reach the gone leaf; full does
+                assert any("-311" in w and "unreadable" in w for w in sequential["warnings"])
+            for workers in (8, 16):
+                pooled = validate_pyramid(str(tmp_path), workers=workers, **kwargs)
+                assert json.dumps(pooled) == json.dumps(sequential), (workers, kwargs)
+
+    def test_cli_workers_flag(self, tmp_path, capsys):
+        manifest = _build_store(tmp_path)
+        _sweep(tmp_path, manifest)
+        out_json = tmp_path / "report.json"
+        assert main([str(tmp_path), "--full", "--workers", "1", "--json", str(out_json)]) == 0
+        printed = capsys.readouterr().out
+        assert printed.splitlines()[0].endswith("(workers 1)")
+        assert "workers" not in json.loads(out_json.read_text())  # how it was read, not what
+        with pytest.raises(SystemExit):
+            main([str(tmp_path), "--workers", "0"])
 
 
 class TestLadderGrammars:
