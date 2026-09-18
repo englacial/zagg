@@ -232,7 +232,9 @@ def _is_derived_zarr(zarr_root: str, store_kwargs: dict) -> bool:
     return isinstance(attrs, dict) and ROLE_ATTR in attrs
 
 
-def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
+def refresh_root_coverage(
+    store_root: str, *, materialize: bool = True, **store_kwargs
+) -> dict | None:
     """Rebuild the root MOC from a full tree walk — the explicit escape hatch.
 
     THE SANCTIONED ROBUSTNESS PATH, not the hot path: D10 forbids walking
@@ -260,7 +262,14 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     fail-open per SHARD, so an unreadable companion costs the section that
     shard and never the refresh; and a walk that lost any shard COMPOSES its
     rebuild with the standing section (§10.4) instead of replacing it, so the
-    escape hatch can never be the thing that deletes the section. A successful
+    escape hatch can never be the thing that deletes the section. That walk
+    also WRITES: every leaf it had to read raw gets the §10.6 record
+    materialized into its prefix (``source: "refresh"``, issue #575), so the
+    repair is a read plus N leaf PUTs, not a read plus one root write. It is
+    fail-open too — an unwritable leaf logs a warning and still contributes —
+    but on a store the caller can only READ, that is one failed PUT per leaf:
+    pass ``materialize=False`` to keep the escape hatch strictly read-only
+    (the sweep keeps the backfill duty). A successful
     refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
@@ -387,7 +396,11 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 if toc_fields and decimal not in toc_failed:
                     try:
                         got, _route = leaf_contribution(
-                            f"{root}/{rel}", cell_order, toc_fields, **store_kwargs
+                            f"{root}/{rel}",
+                            cell_order,
+                            toc_fields,
+                            materialize=materialize,
+                            **store_kwargs,
                         )
                     except Exception as e:  # fail-open: the section is a cache
                         # Shard-scoped, not leaf-scoped: §10.2's word must

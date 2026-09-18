@@ -701,3 +701,13 @@ class TestSweepRoute:
         envelope = refresh_root_coverage(root)
         assert envelope["temporal"]["source"] == "refresh"
         assert set(envelope["temporal"]["shards"]) == {SHARD}
+
+    def test_refresh_materialize_off_writes_no_leaf_record(self, tmp_path):
+        """The escape hatch stays usable on a store the caller can only read."""
+        from zagg.coverage import refresh_root_coverage
+
+        root = _fixture_copy(tmp_path)
+        (Path(_leaf_of(root)) / LEAF_TEMPORAL_NAME).unlink()
+        envelope = refresh_root_coverage(root, materialize=False)
+        assert set(envelope["temporal"]["shards"]) == {SHARD}
+        assert not (Path(_leaf_of(root)) / LEAF_TEMPORAL_NAME).exists()
