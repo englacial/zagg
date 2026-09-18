@@ -1233,6 +1233,50 @@ class TestProcessAndWriteHive:
 
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
+    def test_a_failed_record_write_still_stamps_the_leaf(self, monkeypatch, cfg, tmp_path, caplog):
+        """Issue #575: the record PUT is fail-OPEN, unlike the bitmap's.
+
+        Nothing points at ``temporal.toc`` — §10.6 reads its absence as "read
+        the leaf" and the sweep re-materializes it — so a transient failure on
+        a ~1 KB D9 accelerator must not discard a finished shard's read and
+        aggregate. The leaf still stamps, and the object is simply not there.
+        """
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(leaf_temporal, "write_leaf_temporal", boom)
+        root = str(tmp_path / "store")
+        with caplog.at_level("WARNING"):
+            hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+            )
+        leaf = hive.shard_leaf_path(root, shard)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+        assert "503 SlowDown" in caplog.text
+
     def test_non_temporal_config_writes_no_record(self, monkeypatch, cfg, tmp_path):
         from zagg import leaf_temporal
 

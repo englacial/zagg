@@ -3373,6 +3373,14 @@ record it computed so the store converges. Like the bitmap it is a foreign
 key inside the otherwise-vanilla leaf: zarr data reads are unaffected, and
 member enumeration warn-skips it.
 
+It takes the bitmap's *slot* but not its failure posture. The commit stamp
+points AT the bitmap (§ the stamp's `coverage`), so a stamp published
+without one is a false claim and that write must fail the leaf. Nothing
+points at this record: absence is a defined reading, so a producer that
+fails to write it SHOULD log and **stamp the leaf anyway**, leaving the
+record absent for a later sweep, rather than discard a leaf whose arrays all
+landed. It is an accelerator, and losing one costs a read, not correctness.
+
 **Absence is the rule for non-temporal stores.** A leaf is written with a
 record **iff** its config declares a §8.3 `"per-centroid"` field and the
 leaf holds at least one clocked observation. A `"per-cell"` or

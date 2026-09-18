@@ -1807,8 +1807,9 @@ def process_and_write_hive(
     # sidecar is PUT just before it (issue #200 phase 2), and both inherit
     # its debris semantics: a torn worker's coverage never becomes visible.
     # The leaf write order is pinned: dense (streamed, or one object each when
-    # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp
-    # -> granule-id sibling (issue #388; after the stamp, inside the bracket).
+    # sharded) -> ragged (one object, issue #209) -> coverage sidecar ->
+    # temporal record (issue #575, fail-open) -> stamp -> granule-id sibling
+    # (issue #388; after the stamp, inside the bracket).
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
@@ -1831,19 +1832,32 @@ def process_and_write_hive(
         if words is not None and not full and depth > 0:
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
             write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
-        # The leaf temporal record (issue #575): the same slot as the bitmap
-        # — a per-leaf sidecar PUT before the stamp, so an unstamped prefix's
-        # record is debris with everything else. Absent when the fold saw no
-        # clocked observation (an empty leaf publishes no temporal claim).
+        # The leaf temporal record (issue #575): the bitmap's SLOT — a
+        # per-leaf sidecar PUT before the stamp, so an unstamped prefix's
+        # record is debris with everything else — but not the bitmap's
+        # posture. The stamp points AT the bitmap (``build_coverage(...,
+        # bitmap=...)``), so a stamp without it is a lie and the PUT must
+        # fail closed; nothing points at the record, §10.6 reads its absence
+        # as "read the leaf", and the phase-2 sweep re-materializes it. So it
+        # is fail-OPEN like the D9 granule-id sibling below: a transient 5xx
+        # on a ~1 KB accelerator must not discard a finished shard's read and
+        # aggregate. Absent when the fold saw no clocked observation (an empty
+        # leaf publishes no temporal claim).
         folded = temporal_acc.finish() if temporal_acc is not None else None
         if folded is not None:
-            leaf_temporal.write_leaf_temporal(
-                leaf_path,
-                leaf_temporal.build_leaf_temporal(
-                    *folded, leaf_temporal.temporal_field_names(config), source="worker"
-                ),
-                **store_kwargs,
-            )
+            try:
+                leaf_temporal.write_leaf_temporal(
+                    leaf_path,
+                    leaf_temporal.build_leaf_temporal(
+                        *folded, leaf_temporal.temporal_field_names(config), source="worker"
+                    ),
+                    **store_kwargs,
+                )
+            except Exception as exc:  # D9 accelerator: the sweep regenerates it
+                logger.warning(
+                    f"leaf temporal record for {leaf_path} failed to write "
+                    f"({exc}); continuing to the stamp — the sweep regenerates it (issue #575)"
+                )
         stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),
