@@ -800,7 +800,14 @@ materializes too (`source: "refresh"`) unless called with
    the claim step 3 rests on: inside one invoke;
 3. accept when `temporal.shards` and the cover's `shards` both list the
    store's expected coverage (the distinct successful shard keys across its
-   run records).
+   run records). They can legitimately fall short with the backfill having
+   worked: `MocFamily._accumulate_temporal` is fail-open per SHARD, so one
+   window leaf whose temporal read raises drops its whole shard for the rest of
+   the run (§10.2's whole-word rule — a word joined over whichever windows
+   happened to read is not a conservative envelope). The dropped shards name
+   themselves in that pass's `sweep[moc]: dropping shard ... did not read
+   (...)` warnings and its run record: fix those leaves and re-fire. A shard
+   that drops a second time is its own companion's fault, not the backfill's.
 
 **Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`
 against the AOI to pick candidate shards (one GET, no walk); per leaf,
