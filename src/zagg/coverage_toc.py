@@ -491,26 +491,32 @@ def build_cover_section(contributions: dict, fields, shard_order: int, *, source
 
     Same ``contributions`` mapping :func:`build_temporal_section` folds —
     this derives each shard's word set from its leaves' counted covers: the
-    per-word sum over the window leaves, capped, then coarsened to the pinned
-    cover order and normalized (:func:`zagg.leaf_temporal.cover_from_counts`
-    — byte-equal to :func:`quantize_words` over the same instants, so the
-    §10.5 bytes are what they were before the counts existed). ``None`` for
-    an empty map — the standing absence rule, so a store with no temporal
-    channel gets no sibling object at all.
+    per-word sum over the window leaves, normalized into the word set
+    (:func:`zagg.leaf_temporal.cover_from_counts` — byte-equal to
+    :func:`quantize_words` over the same instants, so the §10.5 bytes are
+    what they were before the counts existed), and only THEN capped, with
+    §10.5's own cap on the cover's words (:func:`_cap_cover`, the rule
+    :func:`merge_cover_sections` applies at the other cover seam). The
+    counts' own cap (§10.3) belongs to the counts block and is applied there,
+    in :func:`build_temporal_section`: capping the un-coalesced buckets here
+    would coarsen a shard whose coalesced cover fits the cap comfortably, and
+    would put two different laws on the two seams that write this object.
+    ``None`` for an empty map — the standing absence rule, so a store with no
+    temporal channel gets no sibling object at all.
 
     A shard that had to coarsen below :data:`TEMPORAL_COVER_ORDER` records the
     order it landed at in its own block (``temporal_order``), and the
     coarsening is logged — §10.5's "widening only, loudly recorded".
     """
     from zagg.hive import _utcnow
-    from zagg.leaf_temporal import cap_counts, cover_from_counts, merge_counts
+    from zagg.leaf_temporal import cover_from_counts, merge_counts
 
     if not contributions:
         return None
     shards: dict[str, dict] = {}
     for decimal in sorted(contributions):
-        counts = cap_counts(merge_counts([p[1] for p in contributions[decimal]]))
-        cover, order = cover_from_counts(counts)
+        cover, order = cover_from_counts(merge_counts([p[1] for p in contributions[decimal]]))
+        cover, order = _cap_cover(cover, order)
         if order != TEMPORAL_COVER_ORDER:
             logger.warning(
                 f"coverage[toc]: shard {decimal} cover coarsened to temporal order {order} "

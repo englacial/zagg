@@ -1167,10 +1167,11 @@ class TestCoverSection:
         assert np.array_equal(cover_words(section)["11213"], expect)
 
     def test_the_cap_coarsens_by_order_and_records_it(self, caplog):
-        # 600 instants two buckets apart: 600 words at the pinned order, over
-        # the 512 cap. The cap coarsens the COUNTED cover (§10.3), whose
-        # buckets stay distinct one rung down (still one apart) and pair up
-        # only at the second: the block lands two orders below the pin.
+        # 600 instants two buckets apart: the buckets never abut, so the
+        # NORMALIZED cover is 600 words at the pinned order, over the 512 cap.
+        # §10.5's cap is on those words, so ONE rung down suffices — the
+        # doubled buckets abut and `toc_normalize` coalesces the whole run
+        # into a single word — and the block lands one order below the pin.
         ts = (BASE_NS + np.arange(600, dtype=np.uint64) * np.uint64(2 * BUCKET_NS)).astype(
             np.uint64
         )
@@ -1181,7 +1182,8 @@ class TestCoverSection:
         with caplog.at_level("WARNING"):
             section = build_cover_section(contributions, ["h"], 4)
         block = section["shards"]["11213"]
-        assert block["temporal_order"] == TEMPORAL_COVER_ORDER - 2
+        assert block["temporal_order"] == TEMPORAL_COVER_ORDER - 1
+        assert block["count"] == 1
         assert block["count"] <= COVER_CAP
         assert "coarsened" in caplog.text
         effective = block["temporal_order"]
@@ -1196,6 +1198,30 @@ class TestCoverSection:
         # `test_parity_with_the_tier_one_map` never reaches.
         tier1 = int(toc_reduce(cover))
         assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], effective)))
+
+    def test_an_abutting_run_over_the_cap_stays_at_the_pin(self, caplog):
+        """§10.5's cap counts the COVER's words, not the counts' buckets.
+
+        600 consecutive occupied buckets are 600 counted-cover keys (§10.3,
+        un-coalesced) but exactly ONE §10.5 word, because abutting buckets
+        coalesce. Capping the buckets instead would coarsen this shard below
+        the pin for a cover that was never near the cap — and would disagree
+        with :func:`merge_cover_sections`, which caps the normalized words.
+        """
+        ts = (BASE_NS + np.arange(600, dtype=np.uint64) * np.uint64(BUCKET_NS)).astype(np.uint64)
+        stamps = np.asarray(time2toc(ts), dtype=np.uint64)
+        counts = count_words(stamps)
+        assert counts.words.size == 600 > COVER_CAP
+        assert len(quantize_words(stamps)) == 1
+        contributions = {"11213": [(int(toc_reduce(stamps)), counts)]}
+        with caplog.at_level("WARNING"):
+            section = build_cover_section(contributions, ["h"], 4)
+        block = section["shards"]["11213"]
+        assert "temporal_order" not in block and block["count"] == 1
+        assert "coarsened" not in caplog.text
+        # And the same shard through the other §10.5 seam lands identically.
+        merged = merge_cover_sections(section, section)
+        assert merged["shards"]["11213"] == block
 
     def test_parity_with_the_tier_one_map(self):
         contributions = _contributions([1, 5, 11])

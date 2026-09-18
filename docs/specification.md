@@ -3015,7 +3015,14 @@ approximation this tier carries, and it is confined to such leaves.
 - **The §10.5 cover is derived from it**: take the keys, `toc_normalize`.
   This MUST equal §10.5's quantization over the same instants at the same
   order — the two are one law on one grid — so a cover is never computed
-  separately from its counts.
+  separately from its counts. The derivation reads the counts **before** this
+  section's cap: the cap here counts un-coalesced buckets, §10.5's counts the
+  cover's words (abutting buckets coalesce into one), and the two are
+  different quantities. A producer therefore derives the cover from the
+  uncapped counts and then applies §10.5's own cap to it, so a shard whose
+  coalesced cover fits stays at the pinned order however many buckets it
+  occupies. The one exception is a §10.6 record, whose `cover` is derived
+  from the `counts` the record actually carries (below).
 
 **Why a counted cover and not a digest.** The sources are spikes: a pass
 crosses an order-9 shard in about a second, so a shard's time distribution
@@ -3237,7 +3244,12 @@ Three consequences, all normative:
 - **The cover is the counted cover's key set** (§10.3, §10.6): a producer
   holding a leaf's or a shard's counted cover derives this object's words by
   taking its keys and normalizing, and MUST get exactly what quantizing the
-  instants directly gives at the same order — one law on one grid.
+  instants directly gives at the same order — one law on one grid. It derives
+  them from the counts as counted, **before** §10.3's cap on the buckets, and
+  then applies the cap below to the resulting words: the two caps count
+  different things (buckets there, coalesced words here), so a shard holding
+  more than `cap` occupied buckets in one unbroken run is one word here and
+  stays at the pinned order.
 
 **The cap.** A shard's block holds at most `cap` words. A producer whose
 cover lands above it MUST coarsen **by order** — re-quantize at `o − 1`,
@@ -3423,10 +3435,15 @@ which is that rule pinned as bytes.
   words (worker: each instant its own bucket, exact) or from the
   per-centroid companions with the centroid weights as counts (sweep: a
   merged centroid at its envelope midpoint, §10.3).
-- **`cover`** (required) — the leaf's §10.5 word set, **derived from
-  `counts`** by §10.3's law (its keys, `toc_normalize`d, at its order) and
-  carried so a reader wanting only the word set needs no decoding of the
-  counts. In the §10.5 block grammar (`words` base64 of `count`
+- **`cover`** (required) — the leaf's §10.5 word set, **derived from the
+  `counts` this record carries** — after their cap, not before it — by
+  §10.3's law (its keys, `toc_normalize`d, at its order), and carried so a
+  reader wanting only the word set needs no decoding of the counts. This is
+  §10.3's one exception to deriving the cover from the uncapped counts, and
+  it is what makes the record self-checking: a reader recomputes the cover
+  from the block it is handed and refuses a record whose two blocks
+  disagree. A producer composing shard blocks for §10.5 from records still
+  applies §10.5's own cap to the composed words, not this one. In the §10.5 block grammar (`words` base64 of `count`
   little-endian `uint64` words; `temporal_order` present **iff** the leaf
   coarsened below the record's pin, absence meaning that pin, never an
   order above it) plus its own `element`/`encoding` declaration, since the
