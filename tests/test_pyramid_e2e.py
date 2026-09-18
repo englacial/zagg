@@ -544,6 +544,40 @@ class TestHarnessHandles:
         other = harness.leaf_group("-312")
         assert harness.array(other, "count") is not handles[0]
 
+    def test_run_cells_merges_a_counter_with_no_error_list(self, tmp_path):
+        """``counted`` merges over its OWN keys, not over ``errors``'.
+
+        The two dicts are built side by side from the same names today, so
+        this is latent — but a leg that counts something it cannot FAIL (a
+        declined/unchecked tally) would merge to zero, and
+        ``_settle_value_checks`` reads a zero counter as "0 comparison(s)
+        performed — NOTHING was validated", i.e. a false red on the
+        acceptance gate (review finding).
+        """
+        from zagg.pyramid_check_core import _Harness, _run_cells
+
+        manifest = _build_store(tmp_path)
+        for workers in (1, 8):
+            harness = _Harness(
+                str(tmp_path),
+                manifest,
+                {},
+                rng=None,
+                sample_nodes=1,
+                sample_cells=1,
+                workers=workers,
+            )
+            errors: dict = {"counts": []}
+            counted = {"counts": 0, "declined": 0}
+
+            def fn(j, errs, cnt):
+                cnt["counts"] += 1
+                cnt["declined"] += int(j)
+
+            _run_cells(harness, fn, [1, 2, 3], errors, counted)
+            assert counted == {"counts": 3, "declined": 6}, workers
+            assert errors == {"counts": []}
+
     def test_cold_group_opens_do_not_serialize(self, tmp_path, monkeypatch):
         """A cold group open is a NETWORK round trip: no lock may span it.
 

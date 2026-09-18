@@ -674,7 +674,11 @@ def _run_cells(harness, fn, cells, errors, counted) -> None:
     own warning buffer (:meth:`_Harness.capture`); the merge is in cell
     order, so the mismatch lists (``first:`` and the ``mismatches`` head),
     the ``sampled`` counters and the warning list read exactly as the
-    sequential loop's whatever the pool size.
+    sequential loop's whatever the pool size. The two accumulators are
+    merged over their OWN keys (review finding): a counter with no matching
+    error list would otherwise stay at zero, and
+    ``_settle_value_checks`` reads a zero counter as "NOTHING was
+    validated" — a false red on the acceptance gate, not an undercount.
     """
 
     def task(j):
@@ -687,7 +691,8 @@ def _run_cells(harness, fn, cells, errors, counted) -> None:
     for errs, cnt, warned in _map_concurrent(task, cells, harness.workers):
         for name in errors:
             errors[name].extend(errs[name])
-            counted[name] += cnt[name]
+        for name in counted:  # NOT driven by ``errors``: a leg may count
+            counted[name] += cnt[name]  # something it cannot fail
         for message in warned:
             harness.warn(message)
 
