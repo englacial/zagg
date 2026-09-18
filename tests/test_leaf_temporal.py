@@ -692,6 +692,30 @@ class TestSweepRoute:
             == 2 * expected["root_coverage"]["obs_total"]
         )
 
+    def test_an_empty_leaf_counts_no_route(self, tmp_path, monkeypatch):
+        """The route tally is per CONTRIBUTING leaf (issue #575).
+
+        A leaf holding no temporal row publishes no claim (§10.6), so it is
+        not telemetry about how the section was composed — counting it as
+        ``raw`` would put a permanent floor under the backfill numbers phase
+        3 surfaces.
+        """
+        from zagg.sweep import MocFamily
+
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        empty = MocFamily()
+        monkeypatch.setattr(leaf_temporal, "leaf_contribution", lambda *_a, **_k: (None, "raw"))
+        empty._accumulate_temporal(root, SHARD, leaf, {})
+        assert empty._temporal_routes == {"record": 0, "materialized": 0, "raw": 0}
+        assert empty._temporal == {}
+        # A leaf that does contribute is counted under the route it took.
+        monkeypatch.undo()
+        family = MocFamily()
+        family._accumulate_temporal(root, SHARD, leaf, {})
+        assert family._temporal_routes == {"record": 1, "materialized": 0, "raw": 0}
+        assert list(family._temporal) == [SHARD]
+
     def test_refresh_reads_records_too(self, tmp_path, monkeypatch):
         import zagg.coverage_toc as toc
         from zagg.coverage import refresh_root_coverage

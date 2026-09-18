@@ -199,8 +199,13 @@ class MocFamily(SweepFamily):
         #: Shards whose temporal read failed: dropped from the map entirely,
         #: never published from the window leaves that did read (issue #480).
         self._temporal_failed: set[str] = set()
-        #: How each leaf's contribution was obtained (issue #575): from its
-        #: record, from the raw route and materialized, or raw only.
+        #: How each CONTRIBUTING leaf's contribution was obtained (issue
+        #: #575): from its record, from the raw route and materialized, or
+        #: raw only. Counted per contributing leaf — a leaf holding no
+        #: temporal row contributes nothing and is not counted at all — and
+        #: never decremented: a later window leaf that drops its whole shard
+        #: (the ``except`` below) leaves the earlier windows' counts standing,
+        #: so the three need not reconcile with ``temporal_shards``.
         self._temporal_routes: dict[str, int] = {"record": 0, "materialized": 0, "raw": 0}
         #: Resolved once, on the first leaf read; ``None`` until then.
         self._temporal_fields: dict | None = None
@@ -253,8 +258,8 @@ class MocFamily(SweepFamily):
             self._temporal_failed.add(decimal)
             self._temporal.pop(decimal, None)
             return
-        self._temporal_routes[route] += 1
         if got is not None:
+            self._temporal_routes[route] += 1
             self._temporal.setdefault(decimal, []).append(got)
 
     def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
