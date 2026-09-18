@@ -537,6 +537,31 @@ class TestSweepRoute:
         assert route == "raw" and got is not None
         assert not (Path(leaf) / LEAF_TEMPORAL_NAME).exists()
 
+    def test_a_record_that_does_not_read_costs_the_leaf_read_not_the_shard(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A store failure on the ~1 KB accelerator falls through to the leaf.
+
+        §10.6 reads an absent record as "read the leaf", and an UNREADABLE
+        one is no more evidence about the leaf than a missing one — so a 403
+        or a 5xx on that key must not drop the shard (and, under §10.4, must
+        not overwrite a body that may be a foreign revision).
+        """
+
+        def refuse(*_a, **_k):
+            raise OSError("403 on the sidecar key")
+
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        before = (Path(leaf) / LEAF_TEMPORAL_NAME).read_bytes()
+        monkeypatch.setattr(leaf_temporal, "read_leaf_temporal_record", refuse)
+        with caplog.at_level("WARNING"):
+            got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "raw" and got is not None
+        assert "did not read" in caplog.text
+        assert (Path(leaf) / LEAF_TEMPORAL_NAME).read_bytes() == before
+
     def test_a_foreign_revision_record_is_preserved_and_bypassed(self, tmp_path):
         root = _fixture_copy(tmp_path)
         leaf = _leaf_of(root)

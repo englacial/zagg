@@ -475,8 +475,11 @@ def leaf_contribution(
     is preserved (raw route, never overwritten); an unparsable or
     inconsistent one is debris the materialized record replaces; one whose
     ``fields`` omit a declared field is stale (the field postdates it) and
-    is re-derived over the union. Materialization is fail-open (D9): a write
-    that fails is logged and the contribution still returns.
+    is re-derived over the union. A record whose GET itself fails is neither:
+    the leaf is read (an unreadable accelerator is no more evidence about it
+    than a missing one) and the object is left alone, since a body that did
+    not read may be a foreign revision. Materialization is fail-open (D9): a
+    write that fails is logged and the contribution still returns.
     """
     from zagg.coverage_toc import read_leaf_temporal
 
@@ -486,6 +489,13 @@ def leaf_contribution(
     except ValueError as e:
         logger.warning(f"leaf temporal: {leaf_root} record is not JSON ({e}) — re-deriving")
         raw = None
+    except Exception as e:
+        # The GET itself failed (a 403 on the key, a 5xx, a timeout): the
+        # accelerator is not the truth, so read the leaf rather than costing
+        # the shard — and never overwrite a body that could not be read (it
+        # may be a foreign revision, which §10.4 says to preserve).
+        logger.warning(f"leaf temporal: {leaf_root} record did not read ({e}) — re-deriving")
+        raw, foreign = None, True
     record = load_leaf_temporal(raw)
     if record is not None:
         if set(record.get("fields") or []) >= set(fields):
