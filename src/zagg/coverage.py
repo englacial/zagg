@@ -295,7 +295,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     order = int(manifest["shard_order"])
     # The §10 temporal section (issue #480) is rebuilt from the SAME walk, so
     # the escape hatch regenerates it rather than deleting it — and, because
-    # this walk is whole-store by construction, its root time-digest is the
+    # this walk is whole-store by construction, its root counted cover is the
     # authoritative one (spec §10's whole-coverage rule). The §10.5 word-set
     # cover sibling (issue #489) rebuilds from the same contributions.
     toc_fields = temporal_fields(manifest)

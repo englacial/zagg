@@ -2163,13 +2163,25 @@ never sharded, §8/#247):
   so §10's golden: the object was written by the production sweep writer (the
   MOC family's leaf read plus its finisher) and carries the
   `zagg-coverage-toc/1` section — the shard's tier-1 envelope word and the
-  tier-2 root time-digest in the native ragged `(k, 2)` + word-sibling form.
+  tier-2 root **counted cover** (§10.3): two row-aligned `uint64` buffers,
+  the occupied bucket words at the pinned order and their per-bucket
+  observation counts. There is no `digest` key, and the suite asserts its
+  absence — the counted cover replaced the time-digest outright
+  ([#575](https://github.com/englacial/zagg/issues/575)), so a reader
+  implementing §10.3 from this fixture meets no digest grammar at all.
   `temporal.expected.json`'s `root_coverage` block records the tier-1 word
   **derived from the generator's inputs** (the join over every per-centroid
   word it fed the writer, so the writer is pinned rather than self-certified),
-  the decoded digest rows read back — the same exception `column/`'s group
-  values are — and `obs_total`, the cell plan's own observation count, which
-  §10.3's weight rule says the digest's total weight MUST equal. The other
+  the decoded `words`/`obs` buffers read back — the same exception `column/`'s
+  group values are — and `obs_total`, the cell plan's own observation count,
+  which §10.3's count rule says the block's `obs_total` MUST equal. The one
+  leaf also carries the **§10.6 record**, `temporal.toc`
+  ([#575](https://github.com/englacial/zagg/issues/575)), written by the
+  production worker path; `temporal.expected.json`'s `leaf_temporal` block
+  records the object name, the required keys, the envelope word (equal to the
+  root section's shard word), and the decoded counted cover and cover — each
+  derived through §10.3's laws from the generator's own instants, never
+  transcribed from the object. The other
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
   trees are byte-identical to their pre-§10 selves — which is exactly §10's

@@ -719,7 +719,7 @@ the reference example can never drift from the implementation.
 
 A temporal-declaring store adds one more key here: `temporal`, the
 `zagg-coverage-toc/1` section (per-shard toc envelope words plus an optional
-root time-digest) whose grammar is normative in
+root counted cover) whose grammar is normative in
 [`specification.md`](specification.md) §10 — one metadata GET then answers
 "which shards hold data DURING my window" before any leaf is opened. A store
 with no temporal channel carries no such key and its root object is

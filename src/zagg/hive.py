@@ -1090,8 +1090,9 @@ def build_root_coverage(
     object byte-identical to pre-#246 runs.
 
     ``temporal`` (issue #480): the spec §10 ``zagg-coverage-toc/1`` section —
-    the per-shard toc envelope word map plus the optional root time-digest,
-    built by :func:`zagg.coverage_toc.build_temporal_section`. ``None`` for a
+    the per-shard toc envelope word map plus the optional root counted cover
+    (§10.3, issue #575), built by
+    :func:`zagg.coverage_toc.build_temporal_section`. ``None`` for a
     store with no temporal channel, which keeps ITS root object byte-identical
     to a pre-#480 one; absence of the section is never a refusal.
     """
