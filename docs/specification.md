@@ -2992,6 +2992,21 @@ have for the cover sibling:
   field** — the open question §10.2 flags, seen from the count side.
   `fields` bounds that set from above rather than naming it exactly (§10.1).
 
+  **The two producers do not agree on this when `fields` names more than one
+  field.** A block derived from a leaf's committed §8.3 companions (the
+  sweep's raw route) reads one companion per declared field and so counts an
+  observation **once per field**, the rule above. A §10.6 record written by
+  the leaf's own worker folds the chunk's ONE shared clock column and so
+  counts each clocked observation **once**, whatever number of fields declare
+  a companion over it. For a store with `f` temporal fields the two feeds
+  therefore differ by a factor of `f` on the same leaf, and on a store that
+  mixes them — some leaves recorded, some backfilled — the root `obs_total`
+  is a sum of counts under two rules and is **not a single well-defined
+  quantity**. Readers MUST NOT treat a multi-field `obs_total` as an exact
+  observation count; the `obs` ratios within one block are unaffected, and a
+  single-field store (every published one to date) has no discrepancy. Which
+  rule both producers should meet is open — see §10.2's question.
+
 **How an observation lands in a bucket.** Its instant is its §8.3 word's
 *representative instant*: the instant itself for a timestamp word, the
 envelope's midpoint for a range word. Under the worker-written leaf record
@@ -3414,10 +3429,17 @@ which is that rule pinned as bytes.
   `fields` semantics.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
   MUST equal the counts block's `obs_total`: for a worker record the number
-  of clocked observations the leaf aggregated, for a sweep record the total
-  weight of the companions it folded (once per field, §10.3). The two agree
-  except where a clocked observation carried a non-finite payload value,
-  which the payload digest drops and the worker's clock does not.
+  of clocked observations the leaf aggregated, **once per observation** (the
+  worker folds one shared clock column, so a second declared field adds
+  nothing to the count), for a sweep record the total weight of the
+  companions it folded, **once per field** (§10.3's rule). The two therefore
+  agree only where `fields` names a single field — and there only up to a
+  clocked observation whose payload value was non-finite, which the payload
+  companion drops and the worker's clock does not. With `f` declared
+  temporal fields a sweep record's `n_obs` is about `f ×` a worker record's
+  for the same leaf, so `n_obs` from a mixed store is a lower bound on
+  neither rule's count; §10.3's `obs_total` bullet carries the same warning
+  for the root, and the rule the two producers should share is open.
 - **`word`** (required) — the §10.2 envelope word for THIS leaf, as a
   decimal string: the grammar's join (`toc_reduce`) over every observation
   word the leaf holds. Because the join is a semilattice, it is identical

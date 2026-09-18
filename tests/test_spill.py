@@ -1253,6 +1253,43 @@ class TestLeafTemporalFold:
         self._assert_fold(acc.finish(), dfs, expected, expected[2])
         assert len(fed) == 4 and max(fed) < expected[2]  # one feed per chunk, none the shard
 
+    def test_two_temporal_fields_count_once_per_observation(self, monkeypatch):
+        """The two §10 producers disagree on `n_obs` for a MULTI-field store.
+
+        The worker folds the chunk's one shared clock column, so a second
+        declared field adds nothing to the count; the sweep's raw route reads
+        one companion per field and counts once PER FIELD (§10.3's
+        `obs_total` rule, `read_leaf_temporal`'s docstring). Both sides are
+        pinned here on one shard so the factor-of-`f` discrepancy is visible
+        rather than latent — which rule the two producers should share is
+        issue #575's standing question for review.
+        """
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        variables = _companion_variables()
+        variables["g_tdigest"] = {
+            **variables["h_tdigest"],
+            "location": "leaf_id",
+            "temporal": "per-centroid",
+        }
+        cfg = _config(variables=variables, output=_TIME_SOURCE)
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = self._dfs(grid, key)
+        acc = LeafTemporalAccumulator()
+        _, ragged, meta = _run(monkeypatch, cfg, grid, key, list(dfs), temporal_out=acc)
+        n = meta["total_obs"]
+        # Worker: once per observation, whatever the declared field count.
+        self._assert_fold(acc.finish(), dfs, self._expected(dfs), n)
+        # Sweep: once per field — the same observations weighed twice, because
+        # each field's committed companion is read and counted on its own.
+        per_field = {
+            name: int(sum(float(np.asarray(p).reshape(-1, 2)[:, 1].sum()) for p in ragged[name][0]))
+            for name in ("h_tdigest", "g_tdigest")
+        }
+        assert set(per_field.values()) == {n}
+        assert sum(per_field.values()) == 2 * n
+
     def test_a_config_without_a_temporal_field_feeds_nothing(self, monkeypatch):
         from zagg.leaf_temporal import LeafTemporalAccumulator
 
