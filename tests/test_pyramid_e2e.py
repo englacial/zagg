@@ -544,6 +544,36 @@ class TestHarnessHandles:
         other = harness.leaf_group("-312")
         assert harness.array(other, "count") is not handles[0]
 
+    def test_cold_group_opens_do_not_serialize(self, tmp_path, monkeypatch):
+        """A cold group open is a NETWORK round trip: no lock may span it.
+
+        Eight distinct leaves at ``workers=8``, each open sleeping 50 ms:
+        under a mutex that is 8 x 50 ms, concurrently it is one 50 ms wait
+        (review finding — the penalty was exactly ``workers``x, and the
+        roster it scales with is 2,918 leaves on CA, not the canary's 4).
+        The bound asserted is the SERIAL floor, not the concurrent one, so
+        the test pins the lock rather than the scheduler.
+        """
+        import time
+
+        from zagg.pyramid_check_core import _Harness, _map_concurrent
+
+        def slow_open_group(_store, *, path, **_kwargs):
+            time.sleep(0.05)
+            return path
+
+        manifest = _build_store(tmp_path)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=8
+        )
+        monkeypatch.setattr(zarr, "open_group", slow_open_group)
+        leaves = [f"-3{a}{b}" for a in "12" for b in "1234"]
+        start = time.perf_counter()
+        opened = _map_concurrent(harness.leaf_group, leaves, 8)
+        elapsed = time.perf_counter() - start
+        assert len(set(opened)) == len(leaves)  # eight distinct groups...
+        assert elapsed < 8 * 0.05 / 2  # ... opened concurrently, not one by one
+
     def test_a_full_pass_opens_each_array_once(self, tmp_path, monkeypatch):
         """The property that matters at roster scale: no repeated handle opens."""
         manifest = _build_store(tmp_path)

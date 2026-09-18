@@ -303,9 +303,11 @@ class _Harness:
     """One validation pass's shared context: store handles + group cache.
 
     ``workers`` is the read concurrency of the per-cell value legs
-    (:func:`_run_cells`); the group cache and the warning list are safe to
-    share across those threads (a lock around the one-time opens, a
-    per-thread warning buffer so the merge keeps cell order).
+    (:func:`_run_cells`); the handle caches and the warning list are safe to
+    share across those threads (race-tolerant publishing, a per-thread
+    warning buffer so the merge keeps cell order). No lock is ever held
+    across a store open: a duplicate open is harmless, a serialized one
+    costs ``workers``x (:meth:`_open`, :meth:`array`).
     """
 
     def __init__(
@@ -374,16 +376,27 @@ class _Harness:
             self._local.buffer = None
 
     def _open(self, rel: str, inner: int):
+        """Cached resolution group, opened OUTSIDE any lock (review finding).
+
+        A cold open is a NETWORK round trip (``{rel}/{inner}/zarr.json``),
+        not a local constructor, and holding a mutex across it serialized
+        every cold open across all ``workers`` — the one place the pool was
+        fully undone, and it scales with the roster (4 leaves on the canary,
+        2,918 on CA). Two threads racing the same group cost one wasted GET;
+        ``setdefault`` publishes whichever handle arrived first and both
+        callers use that one, so the cache still holds exactly one handle
+        per group. Per-ARRAY opens are gated instead of raced
+        (:meth:`array`): those are the hot ones.
+        """
         import zarr
 
         key = f"{rel}/{int(inner)}"  # == the opened group's ``path``
-        if key not in self._groups:
-            with self._lock:  # one open per group, whichever thread gets there first
-                if key not in self._groups:
-                    self._groups[key] = zarr.open_group(
-                        self.store, path=key, mode="r", zarr_format=3
-                    )
-        return self._groups[key]
+        group = self._groups.get(key)
+        if group is None:
+            group = self._groups.setdefault(
+                key, zarr.open_group(self.store, path=key, mode="r", zarr_format=3)
+            )
+        return group
 
     def array(self, group, name: str):
         """Memoized ``group[name]`` handle, or ``None`` when the array is absent.
