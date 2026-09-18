@@ -53,6 +53,20 @@ which validates the ``/2`` declaration grammar, the §4.6 leaf-column tier,
 and the ladder against the gen-1 columns under the derived
 stage-gather/stage-merge regimes. The grammar-independent machinery both
 arms share lives in :mod:`zagg.pyramid_check_core`.
+
+**Read bounds, including memory.** The store-wide reads are the ones named
+above; everything else is sampled. ``--workers`` bounds how many cells are
+read CONCURRENTLY, not how large a cell is: one ``check_cell`` holds, per
+field, the raw contributor slabs, the extracted payloads and their float64
+decode at once, and that footprint is set by the cell's CONTRIBUTOR SPAN —
+every roster member under the output cell — which ``--sample-cells`` does
+not bound (at a ladder level coarser than ``shard_order`` a single output
+cell's contributor set is roster-sized). ``COLUMN_PARITY_FOLD_MAX`` caps
+that span for the §4.6 column-parity leg only; the ladder legs re-fold
+unconditionally. So peak RSS is roughly ``workers`` x the widest single
+cell of the pass — 157 MB (``--workers 1``) to 183 MB (``--workers 8``) on
+the 4-leaf canary, and a number to record on the first CA acceptance run
+before a large roster leans on the default.
 """
 
 from __future__ import annotations

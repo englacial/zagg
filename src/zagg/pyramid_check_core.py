@@ -53,9 +53,14 @@ def _map_concurrent(fn, items, workers: int) -> list:
     order, so the printed report and the JSON are the same at any pool
     size, and a raised exception is the first FAILING item's in input order
     (later items are cancelled where still pending) — the loop's own
-    contract. Only results are retained; in-flight work is bounded by the
-    pool size, so a task that decodes payloads holds at most ``workers`` of
-    them at once.
+    contract. Only results are retained, so the pool bounds the NUMBER of
+    cells in flight (at most ``workers``) — not the size of any one of
+    them: a cell's working set is set by its contributor span, which is
+    ladder geometry, not by ``--sample-cells``. The one cap on that span is
+    :data:`COLUMN_PARITY_FOLD_MAX`, and it applies to the §4.6 column-parity
+    leg alone. Peak memory is therefore ``workers`` x the WIDEST cell of the
+    pass (review finding; see the memory note in
+    :mod:`zagg.pyramid_check`'s module header).
     """
     items = list(items)
     if workers <= 1 or len(items) <= 1:
