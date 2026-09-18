@@ -311,6 +311,8 @@ class _Harness:
     def __init__(
         self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells, workers=8
     ):
+        from zagg.store import open_store
+
         self.store_root = str(store_root).rstrip("/")
         self.manifest = manifest
         self.store_kwargs = dict(store_kwargs)
@@ -333,6 +335,13 @@ class _Harness:
             if meta.get("class") == "approximate"
             for _kwarg, sibling in _field_companions(name, meta)
         }
+        # ONE object store for the whole pass, every artifact addressed by
+        # zarr's ``path=`` (review finding). ``open_store`` builds a FRESH
+        # obstore ``S3Store`` per call — its own connection pool and TLS
+        # handshake — and the ambient-store cache in :mod:`zagg.store`
+        # belongs to ``open_object_store``, not to this route; a per-leaf
+        # store therefore shared nothing across a 2,918-leaf roster.
+        self.store = open_store(self.store_root, read_only=True, **self.store_kwargs)
         self._groups: dict = {}
         self._lock = threading.Lock()
         self._local = threading.local()
@@ -365,17 +374,12 @@ class _Harness:
     def _open(self, rel: str, inner: int):
         import zarr
 
-        from zagg.store import open_store
-
-        key = (rel, int(inner))
+        key = f"{rel}/{int(inner)}"  # == the opened group's ``path``
         if key not in self._groups:
             with self._lock:  # one open per group, whichever thread gets there first
                 if key not in self._groups:
-                    store = open_store(
-                        f"{self.store_root}/{rel}", read_only=True, **self.store_kwargs
-                    )
                     self._groups[key] = zarr.open_group(
-                        store, path=str(inner), mode="r", zarr_format=3
+                        self.store, path=key, mode="r", zarr_format=3
                     )
         return self._groups[key]
 

@@ -472,6 +472,45 @@ class TestReadConcurrency:
             main([str(tmp_path), "--workers", "0"])
 
 
+class TestHarnessHandles:
+    """What the harness opens, and how often (issue #434 follow-up).
+
+    The report is the same whatever these do — that is
+    ``test_report_is_identical_at_any_pool_size``'s job. These pin the READ
+    COST the profile found: one object store per pass rather than one per
+    leaf, one array handle per (group, field) rather than one per access,
+    and no lock held across a network open.
+    """
+
+    def test_one_store_serves_the_whole_roster(self, tmp_path, monkeypatch):
+        """Every artifact opens on ONE store, addressed by zarr's ``path=``.
+
+        ``open_store`` builds a FRESH obstore ``S3Store`` per call — its own
+        connection pool and TLS handshake — and the ambient-store cache in
+        ``zagg.store`` belongs to ``open_object_store``, not to this route
+        (review finding). So a per-leaf store shared nothing across the
+        roster.
+        """
+        import zagg.store as zagg_store
+        from zagg.pyramid_check_core import _Harness
+
+        manifest = _build_store(tmp_path)
+        opened, real_open_store = [], zagg_store.open_store
+
+        def counting_open_store(path, **kwargs):
+            opened.append(path)
+            return real_open_store(path, **kwargs)
+
+        monkeypatch.setattr(zagg_store, "open_store", counting_open_store)
+        harness = _Harness(
+            str(tmp_path), manifest, {}, rng=None, sample_nodes=1, sample_cells=1, workers=8
+        )
+        groups = [harness.leaf_group(dec) for dec in LEAVES]
+        assert opened == [str(tmp_path)]  # one store, built once, at the root
+        assert {id(g.store_path.store) for g in groups} == {id(harness.store)}
+        assert len({g.path for g in groups}) == len(LEAVES)  # ... distinct groups on it
+
+
 class TestLadderGrammars:
     """The read-side follows either pyramid grammar's ladder."""
 
