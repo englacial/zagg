@@ -778,3 +778,26 @@ class TestSweepRoute:
         )
         assert "temporal" not in summary["families"]["moc"]
         assert "temporal_shards" not in summary["families"]["moc"]
+
+    def test_a_pass_that_published_nothing_still_reports_zeros(self, tmp_path, monkeypatch):
+        """ "Nothing published" and "no temporal channel" are different states.
+
+        The gate is the DECLARATION, not the tally: a temporal store whose
+        every shard was dropped by the shard-scoped fail-open is exactly the
+        state the issue #575 backfill operator has to be able to read off the
+        run record, and it must not look like the non-temporal store above.
+        """
+        from zagg.grids.morton import morton_word
+        from zagg.sweep import run_sweep
+
+        def boom(*_a, **_k):
+            raise OSError("403 on the sidecar key")
+
+        root = _fixture_copy(tmp_path)
+        monkeypatch.setattr(leaf_temporal, "leaf_contribution", boom)
+        summary = run_sweep(root, [(int(morton_word(SHARD)), None)], families=["moc"], record=False)
+        moc = summary["families"]["moc"]
+        assert moc["temporal"] == {"records": 0, "materialized": 0, "raw": 0}
+        # Nothing composed, so no section and no shard count — the route block
+        # is the only thing separating this from the non-temporal store above.
+        assert "temporal_shards" not in moc

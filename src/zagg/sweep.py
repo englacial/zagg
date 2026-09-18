@@ -273,11 +273,17 @@ class MocFamily(SweepFamily):
 
     def summary(self) -> dict:
         # ``temporal: {records, materialized, raw}`` (issue #575): how this pass
-        # obtained each leaf's contribution. Absent on a non-temporal store, so
-        # its sweep record stays as it was.
-        routes = self._temporal_routes
-        if not any(routes.values()):
+        # obtained each leaf's contribution. Gated on the DECLARATION, not on
+        # the tally: ``_temporal_fields`` is ``None`` until the first leaf read
+        # and ``{}`` on a non-temporal store, so a non-temporal store's sweep
+        # record stays as it was and a partition that visited no leaf still
+        # says nothing — while a temporal pass that published nothing (every
+        # shard dropped by the fail-open above, the regime the issue #575
+        # backfill runs in) reports zeros rather than reading as a store with
+        # no temporal channel at all.
+        if not self._temporal_fields:
             return {}
+        routes = self._temporal_routes
         return {
             "temporal": {
                 "records": routes["record"],
