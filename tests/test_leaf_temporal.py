@@ -679,12 +679,19 @@ class TestSweepRoute:
         (Path(root) / "coverage.moc").unlink()
         (Path(root) / "coverage.toc").unlink()
         leaves = [(int(morton_word(SHARD)), None), (int(morton_word(other)), None)]
+        materialized = 0
         for index in range(4):
             summary = run_sweep(
                 root, leaves, families=["moc"], record=False, partition={"index": index, "of": 4}
             )
-            assert summary["families"]["moc"].get("finish_deferred", True) is True
-            assert "root_moc_written" not in summary["families"]["moc"]
+            moc = summary["families"]["moc"]
+            assert moc.get("finish_deferred", True) is True
+            assert "root_moc_written" not in moc
+            # The route telemetry rides the deferred pass too — that is where
+            # the backfill happens (phase 3, issue #575).
+            materialized += moc.get("temporal", {}).get("materialized", 0)
+            assert moc.get("temporal", {}).get("records", 0) == 0
+        assert materialized == 2
         assert not (Path(root) / "coverage.moc").exists()
         for decimal in (SHARD, other):
             record = read_leaf_temporal_record(_leaf_of(root, decimal))
@@ -693,6 +700,11 @@ class TestSweepRoute:
         summary = run_sweep(root, leaves, families=["moc"], record=False)
         assert summary["families"]["moc"]["root_moc_written"] is True
         assert summary["families"]["moc"]["temporal_shards"] == 2
+        assert summary["families"]["moc"]["temporal"] == {
+            "records": 2,
+            "materialized": 0,
+            "raw": 0,
+        }
         envelope = read_root_coverage(root)
         assert set(envelope["temporal"]["shards"]) == {SHARD, other}
         expected = json.loads((SPEC_DATA / "temporal.expected.json").read_text())
@@ -754,3 +766,15 @@ class TestSweepRoute:
         envelope = refresh_root_coverage(root, materialize=False)
         assert set(envelope["temporal"]["shards"]) == {SHARD}
         assert not (Path(_leaf_of(root)) / LEAF_TEMPORAL_NAME).exists()
+
+    def test_the_route_telemetry_is_absent_on_a_non_temporal_store(self, tmp_path):
+        from zagg.grids.morton import morton_word
+        from zagg.sweep import run_sweep
+
+        root = tmp_path / "minimal"
+        shutil.copytree(SPEC_DATA / "minimal", root)
+        summary = run_sweep(
+            str(root), [(int(morton_word(SHARD)), None)], families=["moc"], record=False
+        )
+        assert "temporal" not in summary["families"]["moc"]
+        assert "temporal_shards" not in summary["families"]["moc"]

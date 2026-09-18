@@ -669,6 +669,7 @@ shard plus two store-root objects:
 | 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
 | root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
 | root sibling | [§10.5](specification.md) word-set cover: a per-shard toc word SET (temporal stores only) | `{store_root}/coverage.toc` | one opt-in GET, temporal consumers only, on demand |
+| leaf record | [§10.6](specification.md) temporal record: the leaf's envelope word + counted cover (temporal stores only) | `{full_id}.zarr/temporal.toc` sidecar | one small GET — the sweep's per-leaf read; readers never need it |
 
 **Leaf envelope** (on the stamp, `zagg.hive.read_coverage`; strict
 `spec: morton-moc/1` gate — unknown specs read as absent):
@@ -742,6 +743,39 @@ spatial-only pre-#480 root — which is why it is not inline), discovered
 through the section's `cover` marker, and carries the same
 regenerable-accelerator staleness posture as everything else on this page.
 Grammar: [`specification.md`](specification.md) §10.5.
+
+**Leaf temporal record** (`{full_id}.zarr/temporal.toc`,
+[issue #575](https://github.com/englacial/zagg/issues/575)): on a temporal
+store every leaf the worker writes also carries a small JSON record — its
+§10.2 envelope word, its §10.3 counted cover (observation counts per
+aligned time bucket) and the §10.5 cover derived from it — computed per
+chunk from the toc words the aggregation already encodes, and PUT in the
+bitmap's slot: after the arrays, before the stamp, fail-open. It exists so
+the families sweep composes the root section and the cover sibling from
+one small GET per leaf instead of reading every leaf's raw `_times` column
+back (a million-row ragged array per field per leaf at California scale,
+which no single invoke could finish). The sweep reads the record first and
+falls back to the raw columns one chunk at a time, materializing the record
+it computed (`source: "sweep"`) so the store converges; the refresh escape
+hatch (`zagg.coverage.refresh_root_coverage`) takes the same route and
+materializes too (`source: "refresh"`) unless called with
+`materialize=False`, which keeps it strictly read-only. Grammar:
+[`specification.md`](specification.md) §10.6.
+
+*Backfilling a store written before the record existed* (the sweep record's
+`temporal: {records, materialized, raw}` block shows the split per pass):
+
+1. fire a **partitioned** families pass over the record-less leaves
+   (`runner._invoke_lambda_sweep(..., partitions=2**n)`, issue #377) — it
+   cannot write the root section (its finish is deferred) but it lands every
+   leaf's record, one chunk at a time, bounded by the chunk rather than the
+   leaf; re-fire only the leaves still without a record until none remain;
+2. fire **one unpartitioned** families pass (`partitions=1`, what the runner
+   tail fires anyway): it composes `coverage.moc`'s `temporal` section and
+   `coverage.toc` from the records alone, in seconds;
+3. accept when `temporal.shards` and the cover's `shards` both list the
+   store's expected coverage (the distinct successful shard keys across its
+   run records).
 
 **Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`
 against the AOI to pick candidate shards (one GET, no walk); per leaf,

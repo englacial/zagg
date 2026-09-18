@@ -129,6 +129,15 @@ class SweepFamily:
         """Post-walk hook over the base-node artifacts; extra summary keys."""
         return {}
 
+    def summary(self) -> dict:
+        """Per-pass telemetry keys, reported whether or not ``finish`` ran.
+
+        A partitioned pass defers ``finish`` (issue #377) but still did per-leaf
+        work worth recording — the issue #575 backfill happens exactly there —
+        so this rides every pass's family result, partitioned or not.
+        """
+        return {}
+
 
 class StatsFamily(SweepFamily):
     """Stats/cost rollups (D20 fold): leaf ``stats.json`` sidecars up-tree.
@@ -261,6 +270,21 @@ class MocFamily(SweepFamily):
         if got is not None:
             self._temporal_routes[route] += 1
             self._temporal.setdefault(decimal, []).append(got)
+
+    def summary(self) -> dict:
+        # ``temporal: {records, materialized, raw}`` (issue #575): how this pass
+        # obtained each leaf's contribution. Absent on a non-temporal store, so
+        # its sweep record stays as it was.
+        routes = self._temporal_routes
+        if not any(routes.values()):
+            return {}
+        return {
+            "temporal": {
+                "records": routes["record"],
+                "materialized": routes["materialized"],
+                "raw": routes["raw"],
+            }
+        }
 
     def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
         # ``spec`` is unused here: leaf PATHS are the frozen /1-/2 grammar
@@ -942,6 +966,7 @@ def _sweep_family(
             break
     tops = [computed[d] for d in frontier]
     result = dict(counts)
+    result.update(fam.summary())
     if min_order:
         # Deferred in ORDERS as well as by name, so the finisher's obligation
         # is machine-readable and sized: split == shard_order is permitted,
