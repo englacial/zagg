@@ -3,7 +3,7 @@
  "encoding": "ranges",
  "order": 4,
  "source": "sweep",
- "generated_at": "2026-08-24T15:08:53+00:00",
+ "generated_at": "2026-09-18T04:22:19+00:00",
  "ranges": [
   [
    "11213",
@@ -13,29 +13,27 @@
  "temporal": {
   "spec": "zagg-coverage-toc/1",
   "source": "sweep",
-  "generated_at": "2026-08-24T15:08:53+00:00",
+  "generated_at": "2026-09-18T04:22:19+00:00",
   "fields": [
    "h_tdigest"
   ],
   "shards": {
    "11213": "10689250968998868755"
   },
-  "digest": {
-   "delta": 64,
-   "weights": "counts",
-   "value": "toc-ns",
+  "counts": {
+   "temporal_order": 24,
+   "cap": 512,
    "element": {
-    "dtype": "float32",
+    "dtype": "uint64",
     "shape": [
-     -1,
-     2
+     -1
     ]
    },
    "encoding": "base64",
-   "centroids": 35,
-   "weight_total": 346.0,
-   "payload": "2VeUXgAAgD/ZV5ReAACAP9lXlF4AAIA/2VeUXgAAgD/ZV5ReAACAP9lXlF4AAABA2VeUXgAAAEDZV5ReAAAAQNlXlF4AAABA2VeUXgAAQEDZV5ReAABAQNlXlF4AAEBA2VeUXgAAQEDZV5ReAABAQNlXlF4AAEBA2VeUXgAAQEDZV5ReAABAQNlXlF4AAKBA2leUXgAAgEDtWpReAAAAQO1alF4AAOBA7VqUXgAAQEHtWpReAACIQe1alF4AAKhB7VqUXgAAyEHtWpReAADYQe1alF4AAOhB7VqUXgAA6EHuWpReAADgQO5alF4AACBB7lqUXgAAgEHuWpReAACgQe5alF4AAMBB7lqUXgAA0EHuWpReAADgQQ==",
-   "times": "gHTT0R/ZV5SA0qOEIdlXlIAK8alT2VeUgGjB3FTZV5SAxpGPVtlXlJLsK0oi2VeUlOwrSiXZV5So7CtKTdlXlKnsK0pQ2VeUluwrSijZV5SY7CtKLNlXlJrsK0ow2VeUnOwrSjTZV5Se7CtKONlXlKDsK0o82VeUouwrSkHZV5Sl7CtKRdlXlBjtK0pJ2VeUG+0rSjDaV5RDdi1Kg+xalEh2LUqG7FqUUHYtSpDsWpRcdi1KoexalGt2LUq47FqUfHYtStbsWpSPdi1K+exalKR2LUoe7VqUuHYtSkftWpQTdy1KHe5alA53LUoP7lqUB3ctSvjtWpT8di1K3O1alO52LUq77VqU3XYtSpftWpTLdi1Kb+1alA=="
+   "words": "AO0rSgDZV5SA7StKANpXlIB2LUoA7FqUAHctSgDtWpSAdy1KAO5alA==",
+   "obs": "KQAAAAAAAAAFAAAAAAAAAFkAAAAAAAAAuAAAAAAAAAAbAAAAAAAAAA==",
+   "count": 5,
+   "obs_total": 346
   },
   "cover": "zagg-coverage-toc-cover/1"
  }

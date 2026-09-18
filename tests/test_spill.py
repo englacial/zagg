@@ -1137,3 +1137,173 @@ class TestTmpGuard:
         monkeypatch.setattr(_os, "statvfs", fake)
         check_tmp_headroom(1, tmp_dir="/somewhere")
         assert seen["path"] == "/somewhere"
+
+
+class TestLeafTemporalFold:
+    """Issue #575: the leaf temporal accumulator is fed from every worker regime.
+
+    The record's word and counted cover must equal the whole-shard fold over
+    the observation clock whichever route the worker takes — pooled, spill
+    single-block (the pooled machinery over read-back columns) and spill
+    multi-block (per cell, in ``_fold_block``) — and the fold must never be
+    handed the whole shard at once.
+    """
+
+    def _expected(self, dfs):
+        from mortie import toc_reduce
+
+        from zagg.leaf_temporal import count_words
+        from zagg.time_axis import observation_words
+
+        src = _TIME_SOURCE["time_source"]
+        words = np.concatenate(
+            [
+                observation_words(
+                    df["delta_time"].to_numpy(),
+                    epoch=src["epoch"],
+                    scale=src["scale"],
+                    units=src["units"],
+                )
+                for df in dfs
+            ]
+        )
+        return int(toc_reduce(words)), count_words(words), len(words)
+
+    def _dfs(self, grid, key, seed=7, **kw):
+        return _with_clock(_granule_dfs(grid, key, _CELL_LISTS, seed=seed, **kw))
+
+    @staticmethod
+    def _assert_fold(got, dfs, expected, total):
+        word, counts = got
+        e_word, e_counts, e_n = expected
+        assert word == e_word
+        assert counts.order == e_counts.order
+        np.testing.assert_array_equal(counts.words, e_counts.words)
+        np.testing.assert_array_equal(counts.obs, e_counts.obs)
+        assert int(counts.obs.sum()) == e_n == total
+
+    @pytest.mark.parametrize("regime", ["pooled", "spill-single", "spill-multi"])
+    def test_every_regime_folds_the_whole_shard_exactly(self, monkeypatch, regime):
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        if regime == "spill-multi":
+            monkeypatch.setattr(
+                "zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1
+            )
+        streaming = None if regime == "pooled" else {"buffer_granules": 2, "mode": "spill"}
+        cfg = _config(streaming=streaming, variables=_companion_variables(), output=_TIME_SOURCE)
+        grid = _grid(cfg)
+        key = _shard_key()
+        # A NaN-valued cell still carries a clock: the record counts every
+        # clocked observation, the payload digest drops the NaN rows.
+        dfs = self._dfs(grid, key, nan_cells={4})
+        acc = LeafTemporalAccumulator()
+        _, _, meta = _run(monkeypatch, cfg, grid, key, list(dfs), temporal_out=acc, profile=True)
+        if regime == "spill-multi":
+            assert meta["phase_timings"]["spill_blocks_closed"] > 0
+        elif regime == "spill-single":
+            assert meta["phase_timings"]["spill_blocks_closed"] == 0
+        self._assert_fold(acc.finish(), dfs, self._expected(dfs), meta["total_obs"])
+
+    def test_the_fold_never_sees_the_whole_shard(self, monkeypatch):
+        # Multi-block spill feeds per cell; with a small row budget the largest
+        # array any fold sees is bounded by that budget plus one feed — never
+        # the shard (the #574 regime the record exists to respect).
+        from zagg import leaf_temporal
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        monkeypatch.setattr(leaf_temporal, "FOLD_ROWS", 64)
+        monkeypatch.setattr("zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1)
+        sizes: list[int] = []
+        fold = LeafTemporalAccumulator._fold
+
+        def spy(self, words, weights):
+            sizes.append(len(words))
+            return fold(self, words, weights)
+
+        monkeypatch.setattr(LeafTemporalAccumulator, "_fold", spy)
+        cfg = _config(
+            streaming={"buffer_granules": 2, "mode": "spill"},
+            variables=_companion_variables(),
+            output=_TIME_SOURCE,
+        )
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = self._dfs(grid, key)
+        acc = LeafTemporalAccumulator()
+        _, _, meta = _run(monkeypatch, cfg, grid, key, list(dfs), temporal_out=acc)
+        assert int(acc.finish()[1].obs.sum()) == meta["total_obs"] == 750
+        assert len(sizes) > 1 and max(sizes) <= 64 + 50 < meta["total_obs"]
+
+    def test_k_gt_1_pooled_feeds_are_bounded_by_the_chunk(self, monkeypatch):
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        cfg = _config(variables=_companion_variables(), output=_TIME_SOURCE)
+        grid = _grid(cfg, parent=2, child=5, chunk_inner=3)
+        assert grid.chunks_per_shard == 4
+        key = _shard_key(order=2)
+        dfs = _with_clock(_granule_dfs(grid, key, [[0, 20, 40], [5, 20, 60], [0, 40, 63]], seed=3))
+        fed: list[int] = []
+        acc = LeafTemporalAccumulator()
+        add = acc.add_words
+        monkeypatch.setattr(acc, "add_words", lambda w: (fed.append(len(w)), add(w)))
+        sink: list = []
+        _run(monkeypatch, cfg, grid, key, list(dfs), chunk_results=sink, temporal_out=acc)
+        expected = self._expected(dfs)
+        self._assert_fold(acc.finish(), dfs, expected, expected[2])
+        # The feeds are the per-cell VIEWS of each chunk's one flat encode (no
+        # concatenated copy of the chunk), so there is one per populated cell:
+        # cells 0 and 5 in chunk 0, 20 in chunk 1, 40 in chunk 2, 60 and 63 in
+        # chunk 3, at 50 rows per cell per granule. Every feed is bounded by
+        # its own chunk's rows — the fattest chunk is 0's 150 — and none is the
+        # shard; what the accumulator actually folds is bounded separately, by
+        # ``FOLD_ROWS`` (``test_the_fold_never_sees_the_whole_shard``).
+        assert len(fed) == 6 and sum(fed) == expected[2]
+        assert max(fed) <= 150 < expected[2]
+
+    def test_two_temporal_fields_count_once_per_observation(self, monkeypatch):
+        """The two §10 producers disagree on `n_obs` for a MULTI-field store.
+
+        The worker folds the chunk's one shared clock column, so a second
+        declared field adds nothing to the count; the sweep's raw route reads
+        one companion per field and counts once PER FIELD (§10.3's
+        `obs_total` rule, `read_leaf_temporal`'s docstring). Both sides are
+        pinned here on one shard so the factor-of-`f` discrepancy is visible
+        rather than latent — which rule the two producers should share is
+        issue #575's standing question for review.
+        """
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        variables = _companion_variables()
+        variables["g_tdigest"] = {
+            **variables["h_tdigest"],
+            "location": "leaf_id",
+            "temporal": "per-centroid",
+        }
+        cfg = _config(variables=variables, output=_TIME_SOURCE)
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = self._dfs(grid, key)
+        acc = LeafTemporalAccumulator()
+        _, ragged, meta = _run(monkeypatch, cfg, grid, key, list(dfs), temporal_out=acc)
+        n = meta["total_obs"]
+        # Worker: once per observation, whatever the declared field count.
+        self._assert_fold(acc.finish(), dfs, self._expected(dfs), n)
+        # Sweep: once per field — the same observations weighed twice, because
+        # each field's committed companion is read and counted on its own.
+        per_field = {
+            name: int(sum(float(np.asarray(p).reshape(-1, 2)[:, 1].sum()) for p in ragged[name][0]))
+            for name in ("h_tdigest", "g_tdigest")
+        }
+        assert set(per_field.values()) == {n}
+        assert sum(per_field.values()) == 2 * n
+
+    def test_a_config_without_a_temporal_field_feeds_nothing(self, monkeypatch):
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        cfg = _config(variables=_base_variables())
+        grid = _grid(cfg)
+        key = _shard_key()
+        acc = LeafTemporalAccumulator()
+        _run(monkeypatch, cfg, grid, key, _granule_dfs(grid, key, _CELL_LISTS), temporal_out=acc)
+        assert acc.finish() is None

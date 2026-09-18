@@ -1151,6 +1151,213 @@ class TestProcessAndWriteHive:
         # sidecar is debris like everything else in it.
         assert ops == ["dense", "ragged", "sidecar", "stamp"]
 
+    def _temporal_cfg(self, cfg):
+        """Arm the §10.6 record: one per-centroid field plus its clock."""
+        cfg.aggregation["variables"]["h"] = {
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [2],
+            "dtype": "float32",
+            "fill_value": 0,
+            "temporal": "per-centroid",
+        }
+        cfg.output["time_source"] = {
+            "field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        return cfg
+
+    def test_temporal_record_lands_between_the_sidecar_and_the_stamp(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issue #575: a per-centroid config writes the leaf's ``temporal.toc``
+        from the words the worker fed the accumulator, in the bitmap's slot —
+        after the arrays, before the stamp (D4) — and a non-temporal config
+        writes none and takes the code path it always did."""
+        from mortie import time2toc, toc_reduce
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.coverage_toc import quantize_words
+        from zagg.leaf_temporal import count_words, cover_from_counts
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(7)],
+            dtype=np.uint64,
+        )
+        ops: list = []
+
+        def rec(name, fn):
+            def wrapped(*a, **k):
+                ops.append(name)
+                return fn(*a, **k)
+
+            return wrapped
+
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 7.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words[:4])
+            kwargs["temporal_out"].add_words(words[4:])
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(
+            hive, "write_coverage_sidecar", rec("sidecar", hive.write_coverage_sidecar)
+        )
+        monkeypatch.setattr(
+            leaf_temporal, "write_leaf_temporal", rec("temporal", leaf_temporal.write_leaf_temporal)
+        )
+        monkeypatch.setattr(hive, "stamp_commit", rec("stamp", hive.stamp_commit))
+        root = str(tmp_path / "store")
+        hive.process_and_write_hive(shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={})
+        assert ops == ["sidecar", "temporal", "stamp"]
+        leaf = hive.shard_leaf_path(root, shard)
+        record = leaf_temporal.read_leaf_temporal_record(leaf)
+        word, counts = leaf_temporal.leaf_temporal_contribution(record)
+        assert record["source"] == "worker" and record["fields"] == ["h"]
+        assert word == int(toc_reduce(words)) and record["n_obs"] == 7
+        expect = count_words(words)
+        np.testing.assert_array_equal(counts.words, expect.words)
+        np.testing.assert_array_equal(counts.obs, expect.obs)
+        np.testing.assert_array_equal(cover_from_counts(counts)[0], quantize_words(words))
+        from zagg.store import open_store
+
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_a_failed_record_write_still_stamps_the_leaf(self, monkeypatch, cfg, tmp_path, caplog):
+        """Issue #575: the record PUT is fail-OPEN, unlike the bitmap's.
+
+        Nothing points at ``temporal.toc`` — §10.6 reads its absence as "read
+        the leaf" and the sweep re-materializes it — so a transient failure on
+        a ~1 KB D9 accelerator must not discard a finished shard's read and
+        aggregate. The leaf still stamps, and the object is simply not there.
+        """
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(leaf_temporal, "write_leaf_temporal", boom)
+        root = str(tmp_path / "store")
+        with caplog.at_level("WARNING"):
+            hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+            )
+        leaf = hive.shard_leaf_path(root, shard)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+        assert "503 SlowDown" in caplog.text
+
+    def test_a_leaf_rewrite_never_leaves_a_stale_record(self, monkeypatch, cfg, tmp_path):
+        """Issue #575: a rewritten leaf never keeps the PRIOR attempt's record.
+
+        The phase-2 sweep regenerates on ABSENCE, so the two write-site paths
+        that leave no record — a fold that saw no clocked observation
+        (``folded is None``) and the fail-open PUT — must not leave an older
+        revision's object standing over new arrays. They cannot: since issue
+        #341 ``_leaf()`` templates with ``overwrite=True``, which
+        ``delete_dir("")``s the whole leaf prefix before the new template
+        lands, so the record goes with the arrays it described.
+        """
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake_feeding(feed: bool):
+            def fake(g, shard_key, urls, **kwargs):
+                carrier = self._carrier(grid, shard_key)
+                if feed:
+                    kwargs["temporal_out"].add_words(words)
+                kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+                kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+                return pd.DataFrame(), self._meta(shard_key)
+
+            return fake
+
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+
+        def rewrite(feed: bool):
+            monkeypatch.setattr(processing, "process_shard", fake_feeding(feed))
+            hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+            )
+            assert hive.read_commit(open_store(leaf))["complete"] is True
+
+        rewrite(feed=True)
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is not None
+        # A rewrite whose fold sees no clocked observation writes no record —
+        # and the prior one is gone with the prefix, never standing over a
+        # leaf that now holds no temporal claim at all.
+        rewrite(feed=False)
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+        # Same for the fail-open PUT: what it would have replaced was already
+        # deleted by the template clear, so the failure leaves absence.
+        rewrite(feed=True)
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is not None
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        monkeypatch.setattr(leaf_temporal, "write_leaf_temporal", boom)
+        rewrite(feed=True)
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+
+    def test_non_temporal_config_writes_no_record(self, monkeypatch, cfg, tmp_path):
+        from zagg import leaf_temporal
+
+        grid_probe = self._grid(cfg)
+        seen: dict = {}
+
+        def fake(g, shard_key, urls, **kwargs):
+            seen["temporal_out"] = kwargs.get("temporal_out")
+            carrier = self._carrier(grid_probe, shard_key)
+            kwargs["write_chunk"](grid_probe.block_index(int(shard_key)), carrier, {})
+            return pd.DataFrame(), self._meta(shard_key)
+
+        _grid, shard, root, _meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        assert seen["temporal_out"] is None
+        assert leaf_temporal.read_leaf_temporal_record(hive.shard_leaf_path(root, shard)) is None
+
 
 # ── leaf skip-if-current + contraction guard (issue #388 phase 2) ────────────
 
