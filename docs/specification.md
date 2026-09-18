@@ -3438,9 +3438,13 @@ which is that rule pinned as bytes.
   recording only the fields actually read would make the gate below
   re-derive that leaf on every pass). Provenance, with §10.1 `fields`
   semantics — and a staleness gate: a reader MAY treat a record whose
-  `fields` omit a field the manifest declares as absent (the field postdates
-  it) and re-derive over the manifest's declared set; zagg's sweep does, and
-  materializes the re-derived record in its place.
+  `fields` omit or exceed the set the manifest declares as absent (the
+  declaration moved under it — a field postdates the record, or has since
+  been dropped) and re-derive over the manifest's declared set; zagg's sweep
+  does, and materializes the re-derived record in its place. Equality is
+  what makes the two feeds comparable: a record folded over a field the
+  manifest no longer declares would contribute counts a record-less leaf in
+  the same store does not.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
   MUST equal the counts block's `obs_total`: for a worker record the number
   of clocked observations the leaf aggregated, **once per observation** (the

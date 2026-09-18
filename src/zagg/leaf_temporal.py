@@ -474,8 +474,10 @@ def leaf_contribution(
     Succession and debris follow §10.4/§10.6: a record at a FOREIGN revision
     is preserved (raw route, never overwritten); an unparsable or
     inconsistent one is debris the materialized record replaces; one whose
-    ``fields`` omit a declared field is stale (the field postdates it) and
-    is re-derived over the union. A record whose GET itself fails is neither:
+    ``fields`` are not EXACTLY the declared set is stale — it either omits a
+    field that postdates it or names one the declaration has since dropped —
+    and is re-derived over the manifest's current set, so every contribution
+    folds over one declared set. A record whose GET itself fails is neither:
     the leaf is read (an unreadable accelerator is no more evidence about it
     than a missing one) and the object is left alone, since a body that did
     not read may be a foreign revision. Materialization is fail-open (D9): a
@@ -498,14 +500,14 @@ def leaf_contribution(
         raw, foreign = None, True
     record = load_leaf_temporal(raw)
     if record is not None:
-        if set(record.get("fields") or []) >= set(fields):
+        if set(record.get("fields") or []) == set(fields):
             try:
                 return leaf_temporal_contribution(record), "record"
             except (KeyError, TypeError, ValueError) as e:
                 logger.warning(f"leaf temporal: {leaf_root} record is debris ({e}) — re-deriving")
         else:
             logger.info(
-                f"leaf temporal: {leaf_root} record predates a declared field — re-deriving"
+                f"leaf temporal: {leaf_root} record's fields are not the declared set — re-deriving"
             )
     elif isinstance(raw, dict) and isinstance(raw.get("spec"), str) and raw["spec"]:
         # An unknown revision: read the leaf, and leave the object alone.

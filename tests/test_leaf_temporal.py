@@ -572,7 +572,9 @@ class TestSweepRoute:
         assert route == "raw" and got is not None
         assert read_leaf_temporal_record(leaf) == future
 
-    @pytest.mark.parametrize("damage", ["not json {", "n_obs", "fields", "unmarked"])
+    @pytest.mark.parametrize(
+        "damage", ["not json {", "n_obs", "fields", "fields_extra", "unmarked"]
+    )
     def test_debris_and_stale_records_are_replaced(self, tmp_path, damage, caplog):
         root = _fixture_copy(tmp_path)
         leaf = _leaf_of(root)
@@ -586,6 +588,13 @@ class TestSweepRoute:
                 record["n_obs"] += 1  # inconsistent with its own counts
             elif damage == "fields":
                 record["fields"] = []  # predates the declared field
+            elif damage == "fields_extra":
+                # The other direction: a field the declaration has since
+                # dropped. The gate is EQUALITY on the declared set, so this
+                # re-derives too — a record folding a field no longer
+                # declared would contribute counts a record-less leaf in the
+                # same store does not.
+                record["fields"] = sorted([*fields, "zz_tdigest"])
             else:
                 record.pop("spec")  # claims no revision at all
             path.write_text(json.dumps(record))
