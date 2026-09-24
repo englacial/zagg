@@ -274,12 +274,21 @@ span property is normative; a dedicated subtree reader is implementation
 once the commit stamp lands, a writer MUST NOT modify bytes at an existing
 leaf key in place — no partial rewrite, no append, no re-encode of one
 array. The only legal change to a stamped leaf is **wholesale replacement**
-under the D4 retry discipline (the leaf template clears the prefix first, so
-every object under it is a new object, then the stamp lands last). This is
-what lets a byte-range index into a leaf — the §11 Icechunk companion refs,
-moczarr's 2-GET reads — trust `(key, offset, length)` for as long as the
-stamp it was taken under stands; a replacing writer re-records its refs with
-the new leaf (§11.4). Issue
+under the D4 retry discipline: the leaf template clears the prefix, rewrites
+it, and lands the stamp last. This is what lets a byte-range index into a
+leaf — the §11 Icechunk companion refs, moczarr's 2-GET reads — trust
+`(key, offset, length)` for as long as the stamp it was taken under stands.
+
+A replacement is not, however, a change of **keys**. Clear-then-template
+rewrites the same key layout, and on an unversioned bucket the new object
+lands at exactly the key an old reference names — so a reference taken under
+a superseded stamp does *not* 404: it reads the new object's bytes at a stale
+offset and would silently mis-decode. Two things close that. The replacing
+writer re-records its refs against the new leaf (§11.4); and every recorded
+reference carries the referenced object's **ETag as its Icechunk checksum**
+(§11.3), which Icechunk verifies on read, so a reference not yet re-recorded
+fails **loudly** instead of returning wrong bytes. Stage 2's content-pinned
+keys retire the case. Issue
 [#580](https://github.com/englacial/zagg/issues/580).
 
 ### 1.6 Succession
@@ -3374,6 +3383,13 @@ Each **populated** inner chunk is recorded as one virtual reference:
   `{leaf}/{p}/c/{j}`, `offset` 0, `length` the object size; a missing object
   gets no reference.
 
+Every reference also carries a **checksum**: the **ETag** of the object it
+points into, read from the HEAD the writer performs against that object after
+the leaf write (§11.4). Icechunk verifies it on read, so a reference into a
+leaf that has since been wholesale-replaced (§1.5 leaf immutability — same
+keys, new bytes) fails loudly rather than decoding the replacement at a stale
+offset.
+
 `location` is `url_prefix + key`, `key` the object's path relative to the
 store root. The repo declares exactly one **virtual chunk container** whose
 `url_prefix` is the store root URL **with a trailing `/`**
@@ -3399,9 +3415,12 @@ prefix with the same credentials it reads the leaves with.
 A **replaced** leaf (§1.5 leaf immutability) is re-recorded by the replacing
 worker: the new commit's refs are the new objects' index and supersede the
 old ones on `main`. Snapshots older than that commit still reference the
-replaced keys and are stale for that leaf — Icechunk's garbage collection
-does not manage virtual targets, and stage 1 does not pin history across a
-replacement (stage 2's content-pinned keys do).
+replaced keys and are stale for that leaf — and because clear-then-template
+reuses those keys, their refs resolve to a **live** object rather than
+404ing. The per-ref ETag checksum (§11.3) is what makes that a loud failure
+instead of a silent mis-decode. Icechunk's garbage collection does not manage
+virtual targets, and stage 1 does not pin history across a replacement
+(stage 2's content-pinned keys do).
 
 Writing the refs is **fail-open** (D9): a refs failure is logged and recorded
 in the leaf's D20 stats sidecar (`icechunk.error`) and never fails the leaf
