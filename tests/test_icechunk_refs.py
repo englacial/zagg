@@ -286,6 +286,43 @@ class TestLeafRefs:
         assert rag["sharded"] is True and rag["refs"] == 1
         assert [bool(loc) for loc in rag["locations"]] == [True, False, False, False]
 
+    @pytest.mark.parametrize(
+        "mutate, match",
+        [
+            ({"index_location": "start"}, "start-located"),
+            (
+                {"index_codecs": [{"name": "bytes", "configuration": {"endian": "little"}}]},
+                "the ref plan reads",
+            ),
+        ],
+    )
+    def test_plan_refuses_an_unreadable_shard_index(
+        self, monkeypatch, cfg, tmp_path, mutate, match
+    ):
+        # The suffix read assumes an end-located, uncompressed index; both
+        # facts are in the array's own codec config, so the plan checks them
+        # instead of reading chunk payload as (offset, length) pairs (§11.3).
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        shard = _shards(grid, 1)[0]
+        _write_leaf(monkeypatch, grid, root, shard)
+        real = grid.shard_spec
+
+        def spec():
+            members = {}
+            for name, member in real().members.items():
+                data = member.model_dump()
+                codecs = list(data["codecs"])
+                codecs[0] = dict(codecs[0])
+                codecs[0]["configuration"] = {**codecs[0]["configuration"], **mutate}
+                data["codecs"] = codecs
+                members[name] = type(member)(**data)
+            return type(real())(members=members, attributes=real().attributes)
+
+        monkeypatch.setattr(grid, "shard_spec", spec)
+        with pytest.raises(ValueError, match=match):
+            icechunk_refs.leaf_ref_plan(grid, shard, root, store_kwargs={})
+
     def test_record_leaf_commits_and_reads_back(self, monkeypatch, cfg, tmp_path):
         grid = _grid(cfg)
         root = str(tmp_path / "store")
