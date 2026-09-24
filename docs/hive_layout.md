@@ -1356,9 +1356,11 @@ their siblings — chunked at the leaf's **inner** chunk and coded with the
 inner chain (no `sharding_indexed`), so `icechunk` + `zarr` (or icechunk-js
 in a browser) open the hive as ordinary arrays without moczarr. A leaf at
 shard rank `r` owns global chunks `[r·C, (r+1)·C)` (spec §11.3); absent inner
-chunks emit no reference and read as fill; every reference into an S3
-container carries the object's ETag as its checksum, so a leaf replaced
-in place fails loudly instead of decoding stale offsets.
+chunks emit no reference and read as fill; every reference carries the
+object's checksum in the form its container validates — the ETag on S3, the
+object's `last_modified` ceiled to the next whole second on a local store —
+so a leaf replaced in place fails loudly instead of decoding stale offsets
+(locally, only a replacement landing inside the same second slips through).
 
 Two writes, both worker-side (the dispatcher never writes, D8), both
 **fail-open** — the repo is a regenerable index, never load-bearing:

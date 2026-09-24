@@ -293,9 +293,10 @@ lands at exactly the key an old reference names — so a reference taken under
 a superseded stamp does *not* 404: it reads the new object's bytes at a stale
 offset and would silently mis-decode. Two things close that. The replacing
 writer re-records its refs against the new leaf (§11.4); and every recorded
-reference carries the referenced object's **ETag as its Icechunk checksum**
-(§11.3), which Icechunk verifies on read, so a reference not yet re-recorded
-fails **loudly** instead of returning wrong bytes. Stage 2's content-pinned
+reference carries the referenced object's **ETag** — or, on a local store,
+its `last_modified` — **as its Icechunk checksum** (§11.3), which Icechunk
+verifies on read, so a reference not yet re-recorded fails **loudly** instead
+of returning wrong bytes. Stage 2's content-pinned
 keys retire the case. Issue
 [#580](https://github.com/englacial/zagg/issues/580).
 
@@ -3440,17 +3441,22 @@ be percent-encoded — `?` → `%3F`, `#` → `%23`, `%` → `%25`
 (`set_virtual_refs_arr`). zagg's own keys contain none of the three; the rule
 is normative for a reader reconstructing a key from a recorded `location`.
 
-Every reference into an **object-store** container also carries a
-**checksum**: the **ETag** of the object it points into, read from the HEAD
-the writer performs against that object after the leaf write (§11.4).
-Icechunk verifies it on read, so a reference into a leaf that has since been
+Every reference also carries a **checksum**, in the form its container
+validates. Into an **object-store** container it is the **ETag** of the
+object it points into, read from the HEAD the writer performs against that
+object after the leaf write (§11.4). Into a **`file://`** container it is
+that object's **`last_modified`**, ceiled to the next whole second: Icechunk
+compares a recorded datetime against the object's modification time at
+**whole-second granularity**, so the exact sub-second `mtime` fails the very
+object it was read from while the ceiling passes it. Icechunk verifies either
+form on read, so a reference into a leaf that has since been
 wholesale-replaced (§1.5 leaf immutability — same keys, new bytes) fails
-loudly rather than decoding the replacement at a stale offset. References
-into a **`file://`** container carry no checksum: Icechunk's local-filesystem
-container validates none of the checksum forms (every form fails an unchanged
-object on 2.2.2), so a local store — the test and local-backend case — has
-only the §1.5 discipline; the writer records which it did under
-`icechunk.checksum` in the leaf's stats sidecar (`"etag"` or `null`).
+loudly rather than decoding the replacement at a stale offset. That
+granularity is the local form's one caveat: a replacement landing within the
+**same second** as the original passes the check (an object store's ETag has
+no such window). The writer records which form it used under
+`icechunk.checksum` in the leaf's stats sidecar (`"etag"` or
+`"last_modified"`).
 
 `location` is `url_prefix + key`, `key` the object's path relative to the
 store root. The repo declares exactly one **virtual chunk container** whose
@@ -3483,21 +3489,22 @@ worker: the new commit's refs are the new objects' index and supersede the
 old ones on `main`. Snapshots older than that commit still reference the
 replaced keys and are stale for that leaf — and because clear-then-template
 reuses those keys, their refs resolve to a **live** object rather than
-404ing. The per-ref ETag checksum (§11.3) is what makes that a loud failure
+404ing. The per-ref checksum (§11.3) is what makes that a loud failure
 instead of a silent mis-decode. Icechunk's garbage collection does not manage
 virtual targets, and stage 1 does not pin history across a replacement
 (stage 2's content-pinned keys do).
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
-come out of the leaf's own index, but the sizes and ETags do not. After the
+come out of the leaf's own index, but the sizes and checksums do not. After the
 leaf write, for each array the leaf wrote the worker issues:
 
 - **sharded array**: one ranged `GET` of the shard index suffix (the §1.5
   recipe's second read, which yields every inner chunk's `(offset, length)`
-  at once) **and** one `HEAD` of the shard object, for its `ETag` (§11.3);
+  at once) **and** one `HEAD` of the shard object, for its checksum — the
+  `ETag`, or `last_modified` on a local store (§11.3);
 - **regular (unsharded) array**: one `LIST` of the array's `c/` chunk prefix,
-  which yields every chunk object's key, size (the ref's `length`) and `ETag`
-  in one request — and, unlike probing, discovers which chunks the leaf
+  which yields every chunk object's key, size (the ref's `length`) and
+  checksum in one request — and, unlike probing, discovers which chunks the leaf
   actually wrote.
 
 That is one HEAD plus one ranged GET per sharded array per leaf, and one LIST

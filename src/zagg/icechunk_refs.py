@@ -38,6 +38,7 @@ import logging
 import math
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,20 @@ def container_prefix(store_root: str) -> str:
     if root.startswith("s3://"):
         return root + "/"
     return f"file://{Path(root).resolve()}/"
+
+
+def _ceil_second(when):
+    """``when`` ceiled to the next whole second — the ``file://`` checksum (§11.3).
+
+    Icechunk compares a recorded ``LastUpdatedAt`` checksum against the
+    object's ``last_modified`` at WHOLE-SECOND granularity, so an object's
+    exact sub-second mtime fails the object it was read from. The ceiling
+    passes an unchanged object and still fails any rewrite landing a second
+    or more later; a rewrite inside the same second is the form's caveat.
+    """
+    if when.microsecond == 0:
+        return when
+    return when.replace(microsecond=0) + timedelta(seconds=1)
 
 
 def split_exponent(shard_order: int, chunk_order: int) -> int:
@@ -327,9 +342,10 @@ def _check_geometry(block: dict, grid, store_root: str, path: str) -> None:
 
     A store whose leaves were cleared but whose root survived reopens the
     stale repo underneath a new-geometry manifest; writing this run's refs
-    into that repo puts them at indices that mean something else, and a
-    ``file://`` container carries no checksum to catch it (§11.3). The caller
-    is fail-open, so a mismatched store loses the index instead.
+    into that repo puts them at indices that mean something else, which no
+    per-ref checksum catches — the objects are exactly the ones recorded
+    (§11.3). The caller is fail-open, so a mismatched store loses the index
+    instead.
     """
     want = _geometry(grid, store_root)
     have = {key: block.get(key) for key in want}
@@ -394,7 +410,7 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
     ``{"path", "sharded", "chunk_grid", "arr_offset", "locations", "offsets",
     "lengths", "checksum", "refs"}`` for a sharded array (one shard object,
     refs from its index suffix) or ``{"path", "sharded": False, "chunks":
-    [(key, location, length, etag), ...], "refs"}`` for a regular one (one
+    [(key, location, length, checksum), ...], "refs"}`` for a regular one (one
     object per chunk, from a LIST). Arrays with no object emit no entry.
     """
     import obstore
@@ -405,10 +421,11 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
 
     leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
     prefix = container_prefix(store_root)
-    # Checksums: icechunk validates the ETag on object-store containers only
-    # (its local-filesystem container rejects every checksum form, verified on
-    # 2.2.2), so ``file://`` refs carry none.
-    with_checksum = prefix.startswith("s3://")
+    # Checksums (§11.3): every ref carries the form its container validates —
+    # the ETag on an object store, the object's ``last_modified`` ceiled to
+    # the next whole second on ``file://``. Both come off the HEAD/LIST this
+    # plan already issues, so staleness detection costs zero extra requests.
+    etags = prefix.startswith("s3://")
     store = open_object_store(store_root, **store_kwargs)
     (rank,) = grid.block_index(int(shard_key))
     plan: list[dict] = []
@@ -434,8 +451,9 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
             index_codecs = [dict(c) for c in shard_cfg.get("index_codecs", _INDEX_CODECS)]
             if location != _INDEX_LOCATION or index_codecs != _INDEX_CODECS:
                 # A start-located or compressed index would make the suffix
-                # read below return chunk payload as (offset, length) pairs,
-                # and a file:// container has no checksum to catch it (§11.3).
+                # read below return chunk payload as (offset, length) pairs;
+                # the per-ref checksum does not catch that (the object is the
+                # one recorded, the offsets are the nonsense — §11.3).
                 raise ValueError(
                     f"{path}: shard index is {location}-located with {index_codecs}; "
                     f"the ref plan reads {_INDEX_LOCATION}-located {_INDEX_CODECS}"
@@ -462,7 +480,7 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
                     "locations": [prefix + key if p else "" for p in present],
                     "offsets": offsets,
                     "lengths": lengths,
-                    "checksum": head["e_tag"] if with_checksum else None,
+                    "checksum": head["e_tag"] if etags else _ceil_second(head["last_modified"]),
                     "refs": int(present.sum()),
                 }
             )
@@ -476,7 +494,7 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
                     f"{path}/c/" + "/".join(str(i) for i in global_index),
                     prefix + meta["path"],
                     int(meta["size"]),
-                    meta["e_tag"] if with_checksum else None,
+                    meta["e_tag"] if etags else _ceil_second(meta["last_modified"]),
                 )
             )
         if chunks:
@@ -515,7 +533,8 @@ def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=
 
     Returns the record the caller rides into the leaf's stats sidecar:
     ``{"path", "snapshot", "arrays", "refs", "rebases", "commit_s",
-    "checksum"}``, or ``{"skipped": reason}`` for a unit stage 1 does not
+    "checksum"}`` (``checksum`` the form the refs carry: ``"etag"`` or
+    ``"last_modified"``, §11.3), or ``{"skipped": reason}`` for a unit stage 1 does not
     index (a windowed leaf, §11.6; a leaf with no chunk objects). Raises on
     failure — the caller is fail-open.
     """
@@ -525,7 +544,7 @@ def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=
 
     if window is not None:
         return {"skipped": "windowed"}
-    checksum = "etag" if container_prefix(store_root).startswith("s3://") else None
+    checksum = "etag" if container_prefix(store_root).startswith("s3://") else "last_modified"
     # Open and vet the repo BEFORE the plan: the plan costs ~20 object-store
     # requests, and refs must never land in a repo built for another geometry.
     order = int(grid.parent_order)
@@ -562,8 +581,10 @@ def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=
             if rejected:
                 raise RuntimeError(f"{entry['path']}: {len(rejected)} virtual refs rejected")
         else:
-            for key, location, length, etag in entry["chunks"]:
-                session.store.set_virtual_ref(key, location, offset=0, length=length, checksum=etag)
+            for key, location, length, chunk_checksum in entry["chunks"]:
+                session.store.set_virtual_ref(
+                    key, location, offset=0, length=length, checksum=chunk_checksum
+                )
         refs += entry["refs"]
     t0 = time.perf_counter()
     snapshot, rebases = _commit(
