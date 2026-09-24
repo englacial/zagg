@@ -614,6 +614,25 @@ class TestStagePass:
         counts = list(g["3"]["count"][:])
         assert counts[:2] == [136, 272] and counts[4] == 408
 
+    def test_stage_column_stamps_and_sidecars_the_same_o11_record(self, tmp_path):
+        # Issue #580: the stage column is the sixth stamp writer, and it
+        # records the §5.3 content-hash record in BOTH planes — the stamp it
+        # rides and the D20 sidecar beside it — from one computation, so the
+        # two can never disagree. It carries the finished record, never the
+        # staged slabs (those are not JSON-serializable, and the fail-open
+        # sidecar would swallow the TypeError into a silent drop).
+        from zagg.hive import read_commit
+
+        m = _stage_store(tmp_path / "s")
+        _sweep(tmp_path / "s", m, width=1)
+        stamp = read_commit(open_store(str(tmp_path / "s" / "1" / "1" / "all.pyramid.zarr")))
+        record = json.loads((tmp_path / "s" / "1" / "1" / "all.pyramid.stats.json").read_text())
+        hashes = stamp["content_hashes"]
+        assert hashes == record["content_hashes"]
+        # The relay member and its morton sibling are both covered.
+        assert set(hashes["arrays"]) >= {"3/morton", "3/count", "3/h_tdigest"}
+        assert len(hashes["combined"]) == 64
+
 
 class TestLocatedStageSweep:
     """The staged sweep's §9 located paths (ruling 4 on issue #410).
