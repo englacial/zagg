@@ -263,10 +263,13 @@ class TestStampRecord:
         # The parity gate the issue asks for: moczarr's reference recipe over
         # the written leaf reproduces the stamp's record exactly.
         moczarr_stats = pytest.importorskip("moczarr.stats")
-        from zagg.hive import read_commit
+        from zagg.hive import MANIFEST_NAME, read_commit
 
         _meta, leaf = kitchen_leaf
-        root = leaf.parents[5]  # the leaf path is 1/1/2/1/3/11213.zarr under the root
+        # The store root is the manifest's directory, not a parent count: a
+        # wrong root silently hashes the wrong tree, and the fixture's node
+        # depth is not this test's business.
+        root = next(p for p in leaf.parents if (p / MANIFEST_NAME).exists())
         theirs = moczarr_stats.hash_arrays(str(root), str(leaf.relative_to(root)))
         stamp = read_commit(LocalStore(str(leaf)))
         assert stamp["content_hashes"]["arrays"] == theirs
