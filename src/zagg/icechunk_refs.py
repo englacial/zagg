@@ -61,8 +61,11 @@ MULTISCALES_ATTR = "multiscales"
 #: The one branch every commit lands on (§11.4).
 BRANCH = "main"
 #: Icechunk's configurable default ``min_num_chunks`` below which a manifest
-#: carries no location dictionary (§11.5, informative): every admissible split
-#: is at least a whole leaf and clears it by construction.
+#: carries no location dictionary (§11.5, informative): the DEFAULT split —
+#: one manifest per ``commit_order`` cell, 16,384 chunks per array at
+#: production — clears it comfortably; the finest admissible one,
+#: ``split_order == shard_order`` (one whole leaf, 256 chunks), does not, and
+#: trades the dictionary away.
 LOCATION_DICT_MIN_CHUNKS = 1000
 #: Rebase-and-retry ceiling on a commit (icechunk's own ``rebase_tries``
 #: semantics: this many rebase rounds; no backoff/jitter machinery).

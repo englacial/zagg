@@ -164,12 +164,13 @@ class TestSplit:
         assert icechunk_refs.split_block(grid, 6) == {"chunks": 4**7, "order": 6}
         assert icechunk_refs.split_block(grid, 4) == {"chunks": 4**9, "order": 4}
 
-    def test_split_clears_the_dictionary_gate_by_construction(self):
-        # §11.5 (informative): a leaf is 4^(chunk_order - shard_order) chunks
-        # and the split is never finer than the commit node, so at production
-        # geometry every manifest carries >= one leaf's 256 refs per array --
-        # and at the default split 6, 4^7 = 16,384, far above the 1,000 gate.
+    def test_the_default_split_clears_the_dictionary_gate(self):
+        # §11.5 (informative): the default split is one manifest per order-6
+        # cell -- 4^7 = 16,384 chunks per array at production, far above the
+        # 1,000 gate. The FINEST admissible split does not clear it: one
+        # whole leaf is 4^4 = 256 chunks, so it carries no dictionary.
         assert 4 ** icechunk_refs.split_exponent(13, 6) > icechunk_refs.LOCATION_DICT_MIN_CHUNKS
+        assert 4 ** icechunk_refs.split_exponent(13, 9) < icechunk_refs.LOCATION_DICT_MIN_CHUNKS
 
 
 class TestOptions:
