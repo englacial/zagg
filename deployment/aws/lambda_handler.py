@@ -209,6 +209,19 @@ the dispatcher at end of run, like coverage mode):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
+Icechunk-init mode (issue #580, spec §11 — the once-per-run companion-repo
+init; one synchronous RequestResponse invoke from the dispatcher after the
+ping and BEFORE the fan-out, so every leaf's refs commit finds the array
+nodes; idempotent, fail-open at the dispatcher):
+{
+    "mode": "icechunk_init",
+    "store_path": str,
+    "config": dict,             # same single-source config as setup/ping
+    "parent_order": int (optional, same meaning as setup),
+    "run_id": str,              # stamped into the "init {run_id}" commit
+    "output_credentials": dict (optional, same shape as process mode),
+}
+
 Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
 granule under an S3 prefix; a batch of granules per invocation for the fan-out):
 {
@@ -688,6 +701,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="sweep"`` folds the D22 rollup families worker-side (issue #300);
+    ``mode="icechunk_init"`` creates-or-opens the order's Icechunk companion
+    repo before the fan-out (issue #580);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -716,6 +731,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_sweep(event)
     if mode == "stats":
         return _handle_stats(event)
+    if mode == "icechunk_init":
+        return _handle_icechunk_init(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -1483,6 +1500,46 @@ def _handle_stage_sweep(
                     error=e,
                 )
             ),
+        }
+
+
+def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Create-or-open the shard order's Icechunk companion repo (issue #580, spec §11).
+
+    One synchronous ``RequestResponse`` invoke per run, posted by the
+    dispatcher after the ping and BEFORE the fan-out (the dispatcher never
+    writes, D8; every leaf's refs commit needs the array nodes to exist).
+    Idempotent — an initialized repo is reopened, never re-templated — so a
+    rerun into an existing store is a no-op commit-wise. The grid comes from
+    the same forwarded ``config`` (+ ``parent_order``) the workers fan out
+    on, so the repo's array model cannot drift from the leaf template. The
+    body echoes :func:`zagg.icechunk_refs.init_repo`'s record (repo ``path``,
+    ``snapshot``, ``created``, ``split``); a 500 carries the error and the
+    dispatcher treats either failure fail-open (the leaves never depend on
+    the index).
+    """
+    logger.info(f"Icechunk init mode: repo for {event.get('store_path')}")
+    try:
+        from zagg.grids import from_config
+        from zagg.icechunk_refs import init_repo
+
+        config = load_config_from_dict(event["config"])
+        grid = from_config(config, parent_order=event.get("parent_order"))
+        record = init_repo(
+            event["store_path"],
+            grid,
+            run_id=str(event.get("run_id") or "unknown"),
+            store_kwargs=_output_store_kwargs(event),
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "icechunk_init", **record}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "icechunk_init"}),
         }
 
 

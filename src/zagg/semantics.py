@@ -54,7 +54,7 @@ Excluded as packaging: all orders (``parent_order``/``child_order``/
 ``chunk_inner`` — the D24 resolution axis, which the epoch deliberately did
 NOT touch: hashing them would still make o8 and o9 runs different products and
 block mixed-order processing), store layout/path/name, ``coverage_moc`` and
-``sweep`` (run triggers over regenerable D9 caches), the chunk-index block
+``sweep`` and ``icechunk`` (run triggers over regenerable D9 caches), the chunk-index block
 (``data_source.index`` — the issue #499 epoch, espg-ruled 2026-09-13: read
 machinery; see :data:`DATA_SOURCE_PACKAGING_KEYS`), ``consolidate_metadata``
 (a derived finalize blob), the whole ``pyramid`` block (D11 keeps it out of

@@ -1809,6 +1809,9 @@ class TestSummaryKeysByteIdentical:
         # unless a unit refused. LOCAL-only — the fleet has no once-per-run
         # worker-side write seam (D8), so _LAMBDA_KEYS below does not carry it.
         "refusal_manifest_path",
+        # Icechunk companion init record (issue #580): always present, None
+        # off-hive / opted out, {"error"} on a fail-open init.
+        "icechunk",
     } | _IDENTITY_KEYS
     _LAMBDA_KEYS = {
         "total_cells",
@@ -1832,6 +1835,8 @@ class TestSummaryKeysByteIdentical:
         "finalize_s",
         # Guarded finalize (issue #335); always present, None on success.
         "finalize_error",
+        # Icechunk companion init record (issue #580), as on the local backend.
+        "icechunk",
         "function_timeout_s",
         "worker_max_s",
         "worker_median_s",

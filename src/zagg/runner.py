@@ -39,6 +39,7 @@ from zagg.config import (
     get_coverage_moc,
     get_driver,
     get_handoff,
+    get_icechunk,
     get_output_endpoint_url,
     get_output_region,
     get_parent_order,
@@ -3087,12 +3088,18 @@ def _run_local(
         manifest = ensure_manifest(
             store_path, manifest, overwrite=overwrite, config=config, **store_kwargs
         )
+        # Icechunk companion repo (issue #580, spec §11): the once-per-run
+        # init, in-process here as the sweep is — this process IS the worker.
+        # Fail-open (D9): the repo is a derived index; a failed init is
+        # recorded in the summary and every leaf's refs then fail-open too.
+        icechunk_init = _init_icechunk_local(config, grid, store_path, run_id, store_kwargs)
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
         # pairs — dispatch byte-identical to pre-windowing runs.
         if windowing is not None:
             cells = _windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
     else:
+        icechunk_init = None
         zarr_store = open_store(store_path, **store_kwargs)
         zarr_store = grid.emit_template(zarr_store, overwrite=overwrite)
 
@@ -3357,6 +3364,10 @@ def _run_local(
         # Store-root refusal manifest (issue #388), local-only like the root
         # touch above; None when nothing refused — see _write_refusals.
         "refusal_manifest_path": refusal_manifest_path,
+        # Icechunk companion init record (issue #580): the repo path +
+        # snapshot, ``{"error": ...}`` when the fail-open init did not land,
+        # None on a non-hive run or with output.icechunk off.
+        "icechunk": icechunk_init,
         "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "store_path": store_path,
@@ -3954,6 +3965,26 @@ def _run_lambda(
             output_creds_event=output_creds_event,
             run_manifest=run_manifest,
         )
+        # Icechunk companion repo (issue #580, spec §11): the once-per-run
+        # init rides ONE synchronous worker invoke — the dispatcher never
+        # writes (D8), and every leaf's refs commit needs the array nodes to
+        # exist first, so unlike the manifest write this one blocks the
+        # fan-out. Fail-open: a stale deployment (400 from the process
+        # handler) or a refused init records an error in the summary and the
+        # leaves' refs fail-open too; the leaves themselves are unaffected.
+        icechunk_init = (
+            _invoke_lambda_icechunk_init(
+                state["lambda_client"],
+                function_name,
+                store_path,
+                config_dict=config_dict,
+                parent_order=parent_order,
+                run_id=run_id,
+                output_creds_event=output_creds_event,
+            )
+            if get_icechunk(config)
+            else None
+        )
         # Overlap the fan-out with the client-side morton_hive.json check
         # (issue #274 Fix 2): the async setup write above typically lands
         # within seconds, so by finalize the flag is set and the blocking
@@ -3965,6 +3996,7 @@ def _run_lambda(
             lambda: read_manifest(store_path, **manifest_kwargs) is not None
         )
     else:
+        icechunk_init = None
         _invoke_lambda_setup(
             state["lambda_client"],
             function_name,
@@ -4215,6 +4247,8 @@ def _run_lambda(
             "worker_pstdev_s": worker_pstdev_s,
             "worker_pct_timeout": worker_pct_timeout,
             "max_memory_mb": max_memory_mb,
+            # Icechunk companion init record (issue #580): see _run_local.
+            "icechunk": icechunk_init,
             "store_path": store_path,
             "backend": "lambda",
             "function_name": function_name,
@@ -5526,6 +5560,84 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
         del event["leaves"]
         event["discover"] = True
     return event
+
+
+def _init_icechunk_local(config, grid, store_path, run_id, store_kwargs) -> dict | None:
+    """The local backend's in-process Icechunk init (issue #580); its record.
+
+    ``None`` when ``output.icechunk`` is off; ``{"error": ...}`` on a failed
+    init (fail-open, D9 — the repo is a regenerable index and the leaves stay
+    normative); else :func:`zagg.icechunk_refs.init_repo`'s record.
+    """
+    if not get_icechunk(config):
+        return None
+    from zagg.icechunk_refs import init_repo
+
+    try:
+        record = init_repo(store_path, grid, run_id=run_id, store_kwargs=store_kwargs)
+    except Exception as e:
+        logger.warning(f"icechunk init failed (fail-open, issue #580): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+    logger.info(
+        f"Icechunk repo {record['path']} {'created' if record['created'] else 'reopened'} "
+        f"at snapshot {record['snapshot']}"
+    )
+    return record
+
+
+def _invoke_lambda_icechunk_init(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    parent_order=None,
+    run_id=None,
+    output_creds_event=None,
+) -> dict:
+    """One synchronous ``mode="icechunk_init"`` invoke (issue #580); its record.
+
+    The fleet twin of :func:`_init_icechunk_local`: the worker role creates
+    or reopens the order's repo and defines its array nodes BEFORE the
+    fan-out, so every leaf commit finds them. ``RequestResponse`` because the
+    fan-out must not start ahead of it; fail-open because the leaves never
+    depend on it — a stale deployment (its process handler 400s the unknown
+    mode), a throttled invoke or a refused init all return ``{"error": ...}``
+    with a warning, and the run proceeds refs-less.
+    """
+    event = {
+        "mode": "icechunk_init",
+        "store_path": store_path,
+        "parent_order": parent_order,
+        "run_id": run_id,
+        "config": config_dict,
+    }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    try:
+        response = lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(event),
+        )
+        payload = response["Payload"].read().decode("utf-8")
+        if response.get("FunctionError"):
+            raise RuntimeError(payload)
+        result = json.loads(payload)
+        body = json.loads(result.get("body") or "{}")
+        if result.get("statusCode") != 200:
+            raise RuntimeError(
+                f"statusCode {result.get('statusCode')}: {body.get('error') or result.get('body')!r}"
+            )
+    except Exception as e:
+        logger.warning(f"icechunk init invoke failed (fail-open, issue #580): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+    record = {k: body[k] for k in ("path", "order", "snapshot", "created", "split") if k in body}
+    logger.info(
+        f"Icechunk repo {record.get('path')} "
+        f"{'created' if record.get('created') else 'reopened'} at snapshot {record.get('snapshot')}"
+    )
+    return record
 
 
 def _invoke_lambda_sweep(

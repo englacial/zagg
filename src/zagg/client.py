@@ -68,6 +68,7 @@ from zagg.config import (
     get_coverage_moc,
     get_driver,
     get_handoff,
+    get_icechunk,
     get_output_endpoint_url,
     get_output_region,
     get_parent_order,
@@ -847,6 +848,18 @@ class Run:
                 output_creds_event=output_creds_event,
                 run_manifest=run_manifest,
             )
+            # Icechunk companion init (issue #580): synchronous, before the
+            # fan-out, fail-open — the same seam ``runner._run_lambda`` takes.
+            if get_icechunk(self.config):
+                runner._invoke_lambda_icechunk_init(
+                    client,
+                    self.function_name,
+                    self.store,
+                    config_dict=config_dict,
+                    parent_order=self._parent_order,
+                    run_id=run_id,
+                    output_creds_event=output_creds_event,
+                )
         else:
             runner._invoke_lambda_setup(
                 client,
