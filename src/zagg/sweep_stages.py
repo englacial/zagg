@@ -162,11 +162,9 @@ def sweep_stage_pass(
     that dispatches no tuple refuses BY NAME rather than sweeping nothing — a
     mistyped dispatch order must not read as a clean no-op.
 
-    ``dirt_only`` (the ``by_shard`` shape, issue #580) names leaves whose data
-    is unchanged but whose Icechunk ref sidecar was rewritten (a touched
-    skip-if-current unit, PR #581 question (11)). A node whose subtree holds
-    dirt-only leaves and no dirty one is not folded: the ref hook alone runs
-    for it, as dirty, and the row counts it as ``icechunk_regathered``.
+    ``dirt_only`` (``by_shard`` shape, issue #580): leaves with unchanged data
+    but a rewritten Icechunk ref sidecar. A node with dirt-only leaves and no
+    dirty one is not folded; only its ref hook runs (``icechunk_regathered``).
     """
     from zagg.hive import _utcnow
     from zagg.store import open_object_store
@@ -514,9 +512,8 @@ def run_stage_sweep(
     ``coverage.moc`` (a fleet append with no subsequent sweep leaves the
     root MOC stale, and the ratchet only heals nodes a sweep visits; the MOC
     stays an in-pass accelerator for sibling candidates only).
-    ``dirt_only`` is the run's ref-only work set in the same pair shape
-    (:func:`zagg.sweep.dirt_only_leaves`): its nodes re-gather Icechunk refs
-    and fold nothing (:func:`sweep_stage_pass`); the finisher never sees it.
+    ``dirt_only`` is the ref-only work set (:func:`zagg.sweep.dirt_only_leaves`,
+    :func:`sweep_stage_pass`); the finisher never sees it.
 
     ``scope`` is the optional node-prefix MOC (#381 point (11) — decimals,
     words, or a shardmap whose keys are the prefixes); ``partitions=``
@@ -724,10 +721,7 @@ def stage_sweep_after_run(
     reads the config to decide to chain at all, so it also passes the policy
     that governs the finisher's touch — an operator who declared ``never`` on an
     archival destination must not get one new root-core version per staged sweep.
-
-    ``dirt_only`` (issue #580) joins the scope and rides to
-    :func:`run_stage_sweep`: the run's touched current units, whose nodes
-    re-gather their refs without a fold.
+    ``dirt_only`` (issue #580) joins the scope and rides to :func:`run_stage_sweep`.
     """
     from zagg.grids.morton import morton_decimal
 
@@ -914,6 +908,7 @@ def run_stage_worker(
     records_from: str,
     lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
+    dirt_only=(),
 ) -> dict:
     """One fleet stage worker: this invoke's dispatch nodes, one tuple.
 
@@ -961,7 +956,8 @@ def run_stage_worker(
     lost invoke — its barrier waits out the full timeout and its coverage
     never reaches the manifest. That is a worse outcome than a loud refusal,
     so an absent prefix refuses BY NAME before anything is read or written
-    (review finding). Returns the record.
+    (review finding). ``dirt_only`` is the event's ref-only slice
+    (:func:`sweep_stage_pass`). Returns the record.
     """
     from zagg.hive import MANIFEST_NAME, _decimal_order, read_manifest
     from zagg.sweep import _normalize_leaves
@@ -998,6 +994,7 @@ def run_stage_worker(
     shard_order = int(manifest["shard_order"])
     ladder_entries(manifest.get("pyramid") or {}, shard_order)  # loud /2 gate
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
+    regather, _ = _normalize_leaves(dirt_only, shard_order)
     scope = normalize_scope(nodes)
     ttl_s = int(lease_ttl_s or DEFAULT_TTL_S)
     lease = acquire_lease(
@@ -1024,6 +1021,7 @@ def run_stage_worker(
         on_node=_maybe_beat,
         level_actuals=level_actuals,
         only_dispatch=int(dispatch),
+        dirt_only=regather,
     )
     rows = summary["stages"]
     if partition is not None:
@@ -1039,6 +1037,7 @@ def run_stage_worker(
         "tuple_width": int(tuple_width),
         "n_nodes": len(nodes),
         "n_leaves": sum(len(w) for w in by_shard.values()),
+        "n_dirt_only": sum(len(w) for w in regather.values()),
         "skipped_leaves": skipped,
         "partition": None if partition is None else dict(partition),
         "stages": rows,

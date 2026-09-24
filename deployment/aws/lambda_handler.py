@@ -186,6 +186,10 @@ end of run, like coverage mode; also invocable ad hoc):
         SAME "leaves"/"discover" keys the families arm uses -- a stage invoke
         is sent only the slice under its own nodes, so the batching that keeps
         "nodes" under the async cap keeps "leaves" under it too.
+    "dirt_only": [[shard_key, window-or-null], ...] (optional, issue #580,
+        role="stage") -- leaves whose data is current but whose Icechunk ref
+        sidecar was rewritten; their nodes re-gather refs without a fold.
+        Absent -> none.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -1338,7 +1342,7 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 #: The per-stage counts the stage arm's envelope totals for a driver.
-_STAGE_COUNTS = ("written", "current", "failed", "under_covered")
+_STAGE_COUNTS = ("written", "current", "failed", "under_covered", "icechunk_regathered")
 
 
 def _stage_body(
@@ -1469,6 +1473,7 @@ def _handle_stage_sweep(
                 records_from=block.get("records_from"),
                 lease_ttl_s=block.get("lease_ttl_s"),
                 store_kwargs=store_kwargs,
+                dirt_only=[(int(k), w) for k, w in event.get("dirt_only") or []],
             )
         else:
             raise ValueError(f"unknown stage role {role!r} (expected 'stage' or 'finisher')")

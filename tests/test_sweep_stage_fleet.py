@@ -664,6 +664,38 @@ class TestHandlerStageArm:
         assert body["stage_record"].endswith(stage_record_name(0, 0))
         assert (prefix / stage_record_name(0, 0)).exists()
 
+    @pytest.mark.parametrize("dirt", [True, False])
+    def test_dirt_only_rides_to_the_stage_worker(self, tmp_path, monkeypatch, dirt):
+        # Issue #580: the event's ``dirt_only`` refs reach run_stage_worker as
+        # (shard_key, window) pairs; an event without the key (an older
+        # dispatcher) forwards an empty set, i.e. today's behavior.
+        import zagg.sweep_stages as stages_mod
+
+        seen = {}
+        monkeypatch.setattr(
+            stages_mod, "run_stage_worker", lambda *a, **k: seen.update(k) or {"stages": []}
+        )
+        mod = _handler_module()
+        event = _event(tmp_path / "s", _stage_block(0, ["1"], records_from=tmp_path / "p"))
+        if dirt:
+            event["dirt_only"] = _leaf_refs(["1111"])
+        assert mod.lambda_handler(event, None)["statusCode"] == 200
+        assert seen["dirt_only"] == ([(morton_word("1111"), None)] if dirt else [])
+
+    def test_a_dirt_only_node_folds_nothing_over_the_event(self, tmp_path):
+        # The same node handed as dirt-only, not dirty: the worker skips the
+        # fold (no overview written) and records the ref-only share.
+        mod = _handler_module()
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        event = _event(root, _stage_block(0, ["1"], records_from=prefix), leaves=[])
+        event["dirt_only"] = _leaf_refs(["1111", "1112", "1121"])
+        body = json.loads(mod.lambda_handler(event, None)["body"])
+        assert body["ok"] and body["written"] == 0 and body["current"] == 0
+        assert body["icechunk_regathered"] == 0  # no repo here: the hook is a no-op
+        record = json.loads((prefix / stage_record_name(0, 0)).read_text())
+        assert record["n_leaves"] == 0 and record["n_dirt_only"] == 3
+
     def test_finisher_role_round_trips_over_the_event(self, tmp_path):
         mod = _handler_module()
         root, prefix = tmp_path / "s", tmp_path / "status"
@@ -1364,6 +1396,52 @@ class TestStageEvent:
         creds = {"accessKeyId": "A", "secretAccessKey": "B"}
         event = build_stage_event("s3://b/p.zarr", {"role": "stage"}, [], creds)
         assert event["output_credentials"] == creds
+
+
+class TestStageEventDirtOnly:
+    def test_dirt_only_rides_only_when_non_empty(self):
+        # Backward compatible (issue #580): an event with no dirt-only refs is
+        # byte-identical to the pre-#580 shape, and a worker reading an event
+        # without the key sees an empty set.
+        from zagg.sweep_fleet import build_stage_event
+
+        block = {"role": "stage", "run_id": "F", "dispatch": 0, "nodes": ["1"], "batch": 0}
+        plain = build_stage_event("s3://b/p.zarr", block, [[1, None]])
+        assert build_stage_event("s3://b/p.zarr", block, [[1, None]], None, []) == plain
+        assert "dirt_only" not in plain
+        event = build_stage_event("s3://b/p.zarr", block, [], None, [[2, None]])
+        assert event["dirt_only"] == [[2, None]] and event["leaves"] == []
+
+    def test_the_fleet_ships_each_node_its_dirt_only_slice(self, tmp_path):
+        # The dispatcher (D8: it only assembles) adds the dirt-only leaves'
+        # ancestors to each tuple's dispatch nodes and ships each batch its
+        # own slice; the finisher never carries it; nothing is folded.
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        summary = _fleet(
+            root, client, leaves=[], dirt_only=[(morton_word(d), None) for d in LEAVES]
+        )
+        assert summary["n_leaves"] == 0 and summary["n_dirt_only"] == len(LEAVES)
+        stage_events = [e for e in client.events if e["stage"]["role"] == "stage"]
+        assert stage_events and all(e["leaves"] == [] for e in stage_events)
+        shipped = sorted(
+            tuple(r) for e in stage_events if e["stage"]["dispatch"] == 0 for r in e["dirt_only"]
+        )
+        assert shipped == sorted((morton_word(d), None) for d in LEAVES)
+        (finisher,) = [e for e in client.events if e["stage"]["role"] == "finisher"]
+        assert "dirt_only" not in finisher and summary["finisher"]["landed"]
+        bodies = [json.loads(r["body"]) for r in client.responses]
+        assert sum(b["written"] for b in bodies) == 0
+
+    def test_a_plain_fleet_run_carries_no_dirt_only_key(self, tmp_path):
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(mod.lambda_handler)
+        _fleet(root, client)
+        assert not any("dirt_only" in e for e in client.events)
 
 
 class TestBarrier:
