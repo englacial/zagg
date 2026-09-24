@@ -3523,8 +3523,8 @@ leaf-array) gives leaves-per-manifest ≈ 0.6·√N: ≈30 at California scale
 (order 6–7 cells), ≈1,000 at the full globe (order-4 cells → 27k manifests, a
 2.7 MB snapshot and 2.6 MB of manifests — the shape of the live ISMIP repo,
 27,423 manifests / 2.2 MB snapshot). So both the manifest split and the
-commit granularity are configurable and derived, and a manifest is written
-by **exactly one commit**.
+commit granularity are configurable and derived, and a **base** manifest is
+written by **exactly one commit** (§11.5).
 
 **Contract — the ladder.** Refs travel up the §4 pyramid the way the digest
 columns do:
@@ -3637,28 +3637,42 @@ fields to `icechunk_*` columns.
 ### 11.5 Manifest splitting
 
 **Contract.** Manifests are split along the chunk axis into runs of `4^m`
-chunks. Because that axis is in nested order, one run is exactly the chunks
-of **one HEALPix cell at order `chunk_order − m`**, so the split is stated as
-"one manifest per order-`split_order` cell":
+chunks, and `m` is fixed **once, from the base level**:
 
 ```text
-m = min(max(chunk_order − split_order, 0), chunk_order)
+m_base = chunk_order_base − split_order          (7 at production: 4^7 = 16,384 chunks)
+m      = min(m_base, chunk_order_level)          (per level)
 ```
 
-The split is configured **per order group** (Icechunk's path-matched
-split conditions, `^/{order}/`). `chunk_order` is the group's own chunk axis
-— the inner-chunk order for the shard-order group (13 at production), the
-node order for an overview group (one chunk per node) — so an overview
-group coarser than the split gets one chunk per manifest, a coarser level
-has 4^k fewer cells and correspondingly smaller manifests, and no manifest
-ever spans more than a base cell.
-`split_order` MUST satisfy `commit_order ≤ split_order ≤ shard_order`: the
-committing node (§11.4) owns every leaf and overview under its order, so a
-manifest keyed to a cell at or below it is written by that one commit and no
-other — **zero rewrite amplification**. The setting is recorded per level as
-`levels.{order}.split` (`chunks` = `4^m`, `order` = `chunk_order − m`) and
-once as `split_order` in the `zagg_icechunk` block (§11.1), never assumed
-by readers.
+Because the chunk axis is in nested order, one run of the **base** is
+exactly the chunks of one HEALPix cell at order `split_order`, so the split
+is stated as "one base manifest per order-`split_order` cell". Every other
+level holds the same **number of chunks** per manifest — not one
+`split_order` cell — capped at its own chunk axis (`chunk_order` is the
+group's own: the inner-chunk order for the base, 13 at production; the node
+order for a column or overview group, one chunk per node). At the defaults
+that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
+and one base cell (12 manifests per array) at `/11` and every coarser level;
+no manifest ever spans more than a base cell. Holding the chunk count
+constant is what keeps the manifest count — and with it the snapshot, which
+lists every manifest — at the base's: applying "one manifest per
+`split_order` cell" to every level would multiply both by the number of
+levels (≈5× at production).
+
+The split is configured **per order group** (Icechunk's path-matched split
+conditions, `^/{order}/`) and recorded per level as `levels.{order}.split`
+(`chunks` = `4^m`, `order` = `chunk_order − m` — the cell order one
+manifest spans, which differs per level by design) and once as
+`split_order` in the `zagg_icechunk` block (§11.1), never assumed by
+readers. `split_order` MUST satisfy `commit_order ≤ split_order ≤
+shard_order`: the committing node (§11.4) owns every leaf under its order,
+so a **base** manifest keyed to a cell at or below it is written by that one
+commit and no other — **zero rewrite amplification** at the only heavy
+level. A coarse-level manifest spans more than one committing node's
+subtree and is rewritten by each node that touches it (a rebase on disjoint
+chunks, `ConflictDetector`); that is deliberate: those manifests are tens of
+KB, so the amplification is negligible in bytes, while their **count** is
+what every snapshot read pays for.
 
 **Contract — the ratchet.** The store's recorded `split_order` is
 authoritative and moves **one way, toward coarser**. At `init`, the run
@@ -3675,13 +3689,15 @@ a later finalize reads to run Icechunk's `rewrite_manifests` once over the
 old manifests (not run by the writer; mixed cuts are valid — each manifest
 carries its own extents). A repo is never re-split finer. `split_order` is
 a layout knob outside the D19 semantic core: it changes no leaf byte.
-`commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`. Snapshot size sums across levels; the overview levels add under
-1% of the refs (order 8 is 741 nodes × one chunk per array at California
-scale), so the numbers below barely move.
+`commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`.
 
 At the defaults (`split_order = commit_order = 6` at production) a
 shard-order manifest is `4^7` = 16,384 chunks — one order-6 cell, 64 leaves —
-which is ≈43 order-6 cells × 9 arrays ≈ 390 manifests at California scale.
+which is ≈43 order-6 cells × 9 arrays ≈ 390 base manifests at California
+scale. The coarse levels add a few hundred (`/13` at one order-2 cell per
+manifest, `/12` at one order-1 cell, 12 per array at `/11` and coarser), so
+the snapshot is ≈390 + a few hundred entries; at the full-globe worst case it
+is ≈442k + ~1k, not the ≈2.2M a per-level `split_order` cut would list.
 The **global-scale** setting is `split_order: 4, commit_order: 3`: `4^9` chunks
 per manifest, one order-4 cell (1,024 leaves), 3,072 manifests per array
 (27k across the arrays, a ≈2.7 MB snapshot), committed by the 768 order-3

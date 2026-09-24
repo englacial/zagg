@@ -16,9 +16,12 @@ travel the way the digest columns do:
    everything gathered in ONE commit per node covering every order in its
    subtree (refs into ``/9/…``, ``/8/…``, … of the one repo); coarser tuples
    commit only their own overviews (their children already committed); finer
-   tuples write columns only. A manifest (one per ``split_order`` cell, per
-   order group) is therefore written by exactly one commit — zero rewrite
-   amplification.
+   tuples write columns only. A BASE manifest (one per ``split_order`` cell)
+   is therefore written by exactly one commit — zero rewrite amplification
+   where it matters; a coarse-level manifest holds the same number of chunks
+   and so spans several committing nodes' subtrees, and is rewritten (tens
+   of KB, rebased on disjoint chunks) by each — deliberately, since it is the
+   manifest COUNT the snapshot pays for (spec §11.5).
 
 The carrier is JSON — a member of the leaf's JSON-sibling family, keyed by
 the stats sidecar's grammar — holding a list of *units* ``{"level",
