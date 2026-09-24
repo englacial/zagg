@@ -124,7 +124,7 @@ MULTISCALES_GROUP_NAME = "multiscales"
 
 #: The store-root child reserved for the §11 Icechunk companion repos
 #: (issue #580): one repository per pyramid order at
-#: ``{store_root}/icechunk/{order}/``. Reserved on the same footing as
+#: ``{store_root}/icechunk/`` (one repo, a group per order). Reserved on the same footing as
 #: :data:`MULTISCALES_GROUP_NAME` — the D19 product-name grammar excludes it
 #: so a multi-product root walker can never classify it as a product.
 ICECHUNK_DIR_NAME = "icechunk"
@@ -1995,15 +1995,38 @@ def process_and_write_hive(
         if get_icechunk(config):
             _t0 = time.time()
             try:
-                from zagg.icechunk_refs import record_leaf
+                from zagg.icechunk_refs import leaf_ref_plan, record_leaf, resolve_options
 
-                metadata["icechunk"] = record_leaf(
-                    store_root,
-                    grid,
-                    shard_key,
-                    store_kwargs=store_kwargs,
-                    window=window["label"] if window else None,
-                )
+                label = window["label"] if window else None
+                if resolve_options(config, grid.parent_order)["commit"] == "leaf":
+                    metadata["icechunk"] = record_leaf(
+                        store_root, grid, shard_key, store_kwargs=store_kwargs, window=label
+                    )
+                elif label is not None:
+                    metadata["icechunk"] = {"skipped": "windowed"}
+                else:
+                    # Ladder mode (phase 6, §11.4): the plan is written as a
+                    # sidecar beside the leaf — no icechunk session on the
+                    # leaf path; the staged sweep gathers and commits it.
+                    from zagg.icechunk_ladder import write_leaf_refs
+
+                    plan = leaf_ref_plan(grid, shard_key, store_root, store_kwargs=store_kwargs)
+                    if not any(entry["refs"] for entry in plan):
+                        metadata["icechunk"] = {"skipped": "empty"}
+                    else:
+                        metadata["icechunk"] = {
+                            **write_leaf_refs(
+                                store_root,
+                                leaf_path,
+                                grid,
+                                plan,
+                                spec=sidecar_spec,
+                                store_kwargs=store_kwargs,
+                            ),
+                            "checksum": "etag"
+                            if store_root.startswith("s3://")
+                            else "last_modified",
+                        }
             except Exception as e:
                 logger.warning(
                     f"icechunk refs failed for shard {shard_key} (fail-open, issue #580): {e}"

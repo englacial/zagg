@@ -414,7 +414,9 @@ def build_record(
         "leaf_column": metadata.get("leaf_column"),
         # Icechunk companion refs (issue #580, spec §11.4): the leaf's refs
         # commit — ``{path, snapshot, arrays, refs, rebases, commit_s,
-        # checksum}`` on success, ``{"skipped": reason}`` for a unit stage 1
+        # checksum}`` on success (``commit: "leaf"``), or in ladder mode the
+        # ref sidecar it wrote instead — ``{sidecar, bytes, refs, arrays,
+        # checksum}`` — ``{"skipped": reason}`` for a unit stage 1
         # does not index (windowed, empty), ``{"error": ...}`` when the
         # fail-open write did not land. ``rebases`` and ``commit_s`` are the
         # fleet's first measurement of commit contention (the issue's open
@@ -607,6 +609,9 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     row["icechunk_rebases"] = ice.get("rebases")
     row["icechunk_commit_s"] = ice.get("commit_s")
     row["icechunk_checksum"] = ice.get("checksum")
+    # Ladder mode (phase 6): the leaf wrote a ref sidecar instead of committing.
+    row["icechunk_sidecar"] = ice.get("sidecar")
+    row["icechunk_bytes"] = ice.get("bytes")
     row["icechunk_skipped"] = ice.get("skipped")
     row["icechunk_error"] = ice.get("error")
     return row
@@ -799,7 +804,8 @@ def write_run_parquet(
     (``summary["icechunk"]``): three more run-level columns, split the way the
     row-level ``icechunk_*`` flattener splits its record rather than collapsed
     into one — ``icechunk_init_repo`` (the record's ``path``),
-    ``icechunk_init_snapshot`` (the init commit) and ``icechunk_init_error``
+    ``icechunk_init_snapshot`` (the init commit), ``icechunk_init_error``
+    and ``icechunk_split_ratchet`` (the §11.5 ratchet this run applied, or null)
     (the fail-open failure string, on the ``finalize_error`` precedent). So a
     run's leaves join to the repo history they were committed into, and
     "init failed" is never something a reader infers from whether a value
@@ -822,6 +828,13 @@ def write_run_parquet(
     df["icechunk_init_repo"] = init.get("path")
     df["icechunk_init_snapshot"] = init.get("snapshot")
     df["icechunk_init_error"] = init.get("error")
+    # The §11.5 split ratchet (phase 6): ``"{from}->{to}"`` when this run
+    # moved the store's split_order coarser — the flag a later
+    # rewrite_manifests pass reads — else null.
+    ratchet = init.get("split_ratchet")
+    df["icechunk_split_ratchet"] = (
+        f"{ratchet['from']}->{ratchet['to']}" if isinstance(ratchet, dict) else None
+    )
     # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
     # the DataFrame's float64 inference on a column that mixes ints with
     # failure-row ``None``s silently corrupts them (issue #300 — the sweep's

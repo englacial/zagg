@@ -120,7 +120,7 @@ Contents:
 8. [`zagg-toc/1` — the temporal declaration](#8-zagg-toc1)
 9. [`zagg-located/1` — the located declaration](#9-zagg-located1)
 10. [`zagg-coverage-toc/1` — the root coverage temporal section](#10-zagg-coverage-toc1)
-11. [Icechunk companion repos — the per-order virtual-ref index](#11-icechunk-companion-repos)
+11. [Icechunk companion repo — the virtual-ref index](#11-icechunk-companion-repos)
 
 ---
 
@@ -3314,7 +3314,7 @@ pinned.
 
 ---
 
-## 11. Icechunk companion repos
+## 11. Icechunk companion repo
 
 **Status: contract** (`zagg-icechunk/1`, issue
 [#580](https://github.com/englacial/zagg/issues/580), stage 1 — refs-only,
@@ -3338,17 +3338,24 @@ store, and every hive commit maps onto an Icechunk snapshot.
 
 ### 11.1 Placement and naming
 
-**Contract.** One repository per pyramid order, at the store root:
+**Contract.** One repository per store, at the store root, with one zarr
+**group per pyramid order** inside it:
 
 ```text
-{store_root}/icechunk/{order}/      <- Icechunk repository for the artifacts at {order}
+{store_root}/icechunk/          <- the Icechunk repository
+   /9                            <- the base: the source leaves at the shard order
+   /8, /7, … /0                  <- one group per declared §4 overview order
 ```
 
-`{order}` is the HEALPix order of the artifacts whose chunks the repo
-references: the store's **shard order** for the source leaves (the one repo
-stage 1 writes), an overview order for the sweep-built §4 overviews at that
-order (reserved; a follow-up writes them). `icechunk/` is a **reserved
-store-root child name** on the same footing as the §4.10 `multiscales/`
+`/{order}` holds that order's arrays (§11.2): the shard-order group the
+source leaves' arrays, an overview-order group the sweep-built overviews'
+(each overview object is one chunk per array on that group's axis). Every
+group is created by the once-per-run init (§11.4), and the repo's **root
+attrs mirror the manifest's `zagg-multiscales/1` block** (§4.9) verbatim as
+`multiscales`, so a reader opens one repo and discovers every level from
+its root — the GeoZarr/OME-NGFF-style multiscales convention
+(earth-mover/icechunk-multiscales-demo; what gridlook's level resolver
+reads). `icechunk/` is a **reserved store-root child name** on the same footing as the §4.10 `multiscales/`
 companion: it is excluded from the **D19 product-name grammar** (like the
 base-component exclusion), so a multi-product root walker can never classify
 it as a product, and `zagg.hive.validate_product_name` refuses the name
@@ -3360,17 +3367,26 @@ self-describing:
 ```json
 "zagg_icechunk": {
   "spec": "zagg-icechunk/1",
-  "order": 9,
   "shard_order": 9, "chunk_order": 13, "cell_order": 19,
   "url_prefix": "s3://bucket/product/",
-  "split": {"chunks": 4096, "order": 7}
-}
+  "commit": "ladder", "commit_order": 6, "split_order": 6,
+  "levels": {
+    "9": {"chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}},
+    "8": {"chunk_order": 8,  "cell_order": 18, "split": {"chunks": 16,    "order": 6}},
+    "7": {"chunk_order": 7,  "cell_order": 17, "split": {"chunks": 4,     "order": 6}},
+    "6": {"chunk_order": 6,  "cell_order": 16, "split": {"chunks": 1,     "order": 6}}
+  }
+},
+"multiscales": [ … the manifest's zagg-multiscales/1 block, verbatim … ]
 ```
 
-`order` is the repo's order (§11.1); `shard_order` / `chunk_order` /
-`cell_order` mirror the manifest and the grid; `url_prefix` is the virtual
-chunk container's prefix (§11.3); `split` records the manifest split
-(§11.5). That block is the **whole** of the repo root group's attrs — a leaf
+`shard_order` / `chunk_order` / `cell_order` mirror the manifest and the
+base grid; `url_prefix` is the virtual chunk container's prefix (§11.3);
+`levels` carries, per order group, its chunk axis order, its cell order and
+its manifest split (§11.5); `commit`, `commit_order` and `split_order` are
+the ladder's knobs (§11.4, §11.5), read back by every stage node so the
+sweep needs no config. Each order group carries the leaf (or overview)
+resolution group's own attrs — the `dggs` block and conventions. That block is the **whole** of the repo root group's attrs — a leaf
 root group carries only its own commit stamp, which is a per-leaf fact and so
 has nothing to mirror. Each **resolution group** mirrors the leaf resolution
 group's attrs verbatim (the `dggs` block, `zarr_conventions`), and **never the
@@ -3378,11 +3394,11 @@ commit stamp**.
 
 ### 11.2 Array model
 
-**Contract.** For every named array the leaf template declares at path `p`
-beneath the leaf root (e.g. `19/count`, `19/h_tdigest`,
-`19/h_tdigest_locations`), the repo holds an array at the same path `p`
-whose metadata is the leaf array's, re-rooted on the whole order (for the
-leaf repo of stage 1, `order == shard_order`):
+**Contract.** For every named array the level's template declares (a leaf
+array `{cell_order}/{name}` for the shard-order group, an overview array for
+an overview-order group), the repo holds `/{order}/{name}` whose metadata is
+the template array's, re-rooted on the whole order (`order == shard_order`
+for the base; `n_shards = 12·4^order` in every case):
 
 | field | repo array | derivation |
 |---|---|---|
@@ -3470,110 +3486,185 @@ new location before its refs resolve.
 
 ### 11.4 Commits
 
-**Contract.** Commits land on the `main` branch, one per artifact:
+**Why not one commit per leaf (informative).** A per-leaf commit does not
+scale. At the full-globe worst case (3,145,728 order-9 leaves, 49,152
+order-6 cells) it is 3.1M commits — and the real limit is not the commit
+count but the **snapshot**: an Icechunk snapshot lists every manifest, so its
+size is set by the manifest count. One manifest per order-6 cell per array is
+~442k manifests ≈ **44 MB read on every open, every rebase and every
+commit** (≈2.2 TB of snapshot traffic over one run). Balancing snapshot bytes
+(~100 B per manifest entry) against per-manifest bytes (~2.5 KB on disk per
+leaf-array) gives leaves-per-manifest ≈ 0.6·√N: ~30 at California scale
+(order 6–7 cells), ~1,000 at the full globe (order-4 cells → 27k manifests, a
+2.7 MB snapshot and 2.6 MB of manifests — the shape of the live ISMIP repo,
+27,423 manifests / 2.2 MB snapshot). So both the manifest split and the
+commit granularity are configurable and derived, and a manifest is written
+by **exactly one commit**.
 
-- `init {run_id}` — the once-per-run initialization: the repo exists (created
-  if absent, reopened if present) and every array node of §11.2 is defined
-  **before the first leaf commit**. It is idempotent: a repo that already
-  carries the nodes is reopened, never re-templated.
-- `leaf {decimal}` — one commit per leaf, written **by the worker that
-  committed the leaf, after its stamp** (D4: the stamp certifies the objects
-  the refs point at) and **last in the unit**, behind every post-stamp phase
-  that can still fail it — a failed unit is retried, and the retry replaces
-  the leaf wholesale (§1.5), so refs recorded ahead of such a phase would
-  leave the branch tip, not merely a superseded snapshot, indexing the
-  discarded attempt's offsets. It records every array the leaf wrote, dense and
-  ragged. Concurrent leaf commits touch disjoint chunk ranges of the same
-  arrays, so a lost compare-and-swap on the branch ref is resolved by a local
-  rebase and retry (Icechunk's conflict detector reports no conflict);
-  ordering between leaves is immaterial.
+**Contract — the ladder.** Refs travel up the §4 pyramid the way the digest
+columns do:
 
-A **replaced** leaf (§1.5 leaf immutability) is re-recorded by the replacing
-worker: the new commit's refs are the new objects' index and supersede the
-old ones on `main`. Snapshots older than that commit still reference the
-replaced keys and are stale for that leaf — and because clear-then-template
-reuses those keys, their refs resolve to a **live** object rather than
-404ing. The per-ref checksum (§11.3) is what makes that a loud failure
-instead of a silent mis-decode. Icechunk's garbage collection does not manage
-virtual targets, and stage 1 does not pin history across a replacement
-(stage 2's content-pinned keys do).
+1. **The leaf worker writes a ref sidecar, not a commit.** After the leaf's
+   stamp, its granule-id sibling and the §4.6 column fold — last in the unit,
+   behind every post-stamp phase that can still fail it — the worker computes
+   the leaf's ref plan (the reads below) and writes it as one compact object
+   beside the leaf, named by the stats sidecar's sibling grammar with the
+   base `icechunk_refs.json` (`{stem}.icechunk_refs.json` under `morton-hive/3`).
+   The carrier is JSON declaring `zagg-icechunk-refs/1`, the writer's
+   geometry (`shard_order`, `chunk_order`, `cell_order` — never the
+   container prefix, which is vetted at the repo) and the entries (~40 KB per
+   leaf at production geometry). It is a **writer-internal carrier**, not part
+   of the reader contract — the repo is. No Icechunk session is opened on
+   the leaf path.
+2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
+   `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
+   the finest tuple, its children's **node ref columns** (the same carrier at
+   `{node}/icechunk_refs.json`) above — and adds the refs of the overview
+   objects at every order of its tuple beneath it (read the same way a
+   leaf's are). A missing carrier is counted (`icechunk_missing`) and
+   tolerated — under-coverage, never a failure — and a carrier whose
+   recorded geometry disagrees with the repo's block is refused.
+3. **One tuple commits.** Let `c` be `commit_order`, `d` a tuple's dispatch
+   order and `d′` its child order (the tuple covers orders `[d, d′)`):
+   - `d ≤ c < d′` — the **committing tuple**: every node commits all it
+     gathered in **one commit** — the leaf refs into `/{shard_order}/…` and
+     each overview order's refs into `/{order}/…` of the same repo —
+     message `node {decimal}`;
+   - `d′ ≤ c` — a coarser tuple: its nodes commit only their **own**
+     overview refs (their children already committed);
+   - `d > c` — a finer tuple: its nodes write their node ref column and
+     commit nothing.
+
+   Commits rebase on conflict exactly as before (`ConflictDetector`; nodes
+   touch disjoint chunk ranges), and each stage row records
+   `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
+   `icechunk_refs`, `icechunk_missing` and `icechunk_failed`.
+
+`commit_order` defaults to the **finest dispatch node** of the staged sweep
+(`shard_order − tuple_width` when the shard order is a multiple of the width:
+6 at production), `split_order` to `commit_order`. Both ride the
+`zagg_icechunk` block, with different standing: `split_order` is the
+**store's** value and ratchets (§11.5); `commit` and `commit_order` are
+**per-run** — the init writes this run's values so its stage nodes can read
+them, and they are never a compatibility key. `commit: "leaf"` keeps the per-leaf commit of the
+first revision — the leaf commits `leaf {decimal}` itself and the ladder
+commits overview refs only — for the local backend without a staged sweep and
+for tests; the fleet default is the ladder.
+
+**Init.** `init {run_id}` — the once-per-run initialization, before the
+fan-out: the repo exists with **every** order group the ladder commits into
+(the shard-order group and one per declared overview order, created here
+once because Icechunk's create is not safe under concurrent callers), its
+array nodes (§11.2) defined and the `multiscales` mirror in its root attrs. Idempotent: a repo that already carries a matching block is
+reopened, never re-templated; a block for another geometry, container or
+ladder setting is refused.
+
+A **replaced** leaf (§1.5 leaf immutability) is re-indexed by the next staged
+sweep that gathers it: the new sidecar's refs supersede the old ones on
+`main`. Snapshots older than that commit still reference the replaced keys —
+and because clear-then-template reuses those keys, their refs resolve to a
+**live** object rather than 404ing. The per-ref checksum (§11.3) is what
+makes that a loud failure instead of a silent mis-decode. Icechunk's garbage
+collection does not manage virtual targets, and stage 1 does not pin history
+across a replacement (stage 2's content-pinned keys do).
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
-come out of the leaf's own index, but the sizes and checksums do not. After the
-leaf write, for each array the leaf wrote the worker issues:
+come out of the object's own index, but the sizes and checksums do not. For
+each array of a leaf (at the leaf worker) or of an overview object (at its
+stage node) the writer issues:
 
 - **sharded array**: one ranged `GET` of the shard index suffix (the §1.5
   recipe's second read, which yields every inner chunk's `(offset, length)`
   at once) **and** one `HEAD` of the shard object, for its checksum — the
   `ETag`, or `last_modified` on a local store (§11.3);
-- **regular (unsharded) array**: one `LIST` of the array's `c/` chunk prefix,
+- **regular (unsharded) array** — every overview array, and a leaf array on
+  a `chunk_inner`-less grid: one `LIST` of the array's `c/` chunk prefix,
   which yields every chunk object's key, size (the ref's `length`) and
-  checksum in one request — and, unlike probing, discovers which chunks the leaf
-  actually wrote.
+  checksum in one request — and, unlike probing, discovers which chunks were
+  actually written.
 
-That is one HEAD plus one ranged GET per sharded array per leaf, and one LIST
-per unsharded array — small beside the leaf write, but not nothing.
+Plus, per stage node, one small `GET` per child carrier. Small beside the
+leaf write, but not nothing.
 
-Writing the refs is **fail-open** (D9): a refs failure is logged and recorded
-in the leaf's D20 stats sidecar (`icechunk.error`) and never fails the leaf
-write — the leaf is normative, the index is regenerable. The sidecar's
-`icechunk` block is the leaf's record of its commit: `{path, snapshot,
-arrays, refs, rebases, commit_s, checksum}` on success — `rebases` the
-number of rebase-and-retry rounds the commit needed and `commit_s` its wall
-time, the measurements the fleet's contention question is answered from —
-`{skipped: reason}` for a unit stage 1 does not index (§11.6), or
-`{error: message}`. The run parquet flattens the same fields to
-`icechunk_*` columns.
+Writing refs is **fail-open** (D9) at every rung: a leaf's sidecar failure
+is logged and recorded in its D20 stats sidecar (`icechunk.error`) and never
+fails the leaf; a stage node's failure counts `icechunk_failed` and never
+fails the sweep — the leaf is normative, the index is regenerable (a later
+staged sweep re-gathers). The leaf's `icechunk` block records the sidecar it
+wrote — `{sidecar, bytes, refs, arrays, checksum}` — or, under
+`commit: "leaf"`, its commit `{path, snapshot, arrays, refs, rebases,
+commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
+(§11.6); `{error: message}` on failure. The run parquet flattens the same
+fields to `icechunk_*` columns.
 
 ### 11.5 Manifest splitting
 
 **Contract.** Manifests are split along the chunk axis into runs of `4^m`
 chunks. Because that axis is in nested order, one run is exactly the chunks
-of **one HEALPix cell at order `chunk_order − m`**, so the split is stated
-as "one manifest per order-N cell". The writer picks
+of **one HEALPix cell at order `chunk_order − m`**, so the split is stated as
+"one manifest per order-`split_order` cell":
 
 ```text
-m = min(max(chunk_order − shard_order, m₀), chunk_order)
+m = min(max(chunk_order − split_order, 0), chunk_order)
 ```
 
-with `m₀` the smallest `m` such that `4^m ≥ 4 · 1000`. The first term keeps
-every leaf commit rewriting a *whole number* of manifests: a leaf is
-`4^(chunk_order − shard_order)` chunks, and a smaller `m` would put two
-leaves' chunks in one manifest and make concurrent leaf commits contend over
-the same run. The second is the location-dictionary gate: Icechunk
-deduplicates a manifest's `location` strings only from `min_num_chunks`
-chunks upward — a **configurable** setting whose default is 1,000, not a
-format constant — and the ×4 margin keeps a run above that default after its
-absent chunks (which emit no ref) are subtracted. The third term caps a
-manifest at **one base cell**, never more: the chunk axis carries only
-`4^chunk_order` chunks per base cell, so there is no order-`(chunk_order − m)`
-cell to name above that. It binds only on small geometries (a test grid whose
-`shard_order` is at or near 0, where the gate term would otherwise win),
-never at production scale. At the production geometry (shard 9 / chunk 13)
-the three terms are 4, 6 and 13, so `m = 6`: 4,096 chunks, one manifest per
-**order-7 cell, 16 leaves**. The choice is recorded as
-`split.chunks` (`4^m`) and `split.order` (`chunk_order − m`, the order of the
-cell one manifest covers) in the `zagg_icechunk` block (§11.1), not hardcoded
+The split is configured **per order group** (Icechunk's path-matched
+split conditions, `^/{order}/`). `chunk_order` is the group's own chunk axis
+— the inner-chunk order for the shard-order group (13 at production), the
+node order for an overview group (one chunk per node) — so an overview
+group coarser than the split gets one chunk per manifest, a coarser level
+has 4^k fewer cells and correspondingly smaller manifests, and no manifest
+ever spans more than a base cell.
+`split_order` MUST satisfy `commit_order ≤ split_order ≤ shard_order`: the
+committing node (§11.4) owns every leaf and overview under its order, so a
+manifest keyed to a cell at or below it is written by that one commit and no
+other — **zero rewrite amplification**. The setting is recorded per level as
+`levels.{order}.split` (`chunks` = `4^m`, `order` = `chunk_order − m`) and
+once as `split_order` in the `zagg_icechunk` block (§11.1), never assumed
 by readers.
 
-*(Informative.)* `m = 6` is a trade, not a derived optimum, and the trade is
-write amplification. A leaf commit rewrites every manifest its chunks fall
-in, so at `m = 6` each of the 16 leaves of one order-7 cell rewrites that
-whole cell's manifest — over a run, up to **16× the per-array manifest bytes**
-that one-leaf manifests (`m = 4`, 256 chunks) would write. What it buys is
-the location dictionary, which `m = 4` cannot reach at all under the
-1,000-chunk default; and the dictionary is worth reaching here precisely
-because all 256 refs of one leaf array carry the **same** `location` (the
-leaf's single shard object), so the deduplicated form stores that string once
-per leaf instead of 256 times. Because the number is recorded in
-`zagg_icechunk.split`, a later revision may retune it — lowering
-`min_num_chunks` and `m` together, say — without any reader change.
+**Contract — the ratchet.** The store's recorded `split_order` is
+authoritative and moves **one way, toward coarser**. At `init`, the run
+config's `split_order` is compared with the block's: a config value FINER
+than the store's (numerically higher) is not applied — the init adopts the
+store's value and logs a warning naming both (templates are hash-pinned build
+configs reused by appends; refusing would break every append after a
+ratchet); an equal value is a no-op; a COARSER value is an intentional
+ratchet: the init records the new `split_order` and per-level splits in the
+block and in the repo's saved splitting config **before any commit of the
+run**, so every manifest the run writes is already at the new cut, and
+flags the run record with `icechunk_split_ratchet: "{from}->{to}"`, which
+a later finalize reads to run Icechunk's `rewrite_manifests` once over the
+old manifests (not run by the writer; mixed cuts are valid — each manifest
+carries its own extents). A repo is never re-split finer. `split_order` is
+a layout knob outside the D19 semantic core: it changes no leaf byte.
+`commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`. Snapshot size sums across levels; the overview levels add under
+1% of the refs (order 8 is 741 nodes × one chunk per array at California
+scale), so the numbers below barely move.
+
+At the defaults (`split_order = commit_order = 6` at production) a
+shard-order manifest is 4^7 = 16,384 chunks — one order-6 cell, 64 leaves —
+which is ~43 order-6 cells × 9 arrays ≈ 390 manifests at California scale.
+The **global-scale** setting is `split_order: 4, commit_order: 3`: 4^9 chunks
+per manifest, one order-4 cell (1,024 leaves), 3,072 manifests per array
+(27k across the arrays, a ~2.7 MB snapshot), committed by the 768 order-3
+nodes (768 commits) — the numbers §11.4's rationale derives.
+
+*(Informative.)* Icechunk deduplicates a manifest's `location` strings only
+from `min_num_chunks` chunks upward (a configurable setting defaulting to
+1,000, not a format constant). Every admissible split clears it by
+construction — the finest manifest is a whole leaf, 256 chunks per array at
+production, and the default is 64 of them — and the dictionary is worth
+having precisely because all refs of one leaf array carry the **same**
+`location` (the leaf's single shard object).
 
 ### 11.6 What §11 does not cover (informative)
 
 Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
 across windows and so cannot share one chunk axis; stage 1 records no refs
-for them (the sidecar says `skipped: windowed`). Raster hive products
-(`(time, cells)` arrays, never sharded) and the sweep-built overviews at
-ancestor orders are likewise out of stage 1's writer scope. None of these
-change the leaf format, the t-digest storage or the moczarr reader.
+for them (the sidecar says `skipped: windowed`) and the ladder does not run
+on a windowed store. Raster hive products (`(time, cells)` arrays, never
+sharded) are likewise out of stage 1's writer scope. The sweep-built §4
+overviews are **in** scope since the ladder (§11.4): every declared overview
+order has its repo and its refs. None of these change the leaf format, the
+t-digest storage or the moczarr reader.

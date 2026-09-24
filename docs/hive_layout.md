@@ -1302,7 +1302,7 @@ trio, separately, is touched by the
 **local backend only** — as is the refusal manifest above, for the same reason
 (D8 keeps the Lambda dispatcher from writing to the store, and the handler has
 no once-per-run root-write mode yet; both wait on the same resolution — PR #397
-question (10)). The **Icechunk companion repo** (`icechunk/{order}/`, below)
+question (10)). The **Icechunk companion repo** (`icechunk/`, below)
 is outside the touch contract as well: `touch_current_unit` assembles a unit
 footprint of leaf tree + stats sidecar + `granules.json` + sub-map + declared
 column, `touch_store_root` covers the root trio, and neither reaches the repo
@@ -1359,13 +1359,15 @@ stage 1: refs-only, additive; the leaves stay normative):
 {store_root}/
   morton_hive.json
   coverage.moc
-  icechunk/{shard_order}/         <- one Icechunk repo per order (reserved name)
+  icechunk/                       <- ONE Icechunk repo per store (reserved name)
+     /9                            <- a group per order: the base at the shard order …
+     /8, /7, … /0                  <- … and one per declared overview order
   {sign+base}/...                 <- the digit tree, unchanged
 ```
 
-The repo is one zarr hierarchy per order: the leaf's resolution group
-(`{cell_order}/`, `dggs` attrs included) with every leaf array re-rooted on
-the whole order — `count`, `morton`, every field, the ragged vlen arrays and
+The repo is one zarr hierarchy: a **group per pyramid order**, each carrying
+the leaf's (or overview's) resolution-group attrs — `dggs` included — with
+every array re-rooted on the whole order — `count`, `morton`, every field, the ragged vlen arrays and
 their siblings — chunked at the leaf's **inner** chunk and coded with the
 inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
 ordinary arrays without moczarr. In a **browser**, icechunk-js reads the
@@ -1374,45 +1376,96 @@ ordinary arrays without moczarr. In a **browser**, icechunk-js reads the
 `vlen-bytes` codec, and a closed dtype union —
 [issue #580](https://github.com/englacial/zagg/issues/580),
 [zarr-extensions#71](https://github.com/zarr-developers/zarr-extensions/issues/71)).
-The Python pair decodes both. A leaf at
-shard rank `r` owns global chunks `[r·C, (r+1)·C)` (spec §11.3); absent inner
+The Python pair decodes both. The repo's root attrs mirror the manifest's
+`zagg-multiscales/1` block as `multiscales`, so one open discovers every
+level (the icechunk-multiscales convention gridlook's level resolver reads).
+A leaf at shard rank `r` owns global chunks `[r·C, (r+1)·C)` (spec §11.3); absent inner
 chunks emit no reference and read as fill; every reference carries the
 object's checksum in the form its container validates — the ETag on S3, the
 object's `last_modified` ceiled to the next whole second on a local store —
 so a leaf replaced in place fails loudly instead of decoding stale offsets
 (locally, only a replacement landing inside the same second slips through).
 
-Two writes, both worker-side (the dispatcher never writes, D8), both
+Three writes, all worker-side (the dispatcher never writes, D8), all
 **fail-open** — the repo is a regenerable index, never load-bearing:
 
 - **`mode: "icechunk_init"`**, one synchronous invoke after the ping and
   before the fan-out (the local backend calls
   `zagg.icechunk_refs.init_repo` in-process after the manifest lands):
-  creates-or-opens the repo, defines the array nodes, the manifest split
-  and the virtual chunk container, and commits `init {run_id}`. Idempotent
-  — a rerun reopens. The record (`path`, `snapshot`, `created`, `split`) rides
-  the run summary under `icechunk`; a failed init records `{"error": …}`
-  there and the run proceeds refs-less. The run parquet broadcasts it as
-  `icechunk_init_repo`, `icechunk_init_snapshot` and `icechunk_init_error`,
-  always written so the column set does not vary run to run.
-- **Per-leaf refs at commit**: after the leaf's stamp — last in the unit,
+  creates-or-opens the repo with **every** order group the ladder commits
+  into — the shard-order group and one per declared overview order —
+  defines their array nodes, one manifest split per group, the virtual chunk
+  container and the `multiscales` mirror, and commits `init {run_id}`.
+  Idempotent — a rerun reopens; a repo built for another geometry or ladder
+  setting is refused. The record (`path`, `snapshot`, `created`, `options`,
+  `levels`, `ladder`) rides the run summary under
+  `icechunk`; a failed init records `{"error": …}` there and the run proceeds
+  refs-less. The run parquet broadcasts it as `icechunk_init_repo`,
+  `icechunk_init_snapshot` and `icechunk_init_error`, always written so the
+  column set does not vary run to run.
+- **The leaf's ref sidecar**: after the leaf's stamp — last in the unit,
   behind the granule-id sibling and the [issue #383](https://github.com/englacial/zagg/issues/383)
-  column fold, which is the final post-stamp phase that can still fail the
-  unit (a failed unit is retried, and the retry rewrites leaf + column
-  wholesale) — the worker sizes the objects it wrote (one HEAD + one
-  ranged GET of the shard-index suffix per sharded array, one LIST per
-  regular array), writes the refs, and commits `leaf {decimal}` with
-  rebase-on-conflict (icechunk's `ConflictDetector`; leaves touch disjoint
-  chunk ranges, so a rebase always succeeds). The outcome rides the leaf's
-  stats sidecar as `icechunk` — `{path, snapshot, arrays, refs, rebases,
-  commit_s, checksum}`, `{skipped: "windowed" | "empty"}`, or `{error}` — and
-  the run parquet as `icechunk_*` columns; `rebases` and `commit_s` are what
-  the first fleet run reports for the commit-contention question. Its cost
-  is its own `phase_timings["icechunk"]`, not `write`.
+  column fold — the worker sizes the objects it wrote (one HEAD + one ranged
+  GET of the shard-index suffix per sharded array, one LIST per regular
+  array) and writes the plan as a JSON sibling beside the leaf's stats
+  sidecar (`icechunk_refs.json`, ~40 KB at production geometry). No
+  Icechunk session on the leaf path. The outcome rides the leaf's stats sidecar as `icechunk` —
+  `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "windowed" |
+  "empty"}`, or `{error}` — and the run parquet as `icechunk_*` columns. Its
+  cost is its own `phase_timings["icechunk"]`, not `write`.
+- **The ladder commits** (`zagg.icechunk_ladder`, hooked into every node of
+  the [staged sweep](#the-staged-sweep-issue-384)): a stage node gathers its
+  subtree's carriers — leaf sidecars at the finest tuple, its children's
+  node ref columns above — adds the refs of the overview objects at its
+  tuple's orders, and either writes its own node column or **commits**. The
+  tuple whose order range contains `commit_order` commits everything
+  gathered in **one commit per node** covering every order in its subtree
+  (`node {decimal}`, refs into `/9/…`, `/8/…`, … of the one repo); coarser
+  tuples commit only their own overviews; finer tuples write columns only.
+  So a manifest — one per `split_order` cell per order group — is written by
+  exactly one commit.
+  Each stage row records `icechunk_commits`, `icechunk_rebases`,
+  `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
+  `icechunk_failed`; the first fleet run's contention question reads
+  `icechunk_rebases` off the stage records.
+
+**Why the ladder, and the scale settings.** Per-leaf commits do not scale:
+at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M
+commits, and — the real limit — an Icechunk snapshot lists every manifest, so
+one manifest per order-6 cell per array is ~442k manifests, a 44 MB snapshot
+read on every open, rebase and commit (≈2.2 TB of snapshot writes per run).
+Balancing snapshot bytes (~100 B per manifest entry) against per-manifest
+bytes (~2.5 KB on disk per leaf-array) gives leaves-per-manifest ≈ 0.6·√N —
+~30 at California scale, ~1,000 at the globe. Both knobs live under
+`output.icechunk`:
+
+```yaml
+output:
+  icechunk:                 # true / false / absent (default on for hive) also accepted
+    commit: ladder          # "leaf" = the per-leaf commit (local backend without a staged sweep; tests)
+    commit_order: 6         # default: the finest staged-sweep dispatch node (shard_order − tuple_width)
+    split_order: 6          # default: commit_order; must be >= commit_order and <= shard_order
+```
+
+| setting | manifest = one cell at | chunks / manifest (shard-order group) | commits | snapshot |
+|---|---|---|---|---|
+| default (`6` / `6`) | order 6, 64 leaves | 4^7 = 16,384 | one per order-6 node | ~390 manifests at California scale |
+| global (`split 4` / `commit 3`) | order 4, 1,024 leaves | 4^9 | 768 (the order-3 nodes) | 27k manifests, ~2.7 MB |
+
+`split_order` is a one-way ratchet toward coarser (spec §11.5): a run whose
+config is finer than the store's recorded value adopts the store's with a
+warning; a coarser value re-cuts new manifests from this run on and flags
+the run parquet's `icechunk_split_ratchet` for a later `rewrite_manifests`
+pass over the old ones. `tuple_width` is unchanged (3). The local backend resolves an unset `commit`
+to `leaf` unless `output.sweep: "stages"` chains the staged sweep — a default
+local run walks no ladder, so its sidecars would never be committed; the
+fleet's default is the ladder. The default `commit_order` is a function of
+the shard order and the width (`zagg.icechunk_refs.finest_dispatch_order`).
 
 `output.icechunk: false` opts a hive run out (default on; excluded from the
-D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves, raster
-hive products and the sweep's overviews are outside stage 1 (spec §11.6).
+D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves and raster
+hive products are outside stage 1 (spec §11.6); the sweep's overviews are in
+— every declared overview order has its repo.
 
 Reading it back:
 
@@ -1423,14 +1476,16 @@ import icechunk, zarr
 # "/", recorded in the repo's own root attrs as zagg_icechunk.url_prefix.
 root_prefix = "s3://bucket/product/"
 storage = icechunk.s3_storage(
-    bucket="bucket", prefix="product/icechunk/9", region="us-west-2", anonymous=True
+    bucket="bucket", prefix="product/icechunk", region="us-west-2", anonymous=True
 )
 repo = icechunk.Repository.open(
     storage,
     authorize_virtual_chunk_access={root_prefix: icechunk.s3_anonymous_credentials()},
 )
 group = zarr.open_group(repo.readonly_session("main").store, mode="r")
-count = group["19/count"]          # shape 12·4^19, chunks 4^6 — the whole order
+group.attrs["multiscales"]         # the manifest's zagg-multiscales/1 block: every level
+count = group["9/count"]           # the base: shape 12·4^19, chunks 4^6 — the whole order
+coarse = group["7/count"]          # an overview level: one chunk per order-7 node
 ```
 
 That is the **public** store — the motivating case, and the one an icechunk-js
@@ -1446,9 +1501,9 @@ either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `url_prefix` and the paths above, which is what makes the same two calls
 writable in icechunk-js.
 
-The manifest split (spec §11.5) is one manifest per order-`N` cell — at the
-production geometry `N = 7`, 4,096 chunks, 16 leaves — recorded in the repo
-root's `zagg_icechunk.split` block, so a reader never assumes it.
+The manifest split (spec §11.5) is one manifest per order-`split_order` cell
+— at the defaults an order-6 cell, 16,384 chunks, 64 leaves — recorded in
+each repo root's `zagg_icechunk.split` block, so a reader never assumes it.
 
 ## Raster hive stores (issue #247)
 

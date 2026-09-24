@@ -3111,6 +3111,11 @@ def _run_local(
         # init, in-process here as the sweep is — this process IS the worker.
         # Fail-open (D9): the repo is a derived index; a failed init is
         # recorded in the summary and every leaf's refs then fail-open too.
+        # The commit mode (phase 6): the local backend commits through the
+        # ladder only when the staged sweep runs (``output.sweep: "stages"``),
+        # so an unset ``commit`` resolves to the per-leaf commit here — the
+        # fleet's default is the ladder. Explicit settings are honored.
+        config = _local_icechunk_commit_mode(config)
         icechunk_init = _init_icechunk_local(config, grid, store_path, run_id, store_kwargs)
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
@@ -5582,6 +5587,27 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
     return event
 
 
+def _local_icechunk_commit_mode(config):
+    """The local backend's default ``output.icechunk.commit`` (issue #580 phase 6).
+
+    ``"ladder"`` when the run chains the staged sweep (``output.sweep:
+    "stages"`` — the tuple containing ``commit_order`` then commits), else
+    ``"leaf"`` (a default local run runs the families sweep, which walks no
+    ladder, so sidecars would never be committed). An explicit ``commit`` is
+    left alone; the knob is outside the D19 core, so this perturbs no identity.
+    """
+    from dataclasses import replace
+
+    from zagg.config import get_icechunk_options
+
+    if not get_icechunk(config) or get_icechunk_options(config)["commit"] is not None:
+        return config
+    flag = config.output.get("icechunk")
+    block = dict(flag) if isinstance(flag, dict) else {}
+    block["commit"] = "ladder" if config.output.get("sweep") == "stages" else "leaf"
+    return replace(config, output={**config.output, "icechunk": block})
+
+
 def _init_icechunk_local(config, grid, store_path, run_id, store_kwargs) -> dict | None:
     """The local backend's in-process Icechunk init (issue #580); its record.
 
@@ -5594,7 +5620,7 @@ def _init_icechunk_local(config, grid, store_path, run_id, store_kwargs) -> dict
     from zagg.icechunk_refs import init_repo
 
     try:
-        record = init_repo(store_path, grid, run_id=run_id, store_kwargs=store_kwargs)
+        record = init_repo(store_path, grid, config, run_id=run_id, store_kwargs=store_kwargs)
     except Exception as e:
         logger.warning(f"icechunk init failed (fail-open, issue #580): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
@@ -5618,7 +5644,7 @@ def _invoke_lambda_icechunk_init(
     """One synchronous ``mode="icechunk_init"`` invoke (issue #580); its record.
 
     The fleet twin of :func:`_init_icechunk_local`: the worker role creates
-    or reopens the order's repo and defines its array nodes BEFORE the
+    or reopens the store's repo and defines every level's array nodes BEFORE the
     fan-out, so every leaf commit finds them. ``RequestResponse`` because the
     fan-out must not start ahead of it; fail-open because the leaves never
     depend on it — a stale deployment (its process handler 400s the unknown
@@ -5667,7 +5693,11 @@ def _invoke_lambda_icechunk_init(
     except Exception as e:
         logger.warning(f"icechunk init invoke failed (fail-open, issue #580): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
-    record = {k: body[k] for k in ("path", "order", "snapshot", "created", "split") if k in body}
+    record = {
+        k: body[k]
+        for k in ("path", "snapshot", "created", "options", "levels", "ladder", "split_ratchet")
+        if k in body
+    }
     record["invoke_s"] = time.perf_counter() - t0
     logger.info(
         f"Icechunk repo {record.get('path')} "

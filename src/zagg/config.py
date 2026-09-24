@@ -1312,8 +1312,42 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     # explicit true on a non-hive store is a config mistake (the repo indexes
     # hive leaves by shard rank).
     icechunk = config.output.get("icechunk")
-    if icechunk is not None and not isinstance(icechunk, bool):
-        raise ValueError(f"output.icechunk must be a boolean (got {icechunk!r})")
+    if icechunk is not None and not isinstance(icechunk, (bool, dict)):
+        raise ValueError(
+            f"output.icechunk must be a boolean or an options block (got {icechunk!r})"
+        )
+    if isinstance(icechunk, dict):
+        # The ladder's knobs (issue #580 phase 6, spec §11.4/§11.5): the
+        # shard-order-relative checks run at init (icechunk_refs.resolve_options,
+        # where the shard order is known); the shape and the one invariant
+        # that needs no geometry — a commit must write whole manifests — here.
+        unknown = set(icechunk) - {"commit", "commit_order", "split_order"}
+        if unknown:
+            raise ValueError(
+                f"output.icechunk has unknown key(s) {sorted(unknown)} (accepts commit, "
+                f"commit_order, split_order)"
+            )
+        commit = icechunk.get("commit")
+        if commit is not None and commit not in ("ladder", "leaf"):
+            raise ValueError(f"output.icechunk.commit must be 'ladder' or 'leaf' (got {commit!r})")
+        orders = {k: icechunk.get(k) for k in ("commit_order", "split_order")}
+        for key, value in orders.items():
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(
+                    f"output.icechunk.{key} must be a non-negative integer (got {value!r})"
+                )
+        if (
+            orders["commit_order"] is not None
+            and orders["split_order"] is not None
+            and orders["split_order"] < orders["commit_order"]
+        ):
+            raise ValueError(
+                f"output.icechunk.split_order {orders['split_order']} is finer than commit_order "
+                f"{orders['commit_order']}: a manifest (one per split_order cell) would be written "
+                f"by more than one commit (spec §11.5)"
+            )
     if icechunk and get_store_layout(config) != "hive":
         raise ValueError(
             "output.icechunk requires output.store_layout: hive (the companion repo "
@@ -3381,7 +3415,22 @@ def get_icechunk(config: PipelineConfig) -> bool:
             and get_windowing(config) is None
             and (config.data_source or {}).get("reader") != "raster"
         )
+    if isinstance(flag, dict):
+        return True  # an options block (phase 6) is an opt-in with knobs
     return bool(flag)
+
+
+def get_icechunk_options(config: PipelineConfig) -> dict:
+    """The raw ``output.icechunk`` ladder knobs, absent keys ``None`` (issue #580 phase 6).
+
+    ``{"commit": "ladder" | "leaf" | None, "commit_order": int | None,
+    "split_order": int | None}`` — a boolean or absent knob yields all-``None``;
+    :func:`zagg.icechunk_refs.resolve_options` applies the shard-order
+    defaults and the §11.5 invariants.
+    """
+    flag = config.output.get("icechunk")
+    block = flag if isinstance(flag, dict) else {}
+    return {k: block.get(k) for k in ("commit", "commit_order", "split_order")}
 
 
 def get_pyramid(config: PipelineConfig) -> dict | None:
