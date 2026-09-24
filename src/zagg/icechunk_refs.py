@@ -998,8 +998,29 @@ def leaf_units(
     return units
 
 
+def vet_leaf_repo(store_root: str, grid, *, store_kwargs: dict):
+    """The store's repo, opened and vetted for ``grid``'s leaves (§11.4); raises otherwise.
+
+    What a per-leaf commit checks BEFORE its plan (:func:`leaf_units`, ~20
+    object-store requests): a missing repo, or one built for another
+    geometry, refuses here, so refs never land at indices that mean something
+    else and a refusal never pays for the plan. The worker seam calls it
+    ahead of :func:`leaf_units` and hands the handle to :func:`record_leaf`.
+    """
+    repo, _block = open_vetted(
+        store_root,
+        store_kwargs=store_kwargs,
+        want={
+            "shard_order": int(grid.parent_order),
+            "chunk_order": int(grid.chunk_order),
+            "cell_order": int(grid.child_order),
+        },
+    )
+    return repo
+
+
 def record_leaf(
-    store_root: str, grid, shard_key, *, store_kwargs: dict, window=None, units=None
+    store_root: str, grid, shard_key, *, store_kwargs: dict, window=None, units=None, repo=None
 ) -> dict:
     """The per-leaf commit (``commit: "leaf"``): refs + ``leaf {decimal}`` (§11.4).
 
@@ -1011,23 +1032,17 @@ def record_leaf(
     refs carry: ``"etag"`` or ``"last_modified"``, §11.3), or ``{"skipped":
     reason}`` for a unit stage 1 does not index (a windowed leaf, §11.6; a
     leaf with no chunk objects). Raises on failure — the caller is fail-open.
-    Opens and vets the repo BEFORE the plan: the plan costs ~20 object-store
-    requests, and refs must never land in a repo built for another geometry.
+    ``repo`` is a handle :func:`vet_leaf_repo` already returned (the worker
+    seam vets before it plans); ``None`` opens and vets here, still BEFORE
+    the plan.
     """
     from zagg.grids.morton import morton_decimal
 
     if window is not None:
         return {"skipped": "windowed"}
     checksum = "etag" if container_prefix(store_root).startswith("s3://") else "last_modified"
-    repo, _block = open_vetted(
-        store_root,
-        store_kwargs=store_kwargs,
-        want={
-            "shard_order": int(grid.parent_order),
-            "chunk_order": int(grid.chunk_order),
-            "cell_order": int(grid.child_order),
-        },
-    )
+    if repo is None:
+        repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs)
     if units is None:
         plan = leaf_ref_plan(grid, shard_key, store_root, store_kwargs=store_kwargs)
         units = [{"level": int(grid.child_order), "entries": plan}]
@@ -1070,4 +1085,5 @@ __all__ = [
     "resolve_options",
     "split_block",
     "split_exponent",
+    "vet_leaf_repo",
 ]

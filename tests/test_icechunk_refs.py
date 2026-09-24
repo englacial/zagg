@@ -681,7 +681,7 @@ class TestLeafRefs:
         )
         with pytest.raises(ValueError, match="is not initialized"):
             icechunk_refs.record_leaf(root, grid, shard, store_kwargs={})
-        monkeypatch.undo()
+        # The spy stays armed across both halves (init plans nothing).
         icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
         other = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
         with pytest.raises(ValueError, match="was built for"):
@@ -1039,6 +1039,28 @@ class TestWorkerWiring:
 
         row = flatten_record(build_record(shard_key=shard, metadata=meta, granule_ids=["g"]))
         assert row["icechunk_error"] and row["icechunk_snapshot"] is None
+
+    @pytest.mark.parametrize("repo", ["missing", "mismatched"])
+    def test_leaf_commit_vets_the_repo_before_the_plan(self, monkeypatch, cfg, tmp_path, repo):
+        # The worker seam, not record_leaf alone: under ``commit: "leaf"`` a
+        # missing or mismatched repo refuses before ``leaf_units`` pays for
+        # the plan's HEADs and index GETs (review finding).
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        root = str(tmp_path / "store")
+        if repo == "mismatched":
+            other = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+            icechunk_refs.init_repo(root, other, cfg, run_id=RUN_ID, store_kwargs={})
+        calls = []
+        real = icechunk_refs.leaf_units
+        monkeypatch.setattr(
+            icechunk_refs, "leaf_units", lambda *a, **kw: calls.append(1) or real(*a, **kw)
+        )
+        meta = _write_leaf(monkeypatch, grid, root, _shards(grid, 1)[0], refs=True)
+        assert meta.get("error") is None
+        match = "is not initialized" if repo == "missing" else "was built for"
+        assert match in meta["icechunk"]["error"]
+        assert calls == []
 
     def test_refs_are_recorded_last_after_the_stamp_and_the_column(
         self, monkeypatch, cfg, tmp_path

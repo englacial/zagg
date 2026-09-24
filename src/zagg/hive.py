@@ -1995,12 +1995,26 @@ def process_and_write_hive(
         if get_icechunk(config):
             _t0 = time.time()
             try:
-                from zagg.icechunk_refs import leaf_units, record_leaf, resolve_options
+                from zagg.icechunk_refs import (
+                    leaf_units,
+                    record_leaf,
+                    resolve_options,
+                    vet_leaf_repo,
+                )
 
                 label = window["label"] if window else None
                 if label is not None:
                     metadata["icechunk"] = {"skipped": "windowed"}
                 else:
+                    commit_leaf = resolve_options(config, grid.parent_order)["commit"] == "leaf"
+                    # A per-leaf commit vets the repo BEFORE the plan: a
+                    # missing or mismatched repo refuses for one read, not
+                    # the plan's ~20 requests (review finding).
+                    repo = (
+                        vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs)
+                        if commit_leaf
+                        else None
+                    )
                     # The leaf's units (§11.4): its base arrays plus the
                     # column's declared level, when this unit wrote one.
                     units = leaf_units(
@@ -2011,9 +2025,14 @@ def process_and_write_hive(
                         column=metadata.get("leaf_column"),
                         store_kwargs=store_kwargs,
                     )
-                    if resolve_options(config, grid.parent_order)["commit"] == "leaf":
+                    if commit_leaf:
                         metadata["icechunk"] = record_leaf(
-                            store_root, grid, shard_key, store_kwargs=store_kwargs, units=units
+                            store_root,
+                            grid,
+                            shard_key,
+                            store_kwargs=store_kwargs,
+                            units=units,
+                            repo=repo,
                         )
                     elif not any(e["refs"] for u in units for e in u["entries"]):
                         metadata["icechunk"] = {"skipped": "empty"}
