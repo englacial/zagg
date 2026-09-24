@@ -921,6 +921,115 @@ class TestKnob:
         assert semantic_hash(cfg) == before
 
 
+class TestS3Kwargs:
+    """The S3 halves of ``_storage``/``_container`` — the ONLY path the fleet
+    takes, and the one every other test in this file sidesteps by running on
+    ``local_filesystem_storage``.
+
+    Pure kwargs assembly: the four icechunk constructors are captured, never
+    called for real, so this pins the claim that the module mirrors
+    :mod:`zagg.store`'s credential and ACL rules (issue #495).
+    """
+
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        seen: dict = {}
+
+        def recorder(name):
+            def fake(**kwargs):
+                seen[name] = kwargs
+                return f"<{name}>"
+
+            return fake
+
+        def static(**kwargs):
+            seen["static"] = kwargs
+            return "<static>"
+
+        def refreshable(fn):
+            seen["refreshable"] = fn
+            return "<refreshable>"
+
+        real_store = icechunk.s3_store
+
+        def store(**kwargs):
+            # VirtualChunkContainer takes a real ObjectStoreConfig, so this one
+            # records AND builds; the storage constructor is fully faked.
+            seen["s3_store"] = kwargs
+            return real_store(**kwargs)
+
+        monkeypatch.setattr(icechunk, "s3_storage", recorder("s3_storage"))
+        monkeypatch.setattr(icechunk, "s3_store", store)
+        monkeypatch.setattr(icechunk, "s3_static_credentials", static)
+        monkeypatch.setattr(icechunk, "s3_refreshable_credentials", refreshable)
+        return seen
+
+    def test_ambient_storage_and_container(self, captured):
+        assert icechunk_refs._storage("s3://my-bucket/runs/o4", {"region": "us-west-2"}) == (
+            "<s3_storage>"
+        )
+        kwargs = captured["s3_storage"]
+        assert kwargs["bucket"] == "my-bucket" and kwargs["prefix"] == "runs/o4"
+        assert kwargs["region"] == "us-west-2" and kwargs["endpoint_url"] is None
+        assert kwargs["allow_http"] is False and kwargs["force_path_style"] is False
+        # Ambient: the refreshable botocore chain, not frozen keys — and an
+        # in-account bucket takes no ACL header.
+        assert callable(kwargs["get_credentials"])
+        assert "access_key_id" not in kwargs and "write_headers" not in kwargs
+
+        container, creds = icechunk_refs._container("s3://my-bucket/runs", {"region": "us-west-2"})
+        store = captured["s3_store"]
+        assert store["region"] == "us-west-2" and store["endpoint_url"] is None
+        assert store["allow_http"] is False and store["force_path_style"] is False
+        assert creds == "<refreshable>"
+        assert captured["refreshable"] is icechunk_refs._boto3_credentials
+        assert isinstance(container, icechunk.VirtualChunkContainer)
+
+    def test_injected_credentials_are_static_and_take_the_acl(self, captured):
+        creds = {"accessKeyId": "AK", "secretAccessKey": "SK", "sessionToken": "TOK"}
+        icechunk_refs._storage("s3://theirs/p", {"region": "us-west-2", "credentials": creds})
+        kwargs = captured["s3_storage"]
+        assert kwargs["access_key_id"] == "AK" and kwargs["secret_access_key"] == "SK"
+        assert kwargs["session_token"] == "TOK" and "get_credentials" not in kwargs
+        # Issue #495: injected credentials mean a target this account does not
+        # own, so every object-creating request carries the canned ACL.
+        assert kwargs["write_headers"] == {"x-amz-acl": "bucket-owner-full-control"}
+
+        _container, cred = icechunk_refs._container("s3://theirs", {"credentials": creds})
+        assert cred == "<static>"
+        assert captured["static"] == {
+            "access_key_id": "AK",
+            "secret_access_key": "SK",
+            "session_token": "TOK",
+        }
+
+    def test_published_bucket_takes_the_acl_on_ambient_credentials(self, captured):
+        from zagg.store import _PUBLISHED_BUCKETS
+
+        bucket = sorted(_PUBLISHED_BUCKETS)[0]
+        icechunk_refs._storage(f"s3://{bucket}/zagg", {"region": "us-west-2"})
+        kwargs = captured["s3_storage"]
+        assert callable(kwargs["get_credentials"])
+        assert kwargs["write_headers"] == {"x-amz-acl": "bucket-owner-full-control"}
+
+    def test_custom_endpoint_is_path_style_http_and_never_external(self, captured):
+        kw = {
+            "region": "us-east-1",
+            "endpoint_url": "http://localhost:9000",
+            "credentials": {"accessKeyId": "AK", "secretAccessKey": "SK"},
+        }
+        icechunk_refs._storage("s3://minio/p", kw)
+        kwargs = captured["s3_storage"]
+        assert kwargs["endpoint_url"] == "http://localhost:9000"
+        assert kwargs["allow_http"] is True and kwargs["force_path_style"] is True
+        # A custom endpoint excludes both external routes (zagg.store's rule),
+        # so no ACL header even with injected credentials.
+        assert "write_headers" not in kwargs
+        icechunk_refs._container("s3://minio", kw)
+        store = captured["s3_store"]
+        assert store["allow_http"] is True and store["force_path_style"] is True
+
+
 def test_container_prefix_forms():
     assert icechunk_refs.container_prefix("s3://b/p/") == "s3://b/p/"
     assert icechunk_refs.container_prefix("s3://b/p") == "s3://b/p/"
