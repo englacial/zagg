@@ -46,7 +46,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, cast
 
 import numpy as np
 
@@ -404,8 +404,8 @@ def ladder_grids(manifest: dict, shard_order: int) -> dict:
         levels = ladder_entries(pyramid, shard_order)
     except ValueError:
         return {}
-    decl = pyramid.get("overview") if isinstance(pyramid.get("overview"), dict) else {}
-    fields = composable_fields(decl.get("fields") or {})
+    decl = pyramid.get("overview")
+    fields = composable_fields((decl.get("fields") if isinstance(decl, dict) else None) or {})
     if not fields:
         return {}
     config = _overview_config(fields)
@@ -500,7 +500,7 @@ def _update_block(repo, updates: dict, message: str, *, local: bool, path: str) 
 
     session = repo.writable_session(BRANCH)
     root = zarr.open_group(session.store, mode="r+")
-    block = dict(root.attrs[ICECHUNK_ATTR])
+    block = dict(cast("Mapping[str, Any]", root.attrs[ICECHUNK_ATTR]))
     block.update(updates)
     root.attrs[ICECHUNK_ATTR] = block
     snapshot, _rebases = _commit(session, message, local=local, path=path)

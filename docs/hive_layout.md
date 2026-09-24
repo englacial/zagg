@@ -1351,7 +1351,7 @@ cap. The honest options today are:
 
 Every hive leaf commit also records the leaf's inner chunks as Icechunk
 **virtual chunk references** in a companion repository per pyramid order at
-the store root — [specification §11](specification.md#11-icechunk-companion-repos)
+the store root — [specification §11](specification.md#11-icechunk-companion-repo)
 is the contract ([issue #580](https://github.com/englacial/zagg/issues/580),
 stage 1: refs-only, additive; the leaves stay normative):
 
@@ -1408,7 +1408,7 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
   column fold — the worker sizes the objects it wrote (one HEAD + one ranged
   GET of the shard-index suffix per sharded array, one LIST per regular
   array) and writes the plan as a JSON sibling beside the leaf's stats
-  sidecar (`icechunk_refs.json`, ~40 KB at production geometry). No
+  sidecar (`icechunk_refs.json`, ≈40 KB at production geometry). No
   Icechunk session on the leaf path. The outcome rides the leaf's stats sidecar as `icechunk` —
   `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "windowed" |
   "empty"}`, or `{error}` — and the run parquet as `icechunk_*` columns. Its
@@ -1432,11 +1432,11 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M
 commits, and — the real limit — an Icechunk snapshot lists every manifest, so
-one manifest per order-6 cell per array is ~442k manifests, a 44 MB snapshot
+one manifest per order-6 cell per array is ≈442k manifests, a 44 MB snapshot
 read on every open, rebase and commit (≈2.2 TB of snapshot writes per run).
-Balancing snapshot bytes (~100 B per manifest entry) against per-manifest
-bytes (~2.5 KB on disk per leaf-array) gives leaves-per-manifest ≈ 0.6·√N —
-~30 at California scale, ~1,000 at the globe. Both knobs live under
+Balancing snapshot bytes (≈100 B per manifest entry) against per-manifest
+bytes (≈2.5 KB on disk per leaf-array) gives leaves-per-manifest ≈ 0.6·√N —
+≈30 at California scale, ≈1,000 at the globe. Both knobs live under
 `output.icechunk`:
 
 ```yaml
@@ -1449,8 +1449,8 @@ output:
 
 | setting | manifest = one cell at | chunks / manifest (shard-order group) | commits | snapshot |
 |---|---|---|---|---|
-| default (`6` / `6`) | order 6, 64 leaves | 4^7 = 16,384 | one per order-6 node | ~390 manifests at California scale |
-| global (`split 4` / `commit 3`) | order 4, 1,024 leaves | 4^9 | 768 (the order-3 nodes) | 27k manifests, ~2.7 MB |
+| default (`6` / `6`) | order 6, 64 leaves | `4^7` = 16,384 | one per order-6 node | ≈390 manifests at California scale |
+| global (`split 4` / `commit 3`) | order 4, 1,024 leaves | `4^9` | 768 (the order-3 nodes) | 27k manifests, ≈2.7 MB |
 
 `split_order` is a one-way ratchet toward coarser (spec §11.5): a run whose
 config is finer than the store's recorded value adopts the store's with a

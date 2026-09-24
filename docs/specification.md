@@ -120,7 +120,7 @@ Contents:
 8. [`zagg-toc/1` — the temporal declaration](#8-zagg-toc1)
 9. [`zagg-located/1` — the located declaration](#9-zagg-located1)
 10. [`zagg-coverage-toc/1` — the root coverage temporal section](#10-zagg-coverage-toc1)
-11. [Icechunk companion repo — the virtual-ref index](#11-icechunk-companion-repos)
+11. [Icechunk companion repo — the virtual-ref index](#11-icechunk-companion-repo)
 
 ---
 
@@ -3491,11 +3491,11 @@ scale. At the full-globe worst case (3,145,728 order-9 leaves, 49,152
 order-6 cells) it is 3.1M commits — and the real limit is not the commit
 count but the **snapshot**: an Icechunk snapshot lists every manifest, so its
 size is set by the manifest count. One manifest per order-6 cell per array is
-~442k manifests ≈ **44 MB read on every open, every rebase and every
+≈442k manifests ≈ **44 MB read on every open, every rebase and every
 commit** (≈2.2 TB of snapshot traffic over one run). Balancing snapshot bytes
-(~100 B per manifest entry) against per-manifest bytes (~2.5 KB on disk per
-leaf-array) gives leaves-per-manifest ≈ 0.6·√N: ~30 at California scale
-(order 6–7 cells), ~1,000 at the full globe (order-4 cells → 27k manifests, a
+(≈100 B per manifest entry) against per-manifest bytes (≈2.5 KB on disk per
+leaf-array) gives leaves-per-manifest ≈ 0.6·√N: ≈30 at California scale
+(order 6–7 cells), ≈1,000 at the full globe (order-4 cells → 27k manifests, a
 2.7 MB snapshot and 2.6 MB of manifests — the shape of the live ISMIP repo,
 27,423 manifests / 2.2 MB snapshot). So both the manifest split and the
 commit granularity are configurable and derived, and a manifest is written
@@ -3512,7 +3512,7 @@ columns do:
    base `icechunk_refs.json` (`{stem}.icechunk_refs.json` under `morton-hive/3`).
    The carrier is JSON declaring `zagg-icechunk-refs/1`, the writer's
    geometry (`shard_order`, `chunk_order`, `cell_order` — never the
-   container prefix, which is vetted at the repo) and the entries (~40 KB per
+   container prefix, which is vetted at the repo) and the entries (≈40 KB per
    leaf at production geometry). It is a **writer-internal carrier**, not part
    of the reader contract — the repo is. No Icechunk session is opened on
    the leaf path.
@@ -3643,11 +3643,11 @@ a layout knob outside the D19 semantic core: it changes no leaf byte.
 scale), so the numbers below barely move.
 
 At the defaults (`split_order = commit_order = 6` at production) a
-shard-order manifest is 4^7 = 16,384 chunks — one order-6 cell, 64 leaves —
-which is ~43 order-6 cells × 9 arrays ≈ 390 manifests at California scale.
-The **global-scale** setting is `split_order: 4, commit_order: 3`: 4^9 chunks
+shard-order manifest is `4^7` = 16,384 chunks — one order-6 cell, 64 leaves —
+which is ≈43 order-6 cells × 9 arrays ≈ 390 manifests at California scale.
+The **global-scale** setting is `split_order: 4, commit_order: 3`: `4^9` chunks
 per manifest, one order-4 cell (1,024 leaves), 3,072 manifests per array
-(27k across the arrays, a ~2.7 MB snapshot), committed by the 768 order-3
+(27k across the arrays, a ≈2.7 MB snapshot), committed by the 768 order-3
 nodes (768 commits) — the numbers §11.4's rationale derives.
 
 *(Informative.)* Icechunk deduplicates a manifest's `location` strings only
