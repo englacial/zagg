@@ -805,7 +805,9 @@ class Run:
         )
 
         s3_creds = self._source_credentials or runner._resolve_source_credentials(self.config)
-        config_dict = asdict(self.config)
+        # The facade chains no staged sweep, so the ref ladder never runs
+        # here: an unset icechunk ``commit`` ships pinned per-leaf (#580).
+        config_dict = asdict(runner._pin_icechunk_commit(self.config, self.grid, stages=False))
         output_creds_event = runner._build_output_creds_event(
             self._output_credentials, self._output_endpoint_url, self.region
         )

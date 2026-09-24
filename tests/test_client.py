@@ -338,6 +338,21 @@ class TestDispatch:
             "granules": [_rec(3)],
         }
 
+    def test_icechunk_commit_ships_pinned_per_leaf(self, catalog):
+        # The facade chains no staged sweep, so the ref ladder never runs:
+        # even under ``sweep: "stages"`` an unset commit must reach the init
+        # and every worker as the per-leaf commit, never the ladder whose
+        # sidecars nothing would gather (issue #580 review finding).
+        cfg = default_config("atl06")
+        cfg.output["sweep"] = "stages"
+        stub = StubLambdaClient()
+        _run(catalog, client=stub, config=cfg).dispatch(shard_keys=[_WORDS[1]]).results()
+        events = [e for _, _, e in stub.events if e.get("mode") in (None, "icechunk_init")]
+        assert {e.get("mode") for e in events} == {None, "icechunk_init"}
+        for event in events:
+            assert event["config"]["output"]["icechunk"] == {"commit": "leaf"}
+        assert "icechunk" not in cfg.output  # the caller's config is untouched
+
     def test_pairless_report_stays_out_of_the_cell_submap(self, catalog):
         # The sibling join's exclusion report (issue #425) holds one entry per
         # unpaired granule — unbounded in the catalog size — so it must not
