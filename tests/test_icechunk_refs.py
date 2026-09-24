@@ -1039,6 +1039,22 @@ class TestWorkerWiring:
         row = flatten_record(build_record(shard_key=shard, metadata=meta, granule_ids=["g"]))
         assert row["icechunk_sidecar"] == ice["sidecar"] and row["icechunk_bytes"] == ice["bytes"]
         assert row["icechunk_snapshot"] is None
+        # The levels reach the parquet too: base + column, not the base alone.
+        assert ice["levels"] == [6, 5] and row["icechunk_levels"] == "6,5"
+
+    def test_levels_flatten_to_a_parquet_scalar(self):
+        # Comma-joined, and null when the record carries no levels (nothing
+        # indexed, or the knob off) rather than an empty string.
+        from zagg.telemetry import build_record, flatten_record
+
+        def row(ice):
+            meta = {"total_obs": 1, **({} if ice is None else {"icechunk": ice})}
+            return flatten_record(build_record(shard_key=1, metadata=meta, granule_ids=["g"]))
+
+        assert row({"levels": [6, 5]})["icechunk_levels"] == "6,5"
+        assert row({"levels": []})["icechunk_levels"] is None
+        assert row({"refs": 0})["icechunk_levels"] is None
+        assert row(None)["icechunk_levels"] is None
 
     def test_knob_off_records_nothing(self, monkeypatch, cfg, tmp_path):
         grid = _grid(cfg)
