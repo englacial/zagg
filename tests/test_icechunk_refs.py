@@ -826,6 +826,18 @@ class TestRunRecord:
         assert event["icechunk_init"] == {"path": "s3://b/p/icechunk/4", "snapshot": "SNAP"}
 
 
+def test_flatten_record_coerces_a_non_dict_block():
+    # ``metadata`` is not always locally built — the dispatcher's stale-worker
+    # path passes the JSON body a remote worker returned — so a version-skewed
+    # body carrying e.g. ``"icechunk": "ok"`` must flatten to nulls rather than
+    # raising AttributeError and taking the whole run parquet with it.
+    from zagg.telemetry import build_record, flatten_record
+
+    row = flatten_record(build_record(shard_key=1, metadata={"icechunk": "ok"}, granule_ids=["g"]))
+    assert row["icechunk_snapshot"] is None and row["icechunk_refs"] is None
+    assert row["icechunk_error"] is None and row["icechunk_skipped"] is None
+
+
 class TestLocalRunEndToEnd:
     """Phase 5: a local-backend run — init, leaves, refs, run record — end to end."""
 

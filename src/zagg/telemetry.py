@@ -590,7 +590,13 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     # Icechunk refs commit (issue #580): the scalars a fleet run's contention
     # question reads straight off the parquet — ``rebases`` and ``commit_s``
     # per leaf — plus the snapshot for joining a leaf to the repo's history.
-    ice = record.get("icechunk") or {}
+    # Coerced, never dereferenced blind: ``metadata`` is not always locally
+    # built — the dispatcher's stale-worker path (``runner._lambda_result_rows``)
+    # passes the JSON body a remote worker returned — so a version-skewed body
+    # carrying a non-dict here must not take down the WHOLE run-parquet write
+    # on a path that is otherwise fail-open (review finding).
+    ice = record.get("icechunk")
+    ice = ice if isinstance(ice, dict) else {}
     row["icechunk_snapshot"] = ice.get("snapshot")
     row["icechunk_refs"] = ice.get("refs")
     row["icechunk_rebases"] = ice.get("rebases")
