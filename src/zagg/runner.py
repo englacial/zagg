@@ -5624,6 +5624,12 @@ def _invoke_lambda_icechunk_init(
     depend on it — a stale deployment (its process handler 400s the unknown
     mode), a throttled invoke or a refused init all return ``{"error": ...}``
     with a warning, and the run proceeds refs-less.
+
+    The record carries ``invoke_s``, the blocking round-trip's wall time --
+    often the run's first real invoke, so it may include a cold start. It
+    rides the record rather than a sibling summary key because the summary
+    already brackets this call inside ``setup_s``, which keeps its
+    pre-fan-out meaning.
     """
     event = {
         "mode": "icechunk_init",
@@ -5634,6 +5640,7 @@ def _invoke_lambda_icechunk_init(
     }
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
+    t0 = time.perf_counter()
     try:
         response = lambda_client.invoke(
             FunctionName=function_name,
@@ -5653,6 +5660,7 @@ def _invoke_lambda_icechunk_init(
         logger.warning(f"icechunk init invoke failed (fail-open, issue #580): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
     record = {k: body[k] for k in ("path", "order", "snapshot", "created", "split") if k in body}
+    record["invoke_s"] = time.perf_counter() - t0
     logger.info(
         f"Icechunk repo {record.get('path')} "
         f"{'created' if record.get('created') else 'reopened'} at snapshot {record.get('snapshot')}"
