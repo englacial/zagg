@@ -3315,7 +3315,7 @@ self-describing:
   "order": 9,
   "shard_order": 9, "chunk_order": 13, "cell_order": 19,
   "url_prefix": "s3://bucket/product/",
-  "split": {"chunks": 4096, "cell_order": 7}
+  "split": {"chunks": 4096, "order": 7}
 }
 ```
 
@@ -3418,7 +3418,9 @@ engages only from 1,000 chunks per manifest (`min_num_chunks`), and the ×4
 margin keeps a run above that gate after its absent chunks (which emit no
 ref) are subtracted. That is `m = 6`, 4,096 chunks — at the production
 geometry one manifest per **order-7 cell, 16 leaves**; the choice is recorded
-in the `zagg_icechunk.split` block (§11.1), not hardcoded by readers.
+as `split.chunks` (`4^m`) and `split.order` (`chunk_order − m`, the order of
+the cell one manifest covers) in the `zagg_icechunk` block (§11.1), not
+hardcoded by readers.
 
 ### 11.6 What §11 does not cover (informative)
 
