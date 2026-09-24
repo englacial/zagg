@@ -3301,10 +3301,11 @@ store, and every hive commit maps onto an Icechunk snapshot.
 references: the store's **shard order** for the source leaves (the one repo
 stage 1 writes), an overview order for the sweep-built §4 overviews at that
 order (reserved; a follow-up writes them). `icechunk/` is a **reserved
-store-root child name**, the fourth root-only exception to the node
-invariant (D5) beside `morton_hive.json`, the coverage sidecars and the §4.10
-`multiscales/` companion: it is excluded from product discovery at a
-multi-product root, and a product MUST NOT be named `icechunk`.
+store-root child name** on the same footing as the §4.10 `multiscales/`
+companion: it is excluded from the **D19 product-name grammar** (like the
+base-component exclusion), so a multi-product root walker can never classify
+it as a product, and `zagg.hive.validate_product_name` refuses the name
+outright — a product MUST NOT be named `icechunk`.
 
 The repo's root group carries a `zagg_icechunk` attrs block that makes it
 self-describing:

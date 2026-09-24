@@ -122,6 +122,13 @@ PRODUCT_NAME_MAX = 192
 #: cycle for a string literal.
 MULTISCALES_GROUP_NAME = "multiscales"
 
+#: The store-root child reserved for the §11 Icechunk companion repos
+#: (issue #580): one repository per pyramid order at
+#: ``{store_root}/icechunk/{order}/``. Reserved on the same footing as
+#: :data:`MULTISCALES_GROUP_NAME` — the D19 product-name grammar excludes it
+#: so a multi-product root walker can never classify it as a product.
+ICECHUNK_DIR_NAME = "icechunk"
+
 
 def validate_product_name(name: str) -> str:
     """Validate a D19 product name; returns it.
@@ -161,6 +168,16 @@ def validate_product_name(name: str) -> str:
         raise ValueError(
             f"product name {MULTISCALES_GROUP_NAME!r} is reserved for the multiscales "
             f"companion group at the store root (spec §4.10, issue #394)"
+        )
+    if name == ICECHUNK_DIR_NAME:
+        # The issue #580 companion repos own this store-root child (spec
+        # §11.1): a product by the same name would collide with them at every
+        # multi-product root. No legacy warning pairs with this one — the
+        # reservation lands with the section, so no store predating it can
+        # hold a product by this name.
+        raise ValueError(
+            f"product name {ICECHUNK_DIR_NAME!r} is reserved for the Icechunk "
+            f"companion repos at the store root (spec §11.1, issue #580)"
         )
     return name
 
