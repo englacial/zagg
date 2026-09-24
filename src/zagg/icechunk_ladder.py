@@ -58,7 +58,10 @@ NODE_REFS_NAME = "icechunk_refs.json"
 #: The leaf carrier's geometry block — vetted against the repo's own, keyed
 #: off this fixed tuple so a carrier that declares none is refused (§11.4).
 GEOMETRY_KEYS = ("shard_order", "chunk_order", "cell_order")
-#: The counters :func:`stage_node_refs` adds to a stage row.
+#: Every counter the hook adds to a stage row — pre-seeded there whether or
+#: not any node did work, so the row's key set does not depend on the pass.
+#: ``icechunk_commit_s`` is the commit's own wall time, ``icechunk_s`` the
+#: hook's (the gather included).
 STAGE_COUNTS = (
     "icechunk_refs",
     "icechunk_commits",
@@ -68,6 +71,7 @@ STAGE_COUNTS = (
     "icechunk_failed",
     "icechunk_skipped_levels",
     "icechunk_clean",
+    "icechunk_s",
 )
 
 
@@ -530,7 +534,7 @@ def stage_hook(
         counts["icechunk_failed"] += 1
         return {"node": node, "error": f"{type(e).__name__}: {e}"}
     finally:
-        counts["icechunk_s"] = counts.get("icechunk_s", 0.0) + (time.perf_counter() - t0)
+        counts["icechunk_s"] += time.perf_counter() - t0
 
 
 def node_row(record: dict) -> dict:

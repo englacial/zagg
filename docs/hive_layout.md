@@ -1426,7 +1426,10 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
   exactly one commit.
   Each stage row records `icechunk_commits`, `icechunk_rebases`,
   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
-  `icechunk_failed`; the first fleet run's contention question reads
+  `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean` and
+  `icechunk_s` (the hook's own wall time, the gather included), plus an
+  `icechunk_nodes` list naming each node that did work and the snapshot it
+  committed; the first fleet run's contention question reads
   `icechunk_rebases` off the stage records.
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:

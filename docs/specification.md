@@ -3538,7 +3538,11 @@ columns do:
    Commits rebase on conflict exactly as before (`ConflictDetector`; nodes
    touch disjoint chunk ranges), and each stage row records
    `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
-   `icechunk_refs`, `icechunk_missing` and `icechunk_failed`.
+   `icechunk_refs`, `icechunk_missing`, `icechunk_failed`,
+   `icechunk_skipped_levels`, `icechunk_clean` and `icechunk_s` — every one
+   pre-seeded, so a row's key set does not depend on whether a node did work
+   — plus `icechunk_nodes`, one entry per node that did, carrying the
+   snapshot it committed (the leaf→snapshot join).
 
    The ladder runs over the **dirty set** — the nodes with a dirty leaf
    beneath them — not over every candidate node: a node whose whole subtree
