@@ -222,6 +222,17 @@ class TestInit:
         _group, repo = _open(root, 4)
         assert [s.message for s in repo.ancestry(branch="main")][0] == f"init {RUN_ID}"
 
+    def test_rerun_with_another_geometry_raises(self, cfg, tmp_path):
+        # A store whose leaves were cleared but whose root survived reopens the
+        # stale repo under a new-geometry manifest; the idempotent branch is a
+        # match check, so the second init refuses instead of silently reusing
+        # an array model this run's leaves do not fit.
+        root = str(tmp_path / "store")
+        icechunk_refs.init_repo(root, _grid(cfg), run_id=RUN_ID, store_kwargs={})
+        other = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+        with pytest.raises(ValueError, match="was built for"):
+            icechunk_refs.init_repo(root, other, run_id="run-2", store_kwargs={})
+
     def test_read_block(self, cfg, tmp_path):
         grid = _grid(cfg)
         root = str(tmp_path / "store")
@@ -324,6 +335,29 @@ class TestLeafRefs:
             "skipped": "windowed"
         }
         assert icechunk_refs.record_leaf(root, grid, shard, store_kwargs={}) == {"skipped": "empty"}
+
+    def test_record_leaf_requires_an_initialized_matching_repo(self, monkeypatch, cfg, tmp_path):
+        # The repo is vetted before the plan's ~20 object-store requests: an
+        # uninitialized repo and one built for another geometry both raise, so
+        # refs never land at indices that mean something else (§11.3).
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        shard = _shards(grid, 1)[0]
+        _write_leaf(monkeypatch, grid, root, shard)
+        calls = []
+        monkeypatch.setattr(
+            icechunk_refs,
+            "leaf_ref_plan",
+            lambda *a, **kw: calls.append(1) or [],
+        )
+        with pytest.raises(ValueError, match="is not initialized"):
+            icechunk_refs.record_leaf(root, grid, shard, store_kwargs={})
+        monkeypatch.undo()
+        icechunk_refs.init_repo(root, grid, run_id=RUN_ID, store_kwargs={})
+        other = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+        with pytest.raises(ValueError, match="was built for"):
+            icechunk_refs.record_leaf(root, other, shard, store_kwargs={})
+        assert calls == []  # neither refusal paid for a plan
 
     def test_unsharded_leaf_refs_one_object_per_chunk(self, monkeypatch, cfg, tmp_path):
         grid = _grid(cfg, sharded=False)
