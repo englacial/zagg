@@ -46,7 +46,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Iterable, Mapping, cast
 
 import numpy as np
 
@@ -809,13 +809,16 @@ def open_vetted(store_root: str, *, store_kwargs: dict, want: dict | None = None
 
 
 def commit_units(
-    store_root: str, units: list, message: str, *, store_kwargs: dict, repo=None
+    store_root: str, units: Iterable[dict], message: str, *, store_kwargs: dict, repo=None
 ) -> dict:
     """Write ref-plan units for any set of orders into ONE session and commit once.
 
-    ``units`` is ``[{"order", "entries"}]``: each entry lands under its order's
-    group (``/{order}/{path}``). Returns ``{"path", "snapshot", "refs",
-    "orders", "rebases", "commit_s"}`` (``snapshot`` ``None`` when nothing was
+    ``units`` is any ITERABLE of ``{"order", "entries"}``: each entry lands
+    under its order's group (``/{order}/{path}``). A generator is the point —
+    the ladder streams a committing node's subtree through here one child at
+    a time, so the node's peak is one child's carriers rather than the whole
+    subtree's (§11.4). Returns ``{"path", "snapshot", "refs", "orders",
+    "rebases", "commit_s"}`` (``snapshot`` ``None`` when nothing was
     written). ``repo`` skips the open/vet when the caller already holds a
     vetted handle.
     """

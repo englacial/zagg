@@ -34,6 +34,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from typing import Iterable
 
 import numpy as np
 
@@ -145,15 +146,19 @@ def unpack_units(raw: bytes, prefix: str) -> tuple[list[dict], dict]:
         entries = []
         for entry in unit["entries"]:
             if entry["sharded"]:
+                # ONE string object for the whole entry: every present inner
+                # chunk of a sharded array shares the leaf's one shard object
+                # (``pack_units`` stores a single ``location`` for that
+                # reason), so expanding it per chunk allocated ~256 identical
+                # ~80-char copies per array per leaf (review finding).
+                loc = prefix + entry["location"]
                 entries.append(
                     {
                         "path": entry["path"],
                         "sharded": True,
                         "chunk_grid": tuple(entry["chunk_grid"]),
                         "arr_offset": tuple(entry["arr_offset"]),
-                        "locations": [
-                            prefix + entry["location"] if p else "" for p in entry["present"]
-                        ],
+                        "locations": [loc if p else "" for p in entry["present"]],
                         "offsets": np.asarray(entry["offsets"], dtype="<u8"),
                         "lengths": np.asarray(entry["lengths"], dtype="<u8"),
                         "checksum": _checksum_in(entry["checksum"]),
@@ -331,18 +336,20 @@ def _overview_units(store_root, node, orders, level_by_order, fields, candidates
 
 
 def _child_units(store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs):
-    """The subtree's gathered units plus how many children carried none usable.
+    """Yield ``(units, missing)`` per child, one child at a time.
 
-    A child whose carrier is absent, unreadable or for another geometry is
-    counted under ``missing`` and its siblings are kept: a per-leaf fault
-    never costs the node its whole gather (§11.4).
+    A GENERATOR, not a list: the committing node feeds each child's units
+    straight into the one session and lets them go before reading the next,
+    so the node never holds its whole subtree's carriers at once — at the
+    global-scale setting (``commit_order`` 3) that subtree is 4,096 leaves
+    (review finding). ``missing`` is 1 for a child whose carrier is absent,
+    unreadable or for another geometry, whose siblings are kept regardless:
+    a per-leaf fault never costs the node its whole gather (§11.4).
     """
     from zagg.grids.morton import morton_word
     from zagg.sweep_overview import _node_at
 
     children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
-    units: list = []
-    missing = 0
     for child in children:
         # Per-CHILD fail-open: a foreign spec token, a truncated carrier
         # (``JSONDecodeError`` is a ``ValueError``) or a geometry mismatch is
@@ -356,7 +363,7 @@ def _child_units(store_root, node, child_order, shard_order, candidates, block, 
                     store_root, morton_word(child), spec=spec, store_kwargs=store_kwargs
                 )
                 if got is None:
-                    missing += 1
+                    yield [], 1
                     continue
                 child_units, meta = got
                 geometry = meta.get("geometry")
@@ -371,14 +378,13 @@ def _child_units(store_root, node, child_order, shard_order, candidates, block, 
             else:
                 child_units = read_node_refs(store_root, child, store_kwargs=store_kwargs)
                 if child_units is None:
-                    missing += 1
+                    yield [], 1
                     continue
         except (ValueError, KeyError) as e:
             logger.warning(f"icechunk: dropping child {child}'s refs (fail-open, issue #580): {e}")
-            missing += 1
+            yield [], 1
             continue
-        units.extend(child_units)
-    return units, missing
+        yield child_units, 0
 
 
 def stage_node_refs(
@@ -429,10 +435,13 @@ def stage_node_refs(
     commits_all = dispatch <= commit_order < child_order and not per_leaf
     column_only = dispatch > commit_order and not per_leaf
     record: dict = {"node": node, "refs": 0, "missing": 0}
+    source: Iterable[dict]
+    args = (store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs)
     if column_only:
-        units, missing = _child_units(
-            store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs
-        )
+        units, missing = [], 0
+        for child_units, miss in _child_units(*args):
+            units.extend(child_units)
+            missing += miss
         written = write_node_refs(store_root, node, units + own, store_kwargs=store_kwargs)
         record.update(refs=written["refs"], missing=missing, column=written["bytes"])
         counts["icechunk_refs"] += written["refs"]
@@ -444,15 +453,25 @@ def stage_node_refs(
                 f"split_order {split_order} is finer than the committing node order {dispatch}: "
                 f"a manifest would be written by more than one commit"
             )
-        units, missing = _child_units(
-            store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs
-        )
-        units = units + own
-        record["missing"] = missing
-        counts["icechunk_missing"] += missing
+        # STREAMED into the one session: each child's units are written and
+        # released before the next is read, so the node's peak is one child,
+        # not its whole subtree (review finding). The commit is unchanged —
+        # still one per node, covering every order it gathered.
+        tally = [0]
+
+        def stream():
+            for child_units, miss in _child_units(*args):
+                tally[0] += miss
+                yield from child_units
+            yield from own
+
+        source = stream()
     else:
-        units = own  # coarser than the committing tuple (or per-leaf mode): own overviews only
-    outcome = commit_units(store_root, units, f"node {node}", store_kwargs=store_kwargs)
+        source = iter(own)  # coarser than the committing tuple (or per-leaf): own overviews only
+    outcome = commit_units(store_root, source, f"node {node}", store_kwargs=store_kwargs)
+    if commits_all:
+        record["missing"] = tally[0]
+        counts["icechunk_missing"] += tally[0]
     record.update(refs=outcome["refs"], commit=outcome)
     counts["icechunk_refs"] += outcome["refs"]
     if outcome["snapshot"] is not None:

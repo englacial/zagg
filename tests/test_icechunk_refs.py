@@ -1441,6 +1441,32 @@ class TestLadder:
         rows = {r["dispatch_order"]: r for r in out["stages"]}
         assert rows[3]["icechunk_missing"] == 1 and rows[3]["icechunk_failed"] == 0
 
+    def test_the_gather_streams_child_by_child(self, monkeypatch, cfg, tmp_path):
+        # The committing node feeds ONE child at a time into the session, so
+        # its peak is a child's carriers rather than the whole subtree's.
+        import inspect
+
+        from zagg.icechunk_ladder import _child_units, ladder_context
+        from zagg.icechunk_refs import commit_units
+
+        assert inspect.isgeneratorfunction(_child_units)
+        shards = _shards(_grid(cfg), 2)
+        grid, root, summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards
+        )
+        manifest = hive.read_manifest(root)
+        block = ladder_context(root, manifest, store_kwargs={})
+        candidates = [morton_decimal(s) for s in shards]
+        yielded = list(
+            _child_units(root, "1111", 4, 4, candidates, block, manifest.get("spec"), {})
+        )
+        assert len(yielded) == len(shards) and [miss for _u, miss in yielded] == [0, 0]
+        # ... and the commit takes that stream in its generator form.
+        out = commit_units(
+            root, (u for units, _m in yielded for u in units), "test", store_kwargs={}
+        )
+        assert out["refs"] > 0 and out["orders"] == [4]
+
     def test_a_corrupt_sidecar_costs_its_leaf_only(self, monkeypatch, cfg, tmp_path):
         # A per-leaf fault must not be given node-wide blast radius: the
         # sibling leaves' refs still commit, and the bad carrier is counted.
