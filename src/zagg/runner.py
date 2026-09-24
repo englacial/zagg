@@ -2533,7 +2533,7 @@ def _dispatch_run_stats(
             # parquet's column set does not vary run to run.
             "finalize_error": finalize_error,
             # Run-level init record (issue #580); the stats worker broadcasts
-            # it as the icechunk_repo / icechunk_init columns.
+            # it as the icechunk_init_repo / _snapshot / _error columns.
             "icechunk_init": icechunk_init,
         }
         if tail_status_url is not None:

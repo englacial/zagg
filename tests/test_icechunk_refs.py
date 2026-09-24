@@ -857,19 +857,21 @@ class TestRunRecord:
         init = {"path": f"{tmp_path}/icechunk/4", "snapshot": "SNAP", "created": True}
         path = write_run_parquet(str(tmp_path), self._rows(), run_id="abc", icechunk_init=init)
         df = pd.read_parquet(path)
-        assert df["icechunk_repo"].tolist() == [f"{tmp_path}/icechunk/4"]
-        assert df["icechunk_init"].tolist() == ["SNAP"]
-        # A fail-open init records its error in the same column.
+        assert df["icechunk_init_repo"].tolist() == [f"{tmp_path}/icechunk/4"]
+        assert df["icechunk_init_snapshot"].tolist() == ["SNAP"]
+        assert df["icechunk_init_error"].isna().all()
+        # A fail-open init lands in its OWN column, never in the snapshot's.
         path = write_run_parquet(
             str(tmp_path), self._rows(), run_id="abd", icechunk_init={"error": "RuntimeError: x"}
         )
         df = pd.read_parquet(path)
-        assert df["icechunk_repo"].isna().all() and df["icechunk_init"].tolist() == [
-            "RuntimeError: x"
-        ]
-        # Off-hive / opted out: both null, columns still present.
+        assert df["icechunk_init_error"].tolist() == ["RuntimeError: x"]
+        assert df["icechunk_init_repo"].isna().all()
+        assert df["icechunk_init_snapshot"].isna().all()
+        # Off-hive / opted out: all null, columns still present.
         df = pd.read_parquet(write_run_parquet(str(tmp_path), self._rows(), run_id="abe"))
-        assert df["icechunk_repo"].isna().all() and df["icechunk_init"].isna().all()
+        for col in ("icechunk_init_repo", "icechunk_init_snapshot", "icechunk_init_error"):
+            assert df[col].isna().all()
 
     def test_dispatch_event_carries_the_record(self, monkeypatch):
         from zagg import runner
@@ -990,9 +992,9 @@ class TestLocalRunEndToEnd:
         # The run parquet carries the init as run-level columns and each leaf's
         # commit as row columns.
         df = pd.read_parquet(summary["run_stats_path"])
-        assert set(df["icechunk_repo"]) == {init["path"]} and set(df["icechunk_init"]) == {
-            init["snapshot"]
-        }
+        assert set(df["icechunk_init_repo"]) == {init["path"]}
+        assert set(df["icechunk_init_snapshot"]) == {init["snapshot"]}
+        assert df["icechunk_init_error"].isna().all()
         # Two workers on local storage: the commit lock serializes them, and a
         # session opened before the other's commit rebases once — the counter
         # the fleet's contention question reads. Never more than one here.

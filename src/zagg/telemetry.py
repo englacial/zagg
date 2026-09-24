@@ -796,10 +796,15 @@ def write_run_parquet(
     alone. Always written, so the column set is the same every run.
 
     ``icechunk_init`` (issue #580) is the run's companion-repo init record
-    (``summary["icechunk"]``): two more run-level columns, ``icechunk_repo``
-    (the repo path) and ``icechunk_init`` (the init snapshot id, or the
-    fail-open error string), so a run's leaves join to the repo history they
-    were committed into. ``None`` (knob off, non-hive) writes both null.
+    (``summary["icechunk"]``): three more run-level columns, split the way the
+    row-level ``icechunk_*`` flattener splits its record rather than collapsed
+    into one — ``icechunk_init_repo`` (the record's ``path``),
+    ``icechunk_init_snapshot`` (the init commit) and ``icechunk_init_error``
+    (the fail-open failure string, on the ``finalize_error`` precedent). So a
+    run's leaves join to the repo history they were committed into, and
+    "init failed" is never something a reader infers from whether a value
+    looks like a hex id. ``None`` (knob off, non-hive) writes all three null;
+    all three are always written, so the column set is the same every run.
     """
     import tempfile
 
@@ -814,8 +819,9 @@ def write_run_parquet(
     # Run-level (issue #335): constant down the column, None on a clean run.
     df["finalize_error"] = finalize_error
     init = icechunk_init or {}
-    df["icechunk_repo"] = init.get("path")
-    df["icechunk_init"] = init.get("snapshot") or init.get("error")
+    df["icechunk_init_repo"] = init.get("path")
+    df["icechunk_init_snapshot"] = init.get("snapshot")
+    df["icechunk_init_error"] = init.get("error")
     # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
     # the DataFrame's float64 inference on a column that mixes ints with
     # failure-row ``None``s silently corrupts them (issue #300 — the sweep's
