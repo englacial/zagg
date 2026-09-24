@@ -769,6 +769,7 @@ def object_ref_plan(
             )
             continue
         chunks = []
+        listing: list[Any]
         if n == 1:
             # A single-chunk array (every column and overview array, §11.2):
             # one HEAD of the one key — the whole object is the ref (offset
@@ -780,7 +781,7 @@ def object_ref_plan(
                 continue
             listing = [{**head, "path": key}]
         else:
-            listing = obstore.list(store, prefix=key_prefix).collect()
+            listing = list(obstore.list(store, prefix=key_prefix).collect())
         for meta in listing:
             coords = tuple(int(x) for x in meta["path"][len(key_prefix) :].split("/"))
             global_index = tuple(o + c for o, c in zip(arr_offset, coords))
