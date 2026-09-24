@@ -3748,6 +3748,9 @@ place and so moves their checksums (§11.3); the unit re-plans its refs from
 fresh HEADs — committed at once under `commit: "leaf"`; under the ladder it
 rewrites its sidecar and enters the same run's staged sweep as a
 **dirt-only** leaf, whose nodes re-gather and commit its refs without
-re-folding their overviews (§11.4). A current unit therefore still writes no
+re-folding their overviews (§11.4). On the fleet the worker's response body
+carries `icechunk_dirty`, the dispatcher assembles the dirt-only set from
+those bodies, and each stage event carries its node slice as `dirt_only`
+(`[[shard_key, window], …]`, absent when empty). A current unit therefore still writes no
 stats record, sidecar or sub-map, but may enter the sweep work set as
 dirt-only when its touch moved ref checksums and the repo is on.
