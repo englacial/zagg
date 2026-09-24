@@ -14,7 +14,8 @@ travel the way the digest columns do:
    its own node column for the tuple above or **commits** (:func:`stage_node_refs`);
 3. the tuple whose order range contains ``icechunk.commit_order`` commits
    everything gathered in ONE commit per node covering every order in its
-   subtree (refs into ``/9/…``, ``/8/…``, … of the one repo); coarser tuples
+   subtree (refs into ``/19/…``, ``/13/…``, ``/12/…``, … of the one repo —
+   groups keyed by cell order); coarser tuples
    commit only their own overviews (their children already committed); finer
    tuples write columns only. A BASE manifest (one per ``split_order`` cell)
    is therefore written by exactly one commit — zero rewrite amplification

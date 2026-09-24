@@ -18,18 +18,20 @@ D8):
 
 - :func:`init_repo` — the once-per-run initialization (``mode="icechunk_init"``
   on Lambda, in-process on the local backend): create-or-open the repo,
-  define every order's group and array nodes (§11.2), the per-order manifest
+  define every level's group and array nodes (§11.2), the per-level manifest
   splits (§11.5) and the virtual chunk container (§11.3), commit
   ``init {run_id}``. Idempotent: an initialized repo is reopened, never
-  re-templated; one built for another geometry or ladder setting is refused.
+  re-templated; one built for another geometry or container is refused
+  (``split_order`` ratchets, ``commit`` / ``commit_order`` are per-run).
 - :func:`leaf_ref_plan` / :func:`object_ref_plan` — size and index the
   objects a leaf (or an overview) wrote: one HEAD + one ranged GET of the
-  shard-index suffix per sharded array, one LIST per regular array.
+  shard-index suffix per sharded array, one HEAD per single-chunk array, one
+  LIST per multi-chunk regular array.
 - :func:`commit_units` — write ref-plan entries for any set of orders into
   one session and commit once, rebase-on-conflict, rebase count + wall time
   recorded. :func:`record_leaf` is the per-leaf commit (``commit: "leaf"``);
-  the ladder (:mod:`zagg.icechunk_ladder`, the fleet default) commits at a
-  stage node instead.
+  the ladder (:mod:`zagg.icechunk_ladder`, the default when the run walks
+  it — :func:`ladder_walks`) commits at a stage node instead.
 
 Concurrency: writers touch disjoint chunk ranges of the same arrays, so a
 lost compare-and-swap on the branch ref is a local rebase + retry

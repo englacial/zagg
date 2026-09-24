@@ -1382,8 +1382,9 @@ The repo is one zarr hierarchy: a **group per level, keyed by cell order**
 other members are sweep intermediates and are not indexed) — each carrying
 the artifact's resolution-group attrs — `dggs` included — with every array
 re-rooted on the whole sphere at that cell order — `count`, `morton`, every field, the ragged vlen arrays and
-their siblings — chunked at the leaf's **inner** chunk and coded with the
-inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
+their siblings — chunked at the object's **inner** chunk (the leaf's inner
+chunk for the base; the whole object, one chunk per node, for a column or
+overview level) and coded with the inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
 ordinary arrays without moczarr. In a **browser**, icechunk-js reads the
 **dense** arrays today — `morton`, `count`, the per-field summaries; the
 `zagg-ragged/1` `vlen-bytes` arrays await zarrita codec support (no
@@ -1406,12 +1407,13 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
 - **`mode: "icechunk_init"`**, one synchronous invoke after the ping and
   before the fan-out (the local backend calls
   `zagg.icechunk_refs.init_repo` in-process after the manifest lands):
-  creates-or-opens the repo with **every** order group the ladder commits
-  into — the shard-order group and one per declared overview order —
-  defines their array nodes, one manifest split per group, the virtual chunk
-  container and the `multiscales` mirror, and commits `init {run_id}`.
-  Idempotent — a rerun reopens; a repo built for another geometry or ladder
-  setting is refused. The record (`path`, `snapshot`, `created`, `options`,
+  creates-or-opens the repo with **every** level group — the base, the
+  column's declared member and one per declared overview level, keyed by
+  cell order — defines their array nodes, one manifest split per group, the
+  virtual chunk container and the `multiscales` mirror, and commits
+  `init {run_id}`. Idempotent — a rerun reopens; a repo built for another
+  geometry or container is refused, while `split_order` follows the ratchet
+  below and `commit` / `commit_order` are per-run, never compared. The record (`path`, `snapshot`, `created`, `options`,
   `levels`, `ladder`, `split_ratchet`) rides the run summary under
   `icechunk`; a failed init records `{"error": …}` there and the run proceeds
   refs-less. The run parquet broadcasts it as `icechunk_init_repo`,
@@ -1463,12 +1465,12 @@ bytes (≈2.5 KB on disk per leaf-array) gives leaves-per-manifest ≈ 0.6·√N
 ```yaml
 output:
   icechunk:                 # true / false / absent (default on for hive) also accepted
-    commit: ladder          # "leaf" = the per-leaf commit (local backend without a staged sweep; tests)
+    commit: ladder          # default: ladder when the run walks it, else "leaf" (the per-leaf commit; below)
     commit_order: 6         # default: the finest staged-sweep dispatch node (shard_order − tuple_width)
     split_order: 6          # default: commit_order; must be >= commit_order and <= shard_order
 ```
 
-| setting | manifest = one cell at | chunks / manifest (shard-order group) | commits | snapshot |
+| setting | manifest = one cell at | chunks / manifest (base level group) | commits | snapshot |
 |---|---|---|---|---|
 | default (`6` / `6`) | order 6, 64 leaves | `4^7` = 16,384 | one per order-6 node | ≈390 base + a few hundred coarse-level manifests at California scale |
 | global (`split 4` / `commit 3`) | order 4, 1,024 leaves | `4^9` | 768 (the order-3 nodes) | 27k manifests, ≈2.7 MB |
@@ -1489,7 +1491,7 @@ the shard order and the width (`zagg.icechunk_refs.finest_dispatch_order`).
 `output.icechunk: false` opts a hive run out (default on; excluded from the
 D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves and raster
 hive products are outside stage 1 (spec §11.6); the sweep's overviews are in
-— every declared overview order has its repo.
+— every declared overview level has its group in the store's one repo.
 
 Reading it back:
 
