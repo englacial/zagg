@@ -1528,7 +1528,13 @@ def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
         record = init_repo(
             event["store_path"],
             grid,
-            run_id=str(event.get("run_id") or "unknown"),
+            # Required, not defaulted: §11.4 fixes the commit grammar as
+            # ``init {run_id}``, and an unattributable commit cannot be
+            # rewritten out of the repo's permanent ancestry. Both dispatchers
+            # always send one; a hand-rolled or older event 500s through the
+            # except below, which is the case where identifying the commit
+            # matters most.
+            run_id=str(event["run_id"]),
             store_kwargs=_output_store_kwargs(event),
         )
         return {
