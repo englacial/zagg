@@ -1884,6 +1884,8 @@ class TestLadder:
         assert again["cells_current"] == 2
         for meta in again["results"]:
             assert meta["touched_objects"] > 0 and "error" not in meta["icechunk"]
+            # Only a rewritten ladder sidecar marks the unit dirt-only.
+            assert meta.get("icechunk_dirty") is (True if commit == "ladder" else None)
         if commit == "ladder":
             run_stage_sweep(root, [(s, None) for s in shards], store_kwargs={})
         group, repo = _open(root)
@@ -1898,6 +1900,57 @@ class TestLadder:
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
             assert leaf["count"][0] == (i + 1) * 10
+
+    def test_skip_touch_regathers_dirt_only_in_the_same_run(self, monkeypatch, cfg, tmp_path):
+        # Question (11), ruled (a): under the ladder, a touched current unit
+        # enters the run's staged sweep as DIRT-ONLY, so the same run
+        # re-gathers its node and commits the rewritten sidecar -- the repo
+        # reads right after the all-skip rerun, with no manual sweep. No data
+        # changed, so the node's overviews and columns are not re-folded, and
+        # the unit still records nothing (no stats row, no new sidecar).
+        import os
+        from pathlib import Path
+
+        shards = _shards(_grid(cfg), 2)
+        grid, root, _ = _ladder_run(monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards)
+        # A leaf's directory holds its tree, sidecars and declared column.
+        leaves = [str(Path(hive.shard_leaf_path(root, s)).parent) for s in shards]
+        # The node-level stage artifacts (overviews, stage columns, their
+        # stamps): everything under a node outside the leaf directories.
+        folded = {
+            str(f): (f.stat().st_mtime_ns, f.read_bytes())
+            for f in Path(root).rglob("*")
+            if f.is_file()
+            and "all." in str(f.relative_to(root))
+            and not any(str(f).startswith(leaf + "/") for leaf in leaves)
+        }
+        assert any("all.zarr" in f for f in folded) and any("pyramid" in f for f in folded)
+        stats = {leaf: Path(leaf, "stats.json").read_bytes() for leaf in leaves}
+        import zagg.sweep_stages as sweep_stages
+
+        folds: list = []
+        monkeypatch.setattr(sweep_stages, "stage_node", lambda *a, **k: folds.append(a[2]))
+        time.sleep(1.1)  # past the ceiled-second checksum of the first write
+        _grid_, _root, again = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards
+        )
+        assert again["cells_current"] == 2 and again["run_stats_path"] is None
+        for meta in again["results"]:
+            assert meta["icechunk_dirty"] is True and "stats" not in meta
+        assert {leaf: Path(leaf, "stats.json").read_bytes() for leaf in leaves} == stats
+        rows = _stage_rows(root)
+        assert folds == []  # dirt-only: the ref hook runs, no node is folded
+        assert [(r["icechunk_regathered"], r["written"]) for r in rows] == [(1, 0), (1, 0)]
+        assert rows[0]["icechunk_commits"] == 1  # the o3 node re-commits its subtree
+        assert {f: (os.stat(f).st_mtime_ns, Path(f).read_bytes()) for f in folded} == folded
+        group, _repo = _open(root)
+        group["5"]["count"][:]  # the touched column's level reads (no stale checksum)
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            np.testing.assert_array_equal(
+                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+            )
 
 
 class TestLeafUnits:

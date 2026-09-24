@@ -3417,24 +3417,28 @@ def _run_local(
     # (which sends the Lambda paths through a mode="sweep" worker invoke)
     # doesn't constrain it. Fail-open inside sweep_after_run (D9).
     if store_layout == "hive" and get_sweep(config):
-        from zagg.sweep import leaves_from_stats_records, sweep_after_run
+        from zagg.sweep import dirt_only_leaves, leaves_from_stats_records, sweep_after_run
 
         leaves = leaves_from_stats_records([m.get("stats") for m in report.results])
         if leaves:
             sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
-            # Post-fleet staged chaining (issue #384) — OPT-IN via
-            # `output.sweep: "stages"` (the recorded lean for open question
-            # (c); flipping it to the default is espg's call). Runs AFTER the
-            # families sweep, auto-scoped to this run's footprint; fail-open.
-            if config.output.get("sweep") == "stages":
-                from zagg.sweep_stages import stage_sweep_after_run
+        # Post-fleet staged chaining (issue #384) — OPT-IN via
+        # `output.sweep: "stages"` (the recorded lean for open question
+        # (c); flipping it to the default is espg's call). Runs AFTER the
+        # families sweep, auto-scoped to this run's footprint; fail-open.
+        # Touched current units ride as dirt-only (issue #580): their nodes
+        # re-gather the rewritten ref sidecars, nothing is re-folded.
+        dirt_only = dirt_only_leaves(report.results)
+        if (leaves or dirt_only) and config.output.get("sweep") == "stages":
+            from zagg.sweep_stages import stage_sweep_after_run
 
-                stage_sweep_after_run(
-                    store_path,
-                    leaves,
-                    store_kwargs=store_kwargs,
-                    touch_policy=get_touch_policy(config),
-                )
+            stage_sweep_after_run(
+                store_path,
+                leaves,
+                dirt_only=dirt_only,
+                store_kwargs=store_kwargs,
+                touch_policy=get_touch_policy(config),
+            )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
