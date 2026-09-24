@@ -926,7 +926,6 @@ class TestLocalRunEndToEnd:
         monkeypatch.setattr(
             runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a", "secretAccessKey": "s"}
         )
-        monkeypatch.setattr(runner, "_check_signature", lambda *a, **k: None)
 
         def fake(g, shard_key, urls, **kwargs):
             for i, (block, _children) in enumerate(g.iter_chunks(int(shard_key))):
@@ -950,7 +949,16 @@ class TestLocalRunEndToEnd:
         monkeypatch.setattr(processing, "process_shard", fake)
         catalog = {
             "metadata": {"short_name": "ATL06", "version": "007"},
-            "grid_signature": {"type": "healpix", "parent_order": 4, "child_order": 6},
+            # The full signature ``HealpixGrid.spatial_signature()`` returns,
+            # so the production guard runs for real (tests/test_hive.py
+            # ``TestRunnerWiring._catalog`` spells it the same way).
+            "grid_signature": {
+                "type": "healpix",
+                "indexing_scheme": "nested",
+                "parent_order": 4,
+                "child_order": 6,
+                "layout": "fullsphere",
+            },
             "shard_keys": shards,
             "granules": [[{"id": f"g{i}", "s3": f"s3://b/g{i}.h5"}] for i in range(len(shards))],
         }
