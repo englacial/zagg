@@ -42,14 +42,26 @@ def _grid(cfg):
     return HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg)
 
 
-def _write_leaf(root, cfg, *, stamp=True, sidecar=True, sidecar_hash="match", granules=GRANULES):
+def _write_leaf(
+    root,
+    cfg,
+    *,
+    stamp=True,
+    sidecar=True,
+    sidecar_hash="match",
+    granules=GRANULES,
+    stamp_hashes=None,
+):
     """Emit + optionally stamp a leaf, optionally with a stats sidecar."""
     leaf = hive.shard_leaf_path(root, WORD)
     store = open_store(leaf)
     _grid(cfg).emit_shard_template(store, overwrite=True)
     if stamp:
         group = zarr.open_group(store, path="", mode="a", zarr_format=3)
-        group.attrs[hive.COMMIT_ATTR] = {"cells_with_data": 1}
+        recorded_stamp = {"cells_with_data": 1}
+        if stamp_hashes is not None:
+            recorded_stamp["content_hashes"] = stamp_hashes
+        group.attrs[hive.COMMIT_ATTR] = recorded_stamp
     if sidecar:
         recorded = {
             "match": semantic_hash(cfg),
@@ -95,6 +107,19 @@ class TestShardStatus:
         assert status["status"] == "hit"
         assert status["semantic_hash_match"] is True
         assert status["catalog_match"] is True
+
+    def test_content_hashes_come_from_the_stamp_when_it_carries_them(self, tmp_path):
+        # Issue #580: the stamp is the §5.3 preferred copy — sealed with the
+        # bytes it certifies — so a leaf whose sidecar predates the key (or
+        # lost it to the fail-open PUT) still surfaces the verifier.
+        cfg = _cfg()
+        record = {"arrays": {"8/morton": "a" * 64}, "combined": "b" * 64}
+        _write_leaf(str(tmp_path), cfg, stamp_hashes=record)
+        status = shard_status(
+            str(tmp_path), WORD, semantic_hash=semantic_hash(cfg), granule_ids=GRANULES
+        )
+        assert status["status"] == "hit"
+        assert status["content_hashes"] == record
 
     def test_catalog_growth_is_stale_never_hit(self, tmp_path):
         # The headline acceptance criterion: ATL03 is a living collection —
