@@ -219,8 +219,17 @@ def sweep_stage_pass(
     store = open_object_store(store_root, **store_kwargs)
     if level_actuals is None:
         level_actuals = {}  # callers may pass one to accumulate across passes
+    # The Icechunk ref ladder (issue #580 phase 6, spec §11.4): one vetted
+    # read of the base repo's block per pass; ``None`` when the store has no
+    # companion, and every node's hook is then a no-op. Fail-open (D9).
+    from zagg.icechunk_ladder import STAGE_COUNTS, ladder_context, stage_hook
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
+    try:
+        ladder = ladder_context(store_root, manifest, store_kwargs=store_kwargs)
+    except Exception as e:
+        logger.warning(f"icechunk ladder disabled for this pass (fail-open, issue #580): {e}")
+        ladder = None
     for stage in schedule:
         t0 = time.perf_counter()
         counts = {
@@ -232,6 +241,7 @@ def sweep_stage_pass(
             "columns_written": 0,
             "columns_current": 0,
             "revalidated": 0,
+            **({name: 0 for name in STAGE_COUNTS} if ladder is not None else {}),
         }
         nodes = sorted({_node_at(d, stage["dispatch"]) for d in candidates})
         nodes = [n for n in nodes if scope_admits(n, scope)]
@@ -266,6 +276,18 @@ def sweep_stage_pass(
                     store_kwargs=store_kwargs,
                     level_actuals=level_actuals,
                 )
+            stage_hook(
+                store_root,
+                node,
+                stage,
+                manifest=manifest,
+                levels=levels,
+                fields=fields,
+                candidates=candidates,
+                block=ladder,
+                store_kwargs=store_kwargs,
+                counts=counts,
+            )
             if on_node is not None:
                 on_node(node)
         row = {

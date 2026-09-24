@@ -1525,9 +1525,13 @@ def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
 
         config = load_config_from_dict(event["config"])
         grid = from_config(config, parent_order=event.get("parent_order"))
+        # The one repo, every level the ladder commits into — the base group
+        # plus one per declared overview order (phase 6) — so no stage node
+        # ever has to create anything.
         record = init_repo(
             event["store_path"],
             grid,
+            config,
             # Required, not defaulted: §11.4 fixes the commit grammar as
             # ``init {run_id}``, and an unattributable commit cannot be
             # rewritten out of the repo's permanent ancestry. Both dispatchers
