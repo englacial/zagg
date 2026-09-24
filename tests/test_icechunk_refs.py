@@ -970,7 +970,7 @@ class TestLocalRunEndToEnd:
             6,
             max_cells=None,
             morton_cell=None,
-            max_workers=2,
+            max_workers=1,
             overwrite=False,
             dry_run=False,
             region="us-west-2",
@@ -1003,10 +1003,12 @@ class TestLocalRunEndToEnd:
         assert set(df["icechunk_init_repo"]) == {init["path"]}
         assert set(df["icechunk_init_snapshot"]) == {init["snapshot"]}
         assert df["icechunk_init_error"].isna().all()
-        # Two workers on local storage: the commit lock serializes them, and a
-        # session opened before the other's commit rebases once — the counter
-        # the fleet's contention question reads. Never more than one here.
-        assert set(df["icechunk_rebases"]) <= {0, 1} and df["icechunk_rebases"].sum() <= 1
+        # One worker: the leaves commit sequentially, so the contention
+        # counter must read exactly zero on both — a nonzero value here would
+        # mean a commit rebased against nothing. Contention itself is pinned
+        # deterministically by TestLeafRefs::test_rebase_is_counted, which
+        # forces a stale session and asserts exactly one rebase.
+        assert df["icechunk_rebases"].tolist() == [0, 0]
         assert set(df["icechunk_snapshot"]) == set(
             m["icechunk"]["snapshot"] for m in summary["results"]
         )
