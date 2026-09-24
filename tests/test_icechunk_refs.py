@@ -48,6 +48,14 @@ def _grid(cfg, *, sharded=True):
     return HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=sharded)
 
 
+#: A minimal explicit windowing declaration (§11.6's first out-of-scope shape).
+_WINDOWING = {
+    "schedule": "explicit",
+    "time_field": "h_li",  # a declared column, so validate_config passes
+    "epoch": "2018-01-01T00:00:00Z",
+    "windows": [{"label": "w1", "start": "2020-01-01T00:00:00Z", "end": "2021-01-01T00:00:00Z"}],
+}
+
 #: Six distinct shard-order-4 leaves under base cell 1, as decimal ids.
 _LEAVES = ("11111", "11112", "11113", "11114", "11121", "11122")
 
@@ -865,7 +873,22 @@ class TestKnob:
         cfg.output.pop("icechunk")
         assert get_icechunk(cfg) is False
 
-    def test_validate_rejects_non_bool_and_non_hive(self, cfg):
+    def test_default_follows_the_writer_scope_not_the_layout(self, cfg):
+        # Spec §11.6: a windowed store's leaves share a shard rank and a
+        # raster product is never sharded, so stage 1 records no refs for
+        # either — the default resolves OFF rather than standing up a repo no
+        # leaf can ever fill.
+        from zagg.config import get_icechunk, get_store_layout
+
+        cfg.output["store_layout"] = "hive"
+        assert get_icechunk(cfg) is True
+        cfg.output["windowing"] = _WINDOWING
+        assert get_icechunk(cfg) is False
+        cfg.output.pop("windowing")
+        raster = default_config("sentinel2_l2a")
+        assert get_store_layout(raster) == "hive" and get_icechunk(raster) is False
+
+    def test_validate_rejects_non_bool_and_out_of_scope_shapes(self, cfg):
         from zagg.config import validate_config
 
         cfg.output["store_layout"] = "hive"
@@ -876,6 +899,14 @@ class TestKnob:
         cfg.output["icechunk"] = True
         with pytest.raises(ValueError, match="requires output.store_layout: hive"):
             validate_config(cfg)
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = _WINDOWING
+        with pytest.raises(ValueError, match=r"windowed stores \(spec §11.6\)"):
+            validate_config(cfg)
+        raster = default_config("sentinel2_l2a")
+        raster.output["icechunk"] = True
+        with pytest.raises(ValueError, match=r"raster products \(spec §11.6\)"):
+            validate_config(raster)
 
     def test_knob_is_outside_the_semantic_core(self, cfg):
         from zagg.semantics import semantic_hash

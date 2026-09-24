@@ -1319,6 +1319,16 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.icechunk requires output.store_layout: hive (the companion repo "
             "references hive leaves by shard rank; flat stores have no leaves)"
         )
+    if icechunk and get_windowing(config) is not None:
+        raise ValueError(
+            "output.icechunk is out of scope for windowed stores (spec §11.6): a "
+            "window's leaves share a shard rank, so stage 1 records no refs for them"
+        )
+    if icechunk and (config.data_source or {}).get("reader") == "raster":
+        raise ValueError(
+            "output.icechunk is out of scope for raster products (spec §11.6): "
+            "raster leaves are never sharded, so stage 1 records no refs for them"
+        )
     # Overview pyramid declaration (issue #201): explicit blocks are grammar-
     # checked here; the D24 none-field warning fires at manifest build time
     # (template time for the store), not per config validation. The NaN-fill
@@ -3353,14 +3363,24 @@ def get_icechunk(config: PipelineConfig) -> bool:
     Default ON for hive-layout stores: the once-per-run ``icechunk_init`` step
     and the per-leaf virtual-ref commit at leaf commit, both fail-open (the
     leaves stay normative; the repo is a regenerable index). ``output.icechunk:
-    false`` opts out; non-hive configs default off and an explicit ``true``
-    there is rejected by ``validate_config``, mirroring ``sweep``. A
-    present-but-null key falls back to the default. Excluded from the D19
-    semantic core like the other run triggers (:mod:`zagg.semantics`).
+    false`` opts out.
+
+    The default follows the stage-1 WRITER's scope, not the layout alone
+    (spec §11.6): windowed hive stores (a window's leaves share a shard rank)
+    and raster hive products (never sharded) record no refs, so the knob
+    resolves OFF there rather than standing up a repo no leaf can fill. A
+    present-but-null key falls back to that default; an explicit ``true`` on
+    any of the three out-of-scope shapes — non-hive, windowed, raster — is
+    rejected by ``validate_config``, mirroring ``sweep``. Excluded from the
+    D19 semantic core like the other run triggers (:mod:`zagg.semantics`).
     """
     flag = config.output.get("icechunk")
     if flag is None:
-        return get_store_layout(config) == "hive"
+        return (
+            get_store_layout(config) == "hive"
+            and get_windowing(config) is None
+            and (config.data_source or {}).get("reader") != "raster"
+        )
     return bool(flag)
 
 
