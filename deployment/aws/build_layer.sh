@@ -44,6 +44,7 @@ ASYNC_TIFF_PIN=$(lambda_pin async-tiff)
 XARRAY_PIN=$(lambda_pin xarray)
 H5NETCDF_PIN=$(lambda_pin h5netcdf)
 H5PY_PIN=$(lambda_pin h5py)
+ICECHUNK_PIN=$(lambda_pin icechunk)
 
 # Sanity: machine arch must match the requested layer arch.
 MACHINE_ARCH=$(uname -m)
@@ -133,6 +134,14 @@ fi
 # extra (lambda_pin above).
 echo "Installing async-tiff ($ASYNC_TIFF_PIN, +obspec)..."
 $PIP install "$ASYNC_TIFF_PIN" obspec -t "$OUTPUT_DIR/python" --no-cache-dir
+
+# icechunk (issue #580): the worker-side Icechunk companion-repo writer
+# (mode="icechunk_init" + the per-leaf refs commit). cp312-abi3 manylinux
+# wheel (~17 MB) on both arches; --no-deps because its only dep, zarr, is a
+# function-zip dep (build_function.sh). The pin comes from the `lambda` extra
+# (lambda_pin above).
+echo "Installing icechunk ($ICECHUNK_PIN, --no-deps)..."
+$PIP install "$ICECHUNK_PIN" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # Verify numpy stayed < 2.3
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)

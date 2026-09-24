@@ -143,6 +143,10 @@ lambda = [
     "astropy",
     # abi3 manylinux_2_28 wheels cover both layer arches, ~4 MB each — issue #218.
     "async-tiff==0.7.2",
+    # Icechunk companion-repo writer (issue #580): cp312-abi3 manylinux wheels
+    # on both layer arches, ~17 MB each; its only dep (zarr) is a function-zip
+    # dep, so the layer installs it --no-deps.
+    "icechunk==2.2.2",
     # The temporal worker (process_event, issue #220) reads xarray datasets and
     # opens NetCDF4/HDF5 bytes in-memory via the h5netcdf engine; h5coro is a
     # byte-range reader, not an xarray engine, so these must ship in the layer.
