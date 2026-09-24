@@ -62,6 +62,7 @@ STAGE_COUNTS = (
     "icechunk_commit_s",
     "icechunk_missing",
     "icechunk_failed",
+    "icechunk_skipped_levels",
 )
 
 
@@ -380,7 +381,22 @@ def stage_node_refs(
     dispatch, child_order = int(stage["dispatch"]), int(stage["child_order"])
     commit_order, split_order = int(block["commit_order"]), int(block["split_order"])
     level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
+    # Against the REPO'S groups, not the manifest's declaration alone: the
+    # pyramid is mutable by design (``hive._FROZEN_MANIFEST_KEYS`` excludes
+    # it) and ``init_repo``'s reopen branch creates no group for a level
+    # declared after the repo was made, so an order the manifest gained would
+    # raise ``NodeNotFound`` mid-commit and discard the node's base refs too
+    # (review finding). The node commits the levels the repo has.
+    have = {int(o) for o in block["levels"]}
     orders = [k for k in stage["orders"] if k in level_by_order]
+    lacking = [k for k in orders if k not in have]
+    if lacking:
+        logger.warning(
+            f"icechunk: node {node} skips order(s) {lacking} — declared by the manifest but "
+            f"absent from the repo's levels {sorted(have)} (issue #580)"
+        )
+        counts["icechunk_skipped_levels"] += len(lacking)
+        orders = [k for k in orders if k in have]
     per_leaf = block.get("commit") == "leaf"
     own = _overview_units(
         store_root, node, orders, level_by_order, fields, candidates, store_kwargs

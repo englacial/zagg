@@ -1441,6 +1441,42 @@ class TestLadder:
         rows = {r["dispatch_order"]: r for r in out["stages"]}
         assert rows[3]["icechunk_missing"] == 1 and rows[3]["icechunk_failed"] == 0
 
+    def test_a_level_the_repo_lacks_is_skipped_not_fatal(self, monkeypatch, cfg, tmp_path):
+        # The manifest's pyramid is mutable by design, so it can declare a
+        # level the repo has no group for; the node must still commit the
+        # levels the repo HAS -- the base leaf refs above all.
+        shards = _shards(_grid(cfg), 2)
+        grid, root, summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards
+        )
+        import zagg.icechunk_ladder as ladder_mod
+
+        real = ladder_mod.ladder_context
+
+        def drop_order_three(store_root, manifest, *, store_kwargs):
+            block = real(store_root, manifest, store_kwargs=store_kwargs)
+            levels = {k: v for k, v in block["levels"].items() if k != "3"}
+            return {**block, "levels": levels}
+
+        monkeypatch.setattr(ladder_mod, "ladder_context", drop_order_three)
+        from zagg.sweep_stages import run_stage_sweep
+
+        out = run_stage_sweep(root, [(s, None) for s in shards], store_kwargs={})
+        rows = {r["dispatch_order"]: r for r in out["stages"]}
+        # The o3 tuple's one order is gone, so the node commits its children's
+        # base refs alone -- and says so rather than losing the whole node.
+        assert rows[3]["icechunk_skipped_levels"] == 1
+        assert rows[3]["icechunk_commits"] == 1 and rows[3]["icechunk_failed"] == 0
+        assert rows[3]["icechunk_refs"] > 0
+        assert rows[0]["icechunk_skipped_levels"] == 0
+        group, _repo = _open(root)
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            np.testing.assert_array_equal(
+                group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+            )
+
     def test_leaf_mode_ladder_commits_overviews_only(self, monkeypatch, cfg, tmp_path):
         shards = _shards(_grid(cfg), 2)
         grid, root, summary = _ladder_run(
