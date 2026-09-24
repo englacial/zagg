@@ -1305,9 +1305,15 @@ no once-per-run root-write mode yet; both wait on the same resolution — PR #39
 question (10)). The **Icechunk companion repo** (`icechunk/`, below)
 is outside the touch contract as well: `touch_current_unit` assembles a unit
 footprint of leaf tree + stats sidecar + `granules.json` + sub-map + declared
-column, `touch_store_root` covers the root trio, and neither reaches the repo
-— so an all-skip rerun, which reopens the repo and commits nothing, refreshes
-every leaf and nothing in the index. The repo is not a root-trio-style
+column + the Icechunk ref sidecar (`icechunk_refs.json`, the ladder's input
+for that leaf — a skipped leaf must keep it as fresh as the leaf it
+describes, or the next staged sweep gathers a hole), `touch_store_root`
+covers the root trio, and neither reaches the repo — so an all-skip rerun,
+which reopens the repo and commits nothing, refreshes every leaf and nothing
+in the index. The ref sidecar's touch is unconditional: it is issued even when
+`output.icechunk` is off or the run used `commit: "leaf"`, where the object
+does not exist — harmless (an absent sibling is neither touched nor failed),
+at the cost of one extra request per unit on an all-skip rerun. The repo is not a root-trio-style
 self-copy candidate either: it is *many* objects (snapshots, manifests,
 chunk-ref manifests, the branch ref), so touching it is O(objects in the repo)
 rather than three known keys. Nor does it degrade gracefully the way a missing
