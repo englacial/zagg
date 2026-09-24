@@ -3283,12 +3283,17 @@ pinned.
 
 ## 11. Icechunk companion repos
 
-**Status: stage 1 — refs-only, additive
-([#580](https://github.com/englacial/zagg/issues/580)).** The leaves remain
-the normative, self-describing data plane (§1–§10); the companion is a
-derived index over their bytes. Stage 2 (a follow-up issue) is where the
-repo becomes the authoritative *metadata* plane; nothing in this section
-presupposes it.
+**Status: contract** (`zagg-icechunk/1`, issue
+[#580](https://github.com/englacial/zagg/issues/580), stage 1 — refs-only,
+additive). The leaves remain the normative, self-describing data plane
+(§1–§10); the companion is a derived index over their bytes. Stage 2 (a
+follow-up issue) is where the repo becomes the authoritative *metadata*
+plane; nothing in this section presupposes it.
+
+**Succession.** Stage 2 is a `/2` revision, declared — as `/1` is — in the
+`zagg_icechunk.spec` token (§11.1), so a reader discriminates the two from
+the repo's own attrs. `/1` remains valid and readable indefinitely: existing
+repos never require rewriting, whatever timing `/2` lands on.
 
 A morton hive is many leaf zarrs. The companion presents every leaf of one
 order as **one zarr hierarchy** by recording each leaf's inner chunks as
