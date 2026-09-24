@@ -379,8 +379,36 @@ class TestPageSearch:
         fake_requests([_non_json(text="é" * 5000)] * _RETRY_ATTEMPTS)
         with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
             _page_search("https://cmr/search", params={})
-        head = "é".encode() * (sources._BODY_SNIPPET // 2)
+        # Bounded in bytes, then decoded for the message: 100 two-byte
+        # characters, printed as text rather than as a bytes repr.
+        head = "é" * (sources._BODY_SNIPPET // 2)
         assert f"body[:{sources._BODY_SNIPPET}]={head!r}" in str(excinfo.value)
+        assert "=b'" not in str(excinfo.value)
+
+    def test_exhausted_raise_decodes_the_snippet_with_replacement(self, fake_requests, monkeypatch):
+        # A byte slice can cut a multi-byte character in half, and an error
+        # page can be in any encoding: the message must never fail to build.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        page = _non_json(text="x")
+        page.content = b"\xff\xfe" + "é".encode() * sources._BODY_SNIPPET
+        fake_requests([page] * _RETRY_ATTEMPTS)
+        with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
+            _page_search("https://cmr/search", params={})
+        msg = str(excinfo.value)
+        assert "\ufffd\ufffd" in msg
+        assert "é" * 90 in msg
+
+    def test_exhausted_raise_is_a_named_value_error_subclass(self, fake_requests, monkeypatch):
+        # Named so a caller can tell "the endpoint answered garbage for every
+        # attempt" from any other ValueError without matching on the message;
+        # still a ValueError so existing handlers keep working.
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_non_json()] * _RETRY_ATTEMPTS)
+        with pytest.raises(sources.STACSearchError) as excinfo:
+            _page_search("https://cmr/search", params={})
+        assert isinstance(excinfo.value, ValueError)
+        assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+        assert len(fake.calls) == _RETRY_ATTEMPTS
 
     def test_gateway_error_after_non_json_still_raises_its_status(self, fake_requests, monkeypatch):
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
