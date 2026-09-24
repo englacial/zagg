@@ -561,15 +561,17 @@ def init_repo(
 ) -> dict:
     """Create-or-open the store's repo and define every level (§11.4 ``init``).
 
-    One repo per store, a group per order — the base at the shard order plus
-    every declared overview order (:func:`ladder_grids`) — created here, once,
-    because Icechunk's create is not safe under concurrent callers and the
-    stage nodes that commit fan out. ``manifest`` is the store's (an append
-    run indexes the declared ladder, not this config's); ``None`` reads it,
-    then builds it from ``config``. Returns ``{"path", "snapshot", "created",
-    "options", "levels", "ladder", "split_ratchet"}``; ``created`` is
-    ``False`` when the repo already carried a block for this array model and
-    container (reopened) — a block for another geometry raises.
+    One repo per store, a group per LEVEL keyed by cell order — the base
+    leaves, the §4.6 column's declared members and every declared overview
+    order (:func:`level_grids`) — created here, once, because Icechunk's
+    create is not safe under concurrent callers and the stage nodes that
+    commit fan out. ``manifest`` is the store's (an append run indexes the
+    declared ladder, not this config's); ``None`` reads it, then builds it
+    from ``config``. Returns ``{"path", "snapshot", "created", "options",
+    "levels", "ladder", "split_ratchet"}``; ``levels`` is keyed by cell order
+    and ``ladder`` is those keys sorted. ``created`` is ``False`` when the
+    repo already carried a block for this array model and container
+    (reopened) — a block for another geometry raises.
 
     **The split ratchet (§11.5).** The store's recorded ``split_order`` is
     authoritative and moves one way, toward coarser: a config FINER than the
