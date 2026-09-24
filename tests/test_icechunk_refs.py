@@ -1646,6 +1646,55 @@ class TestLadder:
         assert rows[0]["icechunk_commits"] == 1
 
 
+class TestLeafUnits:
+    def test_only_the_declared_leaf_member_is_a_level(self, cfg):
+        # Production shape: shard 9 / chunk 13 / cell 19 with the default /2
+        # declaration -> the column holds 13, 12, 11, 10, 9 but the multiscales
+        # column dataset is [13]; 12/11/10 overlap the overview levels and the
+        # node-order partial is a sweep input -- none of them may be indexed.
+        from zagg.column import leaf_column_plan, leaf_level_cells
+
+        cfg.output["store_layout"] = "hive"
+        grid = HealpixGrid(9, 19, config=cfg, chunk_inner=13)
+        resolutions, _fields = leaf_column_plan(cfg, grid)
+        assert resolutions == [13, 12, 11, 10, 9]
+        assert leaf_level_cells(cfg, grid) == [13]
+
+    def test_units_carry_the_base_and_the_column_level_only(self, monkeypatch, cfg):
+        # ``leaf_units`` asks for one plan per unit: the base leaf and the
+        # column's [13] member -- never 12/11/10 or 9 (the collision the
+        # amendment's level table forbids). No store is touched.
+        cfg.output["store_layout"] = "hive"
+        grid = HealpixGrid(9, 19, config=cfg, chunk_inner=13)
+        asked = []
+
+        def fake_plan(g, object_rel, rank, store_root, *, store_kwargs):
+            asked.append((int(g.parent_order), int(g.child_order), object_rel))
+            return [
+                {
+                    "path": "count",
+                    "sharded": False,
+                    "chunks": [("count/c/0", "x", 1, None)],
+                    "refs": 1,
+                }
+            ]
+
+        monkeypatch.setattr(icechunk_refs, "object_ref_plan", fake_plan)
+        from zagg.grids.morton import morton_word
+
+        shard = int(morton_word("111111111"))
+        units = icechunk_refs.leaf_units(
+            grid, cfg, shard, "/s", column="all.pyramid.zarr", store_kwargs={}
+        )
+        assert [u["level"] for u in units] == [19, 13]
+        assert [(n, c) for n, c, _ in asked] == [(9, 19), (9, 13)]
+        assert asked[1][2].endswith("/all.pyramid.zarr")
+        # Without a column, the base alone.
+        asked.clear()
+        units = icechunk_refs.leaf_units(grid, cfg, shard, "/s", column=None, store_kwargs={})
+        assert [u["level"] for u in units] == [19] and len(asked) == 1
+
+
 class TestKnob:
     def test_default_on_for_hive_off_otherwise(self, cfg):
         from zagg.config import get_icechunk

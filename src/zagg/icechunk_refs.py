@@ -926,12 +926,14 @@ def leaf_units(
 
     The base unit at the store's cell order from :func:`leaf_ref_plan`, plus
     — when the unit wrote its §4.6 column (``column`` is its basename) — one
-    unit per resolution the column holds that is a repo LEVEL: the declared
-    leaf-node member(s) (:func:`zagg.column.leaf_column_plan`), never the
-    node-order partial, which is a sweep input (:func:`level_grids`). Each
-    column array is one unsharded chunk, so its ref is the whole object.
+    unit per column member that is a repo LEVEL: the declared leaf-node
+    cells (:func:`zagg.column.leaf_level_cells` — ``[13]`` at production),
+    never the within-footprint intermediates (``12, 11, 10``) or the
+    node-order partial, which are sweep inputs that overlap the overview
+    levels (:func:`level_grids`). Each column array is one unsharded chunk,
+    so its ref is the whole object.
     """
-    from zagg.column import leaf_column_plan
+    from zagg.column import leaf_column_plan, leaf_level_cells
     from zagg.grids.healpix import HealpixGrid
     from zagg.hive import shard_leaf_path
     from zagg.sweep_overview import _overview_config
@@ -947,12 +949,12 @@ def leaf_units(
     plan = leaf_column_plan(config, grid) if column else None
     if plan is None:
         return units
-    resolutions, fields = plan
+    _resolutions, fields = plan
     node_rel = leaf_rel.rsplit("/", 1)[0]
     cfg = _overview_config(fields)
-    for res in resolutions:
-        if int(res) == int(grid.parent_order):
-            continue  # the node-order partial: a sweep input, not a level
+    for res in leaf_level_cells(config, grid):
+        if int(res) >= int(grid.child_order):
+            continue  # a member at the store's own cell order duplicates the base (level_grids)
         column_grid = HealpixGrid(int(grid.parent_order), int(res), config=cfg, sharded=True)
         entries = object_ref_plan(
             column_grid, f"{node_rel}/{column}", rank, store_root, store_kwargs=store_kwargs

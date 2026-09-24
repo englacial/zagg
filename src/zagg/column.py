@@ -854,13 +854,30 @@ def leaf_column_plan(config, grid) -> tuple[list[int], dict] | None:
     composable classes; the template-time warning for excluded fields is NOT
     repeated per shard (``build_pyramid_block`` owns the loud warning).
     """
+    from zagg.pyramid import declared_fields
+
+    levels = _leaf_levels(config, grid)
+    if levels is None:
+        return None
+    resolutions = column_resolutions(levels, grid.parent_order)
+    if not resolutions:
+        return None
+    fields = composable_fields(declared_fields(config)[0])
+    if not fields:
+        return None
+    return resolutions, fields
+
+
+def _leaf_levels(config, grid) -> list | None:
+    """The expanded ``/2`` ladder this config declares for ``grid``, or ``None``.
+
+    The gate half of :func:`leaf_column_plan` (see its docstring for the
+    default flip); factored out so the Icechunk companion can ask which of a
+    column's members are LEVELS (:func:`leaf_level_cells`) through the same
+    derivation the column writer used.
+    """
     from zagg.config import get_pyramid
-    from zagg.pyramid import (
-        declared_fields,
-        expand_overviews,
-        normalize_overviews,
-        validate_overviews,
-    )
+    from zagg.pyramid import expand_overviews, normalize_overviews, validate_overviews
 
     knob = get_pyramid(config)
     if knob is None:
@@ -877,14 +894,27 @@ def leaf_column_plan(config, grid) -> tuple[list[int], dict] | None:
     validate_overviews(
         declared, parent_order=int(grid.parent_order), child_order=int(grid.child_order)
     )
-    levels = expand_overviews(declared, parent_order=int(grid.parent_order))
-    resolutions = column_resolutions(levels, grid.parent_order)
-    if not resolutions:
-        return None
-    fields = composable_fields(declared_fields(config)[0])
-    if not fields:
-        return None
-    return resolutions, fields
+    return expand_overviews(declared, parent_order=int(grid.parent_order))
+
+
+def leaf_level_cells(config, grid) -> list[int]:
+    """The column members that are multiscales LEVELS: the leaf entry's declared cells.
+
+    A column carries more (:func:`column_resolutions`: the within-footprint
+    intermediates and the node-order partial), but the §4.9 mirror lists one
+    ``column`` dataset per declared leaf-node entry — ``[13]`` at the
+    production geometry against a column holding ``13, 12, 11, 10, 9`` — and
+    only those are indexed by the Icechunk companion (spec §11.1): the rest
+    overlap the overview levels for the same cells. Empty when no column is
+    declared.
+    """
+    levels = _leaf_levels(config, grid)
+    if not levels:
+        return []
+    node = int(grid.parent_order)
+    return sorted(
+        {int(c) for e in levels if int(e["node"]) == node for c in e["cells"]}, reverse=True
+    )
 
 
 def write_leaf_column(
