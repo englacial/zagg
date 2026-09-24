@@ -3421,12 +3421,17 @@ be percent-encoded — `?` → `%3F`, `#` → `%23`, `%` → `%25`
 (`set_virtual_refs_arr`). zagg's own keys contain none of the three; the rule
 is normative for a reader reconstructing a key from a recorded `location`.
 
-Every reference also carries a **checksum**: the **ETag** of the object it
-points into, read from the HEAD the writer performs against that object after
-the leaf write (§11.4). Icechunk verifies it on read, so a reference into a
-leaf that has since been wholesale-replaced (§1.5 leaf immutability — same
-keys, new bytes) fails loudly rather than decoding the replacement at a stale
-offset.
+Every reference into an **object-store** container also carries a
+**checksum**: the **ETag** of the object it points into, read from the HEAD
+the writer performs against that object after the leaf write (§11.4).
+Icechunk verifies it on read, so a reference into a leaf that has since been
+wholesale-replaced (§1.5 leaf immutability — same keys, new bytes) fails
+loudly rather than decoding the replacement at a stale offset. References
+into a **`file://`** container carry no checksum: Icechunk's local-filesystem
+container validates none of the checksum forms (every form fails an unchanged
+object on 2.2.2), so a local store — the test and local-backend case — has
+only the §1.5 discipline; the writer records which it did under
+`icechunk.checksum` in the leaf's stats sidecar (`"etag"` or `null`).
 
 `location` is `url_prefix + key`, `key` the object's path relative to the
 store root. The repo declares exactly one **virtual chunk container** whose
@@ -3479,7 +3484,14 @@ per unsharded chunk object — small beside the leaf write, but not nothing.
 
 Writing the refs is **fail-open** (D9): a refs failure is logged and recorded
 in the leaf's D20 stats sidecar (`icechunk.error`) and never fails the leaf
-write — the leaf is normative, the index is regenerable.
+write — the leaf is normative, the index is regenerable. The sidecar's
+`icechunk` block is the leaf's record of its commit: `{path, snapshot,
+arrays, refs, rebases, commit_s, checksum}` on success — `rebases` the
+number of rebase-and-retry rounds the commit needed and `commit_s` its wall
+time, the measurements the fleet's contention question is answered from —
+`{skipped: reason}` for a unit stage 1 does not index (§11.6), or
+`{error: message}`. The run parquet flattens the same fields to
+`icechunk_*` columns.
 
 ### 11.5 Manifest splitting
 

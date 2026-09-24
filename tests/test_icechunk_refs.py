@@ -75,9 +75,17 @@ def _carrier(grid, shard, fill):
     return df
 
 
-def _write_leaf(monkeypatch, grid, root, shard, *, fill=1.0, ragged=None, skip_chunks=()):
-    """One leaf through the production writer; returns the worker metadata."""
+def _write_leaf(
+    monkeypatch, grid, root, shard, *, fill=1.0, ragged=None, skip_chunks=(), refs=False
+):
+    """One leaf through the production writer; returns the worker metadata.
+
+    ``refs`` arms the worker-side refs commit (``output.icechunk``); the
+    ``record_leaf``-level tests keep it OFF so they own the commit themselves.
+    """
     import zagg.processing as processing
+
+    grid.config.output["icechunk"] = bool(refs)
 
     def fake(g, shard_key, urls, **kwargs):
         sink = kwargs.get("chunk_results")
@@ -100,6 +108,9 @@ def _write_leaf(monkeypatch, grid, root, shard, *, fill=1.0, ragged=None, skip_c
             "files_processed": 1,
             "duration_s": 0.0,
             "error": None,
+            # The real process_shard seeds these; the write/hash/icechunk
+            # timings ride an existing dict only.
+            "phase_timings": {"read": 0.0, "index": 0.0, "aggregate": 0.0},
         }
 
     monkeypatch.setattr(processing, "process_shard", fake)
@@ -550,6 +561,71 @@ class TestHandlerMode:
         resp = handler_mod.lambda_handler(event, None)
         assert resp["statusCode"] == 500
         assert json.loads(resp["body"])["mode"] == "icechunk_init"
+
+
+class TestWorkerWiring:
+    """Phase 4: ``process_and_write_hive`` records refs after the stamp, fail-open."""
+
+    def test_leaf_write_records_refs_and_reads_back(self, monkeypatch, cfg, tmp_path):
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        root = str(tmp_path / "store")
+        icechunk_refs.init_repo(root, grid, run_id=RUN_ID, store_kwargs={})
+        shard = _shards(grid, 1)[0]
+        meta = _write_leaf(monkeypatch, grid, root, shard, skip_chunks=(2,), refs=True)
+        ice = meta["icechunk"]
+        assert ice["refs"] > 0 and ice["rebases"] == 0 and ice["commit_s"] >= 0.0
+        assert ice["path"] == f"{root}/icechunk/4"
+        assert meta["phase_timings"]["icechunk"] >= 0.0
+        # The commit is the leaf's, on top of init, and the repo reads the leaf.
+        group, repo = _open(root, 4)
+        assert [s.message for s in repo.ancestry(branch="main")][
+            0
+        ] == f"leaf {morton_decimal(shard)}"
+        assert repo.lookup_branch("main") == ice["snapshot"]
+        (rank,) = grid.block_index(shard)
+        leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+        np.testing.assert_array_equal(
+            group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+        )
+        # The record rides the D20 record and flattens to parquet scalars.
+        from zagg.telemetry import build_record, flatten_record
+
+        record = build_record(shard_key=shard, metadata=meta, granule_ids=["g"])
+        assert record["icechunk"] == ice
+        row = flatten_record(record)
+        assert row["icechunk_snapshot"] == ice["snapshot"]
+        assert row["icechunk_rebases"] == 0 and row["icechunk_refs"] == ice["refs"]
+        assert row["icechunk_error"] is None and row["icechunk_skipped"] is None
+
+    def test_missing_repo_fails_open_after_the_stamp(self, monkeypatch, cfg, tmp_path, caplog):
+        import logging
+
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        root = str(tmp_path / "store")  # no init: the repo does not exist
+        shard = _shards(grid, 1)[0]
+        with caplog.at_level(logging.WARNING, logger="zagg.hive"):
+            meta = _write_leaf(monkeypatch, grid, root, shard, refs=True)
+        assert meta.get("error") is None
+        assert set(meta["icechunk"]) == {"error"}
+        assert "fail-open, issue #580" in caplog.text
+        # The leaf itself is committed and hashed regardless.
+        stamp = hive.read_commit(hive.shard_leaf_path(root, shard))
+        assert stamp["complete"] is True and "content_hashes" in stamp
+        from zagg.telemetry import build_record, flatten_record
+
+        row = flatten_record(build_record(shard_key=shard, metadata=meta, granule_ids=["g"]))
+        assert row["icechunk_error"] and row["icechunk_snapshot"] is None
+
+    def test_knob_off_records_nothing(self, monkeypatch, cfg, tmp_path):
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        root = str(tmp_path / "store")
+        shard = _shards(grid, 1)[0]
+        meta = _write_leaf(monkeypatch, grid, root, shard, refs=False)
+        assert "icechunk" not in meta and "icechunk" not in meta["phase_timings"]
+        assert not (tmp_path / "store" / "icechunk").exists()
 
 
 class TestKnob:

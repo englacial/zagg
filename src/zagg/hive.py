@@ -1828,7 +1828,8 @@ def process_and_write_hive(
     # The leaf write order is pinned: dense (streamed, or one object each when
     # sharded) -> ragged (one object, issue #209) -> O11 hashes (in memory,
     # issue #580) -> coverage sidecar -> stamp -> granule-id sibling (issue
-    # #388; after the stamp, inside the bracket).
+    # #388; after the stamp, inside the bracket) -> Icechunk refs commit
+    # (issue #580; after the stamp, its own phase, fail-open).
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
@@ -1923,6 +1924,35 @@ def process_and_write_hive(
             **store_kwargs,
         )
         _write_elapsed += time.time() - _t0
+        # Icechunk companion refs (issue #580, spec §11.4): AFTER the stamp —
+        # the refs point at objects the stamp has just certified — and
+        # fail-open (D9): the leaf is normative, the repo a regenerable index,
+        # so a refs failure logs and rides the stats sidecar (``icechunk.
+        # error``) but never fails the unit. Its own phase, not ``write``: the
+        # HEADs, the index GETs and the commit are index cost, not leaf cost.
+        # Gated on the knob the init step read (``output.icechunk``); a run
+        # whose init failed lands here too and records the open error.
+        from zagg.config import get_icechunk
+
+        if get_icechunk(config):
+            _t0 = time.time()
+            try:
+                from zagg.icechunk_refs import record_leaf
+
+                metadata["icechunk"] = record_leaf(
+                    store_root,
+                    grid,
+                    shard_key,
+                    store_kwargs=store_kwargs,
+                    window=window["label"] if window else None,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"icechunk refs failed for shard {shard_key} (fail-open, issue #580): {e}"
+                )
+                metadata["icechunk"] = {"error": f"{type(e).__name__}: {e}"}
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["icechunk"] = time.time() - _t0
     # Write-phase split (issue #249): read/index/aggregate come from
     # ``process_shard``; ``write`` is the leaf write-out above (template +
     # dense chunks + ragged + coverage sidecar + stamp). Same gate as the flat
