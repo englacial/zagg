@@ -222,7 +222,7 @@ def sweep_stage_pass(
     # The Icechunk ref ladder (issue #580 phase 6, spec §11.4): one vetted
     # read of the base repo's block per pass; ``None`` when the store has no
     # companion, and every node's hook is then a no-op. Fail-open (D9).
-    from zagg.icechunk_ladder import STAGE_COUNTS, ladder_context, stage_hook
+    from zagg.icechunk_ladder import STAGE_COUNTS, ladder_context, node_row, stage_hook
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     try:
@@ -245,6 +245,7 @@ def sweep_stage_pass(
         }
         nodes = sorted({_node_at(d, stage["dispatch"]) for d in candidates})
         nodes = [n for n in nodes if scope_admits(n, scope)]
+        icechunk_nodes: list = []
         for node in nodes:
             dirty_windows: set = set()
             for d in by_shard:
@@ -276,7 +277,7 @@ def sweep_stage_pass(
                     store_kwargs=store_kwargs,
                     level_actuals=level_actuals,
                 )
-            stage_hook(
+            hooked = stage_hook(
                 store_root,
                 node,
                 stage,
@@ -288,6 +289,8 @@ def sweep_stage_pass(
                 store_kwargs=store_kwargs,
                 counts=counts,
             )
+            if hooked is not None:
+                icechunk_nodes.append(node_row(hooked))
             if on_node is not None:
                 on_node(node)
         row = {
@@ -297,6 +300,8 @@ def sweep_stage_pass(
             **counts,
             "duration_s": time.perf_counter() - t0,
         }
+        if ladder is not None:
+            row["icechunk_nodes"] = icechunk_nodes
         summary["stages"].append(row)
         if on_stage is not None:
             on_stage(row)

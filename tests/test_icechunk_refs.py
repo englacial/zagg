@@ -1347,6 +1347,16 @@ class TestLadder:
         # The base repo reads every leaf back — dense and ragged — via the ladder.
         group, repo = _open(root)
         messages = [s.message for s in repo.ancestry(branch="main")]
+        # The leaf→snapshot join rides the stage record: each committing node
+        # names the snapshot it landed, and they ARE the repo's own ancestry.
+        by_node = {n["node"]: n for n in rows[3]["icechunk_nodes"]}
+        assert sorted(by_node) == ["1111", "1112"]
+        ancestry = {s.id for s in repo.ancestry(branch="main")}
+        for entry in by_node.values():
+            assert entry["snapshot"] in ancestry
+            assert entry["refs"] > 0 and entry["missing"] == 0 and entry["rebases"] == 0
+            assert entry["commit_s"] >= 0.0
+        assert [n["node"] for n in rows[0]["icechunk_nodes"]] == ["1"]
         # Two o3 node commits (leaves + own o3 overviews) and the root's own.
         assert sorted(m for m in messages if m.startswith("node ")) == [
             "node 1",

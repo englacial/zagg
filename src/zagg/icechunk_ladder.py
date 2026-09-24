@@ -510,6 +510,25 @@ def stage_hook(
         counts["icechunk_s"] = counts.get("icechunk_s", 0.0) + (time.perf_counter() - t0)
 
 
+def node_row(record: dict) -> dict:
+    """A hook record as the stage row carries it — the leaf→snapshot join.
+
+    The snapshot a node committed exists nowhere else: in ladder mode the
+    leaf writes a sidecar and no snapshot of its own, so without this the
+    only surviving id in a run is ``icechunk_init_snapshot`` and "which
+    commit indexed this leaf?" needs a walk of ``repo.ancestry`` (review
+    finding). Flattens ``record["commit"]``'s join keys onto the row; a
+    column or a failed node keeps its own (``column``/``missing``/``error``).
+    """
+    commit = record.get("commit") or {}
+    row = {key: value for key, value in record.items() if key != "commit"}
+    if commit.get("snapshot"):
+        row["snapshot"] = commit["snapshot"]
+        row["rebases"] = int(commit["rebases"])
+        row["commit_s"] = float(commit["commit_s"])
+    return row
+
+
 def local_flag(store_root: str) -> bool:
     return _is_local(store_root)
 
@@ -522,6 +541,7 @@ __all__ = [
     "STAGE_COUNTS",
     "ladder_context",
     "leaf_refs_key",
+    "node_row",
     "pack_units",
     "read_leaf_refs",
     "read_node_refs",
