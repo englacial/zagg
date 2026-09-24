@@ -1302,7 +1302,21 @@ trio, separately, is touched by the
 **local backend only** — as is the refusal manifest above, for the same reason
 (D8 keeps the Lambda dispatcher from writing to the store, and the handler has
 no once-per-run root-write mode yet; both wait on the same resolution — PR #397
-question (10)).
+question (10)). The **Icechunk companion repo** (`icechunk/{order}/`, below)
+is outside the touch contract as well: `touch_current_unit` assembles a unit
+footprint of leaf tree + stats sidecar + `granules.json` + sub-map + declared
+column, `touch_store_root` covers the root trio, and neither reaches the repo
+— so an all-skip rerun, which reopens the repo and commits nothing, refreshes
+every leaf and nothing in the index. The repo is not a root-trio-style
+self-copy candidate either: it is *many* objects (snapshots, manifests,
+chunk-ref manifests, the branch ref), so touching it is O(objects in the repo)
+rather than three known keys. Nor does it degrade gracefully the way a missing
+sidecar does — lose one snapshot or manifest and the branch tip is unreadable,
+i.e. the whole order's index goes, not one leaf's refs. The operator lever is
+therefore a **prefix-scoped exclusion on `icechunk/`** in the expiration rule
+(one prefix, one rule, no per-shard fan-out), not a writer-side touch; the
+index is regenerable by a full rerun, but nothing in stage 1 regenerates it
+on its own ([issue #580](https://github.com/englacial/zagg/issues/580)).
 
 **There is no lifecycle rule that separates leaves from the ancestor
 artifacts above them.** An S3 lifecycle filter keys on prefix, object tags,
