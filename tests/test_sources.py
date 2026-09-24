@@ -386,17 +386,18 @@ class TestPageSearch:
         assert "=b'" not in str(excinfo.value)
 
     def test_exhausted_raise_decodes_the_snippet_with_replacement(self, fake_requests, monkeypatch):
-        # A byte slice can cut a multi-byte character in half, and an error
-        # page can be in any encoding: the message must never fail to build.
+        # An error page can be in any encoding, and the byte slice can cut a
+        # multi-byte character in half: the 1-byte invalid prefix leaves the
+        # 200-byte slice ending on the first byte of an "é", so the snippet
+        # carries a replacement at both ends and the message still builds.
         monkeypatch.setattr(sources.time, "sleep", lambda s: None)
         page = _non_json(text="x")
-        page.content = b"\xff\xfe" + "é".encode() * sources._BODY_SNIPPET
+        page.content = b"\xff" + "é".encode() * sources._BODY_SNIPPET
         fake_requests([page] * _RETRY_ATTEMPTS)
         with pytest.raises(ValueError, match=rf"after {_RETRY_ATTEMPTS} attempts") as excinfo:
             _page_search("https://cmr/search", params={})
         msg = str(excinfo.value)
-        assert "\ufffd\ufffd" in msg
-        assert "é" * 90 in msg
+        assert "'\ufffd" + "é" * 99 + "\ufffd'" in msg
 
     def test_exhausted_raise_is_a_named_value_error_subclass(self, fake_requests, monkeypatch):
         # Named so a caller can tell "the endpoint answered garbage for every
