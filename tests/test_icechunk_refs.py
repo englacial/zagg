@@ -745,6 +745,9 @@ class TestWorkerWiring:
         assert row["icechunk_snapshot"] == ice["snapshot"]
         assert row["icechunk_rebases"] == 0 and row["icechunk_refs"] == ice["refs"]
         assert row["icechunk_error"] is None and row["icechunk_skipped"] is None
+        # The checksum FORM is a column of its own: it varies by store scheme,
+        # so no other column derives it (file:// here, ETag on S3).
+        assert row["icechunk_checksum"] == "last_modified"
 
     def test_missing_repo_fails_open_after_the_stamp(self, monkeypatch, cfg, tmp_path, caplog):
         import logging
@@ -836,6 +839,7 @@ def test_flatten_record_coerces_a_non_dict_block():
     row = flatten_record(build_record(shard_key=1, metadata={"icechunk": "ok"}, granule_ids=["g"]))
     assert row["icechunk_snapshot"] is None and row["icechunk_refs"] is None
     assert row["icechunk_error"] is None and row["icechunk_skipped"] is None
+    assert row["icechunk_checksum"] is None
 
 
 class TestLocalRunEndToEnd:

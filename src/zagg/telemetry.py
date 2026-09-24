@@ -589,7 +589,12 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     row["invoked_by_userid"] = ident.get("userid")
     # Icechunk refs commit (issue #580): the scalars a fleet run's contention
     # question reads straight off the parquet — ``rebases`` and ``commit_s``
-    # per leaf — plus the snapshot for joining a leaf to the repo's history.
+    # per leaf — plus the snapshot for joining a leaf to the repo's history,
+    # and ``checksum``, the form the leaf's refs carry (``"etag"`` on an object
+    # store, ``"last_modified"`` on a local one, §11.3). ``checksum`` is here
+    # because it varies by STORE SCHEME rather than by run, so "did this run's
+    # refs land with staleness detection, and in which form?" is not derivable
+    # from any other column (review finding).
     # Coerced, never dereferenced blind: ``metadata`` is not always locally
     # built — the dispatcher's stale-worker path (``runner._lambda_result_rows``)
     # passes the JSON body a remote worker returned — so a version-skewed body
@@ -601,6 +606,7 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     row["icechunk_refs"] = ice.get("refs")
     row["icechunk_rebases"] = ice.get("rebases")
     row["icechunk_commit_s"] = ice.get("commit_s")
+    row["icechunk_checksum"] = ice.get("checksum")
     row["icechunk_skipped"] = ice.get("skipped")
     row["icechunk_error"] = ice.get("error")
     return row
