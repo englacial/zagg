@@ -855,8 +855,10 @@ regionally heterogeneous resolution).
   clean level.
 
 An overview also carries the standard D4 **commit stamp** as its final
-write: an unstamped overview prefix is debris, exactly as for leaves.
-Write order is pinned — template, arrays, `role`/provenance attrs, stamp
+write: an unstamped overview prefix is debris, exactly as for leaves. The
+stamp carries the §5.3 `content_hashes` record over the overview's own
+arrays when one was computed (keyed only then — absence reads unverifiable,
+never tampered). Write order is pinned — template, arrays, `role`/provenance attrs, stamp
 LAST — so presence of the stamp certifies the `role` attr landed; a reader
 MUST ignore unstamped overview prefixes.
 
@@ -1491,13 +1493,16 @@ guessed at.
 ```json
 "morton_hive_commit": {"spec": "morton-hive/1", "complete": true,
                        "cells_with_data": 3, "granule_count": 1,
+                       "content_hashes": {"arrays": {"…": "…"}, "combined": "…"},
                        "written_at": "2026-08-05T00:00:00+00:00"}
 ```
 
   `cells_with_data` is the populated-cell count of the group named by
   `cells_with_data_order`; `granule_count` is the **leaf's** granule count,
-  not a column quantity; and a column stamp carries **no `coverage`
-  payload** (a leaf's does), so a stamp reader MUST NOT require one. On a
+  not a column quantity; `content_hashes` is the §5.3 record over the
+  column's own arrays, keyed only when one was computed; and a column stamp
+  carries **no `coverage` payload** (a leaf's does), so a stamp reader MUST
+  NOT require one. On a
   **windowed** store the column's stamp is `spec: "morton-hive/2"` and
   carries the D15 half exactly as the leaf's does — `window` plus the
   observed `time_range` — so a reader that strict-checks the `spec` marker
@@ -2076,6 +2081,15 @@ dense + ragged writes, coverage sidecar, commit stamp), so writer↔spec
 drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
+
+The leaf fixtures were committed before this revision and are
+unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
+`dggs` block carries the §1 `latitude` token, so each fixture is the
+absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
+for both (the sidecar copy and §1's own evidence paragraph are the record
+for what those artifacts mean). Regeneration is deferred because it would
+also install the §4.9 `multiscales` mirror that `column/` pins the
+**absence** of, retiring an unrelated pin.
 
 Seven tiny single-shard hive stores plus two metadata-only ones (the
 `pyramid/` declaration and the `multiscales/` companion), all on the same
