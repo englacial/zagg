@@ -208,6 +208,20 @@ class TestOptions:
         with pytest.raises(ValueError, match="shard_order"):
             icechunk_refs.resolve_options(self._cfg(cfg, split_order=5), 4)
 
+    def test_ladder_commit_at_the_shard_order_is_refused(self, cfg):
+        # No stage tuple's [dispatch, child_order) range contains the shard
+        # order, so a ladder commit there gathers no leaf sidecar at all.
+        with pytest.raises(ValueError, match="no stage tuple covers the shard order"):
+            icechunk_refs.resolve_options(self._cfg(cfg, commit_order=4), 4)
+        with pytest.raises(ValueError, match="no stage tuple covers the shard order"):
+            icechunk_refs.resolve_options(self._cfg(cfg, commit_order=4, split_order=4), 4)
+        # ``commit: "leaf"`` commits per leaf and is unaffected.
+        assert icechunk_refs.resolve_options(self._cfg(cfg, commit="leaf", commit_order=4), 4) == {
+            "commit": "leaf",
+            "commit_order": 4,
+            "split_order": 4,
+        }
+
     def test_block_shape_is_validated(self, cfg):
         from zagg.config import validate_config
 

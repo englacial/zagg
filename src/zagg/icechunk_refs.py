@@ -161,7 +161,9 @@ def resolve_options(config, shard_order: int, *, tuple_width: int | None = None)
     ``split_order = commit_order``. Validation (§11.5): a commit must write
     whole manifests, so ``split_order >= commit_order``; both at most the
     shard order (a leaf is the finest thing a commit or a manifest can be
-    keyed to); ``commit_order`` non-negative.
+    keyed to); ``commit_order`` non-negative. Under ``commit: "ladder"`` the
+    shard order itself is refused: no stage tuple's ``[dispatch, child_order)``
+    range contains it, so it would commit no leaf refs at all.
     """
     from zagg.config import get_icechunk_options
 
@@ -181,6 +183,18 @@ def resolve_options(config, shard_order: int, *, tuple_width: int | None = None)
     if not 0 <= commit_order <= shard_order:
         raise ValueError(
             f"output.icechunk.commit_order {commit_order} must lie in [0, shard_order {shard_order}]"
+        )
+    if commit == "ladder" and commit_order == shard_order:
+        # Every stage tuple covers orders ``[dispatch, child_order)`` with
+        # ``child_order <= shard_order``, so no tuple's range contains the
+        # shard order itself: the committing role would never be assigned, no
+        # leaf sidecar would ever be gathered, and the base group would stay
+        # empty while the run record showed commits (review finding).
+        raise ValueError(
+            f"output.icechunk.commit_order {commit_order} must lie in [0, shard_order "
+            f"{shard_order}) under commit: 'ladder' — no stage tuple covers the shard "
+            f"order itself, so no leaf refs would be gathered; use commit: 'leaf' for "
+            f"per-leaf commits (spec §11.4)"
         )
     if not commit_order <= split_order <= shard_order:
         raise ValueError(
