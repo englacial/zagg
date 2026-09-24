@@ -1082,7 +1082,12 @@ def write_stage_column(
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
     from zagg.store import open_store
-    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
+    from zagg.sweep_overview import (
+        ROLE_ATTR,
+        _overview_config,
+        _populated_mask,
+        _staged_hashes,
+    )
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     store_kwargs = dict(store_kwargs or {})
@@ -1145,6 +1150,10 @@ def write_stage_column(
         }
     )
     populated = _populated_mask(folded[resolutions[0]], fields)
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
+    # sidecar carries the SAME record — ``_write_sidecar`` takes the finished
+    # record, not the staged slabs, exactly as ``column.write_column`` does.
+    hashes = _staged_hashes(store, staged, f"stage column {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
@@ -1152,17 +1161,22 @@ def write_stage_column(
         window=window,
         time_range=time_range if window is not None else None,
         run_id=run_id,
+        content_hashes=hashes,
     )
-    _write_sidecar(
-        store,
-        path,
-        morton_word(node),
-        staged,
-        int(populated.sum()),
-        granule_count,
-        window,
-        store_kwargs,
-    )
+    # No record -> no sidecar, the leaf column's gate: a hash-less sidecar on
+    # a rewrite reads as a stale-or-absent ambiguity, and the stamp above
+    # already stands without the key (spec §5.3, unverifiable not tampered).
+    if hashes is not None:
+        _write_sidecar(
+            store,
+            path,
+            morton_word(node),
+            hashes,
+            int(populated.sum()),
+            granule_count,
+            window,
+            store_kwargs,
+        )
     return basename
 
 
