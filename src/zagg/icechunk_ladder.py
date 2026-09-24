@@ -75,6 +75,7 @@ STAGE_COUNTS = (
     "icechunk_failed",
     "icechunk_skipped_levels",
     "icechunk_clean",
+    "icechunk_regathered",
     "icechunk_s",
 )
 
