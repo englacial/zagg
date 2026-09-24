@@ -438,18 +438,24 @@ def level_grids(manifest: dict, grid) -> dict:
         return levels
     config = _overview_config(fields)
     for entry in block.get("datasets") or []:
-        node, (cells,), artifact = int(entry["order"]), entry["cells"], entry.get("artifact")
-        cells = int(cells)
-        if cells in levels:
-            # A column member declared AT the store's cell order (a chunk
-            # order equal to the cell order, a test geometry) duplicates the
-            # base leaves; the base is the level, the member is not indexed.
-            continue
-        levels[cells] = {
-            "grid": HealpixGrid(node, cells, config=config, sharded=True),
-            "node": node,
-            "artifact": artifact,
-        }
+        node, artifact = int(entry["order"]), entry.get("artifact")
+        # EVERY cell resolution the entry declares is its own level, at that
+        # entry's node order and artifact: ``expand_overviews`` puts the whole
+        # declared leaf run on the one shard-node entry, so ``overviews: [13,
+        # 12]`` gives ``{"order": 9, "cells": [13, 12]}`` — two column levels,
+        # not one (review finding).
+        for cells in (int(c) for c in entry["cells"]):
+            if cells in levels:
+                # A column member declared AT the store's cell order (a chunk
+                # order equal to the cell order, a test geometry) duplicates
+                # the base leaves; the base is the level, the member is not
+                # indexed.
+                continue
+            levels[cells] = {
+                "grid": HealpixGrid(node, cells, config=config, sharded=True),
+                "node": node,
+                "artifact": artifact,
+            }
     return levels
 
 

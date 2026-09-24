@@ -282,6 +282,31 @@ class TestInit:
         messages = [s.message for s in repo.ancestry(branch="main")]
         assert messages[0] == f"init {RUN_ID}"
 
+    def test_a_two_member_leaf_declaration_is_two_column_levels(self, cfg, tmp_path):
+        # ``expand_overviews`` puts EVERY declared leaf resolution on the one
+        # shard-node entry, so ``overviews: [5, 4]`` (contiguous, both
+        # strictly interior, so ``validate_overviews``-clean) mirrors as a
+        # single ``{"order": 3, "cells": [5, 4]}`` dataset — two column
+        # levels. Unpacking one ``cells`` raised out of ``repo_group_spec``
+        # and the fail-open runner lost the whole companion (review finding).
+        from zagg.column import leaf_level_cells
+
+        cfg.output["pyramid"] = {"overviews": [5, 4]}
+        grid = HealpixGrid(3, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+        root = str(tmp_path / "store")
+        out = icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
+        # Base 6, the two declared column members 5 and 4, the ladder 3/2/1.
+        assert out["ladder"] == [1, 2, 3, 4, 5, 6]
+        assert leaf_level_cells(cfg, grid) == [5, 4]
+        levels = out["levels"]
+        assert [levels[k]["artifact"] for k in ("6", "5", "4")] == ["leaf", "column", "column"]
+        assert {levels[k]["node_order"] for k in ("6", "5", "4")} == {3}
+        group, _repo = _open(root)
+        assert {k for k, _ in group.members()} == {"1", "2", "3", "4", "5", "6"}
+        # Each column level is its own whole-sphere array at its cells.
+        assert group["5"]["count"].shape[0] == 12 * 4**5
+        assert group["4"]["count"].shape[0] == 12 * 4**4
+
     def test_arrays_are_rerooted_on_the_order(self, cfg, tmp_path):
         grid = _grid(cfg)
         root = str(tmp_path / "store")
