@@ -3377,8 +3377,9 @@ Each **populated** inner chunk is recorded as one virtual reference:
 - **sharded leaf array** (every hive leaf, §1.5): `location` is the leaf's
   single shard object — the array's **outer**-chunk key, `{leaf}/{p}/c/0` for
   the 1-D cells arrays the hive writes — and `offset`/`length` are the
-  chunk's entry in the shard index suffix, the two `u64` words the §1.5 2-GET
-  recipe already reads. An inner chunk the index marks **absent** (the
+  chunk's entry in the shard index suffix, the same two `u64` words the §1.5
+  2-GET recipe reads — the writer fetches that suffix itself, once per array
+  (§11.4). An inner chunk the index marks **absent** (the
   `2^64 − 1` sentinel in both words) gets **no reference** and reads as
   `fill_value`.
 - **regular (unsharded) leaf array**: `location` is the chunk object
@@ -3440,6 +3441,19 @@ reuses those keys, their refs resolve to a **live** object rather than
 instead of a silent mis-decode. Icechunk's garbage collection does not manage
 virtual targets, and stage 1 does not pin history across a replacement
 (stage 2's content-pinned keys do).
+
+**The reads the writer performs.** Recording refs costs I/O — the offsets
+come out of the leaf's own index, but the sizes and ETags do not. After the
+leaf write, for each array the leaf wrote the worker issues:
+
+- **sharded array**: one ranged `GET` of the shard index suffix (the §1.5
+  recipe's second read, which yields every inner chunk's `(offset, length)`
+  at once) **and** one `HEAD` of the shard object, for its `ETag` (§11.3);
+- **regular array**: one `HEAD` per chunk object, for that object's size
+  (the ref's `length`) and its `ETag`.
+
+That is one HEAD plus one ranged GET per sharded array per leaf, and one HEAD
+per unsharded chunk object — small beside the leaf write, but not nothing.
 
 Writing the refs is **fail-open** (D9): a refs failure is logged and recorded
 in the leaf's D20 stats sidecar (`icechunk.error`) and never fails the leaf
