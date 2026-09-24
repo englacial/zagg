@@ -628,6 +628,158 @@ class TestWorkerWiring:
         assert not (tmp_path / "store" / "icechunk").exists()
 
 
+class TestRunRecord:
+    """Phase 5: the run parquet's two run-level icechunk columns."""
+
+    @staticmethod
+    def _rows():
+        from zagg.telemetry import build_record, flatten_record
+
+        return [
+            flatten_record(build_record(shard_key=1, metadata={"total_obs": 1}, granule_ids=["g"]))
+        ]
+
+    def test_columns_broadcast_the_init_record(self, tmp_path):
+        import pandas as pd
+
+        from zagg.telemetry import write_run_parquet
+
+        init = {"path": f"{tmp_path}/icechunk/4", "snapshot": "SNAP", "created": True}
+        path = write_run_parquet(str(tmp_path), self._rows(), run_id="abc", icechunk_init=init)
+        df = pd.read_parquet(path)
+        assert df["icechunk_repo"].tolist() == [f"{tmp_path}/icechunk/4"]
+        assert df["icechunk_init"].tolist() == ["SNAP"]
+        # A fail-open init records its error in the same column.
+        path = write_run_parquet(
+            str(tmp_path), self._rows(), run_id="abd", icechunk_init={"error": "RuntimeError: x"}
+        )
+        df = pd.read_parquet(path)
+        assert df["icechunk_repo"].isna().all() and df["icechunk_init"].tolist() == [
+            "RuntimeError: x"
+        ]
+        # Off-hive / opted out: both null, columns still present.
+        df = pd.read_parquet(write_run_parquet(str(tmp_path), self._rows(), run_id="abe"))
+        assert df["icechunk_repo"].isna().all() and df["icechunk_init"].isna().all()
+
+    def test_dispatch_event_carries_the_record(self, monkeypatch):
+        from zagg import runner
+
+        client = _Client(_envelope({"ok": True}))
+        runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/p",
+            self._rows(),
+            run_id="abc",
+            icechunk_init={"path": "s3://b/p/icechunk/4", "snapshot": "SNAP"},
+        )
+        ((_kind, event),) = client.events
+        assert event["mode"] == "stats"
+        assert event["icechunk_init"] == {"path": "s3://b/p/icechunk/4", "snapshot": "SNAP"}
+
+
+class TestLocalRunEndToEnd:
+    """Phase 5: a local-backend run — init, leaves, refs, run record — end to end."""
+
+    def test_two_leaves_read_back_as_one_order(self, monkeypatch, cfg, tmp_path):
+        import pandas as pd
+
+        import zagg.processing as processing
+        from zagg import runner
+
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        cfg.output["grid"] = {
+            **cfg.output.get("grid", {}),
+            "type": "healpix",
+            "parent_order": 4,
+            "child_order": 6,
+            "chunk_inner": 5,
+        }
+        cfg.output["sweep"] = False  # the rollup sweep is not under test
+        shards = _shards(grid, 2)
+        monkeypatch.setattr(
+            runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a", "secretAccessKey": "s"}
+        )
+        monkeypatch.setattr(runner, "_check_signature", lambda *a, **k: None)
+
+        def fake(g, shard_key, urls, **kwargs):
+            for i, (block, _children) in enumerate(g.iter_chunks(int(shard_key))):
+                if i == 2:
+                    continue  # one absent inner chunk per leaf: no ref, reads fill
+                carrier = _carrier(g, shard_key, float(shards.index(int(shard_key)) + 1) * 10 + i)
+                local = g.shard_local_region(block, int(shard_key))
+                rag = {"h": ([np.array([1.0, 2.0], dtype=np.float32)], [0])} if i == 0 else {}
+                kwargs["chunk_results"].append((block, carrier.iloc[local[0]], rag))
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 12,
+                "total_obs": 12,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "error": None,
+                "phase_timings": {"read": 0.0, "index": 0.0, "aggregate": 0.0},
+            }
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        catalog = {
+            "metadata": {"short_name": "ATL06", "version": "007"},
+            "grid_signature": {"type": "healpix", "parent_order": 4, "child_order": 6},
+            "shard_keys": shards,
+            "granules": [[{"id": f"g{i}", "s3": f"s3://b/g{i}.h5"}] for i in range(len(shards))],
+        }
+        root = str(tmp_path / "store")
+        summary = runner._run_local(
+            cfg,
+            catalog,
+            root,
+            6,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=2,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+        assert summary["cells_with_data"] == 2 and summary["cells_error"] == 0
+        init = summary["icechunk"]
+        assert init["created"] is True and init["path"] == f"{root}/icechunk/4"
+        # Every leaf committed its refs on top of the init commit.
+        for meta in summary["results"]:
+            assert meta["icechunk"]["refs"] > 0 and "error" not in meta["icechunk"]
+        group, repo = _open(root, 4)
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        assert (
+            len(messages) == len(shards) + 2
+            and messages[-2] == f"init {summary['results'][0]['stats']['run_id']}"
+        )
+        # The order reads as one zarr: dense values equal the leaf reads, the
+        # ragged raw bytes match cell for cell, absent chunks are fill.
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            span = slice(rank * 16, (rank + 1) * 16)
+            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            for name in ("count", "h_mean", "morton"):
+                np.testing.assert_array_equal(group["6"][name][span], leaf[name][:])
+            assert np.isnan(group["6"]["h_mean"][span][8:12]).all()  # inner chunk 2
+            assert [bytes(a) for a in group["6"]["h"][span]] == [bytes(b) for b in leaf["h"][:]]
+        # The run parquet carries the init as run-level columns and each leaf's
+        # commit as row columns.
+        df = pd.read_parquet(summary["run_stats_path"])
+        assert set(df["icechunk_repo"]) == {init["path"]} and set(df["icechunk_init"]) == {
+            init["snapshot"]
+        }
+        # Two workers on local storage: the commit lock serializes them, and a
+        # session opened before the other's commit rebases once — the counter
+        # the fleet's contention question reads. Never more than one here.
+        assert set(df["icechunk_rebases"]) <= {0, 1} and df["icechunk_rebases"].sum() <= 1
+        assert set(df["icechunk_snapshot"]) == set(
+            m["icechunk"]["snapshot"] for m in summary["results"]
+        )
+        assert df["icechunk_commit_s"].notna().all()
+
+
 class TestKnob:
     def test_default_on_for_hive_off_otherwise(self, cfg):
         from zagg.config import get_icechunk

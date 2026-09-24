@@ -760,6 +760,7 @@ def write_run_parquet(
     timestamp: str | None = None,
     store_kwargs: dict | None = None,
     finalize_error: str | None = None,
+    icechunk_init: dict | None = None,
 ) -> str:
     """PUT the run-level stats parquet at the store root (issue #297 phase 3).
 
@@ -781,6 +782,12 @@ def write_run_parquet(
     across the rows like ``run_id``/``n_shards`` already are, so a postmortem
     can tell "finalize failed" from "the run never happened" off the parquet
     alone. Always written, so the column set is the same every run.
+
+    ``icechunk_init`` (issue #580) is the run's companion-repo init record
+    (``summary["icechunk"]``): two more run-level columns, ``icechunk_repo``
+    (the repo path) and ``icechunk_init`` (the init snapshot id, or the
+    fail-open error string), so a run's leaves join to the repo history they
+    were committed into. ``None`` (knob off, non-hive) writes both null.
     """
     import tempfile
 
@@ -794,6 +801,9 @@ def write_run_parquet(
     df = pd.DataFrame(rows)
     # Run-level (issue #335): constant down the column, None on a clean run.
     df["finalize_error"] = finalize_error
+    init = icechunk_init or {}
+    df["icechunk_repo"] = init.get("path")
+    df["icechunk_init"] = init.get("snapshot") or init.get("error")
     # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
     # the DataFrame's float64 inference on a column that mixes ints with
     # failure-row ``None``s silently corrupts them (issue #300 — the sweep's

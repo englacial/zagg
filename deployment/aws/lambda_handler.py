@@ -1586,6 +1586,9 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
             # defers a finalize failure through its tail, so this is where the
             # failure becomes durable. Absent on a pre-#335 dispatcher -> None.
             finalize_error=event.get("finalize_error"),
+            # Run-level companion init record (issue #580); absent on a
+            # pre-#580 dispatcher -> both columns null.
+            icechunk_init=event.get("icechunk_init"),
         )
         # Tail-completion marker (issue #327): the stats leg is the recorded
         # end of the post-run tail, so a reattached handle can skip a tail

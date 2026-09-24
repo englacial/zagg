@@ -361,7 +361,11 @@ class TestDispatch:
         _run(catalog, client=stub).dispatch().wait(timeout=10)
         modes = stub.modes()
         first_cell = modes.index(None)
-        assert modes[:first_cell] == ["ping", "setup", "icechunk_init"]  # fail-fast ping, then manifest write
+        assert modes[:first_cell] == [
+            "ping",
+            "setup",
+            "icechunk_init",
+        ]  # fail-fast ping, then manifest write
         setup_invocations = [(t, e["mode"]) for _, t, e in stub.events if e.get("mode")]
         assert ("RequestResponse", "ping") in setup_invocations
         assert ("Event", "setup") in setup_invocations

@@ -1333,6 +1333,79 @@ cap. The honest options today are:
    are open; see PR #397 question (10) for the related fleet-side root
    touch.
 
+## The Icechunk companion repo
+
+Every hive leaf commit also records the leaf's inner chunks as Icechunk
+**virtual chunk references** in a companion repository per pyramid order at
+the store root — [specification §11](specification.md#11-icechunk-companion-repos)
+is the contract ([issue #580](https://github.com/englacial/zagg/issues/580),
+stage 1: refs-only, additive; the leaves stay normative):
+
+```
+{store_root}/
+  morton_hive.json
+  coverage.moc
+  icechunk/{shard_order}/         <- one Icechunk repo per order (reserved name)
+  {sign+base}/...                 <- the digit tree, unchanged
+```
+
+The repo is one zarr hierarchy per order: the leaf's resolution group
+(`{cell_order}/`, `dggs` attrs included) with every leaf array re-rooted on
+the whole order — `count`, `morton`, every field, the ragged vlen arrays and
+their siblings — chunked at the leaf's **inner** chunk and coded with the
+inner chain (no `sharding_indexed`), so `icechunk` + `zarr` (or icechunk-js
+in a browser) open the hive as ordinary arrays without moczarr. A leaf at
+shard rank `r` owns global chunks `[r·C, (r+1)·C)` (spec §11.3); absent inner
+chunks emit no reference and read as fill; every reference into an S3
+container carries the object's ETag as its checksum, so a leaf replaced
+in place fails loudly instead of decoding stale offsets.
+
+Two writes, both worker-side (the dispatcher never writes, D8), both
+**fail-open** — the repo is a regenerable index, never load-bearing:
+
+- **`mode: "icechunk_init"`**, one synchronous invoke after the ping and
+  before the fan-out (the local backend calls
+  `zagg.icechunk_refs.init_repo` in-process after the manifest lands):
+  creates-or-opens the repo, defines the array nodes, the manifest split
+  and the virtual chunk container, and commits `init {run_id}`. Idempotent
+  — a rerun reopens. The record (`path`, `snapshot`, `created`, `split`) rides
+  the run summary under `icechunk`; a failed init records `{"error": …}`
+  there and the run proceeds refs-less.
+- **Per-leaf refs at commit**: right after the leaf's stamp (and the
+  granule-id sibling), the worker sizes the objects it wrote (one HEAD + one
+  ranged GET of the shard-index suffix per sharded array, one LIST per
+  regular array), writes the refs, and commits `leaf {decimal}` with
+  rebase-on-conflict (icechunk's `ConflictDetector`; leaves touch disjoint
+  chunk ranges, so a rebase always succeeds). The outcome rides the leaf's
+  stats sidecar as `icechunk` — `{path, snapshot, arrays, refs, rebases,
+  commit_s, checksum}`, `{skipped: "windowed" | "empty"}`, or `{error}` — and
+  the run parquet as `icechunk_*` columns; `rebases` and `commit_s` are what
+  the first fleet run reports for the commit-contention question. Its cost
+  is its own `phase_timings["icechunk"]`, not `write`.
+
+`output.icechunk: false` opts a hive run out (default on; excluded from the
+D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves, raster
+hive products and the sweep's overviews are outside stage 1 (spec §11.6).
+
+Reading it back:
+
+```python
+import icechunk, zarr
+from zagg.icechunk_refs import container_prefix, repo_path
+
+root = "s3://bucket/product"
+storage = icechunk.s3_storage(bucket="bucket", prefix="product/icechunk/9", from_env=True)
+repo = icechunk.Repository.open(
+    storage, authorize_virtual_chunk_access={container_prefix(root): icechunk.s3_from_env_credentials()}
+)
+group = zarr.open_group(repo.readonly_session("main").store, mode="r")
+count = group["19/count"]          # shape 12·4^19, chunks 4^6 — the whole order
+```
+
+The manifest split (spec §11.5) is one manifest per order-`N` cell — at the
+production geometry `N = 7`, 4,096 chunks, 16 leaves — recorded in the repo
+root's `zagg_icechunk.split` block, so a reader never assumes it.
+
 ## Raster hive stores (issue #247)
 
 Raster (pull-NN) pipelines write the same tree with **windowed `(time, cells)`
