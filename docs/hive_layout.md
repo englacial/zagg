@@ -1373,8 +1373,11 @@ Two writes, both worker-side (the dispatcher never writes, D8), both
   — a rerun reopens. The record (`path`, `snapshot`, `created`, `split`) rides
   the run summary under `icechunk`; a failed init records `{"error": …}`
   there and the run proceeds refs-less.
-- **Per-leaf refs at commit**: right after the leaf's stamp (and the
-  granule-id sibling), the worker sizes the objects it wrote (one HEAD + one
+- **Per-leaf refs at commit**: after the leaf's stamp — last in the unit,
+  behind the granule-id sibling and the [issue #383](https://github.com/englacial/zagg/issues/383)
+  column fold, which is the final post-stamp phase that can still fail the
+  unit (a failed unit is retried, and the retry rewrites leaf + column
+  wholesale) — the worker sizes the objects it wrote (one HEAD + one
   ranged GET of the shard-index suffix per sharded array, one LIST per
   regular array), writes the refs, and commits `leaf {decimal}` with
   rebase-on-conflict (icechunk's `ConflictDetector`; leaves touch disjoint

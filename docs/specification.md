@@ -3478,7 +3478,11 @@ new location before its refs resolve.
   carries the nodes is reopened, never re-templated.
 - `leaf {decimal}` — one commit per leaf, written **by the worker that
   committed the leaf, after its stamp** (D4: the stamp certifies the objects
-  the refs point at). It records every array the leaf wrote, dense and
+  the refs point at) and **last in the unit**, behind every post-stamp phase
+  that can still fail it — a failed unit is retried, and the retry replaces
+  the leaf wholesale (§1.5), so refs recorded ahead of such a phase would
+  leave the branch tip, not merely a superseded snapshot, indexing the
+  discarded attempt's offsets. It records every array the leaf wrote, dense and
   ragged. Concurrent leaf commits touch disjoint chunk ranges of the same
   arrays, so a lost compare-and-swap on the branch ref is resolved by a local
   rebase and retry (Icechunk's conflict detector reports no conflict);
