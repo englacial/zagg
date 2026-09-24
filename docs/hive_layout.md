@@ -1392,7 +1392,9 @@ Two writes, both worker-side (the dispatcher never writes, D8), both
   and the virtual chunk container, and commits `init {run_id}`. Idempotent
   — a rerun reopens. The record (`path`, `snapshot`, `created`, `split`) rides
   the run summary under `icechunk`; a failed init records `{"error": …}`
-  there and the run proceeds refs-less.
+  there and the run proceeds refs-less. The run parquet broadcasts it as
+  `icechunk_init_repo`, `icechunk_init_snapshot` and `icechunk_init_error`,
+  always written so the column set does not vary run to run.
 - **Per-leaf refs at commit**: after the leaf's stamp — last in the unit,
   behind the granule-id sibling and the [issue #383](https://github.com/englacial/zagg/issues/383)
   column fold, which is the final post-stamp phase that can still fail the
