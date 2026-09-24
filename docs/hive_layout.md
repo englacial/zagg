@@ -1117,7 +1117,7 @@ Three verdicts:
 
 | verdict | when | what happens |
 |---|---|---|
-| **current** | both halves match, leaf stamped, column agrees with the declaration | fold no-ops; the unit writes **nothing** (no arrays, no stamp, no sidecar, no sub-map, no column — zero sweep dirtiness); the lifecycle touch below runs; counted as `cells_current` |
+| **current** | both halves match, leaf stamped, column agrees with the declaration | fold no-ops; the unit writes **nothing** (no arrays, no stamp, no sidecar, no sub-map, no column — zero sweep dirtiness, with one exception: a unit whose touch moved its Icechunk ref checksums and rewrote its ladder ref sidecar enters the staged sweep as *dirt-only*, [below](#the-lifecycle-touch)); the lifecycle touch below runs; counted as `cells_current` |
 | **refused** | the planned set drops recorded ids: `recorded ∖ planned ≠ ∅` — deliberately *not* strict-subset, so a shardmap that grew while silently dropping old granules (an upstream purge behind a fresh catalog query) still trips it | the unit refuses, writes nothing, and counts as `cells_refused` — never as an error. The log names the **first five** missing ids and their total; the **full per-unit diff is the refusal manifest** at the store root ([below](#the-refusal-manifest)). `--allow-contraction` (`agg(allow_contraction=True)`; on Lambda an `allow_contraction` event field) turns it into a normal rewrite |
 | **rewrite** | everything else — expansion (new cycles), a semantic change, no/unreadable sidecar, an unstamped leaf, column drift, or a pre-#388 sidecar (below) | today's wholesale D4 rewrite, column included |
 
@@ -1312,10 +1312,14 @@ covers the root trio, and neither reaches the repo. The touch does move the
 checksum every ref into the unit carries (spec §11.3: the `file://` mtime; the
 ETag of a multipart-uploaded S3 object, which a self-copy re-mints), so a
 touched unit re-plans its refs from fresh HEADs: under `commit: "leaf"` it
-commits them at once; under the ladder it rewrites its ref sidecar, and the
-refs read again once a staged re-gather covers its node — a skipped unit is
-not in the run's dirty set, so until then (or a manual staged sweep) that
-leaf's refs fail loudly on read (PR #581 question (11)). The ref sidecar's touch is unconditional: it is issued even when
+commits them at once; under the ladder it rewrites its ref sidecar and is
+marked `icechunk_dirty`, and the same run's staged sweep (`output.sweep:
+"stages"`) takes it as a **dirt-only** leaf: its nodes re-gather and commit
+their refs, but no overview or column is re-folded, since no data changed
+(each stage row counts them as `icechunk_regathered`; PR #581 question (11),
+ruled (a)). This narrows the #388 contract: a current unit writes no stats
+record, no sidecar and no sub-map, but it may enter the sweep work set as
+dirt-only when its touch moved ref checksums and the repo is on. The ref sidecar's touch is unconditional: it is issued even when
 `output.icechunk` is off or the run used `commit: "leaf"`, where the object
 does not exist — harmless (an absent sibling is neither touched nor failed),
 at the cost of one extra request per unit on an all-skip rerun. The repo is not a root-trio-style
@@ -1446,7 +1450,8 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
   manifest count at the base's (spec §11.5).
   Each stage row records `icechunk_commits`, `icechunk_rebases`,
   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
-  `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean` and
+  `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
+  `icechunk_regathered` (dirt-only nodes, re-gathered without a fold) and
   `icechunk_s` (the hook's own wall time, the gather included), plus an
   `icechunk_nodes` list naming each node that did work and the snapshot it
   committed; the first fleet run's contention question reads

@@ -3569,7 +3569,8 @@ columns do:
    touch disjoint chunk ranges), and each stage row records
    `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
    `icechunk_refs`, `icechunk_missing`, `icechunk_failed`,
-   `icechunk_skipped_levels`, `icechunk_clean` and `icechunk_s` — every one
+   `icechunk_skipped_levels`, `icechunk_clean`, `icechunk_regathered` and
+   `icechunk_s` — every one
    pre-seeded, so a row's key set does not depend on whether a node did work
    — plus `icechunk_nodes`, one entry per node that did, carrying the
    snapshot it committed (the leaf→snapshot join).
@@ -3578,7 +3579,10 @@ columns do:
    beneath them — not over every candidate node: a node whose whole subtree
    is clean had its refs committed by the run that dirtied it, so it is
    skipped whole and counted (`icechunk_clean`). An append therefore costs
-   O(dirty), not O(store). A full re-gather (repairing a repo against the
+   O(dirty), not O(store). A **dirt-only** leaf (§11.6) joins the dirty set
+   for the ladder alone: a node with dirt-only leaves and no dirty one runs
+   the gather and commit, folds nothing, and is counted
+   (`icechunk_regathered`). A full re-gather (repairing a repo against the
    leaves, after a run whose commits were lost) is a **manual staged sweep
    over the whole store**, where every leaf is dirty by construction.
 
@@ -3741,5 +3745,9 @@ t-digest storage or the moczarr reader.
 
 A skip-if-current unit's lifecycle touch (#388) refreshes its objects in
 place and so moves their checksums (§11.3); the unit re-plans its refs from
-fresh HEADs — committed at once under `commit: "leaf"`, a rewritten sidecar
-under the ladder, which reads again once a staged re-gather covers the node.
+fresh HEADs — committed at once under `commit: "leaf"`; under the ladder it
+rewrites its sidecar and enters the same run's staged sweep as a
+**dirt-only** leaf, whose nodes re-gather and commit its refs without
+re-folding their overviews (§11.4). A current unit therefore still writes no
+stats record, sidecar or sub-map, but may enter the sweep work set as
+dirt-only when its touch moved ref checksums and the repo is on.
