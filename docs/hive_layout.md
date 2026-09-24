@@ -1404,11 +1404,12 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
   container and the `multiscales` mirror, and commits `init {run_id}`.
   Idempotent — a rerun reopens; a repo built for another geometry or ladder
   setting is refused. The record (`path`, `snapshot`, `created`, `options`,
-  `levels`, `ladder`) rides the run summary under
+  `levels`, `ladder`, `split_ratchet`) rides the run summary under
   `icechunk`; a failed init records `{"error": …}` there and the run proceeds
   refs-less. The run parquet broadcasts it as `icechunk_init_repo`,
-  `icechunk_init_snapshot` and `icechunk_init_error`, always written so the
-  column set does not vary run to run.
+  `icechunk_init_snapshot`, `icechunk_init_error` and
+  `icechunk_split_ratchet`, always written so the column set does not vary
+  run to run.
 - **The leaf's ref sidecar**: after the leaf's stamp — last in the unit,
   behind the granule-id sibling and the [issue #383](https://github.com/englacial/zagg/issues/383)
   column fold — the worker sizes the objects it wrote (one HEAD + one ranged
@@ -1511,8 +1512,9 @@ either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 writable in icechunk-js.
 
 The manifest split (spec §11.5) is one manifest per order-`split_order` cell
-— at the defaults an order-6 cell, 16,384 chunks, 64 leaves — recorded in
-each repo root's `zagg_icechunk.split` block, so a reader never assumes it.
+— at the defaults an order-6 cell, 16,384 chunks, 64 leaves — recorded in the
+repo root's `zagg_icechunk` block as `split_order`, and per order group as
+`levels.{order}.split` (`chunks`, `order`), so a reader never assumes it.
 
 ## Raster hive stores (issue #247)
 
