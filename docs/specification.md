@@ -3520,7 +3520,7 @@ of **one HEALPix cell at order `chunk_order − m`**, so the split is stated
 as "one manifest per order-N cell". The writer picks
 
 ```text
-m = max(chunk_order − shard_order, m₀)
+m = min(max(chunk_order − shard_order, m₀), chunk_order)
 ```
 
 with `m₀` the smallest `m` such that `4^m ≥ 4 · 1000`. The first term keeps
@@ -3531,9 +3531,14 @@ the same run. The second is the location-dictionary gate: Icechunk
 deduplicates a manifest's `location` strings only from `min_num_chunks`
 chunks upward — a **configurable** setting whose default is 1,000, not a
 format constant — and the ×4 margin keeps a run above that default after its
-absent chunks (which emit no ref) are subtracted. At the production geometry
-(shard 9 / chunk 13) the two terms are 4 and 6, so `m = 6`: 4,096 chunks, one
-manifest per **order-7 cell, 16 leaves**. The choice is recorded as
+absent chunks (which emit no ref) are subtracted. The third term caps a
+manifest at **one base cell**, never more: the chunk axis carries only
+`4^chunk_order` chunks per base cell, so there is no order-`(chunk_order − m)`
+cell to name above that. It binds only on small geometries (a test grid whose
+`shard_order` is at or near 0, where the gate term would otherwise win),
+never at production scale. At the production geometry (shard 9 / chunk 13)
+the three terms are 4, 6 and 13, so `m = 6`: 4,096 chunks, one manifest per
+**order-7 cell, 16 leaves**. The choice is recorded as
 `split.chunks` (`4^m`) and `split.order` (`chunk_order − m`, the order of the
 cell one manifest covers) in the `zagg_icechunk` block (§11.1), not hardcoded
 by readers.
