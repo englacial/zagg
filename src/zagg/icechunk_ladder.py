@@ -21,7 +21,7 @@ travel the way the digest columns do:
    amplification.
 
 The carrier is JSON — a member of the leaf's JSON-sibling family, keyed by
-the stats sidecar's grammar — holding a list of *units* ``{"order",
+the stats sidecar's grammar — holding a list of *units* ``{"level",
 "entries"}`` whose entries are :func:`zagg.icechunk_refs.object_ref_plan`
 entries with the shared ``location`` and a ``present`` mask in place of the
 per-chunk location list (~40 KB per leaf at production geometry). It is a
@@ -97,7 +97,7 @@ def _strip(location: str, prefix: str) -> str:
 
 
 def pack_units(units: list[dict], prefix: str, **meta) -> bytes:
-    """Serialize ``units`` (``[{"order", "entries"}]``) to the JSON carrier.
+    """Serialize ``units`` (``[{"level", "entries"}]``) to the JSON carrier.
 
     Locations are stored **relative to the container prefix** (§11.3), so the
     carrier's bytes do not depend on where the store lives and a relocated
@@ -137,7 +137,7 @@ def pack_units(units: list[dict], prefix: str, **meta) -> bytes:
                         "refs": int(entry["refs"]),
                     }
                 )
-        out_units.append({"order": int(unit["order"]), "entries": entries})
+        out_units.append({"level": int(unit["level"]), "entries": entries})
     return json.dumps({"spec": REFS_SPEC, **meta, "units": out_units}).encode()
 
 
@@ -182,7 +182,7 @@ def unpack_units(raw: bytes, prefix: str) -> tuple[list[dict], dict]:
                         "refs": int(entry["refs"]),
                     }
                 )
-        units.append({"order": int(unit["order"]), "entries": entries})
+        units.append({"level": int(unit["level"]), "entries": entries})
     return units, meta
 
 
@@ -194,20 +194,21 @@ def leaf_refs_key(leaf_name: str, spec: str | None = None) -> str:
 
 
 def write_leaf_refs(
-    store_root: str, leaf_path: str, grid, plan: list, *, spec, store_kwargs
+    store_root: str, leaf_path: str, grid, units: list, *, spec, store_kwargs
 ) -> dict:
-    """PUT the leaf's ref plan beside it; returns ``{"sidecar", "bytes", "refs", "arrays"}``.
+    """PUT the leaf's units (:func:`zagg.icechunk_refs.leaf_units`) beside it.
 
-    ``sidecar`` is the sibling's KEY (basename), never a path: the record
-    rides the leaf's stats sidecar, where a root-dependent string would
-    break byte parity between runs.
+    Returns ``{"sidecar", "bytes", "refs", "arrays", "levels"}``. ``sidecar``
+    is the sibling's KEY (basename), never a path: the record rides the
+    leaf's stats sidecar, where a root-dependent string would break byte
+    parity between runs.
     """
     from zagg.store import open_object_store, put_object
 
     prefix, _, name = leaf_path.rstrip("/").rpartition("/")
     key = leaf_refs_key(name, spec)
     raw = pack_units(
-        [{"order": int(grid.parent_order), "entries": plan}],
+        units,
         container_prefix(store_root),
         # The orders only — never the container prefix, which is root-
         # dependent and would break byte parity of the sidecar across roots;
@@ -219,11 +220,15 @@ def write_leaf_refs(
         },
     )
     put_object(open_object_store(prefix, **store_kwargs), key, raw)
+    entries = [e for u in units for e in u["entries"]]
     return {
         "sidecar": key,
         "bytes": len(raw),
-        "refs": int(sum(e["refs"] for e in plan)),
-        "arrays": int(sum(1 for e in plan if e["refs"])),
+        "refs": int(sum(e["refs"] for e in entries)),
+        "arrays": int(sum(1 for e in entries if e["refs"])),
+        "levels": sorted(
+            {int(u["level"]) for u in units if any(e["refs"] for e in u["entries"])}, reverse=True
+        ),
     }
 
 
@@ -336,7 +341,7 @@ def _overview_units(store_root, node, orders, level_by_order, fields, candidates
                 )
             )
         if entries:
-            units.append({"order": int(k), "entries": entries})
+            units.append({"level": int(level_by_order[k]), "entries": entries})
     return units
 
 
@@ -422,13 +427,13 @@ def stage_node_refs(
     # declared after the repo was made, so an order the manifest gained would
     # raise ``NodeNotFound`` mid-commit and discard the node's base refs too
     # (review finding). The node commits the levels the repo has.
-    have = {int(o) for o in block["levels"]}
+    have = {int(c) for c in block["levels"]}  # the repo's groups, keyed by cell order
     orders = [k for k in stage["orders"] if k in level_by_order]
-    lacking = [k for k in orders if k not in have]
+    lacking = [k for k in orders if level_by_order[k] not in have]
     if lacking:
         logger.warning(
             f"icechunk: node {node} skips order(s) {lacking} — declared by the manifest but "
-            f"absent from the repo's levels {sorted(have)} (issue #580)"
+            f"their cell orders are absent from the repo's levels {sorted(have)} (issue #580)"
         )
         counts["icechunk_skipped_levels"] += len(lacking)
         orders = [k for k in orders if k in have]

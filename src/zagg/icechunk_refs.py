@@ -2,9 +2,10 @@
 
 A morton hive is many leaf zarrs. The companion repository at
 ``{store_root}/icechunk/`` presents the whole store as ONE zarr hierarchy —
-a **group per pyramid order** (``/9`` the base at the shard order, ``/8``,
-``/7``, … ``/0`` the declared overview orders), each holding that order's
-arrays re-rooted on the whole order, plus the manifest's ``zagg-multiscales/1``
+a **group per level, named by CELL order** (``/19`` the base leaves,
+``/13`` the §4.6 leaf columns' declared member, ``/12`` … ``/4`` the
+declared overview orders — exactly the manifest's ``multiscales`` datasets),
+each holding that level's arrays re-rooted on the whole sphere, plus the manifest's ``zagg-multiscales/1``
 block mirrored into the root attrs as ``multiscales`` — by recording every
 object's inner chunks as Icechunk **virtual chunk references**:
 ``(location, offset, length)`` byte ranges into the objects that already
@@ -403,43 +404,68 @@ def level_geometry(grid) -> dict:
     return {"chunk_order": int(grid.chunk_order), "cell_order": int(grid.child_order)}
 
 
-def ladder_grids(manifest: dict, shard_order: int) -> dict:
-    """``{order: HealpixGrid}`` for every §4 overview order the manifest declares.
+def level_grids(manifest: dict, grid) -> dict:
+    """``{cell_order: {"grid", "node", "artifact"}}`` — the repo's levels (§11.1).
 
-    The grid an overview object is written with
-    (``sweep_stage._write_stage_overview``): one chunk per node, so its
-    level's chunk axis is at the node order and a node's refs are one chunk
-    per array. Empty for a store with no ``/2`` pyramid.
+    Exactly the manifest's ``zagg-multiscales/1`` datasets plus the base:
+    the base leaves at the store's cell order (``node == shard_order``,
+    artifact ``leaf``), the §4.6 leaf column's declared member (``node ==
+    shard_order``, artifact ``column``) and one overview level per declared
+    ancestor order (artifact ``overview``). Each level's grid is the one its
+    artifact is written with — ``grid`` itself for the base, the
+    ``sweep_stage`` / ``column`` writers' ``HealpixGrid(node, cells,
+    config=_overview_config(fields), sharded=True)`` for the rest — so the
+    array model cannot drift from the objects. A column's OTHER members (its
+    within-footprint intermediates and node-order partial) are sweep inputs,
+    not levels: they overlap the overview levels for the same cells and are
+    deliberately not indexed. A store with no ``/2`` declaration has the base
+    level only.
     """
     from zagg.column import composable_fields
     from zagg.grids.healpix import HealpixGrid
     from zagg.sweep_overview import _overview_config
-    from zagg.sweep_stage import ladder_entries
 
-    pyramid = manifest.get("pyramid") or {}
-    try:
-        levels = ladder_entries(pyramid, shard_order)
-    except ValueError:
-        return {}
-    decl = pyramid.get("overview")
+    levels = {
+        int(grid.child_order): {"grid": grid, "node": int(grid.parent_order), "artifact": "leaf"}
+    }
+    mirror = manifest.get(MULTISCALES_ATTR) or []
+    block = mirror[0] if mirror and isinstance(mirror[0], dict) else None
+    if block is None:
+        return levels
+    decl = (manifest.get("pyramid") or {}).get("overview")
     fields = composable_fields((decl.get("fields") if isinstance(decl, dict) else None) or {})
     if not fields:
-        return {}
+        return levels
     config = _overview_config(fields)
-    return {
-        int(e["node"]): HealpixGrid(int(e["node"]), int(e["cells"][0]), config=config, sharded=True)
-        for e in levels
-    }
+    for entry in block.get("datasets") or []:
+        node, (cells,), artifact = int(entry["order"]), entry["cells"], entry.get("artifact")
+        cells = int(cells)
+        if cells in levels:
+            # A column member declared AT the store's cell order (a chunk
+            # order equal to the cell order, a test geometry) duplicates the
+            # base leaves; the base is the level, the member is not indexed.
+            continue
+        levels[cells] = {
+            "grid": HealpixGrid(node, cells, config=config, sharded=True),
+            "node": node,
+            "artifact": artifact,
+        }
+    return levels
 
 
 def repo_group_spec(grid, store_root: str, options: dict, manifest: dict):
-    """The repo's hierarchy: ``zagg_icechunk`` + ``multiscales`` root attrs, a group per order."""
+    """The repo's hierarchy: ``zagg_icechunk`` + ``multiscales`` root attrs, a group per level."""
     from pydantic_zarr.experimental.v3 import GroupSpec
 
-    grids = {int(grid.parent_order): grid, **ladder_grids(manifest, grid.parent_order)}
+    grids = level_grids(manifest, grid)
     levels = {
-        str(order): {**level_geometry(g), "split": split_block(g, options["split_order"])}
-        for order, g in sorted(grids.items(), reverse=True)
+        str(cells): {
+            "node_order": int(level["node"]),
+            "artifact": level["artifact"],
+            **level_geometry(level["grid"]),
+            "split": split_block(level["grid"], options["split_order"]),
+        }
+        for cells, level in sorted(grids.items(), reverse=True)
     }
     block = {
         "spec": ICECHUNK_SPEC,
@@ -461,7 +487,7 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict):
         # from its root attrs (the icechunk-multiscales convention).
         attributes[MULTISCALES_ATTR] = mirror
     return GroupSpec(
-        members={str(order): level_group_spec(g) for order, g in grids.items()},
+        members={str(cells): level_group_spec(level["grid"]) for cells, level in grids.items()},
         attributes=attributes,
     )
 
@@ -743,7 +769,19 @@ def object_ref_plan(
             )
             continue
         chunks = []
-        for meta in obstore.list(store, prefix=key_prefix).collect():
+        if n == 1:
+            # A single-chunk array (every column and overview array, §11.2):
+            # one HEAD of the one key — the whole object is the ref (offset
+            # 0, length = size), no LIST and no index read.
+            key = key_prefix + "/".join("0" for _ in shape)
+            try:
+                head = obstore.head(store, key)
+            except (FileNotFoundError, NotFoundError):
+                continue
+            listing = [{**head, "path": key}]
+        else:
+            listing = obstore.list(store, prefix=key_prefix).collect()
+        for meta in listing:
             coords = tuple(int(x) for x in meta["path"][len(key_prefix) :].split("/"))
             global_index = tuple(o + c for o, c in zip(arr_offset, coords))
             chunks.append(
@@ -816,11 +854,11 @@ def commit_units(
 ) -> dict:
     """Write ref-plan units for any set of orders into ONE session and commit once.
 
-    ``units`` is any ITERABLE of ``{"order", "entries"}``: each entry lands
-    under its order's group (``/{order}/{path}``). A generator is the point —
+    ``units`` is any ITERABLE of ``{"level", "entries"}``: each entry lands
+    under its level's group (``/{level}/{path}``, the level's CELL order). A generator is the point —
     the ladder streams a committing node's subtree through here one child at
     a time, so the node's peak is one child's carriers rather than the whole
-    subtree's (§11.4). Returns ``{"path", "snapshot", "refs", "orders",
+    subtree's (§11.4). Returns ``{"path", "snapshot", "refs", "levels",
     "rebases", "commit_s"}`` (``snapshot`` ``None`` when nothing was
     written). ``repo`` skips the open/vet when the caller already holds a
     vetted handle.
@@ -831,7 +869,7 @@ def commit_units(
     refs = 0
     orders: set = set()
     for unit in units:
-        order = int(unit["order"])
+        order = int(unit["level"])
         for entry in unit["entries"]:
             if not entry["refs"]:
                 continue
@@ -865,7 +903,7 @@ def commit_units(
             "path": path,
             "snapshot": None,
             "refs": 0,
-            "orders": [],
+            "levels": [],
             "rebases": 0,
             "commit_s": 0.0,
         }
@@ -875,23 +913,70 @@ def commit_units(
         "path": path,
         "snapshot": snapshot,
         "refs": refs,
-        "orders": sorted(orders, reverse=True),
+        "levels": sorted(orders, reverse=True),
         "rebases": rebases,
         "commit_s": time.perf_counter() - t0,
     }
 
 
-def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=None) -> dict:
+def leaf_units(
+    grid, config, shard_key, store_root: str, *, column: str | None, store_kwargs: dict
+) -> list[dict]:
+    """The units a committed leaf contributes (§11.4): its base arrays + its column's level.
+
+    The base unit at the store's cell order from :func:`leaf_ref_plan`, plus
+    — when the unit wrote its §4.6 column (``column`` is its basename) — one
+    unit per resolution the column holds that is a repo LEVEL: the declared
+    leaf-node member(s) (:func:`zagg.column.leaf_column_plan`), never the
+    node-order partial, which is a sweep input (:func:`level_grids`). Each
+    column array is one unsharded chunk, so its ref is the whole object.
+    """
+    from zagg.column import leaf_column_plan
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.hive import shard_leaf_path
+    from zagg.sweep_overview import _overview_config
+
+    (rank,) = grid.block_index(int(shard_key))
+    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
+    units = [
+        {
+            "level": int(grid.child_order),
+            "entries": object_ref_plan(grid, leaf_rel, rank, store_root, store_kwargs=store_kwargs),
+        }
+    ]
+    plan = leaf_column_plan(config, grid) if column else None
+    if plan is None:
+        return units
+    resolutions, fields = plan
+    node_rel = leaf_rel.rsplit("/", 1)[0]
+    cfg = _overview_config(fields)
+    for res in resolutions:
+        if int(res) == int(grid.parent_order):
+            continue  # the node-order partial: a sweep input, not a level
+        column_grid = HealpixGrid(int(grid.parent_order), int(res), config=cfg, sharded=True)
+        entries = object_ref_plan(
+            column_grid, f"{node_rel}/{column}", rank, store_root, store_kwargs=store_kwargs
+        )
+        if entries:
+            units.append({"level": int(res), "entries": entries})
+    return units
+
+
+def record_leaf(
+    store_root: str, grid, shard_key, *, store_kwargs: dict, window=None, units=None
+) -> dict:
     """The per-leaf commit (``commit: "leaf"``): refs + ``leaf {decimal}`` (§11.4).
 
-    Returns the record the caller rides into the leaf's stats sidecar:
-    ``{"path", "snapshot", "arrays", "refs", "orders", "rebases", "commit_s",
-    "checksum"}`` (``checksum`` the form the refs carry: ``"etag"`` or
-    ``"last_modified"``, §11.3), or ``{"skipped": reason}`` for a unit stage 1
-    does not index (a windowed leaf, §11.6; a leaf with no chunk objects).
-    Raises on failure — the caller is fail-open. Opens and vets the repo
-    BEFORE the plan: the plan costs ~20 object-store requests, and refs must
-    never land in a repo built for another geometry.
+    ``units`` are the leaf's :func:`leaf_units` when the caller computed
+    them (the worker seam, which knows whether it wrote a column); ``None``
+    commits the base arrays alone. Returns the record the caller rides into
+    the leaf's stats sidecar: ``{"path", "snapshot", "arrays", "refs",
+    "levels", "rebases", "commit_s", "checksum"}`` (``checksum`` the form the
+    refs carry: ``"etag"`` or ``"last_modified"``, §11.3), or ``{"skipped":
+    reason}`` for a unit stage 1 does not index (a windowed leaf, §11.6; a
+    leaf with no chunk objects). Raises on failure — the caller is fail-open.
+    Opens and vets the repo BEFORE the plan: the plan costs ~20 object-store
+    requests, and refs must never land in a repo built for another geometry.
     """
     from zagg.grids.morton import morton_decimal
 
@@ -907,17 +992,20 @@ def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=
             "cell_order": int(grid.child_order),
         },
     )
-    plan = leaf_ref_plan(grid, shard_key, store_root, store_kwargs=store_kwargs)
-    if not any(entry["refs"] for entry in plan):
+    if units is None:
+        plan = leaf_ref_plan(grid, shard_key, store_root, store_kwargs=store_kwargs)
+        units = [{"level": int(grid.child_order), "entries": plan}]
+    if not any(entry["refs"] for unit in units for entry in unit["entries"]):
         return {"skipped": "empty"}
     outcome = commit_units(
         store_root,
-        [{"order": int(grid.parent_order), "entries": plan}],
+        units,
         f"leaf {morton_decimal(int(shard_key))}",
         store_kwargs=store_kwargs,
         repo=repo,
     )
-    return {**outcome, "arrays": sum(1 for entry in plan if entry["refs"]), "checksum": checksum}
+    arrays = sum(1 for unit in units for entry in unit["entries"] if entry["refs"])
+    return {**outcome, "arrays": arrays, "checksum": checksum}
 
 
 __all__ = [
@@ -932,7 +1020,8 @@ __all__ = [
     "container_prefix",
     "finest_dispatch_order",
     "init_repo",
-    "ladder_grids",
+    "leaf_units",
+    "level_grids",
     "leaf_ref_plan",
     "level_group_spec",
     "object_ref_plan",

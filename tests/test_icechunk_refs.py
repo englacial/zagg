@@ -242,7 +242,14 @@ class TestInit:
         out = icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
         assert out["created"] is True
         assert out["path"] == f"{root}/icechunk"
-        assert out["ladder"][-1] == 4  # the base group is the coarsest-to-finest list's last
+        assert out["ladder"] == [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+        ]  # cell orders: overviews, the column (5), the base (6)
         group, repo = _open(root)
         block = group.attrs[icechunk_refs.ICECHUNK_ATTR]
         assert block["spec"] == "zagg-icechunk/1"
@@ -254,9 +261,11 @@ class TestInit:
         # One repo, a group per order: the base (4) plus the declared
         # overview orders, each with its own split block.
         assert sorted(block["levels"], key=int) == [str(o) for o in out["ladder"]]
-        assert block["levels"]["4"] == {
+        assert block["levels"]["6"] == {
             "chunk_order": 5,
             "cell_order": 6,
+            "node_order": 4,
+            "artifact": "leaf",
             "split": {"chunks": 16, "order": 3},
         }
         assert out["levels"] == block["levels"] and out["options"]["commit_order"] == 3
@@ -267,8 +276,8 @@ class TestInit:
         # The resolution group mirrors the leaf's attrs (dggs + conventions,
         # latitude token included), never a commit stamp.
         leaf_attrs = grid.shard_spec().attributes
-        assert dict(group["4"].attrs) == leaf_attrs
-        assert group["4"].attrs["dggs"]["latitude"] == "authalic-wgs84"
+        assert dict(group["6"].attrs) == leaf_attrs
+        assert group["6"].attrs["dggs"]["latitude"] == "authalic-wgs84"
         assert hive.COMMIT_ATTR not in group.attrs
         messages = [s.message for s in repo.ancestry(branch="main")]
         assert messages[0] == f"init {RUN_ID}"
@@ -280,7 +289,7 @@ class TestInit:
         group, _repo = _open(root)
         leaf = grid.shard_spec().members
         for name, spec in leaf.items():
-            arr = group["4"][name]
+            arr = group["6"][name]
             leaf_shape = tuple(spec.shape)
             assert arr.shape == (grid.n_shards * leaf_shape[0], *leaf_shape[1:])
             assert arr.shape[0] == 12 * 4**grid.child_order or name.endswith("_chunk")
@@ -289,7 +298,7 @@ class TestInit:
             assert arr.metadata.dimension_names == tuple(spec.dimension_names)
             assert arr.metadata.data_type.to_json(zarr_format=3) == spec.data_type
         # Ragged: vlen-bytes + zstd inner chain, the §1.2 block intact.
-        rag = group["4"]["h"]
+        rag = group["6"]["h"]
         assert [c.__class__.__name__ for c in rag.metadata.codecs] == [
             "VLenBytesCodec",
             "ZstdCodec",
@@ -314,7 +323,7 @@ class TestInit:
         assert isinstance(condition, icechunk.ManifestSplitCondition.PathMatches)
         ((axis, size),) = dims
         assert isinstance(axis, icechunk.ManifestSplitDimCondition.Axis)
-        assert axis._0 == 0 and size == out["levels"]["4"]["split"]["chunks"]
+        assert axis._0 == 0 and size == out["levels"]["6"]["split"]["chunks"]
         assert isinstance(sizes[-1][0], icechunk.ManifestSplitCondition.AnyArray)
 
     def test_rerun_reopens_without_a_commit(self, cfg, tmp_path):
@@ -357,7 +366,7 @@ class TestInit:
 
         root = str(tmp_path / "store")
         first = self._init(cfg, root, split_order=2, commit_order=2)
-        assert first["levels"]["4"]["split"] == {"chunks": 4**3, "order": 2}
+        assert first["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2}
         with caplog.at_level(logging.WARNING, logger="zagg.icechunk_refs"):
             again = self._init(cfg, root, split_order=3, commit_order=2)  # finer than the store
         assert "finer than the store's recorded 2" in caplog.text
@@ -385,7 +394,7 @@ class TestInit:
         assert "ratchets 3 -> 2" in caplog.text
         assert again["split_ratchet"] == {"from": 3, "to": 2}
         assert again["snapshot"] != first["snapshot"]  # the block rewrite is a commit
-        assert again["levels"]["4"]["split"] == {"chunks": 4**3, "order": 2}
+        assert again["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2}
         block = icechunk_refs.read_block(root, store_kwargs={})
         assert block["split_order"] == 2 and block["levels"] == again["levels"]
         _group, repo = _open(root)
@@ -534,16 +543,16 @@ class TestLeafRefs:
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
             span = slice(rank * 16, (rank + 1) * 16)
             for name in ("count", "h_mean", "morton"):
-                np.testing.assert_array_equal(group["4"][name][span], leaf[name][:])
+                np.testing.assert_array_equal(group["6"][name][span], leaf[name][:])
             # Ragged bytes match cell for cell (chunk 0 populated, the rest fill).
-            got = group["4"]["h"][span]
+            got = group["6"]["h"][span]
             want = leaf["h"][:]
             assert [bytes(a) for a in got] == [bytes(b) for b in want]
             assert bytes(got[0]) == np.array([1.0, 2.0], dtype="<f4").tobytes()
         # Cells of a leaf nobody wrote read as fill.
         other = _shards(grid, 3)[2]
         (rank,) = grid.block_index(other)
-        assert np.isnan(group["4"]["h_mean"][rank * 16 : (rank + 1) * 16]).all()
+        assert np.isnan(group["6"]["h_mean"][rank * 16 : (rank + 1) * 16]).all()
 
     def test_local_refs_catch_a_wholesale_rewrite(self, monkeypatch, cfg, tmp_path):
         # The file:// container DOES validate a checksum: a LastUpdatedAt
@@ -561,12 +570,12 @@ class TestLeafRefs:
         (rank,) = grid.block_index(shard)
         span = slice(rank * 16, (rank + 1) * 16)
         group, _repo = _open(root)
-        np.testing.assert_array_equal(group["4"]["count"][span][:4], np.full(4, 1))
+        np.testing.assert_array_equal(group["6"]["count"][span][:4], np.full(4, 1))
         time.sleep(1.1)  # icechunk compares at whole-second granularity
         _write_leaf(monkeypatch, grid, root, shard, fill=99.0)
         group, _repo = _open(root)
         with pytest.raises(icechunk.StorageError, match="checksum"):
-            group["4"]["count"][span]
+            group["6"]["count"][span]
 
     def test_windowed_and_empty_units_are_skipped(self, monkeypatch, cfg, tmp_path):
         grid = _grid(cfg)
@@ -621,7 +630,7 @@ class TestLeafRefs:
         group, _repo = _open(root)
         leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
         np.testing.assert_array_equal(
-            group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+            group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
         )
 
     def test_concurrent_leaf_commits_all_land(self, monkeypatch, cfg, tmp_path):
@@ -651,7 +660,7 @@ class TestLeafRefs:
         assert len([s for s in repo.ancestry(branch="main")]) == len(shards) + 2  # + init + birth
         for i, shard in enumerate(shards):
             (rank,) = grid.block_index(shard)
-            assert (group["4"]["count"][rank * 16 : (rank + 1) * 16] >= i + 1).all()
+            assert (group["6"]["count"][rank * 16 : (rank + 1) * 16] >= i + 1).all()
 
     def test_rebase_is_counted(self, monkeypatch, cfg, tmp_path):
         grid = _grid(cfg)
@@ -661,11 +670,11 @@ class TestLeafRefs:
         stale = repo.writable_session("main")
         fresh = repo.writable_session("main")
         fresh.store.set_virtual_ref(
-            "4/count/c/0", icechunk_refs.container_prefix(root) + "x", offset=0, length=4
+            "6/count/c/0", icechunk_refs.container_prefix(root) + "x", offset=0, length=4
         )
         icechunk_refs._commit(fresh, "a", local=True)
         stale.store.set_virtual_ref(
-            "4/count/c/1", icechunk_refs.container_prefix(root) + "y", offset=0, length=4
+            "6/count/c/1", icechunk_refs.container_prefix(root) + "y", offset=0, length=4
         )
         snapshot, rebases = icechunk_refs._commit(stale, "b", local=True)
         assert rebases == 1
@@ -896,7 +905,7 @@ class TestWorkerWiring:
         (rank,) = grid.block_index(shard)
         leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
         np.testing.assert_array_equal(
-            group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+            group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
         )
         # The record rides the D20 record and flattens to parquet scalars.
         from zagg.telemetry import build_record, flatten_record
@@ -989,7 +998,7 @@ class TestWorkerWiring:
         assert ice["sidecar"] == leaf_refs_key(leaf.rpartition("/")[2]) == "icechunk_refs.json"
         assert not (tmp_path / "store" / "icechunk").exists()  # no repo, no session
         units, meta_ = read_leaf_refs(root, shard, spec=None, store_kwargs={})
-        assert [u["order"] for u in units] == [4]
+        assert [u["level"] for u in units] == [6, 5]  # the base and the column's declared member
         assert meta_["geometry"] == {"shard_order": 4, "chunk_order": 5, "cell_order": 6}
         # The sidecar round-trips the plan the worker computed.
         plan = icechunk_refs.leaf_ref_plan(grid, shard, root, store_kwargs={})
@@ -1172,9 +1181,9 @@ class TestLocalRunEndToEnd:
             span = slice(rank * 16, (rank + 1) * 16)
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
             for name in ("count", "h_mean", "morton"):
-                np.testing.assert_array_equal(group["4"][name][span], leaf[name][:])
-            assert np.isnan(group["4"]["h_mean"][span][8:12]).all()  # inner chunk 2
-            assert [bytes(a) for a in group["4"]["h"][span]] == [bytes(b) for b in leaf["h"][:]]
+                np.testing.assert_array_equal(group["6"][name][span], leaf[name][:])
+            assert np.isnan(group["6"]["h_mean"][span][8:12]).all()  # inner chunk 2
+            assert [bytes(a) for a in group["6"]["h"][span]] == [bytes(b) for b in leaf["h"][:]]
         # The run parquet carries the init as run-level columns and each leaf's
         # commit as row columns.
         df = pd.read_parquet(summary["run_stats_path"])
@@ -1202,7 +1211,7 @@ class TestCarrier:
         when = datetime(2026, 9, 24, 3, 0, 0, tzinfo=timezone.utc)
         units = [
             {
-                "order": 4,
+                "level": 6,
                 "entries": [
                     {
                         "path": "6/count",
@@ -1223,11 +1232,11 @@ class TestCarrier:
                     },
                 ],
             },
-            {"order": 3, "entries": []},
+            {"level": 4, "entries": []},
         ]
         back, meta = unpack_units(pack_units(units, "file:///r/", node="1111"), "file:///r/")
         assert meta == {"spec": "zagg-icechunk-refs/1", "node": "1111"}
-        assert [u["order"] for u in back] == [4, 3]
+        assert [u["level"] for u in back] == [6, 4]
         sharded, regular = back[0]["entries"]
         assert sharded["locations"] == units[0]["entries"][0]["locations"]
         assert sharded["chunk_grid"] == (4,) and sharded["arr_offset"] == (8,)
@@ -1334,9 +1343,16 @@ class TestLadder:
         assert summary["cells_error"] == 0
         init = summary["icechunk"]
         assert init["options"] == {"commit": "ladder", "commit_order": 3, "split_order": 3}
-        assert init["ladder"] == [0, 1, 2, 3, 4]
-        assert init["levels"]["4"]["split"] == {"chunks": 4**2, "order": 3}  # base: chunk order 5
-        assert init["levels"]["3"]["split"] == {"chunks": 1, "order": 3}  # one chunk per o3 node
+        assert init["ladder"] == [1, 2, 3, 4, 5, 6]  # cell orders: o0..o3 overviews, column, base
+        assert init["levels"]["6"]["split"] == {"chunks": 4**2, "order": 3}  # base: chunk order 5
+        assert init["levels"]["5"] == {
+            "node_order": 4,
+            "artifact": "column",
+            "chunk_order": 4,
+            "cell_order": 5,
+            "split": {"chunks": 4, "order": 3},
+        }
+        assert init["levels"]["4"]["split"] == {"chunks": 1, "order": 3}  # one chunk per o3 node
         for meta in summary["results"]:
             assert "sidecar" in meta["icechunk"] and "snapshot" not in meta["icechunk"]
         rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
@@ -1376,9 +1392,17 @@ class TestLadder:
             span = slice(rank * 16, (rank + 1) * 16)
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
             for name in ("count", "h_mean", "morton"):
-                np.testing.assert_array_equal(group["4"][name][span], leaf[name][:])
-            assert np.isnan(group["4"]["h_mean"][span][8:12]).all()
-            assert [bytes(a) for a in group["4"]["h"][span]] == [bytes(b) for b in leaf["h"][:]]
+                np.testing.assert_array_equal(group["6"][name][span], leaf[name][:])
+            assert np.isnan(group["6"]["h_mean"][span][8:12]).all()
+            assert [bytes(a) for a in group["6"]["h"][span]] == [bytes(b) for b in leaf["h"][:]]
+            # The leaf's column level: its declared member (res 5), one chunk
+            # per leaf at the leaf's rank, read back from the same repo.
+            column = zarr.open_group(
+                hive.shard_leaf_path(root, shard).rsplit("/", 1)[0] + "/all.pyramid.zarr", mode="r"
+            )["5"]
+            np.testing.assert_array_equal(
+                group["5"]["count"][rank * 4 : (rank + 1) * 4], column["count"][:]
+            )
         # Every overview level reads its node's object back at the node's rank,
         # from the SAME repo, discoverable from its multiscales root attrs.
         manifest = hive.read_manifest(root)
@@ -1400,10 +1424,10 @@ class TestLadder:
                 src = zarr.open_group(str(obj), mode="r")[str(r)]
                 n = 4 ** (r - k)
                 np.testing.assert_array_equal(
-                    group[str(k)]["count"][rank * n : (rank + 1) * n], src["count"][:]
+                    group[str(r)]["count"][rank * n : (rank + 1) * n], src["count"][:]
                 )
         # The overview-stage gap is closed: every declared order has its level.
-        assert set(int(o) for o in init["levels"]) == {0, 1, 2, 3, 4}
+        assert set(int(o) for o in init["levels"]) == {1, 2, 3, 4, 5, 6}
 
     def test_two_level_gather_with_a_coarser_commit_order(self, monkeypatch, cfg, tmp_path):
         # commit_order 0: the o3 nodes write ref COLUMNS (leaf sidecars + own
@@ -1427,7 +1451,11 @@ class TestLadder:
         for node in ("1111", "1112"):
             units = read_node_refs(root, node, store_kwargs={})
             assert units is not None
-            assert sorted({u["order"] for u in units}) == [3, 4]
+            assert sorted({u["level"] for u in units}) == [
+                4,
+                5,
+                6,
+            ]  # own o3 overview, columns, leaves
         rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
         assert rows[3]["icechunk_commits"] == 0 and rows[3]["icechunk_refs"] > 0
         assert rows[0]["icechunk_commits"] == 1  # ONE commit, orders 4, 3, 2, 1, 0
@@ -1438,7 +1466,7 @@ class TestLadder:
             (rank,) = grid.block_index(shard)
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
             np.testing.assert_array_equal(
-                group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
 
     def test_missing_sidecars_are_counted_not_fatal(self, monkeypatch, cfg, tmp_path):
@@ -1485,7 +1513,7 @@ class TestLadder:
             (rank,) = grid.block_index(shard)
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
             np.testing.assert_array_equal(
-                group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
 
     def test_the_gather_streams_child_by_child(self, monkeypatch, cfg, tmp_path):
@@ -1512,7 +1540,7 @@ class TestLadder:
         out = commit_units(
             root, (u for units, _m in yielded for u in units), "test", store_kwargs={}
         )
-        assert out["refs"] > 0 and out["orders"] == [4]
+        assert out["refs"] > 0 and out["levels"] == [6, 5]  # the leaves and their columns
 
     def test_a_corrupt_sidecar_costs_its_leaf_only(self, monkeypatch, cfg, tmp_path):
         # A per-leaf fault must not be given node-wide blast radius: the
@@ -1539,7 +1567,7 @@ class TestLadder:
         (rank,) = grid.block_index(shards[1])
         leaf_group = zarr.open_group(hive.shard_leaf_path(root, shards[1]), mode="r")["6"]
         np.testing.assert_array_equal(
-            group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf_group["count"][:]
+            group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf_group["count"][:]
         )
 
     def test_a_carrier_without_a_geometry_block_is_refused(self, monkeypatch, cfg, tmp_path):
@@ -1579,7 +1607,7 @@ class TestLadder:
 
         def drop_order_three(store_root, manifest, *, store_kwargs):
             block = real(store_root, manifest, store_kwargs=store_kwargs)
-            levels = {k: v for k, v in block["levels"].items() if k != "3"}
+            levels = {k: v for k, v in block["levels"].items() if k != "4"}  # o3's cells
             return {**block, "levels": levels}
 
         monkeypatch.setattr(ladder_mod, "ladder_context", drop_order_three)
@@ -1598,7 +1626,7 @@ class TestLadder:
             (rank,) = grid.block_index(shard)
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
             np.testing.assert_array_equal(
-                group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
 
     def test_leaf_mode_ladder_commits_overviews_only(self, monkeypatch, cfg, tmp_path):
