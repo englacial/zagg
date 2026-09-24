@@ -1620,6 +1620,26 @@ class TestKnob:
         with pytest.raises(ValueError, match=r"raster products \(spec §11.6\)"):
             validate_config(raster)
 
+    def test_an_empty_options_block_is_scoped_like_true(self, cfg):
+        # ``{}`` is the spelling for "the ladder defaults" and ``get_icechunk``
+        # resolves it ON, so it must be refused wherever ``True`` is -- it is
+        # falsy, which is exactly how it used to slip past the scope guards.
+        from zagg.config import get_icechunk, validate_config
+
+        cfg.output["store_layout"] = "flat"
+        cfg.output["icechunk"] = {}
+        assert get_icechunk(cfg) is True
+        with pytest.raises(ValueError, match="requires output.store_layout: hive"):
+            validate_config(cfg)
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = _WINDOWING
+        with pytest.raises(ValueError, match=r"windowed stores \(spec §11.6\)"):
+            validate_config(cfg)
+        raster = default_config("sentinel2_l2a")
+        raster.output["icechunk"] = {}
+        with pytest.raises(ValueError, match=r"raster products \(spec §11.6\)"):
+            validate_config(raster)
+
     def test_knob_is_outside_the_semantic_core(self, cfg):
         from zagg.semantics import semantic_hash
 

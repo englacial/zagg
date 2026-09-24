@@ -1348,17 +1348,22 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
                 f"{orders['commit_order']}: a manifest (one per split_order cell) would be written "
                 f"by more than one commit (spec §11.5)"
             )
-    if icechunk and get_store_layout(config) != "hive":
+    # The RESOLVED opt-in, not the literal's truthiness: an options block is
+    # an opt-in whatever it holds, and the empty one -- the spelling for "the
+    # ladder defaults" -- is falsy, so the three scope guards below skipped it
+    # and stood up a repo §11.6 exists to prevent (review finding).
+    enabled = icechunk is True or isinstance(icechunk, dict)
+    if enabled and get_store_layout(config) != "hive":
         raise ValueError(
             "output.icechunk requires output.store_layout: hive (the companion repo "
             "references hive leaves by shard rank; flat stores have no leaves)"
         )
-    if icechunk and get_windowing(config) is not None:
+    if enabled and get_windowing(config) is not None:
         raise ValueError(
             "output.icechunk is out of scope for windowed stores (spec §11.6): a "
             "window's leaves share a shard rank, so stage 1 records no refs for them"
         )
-    if icechunk and (config.data_source or {}).get("reader") == "raster":
+    if enabled and (config.data_source or {}).get("reader") == "raster":
         raise ValueError(
             "output.icechunk is out of scope for raster products (spec §11.6): "
             "raster leaves are never sharded, so stage 1 records no refs for them"
