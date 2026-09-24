@@ -612,6 +612,13 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     # Ladder mode (phase 6): the leaf wrote a ref sidecar instead of committing.
     row["icechunk_sidecar"] = ice.get("sidecar")
     row["icechunk_bytes"] = ice.get("bytes")
+    # The levels the leaf's refs cover, by CELL order — comma-joined so the
+    # column stays a parquet scalar. Both record shapes carry it (the ladder's
+    # sidecar and the ``commit: "leaf"`` twin), and it is the only place
+    # "did this leaf's column level get indexed, or only its base?" is
+    # answerable from the run parquet (review finding).
+    levels = ice.get("levels")
+    row["icechunk_levels"] = ",".join(str(o) for o in levels) if levels else None
     row["icechunk_skipped"] = ice.get("skipped")
     row["icechunk_error"] = ice.get("error")
     return row
