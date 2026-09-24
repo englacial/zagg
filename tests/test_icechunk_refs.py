@@ -1451,6 +1451,35 @@ class TestLadder:
         rows = {r["dispatch_order"]: r for r in out["stages"]}
         assert rows[3]["icechunk_missing"] == 1 and rows[3]["icechunk_failed"] == 0
 
+    def test_a_clean_subtree_is_skipped_whole(self, monkeypatch, cfg, tmp_path):
+        # The gather is O(subtree); running it for every candidate node made
+        # a one-leaf append cost O(store). A node with no dirty leaf beneath
+        # it had its refs committed by the run that dirtied it.
+        shards = _shards(_grid(cfg), 6)  # o3 nodes 1111 (4 leaves) and 1112 (2)
+        grid, root, _summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards
+        )
+        # An UNSCOPED pass with one dirty leaf: both o3 nodes are candidates
+        # (the dirty set plus the root MOC), so the clean one is visited and
+        # skipped -- the post-run chaining is scoped to the run's own subtree.
+        from zagg.sweep_stages import run_stage_sweep
+
+        out = run_stage_sweep(root, [(shards[4], None)], store_kwargs={})  # under 1112
+        rows = {r["dispatch_order"]: r for r in out["stages"]}
+        assert rows[3]["nodes"] == 2  # 1111 and 1112 both dispatched
+        assert rows[3]["icechunk_clean"] == 1 and rows[3]["icechunk_commits"] == 1
+        assert [n["node"] for n in rows[3]["icechunk_nodes"]] == ["1112"]
+        # The root is dirty by containment, so it commits its own overviews.
+        assert rows[0]["icechunk_clean"] == 0 and rows[0]["icechunk_commits"] == 1
+        # The clean node's refs are still there -- the earlier commit's.
+        group, _repo = _open(root)
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            np.testing.assert_array_equal(
+                group["4"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+            )
+
     def test_the_gather_streams_child_by_child(self, monkeypatch, cfg, tmp_path):
         # The committing node feeds ONE child at a time into the session, so
         # its peak is a child's carriers rather than the whole subtree's.

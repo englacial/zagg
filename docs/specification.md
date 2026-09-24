@@ -3540,6 +3540,14 @@ columns do:
    `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
    `icechunk_refs`, `icechunk_missing` and `icechunk_failed`.
 
+   The ladder runs over the **dirty set** — the nodes with a dirty leaf
+   beneath them — not over every candidate node: a node whose whole subtree
+   is clean had its refs committed by the run that dirtied it, so it is
+   skipped whole and counted (`icechunk_clean`). An append therefore costs
+   O(dirty), not O(store). A full re-gather (repairing a repo against the
+   leaves, after a run whose commits were lost) is a **manual staged sweep
+   over the whole store**, where every leaf is dirty by construction.
+
 `commit_order` defaults to the **finest dispatch node** of the staged sweep
 (`shard_order − tuple_width` when the shard order is a multiple of the width:
 6 at production), `split_order` to `commit_order`. Both ride the
