@@ -330,7 +330,7 @@ class TestEventDispatch:
         handle.results()  # drains + joins the tail
         modes = stub.modes()
         first_cell = modes.index(None)
-        assert modes[:first_cell] == ["ping", "setup"]
+        assert modes[:first_cell] == ["ping", "setup", "icechunk_init"]
         assert "finalize" in modes and "coverage" in modes and "stats" in modes
 
     def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):

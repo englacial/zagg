@@ -1307,6 +1307,18 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
         )
+    # Icechunk companion repo (issue #580, spec §11): same posture as sweep —
+    # boolean when present, default ON for hive (get_icechunk resolves it),
+    # explicit true on a non-hive store is a config mistake (the repo indexes
+    # hive leaves by shard rank).
+    icechunk = config.output.get("icechunk")
+    if icechunk is not None and not isinstance(icechunk, bool):
+        raise ValueError(f"output.icechunk must be a boolean (got {icechunk!r})")
+    if icechunk and get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.icechunk requires output.store_layout: hive (the companion repo "
+            "references hive leaves by shard rank; flat stores have no leaves)"
+        )
     # Overview pyramid declaration (issue #201): explicit blocks are grammar-
     # checked here; the D24 none-field warning fires at manifest build time
     # (template time for the store), not per config validation. The NaN-fill
@@ -3330,6 +3342,23 @@ def get_sweep(config: PipelineConfig) -> bool:
     fire-and-forget ``mode="sweep"`` worker Event invoke.
     """
     flag = config.output.get("sweep")
+    if flag is None:
+        return get_store_layout(config) == "hive"
+    return bool(flag)
+
+
+def get_icechunk(config: PipelineConfig) -> bool:
+    """Whether the Icechunk companion repo is written (issue #580, spec §11).
+
+    Default ON for hive-layout stores: the once-per-run ``icechunk_init`` step
+    and the per-leaf virtual-ref commit at leaf commit, both fail-open (the
+    leaves stay normative; the repo is a regenerable index). ``output.icechunk:
+    false`` opts out; non-hive configs default off and an explicit ``true``
+    there is rejected by ``validate_config``, mirroring ``sweep``. A
+    present-but-null key falls back to the default. Excluded from the D19
+    semantic core like the other run triggers (:mod:`zagg.semantics`).
+    """
+    flag = config.output.get("icechunk")
     if flag is None:
         return get_store_layout(config) == "hive"
     return bool(flag)

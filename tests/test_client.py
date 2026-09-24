@@ -361,10 +361,12 @@ class TestDispatch:
         _run(catalog, client=stub).dispatch().wait(timeout=10)
         modes = stub.modes()
         first_cell = modes.index(None)
-        assert modes[:first_cell] == ["ping", "setup"]  # fail-fast ping, then manifest write
+        assert modes[:first_cell] == ["ping", "setup", "icechunk_init"]  # fail-fast ping, then manifest write
         setup_invocations = [(t, e["mode"]) for _, t, e in stub.events if e.get("mode")]
         assert ("RequestResponse", "ping") in setup_invocations
         assert ("Event", "setup") in setup_invocations
+        # The companion init blocks the fan-out (issue #580): synchronous.
+        assert ("RequestResponse", "icechunk_init") in setup_invocations
         # Post-run tail (all worker invokes, D8): finalize backstop + fail-open
         # coverage/stats rollups.
         assert "finalize" in modes
