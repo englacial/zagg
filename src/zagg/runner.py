@@ -2639,6 +2639,11 @@ def _await_run_stats_object(store_path, key, store_kwargs, *, window_s=None) -> 
         time.sleep(_RUN_STATS_VERIFY_INTERVAL_S)
 
 
+def _wrote_nothing(body: dict) -> bool:
+    """A worker body whose unit skipped as current or refused (issue #388)."""
+    return bool(body.get("current") or body.get("refused"))
+
+
 def _lambda_result_rows(results, *, run_id=None) -> tuple[list, list]:
     """Run-parquet rows from the lambda dispatch's per-cell result dicts.
 
@@ -2663,6 +2668,8 @@ def _lambda_result_rows(results, *, run_id=None) -> tuple[list, list]:
     inline_rows = []
     for r in results:
         body = r.get("body") or {}
+        if r.get("status_code") == 200 and _wrote_nothing(body):
+            continue  # a current/refused unit records nothing, as on _run_local
         record = body.get("stats")
         # Envelope-backed rows are re-derivable worker-side (rows_from_status);
         # everything else the pointer path can't rebuild, so it rides inline.
@@ -3625,6 +3632,7 @@ def _run_lambda(
     # The Icechunk commit mode ships resolved (#580): this dispatcher chains
     # the staged sweep on ``output.sweep: "stages"`` (below).
     config_dict = asdict(_pin_icechunk_commit(config, grid, stages=True))
+    skip_hash = _fleet_skip_hash(config, overwrite)
 
     # Build the optional output_credentials event block (write side, symmetric
     # to s3_credentials on the read side). None -> execution-role writes.
@@ -3826,6 +3834,7 @@ def _run_lambda(
                 invoked_by=invoked_by,
                 run_id=run_id,
                 allow_contraction=allow_contraction,
+                semantic_hash=skip_hash,
             )
             cell_payload = _cell_payload(cell_event, submap=submap, async_invoke=True, label=label)
 
@@ -3863,6 +3872,7 @@ def _run_lambda(
             run_id=run_id,
             submap=submap,
             allow_contraction=allow_contraction,
+            semantic_hash=skip_hash,
             **extra,
         )
 
@@ -4045,9 +4055,11 @@ def _run_lambda(
 
     def _accumulate(report, i, result):
         error = result.get("error")
-        if result.get("status_code") == 200 and not error:
-            obs = result.get("body", {}).get("total_obs", 0)
-            report.total_obs += obs
+        body = result.get("body") or {}
+        if result.get("status_code") == 200 and not error and _wrote_nothing(body):
+            pass  # skip-if-current / refused (issue #388): _identity_counts owns them
+        elif result.get("status_code") == 200 and not error:
+            report.total_obs += body.get("total_obs", 0)
             report.cells_with_data += 1
         elif error not in BENIGN_ERRORS:
             report.cells_error += 1
@@ -5596,6 +5608,18 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
     return event
 
 
+def _fleet_skip_hash(config, overwrite) -> str | None:
+    """The run's D19 digest when the fleet's leaf identity gate is armed, else ``None``.
+
+    Armed exactly where :func:`_run_local` arms it (issue #388): a hive run
+    without ``overwrite``. The digest is the RUN config's, so the per-cell
+    ``granule_workers`` clamp cannot perturb the worker's comparison.
+    """
+    if get_store_layout(config) != "hive" or overwrite:
+        return None
+    return _semantic_hash(config)
+
+
 def _pin_icechunk_commit(config, grid, *, stages: bool):
     """``config`` with an unset ``output.icechunk.commit`` pinned to what the run does (issue #580).
 
@@ -5898,6 +5922,7 @@ def _build_cell_event(
     run_id=None,
     result_url=None,
     allow_contraction=False,
+    semantic_hash=None,
 ) -> dict:
     """One shard's worker event dict — the single construction site.
 
@@ -5961,6 +5986,12 @@ def _build_cell_event(
     # into the skip-if-current seam.
     if allow_contraction:
         event["allow_contraction"] = True
+    # Leaf skip-if-current (issue #388), armed on the fleet exactly where the
+    # local backend arms it: ``semantic_hash`` is the RUN config's D19 digest,
+    # set only when the gate is armed; absent, the worker rewrites as before.
+    if semantic_hash is not None:
+        event["skip_if_current"] = True
+        event["semantic_hash"] = semantic_hash
     return event
 
 
@@ -6022,6 +6053,7 @@ def _invoke_lambda_cell(
     run_id=None,
     submap=None,
     allow_contraction=False,
+    semantic_hash=None,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -6056,6 +6088,8 @@ def _invoke_lambda_cell(
     ``allow_contraction`` (issue #388) forwards the contraction-guard escape
     hatch as an ``"allow_contraction": true`` event key; ``False`` (the
     default) omits the key, keeping the event byte-identical.
+    ``semantic_hash`` arms the worker's skip-if-current gate (issue #388; see
+    :func:`_build_cell_event`); ``None`` leaves it off.
     """
     wall_start = time.time()
 
@@ -6077,6 +6111,7 @@ def _invoke_lambda_cell(
         run_id=run_id,
         result_url=result_url,
         allow_contraction=allow_contraction,
+        semantic_hash=semantic_hash,
     )
     # Async dispatch (issue #151): result_url flips the invoke to
     # fire-and-forget. Absent -> the legacy synchronous invoke.

@@ -397,6 +397,7 @@ def dispatch_event_shards(
         max_in_flight=workers,
         on_failed=on_failed,
     )
+    skip_hash = runner._fleet_skip_hash(run.config, run.overwrite)
     futures: dict[int, Future] = {}
     for key, records in cells:
         key = int(key)
@@ -419,6 +420,7 @@ def dispatch_event_shards(
             aoi_payload=aoi_by_shard.get(key),
             invoked_by=invoked_by,
             run_id=run_id,
+            semantic_hash=skip_hash,
         )
         submap = {
             "grid_signature": run.catalog_data["grid_signature"],

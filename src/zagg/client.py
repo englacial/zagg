@@ -1037,6 +1037,7 @@ class Run:
             invoked_by=invoked_by,
             run_id=run_id,
             submap=submap,
+            semantic_hash=runner._fleet_skip_hash(self.config, self.overwrite),
         )
         error = result.get("error")
         if result.get("status_code") == 200 and not error:
