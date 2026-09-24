@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -286,7 +287,8 @@ class TestLeafRefs:
         # Chunk ordinal 2 was never written: the sentinel emits no ref.
         assert [bool(loc) for loc in count["locations"]] == [True, True, False, True]
         assert count["refs"] == 3
-        assert count["checksum"] is None  # file:// container: no checksum
+        # file:// container: the checksum is the object's ceiled last_modified.
+        assert count["checksum"].microsecond == 0
         leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
         assert (
             count["locations"][0] == f"{icechunk_refs.container_prefix(root)}{leaf_rel}/6/count/c/0"
@@ -355,7 +357,8 @@ class TestLeafRefs:
                 skip_chunks=(2,),
             )
             out = icechunk_refs.record_leaf(root, grid, shard, store_kwargs={})
-            assert out["refs"] > 0 and out["rebases"] == 0 and out["checksum"] is None
+            assert out["refs"] > 0 and out["rebases"] == 0
+            assert out["checksum"] == "last_modified"
             assert out["path"] == f"{root}/icechunk/4"
         group, repo = _open(root, 4)
         messages = [s.message for s in repo.ancestry(branch="main")]
@@ -378,6 +381,29 @@ class TestLeafRefs:
         other = _shards(grid, 3)[2]
         (rank,) = grid.block_index(other)
         assert np.isnan(group["6"]["h_mean"][rank * 16 : (rank + 1) * 16]).all()
+
+    def test_local_refs_catch_a_wholesale_rewrite(self, monkeypatch, cfg, tmp_path):
+        # The file:// container DOES validate a checksum: a LastUpdatedAt
+        # datetime, compared at whole-second granularity, so the plan records
+        # ceil(last_modified) (§11.3). A wholesale leaf replacement a second
+        # later then fails the read loudly instead of decoding the new bytes
+        # at the discarded attempt's offsets.
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        icechunk_refs.init_repo(root, grid, run_id=RUN_ID, store_kwargs={})
+        shard = _shards(grid, 1)[0]
+        _write_leaf(monkeypatch, grid, root, shard, fill=1.0)
+        out = icechunk_refs.record_leaf(root, grid, shard, store_kwargs={})
+        assert out["checksum"] == "last_modified"
+        (rank,) = grid.block_index(shard)
+        span = slice(rank * 16, (rank + 1) * 16)
+        group, _repo = _open(root, 4)
+        np.testing.assert_array_equal(group["6"]["count"][span][:4], np.full(4, 1))
+        time.sleep(1.1)  # icechunk compares at whole-second granularity
+        _write_leaf(monkeypatch, grid, root, shard, fill=99.0)
+        group, _repo = _open(root, 4)
+        with pytest.raises(icechunk.StorageError, match="checksum"):
+            group["6"]["count"][span]
 
     def test_windowed_and_empty_units_are_skipped(self, monkeypatch, cfg, tmp_path):
         grid = _grid(cfg)
@@ -427,7 +453,8 @@ class TestLeafRefs:
         keys = sorted(k for k, _l, _n, _e in count["chunks"])
         assert keys == sorted(f"6/count/c/{rank * 4 + j}" for j in (0, 2, 3))
         out = icechunk_refs.record_leaf(root, grid, shard, store_kwargs={})
-        assert out["refs"] > 0
+        # The record names the FORM, never a per-chunk value.
+        assert out["refs"] > 0 and out["checksum"] == "last_modified"
         group, _repo = _open(root, 4)
         leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
         np.testing.assert_array_equal(
