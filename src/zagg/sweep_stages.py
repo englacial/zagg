@@ -281,6 +281,7 @@ def sweep_stage_pass(
                 store_root,
                 node,
                 stage,
+                dirty=any(d.startswith(node) for d in by_shard),
                 manifest=manifest,
                 levels=levels,
                 fields=fields,

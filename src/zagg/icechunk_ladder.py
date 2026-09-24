@@ -67,6 +67,7 @@ STAGE_COUNTS = (
     "icechunk_missing",
     "icechunk_failed",
     "icechunk_skipped_levels",
+    "icechunk_clean",
 )
 
 
@@ -482,10 +483,32 @@ def stage_node_refs(
 
 
 def stage_hook(
-    store_root, node, stage, *, manifest, levels, fields, candidates, block, store_kwargs, counts
+    store_root,
+    node,
+    stage,
+    *,
+    manifest,
+    levels,
+    fields,
+    candidates,
+    block,
+    store_kwargs,
+    counts,
+    dirty=True,
 ):
-    """The few-line seam ``sweep_stages.sweep_stage_pass`` calls per node — fail-open."""
+    """The few-line seam ``sweep_stages.sweep_stage_pass`` calls per node — fail-open.
+
+    ``dirty`` is whether any leaf under ``node`` was written this run. A
+    clean node is skipped whole: its refs were committed by the run that
+    dirtied it, and the gather is O(subtree) — running it for every node on
+    every pass makes an append cost O(store), which is the amplification the
+    ladder exists to avoid (review finding). The ladder therefore runs over
+    the DIRTY SET; a full re-gather is a manual staged sweep over the store.
+    """
     if block is None:
+        return None
+    if not dirty:
+        counts["icechunk_clean"] += 1
         return None
     t0 = time.perf_counter()
     try:
