@@ -58,7 +58,12 @@ that ellipsoid by construction), not an instruction to compute cell geometry
 on the ellipsoid — the words themselves live on the R = 6371.0088 km
 authalic sphere the conversion maps onto. A store whose `dggs` block carries
 no `latitude` key predates the token; this paragraph is its record, and it is
-authalic by the version evidence above. A reader reproducing cell geometry
+authalic by the version evidence above. The absence rule is **per artifact**,
+not per store: a partially rewritten store legitimately carries both vintages
+— a sweep, stage or column backfill re-templates the overviews and columns it
+writes, so those pick up the token while the leaves beside them, never
+rewritten, do not — and each artifact's own `dggs` block is authoritative for
+that artifact. A reader reproducing cell geometry
 (e.g. a viewer's boundary golden test) needs the geodetic ↔ authalic
 conversion at every geodetic seam, exactly as mortie spec §9 prescribes.
 
