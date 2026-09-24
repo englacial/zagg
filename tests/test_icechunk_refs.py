@@ -91,10 +91,13 @@ def _write_leaf(
 
     ``refs`` arms the worker-side refs commit (``output.icechunk``); the
     ``record_leaf``-level tests keep it OFF so they own the commit themselves.
+    Tri-state: ``None`` leaves ``output`` untouched, so the worker resolves the
+    knob from its PRODUCTION default (absent key -> on for a hive writer).
     """
     import zagg.processing as processing
 
-    grid.config.output["icechunk"] = bool(refs)
+    if refs is not None:
+        grid.config.output["icechunk"] = bool(refs)
 
     def fake(g, shard_key, urls, **kwargs):
         sink = kwargs.get("chunk_results")
@@ -768,6 +771,62 @@ class TestWorkerWiring:
 
         row = flatten_record(build_record(shard_key=shard, metadata=meta, granule_ids=["g"]))
         assert row["icechunk_error"] and row["icechunk_snapshot"] is None
+
+    def test_refs_are_recorded_last_after_the_stamp_and_the_column(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The order the whole design rests on, which nothing else asserted:
+        # at ``record_leaf`` time the stamp has landed (so the refs point at
+        # objects it certified) AND the issue #383 column fold is done — the
+        # last post-stamp phase that can still fail the unit, whose retry
+        # rewrites the leaf wholesale at new offsets. Both directions matter,
+        # so the spy checks state at call time, not after the call returns.
+        import zagg.column as column_mod
+        from zagg.telemetry import read_granule_ids
+
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        root = str(tmp_path / "store")
+        icechunk_refs.init_repo(root, grid, run_id=RUN_ID, store_kwargs={})
+        shard = _shards(grid, 1)[0]
+        order: list = []
+        seen: dict = {}
+        real_column = column_mod.write_leaf_column
+        real_record = icechunk_refs.record_leaf
+
+        def column_spy(*args, **kwargs):
+            order.append("column")
+            return real_column(*args, **kwargs)
+
+        def record_spy(store_root, g, key, **kwargs):
+            order.append("icechunk")
+            leaf = hive.shard_leaf_path(store_root, int(key))
+            seen["stamp"] = hive.read_commit(leaf)
+            seen["ids"] = read_granule_ids(leaf)
+            return real_record(store_root, g, key, **kwargs)
+
+        monkeypatch.setattr(column_mod, "write_leaf_column", column_spy)
+        monkeypatch.setattr(icechunk_refs, "record_leaf", record_spy)
+        meta = _write_leaf(monkeypatch, grid, root, shard, refs=True)
+        assert order == ["column", "icechunk"]
+        assert seen["stamp"]["complete"] is True and "content_hashes" in seen["stamp"]
+        assert seen["ids"]["granule_ids"] == ["g.h5"]
+        assert meta["icechunk"]["refs"] > 0
+
+    def test_the_production_default_records_refs(self, monkeypatch, cfg, tmp_path):
+        # Every other test here sets ``output.icechunk`` explicitly, so none
+        # drove the worker through the shipped default: the key is ABSENT and
+        # a hive writer resolves it on.
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        assert "icechunk" not in cfg.output
+        root = str(tmp_path / "store")
+        icechunk_refs.init_repo(root, grid, run_id=RUN_ID, store_kwargs={})
+        shard = _shards(grid, 1)[0]
+        meta = _write_leaf(monkeypatch, grid, root, shard, refs=None)
+        assert "icechunk" not in cfg.output  # still the default, not a set knob
+        assert meta["icechunk"]["refs"] > 0 and "error" not in meta["icechunk"]
+        assert meta["phase_timings"]["icechunk"] >= 0.0
 
     def test_knob_off_records_nothing(self, monkeypatch, cfg, tmp_path):
         grid = _grid(cfg)
