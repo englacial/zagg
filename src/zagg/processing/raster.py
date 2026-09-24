@@ -1498,7 +1498,16 @@ def process_and_write_raster_hive(
         # sidecar; ``None`` leaves both absent (§5.3 unverifiable, not
         # tampered).
         _t1 = time.time()
-        record = _finalize_leaf_hashes(staged, streams)
+        try:
+            record = _finalize_leaf_hashes(staged, streams)
+        except Exception as e:
+            # Fail-open like every other hash site (D9): now that the record
+            # rides the stamp, an unanticipated raise here would otherwise
+            # leave a fully written leaf UNSTAMPED — debris — over a
+            # telemetry-class digest. A ``None`` record and a raise must cost
+            # the same thing: the key, never the leaf.
+            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
+            record = None
         if record is not None:
             meta["content_hashes"] = record
         hash_s = time.time() - _t1
