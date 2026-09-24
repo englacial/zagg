@@ -3412,16 +3412,39 @@ write — the leaf is normative, the index is regenerable.
 **Contract.** Manifests are split along the chunk axis into runs of `4^m`
 chunks. Because that axis is in nested order, one run is exactly the chunks
 of **one HEALPix cell at order `chunk_order − m`**, so the split is stated
-as "one manifest per order-N cell" and every leaf commit rewrites a whole
-number of manifests (`m ≥ chunk_order − shard_order`). The writer picks the
-smallest `m` such that `4^m ≥ 4 · 1000`: Icechunk's location dictionary
-engages only from 1,000 chunks per manifest (`min_num_chunks`), and the ×4
-margin keeps a run above that gate after its absent chunks (which emit no
-ref) are subtracted. That is `m = 6`, 4,096 chunks — at the production
-geometry one manifest per **order-7 cell, 16 leaves**; the choice is recorded
-as `split.chunks` (`4^m`) and `split.order` (`chunk_order − m`, the order of
-the cell one manifest covers) in the `zagg_icechunk` block (§11.1), not
-hardcoded by readers.
+as "one manifest per order-N cell". The writer picks
+
+```text
+m = max(chunk_order − shard_order, m₀)
+```
+
+with `m₀` the smallest `m` such that `4^m ≥ 4 · 1000`. The first term keeps
+every leaf commit rewriting a *whole number* of manifests: a leaf is
+`4^(chunk_order − shard_order)` chunks, and a smaller `m` would put two
+leaves' chunks in one manifest and make concurrent leaf commits contend over
+the same run. The second is the location-dictionary gate: Icechunk
+deduplicates a manifest's `location` strings only from `min_num_chunks`
+chunks upward — a **configurable** setting whose default is 1,000, not a
+format constant — and the ×4 margin keeps a run above that default after its
+absent chunks (which emit no ref) are subtracted. At the production geometry
+(shard 9 / chunk 13) the two terms are 4 and 6, so `m = 6`: 4,096 chunks, one
+manifest per **order-7 cell, 16 leaves**. The choice is recorded as
+`split.chunks` (`4^m`) and `split.order` (`chunk_order − m`, the order of the
+cell one manifest covers) in the `zagg_icechunk` block (§11.1), not hardcoded
+by readers.
+
+*(Informative.)* `m = 6` is a trade, not a derived optimum, and the trade is
+write amplification. A leaf commit rewrites every manifest its chunks fall
+in, so at `m = 6` each of the 16 leaves of one order-7 cell rewrites that
+whole cell's manifest — over a run, up to **16× the per-array manifest bytes**
+that one-leaf manifests (`m = 4`, 256 chunks) would write. What it buys is
+the location dictionary, which `m = 4` cannot reach at all under the
+1,000-chunk default; and the dictionary is worth reaching here precisely
+because all 256 refs of one leaf array carry the **same** `location` (the
+leaf's single shard object), so the deduplicated form stores that string once
+per leaf instead of 256 times. Because the number is recorded in
+`zagg_icechunk.split`, a later revision may retune it — lowering
+`min_num_chunks` and `m` together, say — without any reader change.
 
 ### 11.6 What §11 does not cover (informative)
 
