@@ -532,6 +532,10 @@ class TestLambdaInitInvoke:
         }
         client = _Client(_envelope(body))
         out = self._call(client)
+        # The blocking round-trip times itself (it may carry a cold start) and
+        # the measurement rides the record, not a sibling summary key --
+        # ``setup_s`` keeps its pre-fan-out bracket meaning.
+        assert out.pop("invoke_s") >= 0.0
         assert out == {
             "path": "s3://b/p/icechunk/4",
             "order": 4,
