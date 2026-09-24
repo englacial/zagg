@@ -3389,8 +3389,8 @@ self-describing:
   "commit": "ladder", "commit_order": 6, "split_order": 6,
   "levels": {
     "19": {"node_order": 9, "artifact": "leaf",     "chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}},
-    "13": {"node_order": 9, "artifact": "column",   "chunk_order": 9,  "cell_order": 13, "split": {"chunks": 64,    "order": 6}},
-    "12": {"node_order": 8, "artifact": "overview", "chunk_order": 8,  "cell_order": 12, "split": {"chunks": 16,    "order": 6}},
+    "13": {"node_order": 9, "artifact": "column",   "chunk_order": 9,  "cell_order": 13, "split": {"chunks": 16384, "order": 2}},
+    "12": {"node_order": 8, "artifact": "overview", "chunk_order": 8,  "cell_order": 12, "split": {"chunks": 16384, "order": 1}},
     "…":  "one entry per level, keyed by cell order",
     "4":  {"node_order": 0, "artifact": "overview", "chunk_order": 0,  "cell_order": 4,  "split": {"chunks": 1,     "order": 0}}
   }
@@ -3405,12 +3405,13 @@ its artifact kind, its chunk-axis order (the inner-chunk order for the base,
 the node order for a one-chunk-per-node level), its cell order and its
 manifest split (§11.5); `commit`, `commit_order` and `split_order` are
 the ladder's knobs (§11.4, §11.5), read back by every stage node so the
-sweep needs no config. Each order group carries the leaf (or overview)
-resolution group's own attrs — the `dggs` block and conventions. That block is the **whole** of the repo root group's attrs — a leaf
-root group carries only its own commit stamp, which is a per-leaf fact and so
-has nothing to mirror. Each **resolution group** mirrors the leaf resolution
-group's attrs verbatim (the `dggs` block, `zarr_conventions`), and **never the
-commit stamp**.
+sweep needs no config. The repo root group's attrs are exactly these two
+keys: `zagg_icechunk` and the `multiscales` mirror (the mirror is absent
+only on a store whose manifest declares no `zagg-multiscales/1` block). A
+leaf root group carries only its own commit stamp, which is a per-leaf fact
+and so has nothing to mirror. Each **level group** mirrors its artifact's
+resolution-group attrs verbatim (the `dggs` block, `zarr_conventions`), and
+**never the commit stamp**.
 
 ### 11.2 Array model
 
@@ -3424,10 +3425,10 @@ level's node order, `n_shards = 12·4^n`, the level's global shape
 
 | field | repo array | derivation |
 |---|---|---|
-| `shape` | `(n_shards · L₀, *L[1:])` | `L` the leaf array's shape; `n_shards = 12·4^shard_order` |
-| chunk shape | the leaf's **inner** chunk shape | the `sharding_indexed` codec's `chunk_shape` when the leaf array is sharded (§1.5), else the leaf array's own `chunk_grid` |
+| `shape` | `(n_shards · L₀, *L[1:])` | `L` the level's per-node object array's shape (the leaf's for the base); `n_shards = 12·4^n`, `n` the level's node order |
+| chunk shape | the object's **inner** chunk shape | the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5), else its own `chunk_grid` — the whole object for a column or overview level, one chunk per node |
 | `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
-| `data_type`, `fill_value`, `dimension_names`, `attributes` | verbatim from the leaf array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
+| `data_type`, `fill_value`, `dimension_names`, `attributes` | verbatim from the object array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
 
 Zarr metadata therefore passes through untouched: a reader that decodes a
 leaf array per §1–§3 decodes the repo array the same way, chunk by chunk.
@@ -3461,9 +3462,11 @@ Each **populated** inner chunk is recorded as one virtual reference:
   (§11.4). An inner chunk the index marks **absent** (the
   `2^64 − 1` sentinel in both words) gets **no reference** and reads as
   `fill_value`.
-- **regular (unsharded) leaf array**: `location` is the chunk object
-  `{leaf}/{p}/c/{j}`, `offset` 0, `length` the object size (§11.4); a missing
-  object gets no reference.
+- **regular (unsharded) array** — a leaf array on a `chunk_inner`-less
+  grid, and every column and overview array (one chunk per object):
+  `location` is the chunk object (`{leaf}/{p}/c/{j}`; `{object}/{p}/c/0` for
+  a single-chunk array), `offset` 0, `length` the object size (§11.4); a
+  missing object gets no reference.
 
 Chunk keys are the array's own, under the `chunk_key_encoding` its
 `zarr.json` declares — zagg emits the `default` encoding with the `/`
@@ -3552,8 +3555,10 @@ columns do:
 3. **One tuple commits.** Let `c` be `commit_order`, `d` a tuple's dispatch
    order and `d′` its child order (the tuple covers orders `[d, d′)`):
    - `d ≤ c < d′` — the **committing tuple**: every node commits all it
-     gathered in **one commit** — the leaf refs into `/{shard_order}/…` and
-     each overview order's refs into `/{order}/…` of the same repo —
+     gathered in **one commit** — every level's refs into its group of the
+     same repo, keyed by cell order (§11.1): the base leaves into
+     `/{cell_order}/…` (`/19`), the column's declared member into `/{c}/…`
+     (`/13`) and each overview level into `/{c}/…` (`/12` … `/4`) —
      message `node {decimal}`;
    - `d′ ≤ c` — a coarser tuple: its nodes commit only their **own**
      overview refs (their children already committed);
@@ -3593,12 +3598,15 @@ that walks no ladder would leave the repo empty while every leaf reported a
 sidecar.
 
 **Init.** `init {run_id}` — the once-per-run initialization, before the
-fan-out: the repo exists with **every** order group the ladder commits into
-(the shard-order group and one per declared overview order, created here
-once because Icechunk's create is not safe under concurrent callers), its
-array nodes (§11.2) defined and the `multiscales` mirror in its root attrs. Idempotent: a repo that already carries a matching block is
-reopened, never re-templated; a block for another geometry, container or
-ladder setting is refused.
+fan-out: the repo exists with **every** level group (§11.1 — the base, the
+column's declared member and one per declared overview level, keyed by cell
+order, created here once because Icechunk's create is not safe under
+concurrent callers), its array nodes (§11.2) defined and the `multiscales`
+mirror in its root attrs. Idempotent: a repo that already carries a matching
+block is reopened, never re-templated; a block for another geometry or
+container is refused. The ladder settings are not compared: `split_order`
+follows the §11.5 ratchet (a finer config adopts the store's value, a
+coarser one re-cuts), and `commit` / `commit_order` are per-run.
 
 A **replaced** leaf (§1.5 leaf immutability) is re-indexed by the next staged
 sweep that gathers it: the new sidecar's refs supersede the old ones on
@@ -3618,11 +3626,13 @@ stage node) the writer issues:
   recipe's second read, which yields every inner chunk's `(offset, length)`
   at once) **and** one `HEAD` of the shard object, for its checksum — the
   `ETag`, or `last_modified` on a local store (§11.3);
-- **regular (unsharded) array** — every overview array, and a leaf array on
-  a `chunk_inner`-less grid: one `LIST` of the array's `c/` chunk prefix,
-  which yields every chunk object's key, size (the ref's `length`) and
-  checksum in one request — and, unlike probing, discovers which chunks were
-  actually written.
+- **single-chunk array** — every column and overview array (one chunk per
+  object): one `HEAD` of its one chunk object, for its size (the ref's
+  `length`) and checksum;
+- **multi-chunk regular (unsharded) array** — a leaf array on a
+  `chunk_inner`-less grid: one `LIST` of the array's `c/` chunk prefix, which
+  yields every chunk object's key, size and checksum in one request — and,
+  unlike probing, discovers which chunks were actually written.
 
 Plus, per stage node, one small `GET` per child carrier. Small beside the
 leaf write, but not nothing.
@@ -3726,7 +3736,7 @@ for them (the sidecar says `skipped: windowed`) and the ladder does not run
 on a windowed store. Raster hive products (`(time, cells)` arrays, never
 sharded) are likewise out of stage 1's writer scope. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview
-order has its repo and its refs. None of these change the leaf format, the
+level has its group in the store's one repo, and its refs. None of these change the leaf format, the
 t-digest storage or the moczarr reader.
 
 A skip-if-current unit's lifecycle touch (#388) refreshes its objects in
