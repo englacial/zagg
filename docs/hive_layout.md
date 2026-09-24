@@ -1410,16 +1410,33 @@ Reading it back:
 
 ```python
 import icechunk, zarr
-from zagg.icechunk_refs import container_prefix, repo_path
 
-root = "s3://bucket/product"
-storage = icechunk.s3_storage(bucket="bucket", prefix="product/icechunk/9", from_env=True)
+# The virtual chunk container's prefix: the store root URL with a trailing
+# "/", recorded in the repo's own root attrs as zagg_icechunk.url_prefix.
+root_prefix = "s3://bucket/product/"
+storage = icechunk.s3_storage(
+    bucket="bucket", prefix="product/icechunk/9", region="us-west-2", anonymous=True
+)
 repo = icechunk.Repository.open(
-    storage, authorize_virtual_chunk_access={container_prefix(root): icechunk.s3_from_env_credentials()}
+    storage,
+    authorize_virtual_chunk_access={root_prefix: icechunk.s3_anonymous_credentials()},
 )
 group = zarr.open_group(repo.readonly_session("main").store, mode="r")
 count = group["19/count"]          # shape 12·4^19, chunks 4^6 — the whole order
 ```
+
+That is the **public** store — the motivating case, and the one an icechunk-js
+reader in a browser takes. A private store swaps `anonymous=True` for
+`from_env=True` and `s3_anonymous_credentials()` for
+`s3_from_env_credentials()`, both of which resolve the
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` **environment variables only** —
+not the botocore chain, so an `AWS_PROFILE` reader wants `get_credentials=`
+and `icechunk.s3_refreshable_credentials(...)` instead (which is what the
+writer itself does, `icechunk_refs._boto3_credentials`). Pass `region=`
+either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
+`us-west-2`. Nothing here imports zagg — the repo opens from its own recorded
+`url_prefix` and the paths above, which is what makes the same two calls
+writable in icechunk-js.
 
 The manifest split (spec §11.5) is one manifest per order-`N` cell — at the
 production geometry `N = 7`, 4,096 chunks, 16 leaves — recorded in the repo
