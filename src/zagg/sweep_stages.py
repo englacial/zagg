@@ -136,6 +136,7 @@ def sweep_stage_pass(
     on_node=None,
     level_actuals: dict | None = None,
     only_dispatch: int | None = None,
+    dirt_only: dict | None = None,
 ) -> dict:
     """One staged pass over the dirty set: every tuple, finest first.
 
@@ -160,6 +161,12 @@ def sweep_stage_pass(
     grouping alone (the merge-source law: grouping changes no bytes). An order
     that dispatches no tuple refuses BY NAME rather than sweeping nothing — a
     mistyped dispatch order must not read as a clean no-op.
+
+    ``dirt_only`` (the ``by_shard`` shape, issue #580) names leaves whose data
+    is unchanged but whose Icechunk ref sidecar was rewritten (a touched
+    skip-if-current unit, PR #581 question (11)). A node whose subtree holds
+    dirt-only leaves and no dirty one is not folded: the ref hook alone runs
+    for it, as dirty, and the row counts it as ``icechunk_regathered``.
     """
     from zagg.hive import _utcnow
     from zagg.store import open_object_store
@@ -211,7 +218,10 @@ def sweep_stage_pass(
         logger.info("stage sweep: no composable fields declared; nothing to generate")
         return summary
     windowed = manifest.get("temporal") is not None
-    candidates, moc_stale = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
+    dirt_only = {d: w for d, w in (dirt_only or {}).items() if d not in by_shard}
+    candidates, moc_stale = _candidate_decimals(
+        store_root, shard_order, {**dirt_only, **by_shard}, store_kwargs
+    )
     if moc_stale:
         summary["root_moc_stale"] = True
     if not candidates:
@@ -247,15 +257,18 @@ def sweep_stage_pass(
         nodes = [n for n in nodes if scope_admits(n, scope)]
         icechunk_nodes: list = []
         for node in nodes:
+            dirty = any(d.startswith(node) for d in by_shard)
+            regather = not dirty and any(d.startswith(node) for d in dirt_only)
             dirty_windows: set = set()
             for d in by_shard:
                 if d.startswith(node):
                     dirty_windows |= by_shard[d]
             from zagg.sweep_overview import _read_envelope
 
-            envelope = _read_envelope(store, node)
+            envelope = None if regather else _read_envelope(store, node)
             entries = dict((envelope or {}).get("windows") or {})
-            for key, fold_windows in _window_work(decl, windowed, dirty_windows, entries):
+            work = [] if regather else _window_work(decl, windowed, dirty_windows, entries)
+            for key, fold_windows in work:
                 stage_node(
                     store,
                     store_root,
@@ -281,7 +294,7 @@ def sweep_stage_pass(
                 store_root,
                 node,
                 stage,
-                dirty=any(d.startswith(node) for d in by_shard),
+                dirty=dirty or regather,
                 manifest=manifest,
                 levels=levels,
                 fields=fields,
@@ -292,6 +305,8 @@ def sweep_stage_pass(
             )
             if hooked is not None:
                 icechunk_nodes.append(node_row(hooked))
+                if regather and "error" not in hooked:
+                    counts["icechunk_regathered"] += 1
             if on_node is not None:
                 on_node(node)
         row = {
@@ -489,6 +504,7 @@ def run_stage_sweep(
     run_id: str | None = None,
     lease_ttl_s: int | None = None,
     touch_policy: str = "auto",
+    dirt_only=None,
 ) -> dict:
     """One admitted staged sweep, end to end: lease -> stages -> finisher.
 
@@ -498,6 +514,9 @@ def run_stage_sweep(
     ``coverage.moc`` (a fleet append with no subsequent sweep leaves the
     root MOC stale, and the ratchet only heals nodes a sweep visits; the MOC
     stays an in-pass accelerator for sibling candidates only).
+    ``dirt_only`` is the run's ref-only work set in the same pair shape
+    (:func:`zagg.sweep.dirt_only_leaves`): its nodes re-gather Icechunk refs
+    and fold nothing (:func:`sweep_stage_pass`); the finisher never sees it.
 
     ``scope`` is the optional node-prefix MOC (#381 point (11) — decimals,
     words, or a shardmap whose keys are the prefixes); ``partitions=``
@@ -549,6 +568,7 @@ def run_stage_sweep(
     if leaves is None:
         leaves = discover_leaves(store_root, store_kwargs=store_kwargs)
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
+    regather, _ = _normalize_leaves(dirt_only or [], shard_order)
     scope_words = normalize_scope(scope)
     lease = acquire_lease(
         store_root,
@@ -575,6 +595,7 @@ def run_stage_sweep(
         "shard_order": shard_order,
         "tuple_width": int(tuple_width),
         "n_leaves": sum(len(w) for w in by_shard.values()),
+        "n_dirt_only": sum(len(w) for w in regather.values()),
         "skipped_leaves": skipped,
         "scope": None if scope_words is None else [str(int(w)) for w in scope_words],
         "partitions": partitions,
@@ -610,6 +631,7 @@ def run_stage_sweep(
                 on_stage=lambda row: heartbeat_lease(store_root, lease, store_kwargs=store_kwargs),
                 on_node=_maybe_beat,
                 level_actuals=level_actuals,
+                dirt_only=regather,
             )
             rows = part["stages"]
             if index is not None:
@@ -677,7 +699,12 @@ def _write_stage_record(store_root: str, summary: dict, store_kwargs: dict) -> s
 
 
 def stage_sweep_after_run(
-    store_root: str, leaves, *, store_kwargs: dict | None = None, touch_policy: str = "auto"
+    store_root: str,
+    leaves,
+    *,
+    store_kwargs: dict | None = None,
+    touch_policy: str = "auto",
+    dirt_only=(),
 ):
     """Post-fleet chaining: the ``output.sweep: "stages"`` opt-in, fail-open.
 
@@ -697,15 +724,25 @@ def stage_sweep_after_run(
     reads the config to decide to chain at all, so it also passes the policy
     that governs the finisher's touch — an operator who declared ``never`` on an
     archival destination must not get one new root-core version per staged sweep.
+
+    ``dirt_only`` (issue #580) joins the scope and rides to
+    :func:`run_stage_sweep`: the run's touched current units, whose nodes
+    re-gather their refs without a fold.
     """
     from zagg.grids.morton import morton_decimal
 
     try:
-        scope = sorted({morton_decimal(int(k)) for k, _w in (tuple(r) for r in leaves)})
+        pairs = [tuple(r) for r in (*leaves, *dirt_only)]
+        scope = sorted({morton_decimal(int(k)) for k, _w in pairs})
         if not scope:
             return None
         summary = run_stage_sweep(
-            store_root, leaves, scope=scope, store_kwargs=store_kwargs, touch_policy=touch_policy
+            store_root,
+            leaves,
+            scope=scope,
+            store_kwargs=store_kwargs,
+            touch_policy=touch_policy,
+            dirt_only=dirt_only,
         )
         logger.info(
             f"Post-run staged sweep: {[(s['dispatch_order'], s['written']) for s in summary['stages']]}"
