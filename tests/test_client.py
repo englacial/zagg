@@ -358,7 +358,8 @@ class TestDispatch:
 
     def test_hive_setup_handshake_precedes_cells(self, catalog):
         stub = StubLambdaClient()
-        _run(catalog, client=stub).dispatch().wait(timeout=10)
+        run = _run(catalog, client=stub)
+        run.dispatch().wait(timeout=10)
         modes = stub.modes()
         first_cell = modes.index(None)
         assert modes[:first_cell] == [
@@ -371,6 +372,13 @@ class TestDispatch:
         assert ("Event", "setup") in setup_invocations
         # The companion init blocks the fan-out (issue #580): synchronous.
         assert ("RequestResponse", "icechunk_init") in setup_invocations
+        # ... and its record is KEPT and threaded into the tail's run-record
+        # write, so this dispatcher populates the run-level icechunk columns
+        # the same way runner._run_lambda does — a failed init has to be
+        # recorded, not invisible (D9).
+        (stats_event,) = [e for _, _, e in stub.events if e.get("mode") == "stats"]
+        assert stats_event["icechunk_init"] == run._icechunk_init
+        assert run._icechunk_init is not None
         # Post-run tail (all worker invokes, D8): finalize backstop + fail-open
         # coverage/stats rollups.
         assert "finalize" in modes

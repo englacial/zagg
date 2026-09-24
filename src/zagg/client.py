@@ -405,6 +405,10 @@ class Run:
         self._parent_order = get_parent_order(config) if grid_type == "healpix" else None
         self._child_order = get_child_order(config) if grid_type == "healpix" else None
         self.grid = grid_from_config(config)
+        # The dispatch-time Icechunk init record (issue #580), read by the
+        # tail's run-record write; None until dispatch() fires the invoke,
+        # and None for good when the knob is off.
+        self._icechunk_init: dict | None = None
         runner._check_signature(self.grid, catalog_data)
 
     def __repr__(self) -> str:
@@ -850,8 +854,11 @@ class Run:
             )
             # Icechunk companion init (issue #580): synchronous, before the
             # fan-out, fail-open — the same seam ``runner._run_lambda`` takes.
+            # The record is kept so the tail's run-record write carries the
+            # repo and its init snapshot, exactly as the runner path does —
+            # a failed init has to be recorded, not invisible (D9).
             if get_icechunk(self.config):
-                runner._invoke_lambda_icechunk_init(
+                self._icechunk_init = runner._invoke_lambda_icechunk_init(
                     client,
                     self.function_name,
                     self.store,
@@ -1245,6 +1252,11 @@ class Run:
             # instead of reading "recorded" as "succeeded" (review, PR #343).
             finalize_error=finalize_error,
             tail_status_url=f"{run_status_prefix(self.store, run_id)}/{TAIL_NAME}",
+            # The init record dispatch() kept (issue #580): the run-level
+            # icechunk columns broadcast over every row, so a run's leaves
+            # join to the repo history they were committed into. None when
+            # the knob is off — the same value runner._run_lambda threads.
+            icechunk_init=self._icechunk_init,
         )
         if layout == "hive" and get_sweep(self.config):
             try:
