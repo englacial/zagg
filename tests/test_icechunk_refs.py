@@ -1864,6 +1864,41 @@ class TestLadder:
         assert rows[3]["icechunk_commits"] == 1  # the o3 overviews of node 1111 only
         assert rows[0]["icechunk_commits"] == 1
 
+    @pytest.mark.parametrize("commit", ["leaf", "ladder"])
+    def test_skip_touch_re_records_the_leaf_refs(self, monkeypatch, cfg, tmp_path, commit):
+        # The skip-if-current touch refreshes the leaf's objects in place,
+        # moving the checksum every ref into them carries (the file:// mtime
+        # here; a multipart ETag on S3). The touched unit re-plans from fresh
+        # HEADs: a per-leaf commit lands them at once; in ladder mode the
+        # sidecar is rewritten, so the node's next re-gather commits refs
+        # that read (review finding; before the fix, both reads failed).
+        from zagg.sweep_stages import run_stage_sweep
+
+        shards = _shards(_grid(cfg), 2)
+        block = {"commit": commit}
+        grid, root, _ = _ladder_run(monkeypatch, cfg, tmp_path, icechunk_block=block, shards=shards)
+        time.sleep(1.1)  # past the ceiled-second checksum of the first write
+        _grid_, _root, again = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block=block, shards=shards
+        )
+        assert again["cells_current"] == 2
+        for meta in again["results"]:
+            assert meta["touched_objects"] > 0 and "error" not in meta["icechunk"]
+        if commit == "ladder":
+            run_stage_sweep(root, [(s, None) for s in shards], store_kwargs={})
+        group, repo = _open(root)
+        if commit == "leaf":
+            messages = [m.message for m in repo.ancestry(branch="main")]
+            assert sorted(messages[:2]) == ["leaf 11111", "leaf 11112"]  # the rerun's commits
+        group["5"]["count"][:]  # the touched column's level reads too (no stale checksum)
+        for i, shard in enumerate(shards):
+            (rank,) = grid.block_index(shard)
+            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            np.testing.assert_array_equal(
+                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+            )
+            assert leaf["count"][0] == (i + 1) * 10
+
 
 class TestLeafUnits:
     def test_only_the_declared_leaf_member_is_a_level(self, cfg):
