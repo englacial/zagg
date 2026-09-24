@@ -119,9 +119,10 @@ dependencies = [
     "async-tiff>=0.7.2",
     # Icechunk (issue #580; espg approved the dependency on the issue,
     # 2026-09-23): the per-order virtual-ref companion repo the fleet writes
-    # at leaf commit (spec §11). Sole dep zarr>=3.1.0; cp312-abi3 manylinux
-    # wheels for both layer arches (~17 MB). 2.2.2 is the first release whose
-    # ``set_virtual_refs_arr`` takes the shard index's u64 arrays directly.
+    # at leaf commit (spec §11). Sole dep zarr>=3.1.0. 2.2.2 is the first
+    # release shipping cp312-abi3 manylinux wheels — one ~17 MB wheel per
+    # layer arch rather than one per interpreter, the floor's stated basis on
+    # the issue, which also names 2.2.2 as the fleet pin.
     "icechunk>=2.2.2",
 ]
 
