@@ -537,7 +537,7 @@ class _Payload:
 
 def _envelope(body: dict, status: int = 200, function_error: str | None = None) -> dict:
     raw = json.dumps({"statusCode": status, "body": json.dumps(body)}).encode()
-    out = {"Payload": _Payload(raw)}
+    out: dict = {"Payload": _Payload(raw)}
     if function_error:
         out["FunctionError"] = function_error
     return out
@@ -862,14 +862,14 @@ class TestRunRecord:
         assert df["icechunk_init_error"].isna().all()
         # A fail-open init lands in its OWN column, never in the snapshot's.
         path = write_run_parquet(
-            str(tmp_path), self._rows(), run_id="abd", icechunk_init={"error": "RuntimeError: x"}
+            str(tmp_path), self._rows(), run_id="run-b", icechunk_init={"error": "RuntimeError: x"}
         )
         df = pd.read_parquet(path)
         assert df["icechunk_init_error"].tolist() == ["RuntimeError: x"]
         assert df["icechunk_init_repo"].isna().all()
         assert df["icechunk_init_snapshot"].isna().all()
         # Off-hive / opted out: all null, columns still present.
-        df = pd.read_parquet(write_run_parquet(str(tmp_path), self._rows(), run_id="abe"))
+        df = pd.read_parquet(write_run_parquet(str(tmp_path), self._rows(), run_id="run-c"))
         for col in ("icechunk_init_repo", "icechunk_init_snapshot", "icechunk_init_error"):
             assert df[col].isna().all()
 
