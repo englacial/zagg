@@ -59,6 +59,16 @@ Event payload (default / process mode):
         holding a synchronous connection open while the shard runs. Written
         with the output-store credentials. Absent -> no write, and the event
         and behavior are byte-identical to the synchronous path.
+    "skip_if_current": bool (optional, issue #388, hive only) -- arms the
+        leaf identity gate: a unit whose (semantic_hash, granule-id set)
+        matches its leaf's sidecar writes nothing and returns
+        {"current": true, ...} (plus "icechunk_dirty" when its touch rewrote
+        the ladder ref sidecar, issue #580); a contraction returns
+        {"refused": true, ...}. Neither carries a stats record. Absent -> the
+        unconditional rewrite.
+    "semantic_hash": str (sent with skip_if_current) -- the RUN config's D19
+        digest the gate compares against,
+    "allow_contraction": bool (optional, issue #388) -- rewrite a refused unit.
 }
 
 Setup mode (creates the zarr template once before per-cell fan-out; for a
@@ -2188,6 +2198,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # response body (this metadata) then carries time_range back
                 # for the dispatcher's root-summary union.
                 window=event.get("window"),
+                # Leaf skip-if-current (issue #388): armed only when the
+                # dispatcher sends the key (with the RUN config's D19 digest),
+                # exactly where the local backend arms it; absent -> rewrite.
+                skip_if_current=bool(event.get("skip_if_current")),
+                allow_contraction=bool(event.get("allow_contraction")),
+                semantic_hash=event.get("semantic_hash"),
             )
         else:
             # Flat layout: lazy store + one-time template check, opened on the
@@ -2325,17 +2341,22 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # whose data landed — the record still rides the envelope.
         from zagg.telemetry import build_record, lambda_env, write_sidecar
 
-        record = build_record(
-            shard_key=int(shard_key),
-            metadata=metadata,
-            granule_ids=event.get("granule_urls"),
-            invoked_by=event.get("invoked_by"),
-            run_id=event.get("run_id"),
-            window=(event.get("window") or {}).get("label"),
-            lambda_config=lambda_env(),
-        )
-        metadata["stats"] = record
-        if get_store_layout(config) == "hive" and not metadata.get("error"):
+        # A current/refused unit (issue #388) wrote nothing: no record, no
+        # sidecar, no sub-map -- clobbering its good sidecar with a zero-count
+        # record is exactly what the gate exists to prevent (issue #401).
+        skipped = metadata.get("current") or metadata.get("refused")
+        if not skipped:
+            metadata["stats"] = build_record(
+                shard_key=int(shard_key),
+                metadata=metadata,
+                granule_ids=event.get("granule_urls"),
+                invoked_by=event.get("invoked_by"),
+                run_id=event.get("run_id"),
+                window=(event.get("window") or {}).get("label"),
+                lambda_config=lambda_env(),
+            )
+        if get_store_layout(config) == "hive" and not metadata.get("error") and not skipped:
+            record = metadata["stats"]
             from zagg.hive import shard_leaf_path
 
             try:

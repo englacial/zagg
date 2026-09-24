@@ -1952,6 +1952,74 @@ class TestLadder:
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
 
+    def test_skip_touch_regathers_dirt_only_over_the_fleet(self, monkeypatch, cfg, tmp_path):
+        # The same all-skip rerun, on the production path: each unit is
+        # re-dispatched through the Lambda handler with the event the fleet
+        # dispatcher builds (the gate armed with the run's digest), the
+        # dispatcher assembles the dirt-only set from the worker bodies, and
+        # the fleet stage sweep (workers = the handler, in-process) re-gathers
+        # and commits the rewritten sidecars. The repo reads in the same run.
+        import importlib.util
+        from dataclasses import asdict
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from zagg import runner
+        from zagg.sweep import dirt_only_leaves
+
+        spec = importlib.util.spec_from_file_location(
+            "zagg_lambda_handler_580",
+            Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py",
+        )
+        handler = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(handler)
+
+        shards = _shards(_grid(cfg), 2)
+        grid, root, _ = _ladder_run(monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards)
+        time.sleep(1.1)  # past the ceiled-second checksum of the first write
+        config_dict = asdict(runner._pin_icechunk_commit(cfg, grid, stages=True))
+        ctx = MagicMock(aws_request_id="r", function_name="f", memory_limit_in_mb=2048)
+        ctx.get_remaining_time_in_millis.return_value = 900_000
+        bodies = []
+        for i, shard in enumerate(shards):
+            event = runner._build_cell_event(
+                grid.block_index(shard),
+                shard,
+                4,
+                6,
+                [f"s3://b/g{i}.h5"],
+                root,
+                {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+                config_dict=config_dict,
+                semantic_hash=runner._fleet_skip_hash(cfg, False),
+            )
+            resp = handler._handle_process(event, ctx)
+            assert resp["statusCode"] == 200, resp["body"]
+            bodies.append(json.loads(resp["body"]))
+        assert all(b["current"] and b["icechunk_dirty"] and "stats" not in b for b in bodies)
+        dirt_only = dirt_only_leaves(bodies)
+        assert dirt_only == [(s, None) for s in sorted(shards)]
+
+        class Fleet:
+            def invoke(self, **kwargs):
+                handler.lambda_handler(json.loads(kwargs["Payload"]), None)
+                return {"StatusCode": 202}
+
+        summary = runner._invoke_lambda_stage_sweep(
+            Fleet(), "fn", root, [], shard_order=4, store_kwargs={}, dirt_only=dirt_only
+        )
+        assert summary["finisher"]["landed"] and summary["n_dirt_only"] == 2
+        rows = _stage_rows(root)
+        assert [(r["icechunk_regathered"], r["written"]) for r in rows] == [(1, 0), (1, 0)]
+        group, _repo = _open(root)
+        group["5"]["count"][:]  # the touched column's level reads (no stale checksum)
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            np.testing.assert_array_equal(
+                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+            )
+
 
 class TestLeafUnits:
     def test_only_the_declared_leaf_member_is_a_level(self, cfg):

@@ -304,6 +304,8 @@ class TestDispatch:
         assert all(n == "process-shard-test" for n, _, _ in cells)
 
     def test_cell_event_payload_shape(self, catalog):
+        from zagg.semantics import semantic_hash
+
         stub = StubLambdaClient()
         handle = _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]])
         handle.results()
@@ -322,7 +324,13 @@ class TestDispatch:
             "handoff",
             "run_id",
             "submap",
+            # The fleet's leaf identity gate, armed as on _run_local (hive,
+            # no overwrite): the RUN config's D19 digest rides with it.
+            "skip_if_current",
+            "semantic_hash",
         }
+        assert event["skip_if_current"] is True
+        assert event["semantic_hash"] == semantic_hash(default_config("atl06"))
         assert event["shard_key"] == _WORDS[1]
         assert event["parent_order"] == 6
         assert event["child_order"] == 12
@@ -337,6 +345,14 @@ class TestDispatch:
             "metadata": {"short_name": "ATL06", "version": "006"},
             "granules": [_rec(3)],
         }
+
+    def test_overwrite_disarms_the_fleet_gate(self, catalog):
+        # The operator's hammer disarms the gate on the facade exactly as on
+        # _run_local and _run_lambda (issue #388): no gate keys ride.
+        stub = StubLambdaClient()
+        _run(catalog, client=stub, overwrite=True).dispatch(shard_keys=[_WORDS[1]]).results()
+        (_, _, event) = stub.cell_events()[0]
+        assert "skip_if_current" not in event and "semantic_hash" not in event
 
     def test_icechunk_commit_ships_pinned_per_leaf(self, catalog):
         # The facade chains no staged sweep, so the ref ladder never runs:
