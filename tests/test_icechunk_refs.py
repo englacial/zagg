@@ -217,7 +217,15 @@ class TestInit:
         assert list(containers) == [icechunk_refs.container_prefix(root)]
         splitting = repo.config.manifest.splitting
         assert splitting is not None
-        assert str(out["split"]["chunks"]) in repr(splitting)
+        # The structured form, not a substring of the repr: §11.5 splits on
+        # Axis(0) of any array, and the size must be attached to THAT axis and
+        # THAT condition, which a repr search cannot tell apart from an
+        # unrelated field carrying the same number.
+        ((condition, dims),) = splitting.split_sizes
+        assert isinstance(condition, icechunk.ManifestSplitCondition.AnyArray)
+        ((axis, size),) = dims
+        assert isinstance(axis, icechunk.ManifestSplitDimCondition.Axis)
+        assert axis._0 == 0 and size == out["split"]["chunks"]
 
     def test_rerun_reopens_without_a_commit(self, cfg, tmp_path):
         grid = _grid(cfg)
