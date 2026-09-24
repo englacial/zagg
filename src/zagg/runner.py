@@ -5622,8 +5622,10 @@ def _invoke_lambda_icechunk_init(
     fan-out, so every leaf commit finds them. ``RequestResponse`` because the
     fan-out must not start ahead of it; fail-open because the leaves never
     depend on it — a stale deployment (its process handler 400s the unknown
-    mode), a throttled invoke or a refused init all return ``{"error": ...}``
-    with a warning, and the run proceeds refs-less.
+    mode), a throttled invoke, a refused init, or a 200 that is not the
+    handler's success envelope all return ``{"error": ...}`` with a warning,
+    and the run proceeds refs-less. Never an empty dict: ``{}`` is falsy and
+    would read as "the knob was off" in the summary and the run record.
 
     The record carries ``invoke_s``, the blocking round-trip's wall time --
     often the run's first real invoke, so it may include a cold start. It
@@ -5656,6 +5658,12 @@ def _invoke_lambda_icechunk_init(
             raise RuntimeError(
                 f"statusCode {result.get('statusCode')}: {body.get('error') or result.get('body')!r}"
             )
+        # A 200 whose body is not the handler's success envelope is a
+        # failure, not an empty record: an older or mis-routed worker can
+        # answer 200 with nothing in it, and {} is falsy, so it would read as
+        # "the knob was off" all the way into the run record.
+        if not body.get("ok") or not body.get("path"):
+            raise RuntimeError(f"unexpected icechunk_init body: {body!r}")
     except Exception as e:
         logger.warning(f"icechunk init invoke failed (fail-open, issue #580): {e}")
         return {"error": f"{type(e).__name__}: {e}"}

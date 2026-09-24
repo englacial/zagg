@@ -575,6 +575,11 @@ class TestLambdaInitInvoke:
             (_envelope({"error": "Missing shard_key"}, status=400), None, "statusCode 400"),
             (_envelope({}, function_error="Unhandled"), None, "RuntimeError"),
             (None, ConnectionError("throttled"), "throttled"),
+            # A 200 that is not the handler's success envelope: an older or
+            # mis-routed worker. {} is falsy, so an empty record would read as
+            # "the knob was off" all the way into the run parquet.
+            (_envelope({"zagg_version": "stub"}), None, "unexpected icechunk_init body"),
+            (_envelope({"ok": True, "mode": "icechunk_init"}), None, "unexpected"),
         ],
     )
     def test_failures_are_fail_open(self, response, raise_exc, match, caplog):
@@ -656,6 +661,19 @@ class TestHandlerMode:
         resp = handler_mod.lambda_handler(event, None)
         assert resp["statusCode"] == 500
         assert json.loads(resp["body"])["mode"] == "icechunk_init"
+
+    def test_run_id_is_required_not_defaulted(self, handler_mod, cfg, tmp_path):
+        # §11.4 fixes the commit grammar as ``init {run_id}``; an
+        # unattributable ``init unknown`` cannot be rewritten out of the
+        # repo's permanent ancestry, so a caller that omits it 500s through
+        # the existing except. Both dispatchers always send one.
+        root = str(tmp_path / "store")
+        event = self._event(root, cfg)
+        del event["run_id"]
+        resp = handler_mod.lambda_handler(event, None)
+        assert resp["statusCode"] == 500
+        assert "run_id" in json.loads(resp["body"])["error"]
+        assert icechunk_refs.read_block(root, 4, store_kwargs={}) is None
 
 
 class TestWorkerWiring:
