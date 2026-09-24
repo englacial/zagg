@@ -277,22 +277,53 @@ def repo_group_spec(grid, store_root: str, split: dict):
     )
 
 
+def _session_block(session) -> dict | None:
+    """The ``zagg_icechunk`` block on a session's root group, or ``None``."""
+    import zarr
+    from zarr.errors import GroupNotFoundError
+
+    try:
+        attrs = zarr.open_group(session.store, mode="r").attrs
+    except GroupNotFoundError:
+        return None
+    block = attrs.get(ICECHUNK_ATTR)
+    return dict(block) if isinstance(block, dict) else None
+
+
+def _geometry(grid, store_root: str) -> dict:
+    """The block fields that fix where a leaf's refs land (§11.2, §11.3)."""
+    return {
+        "shard_order": int(grid.parent_order),
+        "chunk_order": int(grid.chunk_order),
+        "cell_order": int(grid.child_order),
+        "url_prefix": container_prefix(store_root),
+    }
+
+
+def _check_geometry(block: dict, grid, store_root: str, path: str) -> None:
+    """Raise unless a persisted block describes THIS run's array model.
+
+    A store whose leaves were cleared but whose root survived reopens the
+    stale repo underneath a new-geometry manifest; writing this run's refs
+    into that repo puts them at indices that mean something else, and a
+    ``file://`` container carries no checksum to catch it (§11.3). The caller
+    is fail-open, so a mismatched store loses the index instead.
+    """
+    want = _geometry(grid, store_root)
+    have = {key: block.get(key) for key in want}
+    if have != want:
+        raise ValueError(f"icechunk repo {path} was built for {have}, this run is {want}")
+
+
 def read_block(store_root: str, order: int, *, store_kwargs: dict) -> dict | None:
     """The repo's ``zagg_icechunk`` block, or ``None`` when absent/uninitialized."""
     import icechunk
-    import zarr
-    from zarr.errors import GroupNotFoundError
 
     try:
         repo = open_repo(store_root, order, store_kwargs=store_kwargs)
     except icechunk.IcechunkError:
         return None
-    try:
-        attrs = zarr.open_group(repo.readonly_session(BRANCH).store, mode="r").attrs
-    except GroupNotFoundError:
-        return None
-    block = attrs.get(ICECHUNK_ATTR)
-    return dict(block) if isinstance(block, dict) else None
+    return _session_block(repo.readonly_session(BRANCH))
 
 
 def init_repo(store_root: str, grid, *, run_id: str, store_kwargs: dict) -> dict:
@@ -300,11 +331,9 @@ def init_repo(store_root: str, grid, *, run_id: str, store_kwargs: dict) -> dict
 
     Returns ``{"path", "order", "snapshot", "created", "split"}``; ``created``
     is ``False`` when the repo already carried the block (reopened, nothing
-    committed) — the idempotent rerun.
+    committed) — the idempotent rerun. The rerun is a *match* check, not a
+    presence check: a repo whose array model is not this run's raises.
     """
-    import zarr
-    from zarr.errors import GroupNotFoundError
-
     from zagg.grids.base import vlen_dtype_warning_suppressed
 
     order = int(grid.parent_order)
@@ -312,11 +341,9 @@ def init_repo(store_root: str, grid, *, run_id: str, store_kwargs: dict) -> dict
     path = repo_path(store_root, order)
     repo = open_repo(store_root, order, store_kwargs=store_kwargs, split_chunks=split["chunks"])
     ro = repo.readonly_session(BRANCH)
-    try:
-        existing = dict(zarr.open_group(ro.store, mode="r").attrs).get(ICECHUNK_ATTR)
-    except GroupNotFoundError:
-        existing = None
-    if isinstance(existing, dict):
+    existing = _session_block(ro)
+    if existing is not None:
+        _check_geometry(existing, grid, store_root, path)
         return {
             "path": path,
             "order": order,
@@ -455,16 +482,31 @@ def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=
     index (a windowed leaf, §11.6; a leaf with no chunk objects). Raises on
     failure — the caller is fail-open.
     """
+    import icechunk
+
     from zagg.grids.morton import morton_decimal
 
     if window is not None:
         return {"skipped": "windowed"}
     checksum = "etag" if container_prefix(store_root).startswith("s3://") else None
+    # Open and vet the repo BEFORE the plan: the plan costs ~20 object-store
+    # requests, and refs must never land in a repo built for another geometry.
+    order = int(grid.parent_order)
+    path = repo_path(store_root, order)
+    # The message stays free of the store root: it rides the leaf's stats
+    # sidecar, where a root-dependent string would break byte parity.
+    absent = f"the order-{order} icechunk repo is not initialized"
+    try:
+        repo = open_repo(store_root, order, store_kwargs=store_kwargs)
+        block = _session_block(repo.readonly_session(BRANCH))
+    except icechunk.IcechunkError as exc:
+        raise ValueError(absent) from exc
+    if block is None:
+        raise ValueError(absent)
+    _check_geometry(block, grid, store_root, path)
     plan = leaf_ref_plan(grid, shard_key, store_root, store_kwargs=store_kwargs)
     if not any(entry["refs"] for entry in plan):
         return {"skipped": "empty"}
-    order = int(grid.parent_order)
-    repo = open_repo(store_root, order, store_kwargs=store_kwargs)
     session = repo.writable_session(BRANCH)
     refs = 0
     for entry in plan:
@@ -491,7 +533,7 @@ def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=
         session, f"leaf {morton_decimal(int(shard_key))}", local=_is_local(store_root)
     )
     return {
-        "path": repo_path(store_root, order),
+        "path": path,
         "snapshot": snapshot,
         "arrays": sum(1 for entry in plan if entry["refs"]),
         "refs": refs,
