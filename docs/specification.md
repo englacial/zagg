@@ -112,6 +112,7 @@ Contents:
 8. [`zagg-toc/1` — the temporal declaration](#8-zagg-toc1)
 9. [`zagg-located/1` — the located declaration](#9-zagg-located1)
 10. [`zagg-coverage-toc/1` — the root coverage temporal section](#10-zagg-coverage-toc1)
+11. [Icechunk companion repos — the per-order virtual-ref index](#11-icechunk-companion-repos)
 
 ---
 
@@ -268,6 +269,18 @@ chunks (the 2-GET recipe generalized to a span), on the per-inner-chunk
 geometry only the covering chunk objects — never a whole-array sweep. The
 span property is normative; a dedicated subtree reader is implementation
 (zagg: [issue #351](https://github.com/englacial/zagg/issues/351)).
+
+**Leaf immutability.** A committed leaf's data objects are **write-once**:
+once the commit stamp lands, a writer MUST NOT modify bytes at an existing
+leaf key in place — no partial rewrite, no append, no re-encode of one
+array. The only legal change to a stamped leaf is **wholesale replacement**
+under the D4 retry discipline (the leaf template clears the prefix first, so
+every object under it is a new object, then the stamp lands last). This is
+what lets a byte-range index into a leaf — the §11 Icechunk companion refs,
+moczarr's 2-GET reads — trust `(key, offset, length)` for as long as the
+stamp it was taken under stands; a replacing writer re-records its refs with
+the new leaf (§11.4). Issue
+[#580](https://github.com/englacial/zagg/issues/580).
 
 ### 1.6 Succession
 
@@ -3256,3 +3269,159 @@ fixture's two clusters leave uncovered, which is what makes the object a
 test of the never-bridge law rather than of a single bucket. The other fixtures carry no `coverage.toc` at all,
 which pins the absence rule as bytes, exactly as §10's section absence is
 pinned.
+
+---
+
+## 11. Icechunk companion repos
+
+**Status: stage 1 — refs-only, additive
+([#580](https://github.com/englacial/zagg/issues/580)).** The leaves remain
+the normative, self-describing data plane (§1–§10); the companion is a
+derived index over their bytes. Stage 2 (a follow-up issue) is where the
+repo becomes the authoritative *metadata* plane; nothing in this section
+presupposes it.
+
+A morton hive is many leaf zarrs. The companion presents every leaf of one
+order as **one zarr hierarchy** by recording each leaf's inner chunks as
+[Icechunk](https://icechunk.io) **virtual chunk references** —
+`(location, offset, length)` byte ranges into the leaf objects that already
+exist — so an Icechunk reader (icechunk-py, icechunk-js in a browser) opens
+the hive as a single array per field without moczarr's hand-built virtual
+store, and every hive commit maps onto an Icechunk snapshot.
+
+### 11.1 Placement and naming
+
+**Contract.** One repository per pyramid order, at the store root:
+
+```text
+{store_root}/icechunk/{order}/      <- Icechunk repository for the artifacts at {order}
+```
+
+`{order}` is the HEALPix order of the artifacts whose chunks the repo
+references: the store's **shard order** for the source leaves (the one repo
+stage 1 writes), an overview order for the sweep-built §4 overviews at that
+order (reserved; a follow-up writes them). `icechunk/` is a **reserved
+store-root child name**, the fourth root-only exception to the node
+invariant (D5) beside `morton_hive.json`, the coverage sidecars and the §4.10
+`multiscales/` companion: it is excluded from product discovery at a
+multi-product root, and a product MUST NOT be named `icechunk`.
+
+The repo's root group carries a `zagg_icechunk` attrs block that makes it
+self-describing:
+
+```json
+"zagg_icechunk": {
+  "spec": "zagg-icechunk/1",
+  "order": 9,
+  "shard_order": 9, "chunk_order": 13, "cell_order": 19,
+  "url_prefix": "s3://bucket/product/",
+  "split": {"chunks": 4096, "cell_order": 7}
+}
+```
+
+`order` is the repo's order (§11.1); `shard_order` / `chunk_order` /
+`cell_order` mirror the manifest and the grid; `url_prefix` is the virtual
+chunk container's prefix (§11.3); `split` records the manifest split
+(§11.5). The root group also mirrors the leaf template's own root attrs and
+each resolution group mirrors the leaf group's attrs (the `dggs` block
+included) — **never the commit stamp**, which is a per-leaf fact.
+
+### 11.2 Array model
+
+**Contract.** For every named array the leaf template declares at path `p`
+beneath the leaf root (e.g. `19/count`, `19/h_tdigest`,
+`19/h_tdigest_locations`), the repo holds an array at the same path `p`
+whose metadata is the leaf array's, re-rooted on the whole order:
+
+| field | repo array | derivation |
+|---|---|---|
+| `shape` | `(n_shards · L₀, *L[1:])` | `L` the leaf array's shape; `n_shards = 12·4^order` |
+| chunk shape | the leaf's **inner** chunk shape | the `sharding_indexed` codec's `chunk_shape` when the leaf array is sharded (§1.5), else the leaf array's own `chunk_grid` |
+| `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
+| `data_type`, `fill_value`, `dimension_names`, `attributes` | verbatim from the leaf array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
+
+Zarr metadata therefore passes through untouched: a reader that decodes a
+leaf array per §1–§3 decodes the repo array the same way, chunk by chunk.
+
+### 11.3 Chunk index law and refs
+
+**Contract.** The repo array's chunk axis is in **canonical nested order**
+(§1.5 "Subtree spans"), so a leaf's chunks are one contiguous run. For a leaf
+at nested rank `r` — its shard's HEALPix nested id at the shard order,
+`r ∈ [0, 12·4^order)`, the same rank the leaf's `block_index` gives — and its
+inner chunk `j` (C-order within the leaf's inner-chunk grid along the cells
+axis, `j ∈ [0, C)`, `C = L₀ / inner₀` chunks per leaf), the global chunk index
+is
+
+```text
+r · C + j        (trailing axes keep their leaf-local chunk index, 0 for a single-chunk payload dim)
+```
+
+At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
+
+Each **populated** inner chunk is recorded as one virtual reference:
+
+- **sharded leaf array** (every hive leaf, §1.5): `location` is the leaf's
+  single shard object (`{leaf}/{p}/c/0…`), `offset`/`length` are the chunk's
+  entry in the shard index suffix — the two `u64` words the §1.5 2-GET recipe
+  already reads. An inner chunk the index marks **absent** (the `2^64 − 1`
+  sentinel in both words) gets **no reference** and reads as `fill_value`.
+- **regular (unsharded) leaf array**: `location` is the chunk object
+  `{leaf}/{p}/c/{j}`, `offset` 0, `length` the object size; a missing object
+  gets no reference.
+
+`location` is `url_prefix + key`, `key` the object's path relative to the
+store root. The repo declares exactly one **virtual chunk container** whose
+`url_prefix` is the store root URL **with a trailing `/`**
+(`s3://bucket/product/`, `file:///…/product/`); a reader authorizes that
+prefix with the same credentials it reads the leaves with.
+
+### 11.4 Commits
+
+**Contract.** Commits land on the `main` branch, one per artifact:
+
+- `init {run_id}` — the once-per-run initialization: the repo exists (created
+  if absent, reopened if present) and every array node of §11.2 is defined
+  **before the first leaf commit**. It is idempotent: a repo that already
+  carries the nodes is reopened, never re-templated.
+- `leaf {decimal}` — one commit per leaf, written **by the worker that
+  committed the leaf, after its stamp** (D4: the stamp certifies the objects
+  the refs point at). It records every array the leaf wrote, dense and
+  ragged. Concurrent leaf commits touch disjoint chunk ranges of the same
+  arrays, so a lost compare-and-swap on the branch ref is resolved by a local
+  rebase and retry (Icechunk's conflict detector reports no conflict);
+  ordering between leaves is immaterial.
+
+A **replaced** leaf (§1.5 leaf immutability) is re-recorded by the replacing
+worker: the new commit's refs are the new objects' index and supersede the
+old ones on `main`. Snapshots older than that commit still reference the
+replaced keys and are stale for that leaf — Icechunk's garbage collection
+does not manage virtual targets, and stage 1 does not pin history across a
+replacement (stage 2's content-pinned keys do).
+
+Writing the refs is **fail-open** (D9): a refs failure is logged and recorded
+in the leaf's D20 stats sidecar (`icechunk.error`) and never fails the leaf
+write — the leaf is normative, the index is regenerable.
+
+### 11.5 Manifest splitting
+
+**Contract.** Manifests are split along the chunk axis into runs of `4^m`
+chunks. Because that axis is in nested order, one run is exactly the chunks
+of **one HEALPix cell at order `chunk_order − m`**, so the split is stated
+as "one manifest per order-N cell" and every leaf commit rewrites a whole
+number of manifests (`m ≥ chunk_order − shard_order`). The writer picks the
+smallest `m` such that `4^m ≥ 4 · 1000`: Icechunk's location dictionary
+engages only from 1,000 chunks per manifest (`min_num_chunks`), and the ×4
+margin keeps a run above that gate after its absent chunks (which emit no
+ref) are subtracted. That is `m = 6`, 4,096 chunks — at the production
+geometry one manifest per **order-7 cell, 16 leaves**; the choice is recorded
+in the `zagg_icechunk.split` block (§11.1), not hardcoded by readers.
+
+### 11.6 What §11 does not cover (informative)
+
+Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
+across windows and so cannot share one chunk axis; stage 1 records no refs
+for them (the sidecar says `skipped: windowed`). Raster hive products
+(`(time, cells)` arrays, never sharded) and the sweep-built overviews at
+ancestor orders are likewise out of stage 1's writer scope. None of these
+change the leaf format, the t-digest storage or the moczarr reader.
