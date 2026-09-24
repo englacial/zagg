@@ -4326,15 +4326,14 @@ def _run_lambda(
         # record-less envelope simply contributes no leaf.
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
-                from zagg.sweep import leaves_from_stats_records
+                from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
-                leaves = leaves_from_stats_records(
-                    [
-                        (r.get("body") or {}).get("stats")
-                        for r in report.results
-                        if r.get("status_code") == 200 and not r.get("error")
-                    ]
-                )
+                ok_bodies = [
+                    r.get("body") or {}
+                    for r in report.results
+                    if r.get("status_code") == 200 and not r.get("error")
+                ]
+                leaves = leaves_from_stats_records([b.get("stats") for b in ok_bodies])
                 if leaves:
                     _invoke_lambda_sweep(
                         state["lambda_client"],
@@ -4344,27 +4343,31 @@ def _run_lambda(
                         output_creds_event=output_creds_event,
                     )
                     logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
-                    # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
-                    # `output.sweep: "stages"`, the same knob the local dispatcher
-                    # reads. Unlike the families leg this one is not
-                    # fire-and-forget: the staged sweep is a fan-out with a soft
-                    # barrier between tuples, so the ordering has to be driven
-                    # from somewhere and the dispatcher is the only place that can
-                    # see every tuple complete. It still never WRITES (D8) — it
-                    # invokes and polls the workers' stage records. Fail-open (D9:
-                    # every stage artifact is regenerable and
-                    # `python -m zagg.sweep --stages` is the backstop).
-                    if config.output.get("sweep") == "stages":
-                        _invoke_lambda_stage_sweep(
-                            state["lambda_client"],
-                            function_name,
-                            store_path,
-                            leaves,
-                            shard_order=int(parent_order),
-                            output_creds_event=output_creds_event,
-                            store_kwargs=_output_store_kwargs(output_creds_event, region),
-                            touch_policy=get_touch_policy(config),
-                        )
+                # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
+                # `output.sweep: "stages"`, the same knob the local dispatcher
+                # reads. Unlike the families leg this one is not
+                # fire-and-forget: the staged sweep is a fan-out with a soft
+                # barrier between tuples, so the ordering has to be driven
+                # from somewhere and the dispatcher is the only place that can
+                # see every tuple complete. It still never WRITES (D8) — it
+                # invokes and polls the workers' stage records. Fail-open (D9:
+                # every stage artifact is regenerable and
+                # `python -m zagg.sweep --stages` is the backstop). Touched
+                # current units ride as dirt-only (issue #580), as on
+                # _run_local: their nodes re-gather refs, nothing is re-folded.
+                dirt_only = dirt_only_leaves(ok_bodies)
+                if (leaves or dirt_only) and config.output.get("sweep") == "stages":
+                    _invoke_lambda_stage_sweep(
+                        state["lambda_client"],
+                        function_name,
+                        store_path,
+                        leaves,
+                        shard_order=int(parent_order),
+                        output_creds_event=output_creds_event,
+                        store_kwargs=_output_store_kwargs(output_creds_event, region),
+                        touch_policy=get_touch_policy(config),
+                        dirt_only=dirt_only,
+                    )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         logger.info(
@@ -5785,6 +5788,7 @@ def _invoke_lambda_stage_sweep(
     max_nodes_per_invoke="default",
     barrier_timeout_s=None,
     total_barrier_budget_s=None,
+    dirt_only=(),
 ) -> dict | None:
     """End-of-run STAGED sweep over the fleet (issue #519); its summary.
 
@@ -5830,6 +5834,9 @@ def _invoke_lambda_stage_sweep(
     lease is claimable — the next sweep takes the store over by name. The
     ladder the workers already wrote stays valid either way; under-coverage is
     recorded per artifact and heals on the next pass (#381 point (6)).
+
+    ``dirt_only`` (issue #580) is the run's touched current units, forwarded
+    to the workers as the stage event's ``dirt_only`` refs.
     """
     from zagg.sweep_fleet import run_stage_sweep_fleet
 
@@ -5852,6 +5859,7 @@ def _invoke_lambda_stage_sweep(
             output_creds_event=output_creds_event,
             store_kwargs=store_kwargs,
             touch_policy=touch_policy,
+            dirt_only=dirt_only,
             **knobs,
         )
     except Exception as e:
