@@ -26,9 +26,9 @@ Concurrency: leaves write disjoint chunk ranges of the same arrays, so a lost
 compare-and-swap on the branch ref is a local rebase + retry
 (``ConflictDetector`` reports no conflict). Icechunk's local-filesystem
 storage is NOT safe for concurrent commits (it says so on open), so the local
-backend's thread pool serializes its commits through
-:data:`_LOCAL_COMMIT_LOCK`; object stores use conditional writes and need no
-lock.
+backend's thread pool serializes its commits through a per-repo-path lock
+(:func:`_local_commit_lock`) — process-local, and only against the repo being
+written; object stores use conditional writes and need no lock.
 """
 
 from __future__ import annotations
@@ -74,7 +74,20 @@ _INDEX_CODECS = [
     {"name": "bytes", "configuration": {"endian": "little"}},
     {"name": "crc32c"},
 ]
-_LOCAL_COMMIT_LOCK = threading.Lock()
+#: One commit lock PER local repo path, guarded by a meta-lock: icechunk's
+#: local-filesystem storage is unsafe for concurrent commits, but that is a
+#: per-repo fact, so two runs into different stores in one interpreter (a
+#: notebook, a test session, ``demo/``) must not serialize against each other.
+#: Process-local only — two PROCESSES writing one local repo are still unsafe
+#: and nothing here prevents that; object stores use conditional writes and
+#: take no lock at all.
+_LOCAL_COMMIT_LOCKS: dict[str, threading.Lock] = {}
+_LOCAL_COMMIT_LOCKS_GUARD = threading.Lock()
+
+
+def _local_commit_lock(repo_path: str) -> threading.Lock:
+    with _LOCAL_COMMIT_LOCKS_GUARD:
+        return _LOCAL_COMMIT_LOCKS.setdefault(repo_path, threading.Lock())
 
 
 def repo_path(store_root: str, order: int) -> str:
@@ -363,7 +376,7 @@ def init_repo(store_root: str, grid, *, run_id: str, store_kwargs: dict) -> dict
     session = repo.writable_session(BRANCH)
     with vlen_dtype_warning_suppressed():
         repo_group_spec(grid, store_root, split).to_zarr(session.store, "", overwrite=False)
-    snapshot, _rebases = _commit(session, f"init {run_id}", local=_is_local(store_root))
+    snapshot, _rebases = _commit(session, f"init {run_id}", local=_is_local(store_root), path=path)
     return {"path": path, "order": order, "snapshot": snapshot, "created": True, "split": split}
 
 
@@ -471,17 +484,21 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
     return plan
 
 
-def _commit(session, message: str, *, local: bool) -> tuple[str, int]:
+def _commit(session, message: str, *, local: bool, path: str = "") -> tuple[str, int]:
     """Commit with rebase-on-conflict; returns ``(snapshot_id, rebases)``.
 
     The loop is icechunk's own ``rebase_with`` pattern, unrolled so the
     attempt count is observable (recorded in the leaf's stats sidecar — the
     fleet's first real measurement of commit contention).
+
+    On the local backend the commit is serialized through this process's lock
+    for ``path`` (:func:`_local_commit_lock`); other repos in the same
+    interpreter are unaffected.
     """
     import icechunk
 
     rebases = 0
-    lock = _LOCAL_COMMIT_LOCK if local else contextlib.nullcontext()
+    lock = _local_commit_lock(path) if local else contextlib.nullcontext()
     with lock:
         while True:
             try:
@@ -550,7 +567,7 @@ def record_leaf(store_root: str, grid, shard_key, *, store_kwargs: dict, window=
         refs += entry["refs"]
     t0 = time.perf_counter()
     snapshot, rebases = _commit(
-        session, f"leaf {morton_decimal(int(shard_key))}", local=_is_local(store_root)
+        session, f"leaf {morton_decimal(int(shard_key))}", local=_is_local(store_root), path=path
     )
     return {
         "path": path,

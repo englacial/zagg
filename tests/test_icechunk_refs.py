@@ -474,6 +474,18 @@ class TestLeafRefs:
         assert repo.lookup_branch("main") == snapshot
 
 
+def test_local_commit_lock_is_per_repo_path():
+    # icechunk's local-filesystem storage is unsafe for concurrent commits,
+    # but that is a PER-REPO fact: two local runs into different stores in one
+    # interpreter must not serialize against each other.
+    a = icechunk_refs._local_commit_lock("/tmp/one/icechunk/4")
+    b = icechunk_refs._local_commit_lock("/tmp/two/icechunk/4")
+    assert a is not b
+    assert icechunk_refs._local_commit_lock("/tmp/one/icechunk/4") is a
+    # Different orders of one store are different repos, hence different locks.
+    assert icechunk_refs._local_commit_lock("/tmp/one/icechunk/5") is not a
+
+
 # ── the invoke seams (phase 3) ───────────────────────────────────────────────
 
 
