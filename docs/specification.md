@@ -3495,11 +3495,13 @@ leaf write, for each array the leaf wrote the worker issues:
 - **sharded array**: one ranged `GET` of the shard index suffix (the §1.5
   recipe's second read, which yields every inner chunk's `(offset, length)`
   at once) **and** one `HEAD` of the shard object, for its `ETag` (§11.3);
-- **regular array**: one `HEAD` per chunk object, for that object's size
-  (the ref's `length`) and its `ETag`.
+- **regular (unsharded) array**: one `LIST` of the array's `c/` chunk prefix,
+  which yields every chunk object's key, size (the ref's `length`) and `ETag`
+  in one request — and, unlike probing, discovers which chunks the leaf
+  actually wrote.
 
-That is one HEAD plus one ranged GET per sharded array per leaf, and one HEAD
-per unsharded chunk object — small beside the leaf write, but not nothing.
+That is one HEAD plus one ranged GET per sharded array per leaf, and one LIST
+per unsharded array — small beside the leaf write, but not nothing.
 
 Writing the refs is **fail-open** (D9): a refs failure is logged and recorded
 in the leaf's D20 stats sidecar (`icechunk.error`) and never fails the leaf
