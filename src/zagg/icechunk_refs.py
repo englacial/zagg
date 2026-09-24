@@ -520,10 +520,22 @@ def _check_block(block: dict, want: dict, path: str) -> None:
     per-ref checksum catches — the objects are exactly the ones recorded
     (§11.3). Callers are fail-open, so a mismatched store loses the index
     instead.
+
+    A ``cell_order`` in ``want`` also vets the LEVEL KEYING: before the §11.1
+    amendment the groups were named by node order, so such a repo agrees on
+    every key here and then raises ``NodeNotFound`` on every commit — an
+    index that silently never fills. No published store carries that shape,
+    so the fix is to clear the repo and re-init.
     """
     have = {key: block.get(key) for key in want}
     if have != want:
         raise ValueError(f"icechunk repo {path} was built for {have}, this run is {want}")
+    if "cell_order" in want and str(int(want["cell_order"])) not in (block.get("levels") or {}):
+        raise ValueError(
+            f"icechunk repo {path} keys its levels {sorted(block.get('levels') or {}, key=int)} "
+            f"by node order, not cell order (pre-§11.1-amendment): every commit into it would "
+            f"raise NodeNotFound. Clear {path} and re-init (spec §11.1, issue #580)."
+        )
 
 
 def read_block(store_root: str, *, store_kwargs: dict) -> dict | None:
