@@ -1343,6 +1343,13 @@ class TestLadder:
         assert rows[3]["icechunk_missing"] == 0 and rows[3]["icechunk_failed"] == 0
         assert rows[0]["icechunk_commits"] == 1  # own overviews at 2, 1, 0, one commit
         assert rows[0]["icechunk_rebases"] == 0 and rows[3]["icechunk_rebases"] == 0
+        # Every counter is SEEDED, so a row's key set does not depend on
+        # whether any node did work -- the stage record is read as a table.
+        from zagg.icechunk_ladder import STAGE_COUNTS
+
+        for row in rows.values():
+            assert set(STAGE_COUNTS) <= set(row), sorted(set(STAGE_COUNTS) - set(row))
+            assert row["icechunk_s"] > 0.0
         assert list((tmp_path / "store").rglob("icechunk_refs.json")), "sidecars exist"
         # The base repo reads every leaf back — dense and ragged — via the ladder.
         group, repo = _open(root)
