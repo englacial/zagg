@@ -3331,11 +3331,12 @@ included) — **never the commit stamp**, which is a per-leaf fact.
 **Contract.** For every named array the leaf template declares at path `p`
 beneath the leaf root (e.g. `19/count`, `19/h_tdigest`,
 `19/h_tdigest_locations`), the repo holds an array at the same path `p`
-whose metadata is the leaf array's, re-rooted on the whole order:
+whose metadata is the leaf array's, re-rooted on the whole order (for the
+leaf repo of stage 1, `order == shard_order`):
 
 | field | repo array | derivation |
 |---|---|---|
-| `shape` | `(n_shards · L₀, *L[1:])` | `L` the leaf array's shape; `n_shards = 12·4^order` |
+| `shape` | `(n_shards · L₀, *L[1:])` | `L` the leaf array's shape; `n_shards = 12·4^shard_order` |
 | chunk shape | the leaf's **inner** chunk shape | the `sharding_indexed` codec's `chunk_shape` when the leaf array is sharded (§1.5), else the leaf array's own `chunk_grid` |
 | `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
 | `data_type`, `fill_value`, `dimension_names`, `attributes` | verbatim from the leaf array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
@@ -3348,10 +3349,10 @@ leaf array per §1–§3 decodes the repo array the same way, chunk by chunk.
 **Contract.** The repo array's chunk axis is in **canonical nested order**
 (§1.5 "Subtree spans"), so a leaf's chunks are one contiguous run. For a leaf
 at nested rank `r` — its shard's HEALPix nested id at the shard order,
-`r ∈ [0, 12·4^order)`, the same rank the leaf's `block_index` gives — and its
-inner chunk `j` (C-order within the leaf's inner-chunk grid along the cells
-axis, `j ∈ [0, C)`, `C = L₀ / inner₀` chunks per leaf), the global chunk index
-is
+`r ∈ [0, 12·4^shard_order)`, the same rank the leaf's `block_index` gives —
+and its inner chunk `j` (C-order within the leaf's inner-chunk grid along the
+cells axis, `j ∈ [0, C)`, `C = L₀ / inner₀` chunks per leaf), the global chunk
+index is
 
 ```text
 r · C + j        (trailing axes keep their leaf-local chunk index, 0 for a single-chunk payload dim)
