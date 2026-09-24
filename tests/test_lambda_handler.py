@@ -1623,6 +1623,52 @@ class TestStatsMode:
         df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
         assert set(df["finalize_error"]) == {"RuntimeError: invoke failed"}
 
+    def test_icechunk_init_from_event_lands_in_the_parquet(self, handler_mod, tmp_path):
+        """Issue #580: the same forwarding leg for the companion-repo init
+        record — the dispatcher holds it, only the worker can PUT (D8), so a
+        typo or a renamed event key here would ship a fleet run with the
+        run-level columns silently null."""
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {
+                "mode": "stats",
+                "store_path": root,
+                "run_id": "runid4",
+                "timestamp": "20260720T010204Z",
+                "rows": self._rows(),
+                "icechunk_init": {"path": f"{root}/icechunk/4", "snapshot": "SNAP"},
+            },
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
+        assert set(df["icechunk_init_repo"]) == {f"{root}/icechunk/4"}
+        assert set(df["icechunk_init_snapshot"]) == {"SNAP"}
+        assert df["icechunk_init_error"].isna().all()
+
+    def test_icechunk_init_absent_leaves_the_columns_null(self, handler_mod, tmp_path):
+        # The pre-#580 dispatcher sends no such key: the columns are still
+        # written (the "same column set every run" contract), just null.
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {
+                "mode": "stats",
+                "store_path": root,
+                "run_id": "runid5",
+                "timestamp": "20260720T010205Z",
+                "rows": self._rows(),
+            },
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
+        for col in ("icechunk_init_repo", "icechunk_init_snapshot", "icechunk_init_error"):
+            assert col in df.columns and df[col].isna().all()
+
     def test_empty_rows_is_ok_and_writes_nothing(self, handler_mod, tmp_path):
         root = str(tmp_path / "out")
         resp = handler_mod.lambda_handler(
