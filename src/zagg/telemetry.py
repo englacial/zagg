@@ -116,6 +116,10 @@ _EQ_OR_NONE_KEYS = (
     # existence must be discoverable without a tree listing. Named
     # ``leaf_column``, not ``column`` — see _ROW_SCALARS below.
     "leaf_column",
+    # Icechunk companion refs record (issue #580): per-leaf by definition —
+    # one commit per leaf — so a rollup collapses it to None like the O11
+    # record above.
+    "icechunk",
     "zagg_version",
     "lambda",
     "invoked_by",
@@ -408,6 +412,15 @@ def build_record(
         # sidecar scan for column-bearing units must key on the LEAF records,
         # not on the column artifacts' own.
         "leaf_column": metadata.get("leaf_column"),
+        # Icechunk companion refs (issue #580, spec §11.4): the leaf's refs
+        # commit — ``{path, snapshot, arrays, refs, rebases, commit_s,
+        # checksum}`` on success, ``{"skipped": reason}`` for a unit stage 1
+        # does not index (windowed, empty), ``{"error": ...}`` when the
+        # fail-open write did not land. ``rebases`` and ``commit_s`` are the
+        # fleet's first measurement of commit contention (the issue's open
+        # question (1)). None wherever no writer recorded it (the knob off,
+        # flat layouts, raster, failures).
+        "icechunk": metadata.get("icechunk"),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
@@ -574,6 +587,16 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     ident = record.get("invoked_by") or {}
     row["invoked_by"] = ident.get("arn")
     row["invoked_by_userid"] = ident.get("userid")
+    # Icechunk refs commit (issue #580): the scalars a fleet run's contention
+    # question reads straight off the parquet — ``rebases`` and ``commit_s``
+    # per leaf — plus the snapshot for joining a leaf to the repo's history.
+    ice = record.get("icechunk") or {}
+    row["icechunk_snapshot"] = ice.get("snapshot")
+    row["icechunk_refs"] = ice.get("refs")
+    row["icechunk_rebases"] = ice.get("rebases")
+    row["icechunk_commit_s"] = ice.get("commit_s")
+    row["icechunk_skipped"] = ice.get("skipped")
+    row["icechunk_error"] = ice.get("error")
     return row
 
 

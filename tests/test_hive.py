@@ -2002,7 +2002,7 @@ class TestHiveProfileWritePhase:
         _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
         timings = meta["phase_timings"]
         # Additive: the process_shard phases keep their names and values.
-        assert set(timings) == {"read", "index", "aggregate", "write", "hash"}
+        assert set(timings) == {"read", "index", "aggregate", "write", "hash", "icechunk"}
         assert {k: timings[k] for k in self._SHARD_PHASES} == self._SHARD_PHASES
         assert timings["write"] >= 0.0
 
@@ -2041,6 +2041,7 @@ class TestHiveProfileWritePhase:
             "write",
             "hash",
             "column",
+            "icechunk",
         }
 
     def test_errored_shard_omits_write(self, monkeypatch, cfg, tmp_path):
@@ -2056,7 +2057,7 @@ class TestHiveProfileWritePhase:
         # without any profile flag — the sidecar record is complete by default.
         fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
         _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
-        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write", "hash"}
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write", "hash", "icechunk"}
         # The leaf still landed, fully stamped.
         from zagg.store import open_store
 
@@ -2226,6 +2227,10 @@ class TestRunnerWiring:
             node,
             hive.AGGREGATION_CORE_NAME,
             hive.ROOT_COVERAGE_NAME,
+            # The Icechunk companion repo dir (issue #580, spec §11.1): the
+            # local backend's in-process init lands it at the root, before
+            # any cell — the reserved fourth root-only child.
+            hive.ICECHUNK_DIR_NAME,
             hive.MANIFEST_NAME,
             parquets[0],
             records[0],
