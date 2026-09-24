@@ -144,25 +144,44 @@ def _open(root):
 
 
 class TestSplit:
-    def test_exponent_is_one_manifest_per_split_order_cell(self):
-        # Production geometry (chunk order 13): split at the default commit
-        # order 6 -> 4^7 chunks per manifest, one order-6 cell.
+    def test_exponent_is_fixed_once_from_the_base(self):
+        # Production geometry (base chunk order 13): split at the default
+        # commit order 6 -> 4^7 chunks per manifest, one order-6 cell of the
+        # base. The global-scale setting: split 4 -> one order-4 cell.
         assert icechunk_refs.split_exponent(13, 6) == 7
-        # The global-scale setting: split 4 -> one order-4 cell per manifest.
         assert icechunk_refs.split_exponent(13, 4) == 9
 
-    def test_exponent_never_below_one_chunk(self):
-        # An overview repo whose chunks are coarser than the split (one chunk
-        # per order-3 node, split 6): one chunk per manifest.
-        assert icechunk_refs.split_exponent(3, 6) == 0
+    def test_every_level_holds_the_same_chunk_count(self):
+        # The exponent is the BASE's at every level whose chunk axis can hold
+        # it: /13 (node order 9, one chunk per node) and /12 (8) and /11 (7)
+        # all get 4^7 chunks per manifest -- one order-2 / order-1 / order-0
+        # cell -- never one order-6 cell apiece (espg ruling 2026-09-24: that
+        # multiplied the manifest count, hence the snapshot, by the number of
+        # levels).
+        for level_chunk_order in (13, 9, 8, 7):
+            assert icechunk_refs.split_exponent(13, 6, level_chunk_order) == 7
 
     def test_exponent_caps_at_a_base_cell(self):
+        # A level whose whole chunk axis is fewer than 4^m_base chunks per
+        # base cell is capped at its own order: one base cell per manifest.
+        assert icechunk_refs.split_exponent(13, 6, 6) == 6
+        assert icechunk_refs.split_exponent(13, 6, 0) == 0
         assert icechunk_refs.split_exponent(5, 0) == 5
 
-    def test_block_names_the_cell_order(self, cfg):
-        grid = HealpixGrid(9, 19, config=cfg, chunk_inner=13)
-        assert icechunk_refs.split_block(grid, 6) == {"chunks": 4**7, "order": 6}
-        assert icechunk_refs.split_block(grid, 4) == {"chunks": 4**9, "order": 4}
+    def test_a_split_at_the_shard_order_is_one_leaf(self):
+        assert icechunk_refs.split_exponent(13, 9) == 4
+
+    def test_block_per_level_at_the_production_split(self, cfg):
+        base = HealpixGrid(9, 19, config=cfg, chunk_inner=13)
+        assert icechunk_refs.split_block(base, 6) == {"chunks": 4**7, "order": 6}
+        assert icechunk_refs.split_block(base, 4) == {"chunks": 4**9, "order": 4}
+        # The column and overview levels, at the grids their writers use
+        # (one chunk per node): the same 16,384 chunks, a coarser cell each.
+        want = {13: (4**7, 2), 12: (4**7, 1), 11: (4**7, 0), 10: (4**6, 0), 4: (1, 0)}
+        for cells, (chunks, order) in want.items():
+            level = HealpixGrid(cells - 4, cells, config=cfg, sharded=True)
+            block = icechunk_refs.split_block(level, 6, base_chunk_order=base.chunk_order)
+            assert block == {"chunks": chunks, "order": order}, cells
 
     def test_the_default_split_clears_the_dictionary_gate(self):
         # §11.5 (informative): the default split is one manifest per order-6
@@ -269,6 +288,17 @@ class TestInit:
             "split": {"chunks": 16, "order": 3},
         }
         assert out["levels"] == block["levels"] and out["options"]["commit_order"] == 3
+        # Every level holds the base's 16 chunks per manifest, capped at its
+        # own chunk axis: the column (5) spans an order-2 cell, the overviews
+        # a coarser one each, down to one base cell (§11.5).
+        assert {k: v["split"] for k, v in block["levels"].items()} == {
+            "6": {"chunks": 16, "order": 3},
+            "5": {"chunks": 16, "order": 2},
+            "4": {"chunks": 16, "order": 1},
+            "3": {"chunks": 16, "order": 0},
+            "2": {"chunks": 4, "order": 0},
+            "1": {"chunks": 1, "order": 0},
+        }
         # The manifest's §4.9 multiscales mirror rides the root attrs.
         assert group.attrs["multiscales"] == hive.build_manifest(grid)["multiscales"]
         assert {str(o) for o in out["ladder"]} == {k for k, _ in group.members()}
@@ -727,6 +757,28 @@ class TestLeafRefs:
         snapshot, rebases = icechunk_refs._commit(stale, "b", local=True)
         assert rebases == 1
         assert repo.lookup_branch("main") == snapshot
+
+    def test_two_nodes_share_a_coarse_level_manifest(self, cfg, tmp_path):
+        # Level 3 (one chunk per order-2 node) holds the base's 16 chunks per
+        # manifest -- one base cell, so the four order-2 nodes under base
+        # cell 0 all land in ONE manifest. Two of them committing disjoint
+        # chunks both succeed: the second rebases on the first (disjoint
+        # chunks are no conflict) and rewrites the shared manifest with both
+        # refs -- the deliberate coarse-level amplification (§11.5).
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        out = icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
+        assert out["levels"]["3"]["split"] == {"chunks": 16, "order": 0}
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        prefix = icechunk_refs.container_prefix(root)
+        first, second = repo.writable_session("main"), repo.writable_session("main")
+        first.store.set_virtual_ref("3/count/c/0", prefix + "x", offset=0, length=4)
+        icechunk_refs._commit(first, "node 0", local=True)
+        second.store.set_virtual_ref("3/count/c/1", prefix + "y", offset=0, length=4)
+        snapshot, rebases = icechunk_refs._commit(second, "node 1", local=True)
+        assert rebases == 1 and repo.lookup_branch("main") == snapshot
+        manifests = repo.inspect_snapshot(snapshot)["manifests"]
+        assert [m["num_chunk_refs"] for m in manifests] == [2]
 
 
 def test_local_commit_lock_is_per_repo_path():
@@ -1414,9 +1466,9 @@ class TestLadder:
             "artifact": "column",
             "chunk_order": 4,
             "cell_order": 5,
-            "split": {"chunks": 4, "order": 3},
+            "split": {"chunks": 16, "order": 2},  # the base's 16 chunks: one o2 cell
         }
-        assert init["levels"]["4"]["split"] == {"chunks": 1, "order": 3}  # one chunk per o3 node
+        assert init["levels"]["4"]["split"] == {"chunks": 16, "order": 1}  # one chunk per o3 node
         for meta in summary["results"]:
             assert "sidecar" in meta["icechunk"] and "snapshot" not in meta["icechunk"]
         rows = {r["dispatch_order"]: r for r in _stage_rows(root)}

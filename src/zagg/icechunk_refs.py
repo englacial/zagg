@@ -128,21 +128,31 @@ def _ceil_second(when):
 # ── options and splits ──────────────────────────────────────────────────────
 
 
-def split_exponent(chunk_order: int, split_order: int) -> int:
-    """``m`` such that one manifest spans ``4^m`` chunks — one ``split_order`` cell (§11.5).
+def split_exponent(base_chunk_order: int, split_order: int, chunk_order: int | None = None) -> int:
+    """``m`` such that one manifest spans ``4^m`` chunks, held constant across levels (§11.5).
 
-    The group's chunk axis is at ``chunk_order`` (the inner chunk's cell
-    order for the base; the node order for an overview level, one chunk per
-    node), so the chunks of one order-``split_order`` cell are a run of
-    ``4^(chunk_order − split_order)``; a level coarser than the split gets one
-    chunk per manifest. Never above a whole base cell.
+    The exponent is fixed ONCE from the base level: ``m_base = base_chunk_order
+    − split_order`` (7 at production — 16,384 inner chunks, one order-6 cell
+    of the base). Every level then holds the same ``4^m`` CHUNKS per manifest,
+    capped at its own chunk axis (``chunk_order``: one chunk per node at a
+    column or overview level), so a coarse level's manifests span coarser
+    cells — ``/13`` one order-2 cell, ``/12`` one order-1 cell, ``/11`` and
+    coarser one base cell — rather than one ``split_order`` cell apiece, which
+    would multiply the manifest count (and the snapshot) by the number of
+    levels. Never above a whole base cell.
     """
-    return min(max(int(chunk_order) - int(split_order), 0), int(chunk_order))
+    m = max(int(base_chunk_order) - int(split_order), 0)
+    return min(m, int(base_chunk_order if chunk_order is None else chunk_order))
 
 
-def split_block(grid, split_order: int) -> dict:
-    """The per-level ``split`` block for ``grid`` at ``split_order`` (§11.5)."""
-    m = split_exponent(grid.chunk_order, split_order)
+def split_block(grid, split_order: int, *, base_chunk_order: int | None = None) -> dict:
+    """The per-level ``split`` block for ``grid`` at ``split_order`` (§11.5).
+
+    ``base_chunk_order`` is the BASE level's chunk axis (the store's
+    ``chunk_order``); ``grid`` is this level's. Absent, ``grid`` is the base.
+    """
+    base = grid.chunk_order if base_chunk_order is None else base_chunk_order
+    m = split_exponent(base, split_order, grid.chunk_order)
     return {"chunks": 4**m, "order": int(grid.chunk_order) - m}
 
 
@@ -470,7 +480,9 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict):
             "node_order": int(level["node"]),
             "artifact": level["artifact"],
             **level_geometry(level["grid"]),
-            "split": split_block(level["grid"], options["split_order"]),
+            "split": split_block(
+                level["grid"], options["split_order"], base_chunk_order=grid.chunk_order
+            ),
         }
         for cells, level in sorted(grids.items(), reverse=True)
     }

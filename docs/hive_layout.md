@@ -1432,8 +1432,11 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
   gathered in **one commit per node** covering every order in its subtree
   (`node {decimal}`, refs into `/19/…`, `/13/…`, `/12/…`, … of the one repo); coarser
   tuples commit only their own overviews; finer tuples write columns only.
-  So a manifest — one per `split_order` cell per order group — is written by
-  exactly one commit.
+  So a base manifest — one per `split_order` cell — is written by exactly
+  one commit; the coarse levels hold the same number of chunks per manifest
+  (one order-2 cell at `/13`, one base cell at `/11` and coarser), so those
+  few manifests are shared across nodes and rebased, which keeps the
+  manifest count at the base's (spec §11.5).
   Each stage row records `icechunk_commits`, `icechunk_rebases`,
   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean` and
@@ -1462,7 +1465,7 @@ output:
 
 | setting | manifest = one cell at | chunks / manifest (shard-order group) | commits | snapshot |
 |---|---|---|---|---|
-| default (`6` / `6`) | order 6, 64 leaves | `4^7` = 16,384 | one per order-6 node | ≈390 manifests at California scale |
+| default (`6` / `6`) | order 6, 64 leaves | `4^7` = 16,384 | one per order-6 node | ≈390 base + a few hundred coarse-level manifests at California scale |
 | global (`split 4` / `commit 3`) | order 4, 1,024 leaves | `4^9` | 768 (the order-3 nodes) | 27k manifests, ≈2.7 MB |
 
 `split_order` is a one-way ratchet toward coarser (spec §11.5): a run whose
@@ -1515,10 +1518,13 @@ either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `url_prefix` and the paths above, which is what makes the same two calls
 writable in icechunk-js.
 
-The manifest split (spec §11.5) is one manifest per order-`split_order` cell
-— at the defaults an order-6 cell, 16,384 chunks, 64 leaves — recorded in the
-repo root's `zagg_icechunk` block as `split_order`, and per order group as
-`levels.{order}.split` (`chunks`, `order`), so a reader never assumes it.
+The manifest split (spec §11.5) is one base manifest per order-`split_order`
+cell — at the defaults an order-6 cell, 16,384 chunks, 64 leaves — and the
+same number of chunks per manifest at every coarser level (so a coarse
+manifest spans a coarser cell: order 2 at `/13`, a base cell at `/11` and
+above), recorded in the repo root's `zagg_icechunk` block as `split_order`,
+and per order group as `levels.{order}.split` (`chunks`, `order`), so a
+reader never assumes it.
 
 ## Raster hive stores (issue #247)
 
