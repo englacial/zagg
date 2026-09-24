@@ -575,6 +575,16 @@ class TestProductRoots:
         # Digit-LEADING names longer than a base component are fine.
         assert hive.validate_product_name("2019_run") == "2019_run"
 
+    def test_reserved_store_root_children(self):
+        # Store-root children the D19 grammar excludes so a multi-product
+        # walker can never classify them as products: the §4.10 multiscales
+        # companion group (#394) and the §11.1 Icechunk companion repos (#580).
+        with pytest.raises(ValueError, match="multiscales"):
+            hive.validate_product_name(hive.MULTISCALES_GROUP_NAME)
+        with pytest.raises(ValueError, match="Icechunk"):
+            hive.validate_product_name("icechunk")
+        assert hive.ICECHUNK_DIR_NAME == "icechunk"
+
     def test_product_root_join(self):
         assert hive.product_root("s3://b/root/", "atl06") == "s3://b/root/atl06"
         with pytest.raises(ValueError, match="grammar"):
