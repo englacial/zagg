@@ -1367,8 +1367,14 @@ The repo is one zarr hierarchy per order: the leaf's resolution group
 (`{cell_order}/`, `dggs` attrs included) with every leaf array re-rooted on
 the whole order — `count`, `morton`, every field, the ragged vlen arrays and
 their siblings — chunked at the leaf's **inner** chunk and coded with the
-inner chain (no `sharding_indexed`), so `icechunk` + `zarr` (or icechunk-js
-in a browser) open the hive as ordinary arrays without moczarr. A leaf at
+inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
+ordinary arrays without moczarr. In a **browser**, icechunk-js reads the
+**dense** arrays today — `morton`, `count`, the per-field summaries; the
+`zagg-ragged/1` `vlen-bytes` arrays await zarrita codec support (no
+`vlen-bytes` codec, and a closed dtype union —
+[issue #580](https://github.com/englacial/zagg/issues/580),
+[zarr-extensions#71](https://github.com/zarr-developers/zarr-extensions/issues/71)).
+The Python pair decodes both. A leaf at
 shard rank `r` owns global chunks `[r·C, (r+1)·C)` (spec §11.3); absent inner
 chunks emit no reference and read as fill; every reference carries the
 object's checksum in the form its container validates — the ETag on S3, the
