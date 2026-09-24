@@ -938,6 +938,7 @@ def _write_stage_overview(
     from mortie import generate_morton_children
     from zarr import open_array
 
+    from zagg.content_hash import staged_record
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
@@ -949,7 +950,6 @@ def _write_stage_overview(
         _overview_basename,
         _overview_config,
         _populated_mask,
-        _staged_hashes,
     )
 
     basename = _overview_basename(key)
@@ -997,7 +997,7 @@ def _write_stage_overview(
     # writer's posture in ``sweep_overview._write_overview``).
     staged = {f"{r}/morton": words}
     staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
-    hashes = _staged_hashes(store, staged, f"stage sweep at {node}/{basename}")
+    hashes = staged_record(store, staged, f"stage sweep at {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
@@ -1077,17 +1077,13 @@ def write_stage_column(
         column_name,
         composable_fields,
     )
+    from zagg.content_hash import staged_record
     from zagg.grids.base import vlen_dtype_warning_suppressed
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
     from zagg.store import open_store
-    from zagg.sweep_overview import (
-        ROLE_ATTR,
-        _overview_config,
-        _populated_mask,
-        _staged_hashes,
-    )
+    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     store_kwargs = dict(store_kwargs or {})
@@ -1153,7 +1149,7 @@ def write_stage_column(
     # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
     # sidecar carries the SAME record — ``_write_sidecar`` takes the finished
     # record, not the staged slabs, exactly as ``column.write_column`` does.
-    hashes = _staged_hashes(store, staged, f"stage column {node}/{basename}")
+    hashes = staged_record(store, staged, f"stage column {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),

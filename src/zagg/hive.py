@@ -1855,23 +1855,11 @@ def process_and_write_hive(
         # dropped record is strictly safer than a wrong one (the §5.2 raise
         # gate lands here as a warning + a stamp without the key).
         _t0 = time.time()
-        try:
-            import warnings
+        from zagg.content_hash import staged_record
 
-            from zagg.content_hash import content_hashes_record, hash_arrays
-
-            group = zarr.open_group(box["store"], path="", mode="r", zarr_format=3)
-            with warnings.catch_warnings():
-                # The leaf's own coverage sidecar is the one known non-zarr
-                # object under the prefix; ``members()`` warn-skips it (the
-                # ``process_and_write_raster_hive`` suppression precedent).
-                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
-                metadata["content_hashes"] = content_hashes_record(
-                    hash_arrays(group, staged=staged)
-                )
-        except Exception as e:
-            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
-        else:
+        record = staged_record(box["store"], staged, f"leaf {leaf_path}")
+        if record is not None:
+            metadata["content_hashes"] = record
             # Same "populated phase_timings" gate as the write stamp below:
             # the timing rides an existing dict, never seeds one.
             if "phase_timings" in metadata:

@@ -642,12 +642,13 @@ def write_column(
     from zarr import open_array
     from zarr.core.sync import sync
 
+    from zagg.content_hash import staged_record
     from zagg.grids.base import vlen_dtype_warning_suppressed
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_decimal
     from zagg.hive import _utcnow, shard_leaf_path, stamp_commit
     from zagg.store import open_store
-    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask, _staged_hashes
+    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     store_kwargs = dict(store_kwargs or {})
@@ -715,7 +716,7 @@ def write_column(
     populated = _populated_mask(folded[resolutions[0]], fields)
     # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
     # sidecar carries the same record.
-    hashes = _staged_hashes(store, staged, f"leaf column {basename}")
+    hashes = staged_record(store, staged, f"leaf column {basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),

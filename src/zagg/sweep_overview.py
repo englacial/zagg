@@ -2575,6 +2575,7 @@ def _write_overview(
     from mortie import generate_morton_children
     from zarr import open_array
 
+    from zagg.content_hash import staged_record
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
@@ -2624,7 +2625,7 @@ def _write_overview(
     # unverifiable, never tampered): a hashing failure stamps without the key.
     staged = {f"{target_order}/morton": words}
     staged.update({f"{target_order}/{name}": slab for name, slab in fold["slabs"].items()})
-    hashes = _staged_hashes(store, staged, f"sweep[overview] at {node}/{basename}")
+    hashes = staged_record(store, staged, f"sweep[overview] at {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
@@ -2653,25 +2654,6 @@ def _write_overview(
     except Exception as e:
         logger.warning(f"sweep[overview]: O11 sidecar failed at {node}/{basename} ({e})")
     return basename
-
-
-def _staged_hashes(store, staged: dict, what: str) -> dict | None:
-    """The §5.3 record over ``staged`` (read-back for the rest), or ``None`` on failure.
-
-    Shared by every stamp writer that already holds its slabs (overview, stage
-    overview, leaf column): computed before the stamp so it rides the stamp
-    (issue #580); fail-open, so a failure logs and stamps without the key.
-    """
-    try:
-        import zarr
-
-        from zagg.content_hash import content_hashes_record, hash_arrays
-
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
-        return content_hashes_record(hash_arrays(group, staged=staged))
-    except Exception as e:
-        logger.warning(f"{what}: O11 content hashing failed (fail-open, issue #342): {e}")
-        return None
 
 
 def _fold_provenance(fold: dict) -> dict:
