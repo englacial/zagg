@@ -436,7 +436,7 @@ def stage_node_refs(
             f"their cell orders are absent from the repo's levels {sorted(have)} (issue #580)"
         )
         counts["icechunk_skipped_levels"] += len(lacking)
-        orders = [k for k in orders if k in have]
+        orders = [k for k in orders if level_by_order[k] in have]
     per_leaf = block.get("commit") == "leaf"
     own = _overview_units(
         store_root, node, orders, level_by_order, fields, candidates, store_kwargs

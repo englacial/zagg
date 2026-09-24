@@ -1596,21 +1596,27 @@ class TestLadder:
     def test_a_level_the_repo_lacks_is_skipped_not_fatal(self, monkeypatch, cfg, tmp_path):
         # The manifest's pyramid is mutable by design, so it can declare a
         # level the repo has no group for; the node must still commit the
-        # levels the repo HAS -- the base leaf refs above all.
+        # levels the repo HAS -- the base leaf refs above all. The repo must
+        # GENUINELY lack the group (not merely a block the context redacts),
+        # or the guard's filter can keep the order and the commit still
+        # succeeds, which is how a filter keyed on node orders rather than
+        # cell orders went unnoticed (review finding).
         shards = _shards(_grid(cfg), 2)
         grid, root, summary = _ladder_run(
             monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards
         )
-        import zagg.icechunk_ladder as ladder_mod
-
-        real = ladder_mod.ladder_context
-
-        def drop_order_three(store_root, manifest, *, store_kwargs):
-            block = real(store_root, manifest, store_kwargs=store_kwargs)
-            levels = {k: v for k, v in block["levels"].items() if k != "4"}  # o3's cells
-            return {**block, "levels": levels}
-
-        monkeypatch.setattr(ladder_mod, "ladder_context", drop_order_three)
+        # o3's level is the one at cell order 4: drop both its group and its
+        # block entry, the shape a level declared AFTER the repo was made
+        # reopens as (``init_repo``'s reopen branch creates no group for it).
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        session = repo.writable_session(icechunk_refs.BRANCH)
+        repo_root = zarr.open_group(session.store, mode="r+")
+        del repo_root["4"]
+        block = dict(repo_root.attrs[icechunk_refs.ICECHUNK_ATTR])
+        block["levels"] = {k: v for k, v in block["levels"].items() if k != "4"}
+        repo_root.attrs[icechunk_refs.ICECHUNK_ATTR] = block
+        session.commit("drop the o3 level")
+        del repo, session, repo_root
         from zagg.sweep_stages import run_stage_sweep
 
         out = run_stage_sweep(root, [(s, None) for s in shards], store_kwargs={})
@@ -1618,10 +1624,11 @@ class TestLadder:
         # The o3 tuple's one order is gone, so the node commits its children's
         # base refs alone -- and says so rather than losing the whole node.
         assert rows[3]["icechunk_skipped_levels"] == 1
-        assert rows[3]["icechunk_commits"] == 1 and rows[3]["icechunk_failed"] == 0
+        assert rows[3]["icechunk_commits"] >= 1 and rows[3]["icechunk_failed"] == 0
         assert rows[3]["icechunk_refs"] > 0
         assert rows[0]["icechunk_skipped_levels"] == 0
         group, _repo = _open(root)
+        assert "4" not in group  # still absent: nothing was written into it
         for shard in shards:
             (rank,) = grid.block_index(shard)
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
