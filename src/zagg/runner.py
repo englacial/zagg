@@ -1224,6 +1224,11 @@ class RasterStrategy:
             "store_path": store_path,
             "backend": "local",
             "run_stats_path": run_stats_path,
+            # Icechunk companion init record (issue #580): the key is present
+            # on every strategy's summary so a caller can read it unguarded;
+            # always None here — raster is out of stage 1's writer scope
+            # (spec §11.6), so no repo is ever initialized on this path.
+            "icechunk": None,
         }
         if profile:
             # Straggler-maxed stage seconds + summed work counts (issue #250);
@@ -1705,6 +1710,9 @@ class RasterStrategy:
             # same key and same meaning as the aggregation lambda summary, so
             # the two paths' summaries keep one shape for this field.
             "finalize_error": finalize_error_str,
+            # Icechunk companion init record (issue #580), as on the local
+            # raster path: always None, raster is outside §11.6's scope.
+            "icechunk": None,
         }
         if profile:
             # Straggler-maxed stage seconds (+ the write bucket) and summed
