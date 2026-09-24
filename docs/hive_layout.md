@@ -1356,8 +1356,8 @@ cap. The honest options today are:
 ## The Icechunk companion repo
 
 Every hive leaf commit also records the leaf's inner chunks as Icechunk
-**virtual chunk references** in a companion repository per pyramid order at
-the store root — [specification §11](specification.md#11-icechunk-companion-repo)
+**virtual chunk references** in one companion repository per store, with a
+group per level, at the store root — [specification §11](specification.md#11-icechunk-companion-repo)
 is the contract ([issue #580](https://github.com/englacial/zagg/issues/580),
 stage 1: refs-only, additive; the leaves stay normative):
 
@@ -1366,14 +1366,17 @@ stage 1: refs-only, additive; the leaves stay normative):
   morton_hive.json
   coverage.moc
   icechunk/                       <- ONE Icechunk repo per store (reserved name)
-     /9                            <- a group per order: the base at the shard order …
-     /8, /7, … /0                  <- … and one per declared overview order
+     /19                           <- a group per LEVEL, named by cell order: the base leaves …
+     /13                           <- … the leaf columns' declared member (one object per leaf) …
+     /12, /11, … /4                <- … and one per declared overview order (one object per node)
   {sign+base}/...                 <- the digit tree, unchanged
 ```
 
-The repo is one zarr hierarchy: a **group per pyramid order**, each carrying
-the leaf's (or overview's) resolution-group attrs — `dggs` included — with
-every array re-rooted on the whole order — `count`, `morton`, every field, the ragged vlen arrays and
+The repo is one zarr hierarchy: a **group per level, keyed by cell order**
+— exactly the manifest's `multiscales` datasets plus the base (the columns'
+other members are sweep intermediates and are not indexed) — each carrying
+the artifact's resolution-group attrs — `dggs` included — with every array
+re-rooted on the whole sphere at that cell order — `count`, `morton`, every field, the ragged vlen arrays and
 their siblings — chunked at the leaf's **inner** chunk and coded with the
 inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
 ordinary arrays without moczarr. In a **browser**, icechunk-js reads the
@@ -1413,8 +1416,8 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
 - **The leaf's ref sidecar**: after the leaf's stamp — last in the unit,
   behind the granule-id sibling and the [issue #383](https://github.com/englacial/zagg/issues/383)
   column fold — the worker sizes the objects it wrote (one HEAD + one ranged
-  GET of the shard-index suffix per sharded array, one LIST per regular
-  array) and writes the plan as a JSON sibling beside the leaf's stats
+  GET of the shard-index suffix per sharded leaf array; one HEAD per
+  single-chunk column array, whose ref is the whole object) and writes the plan as a JSON sibling beside the leaf's stats
   sidecar (`icechunk_refs.json`, ≈40 KB at production geometry). No
   Icechunk session on the leaf path. The outcome rides the leaf's stats sidecar as `icechunk` —
   `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "windowed" |
@@ -1427,7 +1430,7 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
   tuple's orders, and either writes its own node column or **commits**. The
   tuple whose order range contains `commit_order` commits everything
   gathered in **one commit per node** covering every order in its subtree
-  (`node {decimal}`, refs into `/9/…`, `/8/…`, … of the one repo); coarser
+  (`node {decimal}`, refs into `/19/…`, `/13/…`, `/12/…`, … of the one repo); coarser
   tuples commit only their own overviews; finer tuples write columns only.
   So a manifest — one per `split_order` cell per order group — is written by
   exactly one commit.
@@ -1494,8 +1497,9 @@ repo = icechunk.Repository.open(
 )
 group = zarr.open_group(repo.readonly_session("main").store, mode="r")
 group.attrs["multiscales"]         # the manifest's zagg-multiscales/1 block: every level
-count = group["9/count"]           # the base: shape 12·4^19, chunks 4^6 — the whole order
-coarse = group["7/count"]          # an overview level: one chunk per order-7 node
+count = group["19/count"]          # the base leaves: shape 12·4^19, chunks 4^6
+column = group["13/count"]         # the leaf columns' member: shape 12·4^13, chunks 256 (one per leaf)
+coarse = group["11/count"]         # the order-7 overviews: shape 12·4^11, chunks 256 (one per node)
 ```
 
 That is the **public** store — the motivating case, and the one an icechunk-js

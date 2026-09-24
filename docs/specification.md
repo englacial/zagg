@@ -3339,27 +3339,44 @@ store, and every hive commit maps onto an Icechunk snapshot.
 ### 11.1 Placement and naming
 
 **Contract.** One repository per store, at the store root, with one zarr
-**group per pyramid order** inside it:
+**group per level, named by the level's CELL order** — exactly the
+manifest's `zagg-multiscales/1` datasets (§4.9) plus the base:
 
 ```text
 {store_root}/icechunk/          <- the Icechunk repository
-   /9                            <- the base: the source leaves at the shard order
-   /8, /7, … /0                  <- one group per declared §4 overview order
+   /19                           <- the base: the source leaves (node order 9, cells 19)
+   /13                           <- the §4.6 leaf columns' declared member (node 9, cells 13)
+   /12, /11, … /4                <- the §4 overviews, one level per ancestor order (node 8 … 0)
 ```
 
-`/{order}` holds that order's arrays (§11.2): the shard-order group the
-source leaves' arrays, an overview-order group the sweep-built overviews'
-(each overview object is one chunk per array on that group's axis). Every
-group is created by the once-per-run init (§11.4), and the repo's **root
-attrs mirror the manifest's `zagg-multiscales/1` block** (§4.9) verbatim as
-`multiscales`, so a reader opens one repo and discovers every level from
-its root — the GeoZarr/OME-NGFF-style multiscales convention
-(earth-mover/icechunk-multiscales-demo; what gridlook's level resolver
-reads). `icechunk/` is a **reserved store-root child name** on the same footing as the §4.10 `multiscales/`
-companion: it is excluded from the **D19 product-name grammar** (like the
-base-component exclusion), so a multi-product root walker can never classify
-it as a product, and `zagg.hive.validate_product_name` refuses the name
-outright — a product MUST NOT be named `icechunk`.
+| level (group) | artifact per node | node order `n` | cells per object `4^(c−n)` | object arrays |
+|---|---|---|---|---|
+| `/19` | `{leaf}.zarr/19/…` | 9 (shard) | 4^10, as K = 256 inner chunks of 4^6 (§1.5, sharded) | the leaf template's |
+| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column) | 9 | 256, ONE unsharded chunk | the column's declared member |
+| `/12` … `/4` | `{node}/all.zarr/{c}/…` (the ancestor's overview) | 8 … 0 (= c − 4) | 256, ONE unsharded chunk | the overview's |
+
+(production geometry: shard 9 / chunk 13 / cell 19, declared leaf-node
+cells 13 — every ladder level keeps `c − n = 4`; the general rule is the
+manifest's own `datasets`). A column holds more members than its declared
+one — the within-footprint intermediates and the node-order partial the
+stage gather reads (`13`, `12`, `11`, `10` on the live California store) —
+and those are **deliberately not levels**: they overlap the overview levels
+for the same cells and are sweep inputs, not reader-facing artifacts. A
+level whose artifact a node never wrote (a column exists only under a `/2`
+declaration with composable fields; an overview only once swept) simply has
+no refs there and reads as fill. Every group is created by the once-per-run
+init (§11.4) from the manifest's declaration, and the repo's **root attrs
+mirror the manifest's `zagg-multiscales/1` block** verbatim as
+`multiscales`, so a reader opens one repo and discovers every level — its
+node order, cell order and artifact kind — from its root (the
+GeoZarr/OME-NGFF-style multiscales convention;
+earth-mover/icechunk-multiscales-demo; what gridlook's level resolver
+reads). `icechunk/` is a **reserved store-root child name** on the same
+footing as the §4.10 `multiscales/` companion: it is excluded from the **D19
+product-name grammar** (like the base-component exclusion), so a
+multi-product root walker can never classify it as a product, and
+`zagg.hive.validate_product_name` refuses the name outright — a product MUST
+NOT be named `icechunk`.
 
 The repo's root group carries a `zagg_icechunk` attrs block that makes it
 self-describing:
@@ -3371,10 +3388,11 @@ self-describing:
   "url_prefix": "s3://bucket/product/",
   "commit": "ladder", "commit_order": 6, "split_order": 6,
   "levels": {
-    "9": {"chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}},
-    "8": {"chunk_order": 8,  "cell_order": 18, "split": {"chunks": 16,    "order": 6}},
-    "7": {"chunk_order": 7,  "cell_order": 17, "split": {"chunks": 4,     "order": 6}},
-    "6": {"chunk_order": 6,  "cell_order": 16, "split": {"chunks": 1,     "order": 6}}
+    "19": {"node_order": 9, "artifact": "leaf",     "chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}},
+    "13": {"node_order": 9, "artifact": "column",   "chunk_order": 9,  "cell_order": 13, "split": {"chunks": 64,    "order": 6}},
+    "12": {"node_order": 8, "artifact": "overview", "chunk_order": 8,  "cell_order": 12, "split": {"chunks": 16,    "order": 6}},
+    "…":  "one entry per level, keyed by cell order",
+    "4":  {"node_order": 0, "artifact": "overview", "chunk_order": 0,  "cell_order": 4,  "split": {"chunks": 1,     "order": 0}}
   }
 },
 "multiscales": [ … the manifest's zagg-multiscales/1 block, verbatim … ]
@@ -3382,8 +3400,10 @@ self-describing:
 
 `shard_order` / `chunk_order` / `cell_order` mirror the manifest and the
 base grid; `url_prefix` is the virtual chunk container's prefix (§11.3);
-`levels` carries, per order group, its chunk axis order, its cell order and
-its manifest split (§11.5); `commit`, `commit_order` and `split_order` are
+`levels` carries, per level group (keyed by cell order), its node order,
+its artifact kind, its chunk-axis order (the inner-chunk order for the base,
+the node order for a one-chunk-per-node level), its cell order and its
+manifest split (§11.5); `commit`, `commit_order` and `split_order` are
 the ladder's knobs (§11.4, §11.5), read back by every stage node so the
 sweep needs no config. Each order group carries the leaf (or overview)
 resolution group's own attrs — the `dggs` block and conventions. That block is the **whole** of the repo root group's attrs — a leaf
@@ -3394,11 +3414,13 @@ commit stamp**.
 
 ### 11.2 Array model
 
-**Contract.** For every named array the level's template declares (a leaf
-array `{cell_order}/{name}` for the shard-order group, an overview array for
-an overview-order group), the repo holds `/{order}/{name}` whose metadata is
-the template array's, re-rooted on the whole order (`order == shard_order`
-for the base; `n_shards = 12·4^order` in every case):
+**Contract.** For every named array a level's template declares (a leaf
+array `{cell_order}/{name}` for the base, a column's declared-member array
+`{c}/{name}` for the column level, an overview's `{c}/{name}` for an
+overview level), the repo holds `/{c}/{name}` whose metadata is the
+template array's, re-rooted on the whole sphere at that cell order (`n` the
+level's node order, `n_shards = 12·4^n`, the level's global shape
+`12·4^c`):
 
 | field | repo array | derivation |
 |---|---|---|
@@ -3412,17 +3434,20 @@ leaf array per §1–§3 decodes the repo array the same way, chunk by chunk.
 
 ### 11.3 Chunk index law and refs
 
-**Contract.** The repo array's chunk axis is in **canonical nested order**
-(§1.5 "Subtree spans"), so a leaf's chunks are one contiguous run. For a leaf
-at nested rank `r` — its shard's HEALPix nested id at the shard order,
-`r ∈ [0, 12·4^shard_order)`, the same rank the leaf's `block_index` gives —
-and its inner chunk `j` (C-order within the leaf's inner-chunk grid along the
-cells axis, `j ∈ [0, C)`, `C = L₀ / inner₀` chunks per leaf), the global chunk
-index is
+**Contract.** Every level's chunk axis is in **canonical nested order**
+(§1.5 "Subtree spans"), so one node's chunks are one contiguous run. For a
+level of cell order `c` and node order `n`, an object at nested rank `r` at
+order `n` (`r ∈ [0, 12·4^n)`, the rank `block_index` gives) holds `4^(c−n)`
+cells; its chunk `j` (C-order within the object's chunk grid along the cells
+axis, `j ∈ [0, C)`, `C` the object's chunk count) sits at global chunk index
 
 ```text
-r · C + j        (trailing axes keep their leaf-local chunk index, 0 for a single-chunk payload dim)
+r · C + j        (trailing axes keep their object-local chunk index, 0 for a single-chunk payload dim)
 ```
+
+For the base level `C = 4^(chunk_order − shard_order)` inner chunks; for a
+column or overview level the object is ONE chunk, `C = 1`, and the global
+index is the node's rank itself.
 
 At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
 

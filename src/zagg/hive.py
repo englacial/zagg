@@ -1995,31 +1995,41 @@ def process_and_write_hive(
         if get_icechunk(config):
             _t0 = time.time()
             try:
-                from zagg.icechunk_refs import leaf_ref_plan, record_leaf, resolve_options
+                from zagg.icechunk_refs import leaf_units, record_leaf, resolve_options
 
                 label = window["label"] if window else None
-                if resolve_options(config, grid.parent_order)["commit"] == "leaf":
-                    metadata["icechunk"] = record_leaf(
-                        store_root, grid, shard_key, store_kwargs=store_kwargs, window=label
-                    )
-                elif label is not None:
+                if label is not None:
                     metadata["icechunk"] = {"skipped": "windowed"}
                 else:
-                    # Ladder mode (phase 6, §11.4): the plan is written as a
-                    # sidecar beside the leaf — no icechunk session on the
-                    # leaf path; the staged sweep gathers and commits it.
-                    from zagg.icechunk_ladder import write_leaf_refs
-
-                    plan = leaf_ref_plan(grid, shard_key, store_root, store_kwargs=store_kwargs)
-                    if not any(entry["refs"] for entry in plan):
+                    # The leaf's units (§11.4): its base arrays plus the
+                    # column's declared level, when this unit wrote one.
+                    units = leaf_units(
+                        grid,
+                        config,
+                        shard_key,
+                        store_root,
+                        column=metadata.get("leaf_column"),
+                        store_kwargs=store_kwargs,
+                    )
+                    if resolve_options(config, grid.parent_order)["commit"] == "leaf":
+                        metadata["icechunk"] = record_leaf(
+                            store_root, grid, shard_key, store_kwargs=store_kwargs, units=units
+                        )
+                    elif not any(e["refs"] for u in units for e in u["entries"]):
                         metadata["icechunk"] = {"skipped": "empty"}
                     else:
+                        # Ladder mode (phase 6, §11.4): the units are written
+                        # as a sidecar beside the leaf — no icechunk session
+                        # on the leaf path; the staged sweep gathers and
+                        # commits them.
+                        from zagg.icechunk_ladder import write_leaf_refs
+
                         metadata["icechunk"] = {
                             **write_leaf_refs(
                                 store_root,
                                 leaf_path,
                                 grid,
-                                plan,
+                                units,
                                 spec=sidecar_spec,
                                 store_kwargs=store_kwargs,
                             ),
