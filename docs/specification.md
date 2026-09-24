@@ -3728,3 +3728,8 @@ sharded) are likewise out of stage 1's writer scope. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview
 order has its repo and its refs. None of these change the leaf format, the
 t-digest storage or the moczarr reader.
+
+A skip-if-current unit's lifecycle touch (#388) refreshes its objects in
+place and so moves their checksums (§11.3); the unit re-plans its refs from
+fresh HEADs — committed at once under `commit: "leaf"`, a rewritten sidecar
+under the ladder, which reads again once a staged re-gather covers the node.

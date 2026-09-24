@@ -1496,6 +1496,49 @@ def leaf_identity_gate(
     return identity, None
 
 
+def _leaf_icechunk_refs(
+    store_root, grid, config, shard_key, leaf_path, *, column, window, sidecar_spec, store_kwargs
+) -> dict:
+    """The unit's Icechunk record (issue #580, spec §11.4) — fail-open, never raises.
+
+    Plans the leaf's units from fresh HEADs (:func:`zagg.icechunk_refs.leaf_units`:
+    its base arrays plus ``column``'s declared level) and, per the resolved
+    ``commit`` mode, commits them (``"leaf"``, after vetting the repo BEFORE
+    the plan — a missing or mismatched repo refuses for one read, not the
+    plan's ~20 requests) or writes them as the ladder's sidecar beside the
+    leaf (``"ladder"`` — no icechunk session on the leaf path; the staged
+    sweep gathers and commits them). Both the write path and the
+    skip-if-current touch call it. A failure logs and returns ``{"error"}``:
+    the leaf is normative, the repo a regenerable index (D9).
+    """
+    try:
+        from zagg.icechunk_refs import leaf_units, record_leaf, resolve_options, vet_leaf_repo
+
+        if window and window.get("label") is not None:
+            return {"skipped": "windowed"}
+        commit_leaf = resolve_options(config, grid.parent_order, grid=grid)["commit"] == "leaf"
+        repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs) if commit_leaf else None
+        units = leaf_units(
+            grid, config, shard_key, store_root, column=column, store_kwargs=store_kwargs
+        )
+        if commit_leaf:
+            return record_leaf(
+                store_root, grid, shard_key, store_kwargs=store_kwargs, units=units, repo=repo
+            )
+        if not any(e["refs"] for u in units for e in u["entries"]):
+            return {"skipped": "empty"}
+        from zagg.icechunk_ladder import write_leaf_refs
+
+        record = write_leaf_refs(
+            store_root, leaf_path, grid, units, spec=sidecar_spec, store_kwargs=store_kwargs
+        )
+        checksum = "etag" if store_root.startswith("s3://") else "last_modified"
+        return {**record, "checksum": checksum}
+    except Exception as e:
+        logger.warning(f"icechunk refs failed for shard {shard_key} (fail-open, issue #580): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def process_and_write_hive(
     shard_key,
     granule_urls,
@@ -1677,6 +1720,28 @@ def process_and_write_hive(
                 # when zero, so every non-published record stays as it was.
                 if counts.get("skipped_paths"):
                     unit_meta["touch_skipped_paths"] = counts["skipped_paths"]
+                # The touch moved the checksum every ref into this leaf
+                # carries (§11.3: the ``file://`` mtime; a multipart ETag on
+                # S3), so the refs are re-planned from fresh HEADs: a per-leaf
+                # commit lands them now; in ladder mode the sidecar is
+                # rewritten, and the node's next staged re-gather commits it
+                # (issue #580 review finding; question (11) on the PR).
+                from zagg.config import get_icechunk
+
+                if counts["touched"] and get_icechunk(config):
+                    unit_meta["icechunk"] = _leaf_icechunk_refs(
+                        store_root,
+                        grid,
+                        config,
+                        shard_key,
+                        leaf_path,
+                        column=str(column_path).rstrip("/").rpartition("/")[2]
+                        if column_declared and column_path
+                        else None,
+                        window=window,
+                        sidecar_spec=sidecar_spec,
+                        store_kwargs=store_kwargs,
+                    )
             return unit_meta
 
     box: dict = {}
@@ -1994,74 +2059,17 @@ def process_and_write_hive(
 
         if get_icechunk(config):
             _t0 = time.time()
-            try:
-                from zagg.icechunk_refs import (
-                    leaf_units,
-                    record_leaf,
-                    resolve_options,
-                    vet_leaf_repo,
-                )
-
-                label = window["label"] if window else None
-                if label is not None:
-                    metadata["icechunk"] = {"skipped": "windowed"}
-                else:
-                    options = resolve_options(config, grid.parent_order, grid=grid)
-                    commit_leaf = options["commit"] == "leaf"
-                    # A per-leaf commit vets the repo BEFORE the plan: a
-                    # missing or mismatched repo refuses for one read, not
-                    # the plan's ~20 requests (review finding).
-                    repo = (
-                        vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs)
-                        if commit_leaf
-                        else None
-                    )
-                    # The leaf's units (§11.4): its base arrays plus the
-                    # column's declared level, when this unit wrote one.
-                    units = leaf_units(
-                        grid,
-                        config,
-                        shard_key,
-                        store_root,
-                        column=metadata.get("leaf_column"),
-                        store_kwargs=store_kwargs,
-                    )
-                    if commit_leaf:
-                        metadata["icechunk"] = record_leaf(
-                            store_root,
-                            grid,
-                            shard_key,
-                            store_kwargs=store_kwargs,
-                            units=units,
-                            repo=repo,
-                        )
-                    elif not any(e["refs"] for u in units for e in u["entries"]):
-                        metadata["icechunk"] = {"skipped": "empty"}
-                    else:
-                        # Ladder mode (phase 6, §11.4): the units are written
-                        # as a sidecar beside the leaf — no icechunk session
-                        # on the leaf path; the staged sweep gathers and
-                        # commits them.
-                        from zagg.icechunk_ladder import write_leaf_refs
-
-                        metadata["icechunk"] = {
-                            **write_leaf_refs(
-                                store_root,
-                                leaf_path,
-                                grid,
-                                units,
-                                spec=sidecar_spec,
-                                store_kwargs=store_kwargs,
-                            ),
-                            "checksum": "etag"
-                            if store_root.startswith("s3://")
-                            else "last_modified",
-                        }
-            except Exception as e:
-                logger.warning(
-                    f"icechunk refs failed for shard {shard_key} (fail-open, issue #580): {e}"
-                )
-                metadata["icechunk"] = {"error": f"{type(e).__name__}: {e}"}
+            metadata["icechunk"] = _leaf_icechunk_refs(
+                store_root,
+                grid,
+                config,
+                shard_key,
+                leaf_path,
+                column=metadata.get("leaf_column"),
+                window=window,
+                sidecar_spec=sidecar_spec,
+                store_kwargs=store_kwargs,
+            )
             if "phase_timings" in metadata:
                 metadata["phase_timings"]["icechunk"] = time.time() - _t0
     return metadata

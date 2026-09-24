@@ -1308,9 +1308,14 @@ footprint of leaf tree + stats sidecar + `granules.json` + sub-map + declared
 column + the Icechunk ref sidecar (`icechunk_refs.json`, the ladder's input
 for that leaf — a skipped leaf must keep it as fresh as the leaf it
 describes, or the next staged sweep gathers a hole), `touch_store_root`
-covers the root trio, and neither reaches the repo — so an all-skip rerun,
-which reopens the repo and commits nothing, refreshes every leaf and nothing
-in the index. The ref sidecar's touch is unconditional: it is issued even when
+covers the root trio, and neither reaches the repo. The touch does move the
+checksum every ref into the unit carries (spec §11.3: the `file://` mtime; the
+ETag of a multipart-uploaded S3 object, which a self-copy re-mints), so a
+touched unit re-plans its refs from fresh HEADs: under `commit: "leaf"` it
+commits them at once; under the ladder it rewrites its ref sidecar, and the
+refs read again once a staged re-gather covers its node — a skipped unit is
+not in the run's dirty set, so until then (or a manual staged sweep) that
+leaf's refs fail loudly on read (PR #581 question (11)). The ref sidecar's touch is unconditional: it is issued even when
 `output.icechunk` is off or the run used `commit: "leaf"`, where the object
 does not exist — harmless (an absent sibling is neither touched nor failed),
 at the cost of one extra request per unit on an all-skip rerun. The repo is not a root-trio-style
