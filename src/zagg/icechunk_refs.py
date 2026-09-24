@@ -5,12 +5,13 @@ A morton hive is many leaf zarrs. The companion repository at
 a **group per level, named by CELL order** (``/19`` the base leaves,
 ``/13`` the §4.6 leaf columns' declared member, ``/12`` … ``/4`` the
 declared overview orders — exactly the manifest's ``multiscales`` datasets),
-each holding that level's arrays re-rooted on the whole sphere, plus the manifest's ``zagg-multiscales/1``
-block mirrored into the root attrs as ``multiscales`` — by recording every
-object's inner chunks as Icechunk **virtual chunk references**:
-``(location, offset, length)`` byte ranges into the objects that already
-exist. Stage 1 is refs-only and additive: the leaves stay the normative,
-self-describing data plane; the repo is a derived index.
+each holding that level's arrays re-rooted on the whole sphere, plus the
+manifest's ``zagg-multiscales/1`` block mirrored into the root attrs as
+``multiscales`` — by recording every object's inner chunks as Icechunk
+**virtual chunk references**: ``(location, offset, length)`` byte ranges
+into the objects that already exist. Stage 1 is refs-only and additive: the
+leaves stay the normative, self-describing data plane; the repo is a derived
+index.
 
 Entry points, all fleet-first and worker-side (the dispatcher never writes,
 D8):
@@ -876,13 +877,13 @@ def commit_units(
     """Write ref-plan units for any set of orders into ONE session and commit once.
 
     ``units`` is any ITERABLE of ``{"level", "entries"}``: each entry lands
-    under its level's group (``/{level}/{path}``, the level's CELL order). A generator is the point —
-    the ladder streams a committing node's subtree through here one child at
-    a time, so the node's peak is one child's carriers rather than the whole
-    subtree's (§11.4). Returns ``{"path", "snapshot", "refs", "levels",
-    "rebases", "commit_s"}`` (``snapshot`` ``None`` when nothing was
-    written). ``repo`` skips the open/vet when the caller already holds a
-    vetted handle.
+    under its level's group (``/{level}/{path}``, the level's CELL order). A
+    generator is the point — the ladder streams a committing node's subtree
+    through here one child at a time, so the node's peak is one child's
+    carriers rather than the whole subtree's (§11.4). Returns ``{"path",
+    "snapshot", "refs", "levels", "rebases", "commit_s"}`` (``snapshot``
+    ``None`` when nothing was written). ``repo`` skips the open/vet when the
+    caller already holds a vetted handle.
     """
     if repo is None:
         repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
