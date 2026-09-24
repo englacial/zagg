@@ -3419,7 +3419,11 @@ offset.
 store root. The repo declares exactly one **virtual chunk container** whose
 `url_prefix` is the store root URL **with a trailing `/`**
 (`s3://bucket/product/`, `file:///…/product/`); a reader authorizes that
-prefix with the same credentials it reads the leaves with.
+prefix with the same credentials it reads the leaves with. That prefix is
+**absolute**, so the companion does not relocate with the store the way the
+root-relative manifest and MOC sidecars do: a mirrored or moved store must
+re-declare the container prefix (and the recorded `url_prefix`, §11.1) at its
+new location before its refs resolve.
 
 ### 11.4 Commits
 
