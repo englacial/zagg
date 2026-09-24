@@ -3375,13 +3375,32 @@ At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
 Each **populated** inner chunk is recorded as one virtual reference:
 
 - **sharded leaf array** (every hive leaf, §1.5): `location` is the leaf's
-  single shard object (`{leaf}/{p}/c/0…`), `offset`/`length` are the chunk's
-  entry in the shard index suffix — the two `u64` words the §1.5 2-GET recipe
-  already reads. An inner chunk the index marks **absent** (the `2^64 − 1`
-  sentinel in both words) gets **no reference** and reads as `fill_value`.
+  single shard object — the array's **outer**-chunk key, `{leaf}/{p}/c/0` for
+  the 1-D cells arrays the hive writes — and `offset`/`length` are the
+  chunk's entry in the shard index suffix, the two `u64` words the §1.5 2-GET
+  recipe already reads. An inner chunk the index marks **absent** (the
+  `2^64 − 1` sentinel in both words) gets **no reference** and reads as
+  `fill_value`.
 - **regular (unsharded) leaf array**: `location` is the chunk object
-  `{leaf}/{p}/c/{j}`, `offset` 0, `length` the object size; a missing object
-  gets no reference.
+  `{leaf}/{p}/c/{j}`, `offset` 0, `length` the object size (§11.4); a missing
+  object gets no reference.
+
+Chunk keys are the array's own, under the `chunk_key_encoding` its
+`zarr.json` declares — zagg emits the `default` encoding with the `/`
+separator throughout — so the chunk at grid index `(i₀, i₁, …)` is
+
+```text
+{leaf}/{p}/c/{i₀}/{i₁}…
+```
+
+with the trailing axes at their **leaf-local** chunk index (`0` for a
+dimension the array holds in a single chunk). A 1-D array's key is therefore
+`c/0` for its one chunk, and `c/{j}` where the cells axis is chunked. Keys
+are used **verbatim** as the path part of `location` (`//` and `.`/`..` are
+preserved), so a character that is reserved in a URL but part of the key MUST
+be percent-encoded — `?` → `%3F`, `#` → `%23`, `%` → `%25`
+(`set_virtual_refs_arr`). zagg's own keys contain none of the three; the rule
+is normative for a reader reconstructing a key from a recorded `location`.
 
 Every reference also carries a **checksum**: the **ETag** of the object it
 points into, read from the HEAD the writer performs against that object after
