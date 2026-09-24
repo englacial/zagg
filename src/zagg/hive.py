@@ -1724,8 +1724,9 @@ def process_and_write_hive(
                 # carries (§11.3: the ``file://`` mtime; a multipart ETag on
                 # S3), so the refs are re-planned from fresh HEADs: a per-leaf
                 # commit lands them now; in ladder mode the sidecar is
-                # rewritten, and the node's next staged re-gather commits it
-                # (issue #580 review finding; question (11) on the PR).
+                # rewritten and the unit is marked ``icechunk_dirty``, so this
+                # run's staged sweep re-gathers its node as dirt-only (issue
+                # #580, PR #581 question (11) ruled (a)).
                 from zagg.config import get_icechunk
 
                 if counts["touched"] and get_icechunk(config):
@@ -1742,6 +1743,8 @@ def process_and_write_hive(
                         sidecar_spec=sidecar_spec,
                         store_kwargs=store_kwargs,
                     )
+                    if unit_meta["icechunk"].get("sidecar"):
+                        unit_meta["icechunk_dirty"] = True
             return unit_meta
 
     box: dict = {}
