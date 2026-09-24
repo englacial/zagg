@@ -3664,11 +3664,14 @@ nodes (768 commits) — the numbers §11.4's rationale derives.
 
 *(Informative.)* Icechunk deduplicates a manifest's `location` strings only
 from `min_num_chunks` chunks upward (a configurable setting defaulting to
-1,000, not a format constant). Every admissible split clears it by
-construction — the finest manifest is a whole leaf, 256 chunks per array at
-production, and the default is 64 of them — and the dictionary is worth
+1,000, not a format constant). The **default** split clears it comfortably —
+one manifest per order-6 cell is `4^7` = 16,384 chunks per array, 64 leaves.
+The finest admissible split does not: `split_order == shard_order` is one
+whole leaf, `4^4` = 256 chunks per array at production, below the 1,000
+default, so such a manifest carries no dictionary. The dictionary is worth
 having precisely because all refs of one leaf array carry the **same**
-`location` (the leaf's single shard object).
+`location` (the leaf's single shard object), so a hand-set
+`split_order == shard_order` trades it away.
 
 ### 11.6 What §11 does not cover (informative)
 
