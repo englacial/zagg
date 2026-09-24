@@ -2006,7 +2006,8 @@ def process_and_write_hive(
                 if label is not None:
                     metadata["icechunk"] = {"skipped": "windowed"}
                 else:
-                    commit_leaf = resolve_options(config, grid.parent_order)["commit"] == "leaf"
+                    options = resolve_options(config, grid.parent_order, grid=grid)
+                    commit_leaf = options["commit"] == "leaf"
                     # A per-leaf commit vets the repo BEFORE the plan: a
                     # missing or mismatched repo refuses for one read, not
                     # the plan's ~20 requests (review finding).

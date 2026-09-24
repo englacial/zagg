@@ -169,10 +169,37 @@ def finest_dispatch_order(shard_order: int, tuple_width: int | None = None) -> i
     return int(stage_tuples(int(shard_order), tuple_width=width)[0]["dispatch"])
 
 
-def resolve_options(config, shard_order: int, *, tuple_width: int | None = None) -> dict:
+def ladder_walks(config, grid) -> bool:
+    """Whether this run's staged sweep walks the ref ladder (§11.4).
+
+    The unset-``commit`` default hangs on it. True only when the dispatcher
+    chains the staged sweep (``output.sweep: "stages"``) AND the config
+    declares a ``/2`` ladder with at least one composable field — the same
+    derivation :func:`zagg.column.leaf_column_plan` runs; without either,
+    :func:`zagg.sweep_stages.sweep_stage_pass` returns before its first
+    node, and a ladder-mode run would leave the repo empty while every
+    leaf's sidecar reported success (review finding). Config-only, so the
+    init step and every worker resolve the same answer. A dispatcher that
+    chains no staged sweep at all (the ``client`` facade) pins ``commit:
+    "leaf"`` in the config it ships instead.
+    """
+    if config.output.get("sweep") != "stages":
+        return False
+    from zagg.column import leaf_column_plan
+
+    try:
+        return leaf_column_plan(config, grid) is not None
+    except ValueError:
+        return False  # a declaration the sweep would refuse walks no ladder either
+
+
+def resolve_options(config, shard_order: int, *, tuple_width: int | None = None, grid=None) -> dict:
     """``{"commit", "commit_order", "split_order"}`` for this run, defaults applied.
 
-    Defaults: ``commit: "ladder"``; ``commit_order`` the finest dispatch node;
+    Defaults: ``commit: "ladder"`` when the run walks the ladder
+    (:func:`ladder_walks` on ``grid``), else ``"leaf"`` — never a mode whose
+    commits no step of the run makes; without a ``grid`` an unset ``commit``
+    is ``"leaf"``. ``commit_order`` the finest dispatch node;
     ``split_order = commit_order``. Validation (§11.5): a commit must write
     whole manifests, so ``split_order >= commit_order``; both at most the
     shard order (a leaf is the finest thing a commit or a manifest can be
@@ -184,7 +211,9 @@ def resolve_options(config, shard_order: int, *, tuple_width: int | None = None)
 
     raw = get_icechunk_options(config)
     shard_order = int(shard_order)
-    commit = raw.get("commit") or "ladder"
+    commit = raw.get("commit") or (
+        "ladder" if grid is not None and ladder_walks(config, grid) else "leaf"
+    )
     if commit not in COMMIT_MODES:
         raise ValueError(f"output.icechunk.commit must be one of {COMMIT_MODES} (got {commit!r})")
     commit_order = raw.get("commit_order")
@@ -614,7 +643,7 @@ def init_repo(
     from zagg.grids.base import vlen_dtype_warning_suppressed
     from zagg.hive import build_manifest, read_manifest
 
-    options = resolve_options(config, grid.parent_order)
+    options = resolve_options(config, grid.parent_order, grid=grid)
     if manifest is None:
         manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
@@ -1071,6 +1100,7 @@ __all__ = [
     "container_prefix",
     "finest_dispatch_order",
     "init_repo",
+    "ladder_walks",
     "leaf_units",
     "level_grids",
     "leaf_ref_plan",

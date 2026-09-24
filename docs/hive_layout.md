@@ -1472,10 +1472,13 @@ output:
 config is finer than the store's recorded value adopts the store's with a
 warning; a coarser value re-cuts new manifests from this run on and flags
 the run parquet's `icechunk_split_ratchet` for a later `rewrite_manifests`
-pass over the old ones. `tuple_width` is unchanged (3). The local backend resolves an unset `commit`
-to `leaf` unless `output.sweep: "stages"` chains the staged sweep — a default
-local run walks no ladder, so its sidecars would never be committed; the
-fleet's default is the ladder. The default `commit_order` is a function of
+pass over the old ones. `tuple_width` is unchanged (3). An unset `commit`
+resolves to `ladder` only when the run walks it — the dispatcher chains the
+staged sweep (`output.sweep: "stages"`; the `client` facade never does) and
+the store declares a `/2` ladder with at least one composable field
+(`zagg.icechunk_refs.ladder_walks`) — and to `leaf` otherwise, so no run
+writes sidecars nothing gathers. The Lambda dispatchers ship the resolved
+mode in the worker config. The default `commit_order` is a function of
 the shard order and the width (`zagg.icechunk_refs.finest_dispatch_order`).
 
 `output.icechunk: false` opts a hive run out (default on; excluded from the

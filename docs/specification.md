@@ -3585,8 +3585,12 @@ columns do:
 **per-run** — the init writes this run's values so its stage nodes can read
 them, and they are never a compatibility key. `commit: "leaf"` keeps the per-leaf commit of the
 first revision — the leaf commits `leaf {decimal}` itself and the ladder
-commits overview refs only — for the local backend without a staged sweep and
-for tests; the fleet default is the ladder.
+commits overview refs only. An unset `commit` resolves to the ladder only
+when the run walks it — the dispatcher chains the staged sweep
+(`output.sweep: "stages"`) and a `/2` ladder with a composable field is
+declared — and to `"leaf"` otherwise, on every backend: a ladder-mode run
+that walks no ladder would leave the repo empty while every leaf reported a
+sidecar.
 
 **Init.** `init {run_id}` — the once-per-run initialization, before the
 fan-out: the repo exists with **every** order group the ladder commits into

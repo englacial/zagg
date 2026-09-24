@@ -203,14 +203,66 @@ class TestOptions:
         assert icechunk_refs.finest_dispatch_order(9) == 6
         assert icechunk_refs.finest_dispatch_order(4) == 3
         assert icechunk_refs.resolve_options(self._cfg(cfg), 9) == {
-            "commit": "ladder",
+            "commit": "leaf",  # no grid: nothing says a ladder will run
             "commit_order": 6,
             "split_order": 6,
         }
         assert icechunk_refs.resolve_options(self._cfg(cfg), 4)["commit_order"] == 3
 
+    def test_unset_commit_is_the_ladder_only_when_one_walks(self, monkeypatch, cfg):
+        # The default follows whether the run's staged sweep walks the ladder
+        # (review finding): the fleet and local defaults run the families
+        # sweep only, and ``pyramid: false`` or no composable field returns
+        # before the first node — a ladder there leaves the repo empty.
+        import zagg.column as column_mod
+
+        grid = _grid(cfg)
+        cfg = self._cfg(cfg)
+
+        def mode():
+            return icechunk_refs.resolve_options(cfg, 4, grid=grid)["commit"]
+
+        assert mode() == "leaf"  # default output.sweep: the families sweep
+        cfg.output["sweep"] = True
+        assert mode() == "leaf"
+        cfg.output["sweep"] = "stages"
+        assert mode() == "ladder"
+        cfg.output["pyramid"] = False
+        assert mode() == "leaf"
+        del cfg.output["pyramid"]
+        monkeypatch.setattr(column_mod, "composable_fields", lambda fields: {})
+        assert mode() == "leaf"
+        monkeypatch.undo()
+        assert mode() == "ladder"
+        cfg.output["sweep"] = True
+        cfg.output["icechunk"] = {"commit": "ladder"}
+        assert mode() == "ladder"  # an explicit setting is honored
+
+    def test_dispatchers_pin_the_resolved_commit(self, cfg):
+        # The Lambda dispatchers ship the resolved mode; the client facade
+        # (no staged sweep at all) pins the per-leaf commit even under
+        # ``sweep: "stages"``. Explicit settings and the knob off pass through.
+        from zagg import runner
+
+        grid = _grid(cfg)
+        cfg = self._cfg(cfg, commit_order=3)
+
+        def pin(stages):
+            return runner._pin_icechunk_commit(cfg, grid, stages=stages).output["icechunk"]
+
+        assert pin(True) == pin(False) == {"commit_order": 3, "commit": "leaf"}
+        cfg.output["sweep"] = "stages"
+        assert pin(True) == {"commit_order": 3, "commit": "ladder"}
+        assert pin(False) == {"commit_order": 3, "commit": "leaf"}
+        assert cfg.output["icechunk"] == {"commit_order": 3}  # never mutated
+        for flag in ({"commit": "ladder"}, False):
+            cfg.output["icechunk"] = flag
+            assert runner._pin_icechunk_commit(cfg, grid, stages=False) is cfg
+
     def test_global_scale_setting(self, cfg):
-        opts = icechunk_refs.resolve_options(self._cfg(cfg, split_order=4, commit_order=3), 9)
+        opts = icechunk_refs.resolve_options(
+            self._cfg(cfg, commit="ladder", split_order=4, commit_order=3), 9
+        )
         assert opts == {"commit": "ladder", "commit_order": 3, "split_order": 4}
 
     def test_split_finer_than_commit_is_refused(self, cfg):
@@ -232,9 +284,11 @@ class TestOptions:
         # No stage tuple's [dispatch, child_order) range contains the shard
         # order, so a ladder commit there gathers no leaf sidecar at all.
         with pytest.raises(ValueError, match="no stage tuple covers the shard order"):
-            icechunk_refs.resolve_options(self._cfg(cfg, commit_order=4), 4)
+            icechunk_refs.resolve_options(self._cfg(cfg, commit="ladder", commit_order=4), 4)
         with pytest.raises(ValueError, match="no stage tuple covers the shard order"):
-            icechunk_refs.resolve_options(self._cfg(cfg, commit_order=4, split_order=4), 4)
+            icechunk_refs.resolve_options(
+                self._cfg(cfg, commit="ladder", commit_order=4, split_order=4), 4
+            )
         # ``commit: "leaf"`` commits per leaf and is unaffected.
         assert icechunk_refs.resolve_options(self._cfg(cfg, commit="leaf", commit_order=4), 4) == {
             "commit": "leaf",
@@ -274,9 +328,10 @@ class TestInit:
         assert block["spec"] == "zagg-icechunk/1"
         assert block["shard_order"] == 4 and block["chunk_order"] == 5 and block["cell_order"] == 6
         assert block["url_prefix"] == icechunk_refs.container_prefix(root)
-        # A direct init with no ladder knobs: the ladder defaults (commit at
-        # the finest dispatch node, 3 here; split at it).
-        assert (block["commit"], block["commit_order"], block["split_order"]) == ("ladder", 3, 3)
+        # A direct init with no ladder knobs and no staged sweep: the per-leaf
+        # commit (no ladder walks), commit order at the finest dispatch node,
+        # 3 here; split at it.
+        assert (block["commit"], block["commit_order"], block["split_order"]) == ("leaf", 3, 3)
         # One repo, a group per order: the base (4) plus the declared
         # overview orders, each with its own split block.
         assert sorted(block["levels"], key=int) == [str(o) for o in out["ladder"]]
@@ -1103,13 +1158,32 @@ class TestWorkerWiring:
         assert seen["ids"]["granule_ids"] == ["g.h5"]
         assert meta["icechunk"]["refs"] > 0
 
-    def test_the_production_default_writes_a_ref_sidecar(self, monkeypatch, cfg, tmp_path):
-        # Phase 6: with no ``icechunk`` key at all, a hive worker commits
-        # nothing itself — it writes the leaf's ref sidecar for the ladder.
+    def test_the_production_default_commits_per_leaf_without_a_staged_sweep(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # No ``icechunk`` key and the default ``sweep``: no ladder walks, so
+        # the worker commits its own refs rather than writing a sidecar no
+        # stage node would ever gather (review finding).
+        from zagg.icechunk_ladder import LEAF_REFS_NAME
+
+        grid = _grid(cfg)
+        cfg.output["store_layout"] = "hive"
+        root = str(tmp_path / "store")
+        icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
+        shard = _shards(grid, 1)[0]
+        meta = _write_leaf(monkeypatch, grid, root, shard, refs=None)
+        assert meta["icechunk"]["refs"] > 0 and meta["icechunk"]["snapshot"]
+        assert not list((tmp_path / "store").rglob(f"*{LEAF_REFS_NAME}*"))
+
+    def test_the_staged_sweep_default_writes_a_ref_sidecar(self, monkeypatch, cfg, tmp_path):
+        # Phase 6: with no ``icechunk`` key and the staged sweep chained, a
+        # hive worker commits nothing itself — it writes the leaf's ref
+        # sidecar for the ladder.
         from zagg.icechunk_ladder import leaf_refs_key, read_leaf_refs
 
         grid = _grid(cfg)
         cfg.output["store_layout"] = "hive"
+        cfg.output["sweep"] = "stages"
         root = str(tmp_path / "store")
         shard = _shards(grid, 1)[0]
         meta = _write_leaf(monkeypatch, grid, root, shard, refs=None, skip_chunks=(2,))

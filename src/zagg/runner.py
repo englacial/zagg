@@ -3111,11 +3111,11 @@ def _run_local(
         # init, in-process here as the sweep is — this process IS the worker.
         # Fail-open (D9): the repo is a derived index; a failed init is
         # recorded in the summary and every leaf's refs then fail-open too.
-        # The commit mode (phase 6): the local backend commits through the
-        # ladder only when the staged sweep runs (``output.sweep: "stages"``),
-        # so an unset ``commit`` resolves to the per-leaf commit here — the
-        # fleet's default is the ladder. Explicit settings are honored.
-        config = _local_icechunk_commit_mode(config)
+        # The commit mode (phase 6): an unset ``commit`` resolves to the
+        # ladder only when this run walks it — ``output.sweep: "stages"``
+        # chains the staged sweep here AND a ``/2`` ladder with composable
+        # fields is declared (``icechunk_refs.ladder_walks``) — else to the
+        # per-leaf commit. Explicit settings are honored.
         icechunk_init = _init_icechunk_local(config, grid, store_path, run_id, store_kwargs)
         # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
         # window). None (schedule none/absent) keeps the (shard, records)
@@ -3618,7 +3618,9 @@ def _run_lambda(
 
     grid = from_config(config)
     _check_signature(grid, catalog_data)
-    config_dict = asdict(config)
+    # The Icechunk commit mode ships resolved (#580): this dispatcher chains
+    # the staged sweep on ``output.sweep: "stages"`` (below).
+    config_dict = asdict(_pin_icechunk_commit(config, grid, stages=True))
 
     # Build the optional output_credentials event block (write side, symmetric
     # to s3_credentials on the read side). None -> execution-role writes.
@@ -5587,24 +5589,29 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
     return event
 
 
-def _local_icechunk_commit_mode(config):
-    """The local backend's default ``output.icechunk.commit`` (issue #580 phase 6).
+def _pin_icechunk_commit(config, grid, *, stages: bool):
+    """``config`` with an unset ``output.icechunk.commit`` pinned to what the run does (issue #580).
 
-    ``"ladder"`` when the run chains the staged sweep (``output.sweep:
-    "stages"`` — the tuple containing ``commit_order`` then commits), else
-    ``"leaf"`` (a default local run runs the families sweep, which walks no
-    ladder, so sidecars would never be committed). An explicit ``commit`` is
-    left alone; the knob is outside the D19 core, so this perturbs no identity.
+    ``"ladder"`` only when this dispatcher chains the staged sweep
+    (``stages``) AND it walks the ladder
+    (:func:`zagg.icechunk_refs.ladder_walks`), else ``"leaf"``. The Lambda
+    dispatchers ship the pinned block, so the init and every worker read one
+    explicit mode; the ``client`` facade chains no staged sweep at all, so it
+    pins ``"leaf"`` even under ``sweep: "stages"`` — a ladder there would
+    leave sidecars nothing gathers (review finding). An explicit ``commit``
+    is left alone; the knob is outside the D19 core, so this perturbs no
+    identity.
     """
     from dataclasses import replace
 
     from zagg.config import get_icechunk_options
+    from zagg.icechunk_refs import ladder_walks
 
     if not get_icechunk(config) or get_icechunk_options(config)["commit"] is not None:
         return config
     flag = config.output.get("icechunk")
     block = dict(flag) if isinstance(flag, dict) else {}
-    block["commit"] = "ladder" if config.output.get("sweep") == "stages" else "leaf"
+    block["commit"] = "ladder" if stages and ladder_walks(config, grid) else "leaf"
     return replace(config, output={**config.output, "icechunk": block})
 
 
