@@ -54,6 +54,9 @@ REFS_SPEC = "zagg-icechunk-refs/1"
 LEAF_REFS_NAME = "icechunk_refs.json"
 #: Basename of a stage node's ref column, at the node directory.
 NODE_REFS_NAME = "icechunk_refs.json"
+#: The leaf carrier's geometry block — vetted against the repo's own, keyed
+#: off this fixed tuple so a carrier that declares none is refused (§11.4).
+GEOMETRY_KEYS = ("shard_order", "chunk_order", "cell_order")
 #: The counters :func:`stage_node_refs` adds to a stage row.
 STAGE_COUNTS = (
     "icechunk_refs",
@@ -328,7 +331,12 @@ def _overview_units(store_root, node, orders, level_by_order, fields, candidates
 
 
 def _child_units(store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs):
-    """The subtree's gathered units plus how many children carried none."""
+    """The subtree's gathered units plus how many children carried none usable.
+
+    A child whose carrier is absent, unreadable or for another geometry is
+    counted under ``missing`` and its siblings are kept: a per-leaf fault
+    never costs the node its whole gather (§11.4).
+    """
     from zagg.grids.morton import morton_word
     from zagg.sweep_overview import _node_at
 
@@ -336,23 +344,39 @@ def _child_units(store_root, node, child_order, shard_order, candidates, block, 
     units: list = []
     missing = 0
     for child in children:
-        if child_order == shard_order:
-            got = read_leaf_refs(
-                store_root, morton_word(child), spec=spec, store_kwargs=store_kwargs
-            )
-            if got is None:
-                missing += 1
-                continue
-            child_units, meta = got
-            geometry = meta.get("geometry") or {}
-            have = {key: block.get(key) for key in geometry}
-            if have != geometry:
-                raise ValueError(f"leaf {child} refs are for {geometry}, the repo is {have}")
-        else:
-            child_units = read_node_refs(store_root, child, store_kwargs=store_kwargs)
-            if child_units is None:
-                missing += 1
-                continue
+        # Per-CHILD fail-open: a foreign spec token, a truncated carrier
+        # (``JSONDecodeError`` is a ``ValueError``) or a geometry mismatch is
+        # this child's fault, not the node's. Letting it out would cost the
+        # node its whole gather — 63 good leaves for one bad one at
+        # production geometry — so it counts as ``missing`` like a carrier
+        # that was never written (review finding).
+        try:
+            if child_order == shard_order:
+                got = read_leaf_refs(
+                    store_root, morton_word(child), spec=spec, store_kwargs=store_kwargs
+                )
+                if got is None:
+                    missing += 1
+                    continue
+                child_units, meta = got
+                geometry = meta.get("geometry")
+                # Keyed off the FIXED tuple, not off the carrier's own dict: a
+                # carrier with no geometry block compared {} != {} and passed.
+                if not isinstance(geometry, dict) or any(k not in geometry for k in GEOMETRY_KEYS):
+                    raise ValueError(f"leaf {child} refs carry no geometry block")
+                want = {key: geometry[key] for key in GEOMETRY_KEYS}
+                have = {key: block.get(key) for key in GEOMETRY_KEYS}
+                if have != want:
+                    raise ValueError(f"leaf {child} refs are for {want}, the repo is {have}")
+            else:
+                child_units = read_node_refs(store_root, child, store_kwargs=store_kwargs)
+                if child_units is None:
+                    missing += 1
+                    continue
+        except (ValueError, KeyError) as e:
+            logger.warning(f"icechunk: dropping child {child}'s refs (fail-open, issue #580): {e}")
+            missing += 1
+            continue
         units.extend(child_units)
     return units, missing
 
@@ -472,6 +496,7 @@ def local_flag(store_root: str) -> bool:
 
 
 __all__ = [
+    "GEOMETRY_KEYS",
     "LEAF_REFS_NAME",
     "NODE_REFS_NAME",
     "REFS_SPEC",
