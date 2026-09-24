@@ -2057,7 +2057,14 @@ class TestHiveProfileWritePhase:
         # without any profile flag — the sidecar record is complete by default.
         fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
         _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
-        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write", "hash", "icechunk"}
+        assert set(meta["phase_timings"]) == {
+            "read",
+            "index",
+            "aggregate",
+            "write",
+            "hash",
+            "icechunk",
+        }
         # The leaf still landed, fully stamped.
         from zagg.store import open_store
 

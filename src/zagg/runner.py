@@ -2443,7 +2443,14 @@ def _write_run_stats(store_path, rows, *, run_id, store_kwargs, summary=None) ->
     try:
         from zagg.telemetry import write_run_parquet
 
-        path = write_run_parquet(store_path, rows, run_id=run_id, store_kwargs=store_kwargs)
+        path = write_run_parquet(
+            store_path,
+            rows,
+            run_id=run_id,
+            store_kwargs=store_kwargs,
+            # Run-level init record (issue #580): None off-hive / opted out.
+            icechunk_init=(summary or {}).get("icechunk"),
+        )
         if summary is not None:
             summary["run_stats_path"] = path
         logger.info(f"Wrote run stats parquet ({len(rows)} rows): {path}")
@@ -2467,6 +2474,7 @@ def _dispatch_run_stats(
     inline_rows=None,
     finalize_error=None,
     tail_status_url=None,
+    icechunk_init=None,
 ) -> str | None:
     """Fire-and-forget worker-invoke run-record write (issue #313, D8).
 
@@ -2516,6 +2524,9 @@ def _dispatch_run_stats(
             # determinism rule as summary["run_stats_path"] below, so the
             # parquet's column set does not vary run to run.
             "finalize_error": finalize_error,
+            # Run-level init record (issue #580); the stats worker broadcasts
+            # it as the icechunk_repo / icechunk_init columns.
+            "icechunk_init": icechunk_init,
         }
         if tail_status_url is not None:
             event["tail_status_url"] = tail_status_url
@@ -4286,6 +4297,7 @@ def _run_lambda(
             # Tail-completion marker (issue #327): worker-written at the v2 status
             # prefix so Run.attach knows this run's tail was recorded.
             tail_status_url=f"{run_status_prefix(store_path, run_id)}/{TAIL_NAME}",
+            icechunk_init=summary["icechunk"],
         )
         # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
         # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
