@@ -373,6 +373,29 @@ class TestInit:
         with pytest.raises(ValueError, match="was built for"):
             icechunk_refs.init_repo(root, other, cfg, run_id="run-2", store_kwargs={})
 
+    def test_a_repo_keyed_by_node_order_is_refused(self, cfg, tmp_path):
+        # Before the §11.1 amendment the groups were named by NODE order. A
+        # dev store built that way agrees on every compatibility key, reopens
+        # as ``created: False``, and then raises ``NodeNotFound`` on every
+        # commit -- an index that silently never fills (review finding).
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        session = repo.writable_session(icechunk_refs.BRANCH)
+        repo_root = zarr.open_group(session.store, mode="r+")
+        block = dict(repo_root.attrs[icechunk_refs.ICECHUNK_ATTR])
+        # The same levels under the old keying: node orders 4 .. 0.
+        block["levels"] = {str(v["node_order"]): v for v in block["levels"].values()}
+        repo_root.attrs[icechunk_refs.ICECHUNK_ATTR] = block
+        session.commit("re-key the levels by node order")
+        del repo, session, repo_root
+        with pytest.raises(ValueError, match="by node order, not cell order"):
+            icechunk_refs.init_repo(root, grid, cfg, run_id="run-2", store_kwargs={})
+        # The leaf and ladder vets refuse it too -- both pass ``cell_order``.
+        with pytest.raises(ValueError, match="by node order, not cell order"):
+            icechunk_refs.open_vetted(root, store_kwargs={}, want={"cell_order": 6})
+
     def _init(self, cfg, root, **block):
         grid = _grid(cfg)
         cfg.output["icechunk"] = block
