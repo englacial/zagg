@@ -269,6 +269,9 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
 
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
+    # The leaf-store object model is what stage 1 leaves unchanged (spec §11,
+    # "Not changed"), so the companion repo stays out of the count (issue #580).
+    cfg.output["icechunk"] = False
     # A ragged field so the leaf carries its whole-leaf vlen array (issue #209).
     cfg.aggregation["variables"]["h"] = {
         "function": "np.sort",
@@ -880,6 +883,9 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
     cfg.output["grid"]["chunk_inner"] = 8  # K = 16; sharded defaults True (#236)
+    # The leaf-store object model is what stage 1 leaves unchanged (spec §11,
+    # "Not changed"), so the companion repo stays out of the count (issue #580).
+    cfg.output["icechunk"] = False
     if not pyramid:
         cfg.output["pyramid"] = False
     cfg.aggregation["variables"]["h"] = {
