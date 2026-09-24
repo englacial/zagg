@@ -231,6 +231,48 @@ class TestWorkerWiring:
         }
 
 
+class TestStampRecord:
+    """Issue #580 phase 2: the §5.3 record rides the commit stamp itself."""
+
+    def test_stamp_carries_the_sidecar_record(self, kitchen_leaf):
+        # Computed from the staged arrays BEFORE the stamp lands: the stamp
+        # copy, the metadata (sidecar) copy and a full read-back all agree.
+        from zagg.hive import read_commit
+
+        meta, leaf = kitchen_leaf
+        stamp = read_commit(LocalStore(str(leaf)))
+        assert stamp["content_hashes"] == meta["content_hashes"]
+        group = zarr.open_group(LocalStore(str(leaf)), mode="r", zarr_format=3)
+        assert stamp["content_hashes"]["arrays"] == hash_arrays(group)
+
+    def test_stamp_key_absent_when_hashing_fails(self, tmp_path, monkeypatch):
+        # Fail-open (§5.3): a §5.2 raise gate lands as a stamp WITHOUT the key
+        # — the leaf still commits, and absence reads unverifiable.
+        from zagg.hive import read_commit
+
+        monkeypatch.setattr(
+            "zagg.content_hash.hash_arrays",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        meta, leaf = _write_kitchen_sink(tmp_path / "nohash")
+        assert "content_hashes" not in meta
+        stamp = read_commit(LocalStore(str(leaf)))
+        assert stamp["complete"] is True and "content_hashes" not in stamp
+
+    def test_moczarr_reference_agrees_with_the_stamp(self, kitchen_leaf):
+        # The parity gate the issue asks for: moczarr's reference recipe over
+        # the written leaf reproduces the stamp's record exactly.
+        moczarr_stats = pytest.importorskip("moczarr.stats")
+        from zagg.hive import read_commit
+
+        _meta, leaf = kitchen_leaf
+        root = leaf.parents[5]  # the leaf path is 1/1/2/1/3/11213.zarr under the root
+        theirs = moczarr_stats.hash_arrays(str(root), str(leaf.relative_to(root)))
+        stamp = read_commit(LocalStore(str(leaf)))
+        assert stamp["content_hashes"]["arrays"] == theirs
+        assert stamp["content_hashes"]["combined"] == moczarr_stats.combined_hash(theirs)
+
+
 class TestStreamingLeafStaging:
     """The UNSHARDED (streaming) hive leaf stages its dense arrays too.
 

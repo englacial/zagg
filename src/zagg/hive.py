@@ -951,6 +951,7 @@ def stamp_commit(
     window: str | None = None,
     time_range: tuple | list | None = None,
     run_id: str | None = None,
+    content_hashes: dict | None = None,
 ) -> None:
     """Stamp a shard leaf complete — the shard's FINAL write (D4).
 
@@ -973,6 +974,14 @@ def stamp_commit(
     requires — a skip-if-current read that sees a foreign FRESH stamp aborts
     loudly. Fleet-written leaves and columns never carry it; readers treat
     absence as "not a stage artifact", never as an error.
+
+    ``content_hashes`` (issue #580, additive): the spec §5.3 O11 record —
+    ``{"arrays": {path: sha256}, "combined": sha256}`` — computed by the
+    writer from the arrays it just wrote, BEFORE the stamp lands, so the stamp
+    itself certifies the bytes it seals (the D20 sidecar carries the same
+    record as telemetry). ``None`` (a writer that could not stand behind a
+    digest — the §5.2 raise gate) writes no key: absence reads as
+    unverifiable, never tampered.
     """
     if window is None and time_range is not None:
         raise ValueError(
@@ -1016,6 +1025,8 @@ def stamp_commit(
         stamp["coverage"] = coverage
     if run_id is not None:
         stamp["run_id"] = str(run_id)
+    if content_hashes is not None:
+        stamp["content_hashes"] = content_hashes
     group.attrs[COMMIT_ATTR] = stamp
 
 
@@ -1815,12 +1826,56 @@ def process_and_write_hive(
     # sidecar is PUT just before it (issue #200 phase 2), and both inherit
     # its debris semantics: a torn worker's coverage never becomes visible.
     # The leaf write order is pinned: dense (streamed, or one object each when
-    # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp
-    # -> granule-id sibling (issue #388; after the stamp, inside the bracket).
+    # sharded) -> ragged (one object, issue #209) -> O11 hashes (in memory,
+    # issue #580) -> coverage sidecar -> stamp -> granule-id sibling (issue
+    # #388; after the stamp, inside the bracket).
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
             write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid, staged_out=staged)
+        _write_elapsed += time.time() - _t0
+        # O11 content hashes (issue #342, spec §5): computed in-worker at
+        # write, from the STAGED arrays (the ratified source — the write path
+        # already holds every slab, so this is a memory-bandwidth pass).
+        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
+        # one-object-per-array pass and the per-chunk streaming path
+        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
+        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
+        # are the one read-back fallback inside ``hash_arrays``: they are
+        # written per chunk-block, never as a leaf slab. Computed BEFORE the
+        # stamp (issue #580) so the record rides the stamp itself — the D4
+        # seal then certifies the digest of the bytes it seals — and the
+        # caller's D20 sidecar (``telemetry.build_record``) carries the same
+        # record off ``metadata``. Hive-only by ratified decision (3): flat
+        # layouts have no leaf sidecar or stamp to record into, and no flat
+        # writer computes hashes — those stores stay verifiable by running
+        # the §5 recipe manually. Fail-open: the record is telemetry-class
+        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
+        # dropped record is strictly safer than a wrong one (the §5.2 raise
+        # gate lands here as a warning + a stamp without the key).
+        _t0 = time.time()
+        try:
+            import warnings
+
+            from zagg.content_hash import content_hashes_record, hash_arrays
+
+            group = zarr.open_group(box["store"], path="", mode="r", zarr_format=3)
+            with warnings.catch_warnings():
+                # The leaf's own coverage sidecar is the one known non-zarr
+                # object under the prefix; ``members()`` warn-skips it (the
+                # ``process_and_write_raster_hive`` suppression precedent).
+                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
+                metadata["content_hashes"] = content_hashes_record(
+                    hash_arrays(group, staged=staged)
+                )
+        except Exception as e:
+            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
+        else:
+            # Same "populated phase_timings" gate as the write stamp below:
+            # the timing rides an existing dict, never seeds one.
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["hash"] = time.time() - _t0
+        _t0 = time.time()
         words = np.concatenate(occupied) if occupied else None
         if words is not None and words.size == 0:
             words = None
@@ -1846,6 +1901,7 @@ def process_and_write_hive(
             coverage=build_coverage(shard_key, words, grid.child_order, bitmap=bitmap, full=full),
             window=window["label"] if window else None,
             time_range=time_range,
+            content_hashes=metadata.get("content_hashes"),
         )
         # The recorded granule-id list, as this leaf's own sibling object
         # (issue #388): AFTER the stamp, so it never certifies a leaf that
@@ -1875,46 +1931,6 @@ def process_and_write_hive(
     # and a no-data shard (no leaf) stays write-less.
     if not metadata.get("error") and "phase_timings" in metadata and "store" in box:
         metadata["phase_timings"]["write"] = _write_elapsed
-    if not metadata.get("error") and "store" in box:
-        # O11 content hashes (issue #342, spec §5): computed in-worker at
-        # write, from the STAGED arrays (the ratified source — the write path
-        # already holds every slab, so this is a memory-bandwidth pass).
-        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
-        # one-object-per-array pass and the per-chunk streaming path
-        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
-        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
-        # are the one read-back fallback inside ``hash_arrays``: they are
-        # written per chunk-block, never as a leaf slab.
-        # Recorded on ``metadata`` for the caller's D20
-        # sidecar (``telemetry.build_record``). Hive-only by ratified decision
-        # (3): flat layouts have no leaf sidecar to record into, and no flat
-        # writer computes hashes — those stores stay verifiable by running
-        # the §5 recipe manually. Fail-open: the record is telemetry-class
-        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
-        # dropped record is strictly safer than a wrong one (the §5.2 raise
-        # gate lands here as a warning + no record).
-        _t0 = time.time()
-        try:
-            import warnings
-
-            from zagg.content_hash import content_hashes_record, hash_arrays
-
-            group = zarr.open_group(box["store"], path="", mode="r", zarr_format=3)
-            with warnings.catch_warnings():
-                # The leaf's own coverage sidecar is the one known non-zarr
-                # object under the prefix; ``members()`` warn-skips it (the
-                # ``process_and_write_raster_hive`` suppression precedent).
-                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
-                metadata["content_hashes"] = content_hashes_record(
-                    hash_arrays(group, staged=staged)
-                )
-        except Exception as e:
-            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
-        else:
-            # Same "populated phase_timings" gate as the write stamp above:
-            # the timing rides an existing dict, never seeds one.
-            if "phase_timings" in metadata:
-                metadata["phase_timings"]["hash"] = time.time() - _t0
     # Release the aggregate the column fold does not need (issue #538): the
     # K sharded carriers and the streamed ragged blocks are written and dead
     # from here — nothing below reads them — so the fold's transient rides

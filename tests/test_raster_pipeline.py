@@ -1243,6 +1243,9 @@ class TestRasterHiveWorker:
         assert stamp["time_range"] == [T0, T0]
         assert meta["time_range"] == [T0, T0]
         assert stamp["granule_count"] == 1
+        # The streamed O11 record rides the stamp (issue #580 phase 2).
+        assert stamp["content_hashes"] == meta["content_hashes"]
+        assert set(stamp["content_hashes"]) == {"arrays", "combined"}
         # Occupied union = cells whose center lands on the (nodata-free) raster.
         cells = grid.children(shard)
         _rows, _cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))

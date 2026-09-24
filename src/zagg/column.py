@@ -647,7 +647,7 @@ def write_column(
     from zagg.grids.morton import morton_decimal
     from zagg.hive import _utcnow, shard_leaf_path, stamp_commit
     from zagg.store import open_store
-    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
+    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask, _staged_hashes
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     store_kwargs = dict(store_kwargs or {})
@@ -713,16 +713,32 @@ def write_column(
         }
     )
     populated = _populated_mask(folded[resolutions[0]], fields)
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
+    # sidecar carries the same record.
+    hashes = _staged_hashes(store, staged, f"leaf column {basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
         granule_count=int(granule_count),
         window=window,
         time_range=time_range if window is not None else None,
+        content_hashes=hashes,
     )
-    _write_sidecar(
-        store, path, shard_key, staged, int(populated.sum()), granule_count, window, store_kwargs
-    )
+    # No record -> no sidecar: the column's sidecar carries nothing the stamp
+    # does not, save the O11 record, and a hash-less sidecar on a rewrite would
+    # read as a stale-or-absent ambiguity (test_sidecar_lands_after_the_stamp_
+    # and_fails_open). The stamp above already stands without the key.
+    if hashes is not None:
+        _write_sidecar(
+            store,
+            path,
+            shard_key,
+            hashes,
+            int(populated.sum()),
+            granule_count,
+            window,
+            store_kwargs,
+        )
     return basename
 
 
@@ -773,12 +789,13 @@ def _clear_column(store_root: str, shard_key, window: str | None, store_kwargs: 
 
 
 def _write_sidecar(
-    store, path, shard_key, staged, cells_with_data, granule_count, window, store_kwargs
+    store, path, shard_key, hashes, cells_with_data, granule_count, window, store_kwargs
 ) -> None:
     """The column's D20 stats sidecar: ``{stem}.stats.json``, after the stamp.
 
-    The overview writer's O11 recipe (issue #342, spec §5): the content
-    hashes computed from the staged arrays just written, in a
+    The overview writer's O11 recipe (issue #342, spec §5): ``hashes`` is the
+    content-hash record computed from the staged arrays just written (the
+    same record the stamp carries, issue #580), in a
     :func:`zagg.telemetry.build_record` row keyed by the shard. The name is
     derived from the column's own stem — ``telemetry.sidecar_key``'s label
     grammar (rightly) rejects the dotted ``.pyramid`` stem, and the rule is
@@ -792,19 +809,15 @@ def _write_sidecar(
     try:
         import json
 
-        import zarr
-
-        from zagg.content_hash import content_hashes_record, hash_arrays
         from zagg.store import open_object_store, put_object
         from zagg.telemetry import build_record
 
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=int(shard_key),
             metadata={
                 "cells_with_data": int(cells_with_data),
                 "granule_count": int(granule_count),
-                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+                "content_hashes": hashes,
             },
             window=window,
         )

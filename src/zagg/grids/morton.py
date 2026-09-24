@@ -42,6 +42,16 @@ _EXTENSION_NAME_KEY = "ARROW:extension:name"
 #: convention; zagg's design doc only cites it). ``zarr_conventions`` is a
 #: LIST: a future upstream dggs-registry entry (issue #72 ask 3) coexists
 #: alongside this one rather than replacing it.
+#: The mortie spec §5/§9 ``latitude`` token every zagg store stamps in its
+#: ``dggs`` block (issue #549, folded into #580): zagg passes no ``latitude=``
+#: override anywhere (``HealpixGrid.assign``), so the words carry mortie's
+#: default — authalic latitude on the WGS84 ellipsoid from mortie 0.9.8
+#: (espg/mortie#186), which the ``mortie>=1.0.0`` floor guarantees. The token
+#: is mandatory for a writer at the current mortie spec version: an absent
+#: marker would otherwise read as the legacy ``geodetic-spherical`` — a silent
+#: ~0.128° misplacement near 45° latitude.
+LATITUDE_CONVENTION = "authalic-wgs84"
+
 MORTON_CONVENTION = {
     "schema_url": "https://github.com/espg/mortie/blob/main/docs/specification.md#dggs-attrs",
     "spec_url": "https://github.com/espg/mortie/blob/main/docs/specification.md",
@@ -281,6 +291,7 @@ def is_morton_arrow(col) -> bool:
 
 
 __all__ = [
+    "LATITUDE_CONVENTION",
     "MORTON_CONVENTION",
     "MORTON_EXTENSION_NAME",
     "is_morton_array",
