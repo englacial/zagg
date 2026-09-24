@@ -973,8 +973,8 @@ worker invocations.
 
 The break is the price of arming the fleet's leaf identity gate. Skip-if-current
 ([below](#re-runs-skip-if-current-the-contraction-guard-and-the-lifecycle-touch))
-is armed by default only on the local backend today; fleet arming was
-explicitly gated on this epoch
+is armed by default on the local backend and, since PR #581, on the fleet's
+point path; fleet arming was explicitly gated on this epoch
 ([issue #415](https://github.com/englacial/zagg/issues/415), sequencing), for
 the reason phase (7) records: pre-epoch the worker-side fallback hash was
 clamp-sensitive, so a small shard would have compared its leaf against a
@@ -1121,13 +1121,18 @@ Three verdicts:
 | **refused** | the planned set drops recorded ids: `recorded ∖ planned ≠ ∅` — deliberately *not* strict-subset, so a shardmap that grew while silently dropping old granules (an upstream purge behind a fresh catalog query) still trips it | the unit refuses, writes nothing, and counts as `cells_refused` — never as an error. The log names the **first five** missing ids and their total; the **full per-unit diff is the refusal manifest** at the store root ([below](#the-refusal-manifest)). `--allow-contraction` (`agg(allow_contraction=True)`; on Lambda an `allow_contraction` event field) turns it into a normal rewrite |
 | **rewrite** | everything else — expansion (new cycles), a semantic change, no/unreadable sidecar, an unstamped leaf, column drift, or a pre-#388 sidecar (below) | today's wholesale D4 rewrite, column included |
 
-The gate is **on by default for the local backend**; `--overwrite` disables
-it entirely (the operator's unconditional-rewrite hammer — it does not
-acknowledge a contraction, it bypasses the guard). The **deployed Lambda
-handler has not yet opted in**: the seams default off, so fleet re-runs
-still rewrite unconditionally today (PR #397 question (1)). What fleet
-sidecars *record* splits by family, though, and only one half waits on that
-enablement:
+The gate is **on by default for hive point runs on every backend**;
+`--overwrite` disables it entirely (the operator's unconditional-rewrite
+hammer — it does not acknowledge a contraction, it bypasses the guard). On
+the fleet, both point-path dispatchers (`agg(backend="lambda")` and the
+`client` facade) arm it per cell event with `skip_if_current: true` plus the
+RUN config's `semantic_hash`, and the handler forwards both keys and
+`allow_contraction` to the shared seam; a current or refused unit then
+returns no stats record and writes no sidecar or sub-map, exactly as on the
+local backend (issue #401's clobber gate; PR #581). An event without the key
+— an older dispatcher — keeps the unconditional rewrite. **Raster** fleet
+units stay unarmed (the handler's raster body fix below is still owed). What
+fleet sidecars *record* splits by family:
 
 - **Vector — nothing to wait for.** The handler passes the seam's own
   metadata dict straight to `build_record`, the seam stamps
@@ -1314,7 +1319,10 @@ ETag of a multipart-uploaded S3 object, which a self-copy re-mints), so a
 touched unit re-plans its refs from fresh HEADs: under `commit: "leaf"` it
 commits them at once; under the ladder it rewrites its ref sidecar and is
 marked `icechunk_dirty`, and the same run's staged sweep (`output.sweep:
-"stages"`) takes it as a **dirt-only** leaf: its nodes re-gather and commit
+"stages"`) takes it as a **dirt-only** leaf — in process on the local
+backend, and on the fleet as the stage event's `dirt_only` refs, which the
+dispatcher assembles from the worker bodies (D8) and the handler forwards
+to the stage worker: its nodes re-gather and commit
 their refs, but no overview or column is re-folded, since no data changed
 (each stage row counts them as `icechunk_regathered`; PR #581 question (11),
 ruled (a)). This narrows the #388 contract: a current unit writes no stats
@@ -1657,11 +1665,11 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
   [issue #209](https://github.com/englacial/zagg/issues/209)), the default at
   K > 1, so a leaf costs one PUT per dense array instead of K per-inner-chunk
   PUTs concentrated on a single prefix.
-- **Skip-if-current re-runs** ship for the local backend
-  ([issue #388](https://github.com/englacial/zagg/issues/388)): the
-  worker-side identity gate, the contraction guard, and the lifecycle touch
-  — see [Re-runs](#re-runs-skip-if-current-the-contraction-guard-and-the-lifecycle-touch).
-  The Lambda handler enablement is a named follow-up (the seams default
-  off, so deployed workers are byte-identical until it lands).
+- **Skip-if-current re-runs** ship for hive point runs on every backend
+  ([issue #388](https://github.com/englacial/zagg/issues/388); the fleet
+  arming landed with PR #581): the worker-side identity gate, the
+  contraction guard, and the lifecycle touch — see
+  [Re-runs](#re-runs-skip-if-current-the-contraction-guard-and-the-lifecycle-touch).
+  Raster fleet units are not armed yet.
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).
