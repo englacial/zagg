@@ -613,9 +613,18 @@ the `.zarr/` prefix. So the shard's *final* write is a root
   "complete": true,
   "cells_with_data": 412,
   "granule_count": 17,
-  "written_at": "2026-07-10T12:03:41+00:00"
+  "written_at": "2026-07-10T12:03:41+00:00",
+  "content_hashes": {"arrays": {"13/count": "…", "13/morton": "…"}, "combined": "…"}
 }
 ```
+
+`content_hashes` ([issue #580](https://github.com/englacial/zagg/issues/580))
+is the [specification §5](specification.md#5-o11-content-hashes) O11 record —
+per-array sha256 over decoded values plus the combined digest — computed
+from the arrays the worker just wrote, before the stamp lands, so the stamp
+certifies the digest of what it seals. The D20 stats sidecar carries the
+same record; a leaf stamped before the key existed is unverifiable from the
+stamp alone, never tampered.
 
 A leaf whose root metadata lacks the stamp is **debris**: incomplete,
 ignorable, safe to overwrite on retry (the writer re-emits the leaf template

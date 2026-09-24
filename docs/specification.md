@@ -47,17 +47,20 @@ peaks near 45° latitude at 0.12830° (~14.26 km), so a cover or store built
 under one convention does not describe cells under the other, and composing
 them is meaningless (mortie spec §9 is where the prohibition binds). The
 `dggs` attrs block
-(`zagg.grids.healpix.HealpixGrid._dggs_attrs`) does not yet stamp mortie's
-`latitude` token; what it does stamp is `ellipsoid: {name: WGS84,
-semimajor_axis: 6378137.0, inverse_flattening: 298.257223563}` and no sphere
-radius — that entry is the **ingress datum** (the geodetic coordinates fed
-to `geo2mort`, equal-area on that ellipsoid by construction), not an
-instruction to compute cell geometry on the ellipsoid: the words themselves
-live on the R = 6371.0088 km authalic sphere the conversion maps onto.
-Until the token lands, this paragraph is the record for zagg stores, and a
-reader reproducing cell geometry (e.g. a viewer's boundary golden test)
-needs the geodetic ↔ authalic conversion at every geodetic seam, exactly as
-mortie spec §9 prescribes.
+(`zagg.grids.healpix.HealpixGrid._dggs_attrs`) stamps mortie's `latitude`
+token — `"latitude": "authalic-wgs84"`, mandatory for a writer at the current
+mortie spec version, since [#580](https://github.com/englacial/zagg/issues/580)
+(folding #549's resolution; `zagg.grids.morton.LATITUDE_CONVENTION`) —
+beside `ellipsoid: {name: WGS84, semimajor_axis: 6378137.0,
+inverse_flattening: 298.257223563}` and no sphere radius: that entry is the
+**ingress datum** (the geodetic coordinates fed to `geo2mort`, equal-area on
+that ellipsoid by construction), not an instruction to compute cell geometry
+on the ellipsoid — the words themselves live on the R = 6371.0088 km
+authalic sphere the conversion maps onto. A store whose `dggs` block carries
+no `latitude` key predates the token; this paragraph is its record, and it is
+authalic by the version evidence above. A reader reproducing cell geometry
+(e.g. a viewer's boundary golden test) needs the geodetic ↔ authalic
+conversion at every geodetic seam, exactly as mortie spec §9 prescribes.
 
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
@@ -1909,8 +1912,9 @@ robustness property, and the reason two implementations agree without agreeing
 on traversal order. The recorded `arrays` map is a different matter: a writer
 SHOULD record it key-sorted so a regenerated record diffs cleanly.
 
-The hashes are recorded in the leaf's D20 stats sidecar under
-`content_hashes`, in the structured shape:
+The hashes are recorded in the leaf's **commit stamp** (`morton_hive_commit`,
+[issue #580](https://github.com/englacial/zagg/issues/580)) and in its D20
+stats sidecar, both under `content_hashes`, in the structured shape:
 
 ```json
 "content_hashes": {
@@ -1925,6 +1929,15 @@ and is not a legal zagg array name). A leaf with no recorded
 `content_hashes` is **unverifiable, not tampered**: verification MUST
 report "nothing recorded" as a distinct outcome from a mismatch (the
 conservative dedup posture — an unverifiable leaf is never a hit).
+
+**Contract (the stamp copy).** The writer computes the record from the
+arrays it just wrote, *before* the stamp lands, so the D4 seal certifies the
+digest of the bytes it seals; the stamp copy and the sidecar copy are the
+same record. A reader verifying a leaf SHOULD prefer the stamp's copy (one
+root-metadata GET, already read for the stamp) and fall back to the sidecar
+for leaves written before this key existed. A stamp without the key is a
+pre-#580 writer or a writer that could not stand behind a digest (§5.2's
+raise gate) — unverifiable, never tampered.
 
 **Contract.** A sweep-built **overview** (§4) records its hashes in a sidecar
 the same way, and that sidecar is named from the overview's own basename —

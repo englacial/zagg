@@ -949,6 +949,7 @@ def _write_stage_overview(
         _overview_basename,
         _overview_config,
         _populated_mask,
+        _staged_hashes,
     )
 
     basename = _overview_basename(key)
@@ -992,6 +993,11 @@ def _write_stage_overview(
     )
     root.attrs.update({ROLE_ATTR: "overview", OVERVIEW_ATTR: provenance})
     stamp_window = key if windowed else None
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580; the /1
+    # writer's posture in ``sweep_overview._write_overview``).
+    staged = {f"{r}/morton": words}
+    staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
+    hashes = _staged_hashes(store, staged, f"stage sweep at {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
@@ -999,20 +1005,17 @@ def _write_stage_overview(
         window=stamp_window,
         time_range=fold["time_range"] if stamp_window is not None else None,
         run_id=run_id,
+        content_hashes=hashes,
     )
-    try:  # D20 sidecar: fail-open telemetry, §5 O11 record (the /1 writer's posture)
-        from zagg.content_hash import content_hashes_record, hash_arrays
+    try:  # D20 sidecar: fail-open telemetry, the same §5 O11 record
         from zagg.telemetry import SPEC_V3, build_record, write_sidecar
 
-        staged = {f"{r}/morton": words}
-        staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=morton_word(node),
             metadata={
                 "cells_with_data": int(populated.sum()),
                 "granule_count": int(fold["granule_count"]),
-                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+                "content_hashes": hashes,
             },
             window=stamp_window,
         )

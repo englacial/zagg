@@ -29,7 +29,12 @@ from zagg.grids.base import (
     vector_array_spec,
     vlen_dtype_warning_suppressed,
 )
-from zagg.grids.morton import MORTON_CONVENTION, morton_decimal, to_morton_array
+from zagg.grids.morton import (
+    LATITUDE_CONVENTION,
+    MORTON_CONVENTION,
+    morton_decimal,
+    to_morton_array,
+)
 from zagg.time_axis import TOC_SHAPE_PER_CENTROID
 
 HEALPIX_BASE_CELLS: int = 12
@@ -813,6 +818,10 @@ class HealpixGrid:
                 "inverse_flattening": 298.257223563,
             },
             "compression": "none",
+            # mortie spec §9 latitude convention (issue #549): mandatory at the
+            # current mortie spec version; zagg stores are authalic-wgs84 by
+            # construction (no override, mortie >= 1.0 floor).
+            "latitude": LATITUDE_CONVENTION,
         }
         # D16 / issue #304 phase 3: every HEALPix aggregation store is
         # morton-declared — the DISTINCT grid name "morton" with the typed
