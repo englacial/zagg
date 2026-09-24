@@ -65,6 +65,15 @@ _ABSENT = np.uint64(2**64 - 1)
 #: ``(offset, nbytes)`` u64 pair per inner chunk, plus the crc32c suffix.
 _INDEX_ENTRY_BYTES = 16
 _INDEX_CRC_BYTES = 4
+#: The ONE shard-index layout this module knows how to read (spec §1.5): the
+#: index is the object's trailing suffix, uncompressed little-endian u64 pairs
+#: with a crc32c. Both facts ride the array's own codec config, so the plan
+#: checks them rather than assuming them.
+_INDEX_LOCATION = "end"
+_INDEX_CODECS = [
+    {"name": "bytes", "configuration": {"endian": "little"}},
+    {"name": "crc32c"},
+]
 _LOCAL_COMMIT_LOCK = threading.Lock()
 
 
@@ -407,6 +416,17 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
         if sharded:
             if any(-(-s // c) != 1 for s, c in zip(shape, outer)):
                 raise ValueError(f"{path}: a hive leaf array is one shard object (§11.3)")
+            shard_cfg = codecs[0]["configuration"]
+            location = shard_cfg.get("index_location", _INDEX_LOCATION)
+            index_codecs = [dict(c) for c in shard_cfg.get("index_codecs", _INDEX_CODECS)]
+            if location != _INDEX_LOCATION or index_codecs != _INDEX_CODECS:
+                # A start-located or compressed index would make the suffix
+                # read below return chunk payload as (offset, length) pairs,
+                # and a file:// container has no checksum to catch it (§11.3).
+                raise ValueError(
+                    f"{path}: shard index is {location}-located with {index_codecs}; "
+                    f"the ref plan reads {_INDEX_LOCATION}-located {_INDEX_CODECS}"
+                )
             key = key_prefix + "/".join("0" for _ in shape)
             try:
                 head = obstore.head(store, key)
