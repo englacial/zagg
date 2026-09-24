@@ -175,12 +175,26 @@ _RETRY_STATUSES = (502, 503, 504)
 _RETRY_ATTEMPTS = 4
 _RETRY_BACKOFF_S = 2.0
 
-#: Bytes of an unparseable body echoed in the exhausted-retry raise (#562), so
+#: Bytes of an unparsable body echoed in the exhausted-retry raise (#562), so
 #: a CI log alone attributes the failure to its endpoint and page. Sliced off
 #: ``resp.content``, not ``resp.text``: the bound is then the byte bound this
 #: comment advertises, and a multi-MB HTML error page is not decoded whole
-#: (charset sniffing included) just to take its head.
+#: (charset sniffing included) just to take its head. The slice alone is
+#: decoded for the message (UTF-8, undecodable bytes replaced) so the log
+#: reads as text rather than a bytes repr.
 _BODY_SNIPPET = 200
+
+
+class STACSearchError(ValueError):
+    """Raised when a STAC item-search exhausts its retry budget on 2xx
+    responses that carry no usable JSON object (issue #562).
+
+    A ``ValueError`` subclass so existing ``except ValueError`` handlers keep
+    working; catch this type to tell "the endpoint answered garbage for every
+    attempt" from any other ``ValueError``. ``__cause__`` is the rejection
+    ``_json_body`` raised on the last attempt (a ``json.JSONDecodeError``, or
+    the plain ``ValueError`` of the content-type / shape refusals).
+    """
 
 
 def _json_body(resp) -> dict:
@@ -215,7 +229,7 @@ def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
     object (issue #562) with exponential backoff (``_RETRY_ATTEMPTS`` tries total),
     under one shared budget. Any other status falls through to
     ``raise_for_status`` on the first response; an exhausted budget raises
-    that status, or -- for a 2xx -- a ValueError naming the status,
+    that status, or -- for a 2xx -- a ``STACSearchError`` naming the status,
     content-type and head of the body, quoting and chained to whichever
     rejection ``_json_body`` last raised (a decode error, or the
     content-type refusal, which prints a body that does parse).
@@ -248,11 +262,12 @@ def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
         )
         time.sleep(wait)
     resp.raise_for_status()
-    raise ValueError(
+    snippet = resp.content[:_BODY_SNIPPET].decode("utf-8", errors="replace")
+    raise STACSearchError(
         f"STAC search at {url} gave no usable JSON body after {_RETRY_ATTEMPTS} attempts "
         f"({bad}): status={resp.status_code} "
         f"content-type={resp.headers.get('Content-Type', '')!r} "
-        f"body[:{_BODY_SNIPPET}]={resp.content[:_BODY_SNIPPET]!r}"
+        f"body[:{_BODY_SNIPPET}]={snippet!r}"
     ) from bad
 
 
@@ -927,6 +942,7 @@ class Catalog:
 __all__ = [
     "Query",
     "STACQuery",
+    "STACSearchError",
     "CMRSource",
     "STACSource",
     "Catalog",
