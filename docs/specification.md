@@ -3322,9 +3322,11 @@ self-describing:
 `order` is the repo's order (§11.1); `shard_order` / `chunk_order` /
 `cell_order` mirror the manifest and the grid; `url_prefix` is the virtual
 chunk container's prefix (§11.3); `split` records the manifest split
-(§11.5). The root group also mirrors the leaf template's own root attrs and
-each resolution group mirrors the leaf group's attrs (the `dggs` block
-included) — **never the commit stamp**, which is a per-leaf fact.
+(§11.5). That block is the **whole** of the repo root group's attrs — a leaf
+root group carries only its own commit stamp, which is a per-leaf fact and so
+has nothing to mirror. Each **resolution group** mirrors the leaf resolution
+group's attrs verbatim (the `dggs` block, `zarr_conventions`), and **never the
+commit stamp**.
 
 ### 11.2 Array model
 
