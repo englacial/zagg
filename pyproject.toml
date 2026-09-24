@@ -117,6 +117,12 @@ dependencies = [
     # is obspec (pairs with obstore). Rust decode: DEFLATE + 16-bit horizontal
     # predictor verified bit-exact against GDAL on Sentinel-2 c1 COGs.
     "async-tiff>=0.7.2",
+    # Icechunk (issue #580; espg approved the dependency on the issue,
+    # 2026-09-23): the per-order virtual-ref companion repo the fleet writes
+    # at leaf commit (spec §11). Sole dep zarr>=3.1.0; cp312-abi3 manylinux
+    # wheels for both layer arches (~17 MB). 2.2.2 is the first release whose
+    # ``set_virtual_refs_arr`` takes the shard index's u64 arrays directly.
+    "icechunk>=2.2.2",
 ]
 
 [project.optional-dependencies]
