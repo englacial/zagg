@@ -1189,6 +1189,79 @@ class TestProcessHive:
         assert resp["statusCode"] == 500  # error envelope, as on flat
         assert not os.path.exists(hive.shard_leaf_path(event["store_path"], self._WORD))
 
+    def test_armed_rerun_skips_and_keeps_the_sidecar(self, handler_mod, monkeypatch, tmp_path):
+        # Issue #388 on the fleet: an event carrying skip_if_current + the run's
+        # D19 digest arms the seam's identity gate. The rerun of an unchanged
+        # unit folds nothing, returns {"current": true}, carries no stats
+        # record, and leaves the first run's sidecar intact (issue #401's
+        # clobber gate) -- the local backend's contract, on the handler.
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.config import load_config_from_dict
+        from zagg.semantics import semantic_hash
+        from zagg.telemetry import read_sidecar
+
+        grid = self._grid()
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
+        event = self._event(tmp_path)
+        event["run_id"] = "first"
+        assert handler_mod._handle_process(event, _context())["statusCode"] == 200
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        before = read_sidecar(leaf)
+
+        def must_not_fold(*a, **k):
+            raise AssertionError("a current unit must not fold")
+
+        monkeypatch.setattr(processing, "process_shard", must_not_fold)
+        rerun = {
+            **event,
+            "run_id": "second",
+            "skip_if_current": True,
+            "semantic_hash": semantic_hash(load_config_from_dict(event["config"])),
+        }
+        resp = handler_mod._handle_process(rerun, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert body["current"] is True and "stats" not in body
+        assert body["touched_objects"] > 0  # the lifecycle touch ran worker-side
+        assert read_sidecar(leaf) == before and before["run_id"] == "first"
+
+    @pytest.mark.parametrize("armed", [True, False])
+    def test_the_gate_keys_reach_the_seam(self, handler_mod, monkeypatch, tmp_path, armed):
+        # The three event keys ride to process_and_write_hive; absent keys keep
+        # the pre-#388 unconditional rewrite. A touched current unit's
+        # ``icechunk_dirty`` marker (issue #580) survives into the response
+        # body -- the dispatcher's dirt-only work set is built from it.
+        from zagg import hive
+        from zagg.telemetry import read_sidecar
+
+        seen = {}
+
+        def seam(shard_key, *a, **k):
+            seen.update(k)
+            return {
+                "shard_key": int(shard_key),
+                "window": None,
+                "current": True,
+                "icechunk_dirty": True,
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "granule_count": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        monkeypatch.setattr(hive, "process_and_write_hive", seam)
+        event = self._event(tmp_path)
+        if armed:
+            event.update(skip_if_current=True, semantic_hash="abc", allow_contraction=True)
+        body = json.loads(handler_mod._handle_process(event, _context())["body"])
+        assert (seen["skip_if_current"], seen["allow_contraction"], seen["semantic_hash"]) == (
+            (True, True, "abc") if armed else (False, False, None)
+        )
+        assert body["icechunk_dirty"] is True and "stats" not in body
+        assert read_sidecar(hive.shard_leaf_path(event["store_path"], self._WORD)) is None
+
 
 class TestProcessHiveWindowed:
     """Issue #246: a windowed hive event threads ``window`` through the shared
@@ -1622,6 +1695,52 @@ class TestStatsMode:
         assert resp["statusCode"] == 200, resp["body"]
         df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
         assert set(df["finalize_error"]) == {"RuntimeError: invoke failed"}
+
+    def test_icechunk_init_from_event_lands_in_the_parquet(self, handler_mod, tmp_path):
+        """Issue #580: the same forwarding leg for the companion-repo init
+        record — the dispatcher holds it, only the worker can PUT (D8), so a
+        typo or a renamed event key here would ship a fleet run with the
+        run-level columns silently null."""
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {
+                "mode": "stats",
+                "store_path": root,
+                "run_id": "runid4",
+                "timestamp": "20260720T010204Z",
+                "rows": self._rows(),
+                "icechunk_init": {"path": f"{root}/icechunk/4", "snapshot": "SNAP"},
+            },
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
+        assert set(df["icechunk_init_repo"]) == {f"{root}/icechunk/4"}
+        assert set(df["icechunk_init_snapshot"]) == {"SNAP"}
+        assert df["icechunk_init_error"].isna().all()
+
+    def test_icechunk_init_absent_leaves_the_columns_null(self, handler_mod, tmp_path):
+        # The pre-#580 dispatcher sends no such key: the columns are still
+        # written (the "same column set every run" contract), just null.
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {
+                "mode": "stats",
+                "store_path": root,
+                "run_id": "runid5",
+                "timestamp": "20260720T010205Z",
+                "rows": self._rows(),
+            },
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
+        for col in ("icechunk_init_repo", "icechunk_init_snapshot", "icechunk_init_error"):
+            assert col in df.columns and df[col].isna().all()
 
     def test_empty_rows_is_ok_and_writes_nothing(self, handler_mod, tmp_path):
         root = str(tmp_path / "out")

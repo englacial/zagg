@@ -1243,6 +1243,9 @@ class TestRasterHiveWorker:
         assert stamp["time_range"] == [T0, T0]
         assert meta["time_range"] == [T0, T0]
         assert stamp["granule_count"] == 1
+        # The streamed O11 record rides the stamp (issue #580 phase 2).
+        assert stamp["content_hashes"] == meta["content_hashes"]
+        assert set(stamp["content_hashes"]) == {"arrays", "combined"}
         # Occupied union = cells whose center lands on the (nodata-free) raster.
         cells = grid.children(shard)
         _rows, _cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
@@ -1757,6 +1760,27 @@ class TestRasterHiveContentHashes:
             shard, [], grid, root, cfg, store_kwargs={}, window=None
         )
         assert "content_hashes" not in meta  # unverifiable, not tampered (§5.3)
+
+    def test_stamp_lands_when_hashing_raises(self, tmp_path, monkeypatch):
+        # The raster analogue of ``test_stamp_key_absent_when_hashing_fails``:
+        # since #580 the finalize runs BEFORE the stamp, so an unanticipated
+        # raise must still cost only the key. A committed-but-unhashed leaf is
+        # unverifiable (§5.3); an unstamped one is debris.
+        from zagg import hive
+        from zagg.processing import raster as raster_mod
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        monkeypatch.setattr(
+            raster_mod,
+            "_finalize_leaf_hashes",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        meta = raster_mod.process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window=None
+        )
+        assert "content_hashes" not in meta
+        stamp = hive.read_commit(hive.shard_leaf_path(root, shard))
+        assert stamp["complete"] is True and "content_hashes" not in stamp
 
     def test_a_violated_precondition_records_no_hash_at_all(self, tmp_path, caplog):
         # Trap (2) at the integration level: a row written twice invalidates

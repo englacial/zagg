@@ -1809,6 +1809,9 @@ class TestSummaryKeysByteIdentical:
         # unless a unit refused. LOCAL-only — the fleet has no once-per-run
         # worker-side write seam (D8), so _LAMBDA_KEYS below does not carry it.
         "refusal_manifest_path",
+        # Icechunk companion init record (issue #580): always present, None
+        # off-hive / opted out, {"error"} on a fail-open init.
+        "icechunk",
     } | _IDENTITY_KEYS
     _LAMBDA_KEYS = {
         "total_cells",
@@ -1832,6 +1835,8 @@ class TestSummaryKeysByteIdentical:
         "finalize_s",
         # Guarded finalize (issue #335); always present, None on success.
         "finalize_error",
+        # Icechunk companion init record (issue #580), as on the local backend.
+        "icechunk",
         "function_timeout_s",
         "worker_max_s",
         "worker_median_s",
@@ -4542,6 +4547,122 @@ class TestManifestChecker:
         # root via the poller's output-store path (issue #274 Fix 2).
         assert captured["predicate"]() is True
         assert seen["root"] == "s3://out/x.zarr"
+
+
+class TestLambdaSkipAndDirtOnly:
+    """The fleet's leaf identity gate and the dirt-only work set (issues #388, #580).
+
+    ``_run_lambda`` arms the worker gate exactly where ``_run_local`` does (a
+    hive run without ``overwrite``), counts a current unit apart from
+    ``cells_with_data`` with no run-parquet row, and hands a unit the worker
+    marked ``icechunk_dirty`` to the staged sweep as dirt-only — the same
+    assembly as the local backend (PR #581 question (11)).
+    """
+
+    def _drive(self, monkeypatch, atl06_config, *, body, overwrite=False):
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        seen: dict = {"cells": [], "stage": [], "sweep": 0}
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output["sweep"] = "stages"
+        atl06_config.output["coverage_moc"] = False
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_setup_async", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        def cell(client, chunk_idx, shard_key, *a, **k):
+            seen["cells"].append(k)
+            return {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"shard_key": shard_key, "window": None, **body},
+                "error": None,
+                "timeout": False,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", cell)
+        monkeypatch.setattr(
+            runner,
+            "_dispatch_run_stats",
+            lambda client, fn, store, rows, **k: seen.update(rows=rows),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_sweep", lambda *a, **k: seen.update(sweep=seen["sweep"] + 1)
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_stage_sweep", lambda *a, **k: seen["stage"].append((a, k))
+        )
+        summary = runner._run_lambda(
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=overwrite,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        return summary, seen
+
+    def test_the_gate_is_armed_like_the_local_backend(self, monkeypatch, atl06_config):
+        from zagg.semantics import semantic_hash
+
+        _summary, seen = self._drive(monkeypatch, atl06_config, body={"total_obs": 1})
+        expected = semantic_hash(atl06_config)
+        assert [k["semantic_hash"] for k in seen["cells"]] == [expected] * 4
+
+    def test_overwrite_disarms_the_gate(self, monkeypatch, atl06_config):
+        _summary, seen = self._drive(
+            monkeypatch, atl06_config, body={"total_obs": 1}, overwrite=True
+        )
+        assert [k["semantic_hash"] for k in seen["cells"]] == [None] * 4
+
+    @pytest.mark.parametrize("dirty", [True, False])
+    def test_current_units_record_nothing_and_ride_dirt_only(
+        self, monkeypatch, atl06_config, dirty
+    ):
+        body = {"current": True, "total_obs": 0, **({"icechunk_dirty": True} if dirty else {})}
+        summary, seen = self._drive(monkeypatch, atl06_config, body=body)
+        assert summary["cells_current"] == 4 and summary["cells_with_data"] == 0
+        assert seen.get("rows", []) == []  # no run-parquet row for a current unit
+        assert seen["sweep"] == 0  # the families sweep sees real leaves only
+        if not dirty:
+            assert seen["stage"] == []  # an unmarked current unit enters no sweep
+            return
+        ((args, kwargs),) = seen["stage"]
+        assert args[3] == []  # no dirty leaf
+        assert kwargs["dirt_only"] == [(k, None) for k in (10, 11, 12, 13)]
 
 
 class TestFinalizeGuard:

@@ -135,6 +135,7 @@ def touch_current_unit(
     """
     try:
         from zagg.column import _sidecar_name as column_sidecar_name
+        from zagg.icechunk_ladder import leaf_refs_key
         from zagg.sweep import submap_key
         from zagg.telemetry import granule_ids_path, sidecar_path
 
@@ -147,6 +148,10 @@ def touch_current_unit(
             # disarm the contraction guard on a leaf that is otherwise fresh.
             granule_ids_path(str(leaf_path), sidecar_spec),
             f"{prefix}/{submap_key(name, sidecar_spec)}",
+            # The Icechunk ref sidecar (issue #580 phase 6): the ladder's
+            # input for this leaf; a skipped leaf must keep it as fresh as
+            # the leaf, or the next staged sweep gathers a hole.
+            f"{prefix}/{leaf_refs_key(name, sidecar_spec)}",
         ]
         if column_path:
             trees.append(str(column_path))

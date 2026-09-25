@@ -1307,6 +1307,67 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
         )
+    # Icechunk companion repo (issue #580, spec §11): same posture as sweep —
+    # boolean when present, default ON for hive (get_icechunk resolves it),
+    # explicit true on a non-hive store is a config mistake (the repo indexes
+    # hive leaves by shard rank).
+    icechunk = config.output.get("icechunk")
+    if icechunk is not None and not isinstance(icechunk, (bool, dict)):
+        raise ValueError(
+            f"output.icechunk must be a boolean or an options block (got {icechunk!r})"
+        )
+    if isinstance(icechunk, dict):
+        # The ladder's knobs (issue #580 phase 6, spec §11.4/§11.5): the
+        # shard-order-relative checks run at init (icechunk_refs.resolve_options,
+        # where the shard order is known); the shape and the one invariant
+        # that needs no geometry — a commit must write whole manifests — here.
+        unknown = set(icechunk) - {"commit", "commit_order", "split_order"}
+        if unknown:
+            raise ValueError(
+                f"output.icechunk has unknown key(s) {sorted(unknown)} (accepts commit, "
+                f"commit_order, split_order)"
+            )
+        commit = icechunk.get("commit")
+        if commit is not None and commit not in ("ladder", "leaf"):
+            raise ValueError(f"output.icechunk.commit must be 'ladder' or 'leaf' (got {commit!r})")
+        orders = {k: icechunk.get(k) for k in ("commit_order", "split_order")}
+        for key, value in orders.items():
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(
+                    f"output.icechunk.{key} must be a non-negative integer (got {value!r})"
+                )
+        if (
+            orders["commit_order"] is not None
+            and orders["split_order"] is not None
+            and orders["split_order"] < orders["commit_order"]
+        ):
+            raise ValueError(
+                f"output.icechunk.split_order {orders['split_order']} is finer than commit_order "
+                f"{orders['commit_order']}: a manifest (one per split_order cell) would be written "
+                f"by more than one commit (spec §11.5)"
+            )
+    # The RESOLVED opt-in, not the literal's truthiness: an options block is
+    # an opt-in whatever it holds, and the empty one -- the spelling for "the
+    # ladder defaults" -- is falsy, so the three scope guards below skipped it
+    # and stood up a repo §11.6 exists to prevent (review finding).
+    enabled = icechunk is True or isinstance(icechunk, dict)
+    if enabled and get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.icechunk requires output.store_layout: hive (the companion repo "
+            "references hive leaves by shard rank; flat stores have no leaves)"
+        )
+    if enabled and get_windowing(config) is not None:
+        raise ValueError(
+            "output.icechunk is out of scope for windowed stores (spec §11.6): a "
+            "window's leaves share a shard rank, so stage 1 records no refs for them"
+        )
+    if enabled and (config.data_source or {}).get("reader") == "raster":
+        raise ValueError(
+            "output.icechunk is out of scope for raster products (spec §11.6): "
+            "raster leaves are never sharded, so stage 1 records no refs for them"
+        )
     # Overview pyramid declaration (issue #201): explicit blocks are grammar-
     # checked here; the D24 none-field warning fires at manifest build time
     # (template time for the store), not per config validation. The NaN-fill
@@ -3333,6 +3394,48 @@ def get_sweep(config: PipelineConfig) -> bool:
     if flag is None:
         return get_store_layout(config) == "hive"
     return bool(flag)
+
+
+def get_icechunk(config: PipelineConfig) -> bool:
+    """Whether the Icechunk companion repo is written (issue #580, spec §11).
+
+    Default ON for hive-layout stores: the once-per-run ``icechunk_init`` step
+    and the per-leaf virtual-ref commit at leaf commit, both fail-open (the
+    leaves stay normative; the repo is a regenerable index). ``output.icechunk:
+    false`` opts out.
+
+    The default follows the stage-1 WRITER's scope, not the layout alone
+    (spec §11.6): windowed hive stores (a window's leaves share a shard rank)
+    and raster hive products (never sharded) record no refs, so the knob
+    resolves OFF there rather than standing up a repo no leaf can fill. A
+    present-but-null key falls back to that default; an explicit ``true`` on
+    any of the three out-of-scope shapes — non-hive, windowed, raster — is
+    rejected by ``validate_config``, mirroring ``sweep``. Excluded from the
+    D19 semantic core like the other run triggers (:mod:`zagg.semantics`).
+    """
+    flag = config.output.get("icechunk")
+    if flag is None:
+        return (
+            get_store_layout(config) == "hive"
+            and get_windowing(config) is None
+            and (config.data_source or {}).get("reader") != "raster"
+        )
+    if isinstance(flag, dict):
+        return True  # an options block (phase 6) is an opt-in with knobs
+    return bool(flag)
+
+
+def get_icechunk_options(config: PipelineConfig) -> dict:
+    """The raw ``output.icechunk`` ladder knobs, absent keys ``None`` (issue #580 phase 6).
+
+    ``{"commit": "ladder" | "leaf" | None, "commit_order": int | None,
+    "split_order": int | None}`` — a boolean or absent knob yields all-``None``;
+    :func:`zagg.icechunk_refs.resolve_options` applies the shard-order
+    defaults and the §11.5 invariants.
+    """
+    flag = config.output.get("icechunk")
+    block = flag if isinstance(flag, dict) else {}
+    return {k: block.get(k) for k in ("commit", "commit_order", "split_order")}
 
 
 def get_pyramid(config: PipelineConfig) -> dict | None:

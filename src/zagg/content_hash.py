@@ -280,3 +280,26 @@ def content_hashes_record(hashes: Mapping[str, str]) -> dict:
     (``combined`` is order-immune either way — it sorts the digests).
     """
     return {"arrays": dict(sorted(hashes.items())), "combined": combined_hash(hashes)}
+
+
+def staged_record(store: Any, staged: Mapping[str, np.ndarray], what: str) -> dict | None:
+    """The §5.3 record over ``staged`` (read-back for the rest), or ``None``.
+
+    The one entry point for every stamp writer that already holds its slabs
+    (hive leaf, overview, stage overview, leaf column, stage column):
+    computed before the stamp so the record rides the stamp itself (issue
+    #580). Fail-open (D9 telemetry posture) — a failure logs and returns
+    ``None``, and the caller stamps without the key, which §5.3 reads as
+    unverifiable, never tampered.
+
+    ``what`` is a log label only (the failing artifact, in whatever grammar
+    the call site names it); nothing parses it.
+    """
+    try:
+        import zarr
+
+        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        return content_hashes_record(hash_arrays(group, staged=staged))
+    except Exception as e:
+        logger.warning(f"{what}: O11 content hashing failed (fail-open, issue #342): {e}")
+        return None

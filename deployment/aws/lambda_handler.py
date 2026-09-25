@@ -59,6 +59,16 @@ Event payload (default / process mode):
         holding a synchronous connection open while the shard runs. Written
         with the output-store credentials. Absent -> no write, and the event
         and behavior are byte-identical to the synchronous path.
+    "skip_if_current": bool (optional, issue #388, hive only) -- arms the
+        leaf identity gate: a unit whose (semantic_hash, granule-id set)
+        matches its leaf's sidecar writes nothing and returns
+        {"current": true, ...} (plus "icechunk_dirty" when its touch rewrote
+        the ladder ref sidecar, issue #580); a contraction returns
+        {"refused": true, ...}. Neither carries a stats record. Absent -> the
+        unconditional rewrite.
+    "semantic_hash": str (sent with skip_if_current) -- the RUN config's D19
+        digest the gate compares against,
+    "allow_contraction": bool (optional, issue #388) -- rewrite a refused unit.
 }
 
 Setup mode (creates the zarr template once before per-cell fan-out; for a
@@ -186,6 +196,10 @@ end of run, like coverage mode; also invocable ad hoc):
         SAME "leaves"/"discover" keys the families arm uses -- a stage invoke
         is sent only the slice under its own nodes, so the batching that keeps
         "nodes" under the async cap keeps "leaves" under it too.
+    "dirt_only": [[shard_key, window-or-null], ...] (optional, issue #580,
+        role="stage") -- leaves whose data is current but whose Icechunk ref
+        sidecar was rewritten; their nodes re-gather refs without a fold.
+        Absent -> none.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -206,6 +220,19 @@ the dispatcher at end of run, like coverage mode):
         run's tail-completion marker on success (the v2 status prefix's
         tail.json); a reattached handle (Run.attach) then skips a tail that
         already ran. Fail-open; absent -> no write, byte-identical.
+    "output_credentials": dict (optional, same shape as process mode),
+}
+
+Icechunk-init mode (issue #580, spec §11 — the once-per-run companion-repo
+init; one synchronous RequestResponse invoke from the dispatcher after the
+ping and BEFORE the fan-out, so every leaf's refs commit finds the array
+nodes; idempotent, fail-open at the dispatcher):
+{
+    "mode": "icechunk_init",
+    "store_path": str,
+    "config": dict,             # same single-source config as setup/ping
+    "parent_order": int (optional, same meaning as setup),
+    "run_id": str,              # stamped into the "init {run_id}" commit
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -688,6 +715,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="sweep"`` folds the D22 rollup families worker-side (issue #300);
+    ``mode="icechunk_init"`` creates-or-opens the order's Icechunk companion
+    repo before the fan-out (issue #580);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -716,6 +745,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_sweep(event)
     if mode == "stats":
         return _handle_stats(event)
+    if mode == "icechunk_init":
+        return _handle_icechunk_init(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -1321,7 +1352,7 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 #: The per-stage counts the stage arm's envelope totals for a driver.
-_STAGE_COUNTS = ("written", "current", "failed", "under_covered")
+_STAGE_COUNTS = ("written", "current", "failed", "under_covered", "icechunk_regathered")
 
 
 def _stage_body(
@@ -1452,6 +1483,7 @@ def _handle_stage_sweep(
                 records_from=block.get("records_from"),
                 lease_ttl_s=block.get("lease_ttl_s"),
                 store_kwargs=store_kwargs,
+                dirt_only=[(int(k), w) for k, w in event.get("dirt_only") or []],
             )
         else:
             raise ValueError(f"unknown stage role {role!r} (expected 'stage' or 'finisher')")
@@ -1483,6 +1515,56 @@ def _handle_stage_sweep(
                     error=e,
                 )
             ),
+        }
+
+
+def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Create-or-open the shard order's Icechunk companion repo (issue #580, spec §11).
+
+    One synchronous ``RequestResponse`` invoke per run, posted by the
+    dispatcher after the ping and BEFORE the fan-out (the dispatcher never
+    writes, D8; every leaf's refs commit needs the array nodes to exist).
+    Idempotent — an initialized repo is reopened, never re-templated — so a
+    rerun into an existing store is a no-op commit-wise. The grid comes from
+    the same forwarded ``config`` (+ ``parent_order``) the workers fan out
+    on, so the repo's array model cannot drift from the leaf template. The
+    body echoes :func:`zagg.icechunk_refs.init_repo`'s record (repo ``path``,
+    ``snapshot``, ``created``, ``split``); a 500 carries the error and the
+    dispatcher treats either failure fail-open (the leaves never depend on
+    the index).
+    """
+    logger.info(f"Icechunk init mode: repo for {event.get('store_path')}")
+    try:
+        from zagg.grids import from_config
+        from zagg.icechunk_refs import init_repo
+
+        config = load_config_from_dict(event["config"])
+        grid = from_config(config, parent_order=event.get("parent_order"))
+        # The one repo, every level the ladder commits into — the base group
+        # plus one per declared overview order (phase 6) — so no stage node
+        # ever has to create anything.
+        record = init_repo(
+            event["store_path"],
+            grid,
+            config,
+            # Required, not defaulted: §11.4 fixes the commit grammar as
+            # ``init {run_id}``, and an unattributable commit cannot be
+            # rewritten out of the repo's permanent ancestry. Both dispatchers
+            # always send one; a hand-rolled or older event 500s through the
+            # except below, which is the case where identifying the commit
+            # matters most.
+            run_id=str(event["run_id"]),
+            store_kwargs=_output_store_kwargs(event),
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "icechunk_init", **record}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "icechunk_init"}),
         }
 
 
@@ -1529,6 +1611,9 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
             # defers a finalize failure through its tail, so this is where the
             # failure becomes durable. Absent on a pre-#335 dispatcher -> None.
             finalize_error=event.get("finalize_error"),
+            # Run-level companion init record (issue #580); absent on a
+            # pre-#580 dispatcher -> both columns null.
+            icechunk_init=event.get("icechunk_init"),
         )
         # Tail-completion marker (issue #327): the stats leg is the recorded
         # end of the post-run tail, so a reattached handle can skip a tail
@@ -2113,6 +2198,12 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # response body (this metadata) then carries time_range back
                 # for the dispatcher's root-summary union.
                 window=event.get("window"),
+                # Leaf skip-if-current (issue #388): armed only when the
+                # dispatcher sends the key (with the RUN config's D19 digest),
+                # exactly where the local backend arms it; absent -> rewrite.
+                skip_if_current=bool(event.get("skip_if_current")),
+                allow_contraction=bool(event.get("allow_contraction")),
+                semantic_hash=event.get("semantic_hash"),
             )
         else:
             # Flat layout: lazy store + one-time template check, opened on the
@@ -2250,17 +2341,22 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # whose data landed — the record still rides the envelope.
         from zagg.telemetry import build_record, lambda_env, write_sidecar
 
-        record = build_record(
-            shard_key=int(shard_key),
-            metadata=metadata,
-            granule_ids=event.get("granule_urls"),
-            invoked_by=event.get("invoked_by"),
-            run_id=event.get("run_id"),
-            window=(event.get("window") or {}).get("label"),
-            lambda_config=lambda_env(),
-        )
-        metadata["stats"] = record
-        if get_store_layout(config) == "hive" and not metadata.get("error"):
+        # A current/refused unit (issue #388) wrote nothing: no record, no
+        # sidecar, no sub-map -- clobbering its good sidecar with a zero-count
+        # record is exactly what the gate exists to prevent (issue #401).
+        skipped = metadata.get("current") or metadata.get("refused")
+        if not skipped:
+            metadata["stats"] = build_record(
+                shard_key=int(shard_key),
+                metadata=metadata,
+                granule_ids=event.get("granule_urls"),
+                invoked_by=event.get("invoked_by"),
+                run_id=event.get("run_id"),
+                window=(event.get("window") or {}).get("label"),
+                lambda_config=lambda_env(),
+            )
+        if get_store_layout(config) == "hive" and not metadata.get("error") and not skipped:
+            record = metadata["stats"]
             from zagg.hive import shard_leaf_path
 
             try:

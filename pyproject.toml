@@ -117,6 +117,13 @@ dependencies = [
     # is obspec (pairs with obstore). Rust decode: DEFLATE + 16-bit horizontal
     # predictor verified bit-exact against GDAL on Sentinel-2 c1 COGs.
     "async-tiff>=0.7.2",
+    # Icechunk (issue #580; espg approved the dependency on the issue,
+    # 2026-09-23): the per-order virtual-ref companion repo the fleet writes
+    # at leaf commit (spec §11). Sole dep zarr>=3.1.0. 2.2.2 is the first
+    # release shipping cp312-abi3 manylinux wheels — one ~17 MB wheel per
+    # layer arch rather than one per interpreter, the floor's stated basis on
+    # the issue, which also names 2.2.2 as the fleet pin.
+    "icechunk>=2.2.2",
 ]
 
 [project.optional-dependencies]
@@ -136,6 +143,10 @@ lambda = [
     "astropy",
     # abi3 manylinux_2_28 wheels cover both layer arches, ~4 MB each — issue #218.
     "async-tiff==0.7.2",
+    # Icechunk companion-repo writer (issue #580): cp312-abi3 manylinux wheels
+    # on both layer arches, ~17 MB each; its only dep (zarr) is a function-zip
+    # dep, so the layer installs it --no-deps.
+    "icechunk==2.2.2",
     # The temporal worker (process_event, issue #220) reads xarray datasets and
     # opens NetCDF4/HDF5 bytes in-memory via the h5netcdf engine; h5coro is a
     # byte-range reader, not an xarray engine, so these must ship in the layer.

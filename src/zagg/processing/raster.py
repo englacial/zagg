@@ -1468,6 +1468,7 @@ def process_and_write_raster_hive(
     # with acquisitions but no occupied cell writes no leaf). ``phase_timings``
     # cannot serve as the gate — it rides only under ``profile``.
     meta["leaf_written"] = "store" in box
+    hash_s = 0.0
     if "store" in box:
         _t0 = time.time()
         words = occupied[0] if occupied and occupied[0].size else None
@@ -1490,6 +1491,26 @@ def process_and_write_raster_hive(
                 time_range = [_us_iso(min(instants)), _us_iso(max(instants))]
                 meta["time_range"] = time_range
         meta["cells_with_data"] = int(words.size) if words is not None else 0
+        # O11 finalize (issue #342 phase 5), BEFORE the stamp (issue #580) so
+        # the record rides it: the per-row digests close out here — no
+        # read-back, a handful of hashes over bytes already consumed. The
+        # caller's ``build_record`` rides the same record into the leaf's D20
+        # sidecar; ``None`` leaves both absent (§5.3 unverifiable, not
+        # tampered).
+        _t1 = time.time()
+        try:
+            record = _finalize_leaf_hashes(staged, streams)
+        except Exception as e:
+            # Fail-open like every other hash site (D9): now that the record
+            # rides the stamp, an unanticipated raise here would otherwise
+            # leave a fully written leaf UNSTAMPED — debris — over a
+            # telemetry-class digest. A ``None`` record and a raise must cost
+            # the same thing: the key, never the leaf.
+            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
+            record = None
+        if record is not None:
+            meta["content_hashes"] = record
+        hash_s = time.time() - _t1
         stamp_commit(
             box["store"],
             cells_with_data=meta["cells_with_data"],
@@ -1499,6 +1520,7 @@ def process_and_write_raster_hive(
             ),
             window=label,
             time_range=time_range,
+            content_hashes=record,
         )
         # The recorded granule-id list as this leaf's sibling object (issue
         # #388), after the stamp and in the raster id space the gate plans
@@ -1510,24 +1532,12 @@ def process_and_write_raster_hive(
         write_granule_ids(
             leaf_path, raster_granule_ids(granules), spec=sidecar_spec, **store_kwargs
         )
-        write_s += time.time() - _t0
+        write_s += time.time() - _t0 - hash_s
     # Phase split (issues #100/#249; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default): only a unit that
     # actually wrote carries it, so a no-data unit stays write-less and
     # sample/write always decompose this call's wall. The per-stage ``stages``
     # block stays verbosity, gated on profiling/debug (a passed stage_stats).
-    hash_s = 0.0
-    if "store" in box:
-        # O11 finalize (issue #342 phase 5): the per-row digests close out
-        # here — no read-back, so this is a handful of hashes over bytes
-        # already consumed, not another pass over the data. The caller's
-        # ``build_record`` rides it into the leaf's D20 sidecar; ``None``
-        # leaves the record absent (§5.3 unverifiable, not tampered).
-        _t0 = time.time()
-        record = _finalize_leaf_hashes(staged, streams)
-        if record is not None:
-            meta["content_hashes"] = record
-        hash_s = time.time() - _t0
     if "store" in box:
         meta["phase_timings"] = {
             "sample": (time.time() - t_start) - write_s - hash_s,

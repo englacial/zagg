@@ -1179,6 +1179,20 @@ class TestCellIdsEncoding:
         names = [c["name"] for c in attrs["zarr_conventions"]]
         assert names == ["dggs", "morton-dggs"]
 
+    def test_dggs_block_stamps_the_latitude_convention(self):
+        # mortie spec §9 (issue #549, folded into #580): the token is mandatory
+        # at the current mortie spec version, and zagg's words are authalic by
+        # construction (no ``latitude=`` override, mortie >= 1.0 floor). Pinned
+        # off the WRITTEN leaf group too, the object a reader keys on.
+        from zagg.grids.morton import LATITUDE_CONVENTION
+
+        assert LATITUDE_CONVENTION == "authalic-wgs84"
+        g = self._grid()
+        assert g._dggs_attrs()["dggs"]["latitude"] == "authalic-wgs84"
+        store = MemoryStore()
+        g.emit_shard_template(store)
+        assert open_group(store, path="8", mode="r").attrs["dggs"]["latitude"] == "authalic-wgs84"
+
     def test_morton_convention_constants_pinned(self):
         # The self-declared convention identity (issue #305): the UUID is
         # minted once and PERMANENT — this pin makes an accidental regeneration

@@ -84,6 +84,8 @@ from __future__ import annotations
 
 import re
 
+import bench_metrics
+
 from zagg.column import COLUMN_SUFFIX
 
 # Per-shard attribution on the flat layout assumes the 1-D fullsphere HEALPix
@@ -268,6 +270,11 @@ def expected_object_counts(
             if blocks == 1 or not m["ragged"]:
                 lo += 1
     elif store_layout == "hive":
+        # Fence the leaf model to the grids that carry shard/cell orders, as the
+        # flat branch fences itself with :func:`_require_fullsphere`: a rect grid
+        # is named here rather than dying on a bare AttributeError further down
+        # (``shard_spec`` in :func:`_member_layouts`, ``child_order`` below).
+        parent_order, child_order = bench_metrics.shard_cell_orders(grid)
         members = _member_layouts(grid, leaf=True)
         # Store root: the morton_hive.json manifest (always written) PLUS the
         # root coverage.moc. The MOC is a fail-open, regenerable D9 cache that
@@ -314,8 +321,8 @@ def expected_object_counts(
         # mismatch worth seeing rather than a modeled window).
         # ... plus the leaf's own pyramid column and its sidecar (issue #418),
         # exact per populated leaf and zero when none is declared.
-        sidecar = 1 if grid.child_order > grid.parent_order else 0
-        lo = hi = 5 + len(members) + sidecar + _column_objects(pyramid, grid.parent_order)
+        sidecar = 1 if child_order > parent_order else 0
+        lo = hi = 5 + len(members) + sidecar + _column_objects(pyramid, parent_order)
         for m in members:
             blocks = m["blocks_per_shard"]
             hi += blocks

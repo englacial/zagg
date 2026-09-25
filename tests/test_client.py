@@ -304,6 +304,8 @@ class TestDispatch:
         assert all(n == "process-shard-test" for n, _, _ in cells)
 
     def test_cell_event_payload_shape(self, catalog):
+        from zagg.semantics import semantic_hash
+
         stub = StubLambdaClient()
         handle = _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]])
         handle.results()
@@ -322,7 +324,13 @@ class TestDispatch:
             "handoff",
             "run_id",
             "submap",
+            # The fleet's leaf identity gate, armed as on _run_local (hive,
+            # no overwrite): the RUN config's D19 digest rides with it.
+            "skip_if_current",
+            "semantic_hash",
         }
+        assert event["skip_if_current"] is True
+        assert event["semantic_hash"] == semantic_hash(default_config("atl06"))
         assert event["shard_key"] == _WORDS[1]
         assert event["parent_order"] == 6
         assert event["child_order"] == 12
@@ -337,6 +345,29 @@ class TestDispatch:
             "metadata": {"short_name": "ATL06", "version": "006"},
             "granules": [_rec(3)],
         }
+
+    def test_overwrite_disarms_the_fleet_gate(self, catalog):
+        # The operator's hammer disarms the gate on the facade exactly as on
+        # _run_local and _run_lambda (issue #388): no gate keys ride.
+        stub = StubLambdaClient()
+        _run(catalog, client=stub, overwrite=True).dispatch(shard_keys=[_WORDS[1]]).results()
+        (_, _, event) = stub.cell_events()[0]
+        assert "skip_if_current" not in event and "semantic_hash" not in event
+
+    def test_icechunk_commit_ships_pinned_per_leaf(self, catalog):
+        # The facade chains no staged sweep, so the ref ladder never runs:
+        # even under ``sweep: "stages"`` an unset commit must reach the init
+        # and every worker as the per-leaf commit, never the ladder whose
+        # sidecars nothing would gather (issue #580 review finding).
+        cfg = default_config("atl06")
+        cfg.output["sweep"] = "stages"
+        stub = StubLambdaClient()
+        _run(catalog, client=stub, config=cfg).dispatch(shard_keys=[_WORDS[1]]).results()
+        events = [e for _, _, e in stub.events if e.get("mode") in (None, "icechunk_init")]
+        assert {e.get("mode") for e in events} == {None, "icechunk_init"}
+        for event in events:
+            assert event["config"]["output"]["icechunk"] == {"commit": "leaf"}
+        assert "icechunk" not in cfg.output  # the caller's config is untouched
 
     def test_pairless_report_stays_out_of_the_cell_submap(self, catalog):
         # The sibling join's exclusion report (issue #425) holds one entry per
@@ -358,13 +389,27 @@ class TestDispatch:
 
     def test_hive_setup_handshake_precedes_cells(self, catalog):
         stub = StubLambdaClient()
-        _run(catalog, client=stub).dispatch().wait(timeout=10)
+        run = _run(catalog, client=stub)
+        run.dispatch().wait(timeout=10)
         modes = stub.modes()
         first_cell = modes.index(None)
-        assert modes[:first_cell] == ["ping", "setup"]  # fail-fast ping, then manifest write
+        assert modes[:first_cell] == [
+            "ping",
+            "setup",
+            "icechunk_init",
+        ]  # fail-fast ping, then manifest write
         setup_invocations = [(t, e["mode"]) for _, t, e in stub.events if e.get("mode")]
         assert ("RequestResponse", "ping") in setup_invocations
         assert ("Event", "setup") in setup_invocations
+        # The companion init blocks the fan-out (issue #580): synchronous.
+        assert ("RequestResponse", "icechunk_init") in setup_invocations
+        # ... and its record is KEPT and threaded into the tail's run-record
+        # write, so this dispatcher populates the run-level icechunk columns
+        # the same way runner._run_lambda does — a failed init has to be
+        # recorded, not invisible (D9).
+        (stats_event,) = [e for _, _, e in stub.events if e.get("mode") == "stats"]
+        assert stats_event["icechunk_init"] == run._icechunk_init
+        assert run._icechunk_init is not None
         # Post-run tail (all worker invokes, D8): finalize backstop + fail-open
         # coverage/stats rollups.
         assert "finalize" in modes

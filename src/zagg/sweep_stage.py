@@ -938,6 +938,7 @@ def _write_stage_overview(
     from mortie import generate_morton_children
     from zarr import open_array
 
+    from zagg.content_hash import staged_record
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
@@ -992,6 +993,11 @@ def _write_stage_overview(
     )
     root.attrs.update({ROLE_ATTR: "overview", OVERVIEW_ATTR: provenance})
     stamp_window = key if windowed else None
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580; the /1
+    # writer's posture in ``sweep_overview._write_overview``).
+    staged = {f"{r}/morton": words}
+    staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
+    hashes = staged_record(store, staged, f"stage sweep at {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
@@ -999,20 +1005,17 @@ def _write_stage_overview(
         window=stamp_window,
         time_range=fold["time_range"] if stamp_window is not None else None,
         run_id=run_id,
+        content_hashes=hashes,
     )
-    try:  # D20 sidecar: fail-open telemetry, §5 O11 record (the /1 writer's posture)
-        from zagg.content_hash import content_hashes_record, hash_arrays
+    try:  # D20 sidecar: fail-open telemetry, the same §5 O11 record
         from zagg.telemetry import SPEC_V3, build_record, write_sidecar
 
-        staged = {f"{r}/morton": words}
-        staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=morton_word(node),
             metadata={
                 "cells_with_data": int(populated.sum()),
                 "granule_count": int(fold["granule_count"]),
-                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+                "content_hashes": hashes,
             },
             window=stamp_window,
         )
@@ -1074,6 +1077,7 @@ def write_stage_column(
         column_name,
         composable_fields,
     )
+    from zagg.content_hash import staged_record
     from zagg.grids.base import vlen_dtype_warning_suppressed
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
@@ -1142,6 +1146,10 @@ def write_stage_column(
         }
     )
     populated = _populated_mask(folded[resolutions[0]], fields)
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
+    # sidecar carries the SAME record — ``_write_sidecar`` takes the finished
+    # record, not the staged slabs, exactly as ``column.write_column`` does.
+    hashes = staged_record(store, staged, f"stage column {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
@@ -1149,17 +1157,22 @@ def write_stage_column(
         window=window,
         time_range=time_range if window is not None else None,
         run_id=run_id,
+        content_hashes=hashes,
     )
-    _write_sidecar(
-        store,
-        path,
-        morton_word(node),
-        staged,
-        int(populated.sum()),
-        granule_count,
-        window,
-        store_kwargs,
-    )
+    # No record -> no sidecar, the leaf column's gate: a hash-less sidecar on
+    # a rewrite reads as a stale-or-absent ambiguity, and the stamp above
+    # already stands without the key (spec §5.3, unverifiable not tampered).
+    if hashes is not None:
+        _write_sidecar(
+            store,
+            path,
+            morton_word(node),
+            hashes,
+            int(populated.sum()),
+            granule_count,
+            window,
+            store_kwargs,
+        )
     return basename
 
 

@@ -47,17 +47,25 @@ peaks near 45° latitude at 0.12830° (~14.26 km), so a cover or store built
 under one convention does not describe cells under the other, and composing
 them is meaningless (mortie spec §9 is where the prohibition binds). The
 `dggs` attrs block
-(`zagg.grids.healpix.HealpixGrid._dggs_attrs`) does not yet stamp mortie's
-`latitude` token; what it does stamp is `ellipsoid: {name: WGS84,
-semimajor_axis: 6378137.0, inverse_flattening: 298.257223563}` and no sphere
-radius — that entry is the **ingress datum** (the geodetic coordinates fed
-to `geo2mort`, equal-area on that ellipsoid by construction), not an
-instruction to compute cell geometry on the ellipsoid: the words themselves
-live on the R = 6371.0088 km authalic sphere the conversion maps onto.
-Until the token lands, this paragraph is the record for zagg stores, and a
-reader reproducing cell geometry (e.g. a viewer's boundary golden test)
-needs the geodetic ↔ authalic conversion at every geodetic seam, exactly as
-mortie spec §9 prescribes.
+(`zagg.grids.healpix.HealpixGrid._dggs_attrs`) stamps mortie's `latitude`
+token — `"latitude": "authalic-wgs84"`, mandatory for a writer at the current
+mortie spec version, since [#580](https://github.com/englacial/zagg/issues/580)
+(folding #549's resolution; `zagg.grids.morton.LATITUDE_CONVENTION`) —
+beside `ellipsoid: {name: WGS84, semimajor_axis: 6378137.0,
+inverse_flattening: 298.257223563}` and no sphere radius: that entry is the
+**ingress datum** (the geodetic coordinates fed to `geo2mort`, equal-area on
+that ellipsoid by construction), not an instruction to compute cell geometry
+on the ellipsoid — the words themselves live on the R = 6371.0088 km
+authalic sphere the conversion maps onto. A store whose `dggs` block carries
+no `latitude` key predates the token; this paragraph is its record, and it is
+authalic by the version evidence above. The absence rule is **per artifact**,
+not per store: a partially rewritten store legitimately carries both vintages
+— a sweep, stage or column backfill re-templates the overviews and columns it
+writes, so those pick up the token while the leaves beside them, never
+rewritten, do not — and each artifact's own `dggs` block is authoritative for
+that artifact. A reader reproducing cell geometry
+(e.g. a viewer's boundary golden test) needs the geodetic ↔ authalic
+conversion at every geodetic seam, exactly as mortie spec §9 prescribes.
 
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
@@ -112,6 +120,7 @@ Contents:
 8. [`zagg-toc/1` — the temporal declaration](#8-zagg-toc1)
 9. [`zagg-located/1` — the located declaration](#9-zagg-located1)
 10. [`zagg-coverage-toc/1` — the root coverage temporal section](#10-zagg-coverage-toc1)
+11. [Icechunk companion repo — the virtual-ref index](#11-icechunk-companion-repo)
 
 ---
 
@@ -268,6 +277,28 @@ chunks (the 2-GET recipe generalized to a span), on the per-inner-chunk
 geometry only the covering chunk objects — never a whole-array sweep. The
 span property is normative; a dedicated subtree reader is implementation
 (zagg: [issue #351](https://github.com/englacial/zagg/issues/351)).
+
+**Leaf immutability.** A committed leaf's data objects are **write-once**:
+once the commit stamp lands, a writer MUST NOT modify bytes at an existing
+leaf key in place — no partial rewrite, no append, no re-encode of one
+array. The only legal change to a stamped leaf is **wholesale replacement**
+under the D4 retry discipline: the leaf template clears the prefix, rewrites
+it, and lands the stamp last. This is what lets a byte-range index into a
+leaf — the §11 Icechunk companion refs, moczarr's 2-GET reads — trust
+`(key, offset, length)` for as long as the stamp it was taken under stands.
+
+A replacement is not, however, a change of **keys**. Clear-then-template
+rewrites the same key layout, and on an unversioned bucket the new object
+lands at exactly the key an old reference names — so a reference taken under
+a superseded stamp does *not* 404: it reads the new object's bytes at a stale
+offset and would silently mis-decode. Two things close that. The replacing
+writer re-records its refs against the new leaf (§11.4); and every recorded
+reference carries the referenced object's **ETag** — or, on a local store,
+its `last_modified` — **as its Icechunk checksum** (§11.3), which Icechunk
+verifies on read, so a reference not yet re-recorded fails **loudly** instead
+of returning wrong bytes. Stage 2's content-pinned
+keys retire the case. Issue
+[#580](https://github.com/englacial/zagg/issues/580).
 
 ### 1.6 Succession
 
@@ -830,8 +861,10 @@ regionally heterogeneous resolution).
   clean level.
 
 An overview also carries the standard D4 **commit stamp** as its final
-write: an unstamped overview prefix is debris, exactly as for leaves.
-Write order is pinned — template, arrays, `role`/provenance attrs, stamp
+write: an unstamped overview prefix is debris, exactly as for leaves. The
+stamp carries the §5.3 `content_hashes` record over the overview's own
+arrays when one was computed (keyed only then — absence reads unverifiable,
+never tampered). Write order is pinned — template, arrays, `role`/provenance attrs, stamp
 LAST — so presence of the stamp certifies the `role` attr landed; a reader
 MUST ignore unstamped overview prefixes.
 
@@ -1466,13 +1499,16 @@ guessed at.
 ```json
 "morton_hive_commit": {"spec": "morton-hive/1", "complete": true,
                        "cells_with_data": 3, "granule_count": 1,
+                       "content_hashes": {"arrays": {"…": "…"}, "combined": "…"},
                        "written_at": "2026-08-05T00:00:00+00:00"}
 ```
 
   `cells_with_data` is the populated-cell count of the group named by
   `cells_with_data_order`; `granule_count` is the **leaf's** granule count,
-  not a column quantity; and a column stamp carries **no `coverage`
-  payload** (a leaf's does), so a stamp reader MUST NOT require one. On a
+  not a column quantity; `content_hashes` is the §5.3 record over the
+  column's own arrays, keyed only when one was computed; and a column stamp
+  carries **no `coverage` payload** (a leaf's does), so a stamp reader MUST
+  NOT require one. On a
   **windowed** store the column's stamp is `spec: "morton-hive/2"` and
   carries the D15 half exactly as the leaf's does — `window` plus the
   observed `time_range` — so a reader that strict-checks the `spec` marker
@@ -1887,8 +1923,9 @@ robustness property, and the reason two implementations agree without agreeing
 on traversal order. The recorded `arrays` map is a different matter: a writer
 SHOULD record it key-sorted so a regenerated record diffs cleanly.
 
-The hashes are recorded in the leaf's D20 stats sidecar under
-`content_hashes`, in the structured shape:
+The hashes are recorded in the leaf's **commit stamp** (`morton_hive_commit`,
+[issue #580](https://github.com/englacial/zagg/issues/580)) and in its D20
+stats sidecar, both under `content_hashes`, in the structured shape:
 
 ```json
 "content_hashes": {
@@ -1903,6 +1940,15 @@ and is not a legal zagg array name). A leaf with no recorded
 `content_hashes` is **unverifiable, not tampered**: verification MUST
 report "nothing recorded" as a distinct outcome from a mismatch (the
 conservative dedup posture — an unverifiable leaf is never a hit).
+
+**Contract (the stamp copy).** The writer computes the record from the
+arrays it just wrote, *before* the stamp lands, so the D4 seal certifies the
+digest of the bytes it seals; the stamp copy and the sidecar copy are the
+same record. A reader verifying a leaf SHOULD prefer the stamp's copy (one
+root-metadata GET, already read for the stamp) and fall back to the sidecar
+for leaves written before this key existed. A stamp without the key is a
+pre-#580 writer or a writer that could not stand behind a digest (§5.2's
+raise gate) — unverifiable, never tampered.
 
 **Contract.** A sweep-built **overview** (§4) records its hashes in a sidecar
 the same way, and that sidecar is named from the overview's own basename —
@@ -2041,6 +2087,16 @@ dense + ragged writes, coverage sidecar, commit stamp), so writer↔spec
 drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
+
+The leaf fixtures were committed before this revision (`temporal/` was
+regenerated for §10.6 under issue #575, still before it) and are
+unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
+`dggs` block carries the §1 `latitude` token, so each fixture is the
+absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
+for both (the sidecar copy and §1's own evidence paragraph are the record
+for what those artifacts mean). Regeneration is deferred because it would
+also install the §4.9 `multiscales` mirror that `column/` pins the
+**absence** of, retiring an unrelated pin.
 
 Seven tiny single-shard hive stores plus two metadata-only ones (the
 `pyramid/` declaration and the `multiscales/` companion), all on the same
@@ -3371,7 +3427,11 @@ written before this revision simply lacks it, a reader treats absence as
 "read the leaf", and a sweep that had to take the raw route MAY write the
 record it computed so the store converges. Like the bitmap it is a foreign
 key inside the otherwise-vanilla leaf: zarr data reads are unaffected, and
-member enumeration warn-skips it.
+member enumeration warn-skips it. It is not a data object in §1.5's
+write-once sense — it is a leaf-internal accelerator sealed by the same
+stamp — and the §11 Icechunk companion never references it: the ref plan
+enumerates the template's named arrays and reads their chunk keys only,
+so neither this record nor `coverage.moc` is referenced or checksummed.
 
 It takes the bitmap's *slot* but not its failure posture. The commit stamp
 points AT the bitmap (§ the stamp's `coverage`), so a stamp published
@@ -3520,3 +3580,446 @@ equal to the root section's shard word), the decoded counted cover and the
 decoded cover — each derived through §10.3's laws from those same instants,
 never transcribed — so the record is pinned against the generator's inputs,
 not against itself.
+
+---
+
+## 11. Icechunk companion repo
+
+**Status: contract** (`zagg-icechunk/1`, issue
+[#580](https://github.com/englacial/zagg/issues/580), stage 1 — refs-only,
+additive). The leaves remain the normative, self-describing data plane
+(§1–§10); the companion is a derived index over their bytes. Stage 2 (a
+follow-up issue) is where the repo becomes the authoritative *metadata*
+plane; nothing in this section presupposes it.
+
+**Succession.** Stage 2 is a `/2` revision, declared — as `/1` is — in the
+`zagg_icechunk.spec` token (§11.1), so a reader discriminates the two from
+the repo's own attrs. `/1` remains valid and readable indefinitely: existing
+repos never require rewriting, whatever timing `/2` lands on.
+
+A morton hive is many leaf zarrs. The companion presents every leaf of one
+order as **one zarr hierarchy** by recording each leaf's inner chunks as
+[Icechunk](https://icechunk.io) **virtual chunk references** —
+`(location, offset, length)` byte ranges into the leaf objects that already
+exist — so an Icechunk reader (icechunk-py, icechunk-js in a browser) opens
+the hive as a single array per field without moczarr's hand-built virtual
+store, and every hive commit maps onto an Icechunk snapshot.
+
+### 11.1 Placement and naming
+
+**Contract.** One repository per store, at the store root, with one zarr
+**group per level, named by the level's CELL order** — exactly the
+manifest's `zagg-multiscales/1` datasets (§4.9) plus the base:
+
+```text
+{store_root}/icechunk/          <- the Icechunk repository
+   /19                           <- the base: the source leaves (node order 9, cells 19)
+   /13                           <- the §4.6 leaf columns' declared member (node 9, cells 13)
+   /12, /11, … /4                <- the §4 overviews, one level per ancestor order (node 8 … 0)
+```
+
+| level (group) | artifact per node | node order `n` | cells per object `4^(c−n)` | object arrays |
+|---|---|---|---|---|
+| `/19` | `{leaf}.zarr/19/…` | 9 (shard) | 4^10, as K = 256 inner chunks of 4^6 (§1.5, sharded) | the leaf template's |
+| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column) | 9 | 256, ONE unsharded chunk | the column's declared member |
+| `/12` … `/4` | `{node}/all.zarr/{c}/…` (the ancestor's overview) | 8 … 0 (= c − 4) | 256, ONE unsharded chunk | the overview's |
+
+(production geometry: shard 9 / chunk 13 / cell 19, declared leaf-node
+cells 13 — every ladder level keeps `c − n = 4`; the general rule is the
+manifest's own `datasets`). A column holds more members than its declared
+one — the within-footprint intermediates and the node-order partial the
+stage gather reads (`13`, `12`, `11`, `10` on the live California store) —
+and those are **deliberately not levels**: they overlap the overview levels
+for the same cells and are sweep inputs, not reader-facing artifacts. A
+level whose artifact a node never wrote (a column exists only under a `/2`
+declaration with composable fields; an overview only once swept) simply has
+no refs there and reads as fill. Every group is created by the once-per-run
+init (§11.4) from the manifest's declaration, and the repo's **root attrs
+mirror the manifest's `zagg-multiscales/1` block** verbatim as
+`multiscales`, so a reader opens one repo and discovers every level — its
+node order, cell order and artifact kind — from its root (the
+GeoZarr/OME-NGFF-style multiscales convention;
+earth-mover/icechunk-multiscales-demo; what gridlook's level resolver
+reads). `icechunk/` is a **reserved store-root child name** on the same
+footing as the §4.10 `multiscales/` companion: it is excluded from the **D19
+product-name grammar** (like the base-component exclusion), so a
+multi-product root walker can never classify it as a product, and
+`zagg.hive.validate_product_name` refuses the name outright — a product MUST
+NOT be named `icechunk`.
+
+The repo's root group carries a `zagg_icechunk` attrs block that makes it
+self-describing:
+
+```json
+"zagg_icechunk": {
+  "spec": "zagg-icechunk/1",
+  "shard_order": 9, "chunk_order": 13, "cell_order": 19,
+  "url_prefix": "s3://bucket/product/",
+  "commit": "ladder", "commit_order": 6, "split_order": 6,
+  "levels": {
+    "19": {"node_order": 9, "artifact": "leaf",     "chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}},
+    "13": {"node_order": 9, "artifact": "column",   "chunk_order": 9,  "cell_order": 13, "split": {"chunks": 16384, "order": 2}},
+    "12": {"node_order": 8, "artifact": "overview", "chunk_order": 8,  "cell_order": 12, "split": {"chunks": 16384, "order": 1}},
+    "…":  "one entry per level, keyed by cell order",
+    "4":  {"node_order": 0, "artifact": "overview", "chunk_order": 0,  "cell_order": 4,  "split": {"chunks": 1,     "order": 0}}
+  }
+},
+"multiscales": [ … the manifest's zagg-multiscales/1 block, verbatim … ]
+```
+
+`shard_order` / `chunk_order` / `cell_order` mirror the manifest and the
+base grid; `url_prefix` is the virtual chunk container's prefix (§11.3);
+`levels` carries, per level group (keyed by cell order), its node order,
+its artifact kind, its chunk-axis order (the inner-chunk order for the base,
+the node order for a one-chunk-per-node level), its cell order and its
+manifest split (§11.5); `commit`, `commit_order` and `split_order` are
+the ladder's knobs (§11.4, §11.5), read back by every stage node so the
+sweep needs no config. The repo root group's attrs are exactly these two
+keys: `zagg_icechunk` and the `multiscales` mirror (the mirror is absent
+only on a store whose manifest declares no `zagg-multiscales/1` block). A
+leaf root group carries only its own commit stamp, which is a per-leaf fact
+and so has nothing to mirror. Each **level group** mirrors its artifact's
+resolution-group attrs verbatim (the `dggs` block, `zarr_conventions`), and
+**never the commit stamp**.
+
+### 11.2 Array model
+
+**Contract.** For every named array a level's template declares (a leaf
+array `{cell_order}/{name}` for the base, a column's declared-member array
+`{c}/{name}` for the column level, an overview's `{c}/{name}` for an
+overview level), the repo holds `/{c}/{name}` whose metadata is the
+template array's, re-rooted on the whole sphere at that cell order (`n` the
+level's node order, `n_shards = 12·4^n`, the level's global shape
+`12·4^c`):
+
+| field | repo array | derivation |
+|---|---|---|
+| `shape` | `(n_shards · L₀, *L[1:])` | `L` the level's per-node object array's shape (the leaf's for the base); `n_shards = 12·4^n`, `n` the level's node order |
+| chunk shape | the object's **inner** chunk shape | the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5), else its own `chunk_grid` — the whole object for a column or overview level, one chunk per node |
+| `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
+| `data_type`, `fill_value`, `dimension_names`, `attributes` | verbatim from the object array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
+
+Zarr metadata therefore passes through untouched: a reader that decodes a
+leaf array per §1–§3 decodes the repo array the same way, chunk by chunk.
+
+### 11.3 Chunk index law and refs
+
+**Contract.** Every level's chunk axis is in **canonical nested order**
+(§1.5 "Subtree spans"), so one node's chunks are one contiguous run. For a
+level of cell order `c` and node order `n`, an object at nested rank `r` at
+order `n` (`r ∈ [0, 12·4^n)`, the rank `block_index` gives) holds `4^(c−n)`
+cells; its chunk `j` (C-order within the object's chunk grid along the cells
+axis, `j ∈ [0, C)`, `C` the object's chunk count) sits at global chunk index
+
+```text
+r · C + j        (trailing axes keep their object-local chunk index, 0 for a single-chunk payload dim)
+```
+
+For the base level `C = 4^(chunk_order − shard_order)` inner chunks; for a
+column or overview level the object is ONE chunk, `C = 1`, and the global
+index is the node's rank itself.
+
+At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
+
+Each **populated** inner chunk is recorded as one virtual reference:
+
+- **sharded leaf array** (every hive leaf, §1.5): `location` is the leaf's
+  single shard object — the array's **outer**-chunk key, `{leaf}/{p}/c/0` for
+  the 1-D cells arrays the hive writes — and `offset`/`length` are the
+  chunk's entry in the shard index suffix, the same two `u64` words the §1.5
+  2-GET recipe reads — the writer fetches that suffix itself, once per array
+  (§11.4). An inner chunk the index marks **absent** (the
+  `2^64 − 1` sentinel in both words) gets **no reference** and reads as
+  `fill_value`.
+- **regular (unsharded) array** — a leaf array on a `chunk_inner`-less
+  grid, and every column and overview array (one chunk per object):
+  `location` is the chunk object (`{leaf}/{p}/c/{j}`; `{object}/{p}/c/0` for
+  a single-chunk array), `offset` 0, `length` the object size (§11.4); a
+  missing object gets no reference.
+
+Chunk keys are the array's own, under the `chunk_key_encoding` its
+`zarr.json` declares — zagg emits the `default` encoding with the `/`
+separator throughout — so the chunk at grid index `(i₀, i₁, …)` is
+
+```text
+{leaf}/{p}/c/{i₀}/{i₁}…
+```
+
+with the trailing axes at their **leaf-local** chunk index (`0` for a
+dimension the array holds in a single chunk). A 1-D array's key is therefore
+`c/0` for its one chunk, and `c/{j}` where the cells axis is chunked. Keys
+are used **verbatim** as the path part of `location` (`//` and `.`/`..` are
+preserved), so a character that is reserved in a URL but part of the key MUST
+be percent-encoded — `?` → `%3F`, `#` → `%23`, `%` → `%25`
+(`set_virtual_refs_arr`). zagg's own keys contain none of the three; the rule
+is normative for a reader reconstructing a key from a recorded `location`.
+
+Every reference also carries a **checksum**, in the form its container
+validates. Into an **object-store** container it is the **ETag** of the
+object it points into, read from the HEAD the writer performs against that
+object after the leaf write (§11.4). Into a **`file://`** container it is
+that object's **`last_modified`**, ceiled to the next whole second: Icechunk
+compares a recorded datetime against the object's modification time at
+**whole-second granularity**, so the exact sub-second `mtime` fails the very
+object it was read from while the ceiling passes it. Icechunk verifies either
+form on read, so a reference into a leaf that has since been
+wholesale-replaced (§1.5 leaf immutability — same keys, new bytes) fails
+loudly rather than decoding the replacement at a stale offset. That
+granularity is the local form's one caveat: a replacement landing within the
+**same second** as the original passes the check (an object store's ETag has
+no such window). The writer records which form it used under
+`icechunk.checksum` in the leaf's stats sidecar (`"etag"` or
+`"last_modified"`).
+
+`location` is `url_prefix + key`, `key` the object's path relative to the
+store root. The repo declares exactly one **virtual chunk container** whose
+`url_prefix` is the store root URL **with a trailing `/`**
+(`s3://bucket/product/`, `file:///…/product/`); a reader authorizes that
+prefix with the same credentials it reads the leaves with. That prefix is
+**absolute**, so the companion does not relocate with the store the way the
+root-relative manifest and MOC sidecars do: a mirrored or moved store must
+declare the container prefix afresh (and the recorded `url_prefix`, §11.1) at its
+new location before its refs resolve.
+
+### 11.4 Commits
+
+**Why not one commit per leaf (informative).** A per-leaf commit does not
+scale. At the full-globe worst case (3,145,728 order-9 leaves, 49,152
+order-6 cells) it is 3.1M commits — and the real limit is not the commit
+count but the **snapshot**: an Icechunk snapshot lists every manifest, so its
+size is set by the manifest count. One manifest per order-6 cell per array is
+≈442k manifests ≈ **44 MB read on every open, every rebase and every
+commit** (≈2.2 TB of snapshot traffic over one run). Balancing snapshot bytes
+(≈100 B per manifest entry) against per-manifest bytes (≈2.5 KB on disk per
+leaf-array) gives leaves-per-manifest ≈ 0.6·√N: ≈30 at California scale
+(order 6–7 cells), ≈1,000 at the full globe (order-4 cells → 27k manifests, a
+2.7 MB snapshot and 2.6 MB of manifests — the shape of the live ISMIP repo,
+27,423 manifests / 2.2 MB snapshot). So both the manifest split and the
+commit granularity are configurable and derived, and a **base** manifest is
+written by **exactly one commit** (§11.5).
+
+**Contract — the ladder.** Refs travel up the §4 pyramid the way the digest
+columns do:
+
+1. **The leaf worker writes a ref sidecar, not a commit.** After the leaf's
+   stamp, its granule-id sibling and the §4.6 column fold — last in the unit,
+   behind every post-stamp phase that can still fail it — the worker computes
+   the leaf's ref plan (the reads below) and writes it as one compact object
+   beside the leaf, named by the stats sidecar's sibling grammar with the
+   base `icechunk_refs.json` (`{stem}.icechunk_refs.json` under `morton-hive/3`).
+   The carrier is JSON declaring `zagg-icechunk-refs/1`, the writer's
+   geometry (`shard_order`, `chunk_order`, `cell_order` — never the
+   container prefix, which is vetted at the repo) and the entries (≈40 KB per
+   leaf at production geometry). It is a **writer-internal carrier**, not part
+   of the reader contract — the repo is. No Icechunk session is opened on
+   the leaf path.
+2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
+   `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
+   the finest tuple, its children's **node ref columns** (the same carrier at
+   `{node}/icechunk_refs.json`) above — and adds the refs of the overview
+   objects at every order of its tuple beneath it (read the same way a
+   leaf's are). A missing carrier is counted (`icechunk_missing`) and
+   tolerated — under-coverage, never a failure — and a carrier whose
+   recorded geometry disagrees with the repo's block is refused.
+3. **One tuple commits.** Let `c` be `commit_order`, `d` a tuple's dispatch
+   order and `d′` its child order (the tuple covers orders `[d, d′)`):
+   - `d ≤ c < d′` — the **committing tuple**: every node commits all it
+     gathered in **one commit** — every level's refs into its group of the
+     same repo, keyed by cell order (§11.1): the base leaves into
+     `/{cell_order}/…` (`/19`), the column's declared member into `/{c}/…`
+     (`/13`) and each overview level into `/{c}/…` (`/12` … `/4`) —
+     message `node {decimal}`;
+   - `d′ ≤ c` — a coarser tuple: its nodes commit only their **own**
+     overview refs (their children already committed);
+   - `d > c` — a finer tuple: its nodes write their node ref column and
+     commit nothing.
+
+   Commits rebase on conflict exactly as before (`ConflictDetector`; nodes
+   touch disjoint chunk ranges), and each stage row records
+   `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
+   `icechunk_refs`, `icechunk_missing`, `icechunk_failed`,
+   `icechunk_skipped_levels`, `icechunk_clean`, `icechunk_regathered` and
+   `icechunk_s` — every one
+   pre-seeded, so a row's key set does not depend on whether a node did work
+   — plus `icechunk_nodes`, one entry per node that did, carrying the
+   snapshot it committed (the leaf→snapshot join).
+
+   The ladder runs over the **dirty set** — the nodes with a dirty leaf
+   beneath them — not over every candidate node: a node whose whole subtree
+   is clean had its refs committed by the run that dirtied it, so it is
+   skipped whole and counted (`icechunk_clean`). An append therefore costs
+   O(dirty), not O(store). A **dirt-only** leaf (§11.6) joins the dirty set
+   for the ladder alone: a node with dirt-only leaves and no dirty one runs
+   the gather and commit, folds nothing, and is counted
+   (`icechunk_regathered`). A full re-gather (repairing a repo against the
+   leaves, after a run whose commits were lost) is a **manual staged sweep
+   over the whole store**, where every leaf is dirty by construction.
+
+`commit_order` defaults to the **finest dispatch node** of the staged sweep
+(`shard_order − tuple_width` when the shard order is a multiple of the width:
+6 at production), `split_order` to `commit_order`. Both ride the
+`zagg_icechunk` block, with different standing: `split_order` is the
+**store's** value and ratchets (§11.5); `commit` and `commit_order` are
+**per-run** — the init writes this run's values so its stage nodes can read
+them, and they are never a compatibility key. `commit: "leaf"` keeps the per-leaf commit of the
+first revision — the leaf commits `leaf {decimal}` itself and the ladder
+commits overview refs only. An unset `commit` resolves to the ladder only
+when the run walks it — the dispatcher chains the staged sweep
+(`output.sweep: "stages"`) and a `/2` ladder with a composable field is
+declared — and to `"leaf"` otherwise, on every backend: a ladder-mode run
+that walks no ladder would leave the repo empty while every leaf reported a
+sidecar.
+
+**Init.** `init {run_id}` — the once-per-run initialization, before the
+fan-out: the repo exists with **every** level group (§11.1 — the base, the
+column's declared member and one per declared overview level, keyed by cell
+order, created here once because Icechunk's create is not safe under
+concurrent callers), its array nodes (§11.2) defined and the `multiscales`
+mirror in its root attrs. Idempotent: a repo that already carries a matching
+block is reopened, never re-templated; a block for another geometry or
+container is refused. The ladder settings are not compared: `split_order`
+follows the §11.5 ratchet (a finer config adopts the store's value, a
+coarser one re-cuts), and `commit` / `commit_order` are per-run.
+
+A **replaced** leaf (§1.5 leaf immutability) is re-indexed by the next staged
+sweep that gathers it: the new sidecar's refs supersede the old ones on
+`main`. Snapshots older than that commit still reference the replaced keys —
+and because clear-then-template reuses those keys, their refs resolve to a
+**live** object rather than 404ing. The per-ref checksum (§11.3) is what
+makes that a loud failure instead of a silent mis-decode. Icechunk's garbage
+collection does not manage virtual targets, and stage 1 does not pin history
+across a replacement (stage 2's content-pinned keys do).
+
+**The reads the writer performs.** Recording refs costs I/O — the offsets
+come out of the object's own index, but the sizes and checksums do not. For
+each array of a leaf (at the leaf worker) or of an overview object (at its
+stage node) the writer issues:
+
+- **sharded array**: one ranged `GET` of the shard index suffix (the §1.5
+  recipe's second read, which yields every inner chunk's `(offset, length)`
+  at once) **and** one `HEAD` of the shard object, for its checksum — the
+  `ETag`, or `last_modified` on a local store (§11.3);
+- **single-chunk array** — every column and overview array (one chunk per
+  object): one `HEAD` of its one chunk object, for its size (the ref's
+  `length`) and checksum;
+- **multi-chunk regular (unsharded) array** — a leaf array on a
+  `chunk_inner`-less grid: one `LIST` of the array's `c/` chunk prefix, which
+  yields every chunk object's key, size and checksum in one request — and,
+  unlike probing, discovers which chunks were actually written.
+
+Plus, per stage node, one small `GET` per child carrier. Small beside the
+leaf write, but not nothing.
+
+Writing refs is **fail-open** (D9) at every rung: a leaf's sidecar failure
+is logged and recorded in its D20 stats sidecar (`icechunk.error`) and never
+fails the leaf; a stage node's failure counts `icechunk_failed` and never
+fails the sweep — the leaf is normative, the index is regenerable (a later
+staged sweep re-gathers). The leaf's `icechunk` block records the sidecar it
+wrote — `{sidecar, bytes, refs, arrays, checksum}` — or, under
+`commit: "leaf"`, its commit `{path, snapshot, arrays, refs, rebases,
+commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
+(§11.6); `{error: message}` on failure. The run parquet flattens the same
+fields to `icechunk_*` columns.
+
+### 11.5 Manifest splitting
+
+**Contract.** Manifests are split along the chunk axis into runs of `4^m`
+chunks, and `m` is fixed **once, from the base level**:
+
+```text
+m_base = chunk_order_base − split_order          (7 at production: 4^7 = 16,384 chunks)
+m      = min(m_base, chunk_order_level)          (per level)
+```
+
+Because the chunk axis is in nested order, one run of the **base** is
+exactly the chunks of one HEALPix cell at order `split_order`, so the split
+is stated as "one base manifest per order-`split_order` cell". Every other
+level holds the same **number of chunks** per manifest — not one
+`split_order` cell — capped at its own chunk axis (`chunk_order` is the
+group's own: the inner-chunk order for the base, 13 at production; the node
+order for a column or overview group, one chunk per node). At the defaults
+that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
+and one base cell (12 manifests per array) at `/11` and every coarser level;
+no manifest ever spans more than a base cell. Holding the chunk count
+constant is what keeps the manifest count — and with it the snapshot, which
+lists every manifest — at the base's: applying "one manifest per
+`split_order` cell" to every level would multiply both by the number of
+levels (≈5× at production).
+
+The split is configured **per order group** (Icechunk's path-matched split
+conditions, `^/{order}/`) and recorded per level as `levels.{order}.split`
+(`chunks` = `4^m`, `order` = `chunk_order − m` — the cell order one
+manifest spans, which differs per level by design) and once as
+`split_order` in the `zagg_icechunk` block (§11.1), never assumed by
+readers. `split_order` MUST satisfy `commit_order ≤ split_order ≤
+shard_order`: the committing node (§11.4) owns every leaf under its order,
+so a **base** manifest keyed to a cell at or below it is written by that one
+commit and no other — **zero rewrite amplification** at the only heavy
+level. A coarse-level manifest spans more than one committing node's
+subtree and is rewritten by each node that touches it (a rebase on disjoint
+chunks, `ConflictDetector`); that is deliberate: those manifests are tens of
+KB, so the amplification is negligible in bytes, while their **count** is
+what every snapshot read pays for.
+
+**Contract — the ratchet.** The store's recorded `split_order` is
+authoritative and moves **one way, toward coarser**. At `init`, the run
+config's `split_order` is compared with the block's: a config value FINER
+than the store's (numerically higher) is not applied — the init adopts the
+store's value and logs a warning naming both (templates are hash-pinned build
+configs reused by appends; refusing would break every append after a
+ratchet); an equal value is a no-op; a COARSER value is an intentional
+ratchet: the init records the new `split_order` and per-level splits in the
+block and in the repo's saved splitting config **before any commit of the
+run**, so every manifest the run writes is already at the new cut, and
+flags the run record with `icechunk_split_ratchet: "{from}->{to}"`, which
+a later finalize reads to run Icechunk's `rewrite_manifests` once over the
+old manifests (not run by the writer; mixed cuts are valid — each manifest
+carries its own extents). A repo is never re-split finer. `split_order` is
+a layout knob outside the D19 semantic core: it changes no leaf byte.
+`commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`.
+
+At the defaults (`split_order = commit_order = 6` at production) a
+shard-order manifest is `4^7` = 16,384 chunks — one order-6 cell, 64 leaves —
+which is ≈43 order-6 cells × 9 arrays ≈ 390 base manifests at California
+scale. The coarse levels add a few hundred (`/13` at one order-2 cell per
+manifest, `/12` at one order-1 cell, 12 per array at `/11` and coarser), so
+the snapshot is ≈390 + a few hundred entries; at the full-globe worst case it
+is ≈442k + ~1k, not the ≈2.2M a per-level `split_order` cut would list.
+The **global-scale** setting is `split_order: 4, commit_order: 3`: `4^9` chunks
+per manifest, one order-4 cell (1,024 leaves), 3,072 manifests per array
+(27k across the arrays, a ≈2.7 MB snapshot), committed by the 768 order-3
+nodes (768 commits) — the numbers §11.4's rationale derives.
+
+*(Informative.)* Icechunk deduplicates a manifest's `location` strings only
+from `min_num_chunks` chunks upward (a configurable setting defaulting to
+1,000, not a format constant). The **default** split clears it comfortably —
+one manifest per order-6 cell is `4^7` = 16,384 chunks per array, 64 leaves.
+The finest admissible split does not: `split_order == shard_order` is one
+whole leaf, `4^4` = 256 chunks per array at production, below the 1,000
+default, so such a manifest carries no dictionary. The dictionary is worth
+having precisely because all refs of one leaf array carry the **same**
+`location` (the leaf's single shard object), so a hand-set
+`split_order == shard_order` trades it away.
+
+### 11.6 What §11 does not cover (informative)
+
+Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
+across windows and so cannot share one chunk axis; stage 1 records no refs
+for them (the sidecar says `skipped: windowed`) and the ladder does not run
+on a windowed store. Raster hive products (`(time, cells)` arrays, never
+sharded) are likewise out of stage 1's writer scope. The sweep-built §4
+overviews are **in** scope since the ladder (§11.4): every declared overview
+level has its group in the store's one repo, and its refs. None of these change the leaf format, the
+t-digest storage or the moczarr reader.
+
+A skip-if-current unit's lifecycle touch (#388) refreshes its objects in
+place and so moves their checksums (§11.3); the unit re-plans its refs from
+fresh HEADs — committed at once under `commit: "leaf"`; under the ladder it
+rewrites its sidecar and enters the same run's staged sweep as a
+**dirt-only** leaf, whose nodes re-gather and commit its refs without
+re-folding their overviews (§11.4). On the fleet the worker's response body
+carries `icechunk_dirty`, the dispatcher assembles the dirt-only set from
+those bodies, and each stage event carries its node slice as `dirt_only`
+(`[[shard_key, window], …]`, absent when empty). A current unit therefore still writes no
+stats record, sidecar or sub-map, but may enter the sweep work set as
+dirt-only when its touch moved ref checksums and the repo is on.

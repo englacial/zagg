@@ -116,6 +116,10 @@ _EQ_OR_NONE_KEYS = (
     # existence must be discoverable without a tree listing. Named
     # ``leaf_column``, not ``column`` — see _ROW_SCALARS below.
     "leaf_column",
+    # Icechunk companion refs record (issue #580): per-leaf by definition —
+    # one commit per leaf — so a rollup collapses it to None like the O11
+    # record above.
+    "icechunk",
     "zagg_version",
     "lambda",
     "invoked_by",
@@ -408,6 +412,17 @@ def build_record(
         # sidecar scan for column-bearing units must key on the LEAF records,
         # not on the column artifacts' own.
         "leaf_column": metadata.get("leaf_column"),
+        # Icechunk companion refs (issue #580, spec §11.4): the leaf's refs
+        # commit — ``{path, snapshot, arrays, refs, rebases, commit_s,
+        # checksum}`` on success (``commit: "leaf"``), or in ladder mode the
+        # ref sidecar it wrote instead — ``{sidecar, bytes, refs, arrays,
+        # checksum}`` — ``{"skipped": reason}`` for a unit stage 1
+        # does not index (windowed, empty), ``{"error": ...}`` when the
+        # fail-open write did not land. ``rebases`` and ``commit_s`` are the
+        # fleet's first measurement of commit contention (the issue's open
+        # question (1)). None wherever no writer recorded it (the knob off,
+        # flat layouts, raster, failures).
+        "icechunk": metadata.get("icechunk"),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
@@ -574,6 +589,38 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     ident = record.get("invoked_by") or {}
     row["invoked_by"] = ident.get("arn")
     row["invoked_by_userid"] = ident.get("userid")
+    # Icechunk refs commit (issue #580): the scalars a fleet run's contention
+    # question reads straight off the parquet — ``rebases`` and ``commit_s``
+    # per leaf — plus the snapshot for joining a leaf to the repo's history,
+    # and ``checksum``, the form the leaf's refs carry (``"etag"`` on an object
+    # store, ``"last_modified"`` on a local one, §11.3). ``checksum`` is here
+    # because it varies by STORE SCHEME rather than by run, so "did this run's
+    # refs land with staleness detection, and in which form?" is not derivable
+    # from any other column (review finding).
+    # Coerced, never dereferenced blind: ``metadata`` is not always locally
+    # built — the dispatcher's stale-worker path (``runner._lambda_result_rows``)
+    # passes the JSON body a remote worker returned — so a version-skewed body
+    # carrying a non-dict here must not take down the WHOLE run-parquet write
+    # on a path that is otherwise fail-open (review finding).
+    ice = record.get("icechunk")
+    ice = ice if isinstance(ice, dict) else {}
+    row["icechunk_snapshot"] = ice.get("snapshot")
+    row["icechunk_refs"] = ice.get("refs")
+    row["icechunk_rebases"] = ice.get("rebases")
+    row["icechunk_commit_s"] = ice.get("commit_s")
+    row["icechunk_checksum"] = ice.get("checksum")
+    # Ladder mode (phase 6): the leaf wrote a ref sidecar instead of committing.
+    row["icechunk_sidecar"] = ice.get("sidecar")
+    row["icechunk_bytes"] = ice.get("bytes")
+    # The levels the leaf's refs cover, by CELL order — comma-joined so the
+    # column stays a parquet scalar. Both record shapes carry it (the ladder's
+    # sidecar and the ``commit: "leaf"`` twin), and it is the only place
+    # "did this leaf's column level get indexed, or only its base?" is
+    # answerable from the run parquet (review finding).
+    levels = ice.get("levels")
+    row["icechunk_levels"] = ",".join(str(o) for o in levels) if levels else None
+    row["icechunk_skipped"] = ice.get("skipped")
+    row["icechunk_error"] = ice.get("error")
     return row
 
 
@@ -737,6 +784,7 @@ def write_run_parquet(
     timestamp: str | None = None,
     store_kwargs: dict | None = None,
     finalize_error: str | None = None,
+    icechunk_init: dict | None = None,
 ) -> str:
     """PUT the run-level stats parquet at the store root (issue #297 phase 3).
 
@@ -758,6 +806,18 @@ def write_run_parquet(
     across the rows like ``run_id``/``n_shards`` already are, so a postmortem
     can tell "finalize failed" from "the run never happened" off the parquet
     alone. Always written, so the column set is the same every run.
+
+    ``icechunk_init`` (issue #580) is the run's companion-repo init record
+    (``summary["icechunk"]``): three more run-level columns, split the way the
+    row-level ``icechunk_*`` flattener splits its record rather than collapsed
+    into one — ``icechunk_init_repo`` (the record's ``path``),
+    ``icechunk_init_snapshot`` (the init commit), ``icechunk_init_error``
+    and ``icechunk_split_ratchet`` (the §11.5 ratchet this run applied, or null)
+    (the fail-open failure string, on the ``finalize_error`` precedent). So a
+    run's leaves join to the repo history they were committed into, and
+    "init failed" is never something a reader infers from whether a value
+    looks like a hex id. ``None`` (knob off, non-hive) writes all three null;
+    all three are always written, so the column set is the same every run.
     """
     import tempfile
 
@@ -771,6 +831,17 @@ def write_run_parquet(
     df = pd.DataFrame(rows)
     # Run-level (issue #335): constant down the column, None on a clean run.
     df["finalize_error"] = finalize_error
+    init = icechunk_init or {}
+    df["icechunk_init_repo"] = init.get("path")
+    df["icechunk_init_snapshot"] = init.get("snapshot")
+    df["icechunk_init_error"] = init.get("error")
+    # The §11.5 split ratchet (phase 6): ``"{from}->{to}"`` when this run
+    # moved the store's split_order coarser — the flag a later
+    # rewrite_manifests pass reads — else null.
+    ratchet = init.get("split_ratchet")
+    df["icechunk_split_ratchet"] = (
+        f"{ratchet['from']}->{ratchet['to']}" if isinstance(ratchet, dict) else None
+    )
     # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
     # the DataFrame's float64 inference on a column that mixes ints with
     # failure-row ``None``s silently corrupts them (issue #300 — the sweep's

@@ -269,6 +269,9 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
 
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
+    # The leaf-store object model is what stage 1 leaves unchanged (spec §11,
+    # "Not changed"), so the companion repo stays out of the count (issue #580).
+    cfg.output["icechunk"] = False
     # A ragged field so the leaf carries its whole-leaf vlen array (issue #209).
     cfg.aggregation["variables"]["h"] = {
         "function": "np.sort",
@@ -792,7 +795,11 @@ def test_flat_model_requires_fullsphere(tmp_path):
             bench_objects.expected_object_counts(grid, n_shards=1)
         with pytest.raises(NotImplementedError, match="fullsphere"):
             bench_objects.store_object_counts(str(tmp_path), grid=grid, shard_keys=[])
-    # The hive path attributes by leaf prefix (layout-agnostic) -- unaffected.
+    # The hive path ATTRIBUTION is by leaf prefix (layout-agnostic), but its
+    # leaf model needs the shard/cell orders, so it fences on those instead --
+    # named via bench_metrics.shard_cell_orders, not a bare AttributeError.
+    with pytest.raises(TypeError, match="shard/cell orders"):
+        bench_objects.expected_object_counts(rect, n_shards=1, store_layout="hive")
     assert bench_objects.expected_object_counts(
         _grid(sharded=False), n_shards=1, store_layout="hive"
     )
@@ -880,6 +887,9 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
     cfg.output["grid"]["chunk_inner"] = 8  # K = 16; sharded defaults True (#236)
+    # The leaf-store object model is what stage 1 leaves unchanged (spec §11,
+    # "Not changed"), so the companion repo stays out of the count (issue #580).
+    cfg.output["icechunk"] = False
     if not pyramid:
         cfg.output["pyramid"] = False
     cfg.aggregation["variables"]["h"] = {

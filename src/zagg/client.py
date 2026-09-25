@@ -68,6 +68,7 @@ from zagg.config import (
     get_coverage_moc,
     get_driver,
     get_handoff,
+    get_icechunk,
     get_output_endpoint_url,
     get_output_region,
     get_parent_order,
@@ -404,6 +405,10 @@ class Run:
         self._parent_order = get_parent_order(config) if grid_type == "healpix" else None
         self._child_order = get_child_order(config) if grid_type == "healpix" else None
         self.grid = grid_from_config(config)
+        # The dispatch-time Icechunk init record (issue #580), read by the
+        # tail's run-record write; None until dispatch() fires the invoke,
+        # and None for good when the knob is off.
+        self._icechunk_init: dict | None = None
         runner._check_signature(self.grid, catalog_data)
 
     def __repr__(self) -> str:
@@ -800,7 +805,9 @@ class Run:
         )
 
         s3_creds = self._source_credentials or runner._resolve_source_credentials(self.config)
-        config_dict = asdict(self.config)
+        # The facade chains no staged sweep, so the ref ladder never runs
+        # here: an unset icechunk ``commit`` ships pinned per-leaf (#580).
+        config_dict = asdict(runner._pin_icechunk_commit(self.config, self.grid, stages=False))
         output_creds_event = runner._build_output_creds_event(
             self._output_credentials, self._output_endpoint_url, self.region
         )
@@ -847,6 +854,21 @@ class Run:
                 output_creds_event=output_creds_event,
                 run_manifest=run_manifest,
             )
+            # Icechunk companion init (issue #580): synchronous, before the
+            # fan-out, fail-open — the same seam ``runner._run_lambda`` takes.
+            # The record is kept so the tail's run-record write carries the
+            # repo and its init snapshot, exactly as the runner path does —
+            # a failed init has to be recorded, not invisible (D9).
+            if get_icechunk(self.config):
+                self._icechunk_init = runner._invoke_lambda_icechunk_init(
+                    client,
+                    self.function_name,
+                    self.store,
+                    config_dict=config_dict,
+                    parent_order=self._parent_order,
+                    run_id=run_id,
+                    output_creds_event=output_creds_event,
+                )
         else:
             runner._invoke_lambda_setup(
                 client,
@@ -1015,6 +1037,7 @@ class Run:
             invoked_by=invoked_by,
             run_id=run_id,
             submap=submap,
+            semantic_hash=runner._fleet_skip_hash(self.config, self.overwrite),
         )
         error = result.get("error")
         if result.get("status_code") == 200 and not error:
@@ -1232,6 +1255,11 @@ class Run:
             # instead of reading "recorded" as "succeeded" (review, PR #343).
             finalize_error=finalize_error,
             tail_status_url=f"{run_status_prefix(self.store, run_id)}/{TAIL_NAME}",
+            # The init record dispatch() kept (issue #580): the run-level
+            # icechunk columns broadcast over every row, so a run's leaves
+            # join to the repo history they were committed into. None when
+            # the knob is off — the same value runner._run_lambda threads.
+            icechunk_init=self._icechunk_init,
         )
         if layout == "hive" and get_sweep(self.config):
             try:

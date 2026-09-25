@@ -186,12 +186,24 @@ def _bucket_leaf_refs(by_shard, dispatch: int) -> dict:
     return buckets
 
 
-def _inline_event(store_path: str, block: dict, leaves, output_creds_event=None) -> dict:
+def _split_refs(refs, dirt_keys) -> tuple:
+    """``(leaves, dirt_only)`` — a batch's union refs split by the dirt-only keys."""
+    if not dirt_keys:
+        return list(refs), []
+    return [r for r in refs if tuple(r) not in dirt_keys], [
+        r for r in refs if tuple(r) in dirt_keys
+    ]
+
+
+def _inline_event(
+    store_path: str, block: dict, leaves, output_creds_event=None, dirt_only=None
+) -> dict:
     """The event build with NO cap fallback — the shape the packer measures.
 
     :func:`build_stage_event` is this plus the last-resort conversion to
     ``discover: true``; measuring through THAT would measure the stripped
-    event and call every overflow a fit.
+    event and call every overflow a fit. ``dirt_only`` (issue #580) rides
+    only when non-empty, so an event without it is byte-identical to before.
     """
     event: dict = {"mode": "sweep", "store_path": store_path, "stage": dict(block)}
     if output_creds_event is not None:
@@ -200,10 +212,14 @@ def _inline_event(store_path: str, block: dict, leaves, output_creds_event=None)
         event["discover"] = True
     else:
         event["leaves"] = list(leaves)
+    if dirt_only:
+        event["dirt_only"] = list(dirt_only)
     return event
 
 
-def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=None) -> dict:
+def build_stage_event(
+    store_path: str, block: dict, leaves, output_creds_event=None, dirt_only=None
+) -> dict:
     """One ``mode="sweep"`` + ``stage`` worker event; the single build site.
 
     Mirrors :func:`zagg.runner._build_sweep_event`: optional keys are added
@@ -225,7 +241,7 @@ def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=N
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
 
-    event = _inline_event(store_path, block, leaves, output_creds_event)
+    event = _inline_event(store_path, block, leaves, output_creds_event, dirt_only)
     if leaves is not None and len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
         logger.warning(
             f"stage fleet: run {block.get('run_id')!r} role {block.get('role', 'stage')} "
@@ -236,10 +252,16 @@ def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=N
         )
         del event["leaves"]
         event["discover"] = True
+        # Dirt-only refs (issue #580) are in no run record, so discovery cannot
+        # recover them: they drop, loudly, and heal on a manual staged sweep.
+        if event.pop("dirt_only", None):
+            logger.warning(f"stage fleet: dropped {len(dirt_only)} dirt-only ref(s) with it")
     return event
 
 
-def _fit_batch(nodes, buckets, *, block: dict, store_path: str, output_creds_event, cap) -> list:
+def _fit_batch(
+    nodes, buckets, *, block: dict, store_path: str, output_creds_event, cap, dirt_keys=()
+) -> list:
     """Split one greedily-packed batch until its REAL event fits under the cap.
 
     The incremental accounting in :func:`pack_batches` is an estimate; this is
@@ -251,12 +273,19 @@ def _fit_batch(nodes, buckets, *, block: dict, store_path: str, output_creds_eve
     """
     leaves = [ref for node in nodes for ref in buckets.get(node, [])]
     probe = {**block, "nodes": list(nodes), "batch": _BATCH_INDEX_PROBE}
-    if len(json.dumps(_inline_event(store_path, probe, leaves, output_creds_event))) <= cap:
+    real, dirt = _split_refs(leaves, dirt_keys)
+    if len(json.dumps(_inline_event(store_path, probe, real, output_creds_event, dirt))) <= cap:
         return [(list(nodes), leaves)]
     if len(nodes) == 1:
         return [(list(nodes), None)]  # its own leaves overflow: discover
     mid = len(nodes) // 2
-    kw = dict(block=block, store_path=store_path, output_creds_event=output_creds_event, cap=cap)
+    kw = dict(
+        block=block,
+        store_path=store_path,
+        output_creds_event=output_creds_event,
+        cap=cap,
+        dirt_keys=dirt_keys,
+    )
     return _fit_batch(nodes[:mid], buckets, **kw) + _fit_batch(nodes[mid:], buckets, **kw)
 
 
@@ -285,7 +314,14 @@ def normalize_max_nodes(max_nodes):
 
 
 def pack_batches(
-    nodes, by_shard, *, block: dict, store_path: str, output_creds_event=None, max_nodes=None
+    nodes,
+    by_shard,
+    *,
+    block: dict,
+    store_path: str,
+    output_creds_event=None,
+    max_nodes=None,
+    dirt_only=None,
 ) -> list:
     """Split one tuple's dispatch nodes into invoke-sized batches.
 
@@ -314,6 +350,11 @@ def pack_batches(
     then measured with one real ``json.dumps`` and split if it still exceeds
     the cap — so a batch this function calls inline ships inline, instead of
     being silently converted to ``discover: true`` at build time.
+
+    ``dirt_only`` (issue #580, the ``by_shard`` shape) packs with the work set:
+    each batch's leaf refs are the union, which the caller splits back with
+    :func:`_split_refs` into the event's ``leaves`` and ``dirt_only`` lists —
+    the split this function measures.
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
 
@@ -325,7 +366,8 @@ def pack_batches(
     envelope["nodes"] = []
     base = len(json.dumps(build_stage_event(store_path, envelope, [], output_creds_event))) + 64
     budget = _ASYNC_PAYLOAD_CAP_BYTES - base
-    buckets = _bucket_leaf_refs(by_shard, int(block["dispatch"]))
+    buckets = _bucket_leaf_refs({**(dirt_only or {}), **by_shard}, int(block["dispatch"]))
+    dirt_keys = {tuple(r) for r in _leaf_refs(dirt_only or {})}
     grouped: list = []
     cur_nodes: list = []
     cur_bytes = 0
@@ -353,6 +395,7 @@ def pack_batches(
                 store_path=store_path,
                 output_creds_event=output_creds_event,
                 cap=_ASYNC_PAYLOAD_CAP_BYTES,
+                dirt_keys=dirt_keys,
             )
         )
     return batches
@@ -489,6 +532,7 @@ def run_stage_sweep_fleet(
     barrier_timeout_s: float = DEFAULT_BARRIER_TIMEOUT_S,
     total_barrier_budget_s: float = DEFAULT_TOTAL_BARRIER_BUDGET_S,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    dirt_only=(),
 ) -> dict:
     """One staged sweep run over the fleet: tuples, barriers, finisher last.
 
@@ -550,6 +594,13 @@ def run_stage_sweep_fleet(
     finisher's). Once the total is spent each remaining barrier degrades to a
     single check — fail-open, exactly as a timeout is.
 
+    ``dirt_only`` (issue #580) is the run's ref-only work set — the touched
+    current units :func:`zagg.sweep.dirt_only_leaves` collects. Its ancestors
+    join each tuple's dispatch nodes, and each stage event carries its node
+    slice as ``dirt_only`` (absent when empty); the worker re-gathers those
+    nodes' refs without a fold (:func:`zagg.sweep_stages.sweep_stage_pass`).
+    The finisher never sees it.
+
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
     store root, worker-written); it is read back here when it lands.
@@ -579,6 +630,10 @@ def run_stage_sweep_fleet(
     # this transport mirrors, passes decimal strings.
     scope = normalize_scope(scope)
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
+    regather, _ = _normalize_leaves(dirt_only, shard_order)
+    regather = {d: w for d, w in regather.items() if d not in by_shard}
+    dirt_keys = {tuple(r) for r in _leaf_refs(regather)}
+    work = {**regather, **by_shard}
     run_id = run_id or (
         f"stage-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
     )
@@ -600,6 +655,7 @@ def run_stage_sweep_fleet(
         "transport": "lambda",
         "records_from": records_from,
         "n_leaves": sum(len(w) for w in by_shard.values()),
+        "n_dirt_only": sum(len(w) for w in regather.values()),
         "skipped_leaves": skipped,
         # Why the run did nothing, or None. Always present: a caller reading
         # the summary should never have to know which branch produced it.
@@ -659,9 +715,9 @@ def run_stage_sweep_fleet(
         # alone otherwise. Both derive the nodes dispatcher-side, per tuple —
         # neither reads the store (D8).
         nodes = (
-            dispatch_nodes(by_shard, dispatch, scope)
+            dispatch_nodes(work, dispatch, scope)
             if coverage is None
-            else coverage_dispatch_nodes(by_shard, dispatch, coverage, scope)
+            else coverage_dispatch_nodes(work, dispatch, coverage, scope)
         )
         if not nodes:
             continue
@@ -682,16 +738,27 @@ def run_stage_sweep_fleet(
             store_path=store_path,
             output_creds_event=output_creds_event,
             max_nodes=max_nodes_per_invoke,
+            dirt_only=regather,
         )
         expected = set()
         for batch, (batch_nodes, batch_leaves) in enumerate(batches):
             expected.add(stage_record_name(dispatch, batch))
+            real, dirt = (
+                (None, []) if batch_leaves is None else _split_refs(batch_leaves, dirt_keys)
+            )
+            if batch_leaves is None and any(d.startswith(tuple(batch_nodes)) for d in regather):
+                logger.warning(
+                    f"stage fleet: node(s) {batch_nodes} overflow the payload cap and fall "
+                    "back to discover — their dirt-only refs (issue #580) are in no run "
+                    "record, so they re-gather on the next manual staged sweep"
+                )
             _fire(
                 build_stage_event(
                     store_path,
                     {**block, "nodes": batch_nodes, "batch": batch},
-                    batch_leaves,
+                    real,
                     output_creds_event,
+                    dirt,
                 )
             )
         t_stage = time.perf_counter()

@@ -1222,6 +1222,24 @@ def leaves_from_stats_records(records) -> list:
     return sorted(refs, key=lambda p: (p[0], p[1] is not None, p[1] or ""))
 
 
+def dirt_only_leaves(metas) -> list:
+    """``(shard_key, window)`` pairs of the run's DIRT-ONLY units (issue #580).
+
+    A skip-if-current unit writes no stats record (issue #388), so it never
+    reaches :func:`leaves_from_stats_records`. The one exception to "a current
+    unit enters no sweep": its lifecycle touch moved the checksums its Icechunk
+    refs carry and it rewrote its ladder sidecar, which the worker marks
+    ``icechunk_dirty``. Those units re-gather their node's refs in the staged
+    sweep without re-folding it (PR #581 question (11), ruled (a)).
+    """
+    refs = {
+        (int(m["shard_key"]), m.get("window"))
+        for m in metas
+        if m and m.get("current") and m.get("icechunk_dirty")
+    }
+    return sorted(refs, key=lambda p: (p[0], p[1] is not None, p[1] or ""))
+
+
 def discover_leaves(store_root: str, *, store_kwargs: dict | None = None) -> list:
     """Leaf refs from the run-record parquets at the product root (D22).
 

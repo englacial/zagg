@@ -2575,6 +2575,7 @@ def _write_overview(
     from mortie import generate_morton_children
     from zarr import open_array
 
+    from zagg.content_hash import staged_record
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
@@ -2614,37 +2615,38 @@ def _write_overview(
         }
     )
     stamp_window = key if windowed else None
+    # O11 content hashes (issue #342 phase 4): an overview leaf gets the same
+    # §5 record as a source leaf, computed from the folded arrays already in
+    # memory (the ratified overview-scope decision (1)) — BEFORE the stamp so
+    # it rides the stamp (issue #580) and the D20 sidecar alike; the
+    # envelope's sweep-internal skip digest (``_content_hash`` above) is a
+    # DIFFERENT recipe with a different job and stays untouched (decision
+    # (2)). Fail-open (D9 telemetry posture; §5.3 reads absence as
+    # unverifiable, never tampered): a hashing failure stamps without the key.
+    staged = {f"{target_order}/morton": words}
+    staged.update({f"{target_order}/{name}": slab for name, slab in fold["slabs"].items()})
+    hashes = staged_record(store, staged, f"sweep[overview] at {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
         granule_count=int(fold["granule_count"]),
         window=stamp_window,
         time_range=fold["time_range"] if stamp_window is not None else None,
+        content_hashes=hashes,
     )
-    # O11 content hashes (issue #342 phase 4): an overview leaf gets the same
-    # §5 D20 sidecar record as a source leaf, computed from the folded arrays
-    # already in memory (the ratified overview-scope decision (1)); the
-    # envelope's sweep-internal skip digest (``_content_hash`` above) is a
-    # DIFFERENT recipe with a different job and stays untouched (decision
-    # (2)). Sidecar naming follows the leaf basename's D23 window-only
-    # grammar (``{stem}.stats.json``) regardless of the store's manifest
-    # spec: overview basenames are v3-named unconditionally, and the legacy
-    # grammar would key every window's sidecar to one ``stats.json`` at the
-    # node. Fail-open (D9 telemetry posture; §5.3 reads absence as
-    # unverifiable, never tampered).
+    # Sidecar naming follows the leaf basename's D23 window-only grammar
+    # (``{stem}.stats.json``) regardless of the store's manifest spec:
+    # overview basenames are v3-named unconditionally, and the legacy grammar
+    # would key every window's sidecar to one ``stats.json`` at the node.
     try:
-        from zagg.content_hash import content_hashes_record, hash_arrays
         from zagg.telemetry import SPEC_V3, build_record, write_sidecar
 
-        staged = {f"{target_order}/morton": words}
-        staged.update({f"{target_order}/{name}": slab for name, slab in fold["slabs"].items()})
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=morton_word(node),
             metadata={
                 "cells_with_data": int(populated.sum()),
                 "granule_count": int(fold["granule_count"]),
-                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+                "content_hashes": hashes,
             },
             window=stamp_window,
         )

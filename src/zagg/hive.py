@@ -122,6 +122,13 @@ PRODUCT_NAME_MAX = 192
 #: cycle for a string literal.
 MULTISCALES_GROUP_NAME = "multiscales"
 
+#: The store-root child reserved for the §11 Icechunk companion repos
+#: (issue #580): one repository per pyramid order at
+#: ``{store_root}/icechunk/`` (one repo, a group per order). Reserved on the same footing as
+#: :data:`MULTISCALES_GROUP_NAME` — the D19 product-name grammar excludes it
+#: so a multi-product root walker can never classify it as a product.
+ICECHUNK_DIR_NAME = "icechunk"
+
 
 def validate_product_name(name: str) -> str:
     """Validate a D19 product name; returns it.
@@ -161,6 +168,16 @@ def validate_product_name(name: str) -> str:
         raise ValueError(
             f"product name {MULTISCALES_GROUP_NAME!r} is reserved for the multiscales "
             f"companion group at the store root (spec §4.10, issue #394)"
+        )
+    if name == ICECHUNK_DIR_NAME:
+        # The issue #580 companion repos own this store-root child (spec
+        # §11.1): a product by the same name would collide with them at every
+        # multi-product root. No legacy warning pairs with this one — the
+        # reservation lands with the section, so no store predating it can
+        # hold a product by this name.
+        raise ValueError(
+            f"product name {ICECHUNK_DIR_NAME!r} is reserved for the Icechunk "
+            f"companion repos at the store root (spec §11.1, issue #580)"
         )
     return name
 
@@ -934,6 +951,7 @@ def stamp_commit(
     window: str | None = None,
     time_range: tuple | list | None = None,
     run_id: str | None = None,
+    content_hashes: dict | None = None,
 ) -> None:
     """Stamp a shard leaf complete — the shard's FINAL write (D4).
 
@@ -956,6 +974,14 @@ def stamp_commit(
     requires — a skip-if-current read that sees a foreign FRESH stamp aborts
     loudly. Fleet-written leaves and columns never carry it; readers treat
     absence as "not a stage artifact", never as an error.
+
+    ``content_hashes`` (issue #580, additive): the spec §5.3 O11 record —
+    ``{"arrays": {path: sha256}, "combined": sha256}`` — computed by the
+    writer from the arrays it just wrote, BEFORE the stamp lands, so the stamp
+    itself certifies the bytes it seals (the D20 sidecar carries the same
+    record as telemetry). ``None`` (a writer that could not stand behind a
+    digest — the §5.2 raise gate) writes no key: absence reads as
+    unverifiable, never tampered.
     """
     if window is None and time_range is not None:
         raise ValueError(
@@ -999,6 +1025,8 @@ def stamp_commit(
         stamp["coverage"] = coverage
     if run_id is not None:
         stamp["run_id"] = str(run_id)
+    if content_hashes is not None:
+        stamp["content_hashes"] = content_hashes
     group.attrs[COMMIT_ATTR] = stamp
 
 
@@ -1469,6 +1497,49 @@ def leaf_identity_gate(
     return identity, None
 
 
+def _leaf_icechunk_refs(
+    store_root, grid, config, shard_key, leaf_path, *, column, window, sidecar_spec, store_kwargs
+) -> dict:
+    """The unit's Icechunk record (issue #580, spec §11.4) — fail-open, never raises.
+
+    Plans the leaf's units from fresh HEADs (:func:`zagg.icechunk_refs.leaf_units`:
+    its base arrays plus ``column``'s declared level) and, per the resolved
+    ``commit`` mode, commits them (``"leaf"``, after vetting the repo BEFORE
+    the plan — a missing or mismatched repo refuses for one read, not the
+    plan's ~20 requests) or writes them as the ladder's sidecar beside the
+    leaf (``"ladder"`` — no icechunk session on the leaf path; the staged
+    sweep gathers and commits them). Both the write path and the
+    skip-if-current touch call it. A failure logs and returns ``{"error"}``:
+    the leaf is normative, the repo a regenerable index (D9).
+    """
+    try:
+        from zagg.icechunk_refs import leaf_units, record_leaf, resolve_options, vet_leaf_repo
+
+        if window and window.get("label") is not None:
+            return {"skipped": "windowed"}
+        commit_leaf = resolve_options(config, grid.parent_order, grid=grid)["commit"] == "leaf"
+        repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs) if commit_leaf else None
+        units = leaf_units(
+            grid, config, shard_key, store_root, column=column, store_kwargs=store_kwargs
+        )
+        if commit_leaf:
+            return record_leaf(
+                store_root, grid, shard_key, store_kwargs=store_kwargs, units=units, repo=repo
+            )
+        if not any(e["refs"] for u in units for e in u["entries"]):
+            return {"skipped": "empty"}
+        from zagg.icechunk_ladder import write_leaf_refs
+
+        record = write_leaf_refs(
+            store_root, leaf_path, grid, units, spec=sidecar_spec, store_kwargs=store_kwargs
+        )
+        checksum = "etag" if store_root.startswith("s3://") else "last_modified"
+        return {**record, "checksum": checksum}
+    except Exception as e:
+        logger.warning(f"icechunk refs failed for shard {shard_key} (fail-open, issue #580): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def process_and_write_hive(
     shard_key,
     granule_urls,
@@ -1650,6 +1721,31 @@ def process_and_write_hive(
                 # when zero, so every non-published record stays as it was.
                 if counts.get("skipped_paths"):
                     unit_meta["touch_skipped_paths"] = counts["skipped_paths"]
+                # The touch moved the checksum every ref into this leaf
+                # carries (§11.3: the ``file://`` mtime; a multipart ETag on
+                # S3), so the refs are re-planned from fresh HEADs: a per-leaf
+                # commit lands them now; in ladder mode the sidecar is
+                # rewritten and the unit is marked ``icechunk_dirty``, so this
+                # run's staged sweep re-gathers its node as dirt-only (issue
+                # #580, PR #581 question (11) ruled (a)).
+                from zagg.config import get_icechunk
+
+                if counts["touched"] and get_icechunk(config):
+                    unit_meta["icechunk"] = _leaf_icechunk_refs(
+                        store_root,
+                        grid,
+                        config,
+                        shard_key,
+                        leaf_path,
+                        column=str(column_path).rstrip("/").rpartition("/")[2]
+                        if column_declared and column_path
+                        else None,
+                        window=window,
+                        sidecar_spec=sidecar_spec,
+                        store_kwargs=store_kwargs,
+                    )
+                    if unit_meta["icechunk"].get("sidecar"):
+                        unit_meta["icechunk_dirty"] = True
             return unit_meta
 
     box: dict = {}
@@ -1807,13 +1903,49 @@ def process_and_write_hive(
     # sidecar is PUT just before it (issue #200 phase 2), and both inherit
     # its debris semantics: a torn worker's coverage never becomes visible.
     # The leaf write order is pinned: dense (streamed, or one object each when
-    # sharded) -> ragged (one object, issue #209) -> coverage sidecar ->
-    # temporal record (issue #575, fail-open) -> stamp -> granule-id sibling
-    # (issue #388; after the stamp, inside the bracket).
+    # sharded) -> ragged (one object, issue #209) -> O11 hashes (in memory,
+    # issue #580) -> coverage sidecar -> temporal record (issue #575,
+    # fail-open) -> stamp -> granule-id sibling (issue #388; after the stamp,
+    # inside the bracket) -> leaf pyramid column (issue #383) -> Icechunk refs
+    # commit (issue #580; last, after the one post-stamp phase that can still
+    # fail the unit). The hash pass precedes both leaf-root sidecars, and the
+    # template's issue #341 clear removed a prior attempt's copies, so its
+    # ``members()`` walk never meets ``coverage.moc`` or ``temporal.toc``.
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
             write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid, staged_out=staged)
+        _write_elapsed += time.time() - _t0
+        # O11 content hashes (issue #342, spec §5): computed in-worker at
+        # write, from the STAGED arrays (the ratified source — the write path
+        # already holds every slab, so this is a memory-bandwidth pass).
+        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
+        # one-object-per-array pass and the per-chunk streaming path
+        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
+        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
+        # are the one read-back fallback inside ``hash_arrays``: they are
+        # written per chunk-block, never as a leaf slab. Computed BEFORE the
+        # stamp (issue #580) so the record rides the stamp itself — the D4
+        # seal then certifies the digest of the bytes it seals — and the
+        # caller's D20 sidecar (``telemetry.build_record``) carries the same
+        # record off ``metadata``. Hive-only by ratified decision (3): flat
+        # layouts have no leaf sidecar or stamp to record into, and no flat
+        # writer computes hashes — those stores stay verifiable by running
+        # the §5 recipe manually. Fail-open: the record is telemetry-class
+        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
+        # dropped record is strictly safer than a wrong one (the §5.2 raise
+        # gate lands here as a warning + a stamp without the key).
+        _t0 = time.time()
+        from zagg.content_hash import staged_record
+
+        record = staged_record(box["store"], staged, f"leaf {leaf_path}")
+        if record is not None:
+            metadata["content_hashes"] = record
+            # Same "populated phase_timings" gate as the write stamp below:
+            # the timing rides an existing dict, never seeds one.
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["hash"] = time.time() - _t0
+        _t0 = time.time()
         words = np.concatenate(occupied) if occupied else None
         if words is not None and words.size == 0:
             words = None
@@ -1865,6 +1997,7 @@ def process_and_write_hive(
             coverage=build_coverage(shard_key, words, grid.child_order, bitmap=bitmap, full=full),
             window=window["label"] if window else None,
             time_range=time_range,
+            content_hashes=metadata.get("content_hashes"),
         )
         # The recorded granule-id list, as this leaf's own sibling object
         # (issue #388): AFTER the stamp, so it never certifies a leaf that
@@ -1894,50 +2027,6 @@ def process_and_write_hive(
     # and a no-data shard (no leaf) stays write-less.
     if not metadata.get("error") and "phase_timings" in metadata and "store" in box:
         metadata["phase_timings"]["write"] = _write_elapsed
-    if not metadata.get("error") and "store" in box:
-        # O11 content hashes (issue #342, spec §5): computed in-worker at
-        # write, from the STAGED arrays (the ratified source — the write path
-        # already holds every slab, so this is a memory-bandwidth pass).
-        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
-        # one-object-per-array pass and the per-chunk streaming path
-        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
-        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
-        # are the one read-back fallback inside ``hash_arrays``: they are
-        # written per chunk-block, never as a leaf slab.
-        # Recorded on ``metadata`` for the caller's D20
-        # sidecar (``telemetry.build_record``). Hive-only by ratified decision
-        # (3): flat layouts have no leaf sidecar to record into, and no flat
-        # writer computes hashes — those stores stay verifiable by running
-        # the §5 recipe manually. Fail-open: the record is telemetry-class
-        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
-        # dropped record is strictly safer than a wrong one (the §5.2 raise
-        # gate lands here as a warning + no record).
-        _t0 = time.time()
-        try:
-            import warnings
-
-            from zagg.content_hash import content_hashes_record, hash_arrays
-
-            group = zarr.open_group(box["store"], path="", mode="r", zarr_format=3)
-            with warnings.catch_warnings():
-                # The leaf's own sidecars (the coverage bitmap and, on a
-                # temporal store, the issue #575 record) are the known
-                # non-zarr objects under the prefix; ``members()`` warn-skips
-                # them (the ``process_and_write_raster_hive`` precedent).
-                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
-                warnings.filterwarnings(
-                    "ignore", message=f"Object at {leaf_temporal.LEAF_TEMPORAL_NAME}"
-                )
-                metadata["content_hashes"] = content_hashes_record(
-                    hash_arrays(group, staged=staged)
-                )
-        except Exception as e:
-            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
-        else:
-            # Same "populated phase_timings" gate as the write stamp above:
-            # the timing rides an existing dict, never seeds one.
-            if "phase_timings" in metadata:
-                metadata["phase_timings"]["hash"] = time.time() - _t0
     # Release the aggregate the column fold does not need (issue #538): the
     # K sharded carriers and the streamed ragged blocks are written and dead
     # from here — nothing below reads them — so the fold's transient rides
@@ -1991,6 +2080,39 @@ def process_and_write_hive(
                 metadata["leaf_column"] = column
                 if "phase_timings" in metadata:
                     metadata["phase_timings"]["column"] = time.time() - _t0
+    # Icechunk companion refs (issue #580, spec §11.4): AFTER the stamp — the
+    # refs point at objects the stamp has just certified — and after the #383
+    # column fold, which is the LAST post-stamp phase that can still fail the
+    # unit. That ordering is load-bearing: a failed unit is retried, the retry
+    # rewrites leaf + column wholesale (same keys, new bytes, new inner-chunk
+    # offsets), and refs committed before the fold would leave the branch tip
+    # — not merely a superseded snapshot — indexing the discarded attempt's
+    # offsets (review finding). Gated on the same clean-unit condition, so the
+    # block only ever indexes a unit that actually succeeded. Fail-open itself
+    # (D9): the leaf is normative, the repo a regenerable index, so a refs
+    # failure logs and rides the stats sidecar (``icechunk.error``) but never
+    # fails the unit. Its own phase, not ``write``: the HEADs, the index GETs
+    # and the commit are index cost, not leaf cost. Gated also on the knob the
+    # init step read (``output.icechunk``); a run whose init failed lands here
+    # too and records the open error.
+    if not metadata.get("error") and "store" in box:
+        from zagg.config import get_icechunk
+
+        if get_icechunk(config):
+            _t0 = time.time()
+            metadata["icechunk"] = _leaf_icechunk_refs(
+                store_root,
+                grid,
+                config,
+                shard_key,
+                leaf_path,
+                column=metadata.get("leaf_column"),
+                window=window,
+                sidecar_spec=sidecar_spec,
+                store_kwargs=store_kwargs,
+            )
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["icechunk"] = time.time() - _t0
     return metadata
 
 
