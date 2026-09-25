@@ -8,12 +8,15 @@ closest observation, not a two-sided bracket; multiple passes bracket
 naturally (espg design ruling, 2026-08-23/24).
 
 Epochs are **store-derived**: each reference store's ``coverage.toc`` sibling
-(spec §10.5) carries per-shard word-set covers quantized at order 18
-(2^45 ns ≈ 9.77 h buckets). A cover *word* is a maximal RUN of those buckets
-(``toc_normalize`` coalesces ranges that merely abut), so the epochs are the
-midpoints of a word's **constituent buckets**, one per bucket — each within
-±4.9 h of every instant its bucket covers, against Sentinel-2's ~4.3-day
-revisit. Granule catalogs are *not* an
+(spec §10.5) carries per-shard word-set covers quantized at the pinned
+temporal order (24 since issue #575: 2^39 ns ≈ 9.2 min buckets; the block
+records its own order, so a coarsened shard decodes at its own rung). A
+cover *word* is a maximal RUN of those buckets (``toc_normalize`` coalesces
+ranges that merely abut), so the epochs are the midpoints of a word's
+**constituent buckets**, one per bucket — each within half a bucket
+(±4.6 min at the pin) of every instant its bucket covers, so the nearest-
+acquisition argmin below cannot flip on a pass near the midpoint between
+two Sentinel-2 acquisitions. Granule catalogs are *not* an
 epoch source — the leaf sub-maps record the dispatched assignment verbatim
 and inherit the CMR-hull over-assignment (~70 assigned vs 49 contributing
 pass-days on shard ``3231422244``-class cases); covers reflect only data

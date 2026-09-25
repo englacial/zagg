@@ -19,13 +19,13 @@ import numpy as np
 import pytest
 from mortie import span2toc, time2toc, toc_merge, toc_overlaps, toc_reduce
 
+from zagg import leaf_temporal as leaf_temporal_module
 from zagg.coverage import refresh_root_coverage
 from zagg.coverage_toc import (
     COVER_CAP,
     COVER_KEY,
     COVER_NAME,
     COVER_SPEC,
-    ROOT_TOC_DELTA,
     TEMPORAL_COVER_ORDER,
     TEMPORAL_COVERAGE_SPEC,
     build_cover_section,
@@ -33,7 +33,7 @@ from zagg.coverage_toc import (
     cover_unchanged,
     cover_words,
     coverage_toc,
-    coverage_toc_digest,
+    coverage_toc_counts,
     load_cover,
     load_temporal_coverage,
     merge_cover_sections,
@@ -46,6 +46,7 @@ from zagg.coverage_toc import (
     write_cover,
 )
 from zagg.hive import build_root_coverage, read_root_coverage, write_root_coverage
+from zagg.leaf_temporal import count_words, cover_from_counts, merge_counts
 
 SPEC_DATA = Path(__file__).parent / "data" / "spec"
 #: A day on the toc scale, in internal ns — enough to keep the synthetic
@@ -56,30 +57,40 @@ BASE_NS = 5_344_000_000_000_000_000
 
 
 def _leaf(seed: int, n: int = 12):
-    """A synthetic per-leaf contribution: ``(word, digest, times, cover)``.
+    """A synthetic per-leaf contribution: ``(word, counts)``.
 
     Shaped exactly like :func:`zagg.coverage_toc.read_leaf_temporal`'s return
-    — a valid ``(k, 2)`` digest sorted by mean, its row-aligned toc words,
-    the join over them, and their §10.5 quantized cover.
+    — the join over the leaf's observation words and its §10.3 counted cover,
+    each instant weighted like a centroid (the worker's shape, where every
+    word is an exact timestamp; the midpoint-counted range words of a sweep
+    backfill are ``test_leaf_temporal``'s business).
     """
     rng = np.random.default_rng(seed)
     starts = np.sort(BASE_NS + seed * 40 * DAY_NS + rng.integers(0, 30 * DAY_NS, n)).astype(
         np.uint64
     )
-    # Both variants, deliberately: a single-instant centroid keeps its exact
-    # timestamp word, a spanning one gets a conservative range.
-    words = np.array(
-        [
-            int(time2toc(int(t))) if i % 3 == 0 else int(span2toc(int(t), int(t) + 3600 * 10**9))
-            for i, t in enumerate(starts)
-        ],
-        dtype=np.uint64,
-    )
-    digest = np.empty((n, 2), dtype=np.float32)
-    digest[:, 0] = starts.astype(np.float64)
-    digest[:, 1] = rng.integers(1, 20, n).astype(np.float64)
-    order = np.lexsort((words, digest[:, 0]))
-    return int(toc_reduce(words)), digest[order], words[order], quantize_words(words)
+    words = np.asarray(time2toc(starts), dtype=np.uint64)
+    return int(toc_reduce(words)), count_words(words, rng.integers(1, 20, n))
+
+
+def _total(contributions) -> int:
+    return sum(int(part[1].obs.sum()) for parts in contributions.values() for part in parts)
+
+
+def _route(reader):
+    """Install ``reader`` at the sweep's per-leaf seam (``leaf_contribution``).
+
+    A reader returning a bare contribution is reported as the record route;
+    one returning ``(contribution, route)`` (the real seam) passes through.
+    """
+
+    def seam(leaf, *args, **kwargs):
+        got = reader(leaf, *args, **kwargs)
+        if isinstance(got, tuple) and len(got) == 2 and isinstance(got[1], str):
+            return got
+        return got, "record"
+
+    return seam
 
 
 def _contributions(seeds):
@@ -92,11 +103,12 @@ class TestSectionGrammar:
     def test_required_keys_and_string_words(self):
         section = build_temporal_section(_contributions([1, 2, 3]), ["h_tdigest"])
         assert section["spec"] == TEMPORAL_COVERAGE_SPEC
-        assert set(section) == {"spec", "source", "generated_at", "fields", "shards", "digest"}
+        assert set(section) == {"spec", "source", "generated_at", "fields", "shards", "counts"}
         assert section["fields"] == ["h_tdigest"]
         assert all(isinstance(w, str) and w.isdigit() for w in section["shards"].values())
-        assert section["digest"]["delta"] == ROOT_TOC_DELTA
-        assert section["digest"]["element"] == {"dtype": "float32", "shape": [-1, 2]}
+        assert section["counts"]["temporal_order"] == TEMPORAL_COVER_ORDER
+        assert section["counts"]["cap"] == COVER_CAP
+        assert section["counts"]["element"] == {"dtype": "uint64", "shape": [-1]}
 
     def test_an_empty_walk_builds_no_section(self):
         assert build_temporal_section({}, []) is None
@@ -108,26 +120,29 @@ class TestSectionGrammar:
         assert set(section["shards"]) == {"11213"}
         assert int(section["shards"]["11213"]) == int(toc_merge(a[0], b[0]))
 
-    def test_weight_conservation(self):
+    def test_count_conservation(self):
         contributions = _contributions([1, 2, 3])
         section = build_temporal_section(contributions, ["h_tdigest"])
-        total = sum(
-            float(part[1][:, 1].sum()) for parts in contributions.values() for part in parts
-        )
-        payload, _words = coverage_toc_digest({"temporal": section})
-        assert float(payload[:, 1].sum()) == pytest.approx(total)
-        assert section["digest"]["weight_total"] == pytest.approx(total)
+        counts = coverage_toc_counts({"temporal": section})
+        assert int(counts.obs.sum()) == section["counts"]["obs_total"] == _total(contributions)
 
-    def test_the_root_words_reduce_to_the_join_of_every_shard_word(self):
+    def test_the_root_cover_lies_inside_the_join_of_every_shard_word(self):
+        # §10.5's parity relation at the root: the counts' cover sits inside
+        # the quantized join of the shard words (equality only when every
+        # word is an instant — these leaves carry midpoint-counted ranges).
+        from mortie import toc2time
+
         section = build_temporal_section(_contributions([1, 2, 3]), ["h_tdigest"])
-        _payload, words = coverage_toc_digest({"temporal": section})
-        assert int(toc_reduce(words)) == int(
-            toc_reduce(np.array([int(w) for w in section["shards"].values()], dtype=np.uint64))
-        )
+        counts = coverage_toc_counts({"temporal": section})
+        cover, order = cover_from_counts(counts)
+        join = toc_reduce(np.array([int(w) for w in section["shards"].values()], dtype=np.uint64))
+        lo_c, hi_c = (int(x) for x in toc2time(int(toc_reduce(cover))))
+        lo_w, hi_w = (int(x) for x in toc2time(int(toc_reduce(quantize_words([join], order)))))
+        assert lo_w <= lo_c and hi_c <= hi_w
 
 
 class TestOrderIndependence:
-    """§10.3 — the fold is ONE k-way merge, so leaf order cannot matter."""
+    """§10.3 — the fold is a per-word sum, so leaf order cannot matter."""
 
     def test_permuting_the_leaves_reproduces_the_section(self):
         contributions = _contributions([4, 7, 11, 13, 17])
@@ -137,20 +152,18 @@ class TestOrderIndependence:
         for order in orders:
             other = build_temporal_section({k: contributions[k] for k in order}, ["h_tdigest"])
             assert other["shards"] == forward["shards"]
-            # Byte-for-byte: both the digest and its companion words, which is
-            # what "permutation-independent in every channel" means.
-            assert other["digest"]["payload"] == forward["digest"]["payload"]
-            assert other["digest"]["times"] == forward["digest"]["times"]
+            # Byte-for-byte: both buffers of the counts block.
+            assert other["counts"] == forward["counts"]
 
-    def test_the_fold_compresses(self):
-        # δ is provenance, not a promise about k (§10.3) — the k1 budget is
-        # scale-free, not a hard cap — but the fold must actually compress:
-        # a root digest the size of its inputs would be no summary at all.
+    def test_the_root_counts_are_the_exact_sum_of_the_leaves(self):
         contributions = _contributions(range(1, 12))
-        rows = sum(len(part[1]) for parts in contributions.values() for part in parts)
         section = build_temporal_section(contributions, ["h_tdigest"])
-        assert 0 < section["digest"]["centroids"] < rows
-        assert section["digest"]["delta"] == ROOT_TOC_DELTA
+        counts = coverage_toc_counts({"temporal": section})
+        expect = merge_counts([part[1] for parts in contributions.values() for part in parts])
+        np.testing.assert_array_equal(counts.words, expect.words)
+        np.testing.assert_array_equal(counts.obs, expect.obs)
+        assert int(counts.obs.sum()) == _total(contributions)
+        assert section["counts"]["count"] == len(expect.words) <= COVER_CAP
 
 
 class TestComposition:
@@ -167,20 +180,20 @@ class TestComposition:
         # The join is idempotent: re-merging changes nothing.
         assert merge_temporal_sections(merged, merged)["shards"] == merged["shards"]
 
-    def test_a_partial_producer_drops_the_digest(self):
+    def test_a_partial_producer_drops_the_counts(self):
         whole = build_temporal_section({"11211": [_leaf(1)], "11212": [_leaf(2)]}, ["h_tdigest"])
         partial = build_temporal_section({"11213": [_leaf(3)]}, ["h_tdigest"])
         merged = merge_temporal_sections(whole, partial)
-        # Neither side's map covers the union, so neither digest can vouch for
-        # the store — tier 1 stands, tier 2 goes.
+        # Neither side's map covers the union, so neither block can vouch for
+        # the store — tier 1 stands, tier 2 goes (summing would double-count).
         assert set(merged["shards"]) == {"11211", "11212", "11213"}
-        assert "digest" not in merged
+        assert "counts" not in merged
 
-    def test_a_whole_covering_producer_replaces_the_digest(self):
+    def test_a_whole_covering_producer_replaces_the_counts(self):
         old = build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"])
         new = build_temporal_section({"11211": [_leaf(9)]}, ["h_tdigest"])
         merged = merge_temporal_sections(old, new)
-        assert merged["digest"]["payload"] == new["digest"]["payload"]
+        assert merged["counts"] == new["counts"] != old["counts"]
 
     def test_a_producer_with_no_section_leaves_the_standing_one_alone(self):
         standing = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
@@ -221,18 +234,18 @@ class TestComposition:
         assert section_unchanged({"spec": "zagg-coverage-toc/2"}, a)
 
     def test_a_partial_producer_converges_instead_of_re_putting_forever(self):
-        """The composed digest, not the built one, is what the skip test sees.
+        """The composed counts, not the built ones, are what the skip test sees.
 
         A producer that walked one shard of a two-shard store always builds a
-        digest, and §10.4 always drops it at the seam. Comparing the built
-        section against the standing one therefore never converges; comparing
-        the MERGE against it does, on the very next pass.
+        counts block, and §10.4 always drops it at the seam. Comparing the
+        built section against the standing one therefore never converges;
+        comparing the MERGE against it does, on the very next pass.
         """
         first = build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"])
         second = build_temporal_section({"11212": [_leaf(2)]}, ["h_tdigest"])
         standing = merge_temporal_sections(first, second)
-        assert "digest" not in standing  # neither producer covered the store
-        assert second.get("digest") is not None  # ... yet the producer built one
+        assert "counts" not in standing  # neither producer covered the store
+        assert second.get("counts") is not None  # ... yet the producer built one
         assert section_unchanged(standing, second)
         assert section_unchanged(standing, first)
 
@@ -254,27 +267,32 @@ class TestAbsence:
     def test_readers_return_none_cleanly(self, envelope):
         assert load_temporal_coverage(envelope) is None
         assert coverage_toc(envelope) is None
-        assert coverage_toc_digest(envelope) is None
+        assert coverage_toc_counts(envelope) is None
         assert shards_overlapping(envelope, 0, 10**18) is None
 
-    def test_a_block_whose_buffers_disagree_with_k_is_refused(self):
-        """§10.3's MUST-check, on all three of the block's shape claims."""
+    def test_a_block_whose_buffers_disagree_is_refused(self):
+        """§10.3's MUST-checks: the two buffers, `count`, `obs_total`, the pin."""
         section = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
-        block = section["digest"]
+        block = section["counts"]
         for bad in (
-            {"centroids": block["centroids"] + 1},
-            {"centroids": None},
-            {"times": build_temporal_section(_contributions([3]), ["h"])["digest"]["times"]},
+            {"count": block["count"] + 1},
+            {"count": None},
+            {"obs": build_temporal_section(_contributions([3]), ["h"])["counts"]["obs"]},
+            {"obs_total": block["obs_total"] + 1},
+            {"temporal_order": TEMPORAL_COVER_ORDER + 1},
         ):
-            envelope = {"temporal": {**section, "digest": {**block, **bad}}}
-            with pytest.raises(ValueError, match="row-aligned"):
-                coverage_toc_digest(envelope)
+            envelope = {"temporal": {**section, "counts": {**block, **bad}}}
+            # ValueError with the spec's own wording, never a bare TypeError
+            # out of a coercion: §10.3 states each of these as a MUST on the
+            # block, and the message is what an external reader implements.
+            with pytest.raises(ValueError, match="counted cover declares"):
+                coverage_toc_counts(envelope)
 
-    def test_a_section_without_a_digest_still_prunes(self):
+    def test_a_section_without_counts_still_prunes(self):
         section = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
-        section.pop("digest")
+        section.pop("counts")
         envelope = {"temporal": section}
-        assert coverage_toc_digest(envelope) is None
+        assert coverage_toc_counts(envelope) is None
         assert set(coverage_toc(envelope)) == set(section["shards"])
 
     def test_a_store_declaring_no_temporal_field_has_no_fields(self):
@@ -300,7 +318,6 @@ class TestPartialReadsDropTheShard:
     """
 
     def test_a_failed_window_leaf_drops_its_whole_shard(self, monkeypatch):
-        import zagg.coverage_toc as toc_module
         from zagg.sweep import MocFamily
 
         def reader(leaf, *args, **kwargs):
@@ -308,7 +325,7 @@ class TestPartialReadsDropTheShard:
                 raise OSError("truncated companion")
             return _leaf(1)
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         family = MocFamily()
         family._temporal_fields = {"h_tdigest": {"sibling": "h_tdigest_times"}}
         family._accumulate_temporal("root", "11213", "root/11213_2019.zarr", {})
@@ -330,10 +347,13 @@ class TestPruning:
         contributions = _contributions([1, 5])
         section = build_temporal_section(contributions, ["h_tdigest"])
         envelope = {"temporal": section}
+        from mortie import toc2time
+
         for shard, parts in contributions.items():
             word = np.array([parts[0][0]], dtype=np.uint64)
-            lo = int(np.asarray(parts[0][1][:, 0]).min()) - DAY_NS
-            hi = int(np.asarray(parts[0][1][:, 0]).max()) + DAY_NS
+            start, end = toc2time(parts[0][1].words)
+            lo = int(np.min(np.asarray(start, np.uint64))) - DAY_NS
+            hi = int(np.max(np.asarray(end, np.uint64))) + DAY_NS
             assert bool(np.asarray(toc_overlaps(word, lo, hi))[0])
             assert shard in shards_overlapping(envelope, lo, hi)
 
@@ -352,10 +372,7 @@ class TestCoverPruning:
         a = BASE_NS + rng.integers(0, 6 * 3600 * 10**9, 40).astype(np.uint64)
         b = BASE_NS + 900 * DAY_NS + rng.integers(0, 6 * 3600 * 10**9, 40).astype(np.uint64)
         words = np.asarray(time2toc(np.concatenate([a, b])), dtype=np.uint64)
-        digest = np.empty((len(words), 2), dtype=np.float32)
-        digest[:, 0] = np.concatenate([a, b]).astype(np.float64)
-        digest[:, 1] = 1.0
-        contributions = {"11213": [(int(toc_reduce(words)), digest, words, quantize_words(words))]}
+        contributions = {"11213": [(int(toc_reduce(words)), count_words(words))]}
         section = build_temporal_section(contributions, ["h"])
         cover = build_cover_section(contributions, ["h"], 4)
         return {"temporal": section}, cover
@@ -487,11 +504,13 @@ class TestCoverPruning:
 
     def test_the_cover_never_under_reports_the_true_instants(self):
         envelope, cover = self._two_campaign_shard()
-        rng = np.random.default_rng(7)
-        # Windows straddling real instants must always select the shard.
-        for day in (0, 900):
-            t = BASE_NS + day * DAY_NS + int(rng.integers(0, 6 * 3600 * 10**9))
-            assert shards_overlapping(envelope, t - 1, t + 1, cover=cover) == ["11213"]
+        # The helper's own instants (same seed): windows straddling any real
+        # instant must always select the shard.
+        rng = np.random.default_rng(3)
+        a = BASE_NS + rng.integers(0, 6 * 3600 * 10**9, 40).astype(np.uint64)
+        b = BASE_NS + 900 * DAY_NS + rng.integers(0, 6 * 3600 * 10**9, 40).astype(np.uint64)
+        for t in (*a[::7], *b[::7]):
+            assert shards_overlapping(envelope, int(t) - 1, int(t) + 1, cover=cover) == ["11213"]
 
     def _mixed_shape(self):
         """One store touching every arm: word set, empty, debris, tier 1, cover-only."""
@@ -507,10 +526,7 @@ class TestCoverPruning:
                 ]
             ).astype(np.uint64)
             words = np.asarray(time2toc(t), dtype=np.uint64)
-            digest = np.empty((len(words), 2), dtype=np.float32)
-            digest[:, 0] = t.astype(np.float64)
-            digest[:, 1] = 1.0
-            contributions[key] = [(int(toc_reduce(words)), digest, words, quantize_words(words))]
+            contributions[key] = [(int(toc_reduce(words)), count_words(words))]
         envelope = {"temporal": build_temporal_section(contributions, ["h"])}
         cover = build_cover_section(contributions, ["h"], 4)
         cover["shards"] = dict(cover["shards"])
@@ -604,7 +620,7 @@ class TestOnCommittedStores:
 
         The §7 ``temporal/`` fixture ships ONE shard, which is exactly the
         shape that hides the composition seam: a single-shard producer is
-        always whole-covering, so its digest survives the merge and the skip
+        always whole-covering, so its counts survive the merge and the skip
         test converges by accident.
         """
         from zagg.grids.morton import morton_word
@@ -623,9 +639,7 @@ class TestOnCommittedStores:
         assert envelope["temporal"]["source"] == "refresh"
         # Same walk, same words: only the carrier's provenance differs.
         assert envelope["temporal"]["shards"] == committed["temporal"]["shards"]
-        assert (
-            envelope["temporal"]["digest"]["payload"] == committed["temporal"]["digest"]["payload"]
-        )
+        assert envelope["temporal"]["counts"] == committed["temporal"]["counts"]
         # The §10.5 sibling rebuilds from the same walk: same word sets, its
         # own provenance, and the carrier's marker points at it.
         committed_cover = json.loads((SPEC_DATA / "temporal" / COVER_NAME).read_text())
@@ -675,9 +689,7 @@ class TestOnCommittedStores:
         committed = json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
         written = read_root_coverage(root)
         assert written["temporal"]["shards"] == committed["temporal"]["shards"]
-        assert (
-            written["temporal"]["digest"]["payload"] == committed["temporal"]["digest"]["payload"]
-        )
+        assert written["temporal"]["counts"] == committed["temporal"]["counts"]
         # The §10.5 sibling lands beside it, byte-equal in content to the
         # committed fixture's, and the section's marker names its revision.
         committed_cover = json.loads((SPEC_DATA / "temporal" / COVER_NAME).read_text())
@@ -750,18 +762,17 @@ class TestOnCommittedStores:
             read_leaf_temporal(leaf, int(manifest["cell_order"]), fields)
 
     def test_refresh_drops_only_the_shard_whose_leaf_failed(self, tmp_path, monkeypatch):
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         self._clone_shard(root)
-        real = toc_module.read_leaf_temporal
+        real = leaf_temporal_module.leaf_contribution
 
         def reader(leaf, *args, **kwargs):
             if "11214" in leaf:
                 raise OSError("truncated companion")
             return real(leaf, *args, **kwargs)
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         envelope = refresh_root_coverage(root)
         # The spatial walk still lists both shards; the temporal map lists
         # only the one it could read whole (§10.2's unknown-not-empty rule).
@@ -815,10 +826,8 @@ class TestOnCommittedStores:
         assert both[0] not in (one[0], other[0])  # neither field alone covers it
         section = build_temporal_section({"11213": [both]}, ["g_tdigest", "h_tdigest"])
         assert int(section["shards"]["11213"]) == both[0]
-        # §10.3's once-per-field counting rule, seen from the weight side.
-        assert section["digest"]["weight_total"] == pytest.approx(
-            float(one[1][:, 1].sum()) + float(other[1][:, 1].sum())
-        )
+        # §10.3's once-per-field counting rule, seen from the count side.
+        assert section["counts"]["obs_total"] == int(one[1].obs.sum()) + int(other[1].obs.sum())
 
     def test_a_manifest_without_a_cell_order_publishes_no_section(self, tmp_path, caplog):
         """A required key missing is a broken manifest, not group ``"0"``.
@@ -860,7 +869,6 @@ class TestOnCommittedStores:
         with the ``temporal`` key gone — during exactly the incident an
         operator reached for refresh to repair.
         """
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         standing = json.loads((Path(root) / "coverage.moc").read_text())["temporal"]
@@ -869,7 +877,7 @@ class TestOnCommittedStores:
         def reader(*args, **kwargs):
             raise OSError("credentials expired mid-walk")
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         envelope = refresh_root_coverage(root)
         assert envelope["ranges"]  # the spatial refresh still succeeded
         assert envelope["temporal"] == standing
@@ -887,7 +895,6 @@ class TestOnCommittedStores:
         would be this revision editing another's bytes at the one seam a
         mixed-version fleet actually meets.
         """
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         moc = Path(root) / "coverage.moc"
@@ -900,7 +907,7 @@ class TestOnCommittedStores:
         def reader(*args, **kwargs):
             raise OSError("credentials expired mid-walk")
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         rebuilt = refresh_root_coverage(root)["temporal"]
         assert rebuilt == standing  # byte for byte, marker included
         assert COVER_KEY not in rebuilt
@@ -908,20 +915,19 @@ class TestOnCommittedStores:
     def test_refresh_composes_a_partial_rebuild_with_the_standing_section(
         self, tmp_path, monkeypatch
     ):
-        import zagg.coverage_toc as toc_module
 
         root = self._copy(tmp_path, "temporal")
         self._clone_shard(root)
         refresh_root_coverage(root)  # both shards land in the standing section
         standing_cover = read_cover(root)
-        real = toc_module.read_leaf_temporal
+        real = leaf_temporal_module.leaf_contribution
 
         def reader(leaf, *args, **kwargs):
             if "11214" in leaf:
                 raise OSError("truncated companion")
             return real(leaf, *args, **kwargs)
 
-        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         envelope = refresh_root_coverage(root)
         # The shard the walk could not read keeps the word the last whole walk
         # published: a partial rebuild composes, it does not overwrite.
@@ -939,9 +945,9 @@ class TestOnCommittedStores:
         """Sweep idempotence where the seam actually bites (§10.4).
 
         Two shards, two incremental sweeps: neither producer covers the store,
-        so the composed section carries no digest while every pass keeps
-        building one. The skip test has to converge on what was WRITTEN, or
-        the fleet re-PUTs a byte-identical root object forever.
+        so the composed section carries no counts while every pass keeps
+        building a block. The skip test has to converge on what was WRITTEN,
+        or the fleet re-PUTs a byte-identical root object forever.
         """
         from zagg.sweep import run_sweep
 
@@ -953,7 +959,7 @@ class TestOnCommittedStores:
             assert summary["families"]["moc"]["root_moc_written"] is True
         written = read_root_coverage(root)
         assert set(written["temporal"]["shards"]) == {"11213", "11214"}
-        assert "digest" not in written["temporal"]
+        assert "counts" not in written["temporal"]
         # The §10.5 sibling accumulated BOTH incremental producers' blocks —
         # the convergence `cover_unchanged` is tested on below.
         assert set(read_cover(root)["shards"]) == {"11213", "11214"}
@@ -1029,7 +1035,7 @@ class TestOnCommittedStores:
         assert not (Path(root) / COVER_NAME).exists()
 
 
-#: One §10.5 cover-order bucket, in internal ns (order 18 -> span 2^45).
+#: One §10.5 cover-order bucket, in internal ns (order 24 -> span 2^39).
 BUCKET_NS = 1 << (63 - TEMPORAL_COVER_ORDER)
 
 
@@ -1037,10 +1043,12 @@ class TestQuantization:
     """§10.5's quantization law: widening only, gap-preserving, commuting."""
 
     def _instants(self, n_days=49, per_day=200, seed=489):
+        # The source shape §10.5's pin is chosen for: a PASS is ~1 s wide
+        # (issue #575), so each day's instants fall inside one second.
         rng = np.random.default_rng(seed)
         days = np.sort(rng.choice(2_700, n_days, replace=False))
         ts = np.concatenate(
-            [BASE_NS + int(d) * DAY_NS + rng.integers(0, 20 * 60 * 10**9, per_day) for d in days]
+            [BASE_NS + int(d) * DAY_NS + rng.integers(0, 10**9, per_day) for d in days]
         ).astype(np.uint64)
         return days, ts
 
@@ -1100,7 +1108,7 @@ class TestQuantization:
     )
     def test_a_gap_survives_iff_it_holds_a_whole_aligned_bucket(self, frac, spans, survives):
         # §10.5's only resolution promise, pinned as bytes in both directions:
-        # the guaranteed floor is TWO bucket spans (2 * 2^45 ns ~ 19.5 h), not one.
+        # the guaranteed floor is TWO bucket spans (2 * 2^39 ns ~ 18.3 min), not one.
         t0 = (BASE_NS // BUCKET_NS) * BUCKET_NS + int(frac * BUCKET_NS)
         t1 = t0 + int(spans * BUCKET_NS)
         cover = quantize_words(time2toc(np.array([t0, t1], dtype=np.uint64)))
@@ -1161,7 +1169,7 @@ class TestCoverSection:
         decoded = cover_words(section)
         assert set(decoded) == set(contributions)
         for decimal, parts in contributions.items():
-            expect = quantize_words(np.concatenate([p[3] for p in parts]))
+            expect, _order = cover_from_counts(merge_counts([p[1] for p in parts]))
             assert np.array_equal(decoded[decimal], expect)
 
     def test_an_empty_walk_builds_no_object(self):
@@ -1170,22 +1178,27 @@ class TestCoverSection:
     def test_window_leaves_union_into_one_shard_block(self):
         parts = [_leaf(3), _leaf(9)]
         section = build_cover_section({"11213": parts}, ["h"], 4)
-        expect = quantize_words(np.concatenate([p[3] for p in parts]))
+        expect, _order = cover_from_counts(merge_counts([p[1] for p in parts]))
         assert np.array_equal(cover_words(section)["11213"], expect)
 
     def test_the_cap_coarsens_by_order_and_records_it(self, caplog):
-        # 600 instants two buckets apart: 600 words at the pinned order,
-        # over the 512 cap; one coarsening step (span doubles) lands at 300.
+        # 600 instants two buckets apart: the buckets never abut, so the
+        # NORMALIZED cover is 600 words at the pinned order, over the 512 cap.
+        # §10.5's cap is on those words, so ONE rung down suffices — the
+        # doubled buckets abut and `toc_normalize` coalesces the whole run
+        # into a single word — and the block lands one order below the pin.
         ts = (BASE_NS + np.arange(600, dtype=np.uint64) * np.uint64(2 * BUCKET_NS)).astype(
             np.uint64
         )
-        cover = quantize_words(time2toc(ts))
+        stamps = np.asarray(time2toc(ts), dtype=np.uint64)
+        cover = quantize_words(stamps)
         assert len(cover) == 600
-        contributions = {"11213": [(int(toc_reduce(cover)), np.empty((0, 2)), [], cover)]}
+        contributions = {"11213": [(int(toc_reduce(stamps)), count_words(stamps))]}
         with caplog.at_level("WARNING"):
             section = build_cover_section(contributions, ["h"], 4)
         block = section["shards"]["11213"]
         assert block["temporal_order"] == TEMPORAL_COVER_ORDER - 1
+        assert block["count"] == 1
         assert block["count"] <= COVER_CAP
         assert "coarsened" in caplog.text
         effective = block["temporal_order"]
@@ -1200,6 +1213,30 @@ class TestCoverSection:
         # `test_parity_with_the_tier_one_map` never reaches.
         tier1 = int(toc_reduce(cover))
         assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], effective)))
+
+    def test_an_abutting_run_over_the_cap_stays_at_the_pin(self, caplog):
+        """§10.5's cap counts the COVER's words, not the counts' buckets.
+
+        600 consecutive occupied buckets are 600 counted-cover keys (§10.3,
+        un-coalesced) but exactly ONE §10.5 word, because abutting buckets
+        coalesce. Capping the buckets instead would coarsen this shard below
+        the pin for a cover that was never near the cap — and would disagree
+        with :func:`merge_cover_sections`, which caps the normalized words.
+        """
+        ts = (BASE_NS + np.arange(600, dtype=np.uint64) * np.uint64(BUCKET_NS)).astype(np.uint64)
+        stamps = np.asarray(time2toc(ts), dtype=np.uint64)
+        counts = count_words(stamps)
+        assert counts.words.size == 600 > COVER_CAP
+        assert len(quantize_words(stamps)) == 1
+        contributions = {"11213": [(int(toc_reduce(stamps)), counts)]}
+        with caplog.at_level("WARNING"):
+            section = build_cover_section(contributions, ["h"], 4)
+        block = section["shards"]["11213"]
+        assert "temporal_order" not in block and block["count"] == 1
+        assert "coarsened" not in caplog.text
+        # And the same shard through the other §10.5 seam lands identically.
+        merged = merge_cover_sections(section, section)
+        assert merged["shards"]["11213"] == block
 
     def test_parity_with_the_tier_one_map(self):
         contributions = _contributions([1, 5, 11])
@@ -1228,7 +1265,7 @@ class TestCoverComposition:
         merged = merge_cover_sections(a, b)
         assert set(merged["shards"]) == {"11210", "11211", "11219"}
         assert merged["fields"] == ["g", "h"]
-        union = quantize_words(np.concatenate([_leaf(2)[3], _leaf(7)[3]]))
+        union, _order = cover_from_counts(merge_counts([_leaf(2)[1], _leaf(7)[1]]))
         assert np.array_equal(cover_words(merged)["11211"], union)
         assert np.array_equal(cover_words(merged)["11210"], cover_words(a)["11210"])
 
@@ -1271,7 +1308,7 @@ class TestCoverComposition:
     def test_a_block_decodes_at_the_objects_pin_not_the_modules(self):
         # §10.5 defines an absent block `temporal_order` against the OBJECT's
         # declaration. A conforming order-14 object leaves its at-the-pin
-        # blocks unmarked, and a reader must not read them as order 18.
+        # blocks unmarked, and a reader must not read them at this build's pin.
         from zagg.coverage_toc import _encode_cover_block
 
         section = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
@@ -1516,19 +1553,15 @@ class TestCaliforniaShape:
     N_DAYS, PER_DAY, SPAN_DAYS = 49, 200, 2_700
 
     def _shard(self):
+        # A pass crosses the shard in ~1 s (issue #575): each day's 200
+        # instants fall inside one second.
         rng = np.random.default_rng(3231242244 % 2**31)
         days = np.sort(rng.choice(self.SPAN_DAYS, self.N_DAYS, replace=False))
         ts = np.concatenate(
-            [
-                BASE_NS + int(d) * DAY_NS + rng.integers(0, 20 * 60 * 10**9, self.PER_DAY)
-                for d in days
-            ]
+            [BASE_NS + int(d) * DAY_NS + rng.integers(0, 10**9, self.PER_DAY) for d in days]
         ).astype(np.uint64)
         words = np.asarray(time2toc(ts), dtype=np.uint64)
-        digest = np.empty((len(words), 2), dtype=np.float32)
-        digest[:, 0] = ts.astype(np.float64)
-        digest[:, 1] = 1.0
-        contributions = {"11213": [(int(toc_reduce(words)), digest, words, quantize_words(words))]}
+        contributions = {"11213": [(int(toc_reduce(words)), count_words(words))]}
         envelope = {"temporal": build_temporal_section(contributions, ["h"])}
         cover = build_cover_section(contributions, ["h"], 4)
         return days, words, envelope, cover
@@ -1552,7 +1585,7 @@ class TestCaliforniaShape:
             assert shards_overlapping(envelope, *self._day_window(d), cover=cover) == ["11213"]
         # INTERIOR gaps only: tier 1's one envelope word spans first..last
         # pass, so it prunes nothing between them — the cover must. At the
-        # order-18 pin a bucket reaches < 0.41 day past an instant, so day
+        # pinned order a bucket reaches minutes past an instant, so day
         # distance >= 2 from every pass is guaranteed gap.
         far = [
             d for d in range(min(day_set), max(day_set)) if min(abs(p - d) for p in day_set) >= 2
