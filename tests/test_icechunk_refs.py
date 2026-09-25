@@ -609,6 +609,25 @@ class TestLeafRefs:
         assert rag["sharded"] is True and rag["refs"] == 1
         assert [bool(loc) for loc in rag["locations"]] == [True, False, False, False]
 
+    def test_a_foreign_leaf_root_object_is_never_planned(self, monkeypatch, cfg, tmp_path):
+        """A non-zarr object inside the leaf — the §10.6 ``temporal.toc``
+        record (issue #575) or the ``coverage.moc`` bitmap — is neither
+        enumerated nor referenced: the plan is keyed by the grid's named
+        arrays and reads under ``{leaf}/{group}/{name}/c/`` only."""
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        shard = _shards(grid, 1)[0]
+        assert _write_leaf(monkeypatch, grid, root, shard).get("error") is None
+        leaf = tmp_path / "store" / hive.shard_leaf_path("", shard).lstrip("/")
+        for name in ("temporal.toc", hive.COVERAGE_SIDECAR):
+            (leaf / name).write_bytes(b"{not zarr}")
+        plan = icechunk_refs.leaf_ref_plan(grid, shard, root, store_kwargs={})
+        assert plan and {e["path"] for e in plan} <= set(grid.shard_spec().members)
+        locations = [loc for e in plan for loc in e.get("locations", [])] + [
+            c[1] for e in plan for c in e.get("chunks", [])
+        ]
+        assert locations and not [loc for loc in locations if loc.endswith((".toc", ".moc"))]
+
     @pytest.mark.parametrize(
         "mutate, match",
         [

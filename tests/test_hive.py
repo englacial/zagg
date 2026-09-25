@@ -1352,6 +1352,55 @@ class TestProcessAndWriteHive:
         rewrite(feed=True)
         assert leaf_temporal.read_leaf_temporal_record(leaf) is None
 
+    def test_a_rerun_hashes_before_either_sidecar_without_member_warnings(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issues #575/#580: the O11 pass runs BEFORE the coverage sidecar and
+        the temporal record, and the issue #341 clear has removed a prior
+        attempt's copies, so ``members()`` never meets ``temporal.toc`` or
+        ``coverage.moc`` — no warning filter guards the hash pass — and the
+        stamp carries ``content_hashes`` on the first write and the rewrite.
+        """
+        import warnings
+        from pathlib import Path
+
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+        for _ in range(2):
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                meta = hive.process_and_write_hive(
+                    shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+                )
+            assert not [w for w in seen if str(w.message).startswith("Object at")]
+            assert (Path(leaf) / leaf_temporal.LEAF_TEMPORAL_NAME).exists()
+            assert (Path(leaf) / hive.COVERAGE_SIDECAR).exists()
+            stamp = hive.read_commit(open_store(leaf))
+            assert stamp["content_hashes"] == meta["content_hashes"]
+            assert stamp["content_hashes"]["arrays"]
+
     def test_non_temporal_config_writes_no_record(self, monkeypatch, cfg, tmp_path):
         from zagg import leaf_temporal
 
