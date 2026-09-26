@@ -154,6 +154,15 @@ class RunHandle:
     harvest loop means a completed run; :meth:`wait` is the explicit form (and
     the only one taking a timeout). Only a handle nobody drains truncates the
     tail — the finisher is a daemon so that case cannot hang exit.
+
+    Under ``output.sweep: "stages"`` the tail also chains the staged sweep
+    (issue #588), invoke-and-poll on the finisher thread, so the join can
+    block up to the fleet's total barrier budget
+    (:data:`zagg.sweep_fleet.DEFAULT_TOTAL_BARRIER_BUDGET_S`, 7,200 s) after
+    the last shard settles. A process exit or kernel restart in that window
+    cuts the sweep off while it holds the store lease; the lease's TTL expiry
+    is the designed recovery (see ``runner._invoke_lambda_stage_sweep``, "If
+    the dispatcher dies mid-barrier"), and the run is left untagged.
     """
 
     def __init__(
@@ -348,7 +357,10 @@ class RunHandle:
         (``runner._RUN_STATS_VERIFY_WINDOW_S``, 20 s as shipped) and re-fires
         once if it has not — so even a fully successful run can spend ~2x that
         window here. Anything under ~40 s risks a false ``TimeoutError``; pass
-        ``None`` to just block (review finding, PR #333).
+        ``None`` to just block (review finding, PR #333). Under ``output.sweep:
+        "stages"`` the tail also runs the staged sweep (issue #588), bounded by
+        :data:`zagg.sweep_fleet.DEFAULT_TOTAL_BARRIER_BUDGET_S` (7,200 s), so
+        size ``timeout`` off that budget there, or pass ``None``.
         """
         if self._finisher is not None:
             self._finisher.join(timeout)
@@ -732,6 +744,9 @@ class Run:
         with its Icechunk ``commit`` mode pinned the way ``runner._run_lambda``
         pins it (issue #588): ``ladder`` when ``output.sweep: "stages"`` walks
         a ``/2`` ladder — the tail chains that staged sweep — else ``leaf``.
+        Under ``sweep: "stages"`` the handle's tail chains the staged sweep
+        whatever the mode, so draining it can block up to the fleet's total
+        barrier budget (see :class:`RunHandle`).
 
         Parameters
         ----------
@@ -1160,8 +1175,13 @@ class Run:
         completed staged sweep (:func:`runner._staged_sweep_incomplete`). The
         tail marker precedes the staged sweep, as on the CLI. A reattached
         handle chains no staged sweep (:meth:`Run.attach` is observe-only;
-        the sweep is the dispatcher's). A finalize failure goes through the
-        shared :func:`runner._finalize_with_retry` (issue #335 — one contract
+        the sweep is the dispatcher's). The staged sweep blocks this daemon
+        finisher up to :data:`zagg.sweep_fleet.DEFAULT_TOTAL_BARRIER_BUDGET_S`
+        (7,200 s); a process exit or kernel restart meanwhile cuts it off while
+        it holds the store lease, whose TTL expiry is the designed recovery
+        (``runner._invoke_lambda_stage_sweep``, "If the dispatcher dies
+        mid-barrier") — the run is then left untagged. A finalize failure goes
+        through the shared :func:`runner._finalize_with_retry` (issue #335 — one contract
         for the CLI and the facade): it warns immediately (``RuntimeWarning`` —
         notebook-visible while the tail is still running), retries once after a
         fixed 5 s backoff, and only a still-failing finalize is recorded on the
@@ -1334,6 +1354,10 @@ class Run:
                     and self._parent_order is not None
                 ):
                     stage_chained = True
+                    logger.info(
+                        f"chaining staged sweep over {len(leaves)} leaves "
+                        f"({len(dirt_only)} dirt-only) for run {run_id}"
+                    )
                     handle.stage_sweep = runner._invoke_lambda_stage_sweep(
                         client,
                         self.function_name,
