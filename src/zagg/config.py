@@ -1307,6 +1307,17 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
         )
+    # Versioned leaves (issue #582, spec §1.5): a boolean kill-switch, default
+    # ON for hive (get_leaf_versions resolves it); ``false`` keeps the legacy
+    # in-place leaf for readers that do not yet follow ``current``.
+    leaf_versions = config.output.get("leaf_versions")
+    if leaf_versions is not None and not isinstance(leaf_versions, bool):
+        raise ValueError(f"output.leaf_versions must be a boolean (got {leaf_versions!r})")
+    if leaf_versions and get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.leaf_versions requires output.store_layout: hive (a version subgroup "
+            "lives under a hive leaf's stable root)"
+        )
     # Icechunk companion repo (issue #580, spec §11): same posture as sweep —
     # boolean when present, default ON for hive (get_icechunk resolves it),
     # explicit true on a non-hive store is a config mistake (the repo indexes
@@ -3400,6 +3411,22 @@ def get_sweep(config: PipelineConfig) -> bool:
     fire-and-forget ``mode="sweep"`` worker Event invoke.
     """
     flag = config.output.get("sweep")
+    if flag is None:
+        return get_store_layout(config) == "hive"
+    return bool(flag)
+
+
+def get_leaf_versions(config: PipelineConfig) -> bool:
+    """Whether hive leaves are written VERSIONED (issue #582, spec §1.5).
+
+    Default ON for hive-layout stores: each unit's arrays go to a fresh
+    ``run-{run_id}-{attempt}`` subgroup under the stable leaf root, whose
+    stamp names it as ``current``, so a replacement never rewrites bytes an
+    earlier run tag references. ``output.leaf_versions: false`` keeps the
+    legacy in-place leaf — the switch for a store whose readers do not yet
+    follow ``current``. Layout, not semantics: outside the D19 core.
+    """
+    flag = config.output.get("leaf_versions")
     if flag is None:
         return get_store_layout(config) == "hive"
     return bool(flag)

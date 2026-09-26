@@ -3186,6 +3186,9 @@ def _run_local(
                     allow_contraction=allow_contraction,
                     semantic_hash=run_semantic_hash,
                     sidecar_spec=manifest["spec"],
+                    # Versioned leaves (issue #582): the run identity names
+                    # the version subgroup each unit writes.
+                    run_id=run_id,
                     **extra,
                 )
                 # A current/refused unit wrote nothing — no record, no

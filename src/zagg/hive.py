@@ -69,6 +69,15 @@ HIVE_SPEC = "morton-hive/1"
 #: manifest carries a temporal block; a ``/1`` store *is* a ``/2`` store with
 #: ``schedule: none``, so ``/1`` stays the spec written for unwindowed stores.
 HIVE_SPEC_V2 = "morton-hive/2"
+#: Versioned leaves (issue #582, spec §1.5): the stable leaf root is a
+#: POINTER STAMP naming ``current``, and the arrays live in a version
+#: subgroup ``run-{run_id}-{attempt}`` that is never rewritten once stamped.
+#: Marked by the ``current`` key alone — the stamp's ``spec`` stays ``/1`` or
+#: ``/2`` as windowing assigns it (``/3`` is the D23 window-only dialect,
+#: :data:`zagg.telemetry.SPEC_V3`); a stamp without ``current`` is a legacy
+#: leaf. Version names begin with this prefix, so a leaf-root member is never
+#: mistaken for a cell-order digit group (§4.2).
+VERSION_PREFIX = "run-"
 #: Root manifest object name (the root-only exception to the node invariant).
 MANIFEST_NAME = "morton_hive.json"
 #: Root-group attrs key carrying the commit stamp (D4).
@@ -927,14 +936,20 @@ def read_coverage_bitmap(
     from zagg.grids.morton import morton_word
     from zagg.store import open_store
 
+    stamp = read_commit(open_store(leaf_root, **store_kwargs)) if coverage is None else None
     if coverage is None:
-        coverage = read_coverage(open_store(leaf_root, **store_kwargs))
+        coverage = (stamp or {}).get("coverage")
     if not coverage or coverage.get("encoding") != "bitmap" or not coverage.get("sidecar"):
         return None
     # Windowed leaves (issue #246) carry `{full_id}_{window}.zarr` basenames;
     # the shard id is the part before the first `_` (the frozen parse rule).
     shard = morton_word(split_leaf_name(leaf_root.rstrip("/").rsplit("/", 1)[-1])[0])
-    store = open_object_store(leaf_root, **store_kwargs)
+    # The sidecar lives beside the arrays, so a versioned leaf's (spec §1.5,
+    # issue #582) is in the current version: resolve through the root stamp
+    # — read here only when the caller passed the envelope without it.
+    if stamp is None:
+        stamp = read_commit(open_store(leaf_root, **store_kwargs))
+    store = open_object_store(leaf_data_path(leaf_root, stamp), **store_kwargs)
     try:
         data = obstore.get(store, str(coverage["sidecar"])).bytes()
     except (FileNotFoundError, NotFoundError):
@@ -952,8 +967,8 @@ def stamp_commit(
     time_range: tuple | list | None = None,
     run_id: str | None = None,
     content_hashes: dict | None = None,
-) -> None:
-    """Stamp a shard leaf complete — the shard's FINAL write (D4).
+) -> dict:
+    """Stamp a shard leaf complete — the shard's FINAL write (D4); the stamp written.
 
     One small PUT rewriting the leaf's root ``zarr.json`` (which the template
     already created), not consolidation. Until this lands, the leaf prefix is
@@ -982,6 +997,11 @@ def stamp_commit(
     record as telemetry). ``None`` (a writer that could not stand behind a
     digest — the §5.2 raise gate) writes no key: absence reads as
     unverifiable, never tampered.
+
+    On a versioned leaf (issue #582, spec §1.5) ``leaf_store`` is the VERSION
+    subgroup; the returned dict is what the caller mirrors onto the stable
+    root with :func:`write_pointer_stamp` once the version's refs are
+    recorded. The stamp itself is identical in form to a legacy leaf's.
     """
     if window is None and time_range is not None:
         raise ValueError(
@@ -1028,6 +1048,59 @@ def stamp_commit(
     if content_hashes is not None:
         stamp["content_hashes"] = content_hashes
     group.attrs[COMMIT_ATTR] = stamp
+    return stamp
+
+
+def leaf_version_name(run_id, attempt: str | None = None) -> str:
+    """A version subgroup name under the stable leaf root: ``run-{run_id}-{attempt}`` (§1.5).
+
+    ``attempt`` is a per-invocation nonce (a fresh one is drawn when omitted)
+    so two writers of one unit in one run — a duplicate-invoke retry, a
+    redundant fleet worker — never share a prefix; the run tag ``run-{run_id}``
+    still groups a run's versions by prefix.
+    """
+    import uuid
+
+    return f"{VERSION_PREFIX}{run_id}-{attempt or uuid.uuid4().hex[:8]}"
+
+
+def leaf_data_path(leaf_path: str, stamp: dict | None) -> str:
+    """Where a leaf's arrays live given its ROOT stamp (§1.5): the version, or the root itself.
+
+    A stamp naming ``current`` is a versioned leaf's pointer; absent (or a
+    legacy stamp) the root prefix IS the leaf. The one reader rule.
+    """
+    current = (stamp or {}).get("current")
+    if not current:
+        return leaf_path
+    if not str(current).startswith(VERSION_PREFIX) or "/" in str(current):
+        raise ValueError(f"leaf {leaf_path} names an invalid version {current!r} (spec §4.2)")
+    return f"{leaf_path.rstrip('/')}/{current}"
+
+
+def resolve_leaf(leaf_path: str, **store_kwargs) -> tuple[str, dict | None]:
+    """``(data_path, stamp)`` for a leaf root: one GET, the pointer stamp read anyway.
+
+    ``stamp`` is ``None`` for absent/unstamped debris (then ``data_path`` is
+    the root, which holds nothing a reader may trust).
+    """
+    from zagg.store import open_store
+
+    stamp = read_commit(open_store(leaf_path, read_only=True, **store_kwargs))
+    return leaf_data_path(leaf_path, stamp), stamp
+
+
+def write_pointer_stamp(leaf_store, stamp: dict, current: str) -> dict:
+    """The stable root's pointer stamp: the version's stamp plus ``current`` (§1.5 step 4).
+
+    One PUT of the root ``zarr.json`` — the swap that makes a new version
+    live. Creates the root group when this is the leaf's first versioned
+    write (a legacy leaf's root group already exists and keeps its members).
+    """
+    group = zarr.open_group(leaf_store, path="", mode="a", zarr_format=3)
+    pointer = {**stamp, "current": current}
+    group.attrs[COMMIT_ATTR] = pointer
+    return pointer
 
 
 def read_commit(leaf_store) -> dict | None:
@@ -1497,7 +1570,17 @@ def leaf_identity_gate(
 
 
 def _leaf_icechunk_refs(
-    store_root, grid, config, shard_key, leaf_path, *, column, window, sidecar_spec, store_kwargs
+    store_root,
+    grid,
+    config,
+    shard_key,
+    leaf_path,
+    *,
+    column,
+    window,
+    sidecar_spec,
+    store_kwargs,
+    version=None,
 ) -> dict:
     """The unit's Icechunk record (issue #580, spec §11.4) — fail-open, never raises.
 
@@ -1509,7 +1592,10 @@ def _leaf_icechunk_refs(
     leaf (``"ladder"`` — no icechunk session on the leaf path; the staged
     sweep gathers and commits them). Both the write path and the
     skip-if-current touch call it. A failure logs and returns ``{"error"}``:
-    the leaf is normative, the repo a regenerable index (D9).
+    the leaf is normative, the repo a regenerable index (D9). ``version`` is
+    the versioned leaf's version subgroup the refs point into (spec §1.5,
+    issue #582) — the one being written, or the current one on the touch
+    path; ``None`` for a legacy leaf.
     """
     try:
         from zagg.icechunk_refs import leaf_units, record_leaf, resolve_options, vet_leaf_repo
@@ -1519,11 +1605,23 @@ def _leaf_icechunk_refs(
         commit_leaf = resolve_options(config, grid.parent_order, grid=grid)["commit"] == "leaf"
         repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs) if commit_leaf else None
         units = leaf_units(
-            grid, config, shard_key, store_root, column=column, store_kwargs=store_kwargs
+            grid,
+            config,
+            shard_key,
+            store_root,
+            column=column,
+            store_kwargs=store_kwargs,
+            version=version,
         )
         if commit_leaf:
             return record_leaf(
-                store_root, grid, shard_key, store_kwargs=store_kwargs, units=units, repo=repo
+                store_root,
+                grid,
+                shard_key,
+                store_kwargs=store_kwargs,
+                units=units,
+                repo=repo,
+                version=version,
             )
         if not any(e["refs"] for u in units for e in u["entries"]):
             return {"skipped": "empty"}
@@ -1557,6 +1655,7 @@ def process_and_write_hive(
     allow_contraction=False,
     semantic_hash=None,
     sidecar_spec=None,
+    run_id=None,
 ):
     """Process one shard into its own hive leaf store (issue #199 phase 2).
 
@@ -1576,6 +1675,14 @@ def process_and_write_hive(
     the K carriers accumulate and the whole leaf is written once
     (``write_leaf_to_zarr`` — one ShardingCodec object per array), mirroring
     the flat sharded switch in ``runner._process_and_write``.
+
+    ``run_id`` (issue #582, spec §1.5) makes the leaf VERSIONED: the arrays
+    go to a fresh version subgroup ``run-{run_id}-{attempt}`` under the
+    stable leaf root, the version is stamped, its refs are recorded against
+    the version's objects, and the root's pointer stamp is swapped LAST — so a
+    replacement never rewrites bytes an earlier run tag references. Without a
+    run identity the writer emits a legacy in-place leaf (and refuses to do
+    so over a root that already names ``current``).
     Phase timings are always collected (issue #297; formerly the opt-in
     ``profile`` gate of issues #100/#249): ``process_shard`` fills
     ``metadata["phase_timings"]`` with read/index/aggregate, and the leaf
@@ -1658,6 +1765,13 @@ def process_and_write_hive(
         time_range_of = windowing["time_field"]
 
     leaf_path = shard_leaf_path(store_root, shard_key, window=window["label"] if window else None)
+    # Versioned leaf (issue #582, spec §1.5): a run identity names the fresh
+    # version subgroup this attempt writes; ``data_path`` is where the arrays
+    # (and the coverage sidecar) go. Legacy writers keep the root.
+    from zagg.config import get_leaf_versions
+
+    version = leaf_version_name(run_id) if run_id and get_leaf_versions(config) else None
+    data_path = f"{leaf_path}/{version}" if version else leaf_path
 
     # Leaf identity gate (issue #388): per (shard, window) unit, before any
     # read or fold. A skipped/refused unit returns here having written NOTHING.
@@ -1688,6 +1802,13 @@ def process_and_write_hive(
         )
         if unit_meta is not None:
             if unit_meta.get("current"):
+                # A versioned leaf's current version (spec §1.5): the touch
+                # refreshes the pointer root and the siblings only — never a
+                # version's objects, whose checksums the run tags depend on —
+                # and the refs re-plan points into it.
+                current = (
+                    read_commit(open_store(leaf_path, read_only=True, **store_kwargs)) or {}
+                ).get("current")
                 # Lifecycle touch (issue #388 phase 3): a skip must still
                 # reset the purge clock on the unit's whole footprint — leaf
                 # tree, sidecar/sub-map siblings, and the declared column
@@ -1705,6 +1826,7 @@ def process_and_write_hive(
                         sidecar_spec=sidecar_spec,
                         store_kwargs=store_kwargs,
                         policy=get_touch_policy(config),
+                        current=current,
                     )
                 except Exception as e:
                     logger.warning(
@@ -1729,7 +1851,9 @@ def process_and_write_hive(
                 # #580, PR #581 question (11) ruled (a)).
                 from zagg.config import get_icechunk
 
-                if counts["touched"] and get_icechunk(config):
+                # A versioned leaf's objects were not touched, so its refs
+                # are untouched too: the re-plan is the LEGACY leaf's (§11.6).
+                if counts["touched"] and get_icechunk(config) and not current:
                     unit_meta["icechunk"] = _leaf_icechunk_refs(
                         store_root,
                         grid,
@@ -1742,6 +1866,7 @@ def process_and_write_hive(
                         window=window,
                         sidecar_spec=sidecar_spec,
                         store_kwargs=store_kwargs,
+                        version=current,
                     )
                     if unit_meta["icechunk"].get("sidecar"):
                         unit_meta["icechunk_dirty"] = True
@@ -1752,7 +1877,16 @@ def process_and_write_hive(
 
     def _leaf():
         if "store" not in box:
-            store = open_store(leaf_path, **store_kwargs)
+            if version is None:
+                # A legacy (in-place) write over a versioned root would clear
+                # every version behind the pointer: refuse (spec §1.5).
+                pointer = read_commit(open_store(leaf_path, read_only=True, **store_kwargs))
+                if pointer and pointer.get("current"):
+                    raise ValueError(
+                        f"leaf {leaf_path} is versioned (current {pointer['current']!r}); "
+                        f"a writer without a run_id cannot replace it in place (spec §1.5)"
+                    )
+            store = open_store(data_path, **store_kwargs)
             # overwrite=True: any existing prefix here is either debris from a
             # torn run (D4) or a prior committed write being redone — both are
             # replaced wholesale; per-leaf state never blocks a retry. Since
@@ -1951,8 +2085,8 @@ def process_and_write_hive(
         # PR #208 round 2). The envelope simply omits the pointer — box only.
         if words is not None and not full and depth > 0:
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
-            write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
-        stamp_commit(
+            write_coverage_sidecar(data_path, bitmap, **store_kwargs)
+        stamp = stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),
             granule_count=metadata.get("granule_count", 0),
@@ -2072,9 +2206,22 @@ def process_and_write_hive(
                 window=window,
                 sidecar_spec=sidecar_spec,
                 store_kwargs=store_kwargs,
+                version=version,
             )
             if "phase_timings" in metadata:
                 metadata["phase_timings"]["icechunk"] = time.time() - _t0
+    # Pointer swap (issue #582, spec §1.5 step 4): the stable root's stamp now
+    # names this attempt's version — one PUT, after the refs, so the repo and
+    # the pointer agree on the version. Only a clean unit swaps: a failed
+    # column leaves the previous version live and the retry writes a new one.
+    if version and "store" in box and not metadata.get("error"):
+        _t0 = time.time()
+        write_pointer_stamp(open_store(leaf_path, **store_kwargs), stamp, version)
+        metadata["leaf_version"] = version
+        if "phase_timings" in metadata:
+            metadata["phase_timings"]["write"] = (
+                metadata["phase_timings"].get("write", 0.0) + time.time() - _t0
+            )
     return metadata
 
 
@@ -2114,7 +2261,10 @@ __all__ = [
     "leaf_column_expectation",
     "leaf_identity_gate",
     "process_and_write_hive",
+    "leaf_data_path",
+    "leaf_version_name",
     "read_commit",
+    "resolve_leaf",
     "read_coverage",
     "read_coverage_bitmap",
     "read_manifest",
@@ -2123,5 +2273,6 @@ __all__ = [
     "shard_leaf_path",
     "stamp_commit",
     "write_coverage_sidecar",
+    "write_pointer_stamp",
     "write_root_coverage",
 ]

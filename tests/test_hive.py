@@ -2358,8 +2358,11 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         leaf = hive.shard_leaf_path(root, shard)
+        # The runner writes VERSIONED leaves (issue #582): the objects sit
+        # under the current version; the stamp stays at the root.
+        data_path, _stamp = hive.resolve_leaf(leaf)
         for name in ("morton", "h"):
-            chunk_dir = os.path.join(leaf, grid.group_path, name, "c")
+            chunk_dir = os.path.join(data_path, grid.group_path, name, "c")
             n_objects = sum(len(files) for _d, _s, files in os.walk(chunk_dir))
             assert n_objects == 1, name
         assert hive.read_commit(open_store(leaf))["complete"] is True

@@ -2263,6 +2263,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 skip_if_current=bool(event.get("skip_if_current")),
                 allow_contraction=bool(event.get("allow_contraction")),
                 semantic_hash=event.get("semantic_hash"),
+                # Versioned leaves (issue #582, spec §1.5): the run identity
+                # names the version subgroup; an event without one (a
+                # hand-rolled or older dispatcher) writes a legacy leaf.
+                run_id=event.get("run_id"),
             )
         else:
             # Flat layout: lazy store + one-time template check, opened on the
