@@ -409,6 +409,7 @@ class Run:
         # tail's run-record write; None until dispatch() fires the invoke,
         # and None for good when the knob is off.
         self._icechunk_init: dict | None = None
+        self._icechunk_finalize: dict | None = None
         runner._check_signature(self.grid, catalog_data)
 
     def __repr__(self) -> str:
@@ -1278,3 +1279,19 @@ class Run:
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # Icechunk run finalize (issue #582): the facade chains no staged
+        # sweep, so every commit of the run is a per-leaf one and has landed
+        # by now; tag the tip. Synchronous, fail-open, the same seam
+        # ``runner._run_lambda`` takes.
+        if self._icechunk_init is not None:
+            self._icechunk_finalize = runner._invoke_lambda_icechunk_finalize(
+                client,
+                self.function_name,
+                self.store,
+                config_dict=asdict(
+                    runner._pin_icechunk_commit(self.config, self.grid, stages=False)
+                ),
+                run_id=run_id,
+                icechunk_init=self._icechunk_init,
+                output_creds_event=output_creds_event,
+            )

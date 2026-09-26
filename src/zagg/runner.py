@@ -3446,6 +3446,12 @@ def _run_local(
                 store_kwargs=store_kwargs,
                 touch_policy=get_touch_policy(config),
             )
+    # Icechunk run finalize (issue #582, spec §11.4): AFTER every commit of
+    # the run — the staged sweep's ladder commits included — tag the tip
+    # ``run-{run_id}`` and apply retention. In-process here, fail-open.
+    summary["icechunk_finalize"] = _finalize_icechunk_local(
+        config, store_path, run_id, icechunk_init, run_semantic_hash, store_kwargs
+    )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -4382,6 +4388,22 @@ def _run_lambda(
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # Icechunk run finalize (issue #582, spec §11.4): one synchronous
+        # worker invoke AFTER the staged sweep returned (its finisher is the
+        # last ladder commit) — the dispatcher never writes (D8). Fail-open.
+        summary["icechunk_finalize"] = (
+            _invoke_lambda_icechunk_finalize(
+                state["lambda_client"],
+                function_name,
+                store_path,
+                config_dict=config_dict,
+                run_id=run_id,
+                icechunk_init=icechunk_init,
+                output_creds_event=output_creds_event,
+            )
+            if icechunk_init is not None
+            else None
+        )
         logger.info(
             f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
         )
@@ -5741,6 +5763,93 @@ def _invoke_lambda_icechunk_init(
         f"Icechunk repo {record.get('path')} "
         f"{'created' if record.get('created') else 'reopened'} at snapshot {record.get('snapshot')}"
     )
+    return record
+
+
+def _finalize_icechunk_local(
+    config, store_path, run_id, icechunk_init, semantic_hash, store_kwargs
+) -> dict | None:
+    """The local backend's in-process Icechunk finalize (issue #582); its record.
+
+    ``None`` when the run stood up no repo (``icechunk_init`` is ``None``:
+    knob off or non-hive); ``{"error": ...}`` when the fail-open finalize did
+    not land — a failed init leaves no repo to tag, and that is recorded here
+    rather than skipped, so the two failures read apart in the summary; else
+    :func:`zagg.icechunk_finalize.finalize_repo`'s record.
+    """
+    if icechunk_init is None:
+        return None
+    from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
+
+    try:
+        return finalize_repo(
+            store_path,
+            run_id=run_id,
+            semantic_hash=semantic_hash,
+            retain_runs=resolve_retain_runs(config),
+            store_kwargs=store_kwargs,
+            split_ratchet=icechunk_init.get("split_ratchet"),
+        )
+    except Exception as e:
+        logger.warning(f"icechunk finalize failed (fail-open, issue #582): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _invoke_lambda_icechunk_finalize(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    run_id,
+    icechunk_init=None,
+    output_creds_event=None,
+) -> dict:
+    """One synchronous ``mode="icechunk_finalize"`` invoke (issue #582); its record.
+
+    The fleet twin of :func:`_finalize_icechunk_local` and the closing
+    bracket of :func:`_invoke_lambda_icechunk_init`: the worker tags the
+    run's tip and applies retention AFTER every commit of the run — so the
+    dispatcher fires it last, after the staged sweep returned. Blocking so
+    the summary can carry the tag; fail-open on the same shapes as the init
+    invoke (a stale deployment's 400, a throttle, a refused finalize, a 200
+    that is not the success envelope), never an empty dict.
+    """
+    event = {
+        "mode": "icechunk_finalize",
+        "store_path": store_path,
+        "run_id": run_id,
+        "config": config_dict,
+        # The init record rides so a split ratchet this run applied is
+        # reported as pending its operator rewrite (spec §11.5).
+        "icechunk_init": icechunk_init,
+    }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    t0 = time.perf_counter()
+    try:
+        response = lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(event),
+        )
+        payload = response["Payload"].read().decode("utf-8")
+        if response.get("FunctionError"):
+            raise RuntimeError(payload)
+        result = json.loads(payload)
+        body = json.loads(result.get("body") or "{}")
+        if result.get("statusCode") != 200:
+            raise RuntimeError(
+                f"statusCode {result.get('statusCode')}: {body.get('error') or result.get('body')!r}"
+            )
+        if not body.get("ok") or not body.get("tag"):
+            raise RuntimeError(f"unexpected icechunk_finalize body: {body!r}")
+    except Exception as e:
+        logger.warning(f"icechunk finalize invoke failed (fail-open, issue #582): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+    record = {k: v for k, v in body.items() if k not in ("ok", "mode")}
+    record["invoke_s"] = time.perf_counter() - t0
+    logger.info(f"Icechunk repo {record.get('path')} tagged {record.get('tag')}")
     return record
 
 

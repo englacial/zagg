@@ -1382,10 +1382,14 @@ class TestLocalRunEndToEnd:
             assert meta["icechunk"]["refs"] > 0 and "error" not in meta["icechunk"]
         group, repo = _open(root)
         messages = [s.message for s in repo.ancestry(branch="main")]
-        assert (
-            len(messages) == len(shards) + 2
-            and messages[-2] == f"init {summary['results'][0]['stats']['run_id']}"
-        )
+        run_id = summary["results"][0]["stats"]["run_id"]
+        # init, one commit per leaf, then the run's finalize (issue #582),
+        # whose tag names the tip.
+        assert len(messages) == len(shards) + 3 and messages[-2] == f"init {run_id}"
+        assert messages[0] == f"finalize {run_id}"
+        fin = summary["icechunk_finalize"]
+        assert fin["tag"] == f"run-{run_id}" and fin["tagged"] is True
+        assert repo.lookup_tag(fin["tag"]) == fin["snapshot"] == repo.lookup_branch("main")
         # The order reads as one zarr: dense values equal the leaf reads, the
         # ragged raw bytes match cell for cell, absent chunks are fill.
         for shard in shards:
@@ -1673,7 +1677,9 @@ class TestLadder:
         assert rows[0]["icechunk_commits"] == 1  # ONE commit, orders 4, 3, 2, 1, 0
         assert rows[0]["icechunk_missing"] == 0
         group, repo = _open(root)
-        assert [s.message for s in repo.ancestry(branch="main")][0] == "node 1"
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        # The root node's one commit, then the run's finalize on top (#582).
+        assert messages[0].startswith("finalize ") and messages[1] == "node 1"
         for shard in shards:
             (rank,) = grid.block_index(shard)
             leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
@@ -1891,7 +1897,8 @@ class TestLadder:
         group, repo = _open(root)
         if commit == "leaf":
             messages = [m.message for m in repo.ancestry(branch="main")]
-            assert sorted(messages[:2]) == ["leaf 11111", "leaf 11112"]  # the rerun's commits
+            assert messages[0].startswith("finalize ")  # the rerun's finalize (#582) …
+            assert sorted(messages[1:3]) == ["leaf 11111", "leaf 11112"]  # … over its commits
         group["5"]["count"][:]  # the touched column's level reads too (no stale checksum)
         for i, shard in enumerate(shards):
             (rank,) = grid.block_index(shard)
