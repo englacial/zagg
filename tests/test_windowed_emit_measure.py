@@ -61,27 +61,20 @@ def _store(tmp_path, *, windows):
         (node / column).mkdir()
         (node / column / "zarr.json").write_bytes(b"{}" * 10)
     write_run_parquet(str(root), rows, run_id="run-a")
-    (root / "sweep_stats_20260101T000000Z_stages.json").write_text(
-        json.dumps(
-            {
-                "stages": [
-                    {
-                        "dispatch_order": 3,
-                        "written": 4,
-                        "icechunk_commits": 0,
-                        "icechunk_rebases": 0,
-                    },
-                    {
-                        "dispatch_order": 0,
-                        "written": 1,
-                        "icechunk_commits": 2,
-                        "icechunk_rebases": 1,
-                        "icechunk_commit_s": 0.5,
-                    },
-                ]
-            }
-        )
-    )
+    # the ladder's stage rows: Icechunk is OFF on a windowed store (spec 11.6)
+    stages = [
+        {"dispatch_order": 3, "written": 4, "icechunk_commits": 0, "icechunk_rebases": 0},
+        {
+            "dispatch_order": 0,
+            "written": 1,
+            "icechunk_commits": 2,
+            "icechunk_rebases": 1,
+            "icechunk_commit_s": 0.5,
+        },
+    ]
+    if windows:
+        stages = [{k: v for k, v in s.items() if not k.startswith("icechunk_")} for s in stages]
+    (root / "sweep_stats_20260101T000000Z_stages.json").write_text(json.dumps({"stages": stages}))
     return str(root)
 
 
@@ -106,11 +99,14 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     assert win["objects"]["leaves_per_shard"]["p100"] == 3.0
     assert win["objects"]["sibling_bytes"] == {f"{w}.pyramid": 20 for w in ("2019", "2020", "2021")}
     # ladder: the stage rows' icechunk counters
-    assert win["ladder"]["stage_records"] == 2
-    assert [s["icechunk_commits"] for s in win["ladder"]["stages"]] == [0, 2]
+    assert win["ladder"]["stage_records"] == base["ladder"]["stage_records"] == 2
+    assert [s["icechunk_commits"] for s in base["ladder"]["stages"]] == [0, 2]
     tool.print_table([base, win])
     out = capsys.readouterr().out
-    assert "windows per shard" in out and "icechunk rebases (sum)" in out
+    assert "windows per shard" in out
+    # measured on the baseline, not measured (``-``, never ``0``) on the windowed arm
+    (commits,) = [ln.split() for ln in out.splitlines() if ln.startswith("icechunk commits")]
+    assert commits[-2:] == ["2", "-"]
     assert out.count("yearly") == 1 and out.count("none") == 1
 
 

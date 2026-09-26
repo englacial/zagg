@@ -11,7 +11,10 @@ the WINDOWED arm of the same order-6 cell, built with
   LIST per shard node; capped by ``--max-shards``);
 - the ladder numbers off the staged sweep record (``sweep_stats_*_stages.json``):
   per-stage ``icechunk_commits`` / ``icechunk_rebases`` / ``icechunk_commit_s``,
-  objects written.
+  objects written. Icechunk is OFF on a windowed store (spec section 11.6), so
+  its stage rows carry no ``icechunk_*`` keys and the table prints ``-`` (not
+  measured), not ``0``: the arms' ladders compare like for like only once
+  windowed Icechunk (issue #584) lands.
 
 Read-only: LISTs and small GETs against the stores named, nothing written.
 Operator tool (the run itself is a live-AWS invoke, espg's to fire); ``--anon``
@@ -234,6 +237,13 @@ def _fmt(v) -> str:
     return f"{v:,}"
 
 
+def _stage_sum(result: dict, key: str):
+    """``key`` summed over the stage rows; ``None`` (printed ``-``) when no row
+    carries it — a windowed store's ladder runs without Icechunk."""
+    values = [s[key] for s in result["ladder"]["stages"] if s.get(key) is not None]
+    return sum(values) if values else None
+
+
 def print_table(results: list[dict]) -> None:
     rows = [
         ("schedule", lambda r: r["schedule"]),
@@ -256,18 +266,9 @@ def print_table(results: list[dict]) -> None:
         ("bytes per shard p50/p90/max", lambda r: _fmt(r["objects"].get("bytes_per_shard"))),
         ("total leaf bytes", lambda r: _fmt(r["objects"].get("total_leaf_bytes"))),
         ("stage rows", lambda r: _fmt(r["ladder"].get("stage_records"))),
-        (
-            "icechunk commits (sum)",
-            lambda r: _fmt(sum(s.get("icechunk_commits") or 0 for s in r["ladder"]["stages"])),
-        ),
-        (
-            "icechunk rebases (sum)",
-            lambda r: _fmt(sum(s.get("icechunk_rebases") or 0 for s in r["ladder"]["stages"])),
-        ),
-        (
-            "icechunk commit_s (sum)",
-            lambda r: _fmt(sum(s.get("icechunk_commit_s") or 0.0 for s in r["ladder"]["stages"])),
-        ),
+        ("icechunk commits (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_commits"))),
+        ("icechunk rebases (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_rebases"))),
+        ("icechunk commit_s (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_commit_s"))),
     ]
     width = max(len(r["store"]) for r in results)
     print(f"{'':32s}" + "".join(f"{r['store']:>{width + 2}s}" for r in results))

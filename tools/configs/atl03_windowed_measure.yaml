@@ -3,8 +3,14 @@
 # marker) plus the three knobs the measurement varies: a YEARLY window schedule
 # on the store's own ``delta_time`` clock, the staged sweep, and the dense
 # overview ladder from 13 down. Run it against ONE order-6 cell into a scratch
-# store, never the live store; the windowed and unwindowed arms differ ONLY in
-# ``output.windowing`` (delete the block for the baseline arm).
+# store, never the live store. The config differs between the arms ONLY in
+# ``output.windowing`` (delete the block for the baseline arm), but the RUNS also
+# differ in Icechunk: an unset ``output.icechunk`` resolves ON for the unwindowed
+# hive baseline and OFF for a windowed store (``get_icechunk``, spec section 11.6),
+# so only the baseline's ladder commits Icechunk and only its stage rows carry
+# ``icechunk_*`` counters (the readout prints ``-`` for the windowed arm). The
+# ladder wall time and ``icechunk_*`` numbers compare like for like only once
+# windowed Icechunk (issue #584) lands; the leaf/object/fleet numbers compare now.
 #
 # Operator invocation (live AWS -- espg runs it; see tools/windowed_emit_measure.py
 # for the readout):
