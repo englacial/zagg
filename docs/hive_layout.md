@@ -454,6 +454,11 @@ place as regenerable-cache debris (D24). After a retrofit, the overview
 family materializes the declared orders on the next sweep — it is in
 `DEFAULT_FAMILIES`, so a plain `python -m zagg.sweep <root>` picks it up
 (the fold itself is issue #201 / PR #344; the retrofit is issue #358).
+On a store with an [Icechunk companion repo](#the-icechunk-companion-repo)
+the same step then commits the declaration into the repo
+(`zagg.icechunk_ops.declare_pyramid`, spec §11.4 **Operations**: new level
+groups, the `multiscales` root attrs; fail-open, reported under the
+summary's `icechunk` key), so both planes are declared in one step.
 
 A config that spells `overviews`
 ([Pyramid overviews](#pyramid-overviews-zagg-pyramid2)) retrofits the
@@ -1557,6 +1562,22 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   `rewrite_pending` for the operator `rewrite_manifests` pass, never run
   here. The record rides the run summary under `icechunk_finalize`; the tag
   is the durable outcome (`repo.lookup_tag("run-…")`, `ancestry(tag=…)`).
+- **Operations** (spec §11.4 **Operations**, issue #582) — the operator's
+  way to change what the repo is authoritative for, one validated commit
+  each, no leaf touched, the commit metadata naming the operation:
+
+  ```
+  python -m zagg.icechunk_ops <store_root> set-attrs /19 '{"dggs": {...}}'   # root "/", a level "/{cells}", an array "/{cells}/{array}"; null deletes a key
+  python -m zagg.icechunk_ops <store_root> declare-pyramid config.yaml     # levels + multiscales follow the manifest's declaration
+  ```
+
+  Before the commit the array model of every array must be unchanged and
+  the block's compatibility keys must hold, else the session is discarded.
+  `set-attrs` refuses the root's `zagg_icechunk` and `multiscales` keys;
+  `declare-pyramid` adds a newly declared level's group (and its manifest
+  split), delists a no-longer-declared one without deleting its group, and
+  refuses a geometry change (that is a `/2` revision). The manifest
+  retrofit runs `declare-pyramid` itself ([above](#retrofitting-the-pyramid-declaration)).
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M

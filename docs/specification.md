@@ -3465,9 +3465,10 @@ derived index over their bytes.
   are the ones a reader binds to.
 
 "Backfill" is therefore not a category: an evolving fact is written to the
-repo in a commit, never by rewriting leaves. Stage 2's remaining items —
-native overview chunks, the metadata-commit operations, the virtual-target
-sweep — are tracked on the issue.
+repo in a commit, never by rewriting leaves — the §11.4 **operations**
+(`zagg.icechunk_ops`: `set-attrs`, `declare-pyramid`) are how an operator
+writes one. Stage 2's remaining item — native overview chunks — is the `/2`
+array model tracked on issue #584.
 
 **Succession.** A change to the repo's ARRAY MODEL is a `/2` revision,
 declared — as `/1` is — in the `zagg_icechunk.spec` token (§11.1), so a
@@ -3801,8 +3802,8 @@ commits are kept; the next run's tag covers them). One finalize, in order:
    intermediate commits until a later finalize's cutoff passes them. History
    therefore reads one snapshot per run only up to the oldest retained tag,
    and per commit after it. Neither step touches a virtual target: Icechunk
-   manages none of the leaf objects (the virtual-target sweep is a stage-2
-   item on the issue). Retention is fail-open inside finalize: an error (two
+   manages none of the leaf objects (the virtual-target collector below is
+   the operator's tool for those). Retention is fail-open inside finalize: an error (two
    finalizes racing on one tag delete, a collection cut off by the invoke's
    ceiling) is recorded as `retention_error` and steps 2 and 3 still run;
 2. one content-free **`finalize {run_id}` commit** whose commit metadata
@@ -3857,6 +3858,53 @@ versioned write left the legacy `{cell_order}/…` arrays at its root — keeps
 those root arrays forever: they are not a version, the collector never
 reclaims them, and any earlier snapshot that references them keeps reading,
 since nothing rewrites them.
+
+**Operations.** An evolving fact of the metadata plane is written by an
+**operation**: one commit on `main` (`zagg.icechunk_ops`; `python -m
+zagg.icechunk_ops <store> <operation> …`), operator-run, never a worker's.
+An operation's commit message names it, its commit metadata carries
+`operation`, `zagg_version` and the operation's own keys — so `ancestry()`
+reads as a log — and it touches no leaf. Before the commit the session is
+**validated**: the array model of every array (shape, dtype, chunk grid,
+codecs, fill value — everything but attrs) MUST be identical before and
+after, the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
+`url_prefix` MUST hold, and every level the block lists MUST have its
+group; a session that fails is discarded and nothing lands. An operation
+that would write nothing commits nothing. The two operations of `/1`:
+
+- **`set-attrs <path> <json>`** merges the JSON object into the attrs of the
+  root group (`/`), a level group (`/{cells}`) or an array
+  (`/{cells}/{array}`); a `null` value deletes the key. The root's
+  `zagg_icechunk` block is the writer's and `multiscales` is
+  `declare-pyramid`'s: both are refused here. This is how a convention block
+  evolves — the `dggs` `latitude` token, a spec marker — without a leaf
+  rewrite; the leaf's own attrs stay as the leaf was stamped, by design
+  (the head of this section).
+- **`declare-pyramid <config>`** brings the repo's levels and `multiscales`
+  root attrs to the manifest's declaration (§4.9): every level of §11.1
+  (`level_grids` of the manifest — the base plus the `/2` block's datasets)
+  that the block does not list gains its group, written from the same spec
+  the init writes, and its manifest split (§11.5) is persisted with the
+  repo; a level the manifest no longer declares is **delisted** — dropped
+  from `levels` — but its group stays, since every snapshot and tag that
+  references it keeps reading (a later re-declaration relists the group
+  after checking its array model); a listed level whose geometry the
+  manifest would change is refused: an array-model change is a `/2`
+  revision, never an operation. The commit metadata records the manifest's
+  `semantic_hash` and the levels `added` / `dropped`. The manifest retrofit
+  (`zagg.sweep_overview.declare_pyramid`, `python -m zagg.sweep <root>
+  --declare-pyramid <config>`) performs this operation itself after its
+  manifest write when the store has a repo (fail-open, D9; its summary's
+  `icechunk` key carries the report or the error), so one operator step
+  declares both planes; the standalone form re-runs it.
+
+`rename-template` (issue #582's third operation) has no object: the #299
+rename landed as named product roots (#316), a product's root is its
+repo's container prefix (§11.1), and an Icechunk virtual reference carries
+its location verbatim, so a product move is a re-index, not a metadata
+commit. #584's `declare-schedule` / `set-t0` are operations of the `/2`
+array model (the `t0` coordinate) and of the (f″) dispatcher rule, and
+land with them.
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
 come out of the object's own index, but the sizes and checksums do not. For
