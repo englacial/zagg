@@ -3325,9 +3325,13 @@ derived index over their bytes.
 
 **Two planes.** A hive store is two planes with different mutability:
 
-- the **data plane** is the leaf shard objects — immutable: a leaf key is
-  never overwritten (§1.5); a leaf's content identity is its §5.3 O11 digest
-  in the commit stamp plus the ETag every virtual reference carries (§11.3);
+- the **data plane** is the leaf shard objects — write-once under §1.5: no
+  byte at a stamped leaf key is modified in place, and the one legal change
+  is wholesale replacement under the same keys (a replaced leaf's earlier
+  references fail loudly by checksum, §1.5/§11.3, so a run tag guarantees
+  the leaves not replaced since it); a leaf's content identity is its §5.3
+  O11 digest in the commit stamp plus the ETag every virtual reference
+  carries (§11.3);
 - the **metadata plane** is the one repository — authoritative for what
   *evolves*: convention and attrs blocks (the `dggs` `latitude` token, spec
   markers, `/1`→`/2` flips), the pyramid declaration mirrored as
