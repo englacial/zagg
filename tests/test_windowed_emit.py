@@ -472,6 +472,60 @@ class TestWindowBins:
         bins.granule_done(1)
         assert (a.closed, b.closed) == (1, 0) and a.open_block_bytes == 0
 
+    def test_one_block_reduces_at_a_time_across_windows(self):
+        # Review finding (5): every close (cap or threshold) joins all the
+        # windows' reducers first, the end-of-read flush is capped too, and
+        # the read ends with no reducer in flight.
+        from zagg.processing.spill import SpillAggregator, SpillOverflowError
+        from zagg.processing.windowed import WindowBins
+
+        class _Spill(SpillAggregator):
+            def __init__(self):
+                self.tmp_dir, self._open, self.alive, self.mergeable = None, 0, False, True
+
+            @property
+            def open_block_bytes(self):
+                return self._open
+
+            def add_read(self, chunk):
+                self._open += 100
+
+            def granule_done(self):
+                pass
+
+            def flush(self):
+                self._open += 100  # the tail lands in the open block
+
+            def close_block(self):
+                if not self.mergeable:
+                    raise SpillOverflowError("no fold law.")
+                self.before_close()
+                self._open, self.alive = 0, True
+
+            def join_reducer(self):
+                self.alive = False
+
+        bins = WindowBins(TestBinChunk.WINDOWS, "t", _Spill)
+        a, b = bins.buffered["a"], bins.buffered["b"]
+        bins._tmp_cap = 250
+        bins.add_reads([pd.DataFrame({"t": [1.0, 15.0]})], 0)
+        bins.granule_done(0)  # a 100, b 100
+        bins.add_reads([pd.DataFrame({"t": [1.0]})], 1)
+        bins.granule_done(1)  # a 200 + b 100 -> a closes, reducing
+        assert a.alive and not b.alive
+        bins.add_reads([pd.DataFrame({"t": [15.0]}), pd.DataFrame({"t": [15.0]})], 2)
+        bins.granule_done(2)  # b 300 -> b closes; a's reduce joined first
+        assert (a.alive, b.alive) == (False, True)
+        bins.flush()  # a 100 + b 100 tails: 200 < cap; the read ends joined
+        assert (a.alive, b.alive) == (False, False)
+        a._open, b._open = 0, 100
+        bins.flush()  # b's tail pushes the total to 300: the cap closes b
+        assert (a.open_block_bytes, b.open_block_bytes) == (100, 0)
+        # A cap close on a config with no fold law names the bulk remedy.
+        b.mergeable, b._open = False, 300
+        with pytest.raises(SpillOverflowError, match="unit: window"):
+            bins._enforce_tmp_cap()
+
 
 # ── the worker seam, end to end on the real read path ────────────────────────
 

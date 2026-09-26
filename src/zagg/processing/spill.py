@@ -651,6 +651,9 @@ class SpillAggregator:
         self.overlap = bool(overlap)
         self._reducer: threading.Thread | None = None
         self._reduce_err: BaseException | None = None
+        # Called before every block close: the bulk multi-window bins join all
+        # N aggregators' reducers there, so one block reduces at a time.
+        self.before_close = None
         # Cross-block mergeable running state (only ever fed on block close).
         self._counts: dict[int, int] = {}
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
@@ -782,6 +785,10 @@ class SpillAggregator:
         in :meth:`flush` is the same fold."""
         self._close_block()
 
+    def join_reducer(self) -> None:
+        """Wait for this aggregator's in-flight block reduce (the bulk bins)."""
+        self._join_reducer()
+
     @property
     def closed_blocks(self) -> int:
         """Blocks closed at the threshold; 0 = exact single-block regime.
@@ -844,6 +851,8 @@ class SpillAggregator:
                 f"widen to their members' envelope, composition takes "
                 f"one k-way re-quantization; counts stay exact."
             )
+        if self.before_close is not None:
+            self.before_close()
         block = self._block
         self._block = SpillBlock(self.tmp_dir)
         self._closed_blocks += 1

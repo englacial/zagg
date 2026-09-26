@@ -29,7 +29,7 @@ import tempfile
 
 import numpy as np
 
-from zagg.processing.spill import SPILL_TMP_FRACTION, SpillAggregator
+from zagg.processing.spill import SPILL_TMP_FRACTION, SpillAggregator, SpillOverflowError
 
 
 def _column(chunk, name: str) -> np.ndarray:
@@ -89,10 +89,17 @@ class WindowBins:
     open blocks' total — :data:`~zagg.processing.spill.SPILL_TMP_FRACTION` of
     the free space at construction, the same fraction a single aggregator's
     default threshold caps itself at — by closing the largest open block when
-    the total crosses it. That close is the one bulk-only fold: it happens
-    only where the windows' combined spill outgrows what one unit's block may
-    hold, and it folds under the same law-equivalent block merge the
-    threshold crossing does.
+    the total crosses it (after each granule and each end-of-read flush).
+    Every block close, cap or threshold, first joins all N aggregators'
+    in-flight reducers, so at most one closed block reduces at a time: ``/tmp``
+    holds that block plus the capped open blocks (the single unit's
+    closing-plus-filling reservation) and memory one reduce. That cap close is
+    the one bulk-only fold: it happens only where the windows' combined spill
+    outgrows what one unit's block may hold, and it folds under the same
+    law-equivalent block merge the threshold crossing does. On a config with
+    no cross-block fold law it is also a bulk-only failure: the close raises
+    ``SpillOverflowError`` for a shard whose every window would have stayed
+    in its fan-out unit's single block.
     """
 
     def __init__(self, windows: list[dict], time_field: str, make_buffered=None):
@@ -113,6 +120,8 @@ class WindowBins:
         self._last = {label: (max(m) if m else None) for label, m in self._members.items()}
         self._drained: set = set()
         spills = [a for a in self.buffered.values() if isinstance(a, SpillAggregator)]
+        for agg in spills:
+            agg.before_close = self._join_reducers
         self._tmp_cap = None
         if spills:
             st = os.statvfs(spills[0].tmp_dir or tempfile.gettempdir())
@@ -150,18 +159,41 @@ class WindowBins:
         self._enforce_tmp_cap()
 
     def flush(self) -> None:
-        """Drain every window's tail buffer (the end-of-read flush)."""
+        """Drain every window's tail buffer (the end-of-read flush), under the cap."""
         for agg in self.buffered.values():
             agg.flush()
+            self._enforce_tmp_cap()
+        self._join_reducers()
+
+    def _spills(self) -> list:
+        return [a for a in self.buffered.values() if isinstance(a, SpillAggregator)]
+
+    def _join_reducers(self) -> None:
+        """Join every window's in-flight block reduce (each block close's hook).
+
+        So at most ONE closed block is reducing across the N aggregators — on
+        ``/tmp`` beside the open blocks, and in memory — which with the cap on
+        the open blocks keeps the single unit's closing-plus-filling reservation.
+        """
+        for agg in self._spills():
+            agg.join_reducer()
 
     def _enforce_tmp_cap(self) -> None:
         if self._tmp_cap is None:
             return
-        spills = [a for a in self.buffered.values() if isinstance(a, SpillAggregator)]
+        spills = self._spills()
         if sum(a.open_block_bytes for a in spills) >= self._tmp_cap:
             largest = max(spills, key=lambda a: a.open_block_bytes)
             if largest.open_block_bytes:
-                largest.close_block()
+                try:
+                    largest.close_block()
+                except SpillOverflowError as e:
+                    raise SpillOverflowError(
+                        f"the bulk shard unit's shared /tmp cap ({self._tmp_cap:,} bytes "
+                        f"over {len(spills)} windows) closed a block: {e} Or dispatch "
+                        f"per window (output.windowing.unit: window), where each "
+                        f"window's block stays under its own threshold."
+                    ) from e
 
     def sink(self, label: str) -> tuple[list, object | None]:
         """``(reads, buffered)`` for one window — the pair the aggregate tail takes."""

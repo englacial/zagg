@@ -180,7 +180,11 @@ output:
   member granule (so the resident tail buffers are the open windows', not
   all N; under `mode: merge` every window's running state stays resident
   until its leaf is written), plus one shared cap on the open spill blocks
-  together (`SPILL_TMP_FRACTION` of free `/tmp`). The leaves are
+  together (`SPILL_TMP_FRACTION` of free `/tmp`), with every block close
+  first joining all the windows' in-flight reduces so one block reduces at a
+  time. A cap close is the one bulk-only fold, and on a config with no
+  cross-block fold law it fails the shard (`SpillOverflowError`) where every
+  fan-out unit would have stayed single-block: dispatch `unit: window` there. The leaves are
   byte-identical to the per-window fan-out's. `unit: window` keeps that
   fan-out — one invoke per (shard, window), the window's granule subset,
   an observation-level `ge`/`lt` filter pair injected into the read — for
