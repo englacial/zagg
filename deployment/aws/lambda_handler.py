@@ -2259,6 +2259,11 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # response body (this metadata) then carries time_range back
                 # for the dispatcher's root-summary union.
                 window=event.get("window"),
+                # Bulk multi-window shard unit (issue #586 phase 2): every
+                # window the shard's granules span, emitted from one read;
+                # the body then carries one metadata dict per window under
+                # ``windows`` and the records below go one per emitted leaf.
+                windows=event.get("windows"),
                 # Leaf skip-if-current (issue #388): armed only when the
                 # dispatcher sends the key (with the RUN config's D19 digest),
                 # exactly where the local backend arms it; absent -> rewrite.
@@ -2404,46 +2409,79 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # verbatim from the invoke payload (the dispatcher resolves it; the
         # worker cannot). Fail-open: a sidecar PUT failure never fails a shard
         # whose data landed — the record still rides the envelope.
-        from zagg.telemetry import build_record, lambda_env, write_sidecar
+        from zagg.telemetry import build_record, lambda_env, window_metas, write_sidecar
 
         # A current/refused unit (issue #388) wrote nothing: no record, no
         # sidecar, no sub-map -- clobbering its good sidecar with a zero-count
         # record is exactly what the gate exists to prevent (issue #401).
+        # A bulk multi-window shard unit (issue #586) records one leaf per
+        # window it emitted, each from its own metadata (``windows``) and its
+        # own granule subset (``windows[i].granules`` indexes granule_urls);
+        # the invoke-level telemetry stamped above rides every leaf's record,
+        # and ``body["stats"]`` is then the LIST of records. Skipped windows
+        # record nothing, as a skipped unit does.
         skipped = metadata.get("current") or metadata.get("refused")
-        if not skipped:
-            metadata["stats"] = build_record(
+        bulk = "windows" in metadata
+        granule_urls = event.get("granule_urls") or []
+        by_label = {w["label"]: w for w in event.get("windows") or []}
+
+        def _unit_granules(m):
+            w = by_label.get(m.get("window")) if bulk else None
+            if w is None or w.get("granules") is None:
+                return granule_urls
+            return [granule_urls[i] for i in w["granules"]]
+
+        recorded = []
+        for m in [] if skipped else window_metas(metadata):
+            if m.get("current") or m.get("refused"):
+                continue
+            if m is not metadata:
+                for key in ("max_memory_mb", "container_hwm_mb", "cpu_seconds"):
+                    m[key] = metadata[key]
+            label = m.get("window") if bulk else (event.get("window") or {}).get("label")
+            m["stats"] = build_record(
                 shard_key=int(shard_key),
-                metadata=metadata,
-                granule_ids=event.get("granule_urls"),
+                metadata=m,
+                granule_ids=_unit_granules(m),
                 invoked_by=event.get("invoked_by"),
                 run_id=event.get("run_id"),
-                window=(event.get("window") or {}).get("label"),
+                window=label,
                 lambda_config=lambda_env(),
             )
-        if get_store_layout(config) == "hive" and not metadata.get("error") and not skipped:
-            record = metadata["stats"]
+            recorded.append((m, label))
+        if bulk:
+            metadata["stats"] = [m["stats"] for m, _label in recorded]
+        if get_store_layout(config) == "hive":
             from zagg.hive import shard_leaf_path
 
-            try:
-                window = event.get("window")
-                leaf = shard_leaf_path(
-                    store_path, int(shard_key), window=window["label"] if window else None
-                )
-                write_sidecar(leaf, record, **_output_store_kwargs(event))
-            except Exception as e:
-                logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
-            # Leaf sub-map (issue #300, D22): full ShardMap JSON next to the
-            # stats sidecar. The event's bare granule_urls can't reconstruct
-            # the ShardMap entries, so the dispatcher threads them (plus the
-            # catalog identity) in the size-gated ``submap`` block; absent
-            # (old dispatcher, or dropped for the async cap) -> no write.
-            submap = event.get("submap")
-            if submap:
+            for m, label in recorded:
+                if m.get("error"):
+                    continue
+                try:
+                    leaf = shard_leaf_path(store_path, int(shard_key), window=label)
+                    write_sidecar(leaf, m["stats"], **_output_store_kwargs(event))
+                except Exception as e:
+                    logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): full ShardMap JSON next to
+                # the stats sidecar. The event's bare granule_urls can't
+                # reconstruct the ShardMap entries, so the dispatcher threads
+                # them (plus the catalog identity) in the size-gated
+                # ``submap`` block; absent (old dispatcher, or dropped for the
+                # async cap) -> no write. A bulk window's sub-map holds the
+                # entries of its own granule subset, matched by the href the
+                # worker read (the driver's endpoint, as _resolve_urls picks).
+                submap = event.get("submap")
+                if not submap:
+                    continue
                 try:
                     from zagg.sweep import submap_emittable, write_leaf_submap
 
-                    window = event.get("window")
                     granules = submap.get("granules") or []
+                    if bulk:
+                        hrefs = {u["url"] if isinstance(u, dict) else u for u in _unit_granules(m)}
+                        driver = (config.data_source or {}).get("driver", "s3")
+                        key = "https" if driver == "https" else "s3"
+                        granules = [r for r in granules if r.get(key) in hrefs]
                     if submap_emittable(submap["grid_signature"], granules):
                         write_leaf_submap(
                             store_path,
@@ -2451,7 +2489,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                             granules,
                             grid_signature=submap["grid_signature"],
                             metadata=submap.get("metadata"),
-                            window=window["label"] if window else None,
+                            window=label,
                             store_kwargs=_output_store_kwargs(event),
                         )
                     else:

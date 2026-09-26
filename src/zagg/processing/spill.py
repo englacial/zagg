@@ -475,6 +475,12 @@ def _memory_budget_bytes() -> int:
 #: worst case; do not lower without re-measuring the replay.
 _BUILD_MULT = 3
 
+#: Share of the spill directory's free space one worker may hold in open
+#: blocks: the cap on :func:`_default_block_bytes`, and the cap the bulk
+#: multi-window bins (:class:`zagg.processing.windowed.WindowBins`) enforce
+#: over their N aggregators' open blocks together.
+SPILL_TMP_FRACTION = 0.45
+
 
 def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
     """Default spill-block threshold (issue #217 design comment).
@@ -499,7 +505,7 @@ def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
     """
     mem = _memory_budget_bytes()
     st = os.statvfs(tmp_dir or tempfile.gettempdir())
-    tmp_cap = int(0.45 * st.f_bavail * st.f_frsize)
+    tmp_cap = int(SPILL_TMP_FRACTION * st.f_bavail * st.f_frsize)
     return max(1, min(int(0.8 * 0.75 * mem * n_partitions / _BUILD_MULT), tmp_cap))
 
 
@@ -764,6 +770,17 @@ class SpillAggregator:
     def empty(self) -> bool:
         """True when no observation ever survived filtering."""
         return self.n_obs_total == 0 and not self._buffer
+
+    @property
+    def open_block_bytes(self) -> int:
+        """Bytes appended to the block still filling (the ``/tmp`` it holds)."""
+        return self._block.bytes_written
+
+    def close_block(self) -> None:
+        """Close the filling block now — the bulk bins' shared ``/tmp`` cap
+        (:class:`zagg.processing.windowed.WindowBins`); the threshold crossing
+        in :meth:`flush` is the same fold."""
+        self._close_block()
 
     @property
     def closed_blocks(self) -> int:

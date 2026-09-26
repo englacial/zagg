@@ -96,7 +96,7 @@ def _concat(frames):
         warnings.filterwarnings(
             "ignore", message="The behavior of DataFrame concatenation with empty or all-NA"
         )
-        df = pd.concat(frames, ignore_index=True)
+        df = pd.concat([f.assign(_run=i) for i, f in enumerate(frames)], ignore_index=True)
     if "window" not in df:
         df["window"] = None
     return df
@@ -110,32 +110,53 @@ def _total(df, col: str):
     return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
 
 
+def _invokes(df):
+    """One row per INVOKE: a bulk multi-window shard unit (issue #586 phase 2)
+    writes one run-record row per emitted leaf, each carrying the invoke's
+    ``duration_s`` / ``max_memory_mb`` / ``gb_seconds`` and ``unit_windows``
+    set, so those rows collapse to the first per ``(run, shard_key)``; every
+    other row is its own invoke."""
+    import pandas as pd
+
+    if "unit_windows" not in df:
+        return df
+    bulk = df["unit_windows"].notna()
+    return pd.concat(
+        [df[~bulk], df[bulk].drop_duplicates(subset=["_run", "shard_key"])], ignore_index=True
+    )
+
+
 def fleet_numbers(store) -> dict:
-    """The run-parquet summary: every ``stats_*.parquet`` at the root, concatenated."""
+    """The run-parquet summary: every ``stats_*.parquet`` at the root, concatenated.
+
+    Rows are leaves (one per emitted leaf); the per-invoke numbers
+    (``units``, the duration / memory quantiles, GB-seconds) read through
+    :func:`_invokes`, so a bulk multi-window run is not counted N times."""
     frames = _run_frames(store)
     if not frames:
         return {"runs": 0, "units": 0}
     df = _concat(frames)
     ok = df[df["success"]] if "success" in df else df
+    ok_invokes = _invokes(ok)
     # distinct windows per shard, None (unwindowed) counting as one: a re-run of
     # the same (shard, window) unit is one leaf, not two
     per_shard = ok.groupby("shard_key")["window"].nunique(dropna=False)
     out = {
         "runs": len(frames),
-        "units": int(len(df)),
+        "units": int(len(_invokes(df))),
         "shards": int(ok["shard_key"].nunique()),
         "windows_per_shard": _quantiles(per_shard.values),
-        "duration_s": _quantiles(ok.get("duration_s", [])),
-        "max_memory_mb": _quantiles(ok.get("max_memory_mb", [])),
+        "duration_s": _quantiles(ok_invokes.get("duration_s", [])),
+        "max_memory_mb": _quantiles(ok_invokes.get("max_memory_mb", [])),
         "errors": int((~df["success"]).sum()) if "success" in df else 0,
         "timeouts": int(df["error_class"].fillna("").str.contains(_TIMEOUT, case=False).sum())
         if "error_class" in df
         else 0,
-        "gb_seconds": _total(ok, "gb_seconds"),
+        "gb_seconds": _total(ok_invokes, "gb_seconds"),
         "n_obs": _total(ok, "n_obs"),
     }
     for col in sorted(c for c in ok.columns if c.startswith("phase_")):
-        out[col] = _quantiles(ok[col])
+        out[col] = _quantiles(ok_invokes[col])
     return out
 
 

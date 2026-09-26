@@ -866,6 +866,7 @@ class TestAggEventMode:
         cfg = default_config("atl06")
         cfg.output["windowing"] = {
             "schedule": "explicit",
+            "unit": "window",  # the per-window fan-out is the seam under test
             "time_field": "h_li",  # a declared column, so validate_config passes
             "epoch": "2018-01-01T00:00:00Z",
             "windows": [

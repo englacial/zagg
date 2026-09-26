@@ -110,6 +110,7 @@ output:
   store_layout: hive
   windowing:                        # absent = schedule none = morton-hive/1
     schedule: yearly                # none | yearly | monthly | daily | explicit
+    unit: shard                     # shard (default) | window — the dispatch unit
     time_field: delta_time          # per-observation timestamp column
                                     #   (a declared data_source column)
     epoch: "2018-01-01T00:00:00Z"   # dataset zero as an ISO-8601 UTC instant
@@ -162,14 +163,45 @@ output:
   `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
   `TAI−UTC = 37 s`; stdlib `datetime` has no leap-second table) — boundaries
   are accurate to ≤ 1 leap second, none declared since 2017.
-- **Dispatch fans one work unit per (shard, window).** The ShardMap's
-  per-granule `time_start`/`time_end` subset granules per window; inside the
-  worker an observation-level filter on `time_field` (a pair of structured
-  `ge`/`lt` predicates riding the ordinary filter machinery) splits
-  boundary-straddling granules exactly — an observation on a boundary instant
-  belongs to the *later* window. Legacy shardmaps without granule times
-  dispatch every granule to every window (the filter keeps it correct) and
-  need `bounds.temporal` to enumerate generative windows.
+- **Dispatch is one work unit per shard, emitting every window its granules
+  span** (`unit: shard`, the default —
+  [issue #586](https://github.com/englacial/zagg/issues/586) phase 2). The
+  ShardMap's per-granule `time_start`/`time_end` decide which granules belong
+  to which window, and the worker reads the shard's granules ONCE, bins each
+  read on `time_field` into the windows (the same half-open `[start, end)`
+  predicate, applied to the read chunk instead of inside the read — an
+  observation on a boundary instant belongs to the *later* window), then
+  aggregates and finishes one window at a time — leaf, stamp, granule-id
+  sibling, leaf column, refs, pointer — releasing each window's reads before
+  the next one pools, so peak memory holds one window's slab beside the
+  shard's reads rather than N. Under `aggregation.streaming` each window
+  gets its own aggregator at the fan-out unit's own threshold, flushed on
+  its own granule cadence, plus one shared cap on the open spill blocks
+  together (`SPILL_TMP_FRACTION` of free `/tmp`). The leaves are
+  byte-identical to the per-window fan-out's. `unit: window` keeps that
+  fan-out — one invoke per (shard, window), the window's granule subset,
+  an observation-level `ge`/`lt` filter pair injected into the read — for
+  runs that want the smaller per-invoke footprint at the cost of reading
+  each shard once per window. The unit is a dispatch choice: the leaves,
+  the manifest's temporal block and the D19 semantic hash are the same
+  either way. The raster path always dispatches per window (membership is
+  per acquisition at dispatch) and rejects the key. Legacy shardmaps
+  without granule times dispatch every granule to every window (the
+  per-observation split keeps it correct) and need `bounds.temporal` to
+  enumerate generative windows.
+- **Run records stay one row per leaf.** A shard unit that emits N leaves
+  writes N D20 records — each leaf's own sidecar, sub-map (its granule
+  subset) and run-parquet row, with `window` naming the leaf, so the
+  sweep's run-record discovery and `Run.attach` read them as before. The
+  invoke-level telemetry (`duration_s`, `max_memory_mb`, `gb_seconds`, the
+  `read` phase) repeats across the invoke's N rows and each carries
+  `unit_windows: N` (null on a per-window unit), so per-invoke quantiles stay
+  the fleet-safety numbers and a per-invoke sum de-duplicates on
+  `(run_id, shard_key)` where `unit_windows` is set. A window whose inputs
+  are current under the skip-if-current gate is skipped inside the shard
+  invoke (no record, as for a skipped unit); a window that fails marks the
+  invoke failed (`error: "window {label}: ..."`), and the retry re-runs the
+  shard with the landed windows skipped by the gate.
 - **Stamps carry the truth, the manifest the schema** (D15): each windowed
   leaf's commit stamp records its `window` label and the ACTUAL written
   `time_range` as ISO-8601 UTC strings (both ends at whole-second
