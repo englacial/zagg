@@ -198,9 +198,10 @@ def ladder_walks(config, grid) -> bool:
     :func:`zagg.sweep_stages.sweep_stage_pass` returns before its first
     node, and a ladder-mode run would leave the repo empty while every
     leaf's sidecar reported success (review finding). Config-only, so the
-    init step and every worker resolve the same answer. A dispatcher that
-    chains no staged sweep at all (the ``client`` facade) pins ``commit:
-    "leaf"`` in the config it ships instead.
+    init step and every worker resolve the same answer — every dispatcher
+    chains the staged sweep under ``stages`` (the CLI, the local backend and
+    the ``client`` facade alike, issue #588); one that does not would pin
+    ``commit: "leaf"`` in the config it ships instead.
     """
     if config.output.get("sweep") != "stages":
         return False

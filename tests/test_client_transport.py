@@ -221,12 +221,13 @@ def _put_status(store, shard_key, status="ok", attempt_id=None, **fields):
     obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
 
 
-def _pinned_config(commit):
+def _pinned_config(commit, **output):
     """The dispatched config as a manifest records it: ``output.icechunk.commit`` pinned."""
     from dataclasses import asdict
 
     cfg = default_config("atl06")
     cfg.output["icechunk"] = {"commit": commit}
+    cfg.output.update(output)
     return asdict(cfg)
 
 
@@ -998,20 +999,31 @@ class TestAttach:
         assert again.modes() == ["icechunk_finalize"]
 
     def test_attach_never_finalizes_a_ladder_run(self, status_store):
-        # ``runner._run_lambda`` under ``sweep: "stages"`` pins ``commit:
-        # "ladder"``: its last commits land in the staged sweep chained AFTER
-        # the tail marker, so the finalize is that dispatcher's alone — attach
-        # fires none on either path (mid-run tail, then recorded tail).
-        _put_manifest(status_store, "ladder", _WORDS, config=_pinned_config("ladder"))
-        body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        # Either Lambda dispatcher under ``sweep: "stages"`` (``_run_lambda``,
+        # ``Run.dispatch`` — issue #588) pins ``commit: "ladder"``: its last
+        # commits land in the staged sweep chained AFTER the tail marker, so
+        # the finalize is that dispatcher's alone — attach fires none on
+        # either path (mid-run tail, then recorded tail), and its mid-run
+        # tail chains no staged sweep of its own (observe-only): the rollup
+        # trigger fires for the leaves, no stage invoke does.
+        from zagg.telemetry import build_record
+
+        _put_manifest(
+            status_store, "ladder", _WORDS, config=_pinned_config("ladder", sweep="stages")
+        )
         for word in _WORDS:
-            _put_status(status_store, word, body=dict(body))
+            body = {"total_obs": 7, "duration_s": 1.0}
+            body["stats"] = build_record(shard_key=int(word), metadata=dict(body))
+            _put_status(status_store, word, body=body)
         stub = EventStubLambdaClient(status_store)
         handle = Run.attach(_STORE, "ladder", lambda_client=stub)
         handle.results()
         handle.wait(timeout=10)
         modes = [m for m in stub.modes() if m]
         assert "stats" in modes and "icechunk_finalize" not in modes
+        sweeps = [e for _, _, e in stub.events if e.get("mode") == "sweep"]
+        assert len(sweeps) == 1 and "stage" not in sweeps[0]  # the rollup, no stage
+        assert handle.stage_sweep is None
         assert "staged sweep" in handle.icechunk_finalize["skipped"]
         again = EventStubLambdaClient(status_store)
         again_handle = Run.attach(_STORE, "ladder", lambda_client=again)
@@ -1141,6 +1153,54 @@ class TestD8Audit:
         handle.wait(timeout=10)
         expected = [ct.MANIFEST_NAME, ct.TAIL_NAME] + [ct.shard_status_key(w) for w in _WORDS]
         assert sorted(puts) == sorted(expected)
+
+    def test_client_event_run_with_a_staged_sweep_makes_no_store_writes(
+        self, catalog, status_store, monkeypatch
+    ):
+        # Issue #588: the tail's staged sweep is the runner's invoke-and-poll
+        # seam — the dispatcher LISTs the stage records and PUTs nothing.
+        # Driven through the REAL fleet path with the barriers collapsed: no
+        # stub worker writes a stage record, so every barrier expires, the
+        # finisher is fired and expires too, and the finalize is withheld
+        # (the completed-sweep gate) with the run left untagged.
+        import functools
+
+        import zagg.store as store_mod
+        from zagg import runner
+
+        real = runner._invoke_lambda_stage_sweep
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_stage_sweep",
+            functools.partial(real, barrier_timeout_s=0.05, total_barrier_budget_s=0.2),
+        )
+        # The fleet's record LIST opens the sweep's own status prefix through
+        # the store factory; route it at the in-memory status store.
+        monkeypatch.setattr(store_mod, "open_object_store", lambda path, *a, **k: status_store)
+        puts: list[str] = []
+        real_put = obstore.put
+
+        def counting_put(store, key, data, *a, **k):
+            puts.append(str(key))
+            return real_put(store, key, data, *a, **k)
+
+        monkeypatch.setattr(obstore, "put", counting_put)
+        cfg = default_config("atl06")
+        cfg.output["sweep"] = "stages"
+        cfg.output["grid"] = {**cfg.output["grid"], "chunk_inner": 9}
+        stub = EventStubLambdaClient(status_store, record=True)
+        handle = _run(catalog, client=stub, config=cfg).dispatch(transport="event")
+        handle.results()
+        handle.wait(timeout=30)
+        assert handle._tail_error is None
+        expected = [ct.MANIFEST_NAME, ct.TAIL_NAME] + [ct.shard_status_key(w) for w in _WORDS]
+        assert sorted(puts) == sorted(expected)
+        stage = [(t, e) for _, t, e in stub.events if e.get("mode") == "sweep" and e.get("stage")]
+        assert stage and all(t == "Event" for t, _ in stage)  # fired, then polled
+        assert {e["stage"]["role"] for _, e in stage} == {"stage", "finisher"}
+        assert handle.stage_sweep["barrier_timed_out"] is True
+        assert handle.icechunk_finalize == {"skipped": "staged sweep barrier timed out"}
+        assert "icechunk_finalize" not in stub.modes()
 
     def test_attach_makes_no_store_writes(self, status_store, monkeypatch):
         # The audit above only covers Run.dispatch, but Run.attach is the one

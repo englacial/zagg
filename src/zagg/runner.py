@@ -5662,11 +5662,13 @@ def _pin_icechunk_commit(config, grid, *, stages: bool):
     ``"ladder"`` only when this dispatcher chains the staged sweep
     (``stages``) AND it walks the ladder
     (:func:`zagg.icechunk_refs.ladder_walks`), else ``"leaf"``. The Lambda
-    dispatchers ship the pinned block, so the init and every worker read one
-    explicit mode; the ``client`` facade chains no staged sweep at all, so it
-    pins ``"leaf"`` even under ``sweep: "stages"`` — a ladder there would
-    leave sidecars nothing gathers (review finding). An explicit ``commit``
-    is left alone; the knob is outside the D19 core, so this perturbs no
+    dispatchers — ``_run_lambda`` and the ``client`` facade's
+    :meth:`~zagg.client.Run.dispatch`, which chains the same staged sweep
+    (issue #588) — ship the pinned block, so the init and every worker read
+    one explicit mode; a dispatcher that chains no staged sweep passes
+    ``stages=False`` and pins ``"leaf"``, since a ladder there would leave
+    sidecars nothing gathers (review finding). An explicit ``commit`` is
+    left alone; the knob is outside the D19 core, so this perturbs no
     identity.
     """
     from dataclasses import replace

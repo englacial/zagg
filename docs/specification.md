@@ -3778,7 +3778,9 @@ coarser one re-cuts), and `commit` / `commit_order` are per-run.
 (`mode="icechunk_finalize"` on Lambda, in-process on the local backend),
 invoked by the dispatcher AFTER every commit of the run has landed: after
 the staged sweep returned under the ladder (its finisher makes the last
-commit), after the fan-out drained under `commit: "leaf"`. Never by a stage
+commit; every dispatcher that chains the sweep — the CLI, the local backend
+and the `client` facade — finalizes at this point), after the fan-out
+drained under `commit: "leaf"`. Never by a stage
 node — tags, expiry and collection are singleton repo operations, and never
 inside the staged sweep's finisher, which is lease-scoped, load-bearing
 store-root machinery while the repo is fail-open (and which a per-leaf run

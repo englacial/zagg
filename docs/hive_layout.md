@@ -533,7 +533,11 @@ python -m zagg.sweep s3://bucket/store --stages --partitions 16
 
 or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
 chained immediately after a fleet run with the opt-in `output.sweep:
-"stages"` (auto-scoped to the run's own footprint). Work is discovered from
+"stages"` (auto-scoped to the run's own footprint) — from `python -m zagg`
+and from the `client` facade's `Run.dispatch` alike ([issue
+#588](https://github.com/englacial/zagg/issues/588); the facade's post-run
+tail chains it after the run record and the rollup sweep, and the summary
+rides the handle as `handle.stage_sweep`). Work is discovered from
 the **run records** (listing-based; the root `coverage.moc` is an
 accelerator for sibling candidates, never the source of truth — a fleet
 append with no subsequent sweep leaves it stale, and discovery still finds
@@ -1552,8 +1556,10 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   `icechunk_rebases` off the stage records.
 - **`mode: "icechunk_finalize"`** ([issue #582](https://github.com/englacial/zagg/issues/582),
   spec §11.4), one synchronous invoke AFTER every commit of the run landed —
-  after the staged sweep returned under the ladder, after the fan-out under
-  `commit: "leaf"` (the local backend calls
+  after the staged sweep returned under the ladder (on both Lambda
+  dispatchers, the CLI and the `client` facade: a sweep that did not
+  complete leaves the run untagged, `icechunk_finalize: {skipped}`), after
+  the fan-out under `commit: "leaf"` (the local backend calls
   `zagg.icechunk_finalize.finalize_repo` in-process at the same point): applies
   the `retain_runs` retention below, makes one content-free `finalize
   {run_id}` commit whose metadata names the run (`run_id`, `semantic_hash`,
@@ -1615,7 +1621,8 @@ warning; a coarser value re-cuts new manifests from this run on and flags
 the run parquet's `icechunk_split_ratchet` for a later `rewrite_manifests`
 pass over the old ones. `tuple_width` is unchanged (3). An unset `commit`
 resolves to `ladder` only when the run walks it — the dispatcher chains the
-staged sweep (`output.sweep: "stages"`; the `client` facade never does) and
+staged sweep (`output.sweep: "stages"`, on every dispatcher: the CLI, the
+local backend and the `client` facade, issue #588) and
 the store declares a `/2` ladder with at least one composable field
 (`zagg.icechunk_refs.ladder_walks`) — and to `leaf` otherwise, so no run
 writes sidecars nothing gathers. The Lambda dispatchers ship the resolved
