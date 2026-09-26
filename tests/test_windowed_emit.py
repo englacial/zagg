@@ -718,7 +718,8 @@ class TestBulkEndToEnd:
         again = _run_bulk(monkeypatch, cfg, root, **{**gate, "run_id": "r2"})
         assert again["current"] is True
         assert [m["current"] for m in again["windows"]] == [True, True, True]
-        assert [m["unit_windows"] for m in again["windows"]] == [3, 3, 3]
+        # Nothing emitted, so no window carries a leaf count (finding (12)).
+        assert [m.get("unit_windows") for m in again["windows"]] == [None, None, None]
         # A new granule in 2020 only: 2018 and 2019 stay current, 2020 rewrites.
         monkeypatch.undo()
 
@@ -740,6 +741,7 @@ class TestBulkEndToEnd:
         assert third["granule_count"] == 3 and third["files_processed"] == 3
         assert "current" not in third
         assert [m.get("current") for m in third["windows"]] == [True, True, None]
+        assert third["windows"][2]["unit_windows"] == 1  # one leaf emitted
         assert third["windows"][2]["total_obs"] == 7 and third["windows"][2][
             "leaf_version"
         ].startswith("run-r3")

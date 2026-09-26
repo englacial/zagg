@@ -2503,7 +2503,7 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
 
     Every window meta is completed with the shard's ``duration_s`` (the
     invoke's, so a per-leaf record's fleet-safety columns describe the invoke
-    that produced it) and ``unit_windows``; the shard meta carries the
+    that produced it), and every written one with ``unit_windows``; the shard meta carries the
     window-independent fields once, the sums, the time-range union, the
     first failed window's error (a benign no-data window is not a failure),
     and ``current`` / ``refused`` only when
@@ -2513,10 +2513,14 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     from zagg.windows import union_time_range
 
     n = len(window_metas)
+    written = [m for m in window_metas if not (m.get("current") or m.get("refused"))]
     for m in window_metas:
         m["duration_s"] = base["duration_s"]
-        m["unit_windows"] = n
-    written = [m for m in window_metas if not (m.get("current") or m.get("refused"))]
+    # The leaves this invoke emitted (review finding (12)): the windows it
+    # wrote or tried to, not the ones the gate skipped — the N rows a per-
+    # invoke sum de-duplicates. A skipped window has no record to carry it.
+    for m in written:
+        m["unit_windows"] = len(written)
     meta = {**base, "windows": window_metas}
     # The sums count the windows that landed; a failed window's partial
     # aggregate is not output (a failed fan-out unit counts nothing).

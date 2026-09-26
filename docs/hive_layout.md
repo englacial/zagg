@@ -202,7 +202,8 @@ output:
   sweep's run-record discovery and `Run.attach` read them as before. The
   invoke-level telemetry (`duration_s`, `max_memory_mb`, `gb_seconds`, the
   `read` phase) repeats across the invoke's N rows and each carries
-  `unit_windows: N` (null on a per-window unit), so per-invoke quantiles stay
+  `unit_windows: N` — the leaves the invoke emitted, windows the gate
+  skipped not counted (null on a per-window unit) — so per-invoke quantiles stay
   the fleet-safety numbers and a per-invoke sum de-duplicates on
   `(run_id, shard_key)` where `unit_windows` is set. A window whose inputs
   are current under the skip-if-current gate is skipped inside the shard
