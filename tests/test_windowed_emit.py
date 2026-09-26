@@ -112,6 +112,44 @@ def _records():
     ]
 
 
+def _digest_cfg(**streaming):
+    """A composable count + t-digest config: streamable under ``mode: merge``,
+    and with a leaf-node overview level, so every leaf writes its column."""
+    cfg = _cfg()
+    cfg.aggregation["variables"] = {
+        "count": {"function": "len", "source": "h_li", "dtype": "int32", "fill_value": 0},
+        "h_tdigest": {
+            "kind": "ragged",
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h_li",
+            "inner_shape": [2],
+            "params": {"delta": 16},
+            "dtype": "float32",
+            "fill_value": 0,
+        },
+    }
+    cfg.output["pyramid"] = {"overviews": 7}
+    if streaming:
+        cfg.aggregation["streaming"] = streaming
+    validate_config(cfg)
+    return cfg
+
+
+def _dense_h5(days, seed):
+    """``_h5`` with 60 distinct heights per day, so t-digest merges show."""
+    h = _h5(np.repeat(days, 60))
+    h._arrays["/h"] = np.random.default_rng(seed).normal(0.0, 5.0, 60 * len(days)).astype("f4")
+    return h
+
+
+def _dense_fakes():
+    return {
+        "s3://bucket/granuleA.h5": _dense_h5([300.0, 400.0, 401.0], 1),
+        "s3://bucket/granuleB.h5": _dense_h5([800.0, 801.0], 2),
+        "s3://bucket/granuleC.h5": _dense_h5([729.5, 730.25], 3),
+    }
+
+
 def _patch(monkeypatch, fakes=None):
     from zagg.index.hierarchical import HierarchicalIndex
 
@@ -158,7 +196,7 @@ def _run_bulk(monkeypatch, cfg, root, fakes=None, records=None, **kw):
     )
 
 
-_CLOCKS = {"written_at", "timestamp"}
+_CLOCKS = {"written_at", "timestamp", "generated_at"}
 
 
 def _scrub(obj):
@@ -170,14 +208,21 @@ def _scrub(obj):
 
 
 def _tree(root):
-    """``{relative path: bytes-or-scrubbed-json}`` of every object under ``root``."""
+    """``{relative path: bytes-or-scrubbed-json}`` of every object under ``root``.
+
+    A versioned leaf's ``run-{run_id}-{nonce}`` names are normalized (the
+    nonce is random per attempt, in paths and in the stamps naming them).
+    """
+    import re
+
+    nonce = re.compile(r"(run-[^-/\"]+)-[0-9a-f]{8}")
     out = {}
     for p in sorted(Path(root).rglob("*")):
         if p.is_file():
             data = p.read_bytes()
             if p.suffix == ".json":
-                data = _scrub(json.loads(data))
-            out[str(p.relative_to(root))] = data
+                data = json.loads(nonce.sub(r"\1-N", json.dumps(_scrub(json.loads(data)))))
+            out[nonce.sub(r"\1-N", str(p.relative_to(root)))] = data
     return out
 
 
@@ -575,6 +620,42 @@ class TestBulkEndToEnd:
         # cadence; every one exact (no block closed).
         assert [m["phase_timings"]["spill_blocks_closed"] for m in bulk["windows"]] == [0, 0, 0]
         assert [m["phase_timings"]["spill_bytes"] > 0 for m in bulk["windows"]] == [True] * 3
+
+    @pytest.mark.parametrize(
+        "streaming",
+        [{}, {"mode": "merge", "buffer_granules": 2}, {"mode": "spill", "buffer_granules": 2}],
+        ids=["pooled", "merge", "spill"],
+    )
+    def test_digest_leaves_and_leaf_columns_match_the_fanout(
+        self, monkeypatch, tmp_path, streaming
+    ):
+        # Review finding (10): a composable config writes the leaf column in
+        # the same pass (refs skipped the same way), and under merge the
+        # flush cadence (buffer_granules: 2) changes the digest bytes, so a
+        # window flushed on the wrong granule boundary shows here.
+        cfg = _digest_cfg(**streaming)
+        fan_root, bulk_root = str(tmp_path / "fan"), str(tmp_path / "bulk")
+        fan = _run_fanout(monkeypatch, cfg, fan_root, fakes=_dense_fakes())
+        bulk = _run_bulk(monkeypatch, cfg, bulk_root, fakes=_dense_fakes())
+        assert [fan[w].get("leaf_column") for w in sorted(fan)] == [
+            m.get("leaf_column") for m in bulk["windows"]
+        ]
+        assert all(m.get("leaf_column") for m in bulk["windows"])
+        fan_tree, bulk_tree = _tree(fan_root), _tree(bulk_root)
+        assert any(".pyramid.zarr/" in k for k in bulk_tree)
+        assert fan_tree == bulk_tree
+
+    def test_versioned_leaves_match_the_fanout(self, monkeypatch, tmp_path):
+        # Review finding (10): the #582 version subgroup + pointer per window,
+        # equal up to the random per-attempt nonce.
+        cfg = _cfg()
+        fan_root, bulk_root = str(tmp_path / "fan"), str(tmp_path / "bulk")
+        _run_fanout(monkeypatch, cfg, fan_root, run_id="r1")
+        bulk = _run_bulk(monkeypatch, cfg, bulk_root, run_id="r1")
+        assert all(m["leaf_version"].startswith("run-r1-") for m in bulk["windows"])
+        fan_tree, bulk_tree = _tree(fan_root), _tree(bulk_root)
+        assert any("/run-r1-N/" in k for k in bulk_tree)
+        assert fan_tree == bulk_tree
 
     def test_records_contract(self, monkeypatch, tmp_path):
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"))
