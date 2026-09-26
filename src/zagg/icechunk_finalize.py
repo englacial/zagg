@@ -18,7 +18,9 @@ One finalize does, in order:
    included; the newer runs keep theirs until a later cutoff passes them),
    and unreferenced repo objects older than it are garbage-collected. The
    default K = 0 retains everything and runs none of it. Only ``run-`` tags
-   are ever deleted, and only here; virtual targets (the leaves) are never
+   are ever deleted, and only here. Objects a concurrent writer has in
+   flight are never collected, but a writer session whose base predates the
+   cutoff cannot commit (spec §11.4); virtual targets (the leaves) are never
    touched by any of it (icechunk manages none of them). Fail-open: an error
    is recorded as ``retention_error`` and steps 2 and 3 still run;
 2. one empty ``finalize {run_id}`` commit whose METADATA identifies the run
@@ -83,8 +85,11 @@ def _retain(repo, retain_runs: int) -> dict:
     run tags stay. The expiry cutoff is a RUN TAG's commit time — the oldest
     retained one, or the newest dropped one when K = 1 — never ``now``: this
     run's commits are all newer than any earlier tag, and a concurrent
-    writer's in-flight objects are never collected. With no earlier tag
-    there is nothing to expire.
+    writer's in-flight objects are never collected. A concurrent writer's
+    SESSION is not protected: one whose base snapshot predates the cutoff
+    (opened before the previous run's finalize, still open across this one)
+    fails its commit on rebase — a storage error ``_commit`` does not retry
+    (spec §11.4). With no earlier tag there is nothing to expire.
 
     Fail-open (review finding): retention is the optional half of finalize,
     so any error — two finalizes racing on one ``delete_tag``, a garbage

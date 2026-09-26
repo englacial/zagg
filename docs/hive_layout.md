@@ -1520,7 +1520,11 @@ the shard order and the width (`zagg.icechunk_refs.finest_dispatch_order`).
 finalize delete the run tags beyond the K − 1 newest, expire the snapshots
 older than the oldest retained run's finalize and garbage-collect the repo
 objects nothing retained references (the cutoff is always a run tag's
-commit time, never "now"). The expiry squashes every commit before that
+commit time, never "now", so no in-flight object is collected — but a
+writer session opened before the previous run's finalize and still open
+across this one loses its base snapshot and fails its commit; only
+overlapping runs on one store can hit that, and K = 0 never expires). The
+expiry squashes every commit before that
 cutoff — the oldest retained run's own intermediate commits included — into
 its finalize snapshot; the newer runs keep theirs until a later cutoff
 passes them. Leaf objects are never touched by any of it.
