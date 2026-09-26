@@ -419,6 +419,9 @@ class TestDispatch:
         (fin_event,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
         assert fin_event["icechunk_init"] == run._icechunk_init
         assert fin_event["run_id"] == stats_event["run_id"]
+        # ... with the very config dispatch() pinned and sent to the init.
+        (init_event,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_init"]
+        assert fin_event["config"] == init_event["config"]
         # The finalize outcome is surfaced on the handle, not write-only: the
         # stub's bare envelope is a fail-open error the caller can read.
         assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]

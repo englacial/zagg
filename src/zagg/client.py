@@ -1293,9 +1293,7 @@ class Run:
                 client,
                 self.function_name,
                 self.store,
-                config_dict=asdict(
-                    runner._pin_icechunk_commit(self.config, self.grid, stages=False)
-                ),
+                config_dict=config_dict,
                 run_id=run_id,
                 icechunk_init=self._icechunk_init,
                 output_creds_event=output_creds_event,
