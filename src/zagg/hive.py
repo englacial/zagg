@@ -2228,9 +2228,14 @@ def process_and_write_hive(
             if "phase_timings" in metadata:
                 metadata["phase_timings"]["icechunk"] = time.time() - _t0
     # Pointer swap (issue #582, spec §1.5 step 4): the stable root's stamp now
-    # names this attempt's version — one PUT, after the refs, so the repo and
-    # the pointer agree on the version. Only a clean unit swaps: a failed
-    # column leaves the previous version live and the retry writes a new one.
+    # names this attempt's version — one PUT, after the refs, so for a single
+    # writer the repo and the pointer agree on the version. Two racing
+    # attempts under ``commit: "leaf"`` (refs A, refs B, swap B, swap A) can
+    # leave ``main`` and the pointer naming DIFFERENT complete versions; both
+    # are retained (one referenced, one current) and the collector reclaims
+    # neither, until the next run converges them. Only a clean unit swaps: a
+    # failed column leaves the previous version live and the retry writes a
+    # new one.
     if version and "store" in box and not metadata.get("error"):
         _t0 = time.time()
         write_pointer_stamp(open_store(leaf_path, **store_kwargs), stamp, version)
