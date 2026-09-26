@@ -3788,9 +3788,25 @@ version's objects, which stay in place, so every earlier snapshot and run
 tag keeps reading. Icechunk's garbage collection never touches a virtual
 target; the **virtual-target collector** (`tools/icechunk_gc_targets.py`,
 operator-run, dry-run by default) deletes a leaf's version subgroups that
-are neither its `current` nor referenced by any retained snapshot or tag
-(`main` and every `run-` tag), reports the reclaimable bytes, never touches
-a legacy leaf, and refuses a store without a repo.
+are neither its `current` nor referenced by any **retained** snapshot,
+reports the reclaimable bytes, never touches a legacy leaf, and refuses a
+store without a repo. **Retained** means every snapshot in the ancestry of
+every branch and of every tag — all tags, not only `run-` ones — after
+expiry; a version only an expired snapshot references is collectable.
+**In-flight guard:** the collector never deletes a version whose stamp
+`written_at` is newer than the newest `run-` tag's finalize commit, since an
+in-flight run's versions have no tag yet (and an unstamped version has no
+`written_at` — it is left alone until its prefix's own run is finalized, the
+same guard read off the `run-{run_id}` prefix). A crash between (3) and (4)
+of the §1.5 write order therefore leaves a version that is either
+**referenced** (per-leaf mode — retained until expiry drops it) or
+**unreferenced but young** (ladder mode — guarded); once its run is
+finalized without the version being gathered it is garbage, and the next
+collection reclaims it. A **converted** legacy leaf — one whose first
+versioned write left the legacy `{cell_order}/…` arrays at its root — keeps
+those root arrays forever: they are not a version, the collector never
+reclaims them, and any earlier snapshot that references them keeps reading,
+since nothing rewrites them.
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
 come out of the object's own index, but the sizes and checksums do not. For
