@@ -2248,6 +2248,34 @@ class TestRunnerWiring:
         assert read_sidecar(leaf)["shard_key"] == shard
         assert hive.read_manifest(root)["shard_order"] == 6
 
+    def test_local_unit_records_the_invocation_wall(self, monkeypatch, cfg, tmp_path):
+        # Issue #589: the local backend stamps ``duration_total_s`` at the
+        # same clock points as the Lambda handler (unit entry -> record), so
+        # the run parquet's column is uniform across backends; ``duration_s``
+        # stays the worker's own aggregate clock.
+        import time
+
+        from zagg import runner
+        from zagg.runner import agg
+        from zagg.telemetry import read_sidecar
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+
+        def fake_hive_write(shard_key, granule_urls, grid, s3_creds, store_root, config, **kw):
+            time.sleep(0.02)
+            return {"shard_key": int(shard_key), "error": None, "total_obs": 1, "duration_s": 0.01}
+
+        monkeypatch.setattr(hive, "process_and_write_hive", fake_hive_write)
+        agg(cfg, catalog=catalog_path, store=root, backend="local")
+
+        record = read_sidecar(hive.shard_leaf_path(root, shard))
+        assert record["duration_s"] == 0.01
+        assert record["duration_total_s"] >= 0.02
+        assert record["gb_seconds"] is None  # unpriced off-Lambda, as before
+
     def test_local_hive_finalize_backstop_restores_lost_manifest(self, monkeypatch, cfg, tmp_path):
         # Issue #252 hybrid: the init-time write is primary, but finalize
         # keeps ensure_manifest as an idempotent backstop — a manifest lost

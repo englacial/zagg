@@ -91,6 +91,9 @@ _SEMANTIC_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 # so equality across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
 _SUM_OR_NONE_KEYS = (
+    # Nullable like the read counters: a rollup over records that never
+    # measured the invocation wall stays None, so ``merge([r]) == r`` holds.
+    "duration_total_s",
     "gb_seconds",
     "est_cost_usd",
     "n_obs_read",
@@ -294,8 +297,14 @@ def build_record(
     is the caller's own value and is trusted as given.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
-    ``duration_s`` (the billed-duration approximation the dispatcher's cost
-    estimate already uses).
+    ``duration_total_s`` — the invocation wall from handler entry to this
+    record (issue #589) — falling back to ``duration_s`` for a record
+    without one (a worker predating the key, the column sidecar, failure
+    rows). ``duration_s`` stays the read + index + aggregate wall the
+    shard-map estimator sizes on; ``phase_write`` / ``phase_hash`` /
+    ``phase_column`` / ``phase_icechunk`` all land AFTER it, which is what
+    the total covers and the fallback undercounts by (~23–70 s per unit on
+    the #586 measurement).
     """
     error = metadata.get("error")
     if semantic_hash is None:
@@ -303,9 +312,12 @@ def build_record(
         if isinstance(fallback, str) and _SEMANTIC_HASH_RE.match(fallback):
             semantic_hash = fallback
     duration_s = float(metadata.get("duration_s") or 0.0)
+    # Nullable, like ``n_obs_read``: absence means unmeasured, never zero.
+    duration_total_s = _opt_float(metadata.get("duration_total_s"))
     gb_seconds = est_cost = None
     if lambda_config and lambda_config.get("memory_mb"):
-        gb_seconds = duration_s * lambda_config["memory_mb"] / 1024.0
+        billed = duration_total_s if duration_total_s is not None else duration_s
+        gb_seconds = billed * lambda_config["memory_mb"] / 1024.0
         # Arch-keyed rate (issue #298's price table, folded in here): the
         # record prices with the same table as the dispatcher's cost block.
         arch = _ARCH_ALIASES.get(str(lambda_config.get("arch") or "").lower())
@@ -375,6 +387,7 @@ def build_record(
         "cells_with_data": int(metadata.get("cells_with_data") or 0),
         "phase_timings": phase_timings,
         "duration_s": duration_s,
+        "duration_total_s": duration_total_s,
         "spill_bytes": spill_bytes,
         # Fold-regime marker (issue #370): blocks closed at the spill threshold.
         # 0/absent = exact single-block leaf; > 0 = the leaf's outputs were
@@ -534,6 +547,7 @@ _ROW_SCALARS = (
     "n_obs_read",
     "cells_with_data",
     "duration_s",
+    "duration_total_s",
     "gb_seconds",
     "est_cost_usd",
     "spill_bytes",
