@@ -27,8 +27,11 @@ the same per-shard write path (see [Status](#status)).
   {sign+base}/{d1}/.../{d_n}/    <- one decimal digit per level (D2)
     {full_id}.zarr/              <- vanilla zarr v3 leaf, one per shard (D3)
     {full_id}_{window}.zarr/     <- time-windowed leaf (D13, morton-hive/2)
-      run-{run_id}/              <- a VERSIONED leaf's arrays: the root
-                                    zarr.json names the current version
+      zarr.json                  <- commit stamp (either leaf form); on a
+                                    VERSIONED leaf it also names `current`
+      {cell_order}/...           <- a legacy leaf's arrays, at the root
+      run-{run_id}-{attempt}/{cell_order}/...
+                                 <- a versioned leaf's arrays (own stamp)
 ```
 
 - **Ids are morton decimal strings** (D1): sign + base digit (`1..6` /
