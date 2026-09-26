@@ -158,6 +158,21 @@ def split_block(grid, split_order: int, *, base_chunk_order: int | None = None) 
     return {"chunks": 4**m, "order": int(grid.chunk_order) - m}
 
 
+def block_splits(block: dict) -> dict:
+    """``{order: split}`` for every level group ``block`` names, cut at its ``split_order``.
+
+    :func:`split_block`'s rule from each entry's recorded chunk axis, so the
+    splits follow the block as it stands (a ratchet included), not the one a
+    caller read earlier.
+    """
+    base, split_order = int(block["chunk_order"]), int(block["split_order"])
+    splits = {}
+    for order, level in (block.get("levels") or {}).items():
+        m = split_exponent(base, split_order, int(level["chunk_order"]))
+        splits[order] = {"chunks": 4**m, "order": int(level["chunk_order"]) - m}
+    return splits
+
+
 def finest_dispatch_order(shard_order: int, tuple_width: int | None = None) -> int:
     """The finest staged-sweep dispatch node order — the default ``commit_order``.
 
@@ -1150,6 +1165,7 @@ __all__ = [
     "repo_group_spec",
     "repo_path",
     "resolve_options",
+    "block_splits",
     "split_block",
     "split_exponent",
     "vet_leaf_repo",

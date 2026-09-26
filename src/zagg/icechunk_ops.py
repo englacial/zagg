@@ -48,6 +48,8 @@ from zagg.icechunk_refs import (
     _commit,
     _is_local,
     _save_splits,
+    _session_block,
+    block_splits,
     open_vetted,
     repo_group_spec,
     repo_path,
@@ -229,11 +231,6 @@ def declare_pyramid(
             )
     added = sorted(levels.keys() - recorded.keys(), key=int)
     dropped = sorted(recorded.keys() - levels.keys(), key=int)
-    if added:
-        # The new groups' manifest splits persist with the repo, as at init
-        # and the §11.5 ratchet; the dropped levels keep theirs.
-        splits = {o: lvl["split"] for o, lvl in {**recorded, **levels}.items()}
-        repo = _save_splits(repo, store_root, splits, store_kwargs)
 
     def mutate(session, _block):
         import zarr
@@ -275,7 +272,7 @@ def declare_pyramid(
         root.attrs.put(attrs)
         return details
 
-    return _operation(
+    report = _operation(
         store_root,
         "declare-pyramid",
         mutate,
@@ -289,6 +286,15 @@ def declare_pyramid(
         repo=repo,
         block=block,
     )
+    if added and report["snapshot"]:
+        # The new groups' manifest splits persist with the repo (§11.5) only
+        # once the commit landed — a metadata commit writes no chunk, so they
+        # are needed from the first ref commit on — and are cut from main's
+        # block as it is NOW, so a concurrent init ratchet's split_order holds.
+        # Residual: a ratchet saving between this read and this save is lost (last writer wins).
+        current = _session_block(repo.readonly_session(BRANCH))
+        _save_splits(repo, store_root, block_splits(current), store_kwargs)
+    return report
 
 
 def _group_matches(session, order: str, group_spec) -> bool:
