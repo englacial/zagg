@@ -1562,6 +1562,11 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   `rewrite_pending` for the operator `rewrite_manifests` pass, never run
   here. The record rides the run summary under `icechunk_finalize`; the tag
   is the durable outcome (`repo.lookup_tag("run-…")`, `ancestry(tag=…)`).
+  `Run.attach` fires it too, off the config's knob and only for a pinned
+  `commit: "leaf"` run (a ladder run's is its dispatcher's), with
+  `newest_only: true` (written only while the run is the newest on the repo,
+  else `{skipped}`) and `icechunk_init: null`, so `rewrite_pending` is
+  always null there.
 - **Operations** (spec §11.4 **Operations**, issue #582) — the operator's
   way to change what the repo is authoritative for, one validated commit
   each, no leaf touched, the commit metadata naming the operation:

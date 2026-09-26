@@ -172,9 +172,12 @@ class RunHandle:
         #: The run's Icechunk finalize record (issue #582) once the tail has
         #: run — ``{path, tag, snapshot, ...}``, or ``{"error": ...}`` from the
         #: fail-open invoke; ``None`` while the tail is in flight and when
-        #: the run stood up no repo. A reattached handle finalizes too (off
-        #: the config's knob; idempotent, so an already-tagged run is a
-        #: no-op). Read it after :meth:`wait` or a drained harvest.
+        #: the knob is off (or, on a dispatch, the run stood up no repo). A
+        #: reattached handle finalizes off the knob: ``{"error": ...}`` when
+        #: the store has no repo, ``{"skipped": ...}`` for a ladder run (its
+        #: dispatcher finalizes) or when a later run has committed since
+        #: (newest-only); an already-tagged run is a no-op. Read it after
+        #: :meth:`wait` or a drained harvest.
         self.icechunk_finalize: dict | None = None
 
     def __len__(self) -> int:
