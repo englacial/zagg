@@ -3795,9 +3795,9 @@ every branch and of every tag — all tags, not only `run-` ones — after
 expiry; a version only an expired snapshot references is collectable.
 **In-flight guard:** the collector never deletes a version whose stamp
 `written_at` is newer than the newest `run-` tag's finalize commit, since an
-in-flight run's versions have no tag yet (and an unstamped version has no
-`written_at` — it is left alone until its prefix's own run is finalized, the
-same guard read off the `run-{run_id}` prefix). A crash between (3) and (4)
+in-flight run's versions have no tag yet. An unstamped version (an attempt
+that died before (2)) has no `written_at`; the collector reclaims it only
+once its own run's `run-{run_id}` tag exists. A crash between (3) and (4)
 of the §1.5 write order therefore leaves a version that is either
 **referenced** (per-leaf mode — retained until expiry drops it) or
 **unreferenced but young** (ladder mode — guarded); once its run is
