@@ -957,6 +957,19 @@ class TestInvokeLambdaCellAsync:
         assert result["retries"] == 0
         assert result["granule_count"] == 1
 
+    def test_lambda_duration_is_the_billed_wall(self):
+        # Issue #589: a body carrying both clocks feeds measure_cost,
+        # cost_usd() and the timeout margin from the invocation wall.
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        result = self._invoke(
+            client,
+            lambda: self._envelope({"total_obs": 7, "duration_s": 3.5, "duration_total_s": 5.0}),
+        )
+        assert result["lambda_duration"] == 5.0
+
     def test_polls_until_result_lands(self, monkeypatch):
         from unittest.mock import MagicMock
 

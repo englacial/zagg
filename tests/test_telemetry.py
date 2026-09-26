@@ -7,6 +7,7 @@ import pytest
 from zagg.telemetry import (
     SCHEMA_VERSION,
     SPEC_V3,
+    billed_seconds,
     build_record,
     failure_record,
     flatten_record,
@@ -134,6 +135,14 @@ class TestBuildRecord:
         # Off-Lambda the total is recorded but unpriced, like duration_s.
         local = _record(duration=10.0, duration_total=13.0)
         assert local["duration_total_s"] == 13.0 and local["gb_seconds"] is None
+
+    def test_billed_seconds_prefers_the_invocation_wall(self):
+        # Issue #589: the dispatcher's cost/timeout figures bill the same
+        # clock build_record prices with -- the total, else duration_s.
+        assert billed_seconds({"duration_s": 10.0, "duration_total_s": 13.0}) == 13.0
+        assert billed_seconds({"duration_s": 10.0}) == 10.0
+        assert billed_seconds({"duration_s": 10.0, "duration_total_s": 0.0}) == 0.0
+        assert billed_seconds({}) == 0 and billed_seconds(None) == 0
 
     def test_unknown_arch_falls_back_to_default_rate(self):
         # The record prices via the #298 arch table; an unmapped arch uses the
