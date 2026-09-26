@@ -176,3 +176,27 @@ def test_empty_store_is_reported_not_fatal(tmp_path):
     result = tool.measure(str(root), store_kwargs={})
     assert result["fleet"] == {"runs": 0, "units": 0}
     assert result["objects"]["shards_listed"] == 0 and result["ladder"]["batch_rows"] == 0
+
+
+def test_a_bulk_invoke_sums_its_per_window_phases():
+    # Review finding (9), issue #586 phase 2: a two-window bulk invoke writes
+    # two rows; the invoke-level columns repeat and collapse to one, the
+    # per-window phases sum to the invoke's, a fan-out row stays its own.
+    import pandas as pd
+
+    rows = pd.DataFrame(
+        {
+            "_run": ["r", "r", "r"],
+            "shard_key": [1, 1, 2],
+            "window": ["2019", "2020", "2019"],
+            "unit_windows": [2, 2, None],
+            "duration_s": [50.0, 50.0, 30.0],
+            "phase_read": [20.0, 20.0, 10.0],
+            "phase_write": [4.0, 6.0, 3.0],
+            "phase_spill_bytes": [None, None, None],
+        }
+    )
+    out = tool._invokes(rows).set_index("shard_key")
+    assert len(out) == 2
+    assert out.loc[1, ["duration_s", "phase_read", "phase_write"]].tolist() == [50.0, 20.0, 10.0]
+    assert out.loc[2, "phase_write"] == 3.0 and pd.isna(out.loc[1, "phase_spill_bytes"])

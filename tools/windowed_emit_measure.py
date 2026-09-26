@@ -113,17 +113,24 @@ def _total(df, col: str):
 def _invokes(df):
     """One row per INVOKE: a bulk multi-window shard unit (issue #586 phase 2)
     writes one run-record row per emitted leaf, each carrying the invoke's
-    ``duration_s`` / ``max_memory_mb`` / ``gb_seconds`` and ``unit_windows``
-    set, so those rows collapse to the first per ``(run, shard_key)``; every
+    ``duration_s`` / ``max_memory_mb`` / ``gb_seconds`` / ``n_obs_read`` /
+    ``phase_read`` and ``unit_windows`` set, so those rows collapse to the
+    first per ``(run, shard_key)`` — except the per-window phases (every
+    ``phase_*`` but ``phase_read``: index, aggregate, write, hash, column, the
+    spill counters), which are each leaf's own and SUM to the invoke's. Every
     other row is its own invoke."""
     import pandas as pd
 
     if "unit_windows" not in df:
         return df
     bulk = df["unit_windows"].notna()
-    return pd.concat(
-        [df[~bulk], df[bulk].drop_duplicates(subset=["_run", "shard_key"])], ignore_index=True
-    )
+    rows, key = df[bulk], ["_run", "shard_key"]
+    head = rows.drop_duplicates(subset=key).set_index(key)
+    summed = [c for c in rows.columns if c.startswith("phase_") and c != "phase_read"]
+    if summed:
+        numeric = rows[key].join(rows[summed].apply(pd.to_numeric, errors="coerce"))
+        head[summed] = numeric.groupby(key)[summed].sum(min_count=1)
+    return pd.concat([df[~bulk], head.reset_index()], ignore_index=True)
 
 
 def fleet_numbers(store) -> dict:
