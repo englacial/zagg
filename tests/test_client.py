@@ -1288,9 +1288,12 @@ class TestStagedSweepTail:
     def _drive(self, catalog, monkeypatch, *, staged, record=True, current=False, ladder=True):
         from zagg import runner
 
-        seen: dict = {"stage": [], "order": []}
+        seen: dict = {"stage": [], "order": [], "modes_at_stage": None}
 
         def stage(*a, **k):
+            # The seam is stubbed, so it never reaches ``stub.invoke``:
+            # snapshot the invokes that preceded it (review, PR #591).
+            seen["modes_at_stage"] = [m for m in a[0].modes() if m]
             seen["order"].append("stage")
             seen["stage"].append((a, k))
             return staged
@@ -1325,6 +1328,9 @@ class TestStagedSweepTail:
         # fires, then the staged sweep, then the finalize — all after the stats
         # invoke wrote the tail marker, exactly as ``_run_lambda``'s tail.
         assert modes.index("stats") < modes.index("sweep")
+        before = seen["modes_at_stage"]
+        assert "stats" in before and "sweep" in before  # the tail marker and rollup precede
+        assert "icechunk_finalize" not in before  # ...and the finalize follows
         assert seen["order"] == ["stage", "finalize"] and modes[-1] == "icechunk_finalize"
         ((args, kwargs),) = seen["stage"]
         assert args[0] is stub and args[1:3] == ("process-shard-test", _STORE)
