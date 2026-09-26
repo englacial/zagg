@@ -59,10 +59,11 @@ def max_cost_preview(
     resolved at call time, not a catalog shard -- so this raises ``ValueError``.
     Returns ``{n_units, memory_gb, arch, timeout_s, max_cost_usd}``. No AWS
     access and no grid-signature check: this is display math, not dispatch.
-    The ceiling is a ceiling (one full timeout per unit) and is NOT scaled by
-    the write side: a unit's billed wall (``duration_total_s``, issue #589)
-    runs ~1.3x its read/aggregate ``duration_s`` on the #586 measurement,
-    and both sit well under the timeout this prices.
+    The ceiling prices one full timeout per unit and is NOT scaled by the
+    write side: Lambda never bills past the function timeout, so the ceiling
+    already bounds the billed wall (``duration_total_s``, issue #589). The
+    observed total/aggregate ratio on the #586 measurement was ~1.3x
+    (baseline arm) to ~1.5x (windowed arm).
     """
     from zagg import runner
 
