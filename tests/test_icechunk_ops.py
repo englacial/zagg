@@ -188,6 +188,41 @@ class TestDeclarePyramid:
         assert again["unchanged"] is True and again["added"] == []
         assert _messages(root)[0] == "declare-pyramid" and _messages(root)[1] != "declare-pyramid"
 
+    def test_a_refused_declaration_leaves_the_split_config(self, monkeypatch, cfg, tmp_path):
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)
+        before = _open(root)[1].config.manifest.splitting
+
+        def refuse(*_a, **_k):
+            raise ValueError("refused")
+
+        monkeypatch.setattr(icechunk_ops, "_validate", refuse)
+        with pytest.raises(ValueError, match="refused"):
+            icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
+        assert _open(root)[1].config.manifest.splitting == before
+
+    def test_the_splits_are_cut_from_the_block_as_committed(self, monkeypatch, cfg, tmp_path):
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)
+        commit = icechunk_ops._commit
+
+        def ratchet_lands_too(session, message, **kw):
+            # An init ratchet lands right after this operation's commit.
+            out = commit(session, message, **kw)
+            _group, repo = _open(root)
+            icechunk_refs._update_block(repo, {"split_order": 1}, "ratchet", local=True, path="")
+            return out
+
+        monkeypatch.setattr(icechunk_ops, "_commit", ratchet_lands_too)
+        icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
+        group, repo = _open(root)
+        block = group.attrs[ICECHUNK_ATTR]
+        assert block["split_order"] == 1
+        want = icechunk_refs._repo_config(root, icechunk_refs.block_splits(block), {})
+        assert repo.config.manifest.splitting == want.manifest.splitting
+
     def test_delisting_keeps_the_group_and_redeclaring_reuses_it(self, monkeypatch, cfg, tmp_path):
         grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
         cfg.output.pop("pyramid")
