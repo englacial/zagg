@@ -1715,7 +1715,10 @@ be added later by the sweep as a derived artifact). Readers:
    stamp's coverage payload pre-filters the AOI (`box_and`/`bitmap_and`).
    If the stamp names `current` (a versioned leaf), the
    arrays are under `{leaf}/{current}/` (`zagg.hive.resolve_leaf`); the
-   stamp's first GET is the pointer, so following it costs no extra request.
+   stamp's first GET is the pointer, so following it costs no extra request
+   for a reader that already GETs the root stamp and then addresses chunks by
+   key (moczarr's 2-GET path, zagg's readers). A zarr-python reader that
+   opens the version **group** pays one GET for its `{current}/zarr.json`.
 4. Discovery without a root MOC falls back to the delimiter-LIST walk:
    recurse on `[1-4]/` children; a `*.zarr` entry is data at that node; no
    digit children ⇒ nothing finer. Never LIST per observation in a join
