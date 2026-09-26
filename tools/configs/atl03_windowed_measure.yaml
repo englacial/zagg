@@ -4,9 +4,10 @@
 # carrying the three knobs the measurement varies: a YEARLY window schedule on
 # the store's own ``delta_time`` clock, the staged sweep, and the dense overview
 # ladder from 13 down. Yearly windows are calendar years, so the catalog dates
-# below give 9 windows (2018..2026), the first (2018, from Oct 14) and last
-# (2026, to Sep 1) partial: read the per-unit quantiles with that in mind. Run it against ONE order-6 cell into a scratch
-# store, never the live store. The config differs between the arms ONLY in
+# below are trimmed to WHOLE years (2019..2025, 7 windows; espg 2026-09-26): the
+# mission's partial first (from 2018-10-14) and current (2026) years would pull
+# the per-unit quantiles with stub windows. Run it against ONE order-6 cell into
+# a scratch store, never the live store. The config differs between the arms ONLY in
 # ``output.windowing`` (delete the block for the baseline arm), but the RUNS also
 # differ in Icechunk: an unset ``output.icechunk`` resolves ON for the unwindowed
 # hive baseline and OFF for a windowed store (``get_icechunk``, spec section 11.6),
@@ -29,7 +30,7 @@
 #   json.dump(mapping(Polygon([(x, y) for y, x in ring]).buffer(-1e-3)), \
 #   open('/tmp/o6_sierra.geojson', 'w'))"
 #   uv run python -m zagg.catalog --config tools/configs/atl03_windowed_measure.yaml \
-#       --short-name ATL03 --start-date 2018-10-14 --end-date 2026-09-01 \
+#       --short-name ATL03 --start-date 2019-01-01 --end-date 2025-12-31 \
 #       --polygon /tmp/o6_sierra.geojson --output /tmp/o6_sierra.json
 #   # 2. windowed arm
 #   uv run python -m zagg --config tools/configs/atl03_windowed_measure.yaml \
