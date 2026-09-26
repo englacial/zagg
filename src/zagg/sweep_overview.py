@@ -1108,8 +1108,13 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
         stamp = read_commit(open_store(path, read_only=True, **store_kwargs))
         if stamp is not None:
             # A versioned leaf's arrays live under its current version
-            # (spec §1.5, issue #582); the stamp just read is the pointer.
-            leaf = leaf_data_path(path, stamp)
+            # (spec §1.5, issue #582); the stamp just read is the pointer. An
+            # invalid ``current`` is a corrupt leaf: probe the next one.
+            try:
+                leaf = leaf_data_path(path, stamp)
+            except ValueError as e:
+                logger.warning(f"declare_pyramid: skipping corrupt leaf {path} ({e})")
+                continue
             break
     if leaf is None:
         # Two very different stores that must not report the same thing: no run
@@ -1887,13 +1892,14 @@ def _fold_node(
             stamp = read_commit(leaf_store)
             if stamp is None:
                 continue  # absent leaf or unstamped debris (D4)
-            if stamp.get("current"):
-                # Versioned leaf (spec §1.5): the arrays are the current
-                # version's; the root stamp already read is its pointer.
-                leaf_store = open_store(leaf_data_path(leaf, stamp), **store_kwargs)
             # Fold the whole leaf's contribution BEFORE touching the slabs, so
             # a corrupt leaf skips cleanly instead of half-applying.
             try:
+                if stamp.get("current"):
+                    # Versioned leaf (spec §1.5): the arrays are the current
+                    # version's; the root stamp already read is its pointer.
+                    # Inside the try: an invalid ``current`` skips THIS leaf.
+                    leaf_store = open_store(leaf_data_path(leaf, stamp), **store_kwargs)
                 group = zarr.open_group(leaf_store, path=str(cell_order), mode="r", zarr_format=3)
                 morton = group["morton"]
                 if morton.shape != (leaf_cells,):
