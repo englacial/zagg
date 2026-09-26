@@ -3823,7 +3823,8 @@ commits are kept; the next run's tag covers them). One finalize, in order:
    shares a hash, so a hash-named tag would collide on the second run.
 
 Idempotent: a finalize whose tag already exists returns it and writes
-nothing. A reattached client (`Run.attach`) finalizes only while its run is
+nothing, and two finalizes of one run are safe: the loser reads the
+winner's tag. A reattached client (`Run.attach`) finalizes only while its run is
 the newest on the repo (no later `init` or `finalize` commit on `main`),
 else it writes nothing and records `{skipped}`, so an untagged old run
 stays covered by the next run's tag as before. Fail-open (D9) at the dispatcher like the init; the record rides
