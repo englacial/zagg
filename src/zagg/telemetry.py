@@ -310,11 +310,13 @@ def build_record(
     ``duration_total_s`` — the invocation wall from handler entry to this
     record (issue #589) — falling back to ``duration_s`` for a record
     without one (a worker predating the key, the column sidecar, failure
-    rows). ``duration_s`` stays the read + index + aggregate wall the
-    shard-map estimator sizes on; ``phase_write`` / ``phase_hash`` /
-    ``phase_column`` / ``phase_icechunk`` all land AFTER it, which is what
-    the total covers and the fallback undercounts by (~23–70 s per unit on
-    the #586 measurement).
+    rows). ``duration_s`` stays the read + index + aggregate wall, the
+    meaning every existing pin and readout reads. The write side,
+    ``phase_timings.{write,hash,column,icechunk}`` (``phase_*`` in the run
+    parquet), lands AFTER it on the sharded (fleet) leaf path — what the
+    total covers and the fallback undercounts by (~23–70 s per unit on the
+    #586 measurement); the unsharded streaming path writes inside
+    ``process_shard``, so there the two clocks overlap.
     """
     error = metadata.get("error")
     if semantic_hash is None:

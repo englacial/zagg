@@ -638,11 +638,14 @@ stamp alone, never tampered.
 
 The sidecar (and the run parquet row flattened from it) carries two clocks
 ([issue #589](https://github.com/englacial/zagg/issues/589)): `duration_s`
-is the worker's read + index + aggregate wall — the number the shard-map
-sizing estimate reads — and `duration_total_s` is the whole unit's, handler
-entry to the record, which is what `gb_seconds` / `est_cost_usd` price from;
-`phase_write` / `phase_hash` / `phase_column` / `phase_icechunk` are the
-write side between them, all stamped after `duration_s` stops.
+is the worker's read + index + aggregate wall — it keeps that meaning
+because every existing pin and readout reads it — and `duration_total_s` is
+the whole unit's, handler entry to the record, which is what `gb_seconds` /
+`est_cost_usd` price from. `phase_timings.{write,hash,column,icechunk}` (the
+run parquet flattens them to `phase_*`) are the write side between them. On
+the sharded leaf path (the fleet's) they are all stamped after `duration_s`
+stops; the unsharded streaming path writes from inside `process_shard`, so
+there the two clocks overlap.
 
 A leaf whose root metadata lacks the stamp is **debris**: incomplete,
 ignorable, safe to overwrite on retry (the writer re-emits the leaf template
