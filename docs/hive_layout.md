@@ -1413,7 +1413,7 @@ object's `last_modified` ceiled to the next whole second on a local store —
 so a leaf replaced in place fails loudly instead of decoding stale offsets
 (locally, only a replacement landing inside the same second slips through).
 
-Three writes, all worker-side (the dispatcher never writes, D8), all
+Four writes, all worker-side (the dispatcher never writes, D8), all
 **fail-open** — the repo is a regenerable index, never load-bearing:
 
 - **`mode: "icechunk_init"`**, one synchronous invoke after the ping and
@@ -1464,6 +1464,19 @@ Three writes, all worker-side (the dispatcher never writes, D8), all
   `icechunk_nodes` list naming each node that did work and the snapshot it
   committed; the first fleet run's contention question reads
   `icechunk_rebases` off the stage records.
+- **`mode: "icechunk_finalize"`** ([issue #582](https://github.com/englacial/zagg/issues/582),
+  spec §11.4), one synchronous invoke AFTER every commit of the run landed —
+  after the staged sweep returned under the ladder, after the fan-out under
+  `commit: "leaf"` (the local backend calls
+  `zagg.icechunk_finalize.finalize_repo` in-process at the same point): applies
+  the `retain_runs` retention below, makes one content-free `finalize
+  {run_id}` commit whose metadata names the run (`run_id`, `semantic_hash`,
+  `zagg_version`, the ladder knobs) and its retention counts, and tags it
+  **`run-{run_id}`**. Idempotent (an existing tag is returned, nothing
+  written); a §11.5 split ratchet this run applied is reported as
+  `rewrite_pending` for the operator `rewrite_manifests` pass, never run
+  here. The record rides the run summary under `icechunk_finalize`; the tag
+  is the durable outcome (`repo.lookup_tag("run-…")`, `ancestry(tag=…)`).
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M
@@ -1481,6 +1494,7 @@ output:
     commit: ladder          # default: ladder when the run walks it, else "leaf" (the per-leaf commit; below)
     commit_order: 6         # default: the finest staged-sweep dispatch node (shard_order − tuple_width)
     split_order: 6          # default: commit_order; must be >= commit_order and <= shard_order
+    retain_runs: 0          # default: keep every run tag; K > 0 keeps the K newest (finalize expires + collects the rest)
 ```
 
 | setting | manifest = one cell at | chunks / manifest (base level group) | commits | snapshot |
@@ -1501,9 +1515,17 @@ writes sidecars nothing gathers. The Lambda dispatchers ship the resolved
 mode in the worker config. The default `commit_order` is a function of
 the shard order and the width (`zagg.icechunk_refs.finest_dispatch_order`).
 
+`retain_runs` is the run-tag retention (spec §11.4): `0` keeps every run
+(the default — history only grows, one finalize snapshot per run); K > 0
+has each finalize delete the run tags beyond the K − 1 newest, expire the
+snapshots older than the oldest retained run and garbage-collect the repo
+objects nothing retained references (the cutoff is always a run tag's
+commit time, never "now"). Leaf objects are never touched by any of it.
+
 `output.icechunk: false` opts a hive run out (default on; excluded from the
 D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves and raster
-hive products are outside stage 1 (spec §11.6); the sweep's overviews are in
+hive products are outside stage 1 (spec §11.6;
+[issue #584](https://github.com/englacial/zagg/issues/584) tracks both); the sweep's overviews are in
 — every declared overview level has its group in the store's one repo.
 
 Reading it back:
@@ -1526,6 +1548,10 @@ group.attrs["multiscales"]         # the manifest's zagg-multiscales/1 block: ev
 count = group["19/count"]          # the base leaves: shape 12·4^19, chunks 4^6
 column = group["13/count"]         # the leaf columns' member: shape 12·4^13, chunks 256 (one per leaf)
 coarse = group["11/count"]         # the order-7 overviews: shape 12·4^11, chunks 256 (one per node)
+
+# A run's snapshot, by tag (spec §11.4): the store as that run left it.
+as_of_run = zarr.open_group(repo.readonly_session(tag="run-<run_id>").store, mode="r")
+runs = [s.metadata for s in repo.ancestry(branch="main") if s.message.startswith("finalize ")]
 ```
 
 That is the **public** store — the motivating case, and the one an icechunk-js
