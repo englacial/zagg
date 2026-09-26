@@ -321,12 +321,15 @@ committed bytes never happens.
 
 The **write order** is normative: (1) write the version subgroup's arrays;
 (2) stamp the version (its own root `zarr.json`, whose `spec` is `/1` or `/2`
-exactly as the legacy rule assigns it — windowed ⇒ `/2`);
-(3) record the refs against the version's objects (§11.3); (4) swap the
-pointer — one PUT of the stable root `zarr.json`, mirroring the version's
-stamp and naming it as `current`; (5) the lifecycle touch refreshes the
-stable root and the current version only, never a superseded one. Until (4)
-lands the leaf reads as it did before the write. A retry **always** writes a
+exactly as the legacy rule assigns it — windowed ⇒ `/2`); (3) record the
+refs against the version's objects (§11.3) — a commit on `main` under
+`commit: "leaf"`, the ladder ref sidecar under `commit: "ladder"` (§11.4);
+(4) swap the pointer — one PUT of the stable root `zarr.json`, mirroring the
+version's stamp and naming it as `current`. What readers see: a **path**
+reader (the D3 address, the stamp, the pointer) sees the previous state until
+(4) lands; an **Icechunk** reader of `main` sees the new version at its
+commit — under `commit: "leaf"` that is step (3), before the swap; under the
+ladder it is the staged sweep's node commit, which may follow (4). A retry **always** writes a
 new version — same run or not, it draws a fresh `attempt` — so no writer
 ever opens, clears or resumes a prefix another writer may hold. An attempt
 that died before its pointer swap leaves a version that is not `current`:

@@ -654,8 +654,11 @@ marks versioning — `current` alone does. A replacement writes a new version
 and swaps the pointer (one PUT), so an earlier run tag in the Icechunk repo
 keeps reading the version it indexed; superseded versions are reclaimed by
 the operator-run collector (`tools/icechunk_gc_targets.py`, dry-run default).
-Write order: version arrays → version stamp → refs against the version's
-objects → pointer swap → lifecycle touch of the root and current version.
+Write order: (1) version arrays → (2) version stamp → (3) refs against the
+version's objects (a commit under `commit: "leaf"`, the ladder sidecar under
+`commit: "ladder"`) → (4) pointer swap. A path reader sees the previous state
+until (4); an Icechunk reader sees the new version at its commit — (3) per
+leaf, the staged sweep's node commit (possibly after (4)) under the ladder.
 `attempt` is a per-invocation nonce (8 hex characters of a fresh `uuid4`), so
 two writers of one unit — a duplicate-invoke retry, a redundant fleet worker —
 never share a prefix: a retry **always** writes a new version, and an attempt
