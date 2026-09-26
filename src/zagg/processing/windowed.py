@@ -15,8 +15,8 @@ the read itself is the shard's single pass.
 
 Byte-identity with the ``(shard, window)`` fan-out: a window's sink receives
 exactly the rows the fan-out unit's read would have kept — same granules
-(``granules``, the window's membership, decides which granules count toward
-its buffer cadence, so a streaming flush lands on the same granule boundary),
+(``granules``, the window's membership, decides which granules' rows it
+takes and which count toward its buffer cadence, so a streaming flush lands on the same granule boundary),
 same group order, same row order — so the pooled aggregation and the
 single-block spill regime reproduce the fan-out's leaf bit for bit. The one
 bulk-only departure is the shared ``/tmp`` cap below.
@@ -108,20 +108,30 @@ class WindowBins:
             st = os.statvfs(spills[0].tmp_dir or tempfile.gettempdir())
             self._tmp_cap = int(SPILL_TMP_FRACTION * st.f_bavail * st.f_frsize)
 
-    def add_reads(self, reads) -> None:
-        """Bin every group read of one granule into its windows' sinks."""
+    def add_reads(self, reads, index: int) -> None:
+        """Bin every group read of granule ``index`` into its windows' sinks.
+
+        Only the windows the granule is a MEMBER of take its rows — the
+        fan-out reads a granule for exactly those windows — so a loose or
+        instant catalog span never lands rows in a leaf whose recorded
+        granule set does not name the granule.
+        """
+        windows = [w for w in self.windows if self._member(w["label"], index)]
         for chunk in reads:
-            for label, part in bin_chunk(chunk, self.time_field, self.windows):
+            for label, part in bin_chunk(chunk, self.time_field, windows):
                 if self.buffered:
                     self.buffered[label].add_read(part)
                 else:
                     self.reads[label].append(part)
 
+    def _member(self, label: str, index: int) -> bool:
+        members = self._members[label]
+        return members is None or index in members
+
     def granule_done(self, index: int) -> None:
         """Mark one granule read for the windows it belongs to (streaming cadence)."""
         for label, agg in self.buffered.items():
-            members = self._members[label]
-            if members is None or index in members:
+            if self._member(label, index):
                 agg.granule_done()
         self._enforce_tmp_cap()
 

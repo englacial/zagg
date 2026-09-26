@@ -712,7 +712,7 @@ def process_shard(
             obs_read_total = (obs_read_total or 0) + int(granule_io["obs_read"])
         try:
             if bins is not None:
-                bins.add_reads(reads)
+                bins.add_reads(reads, index)
             else:
                 for chunk in reads:
                     if buffered is not None:

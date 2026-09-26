@@ -135,13 +135,13 @@ def _bulk_unit(cfg, records=None):
     return shard, _resolve_granule_entries(recs, "s3"), _shard_window_payloads(recs, windows, "s3")
 
 
-def _run_fanout(monkeypatch, cfg, root, **kw):
+def _run_fanout(monkeypatch, cfg, root, fakes=None, records=None, **kw):
     from zagg.runner import _windowed_units
 
-    _patch(monkeypatch)
+    _patch(monkeypatch, fakes)
     out = {}
     for shard, recs, window in _windowed_units(
-        [(_shard_word(), _records())], get_windowing(cfg), None
+        [(_shard_word(), records or _records())], get_windowing(cfg), None
     ):
         urls = [r["s3"] for r in recs]
         out[window["label"]] = hive.process_and_write_hive(
@@ -390,8 +390,9 @@ class TestWindowBins:
             {"label": "c", "start": 20.0, "end": 30.0},  # no membership: every granule
         ]
         bins = WindowBins(windows, "t", _FakeAgg)
-        bins.add_reads([pd.DataFrame({"t": [1.0, 15.0]})])
+        bins.add_reads([pd.DataFrame({"t": [1.0, 15.0]})], 0)
         bins.granule_done(0)
+        bins.add_reads([pd.DataFrame({"t": [5.0]})], 1)  # not a member of a
         bins.granule_done(1)
         a, b, c = (bins.buffered[k] for k in "abc")
         assert (a.done, b.done, c.done) == (1, 2, 2)
@@ -407,7 +408,7 @@ class TestWindowBins:
         from zagg.processing.windowed import WindowBins
 
         bins = WindowBins(TestBinChunk.WINDOWS, "t")
-        bins.add_reads([pd.DataFrame({"t": [1.0, 15.0]}), pd.DataFrame({"t": [2.0]})])
+        bins.add_reads([pd.DataFrame({"t": [1.0, 15.0]}), pd.DataFrame({"t": [2.0]})], 0)
         bins.granule_done(0)
         reads, buffered = bins.sink("a")
         assert buffered is None and [len(r) for r in reads] == [1, 1]
@@ -440,11 +441,11 @@ class TestWindowBins:
         bins = WindowBins(TestBinChunk.WINDOWS, "t", _Spill)
         assert bins._tmp_cap is not None  # sized off the spill dir at construction
         bins._tmp_cap = 250
-        bins.add_reads([pd.DataFrame({"t": [1.0, 15.0]})])  # 100 each -> 200 open
+        bins.add_reads([pd.DataFrame({"t": [1.0, 15.0]})], 0)  # 100 each -> 200 open
         bins.granule_done(0)
         a, b = bins.buffered["a"], bins.buffered["b"]
         assert (a.closed, b.closed) == (0, 0)
-        bins.add_reads([pd.DataFrame({"t": [1.0]})])  # a: 200, b: 100 -> 300 >= cap
+        bins.add_reads([pd.DataFrame({"t": [1.0]})], 1)  # a: 200, b: 100 -> 300 >= cap
         bins.granule_done(1)
         assert (a.closed, b.closed) == (1, 0) and a.open_block_bytes == 0
 
@@ -473,6 +474,19 @@ class TestBulkEndToEnd:
             5,
             6,
         ]
+
+    def test_rows_bin_only_into_member_windows(self, monkeypatch, tmp_path):
+        # Review finding (3): C without time_end collapses to a 2019 instant,
+        # so C is no 2020 member; its 2020 rows must not reach the 2020 leaf
+        # (the fan-out never reads C there, and the leaf's granule ids omit it).
+        records = _records()
+        del records[2]["time_end"]
+        cfg = _cfg()
+        fan_root, bulk_root = str(tmp_path / "fan"), str(tmp_path / "bulk")
+        _run_fanout(monkeypatch, cfg, fan_root, records=records)
+        bulk = _run_bulk(monkeypatch, cfg, bulk_root, records=records)
+        assert [m["total_obs"] for m in bulk["windows"]] == [1, 5, 3]
+        assert _tree(fan_root) == _tree(bulk_root)
 
     def test_bulk_under_spill_streaming_matches_the_fanout(self, monkeypatch, tmp_path):
         cfg = _cfg(mode="spill", buffer_granules=1)
