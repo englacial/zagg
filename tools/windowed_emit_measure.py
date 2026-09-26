@@ -91,12 +91,16 @@ def fleet_numbers(store) -> dict:
     df = pd.concat(frames, ignore_index=True)
     ok = df[df["success"]] if "success" in df else df
     # an unwindowed unit has window None: one leaf per shard, counted as one
-    per_shard = ok.groupby("shard_key")["window"].nunique(dropna=False) if "window" in ok else None
+    per_shard = (
+        ok.groupby("shard_key")["window"].nunique(dropna=False)
+        if "window" in ok
+        else ok.groupby("shard_key").size()
+    )
     out = {
         "runs": len(frames),
         "units": int(len(df)),
         "shards": int(ok["shard_key"].nunique()),
-        "windows_per_shard": _quantiles(per_shard.values) if per_shard is not None else None,
+        "windows_per_shard": _quantiles(per_shard.values),
         "duration_s": _quantiles(ok.get("duration_s", [])),
         "max_memory_mb": _quantiles(ok.get("max_memory_mb", [])),
         "errors": int((~df["success"]).sum()) if "success" in df else 0,
