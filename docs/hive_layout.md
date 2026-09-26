@@ -659,7 +659,14 @@ keeps reading the base-leaf version it indexed (columns and overviews are
 still rewritten at their keys until issue
 [#584](https://github.com/englacial/zagg/issues/584), so a tag reads those
 only as the latest run left them); superseded versions are reclaimed by
-the operator-run collector (`tools/icechunk_gc_targets.py`, dry-run default).
+the operator-run collector (`tools/icechunk_gc_targets.py`, dry-run default:
+`uv run python tools/icechunk_gc_targets.py <store_root> [--execute] [--anon]`
+lists each versioned leaf's versions that are neither `current` nor referenced
+by any retained snapshot — every branch's and every tag's ancestry — and not
+in flight (a stamped version newer than the newest `run-` tag's finalize, or an
+unstamped attempt of a run without a tag, is kept), prints the reclaimable
+bytes, and deletes them only under `--execute`; a legacy leaf is never a
+target and a store without a repo is refused).
 Write order: (1) version arrays → (2) version stamp → (3) refs against the
 version's objects (a commit under `commit: "leaf"`, the ladder sidecar under
 `commit: "ladder"`) → (4) pointer swap. A path reader sees the previous state
