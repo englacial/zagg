@@ -3442,9 +3442,9 @@ pinned.
 **Status: contract** (`zagg-icechunk/1`, issue
 [#580](https://github.com/englacial/zagg/issues/580), stage 1 — refs-only,
 additive; issue [#582](https://github.com/englacial/zagg/issues/582), stage
-2 — the two-plane statement, run tags and finalize below). The leaves remain
-the normative, self-describing data plane (§1–§10); the companion is a
-derived index over their bytes.
+2 — the two-plane statement, run tags, finalize and the metadata operations
+below). The leaves remain the normative, self-describing data plane
+(§1–§10); the companion is a derived index over their bytes.
 
 **Two planes.** A hive store is two planes with different mutability:
 
@@ -3457,8 +3457,9 @@ derived index over their bytes.
   carries (§11.3);
 - the **metadata plane** is the one repository — authoritative for what
   *evolves*: convention and attrs blocks (the `dggs` `latitude` token, spec
-  markers, `/1`→`/2` flips), the pyramid declaration mirrored as
-  `multiscales`, and the run history (tags, §11.4). A leaf's own
+  markers — a leaf stamp's or a convention block's `/1`→`/2` revision
+  carried in attrs, never the repo's own array model), the pyramid
+  declaration mirrored as `multiscales`, and the run history (tags, §11.4). A leaf's own
   `zarr.json` keeps being written (a leaf stays a valid standalone zarr) but
   is **frozen with the leaf**: shape, dtype, chunking and codecs never
   diverge from the repo's array model; attrs may, by design, and the repo's
@@ -3467,8 +3468,9 @@ derived index over their bytes.
 "Backfill" is therefore not a category: an evolving fact is written to the
 repo in a commit, never by rewriting leaves — the §11.4 **operations**
 (`zagg.icechunk_ops`: `set-attrs`, `declare-pyramid`) are how an operator
-writes one. Stage 2's remaining item — native overview chunks — is the `/2`
-array model tracked on issue #584.
+writes one. Stage 2's remaining items are tracked on issue #582: native
+overview chunks (the `/2` array model on issue #584), moczarr's reads
+through the repo (phase 6) and the browser (phase 7).
 
 **Succession.** A change to the repo's ARRAY MODEL is a `/2` revision,
 declared — as `/1` is — in the `zagg_icechunk.spec` token (§11.1), so a
