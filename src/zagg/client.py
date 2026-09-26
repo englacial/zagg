@@ -176,8 +176,8 @@ class RunHandle:
         #: fail-open invoke; ``None`` while the tail is in flight and when
         #: the knob is off (or, on a dispatch, the run stood up no repo). A
         #: reattached handle finalizes off the knob: ``{"error": ...}`` when
-        #: the store has no repo, ``{"skipped": ...}`` for a ladder run (its
-        #: dispatcher finalizes) or when a later run has committed since
+        #: the store has no repo, ``{"skipped": ...}`` for a ``sweep:
+        #: "stages"`` run (its dispatcher finalizes) or when a later run has committed since
         #: (newest-only); an already-tagged run is a no-op. Read it after
         #: :meth:`wait` or a drained harvest.
         self.icechunk_finalize: dict | None = None
@@ -1379,10 +1379,11 @@ class Run:
         never held one — on the config's knob (``get_icechunk``; the worker
         refuses a repo-less store and the invoke fails open). A reattached
         run finalizes only under the manifest config's pinned ``commit:
-        "leaf"``: a ``"ladder"`` run (``runner._run_lambda`` under ``sweep:
-        "stages"``) lands its last commits in the staged sweep that dispatcher
-        chains after the tail marker, so its finalize is that dispatcher's
-        alone and attach never fires it (``{"skipped"}`` on the handle). An
+        "leaf"`` AND no ``sweep: "stages"``: a ``sweep: "stages"`` run's
+        dispatcher chains the staged sweep after the tail marker whatever the
+        commit mode (its nodes commit overview refs under ``"leaf"`` too), so
+        its last commits land there, its finalize is that dispatcher's alone
+        and attach never fires it (``{"skipped"}`` on the handle). An
         attached finalize is ``newest_only``: a later run on the repo leaves
         this one untagged (the next run's tag covers it, spec §11.4).
         """
@@ -1391,9 +1392,13 @@ class Run:
         if self._icechunk_init is None:
             if not (self._attached and get_icechunk(self.config)):
                 return
-            if get_icechunk_options(self.config)["commit"] != "leaf":
+            if (
+                get_icechunk_options(self.config)["commit"] != "leaf"
+                or self.config.output.get("sweep") == "stages"
+            ):
                 handle.icechunk_finalize = {
-                    "skipped": "attached ladder run; its dispatcher finalizes after the staged sweep"
+                    "skipped": 'attached sweep: "stages" run; its dispatcher finalizes '
+                    "after the staged sweep"
                 }
                 return
         elif skip is not None:

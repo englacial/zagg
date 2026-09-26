@@ -1570,7 +1570,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   here. The record rides the run summary under `icechunk_finalize`; the tag
   is the durable outcome (`repo.lookup_tag("run-…")`, `ancestry(tag=…)`).
   `Run.attach` fires it too, off the config's knob and only for a pinned
-  `commit: "leaf"` run (a ladder run's is its dispatcher's), with
+  `commit: "leaf"` run with no `sweep: "stages"` (a `sweep: "stages"`
+  run's is its dispatcher's, after the staged sweep), with
   `newest_only: true` (written only while the run is the newest on the repo,
   else `{skipped}`) and `icechunk_init: null`, so `rewrite_pending` is
   always null there.

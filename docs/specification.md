@@ -3833,8 +3833,9 @@ nothing, and two finalizes of one run are safe: the loser reads the
 winner's tag. A reattached client (`Run.attach`) fires a finalize of its
 own, off the config's knob (it never held the init record, so the event
 carries `icechunk_init: null` and `rewrite_pending` is always null there),
-and only for a pinned `commit: "leaf"` run: a ladder run's finalize is its
-dispatcher's, after the staged sweep, and attach records `{skipped}`. It
+and only for a pinned `commit: "leaf"` run with no `sweep: "stages"`: a
+`sweep: "stages"` run's finalize is its dispatcher's, after the staged sweep
+(whose nodes commit under either mode), and attach records `{skipped}`. It
 finalizes only while its run is the newest on the repo (no later `init` or
 `finalize` commit on `main`), else it writes nothing and records
 `{skipped}`, so an untagged old run stays covered by the next run's tag as

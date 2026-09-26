@@ -1032,6 +1032,28 @@ class TestAttach:
         assert again.events == []
         assert "staged sweep" in again_handle.icechunk_finalize["skipped"]
 
+    def test_attach_never_finalizes_a_leaf_pinned_staged_run(self, status_store):
+        # An explicit ``commit: "leaf"`` under ``sweep: "stages"``: the
+        # dispatcher still chains the staged sweep, whose nodes commit
+        # overview refs under ``"leaf"`` too — so the gate is on the sweep,
+        # not the mode, and attach fires no finalize (review, PR #591).
+        from zagg.telemetry import build_record
+
+        _put_manifest(
+            status_store, "leafstg", _WORDS, config=_pinned_config("leaf", sweep="stages")
+        )
+        for word in _WORDS:
+            body = {"total_obs": 7, "duration_s": 1.0}
+            body["stats"] = build_record(shard_key=int(word), metadata=dict(body))
+            _put_status(status_store, word, body=body)
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "leafstg", lambda_client=stub)
+        handle.results()
+        handle.wait(timeout=10)
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "icechunk_finalize" not in modes
+        assert "staged sweep" in handle.icechunk_finalize["skipped"]
+
     def test_attach_never_finalizes_a_run_whose_knob_is_off(self, status_store):
         # ``output.icechunk: false`` in the dispatched config: no repo was
         # stood up, so a reattached handle fires no finalize on either path.
