@@ -133,10 +133,23 @@ class TestValidation:
             del root_group.attrs[ICECHUNK_ATTR]
             return {}
 
+        def edit_block(**updates):
+            def mutate(session, _block):
+                root_group = zarr.open_group(session.store, mode="r+")
+                block = {**root_group.attrs[ICECHUNK_ATTR], **updates}
+                root_group.attrs[ICECHUNK_ATTR] = block
+                return {}
+
+            return mutate
+
+        repo = icechunk_refs.repo_path(root)
         for mutate, msg in (
             (add_array, "would add array"),
             (resize, "would change the array model"),
             (drop_block, "would remove the root"),
+            (edit_block(shard_order=3), f"icechunk repo {repo} was built for"),
+            (edit_block(cell_order=7), "would move the block's cell_order"),
+            (edit_block(levels={}), "would delist the base level /6"),
         ):
             with pytest.raises(ValueError, match=msg):
                 icechunk_ops._operation(root, "probe", mutate, store_kwargs={})
