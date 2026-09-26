@@ -146,6 +146,24 @@ def test_timeouts_match_the_dispatcher_error_strings(tmp_path):
     assert fleet["errors"] == 3 and fleet["timeouts"] == 2
 
 
+def test_lists_only_successful_exact_shard_keys(tmp_path, caplog):
+    import pandas as pd
+
+    root = _store(tmp_path, windows=None)
+    third = int(morton_word("11113"))  # failed: no leaf, so never LISTed as an empty one
+    rows = [
+        flatten_record(failure_record(shard_key=third, error="ValueError: x")),
+        flatten_record(build_record(shard_key=-1, metadata={}, granule_ids=["g"])),
+    ]
+    write_run_parquet(root, rows, run_id="run-b")
+    frame = pd.DataFrame({"shard_key": [float(2**60), 0.5], "success": [True, True]})
+    frame.to_parquet(Path(root) / "stats_run-c.parquet", engine="fastparquet")
+    result = tool.measure(root, store_kwargs={})
+    assert result["objects"]["shards_listed"] == 2
+    assert result["objects"]["leaves_per_shard"]["p50"] == 1.0
+    assert "skipped 3 shard key(s)" in caplog.text
+
+
 def test_cli_writes_json(tmp_path):
     root = _store(tmp_path, windows=None)
     out = tmp_path / "out.json"

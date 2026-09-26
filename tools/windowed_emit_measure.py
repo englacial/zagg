@@ -30,11 +30,13 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import re
 from collections import defaultdict
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
 _RUN_PARQUET = re.compile(r"^stats_.*\.parquet$")
 _STAGE_RECORD = re.compile(r"^sweep_stats_.*_stages\.json$")
 _QUANTILES = (0.5, 0.9, 1.0)
@@ -239,6 +241,26 @@ def ladder_numbers(store) -> dict:
     }
 
 
+def _listable_shards(frames) -> list[int]:
+    """The shard keys to LIST: successful rows only (a failed shard has no leaf and
+    would read as an empty one), read frame by frame (never through a concat that
+    could coerce exact keys to float), skipping — with a warning, as
+    ``zagg.sweep.discover_leaves`` does — keys that cannot name a node: a float
+    key that is fractional or past 2^53 (inexact, a pre-issue-#300 parquet) and
+    the negative stale-worker sentinel (``-1``)."""
+    keys, skipped = set(), 0
+    for df in frames:
+        ok = df[df["success"]] if "success" in df else df
+        for key in ok["shard_key"].dropna().unique():
+            if isinstance(key, float) and (key != int(key) or key >= 2**53) or int(key) < 0:
+                skipped += 1
+                continue
+            keys.add(int(key))
+    if skipped:
+        logger.warning(f"skipped {skipped} shard key(s) that name no node (float/negative)")
+    return sorted(keys)
+
+
 def measure(store_root: str, *, store_kwargs: dict, max_shards: int = 64) -> dict:
     """Everything for one store; the dict the CLI prints."""
     from zagg.hive import read_manifest
@@ -246,10 +268,7 @@ def measure(store_root: str, *, store_kwargs: dict, max_shards: int = 64) -> dic
     store = _store(store_root, store_kwargs)
     manifest = read_manifest(store_root, **store_kwargs) or {}
     fleet = fleet_numbers(store)
-    shards = []
-    if fleet.get("units"):
-        df = _concat(_run_frames(store))
-        shards = sorted(int(k) for k in df["shard_key"].dropna().unique())
+    shards = _listable_shards(_run_frames(store)) if fleet.get("units") else []
     return {
         "store": store_root,
         "schedule": ((manifest.get("temporal") or {}).get("schedule")) or "none",
