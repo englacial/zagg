@@ -1599,9 +1599,11 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   on the CLI summary / `handle.icechunk_finalize` on the facade, or no
   record at all): it reads the run's dispatch manifest for its config
   (`retain_runs`, the semantic hash — no `--retain-runs`), refuses unless
-  the newest `sweep_stats_*_stages.json` since the dispatch shows a
-  completed sweep, and tags `newest_only` — an older untagged run stays
-  covered by the next run's tag. No `--force`: an incomplete sweep is
+  the newest `sweep_stats_*_stages.json` since the run's init commit
+  (the repo's clock) shows a completed sweep, and tags `newest_only` — an
+  older untagged run stays covered by the next run's tag. The record is
+  tied to the run by time only, so with overlapping runs on one store a
+  sibling run's sweep record can vouch for it. No `--force`: an incomplete sweep is
   completed with `python -m zagg.sweep <store> --stages` first.
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:

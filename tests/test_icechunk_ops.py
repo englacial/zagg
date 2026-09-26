@@ -497,10 +497,18 @@ class TestFinalizeOperation:
         store = open_object_store(ct.run_status_prefix(root, run_id))
         obstore.put(store, ct.MANIFEST_NAME, json.dumps(manifest).encode())
 
-    def _record(self, root, ts="20260101T000500Z", **fields):
+    @staticmethod
+    def _stamp(offset_s=60):
+        """A record-key stamp ``offset_s`` from now (the run's init commit is ~now)."""
+        from datetime import datetime, timedelta, timezone
+
+        return (datetime.now(timezone.utc) + timedelta(seconds=offset_s)).strftime("%Y%m%dT%H%M%SZ")
+
+    def _record(self, root, ts=None, **fields):
         """A staged-sweep run record at the store root, as the finisher writes it."""
         from zagg.store import open_object_store, put_object
 
+        ts = ts or self._stamp()
         record = {"mode": "stages", "barrier_timed_out": False, "finisher": {}, **fields}
         key = f"sweep_stats_{ts}_stages.json"
         put_object(open_object_store(root), key, json.dumps(record).encode())
@@ -544,16 +552,26 @@ class TestFinalizeOperation:
             icechunk_ops.finalize(root, RUN, store_kwargs={})
         assert len(_messages(root)) == n and not _open(root)[1].list_tags()
 
-    def test_refuses_without_a_record_since_the_dispatch(self, monkeypatch, cfg, tmp_path):
-        # No record at all, then one older than the run's dispatch: neither
-        # can stand for this run's ladder.
+    def test_refuses_without_a_record_since_the_init_commit(self, monkeypatch, cfg, tmp_path):
+        # No record at all, then one older than the run's init commit — though
+        # newer than the manifest's ``dispatched_at``: the anchor is the repo's
+        # clock, so neither can stand for this run's ladder.
         _grid_, root = _store(monkeypatch, cfg, tmp_path)
         self._manifest(root, RUN, cfg)
         with pytest.raises(ValueError, match="no staged-sweep record"):
             icechunk_ops.finalize(root, RUN, store_kwargs={})
-        self._record(root, ts="20251231T235959Z")
-        with pytest.raises(ValueError, match="no staged-sweep record"):
+        self._record(root, ts=self._stamp(-3600))
+        with pytest.raises(ValueError, match="since run r1's init commit"):
             icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert not _open(root)[1].list_tags()
+
+    def test_refuses_a_run_with_no_init_commit(self, monkeypatch, cfg, tmp_path):
+        # A manifest and a record, but the repo never saw the run open.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, "r9", cfg)
+        self._record(root)
+        with pytest.raises(ValueError, match="no init commit for run r9"):
+            icechunk_ops.finalize(root, "r9", store_kwargs={})
         assert not _open(root)[1].list_tags()
 
     def test_refuses_without_a_dispatch_manifest(self, monkeypatch, cfg, tmp_path):

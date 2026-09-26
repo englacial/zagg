@@ -26,13 +26,17 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
 - ``finalize`` — tag a ladder run its dispatcher left untagged (issue
   #588): the run's staged sweep completed but the dispatcher died before
   its finalize. Reads the run's dispatch manifest for its config, refuses
-  unless the newest staged-sweep record since the dispatch shows a
-  completed sweep, then runs the §11.4 finalize ``newest_only`` — so it can
+  unless the newest staged-sweep record written since the run's init
+  commit (the repo's clock, not the dispatcher's) shows a completed sweep,
+  then runs the §11.4 finalize ``newest_only`` — so it can
   only ever tag the repo's newest run (an older untagged run stays covered
   by the next run's tag; tagging it would name later commits). No
   ``--force``: a run whose sweep did not complete has no tip that means
   "this run" — ``python -m zagg.sweep <store> --stages`` completes the
   ladder first. Retention is the run config's ``retain_runs``; no override.
+  The record is tied to the run by time only (it names the sweep's own run
+  id): with overlapping runs on one store (§11.4's documented casualty
+  case) a sibling run's completed sweep record can vouch for this run.
 
     python -m zagg.icechunk_ops <store> set-attrs <path> '<json>'
     python -m zagg.icechunk_ops <store> declare-pyramid <config.yaml>
@@ -378,9 +382,10 @@ def newest_stage_record(
     """``(key, record)`` of the newest ``sweep_stats_*_stages.json`` at the root, or ``None``.
 
     One delimiter LIST of the store root (the timestamp-first naming sorts
-    by write time). ``since`` drops records written before it — a run's
-    ``dispatched_at`` — so a record from before the run can never stand for
-    its ladder.
+    by write time). ``since`` drops records written before it — the
+    ``written_at`` of a run's init commit — so a record from before the run
+    can never stand for its ladder. The key's stamp is whole seconds, so
+    ``since`` is floored to the second before the comparison.
     """
     import obstore
 
@@ -396,13 +401,13 @@ def newest_stage_record(
         return None
     ts, name = records[-1]
     written = datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-    if since is not None and written < since:
+    if since is not None and written < since.replace(microsecond=0):
         return None
     return name, json.loads(bytes(obstore.get(store, name).bytes()))
 
 
 def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
-    """``(config, manifest)`` off the run's dispatch manifest; raises when absent.
+    """The run's config off its dispatch manifest; raises when absent.
 
     The manifest at ``<store>.status/run-<run_id>/manifest.json`` (the setup
     invoke's worker-side write, issue #327) carries the very config the run
@@ -420,31 +425,59 @@ def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
             f"the run's retain_runs and semantic hash from it (a Lambda-dispatched run has "
             f"one; a local-backend run finalizes in-process)"
         )
-    return load_config_from_dict(manifest["config"]), manifest
+    return load_config_from_dict(manifest["config"])
+
+
+def _run_opened_at(store_root: str, run_id: str, store_kwargs: dict) -> datetime:
+    """``written_at`` of the run's init commit on ``main``; raises when there is none.
+
+    Every run opens with one (§11.4 **Init**: ``init {run_id}``, or the
+    ``split ratchet … {run_id}`` commit when its init re-cuts —
+    :func:`zagg.icechunk_finalize.run_marker`). Its stamp and the staged-sweep
+    record's key are both worker/object-store-side clocks.
+    """
+    from zagg.icechunk_finalize import run_marker
+
+    repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
+    for info in repo.ancestry(branch=BRANCH):
+        if run_marker(info.message) == ("init", run_id):
+            return info.written_at
+    raise ValueError(
+        f"no init commit for run {run_id} on {repo_path(store_root)}: every run opens with "
+        f"one (spec §11.4 Init): the run never initialized this repo, or a later run's "
+        f"retention has squashed its commits (it is then not the newest run either)"
+    )
 
 
 def finalize(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     """Tag a completed-but-untagged ladder run — the repo's newest — as its dispatcher would have.
 
-    Refuses (raises) without the run's dispatch manifest, without a
-    staged-sweep record written since the run was dispatched, or when that
-    record does not show a completed sweep. Otherwise
+    Refuses (raises) without the run's dispatch manifest, without the run's
+    init commit on the repo, without a staged-sweep record written since
+    that commit (:func:`_run_opened_at` — the manifest supplies the config
+    only), or when that record does not show a completed sweep. Otherwise
     :func:`zagg.icechunk_finalize.finalize_repo` with ``newest_only``: the
     report carries the finalize record plus ``operation``, ``run_id`` and
     ``stage_record`` (the record that vouched for the ladder); ``skipped``
     when the run is no longer the repo's newest or its tag already exists
     (nothing written either way).
+
+    Residual: the record names the sweep's own run id, not this run's, so it
+    is tied to the run by time alone. With overlapping runs on one store (the
+    §11.4 casualty case) a sibling run's completed sweep, landing after this
+    run's init, can vouch for this run's ladder; a stronger link needs the
+    dispatcher to stamp the pipeline run id into the stage event.
     """
     from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
     from zagg.semantics import semantic_hash
 
-    config, manifest = _run_dispatch_config(store_root, run_id, store_kwargs)
-    dispatched_at = datetime.fromisoformat(manifest["dispatched_at"])
-    found = newest_stage_record(store_root, store_kwargs=store_kwargs, since=dispatched_at)
+    config = _run_dispatch_config(store_root, run_id, store_kwargs)
+    opened = _run_opened_at(store_root, run_id, store_kwargs)
+    found = newest_stage_record(store_root, store_kwargs=store_kwargs, since=opened)
     if found is None:
         raise ValueError(
-            f"no staged-sweep record at {store_root} since run {run_id} was dispatched "
-            f"({manifest['dispatched_at']}): complete the ladder first with "
+            f"no staged-sweep record at {store_root} since run {run_id}'s init commit "
+            f"({opened.isoformat(timespec='seconds')}): complete the ladder first with "
             f"`python -m zagg.sweep {store_root} --stages`, then finalize"
         )
     name, record = found
