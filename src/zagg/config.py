@@ -1321,11 +1321,20 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
         # shard-order-relative checks run at init (icechunk_refs.resolve_options,
         # where the shard order is known); the shape and the one invariant
         # that needs no geometry — a commit must write whole manifests — here.
-        unknown = set(icechunk) - {"commit", "commit_order", "split_order"}
+        unknown = set(icechunk) - {"commit", "commit_order", "split_order", "retain_runs"}
         if unknown:
             raise ValueError(
                 f"output.icechunk has unknown key(s) {sorted(unknown)} (accepts commit, "
-                f"commit_order, split_order)"
+                f"commit_order, split_order, retain_runs)"
+            )
+        # Run-tag retention (issue #582): how many run tags finalize keeps;
+        # 0 (the default) keeps every run and never expires or collects.
+        retain = icechunk.get("retain_runs")
+        if retain is not None and (
+            isinstance(retain, bool) or not isinstance(retain, int) or retain < 0
+        ):
+            raise ValueError(
+                f"output.icechunk.retain_runs must be a non-negative integer (got {retain!r})"
             )
         commit = icechunk.get("commit")
         if commit is not None and commit not in ("ladder", "leaf"):
@@ -3429,13 +3438,14 @@ def get_icechunk_options(config: PipelineConfig) -> dict:
     """The raw ``output.icechunk`` ladder knobs, absent keys ``None`` (issue #580 phase 6).
 
     ``{"commit": "ladder" | "leaf" | None, "commit_order": int | None,
-    "split_order": int | None}`` — a boolean or absent knob yields all-``None``;
-    :func:`zagg.icechunk_refs.resolve_options` applies the shard-order
-    defaults and the §11.5 invariants.
+    "split_order": int | None, "retain_runs": int | None}`` — a boolean or
+    absent knob yields all-``None``; :func:`zagg.icechunk_refs.resolve_options`
+    applies the shard-order defaults and the §11.5 invariants, and
+    :func:`zagg.icechunk_finalize.resolve_retain_runs` the retention default.
     """
     flag = config.output.get("icechunk")
     block = flag if isinstance(flag, dict) else {}
-    return {k: block.get(k) for k in ("commit", "commit_order", "split_order")}
+    return {k: block.get(k) for k in ("commit", "commit_order", "split_order", "retain_runs")}
 
 
 def get_pyramid(config: PipelineConfig) -> dict | None:

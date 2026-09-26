@@ -410,6 +410,14 @@ class TestDispatch:
         (stats_event,) = [e for _, _, e in stub.events if e.get("mode") == "stats"]
         assert stats_event["icechunk_init"] == run._icechunk_init
         assert run._icechunk_init is not None
+        # ... and the run's finalize (issue #582) is the LAST invoke of the
+        # tail — synchronous, after every per-leaf commit landed — carrying
+        # the init record so a split ratchet is reported back.
+        assert modes[-1] == "icechunk_finalize"
+        assert ("RequestResponse", "icechunk_finalize") in setup_invocations
+        (fin_event,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
+        assert fin_event["icechunk_init"] == run._icechunk_init
+        assert fin_event["run_id"] == stats_event["run_id"]
         # Post-run tail (all worker invokes, D8): finalize backstop + fail-open
         # coverage/stats rollups.
         assert "finalize" in modes
@@ -903,7 +911,7 @@ class TestFutures:
             for fut in getattr(handle, drain)():
                 fut.result()
         # Whole tail landed, in order, with no wait() call anywhere above.
-        assert stub.modes()[-3:] == ["finalize", "coverage", "stats"]
+        assert stub.modes()[-4:] == ["finalize", "coverage", "stats", "icechunk_finalize"]
         assert not handle._finisher.is_alive()
 
     def test_tail_exception_surfaces_and_still_shuts_the_pool_down(self, catalog, monkeypatch):
@@ -1178,7 +1186,7 @@ class TestProgressAsync:
         assert not thread.is_alive()
         assert handle.status()["pending"] == 0
         # Draining on the thread still joined the post-run tail.
-        assert stub.modes()[-3:] == ["finalize", "coverage", "stats"]
+        assert stub.modes()[-4:] == ["finalize", "coverage", "stats", "icechunk_finalize"]
 
 
 # -- tqdm optionality --------------------------------------------------------

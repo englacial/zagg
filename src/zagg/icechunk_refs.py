@@ -865,7 +865,15 @@ def object_ref_plan(
 # ── commits ─────────────────────────────────────────────────────────────────
 
 
-def _commit(session, message: str, *, local: bool, path: str = "") -> tuple[str, int]:
+def _commit(
+    session,
+    message: str,
+    *,
+    local: bool,
+    path: str = "",
+    metadata: dict | None = None,
+    allow_empty: bool = False,
+) -> tuple[str, int]:
     """Commit with rebase-on-conflict; returns ``(snapshot_id, rebases)``.
 
     The loop is icechunk's own ``rebase_with`` pattern, unrolled so the
@@ -874,7 +882,9 @@ def _commit(session, message: str, *, local: bool, path: str = "") -> tuple[str,
 
     On the local backend the commit is serialized through this process's lock
     for ``path`` (:func:`_local_commit_lock`); other repos in the same
-    interpreter are unaffected.
+    interpreter are unaffected. ``metadata`` and ``allow_empty`` are the
+    finalize commit's (:mod:`zagg.icechunk_finalize`): a run-identifying,
+    content-free snapshot.
     """
     import icechunk
 
@@ -883,7 +893,7 @@ def _commit(session, message: str, *, local: bool, path: str = "") -> tuple[str,
     with lock:
         while True:
             try:
-                return session.commit(message), rebases
+                return session.commit(message, metadata, allow_empty=allow_empty), rebases
             except icechunk.ConflictError:
                 if rebases >= REBASE_TRIES:
                     raise

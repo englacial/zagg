@@ -1,0 +1,353 @@
+"""Run finalize for the Icechunk companion repo (issue #582 phase 2, spec §11.4).
+
+The tag, the finalize commit's metadata, retention, idempotency, the local
+and Lambda dispatcher seams, the handler mode and the config knob.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+
+import pytest
+
+from zagg import icechunk_refs
+from zagg.config import default_config
+from zagg.icechunk_finalize import TAG_PREFIX, finalize_repo, resolve_retain_runs, run_tag
+
+
+@pytest.fixture
+def cfg():
+    cfg = default_config("atl06", validate=False)
+    cfg.output["store_layout"] = "hive"
+    cfg.output["grid"] = {
+        **cfg.output.get("grid", {}),
+        "type": "healpix",
+        "parent_order": 4,
+        "child_order": 6,
+        "chunk_inner": 5,
+    }
+    return cfg
+
+
+@pytest.fixture
+def repo(cfg, tmp_path):
+    """An initialized local repo; ``(root, grid)``."""
+    from zagg.grids import from_config
+
+    root = str(tmp_path / "store")
+    grid = from_config(cfg, parent_order=4)
+    icechunk_refs.init_repo(root, grid, cfg, run_id="r0", store_kwargs={})
+    return root, grid
+
+
+def _finalize(root, run_id, **kw):
+    kw.setdefault("semantic_hash", "h")
+    kw.setdefault("store_kwargs", {})
+    return finalize_repo(root, run_id=run_id, **kw)
+
+
+def _open(root):
+    return icechunk_refs.open_repo(root, store_kwargs={})
+
+
+def _messages(repo):
+    return [s.message for s in repo.ancestry(branch="main")]
+
+
+class TestFinalize:
+    def test_tags_a_run_identifying_commit(self, repo):
+        from zagg import __version__
+
+        root, _grid = repo
+        out = _finalize(root, "r1", split_ratchet=None)
+        r = _open(root)
+        assert out["tag"] == run_tag("r1") == "run-r1" and out["tagged"] is True
+        assert out["path"] == f"{root}/icechunk" and out["commit_s"] >= 0.0
+        assert r.lookup_tag("run-r1") == out["snapshot"]
+        info = r.lookup_snapshot(out["snapshot"])
+        assert info.message == "finalize r1"
+        # The metadata IS the run record: identity, the ladder knobs, the
+        # retention counts.
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        assert info.metadata == {
+            "run_id": "r1",
+            "semantic_hash": "h",
+            "zagg_version": __version__,
+            "commit": block["commit"],
+            "commit_order": block["commit_order"],
+            "split_order": block["split_order"],
+            "retain_runs": 0,
+            "tags_deleted": 0,
+            "snapshots_expired": 0,
+            "gc": None,
+        }
+        # K = 0: nothing expired, nothing collected, the init history intact.
+        assert out["gc"] is None and out["snapshots_expired"] == 0
+        assert _messages(r)[:2] == ["finalize r1", "init r0"]
+
+    def test_rerun_is_idempotent(self, repo):
+        root, _grid = repo
+        first = _finalize(root, "r1")
+        again = _finalize(root, "r1", retain_runs=1)
+        assert again["tagged"] is False and again["snapshot"] == first["snapshot"]
+        assert again["tags_deleted"] == 0 and again["gc"] is None
+        assert _messages(_open(root)).count("finalize r1") == 1
+
+    def test_missing_repo_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="not initialized"):
+            _finalize(str(tmp_path / "nope"), "r1")
+
+    def test_split_ratchet_is_reported_not_rewritten(self, repo, caplog):
+        root, _grid = repo
+        before = len(_messages(_open(root)))
+        with caplog.at_level(logging.WARNING, logger="zagg.icechunk_finalize"):
+            out = _finalize(root, "r1", split_ratchet={"from": 4, "to": 3})
+        assert out["rewrite_pending"] == {"from": 4, "to": 3}
+        assert "rewrite_manifests" in caplog.text
+        assert len(_messages(_open(root))) == before + 1  # the finalize commit only
+
+
+class TestRetention:
+    def _runs(self, root, n, retain_runs):
+        return [_finalize(root, f"r{i}", retain_runs=retain_runs) for i in range(1, n + 1)]
+
+    def test_zero_keeps_every_run(self, repo):
+        root, _grid = repo
+        self._runs(root, 3, 0)
+        r = _open(root)
+        assert sorted(r.list_tags()) == ["run-r1", "run-r2", "run-r3"]
+        assert _messages(r)[:4] == ["finalize r3", "finalize r2", "finalize r1", "init r0"]
+
+    def test_k_keeps_the_k_newest_and_collects_the_rest(self, repo):
+        root, _grid = repo
+        outs = self._runs(root, 3, 2)
+        r = _open(root)
+        assert sorted(r.list_tags()) == ["run-r2", "run-r3"]
+        # r1: no earlier tag -> nothing to expire; r2: r1 retained (K - 1 =
+        # 1), the init commits older than r1's finalize expire; r3: r1's tag
+        # dropped, everything older than r2's finalize expires and is
+        # collected.
+        assert [o["tags_deleted"] for o in outs] == [0, 0, 1]
+        assert outs[0]["gc"] is None and outs[0]["snapshots_expired"] == 0
+        assert outs[1]["snapshots_expired"] >= 1 and outs[1]["gc"]["snapshots_deleted"] >= 1
+        assert outs[2]["snapshots_expired"] >= 1 and outs[2]["gc"]["bytes_deleted"] > 0
+        # History reads tag to tag: one finalize snapshot per retained run.
+        assert _messages(r)[:2] == ["finalize r3", "finalize r2"]
+        assert "finalize r1" not in _messages(r)
+        assert r.lookup_tag("run-r2") == outs[1]["snapshot"]
+
+    def test_only_run_tags_are_ever_deleted(self, repo):
+        root, _grid = repo
+        r = _open(root)
+        r.create_tag("keep-me", r.lookup_branch("main"))
+        self._runs(root, 3, 1)
+        assert sorted(_open(root).list_tags()) == ["keep-me", "run-r3"]
+
+    def test_k_one_never_uses_now_as_the_cutoff(self, repo):
+        # With K = 1 nothing is retained; the cutoff is the newest DROPPED
+        # tag's time, so that tag's own snapshot survives one more finalize
+        # rather than "everything older than now" expiring — which would
+        # collect a concurrent writer's in-flight objects.
+        root, _grid = repo
+        first = _finalize(root, "r1", retain_runs=1)
+        assert first["gc"] is None  # no earlier tag: nothing to expire
+        second = _finalize(root, "r2", retain_runs=1)
+        assert second["tags_deleted"] == 1
+        assert TAG_PREFIX + "r1" not in _open(root).list_tags()
+        # r1's finalize snapshot IS the cutoff: not older than it, so it is
+        # still in the ancestry; only the init commits before it expired.
+        ids = {s.id for s in _open(root).ancestry(branch="main")}
+        assert first["snapshot"] in ids and second["snapshots_expired"] >= 1
+        third = _finalize(root, "r3", retain_runs=1)
+        assert first["snapshot"] not in {s.id for s in _open(root).ancestry(branch="main")}
+        assert third["snapshots_expired"] >= 1
+
+
+class TestKnob:
+    def test_retain_runs_is_validated(self, cfg):
+        from zagg.config import get_icechunk_options, validate_config
+
+        cfg.output["icechunk"] = {"retain_runs": 3}
+        validate_config(cfg)
+        assert get_icechunk_options(cfg)["retain_runs"] == 3
+        assert resolve_retain_runs(cfg) == 3
+        for bad in (-1, True, "3", 1.5):
+            cfg.output["icechunk"] = {"retain_runs": bad}
+            with pytest.raises(ValueError, match="retain_runs"):
+                validate_config(cfg)
+
+    def test_default_keeps_every_run(self, cfg):
+        assert resolve_retain_runs(cfg) == 0
+        cfg.output["icechunk"] = True
+        assert resolve_retain_runs(cfg) == 0
+        cfg.output["icechunk"] = {"commit": "leaf"}
+        assert resolve_retain_runs(cfg) == 0
+
+
+class TestLocalFinalize:
+    def test_none_error_and_record(self, cfg, repo, caplog):
+        from zagg import runner
+
+        root, _grid = repo
+        assert runner._finalize_icechunk_local(cfg, root, "r1", None, "h", {}) is None
+        out = runner._finalize_icechunk_local(cfg, root, "r1", {"created": True}, "h", {})
+        assert out["tag"] == "run-r1" and out["tagged"] is True
+        # A failed init still records the finalize outcome apart from it.
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            out = runner._finalize_icechunk_local(
+                cfg, str(root) + "-missing", "r2", {"error": "RuntimeError: x"}, "h", {}
+            )
+        assert set(out) == {"error"} and "fail-open, issue #582" in caplog.text
+
+
+class _Payload:
+    def __init__(self, raw: bytes):
+        self._raw = raw
+
+    def read(self):
+        return self._raw
+
+
+def _envelope(body: dict, status: int = 200, function_error: str | None = None) -> dict:
+    raw = json.dumps({"statusCode": status, "body": json.dumps(body)}).encode()
+    out: dict = {"Payload": _Payload(raw)}
+    if function_error:
+        out["FunctionError"] = function_error
+    return out
+
+
+class _Client:
+    def __init__(self, response=None, raise_exc=None):
+        self.events: list = []
+        self._response = response
+        self._raise = raise_exc
+
+    def invoke(self, **kwargs):
+        self.events.append((kwargs["InvocationType"], json.loads(kwargs["Payload"])))
+        if self._raise is not None:
+            raise self._raise
+        return self._response
+
+
+class TestLambdaFinalizeInvoke:
+    def _call(self, client):
+        from zagg import runner
+
+        return runner._invoke_lambda_icechunk_finalize(
+            client,
+            "fn",
+            "s3://b/p",
+            config_dict={"x": 1},
+            run_id="r1",
+            icechunk_init={"path": "s3://b/p/icechunk", "split_ratchet": {"from": 4, "to": 3}},
+            output_creds_event={"accessKeyId": "a", "secretAccessKey": "s"},
+        )
+
+    def test_event_shape_and_record(self):
+        body = {
+            "ok": True,
+            "mode": "icechunk_finalize",
+            "path": "s3://b/p/icechunk",
+            "tag": "run-r1",
+            "snapshot": "SNAP",
+            "tagged": True,
+            "retain_runs": 0,
+            "tags_deleted": 0,
+            "snapshots_expired": 0,
+            "gc": None,
+            "rewrite_pending": {"from": 4, "to": 3},
+            "commit_s": 0.01,
+        }
+        client = _Client(_envelope(body))
+        out = self._call(client)
+        assert out.pop("invoke_s") >= 0.0
+        assert out == {k: v for k, v in body.items() if k not in ("ok", "mode")}
+        ((kind, event),) = client.events
+        assert kind == "RequestResponse"  # the summary carries the tag
+        assert event == {
+            "mode": "icechunk_finalize",
+            "store_path": "s3://b/p",
+            "run_id": "r1",
+            "config": {"x": 1},
+            "icechunk_init": {"path": "s3://b/p/icechunk", "split_ratchet": {"from": 4, "to": 3}},
+            "output_credentials": {"accessKeyId": "a", "secretAccessKey": "s"},
+        }
+
+    @pytest.mark.parametrize(
+        "response, raise_exc, match",
+        [
+            (_envelope({"error": "boom", "mode": "icechunk_finalize"}, status=500), None, "boom"),
+            (_envelope({"error": "Missing shard_key"}, status=400), None, "statusCode 400"),
+            (_envelope({}, function_error="Unhandled"), None, "RuntimeError"),
+            (None, ConnectionError("throttled"), "throttled"),
+            (_envelope({"zagg_version": "stub"}), None, "unexpected icechunk_finalize body"),
+            (_envelope({"ok": True, "mode": "icechunk_finalize"}), None, "unexpected"),
+        ],
+    )
+    def test_failures_are_fail_open(self, response, raise_exc, match, caplog):
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            out = self._call(_Client(response, raise_exc))
+        assert set(out) == {"error"} and match in out["error"]
+        assert "fail-open, issue #582" in caplog.text
+
+
+@pytest.fixture(scope="module")
+def handler_mod():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py"
+    spec = importlib.util.spec_from_file_location("zagg_lambda_handler_582", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestHandlerMode:
+    def _event(self, root, cfg, mode, **extra):
+        from dataclasses import asdict
+
+        return {"mode": mode, "store_path": root, "run_id": "r1", "config": asdict(cfg), **extra}
+
+    def test_init_then_finalize(self, handler_mod, cfg, tmp_path):
+        from zagg.semantics import semantic_hash
+
+        root = str(tmp_path / "store")
+        init = handler_mod.lambda_handler(
+            self._event(root, cfg, "icechunk_init", parent_order=4), None
+        )
+        assert init["statusCode"] == 200, init
+        init_body = json.loads(init["body"])
+        resp = handler_mod.lambda_handler(
+            self._event(root, cfg, "icechunk_finalize", icechunk_init=init_body), None
+        )
+        assert resp["statusCode"] == 200, resp
+        body = json.loads(resp["body"])
+        assert body["ok"] and body["mode"] == "icechunk_finalize"
+        assert body["tag"] == "run-r1" and body["tagged"] is True
+        assert body["rewrite_pending"] is None
+        r = _open(root)
+        assert r.lookup_tag("run-r1") == body["snapshot"]
+        # The hash is computed worker-side from the forwarded config.
+        assert r.lookup_snapshot(body["snapshot"]).metadata["semantic_hash"] == semantic_hash(cfg)
+        again = json.loads(
+            handler_mod.lambda_handler(self._event(root, cfg, "icechunk_finalize"), None)["body"]
+        )
+        assert again["tagged"] is False and again["snapshot"] == body["snapshot"]
+
+    def test_run_id_is_required(self, handler_mod, cfg, repo):
+        root, _grid = repo
+        event = self._event(root, cfg, "icechunk_finalize")
+        del event["run_id"]
+        resp = handler_mod.lambda_handler(event, None)
+        assert resp["statusCode"] == 500
+        assert "run_id" in json.loads(resp["body"])["error"]
+        assert not _open(root).list_tags()
+
+    def test_before_init_is_500_never_raises(self, handler_mod, cfg, tmp_path):
+        resp = handler_mod.lambda_handler(
+            self._event(str(tmp_path / "store"), cfg, "icechunk_finalize"), None
+        )
+        assert resp["statusCode"] == 500
+        assert json.loads(resp["body"])["mode"] == "icechunk_finalize"

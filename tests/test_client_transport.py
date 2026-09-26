@@ -332,6 +332,7 @@ class TestEventDispatch:
         first_cell = modes.index(None)
         assert modes[:first_cell] == ["ping", "setup", "icechunk_init"]
         assert "finalize" in modes and "coverage" in modes and "stats" in modes
+        assert modes[-1] == "icechunk_finalize"  # the tail's last invoke (issue #582)
 
     def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):
         # An oversized row set on an EVENT run keeps its run record: the tail
