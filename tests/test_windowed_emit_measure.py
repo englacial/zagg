@@ -114,6 +114,19 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     assert out.count("yearly") == 1 and out.count("none") == 1
 
 
+@pytest.mark.parametrize("windows", [None, ("2019", "2020", "2021")])
+def test_a_rerun_unit_is_not_an_extra_window(tmp_path, windows):
+    root = _store(tmp_path, windows=windows)
+    window = windows[0] if windows else None
+    record = build_record(
+        shard_key=SHARDS[0], metadata={"duration_s": 1.0}, granule_ids=["g"], window=window
+    )
+    write_run_parquet(root, [flatten_record(record)], run_id="run-b")
+    fleet = tool.measure(root, store_kwargs={})["fleet"]
+    assert fleet["runs"] == 2 and fleet["units"] == 2 * len(windows or (None,)) + 1
+    assert fleet["windows_per_shard"]["p100"] == len(windows or (None,))
+
+
 def test_timeouts_match_the_dispatcher_error_strings(tmp_path):
     root = _store(tmp_path, windows=None)
     errors = (

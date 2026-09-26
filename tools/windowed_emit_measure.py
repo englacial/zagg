@@ -65,15 +65,35 @@ def _quantiles(values) -> dict:
 
 
 def _run_frames(store) -> list:
-    """Every ``stats_*.parquet`` at the root, all-null columns dropped (they carry no
-    dtype and would only make ``concat`` warn)."""
+    """Every ``stats_*.parquet`` at the root, one frame each."""
     import pandas as pd
 
     return [
-        pd.read_parquet(io.BytesIO(_get(store, o["path"]))).dropna(axis=1, how="all")
+        pd.read_parquet(io.BytesIO(_get(store, o["path"])))
         for o in _root_objects(store)
         if _RUN_PARQUET.match(o["path"].rsplit("/", 1)[-1])
     ]
+
+
+def _concat(frames):
+    """The run frames as one, ``window`` kept even when all-null (a baseline run).
+
+    pandas 2.x warns that all-NA columns will count toward the result dtype;
+    the columns are kept (the ``window`` one carries the unwindowed ``None``),
+    so only that warning is silenced, scoped to this concat.
+    """
+    import warnings
+
+    import pandas as pd
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="The behavior of DataFrame concatenation with empty or all-NA"
+        )
+        df = pd.concat(frames, ignore_index=True)
+    if "window" not in df:
+        df["window"] = None
+    return df
 
 
 def _total(df, col: str):
@@ -86,19 +106,14 @@ def _total(df, col: str):
 
 def fleet_numbers(store) -> dict:
     """The run-parquet summary: every ``stats_*.parquet`` at the root, concatenated."""
-    import pandas as pd
-
     frames = _run_frames(store)
     if not frames:
         return {"runs": 0, "units": 0}
-    df = pd.concat(frames, ignore_index=True)
+    df = _concat(frames)
     ok = df[df["success"]] if "success" in df else df
-    # an unwindowed unit has window None: one leaf per shard, counted as one
-    per_shard = (
-        ok.groupby("shard_key")["window"].nunique(dropna=False)
-        if "window" in ok
-        else ok.groupby("shard_key").size()
-    )
+    # distinct windows per shard, None (unwindowed) counting as one: a re-run of
+    # the same (shard, window) unit is one leaf, not two
+    per_shard = ok.groupby("shard_key")["window"].nunique(dropna=False)
     out = {
         "runs": len(frames),
         "units": int(len(df)),
@@ -197,9 +212,7 @@ def measure(store_root: str, *, store_kwargs: dict, max_shards: int = 64) -> dic
     fleet = fleet_numbers(store)
     shards = []
     if fleet.get("units"):
-        import pandas as pd
-
-        df = pd.concat(_run_frames(store), ignore_index=True)
+        df = _concat(_run_frames(store))
         shards = sorted(int(k) for k in df["shard_key"].dropna().unique())
     return {
         "store": store_root,
