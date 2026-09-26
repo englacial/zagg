@@ -103,6 +103,9 @@ _SUM_OR_NONE_KEYS = (
 _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
 _EQ_OR_NONE_KEYS = (
     "window",
+    # Bulk multi-window unit width (issue #586): every leaf of one shard
+    # invoke carries the same N; a rollup across invokes collapses it.
+    "unit_windows",
     "shard_key",
     "run_id",
     "semantic_hash",
@@ -345,6 +348,17 @@ def build_record(
         "schema_version": SCHEMA_VERSION,
         "shard_key": int(shard_key),
         "window": str(window) if window is not None else None,
+        # Bulk multi-window emit (issue #586 phase 2): the number of leaves
+        # the shard invoke that wrote this leaf emitted, when it emitted more
+        # than its own — one record per leaf, so ``duration_s`` /
+        # ``max_memory_mb`` / ``gb_seconds`` / the read phase / ``n_obs_read``
+        # (the shard's decoded rows: one read feeds every window) repeat
+        # across the N rows of one invoke (per-invoke quantiles stay the
+        # fleet-safety numbers; the #374 read-vs-keep ratio is per invoke,
+        # ``n_obs_read`` over the rows' summed ``n_obs``); a per-invoke SUM
+        # de-duplicates on ``(run_id, shard_key)`` where this is set. ``None`` on a ``(shard, window)`` fan-out unit
+        # and on unwindowed runs.
+        "unit_windows": _opt_int(metadata.get("unit_windows")),
         "run_id": run_id,
         # The semantic-core hash (D19 rev 2, issue #299): hashes the config's
         # semantic core, NOT the whole template. Nullable for callers without
@@ -524,6 +538,7 @@ _ROW_SCALARS = (
     "schema_version",
     "shard_key",
     "window",
+    "unit_windows",
     "run_id",
     "semantic_hash",
     "zagg_version",
@@ -900,7 +915,7 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
     listing = obstore.list_with_delimiter(store)
     keys = [meta["path"] for meta in listing["objects"] if meta["path"].endswith(".json")]
 
-    def _record(key: str) -> dict | None:
+    def _record(key: str) -> list:
         try:
             envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
             # Two object shapes share the prefix layout: the #151 result
@@ -914,13 +929,44 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
             record = (body or {}).get("stats") if isinstance(body, dict) else None
         except Exception as e:
             logger.warning(f"skipping unparsable status envelope {key}: {e}")
-            return None
-        return record if isinstance(record, dict) else None
+            return []
+        return stats_records(record)
 
     if not keys:
         return []
     with ThreadPoolExecutor(max_workers=min(16, len(keys))) as pool:
-        return [flatten_record(rec) for rec in pool.map(_record, keys) if rec is not None]
+        return [flatten_record(rec) for recs in pool.map(_record, keys) for rec in recs]
+
+
+def stats_records(stats) -> list:
+    """The D20 records a unit's ``stats`` carries: one, or one per emitted leaf.
+
+    A ``(shard, window)`` unit and an unwindowed shard ride ONE record; a
+    bulk multi-window shard invoke (issue #586 phase 2) rides a LIST, one per
+    leaf it emitted. Anything else (absent, a stale worker's body) is none.
+    """
+    if isinstance(stats, dict):
+        return [stats]
+    if isinstance(stats, list):
+        return [r for r in stats if isinstance(r, dict)]
+    return []
+
+
+def window_metas(meta) -> list:
+    """The per-leaf metadata dicts one unit result stands for.
+
+    A bulk multi-window shard invoke (issue #586 phase 2) returns the shard's
+    metadata with ``windows``, one per-window dict in dispatch order — each
+    the shape a ``(shard, window)`` unit returns — so every consumer that
+    counts, classifies or sweeps per leaf reads through this; any other unit
+    result is its own single leaf.
+    """
+    if not isinstance(meta, dict):
+        return []
+    windows = meta.get("windows")
+    if isinstance(windows, list):
+        return [m for m in windows if isinstance(m, dict)]
+    return [meta]
 
 
 # ---------------------------------------------------------------------------

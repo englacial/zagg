@@ -1655,6 +1655,545 @@ def _leaf_icechunk_refs(
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+class _LeafUnit:
+    """One ``(shard, window)`` leaf write: the sinks and the post-aggregate tail.
+
+    The per-leaf half of :func:`process_and_write_hive`, split out (issue
+    #586 phase 2) so the bulk multi-window path can run it once per window
+    behind ONE shard read: :meth:`gate` is the issue #388 identity check,
+    :meth:`sinks` are the ``process_shard`` sink kwargs this leaf's chunks
+    stream into, and :meth:`finish` is everything after the aggregate — the
+    sharded whole-leaf write, ragged, O11 hashes, coverage sidecar, D4 stamp,
+    granule-id sibling, the #383 column, the #580 refs and the #582 pointer
+    swap — returning the unit's metadata. ``granule_urls`` is the unit's own
+    granule list (the window's subset on the bulk path): it is what the gate
+    compares and the sibling records.
+    """
+
+    def __init__(
+        self,
+        shard_key,
+        granule_urls,
+        grid,
+        store_root,
+        config,
+        *,
+        window,
+        windowing,
+        store_kwargs,
+        run_id,
+        sidecar_spec,
+        semantic_hash,
+    ):
+        from zagg.config import get_leaf_versions
+
+        self.shard_key = shard_key
+        self.granule_urls = granule_urls
+        self.grid = grid
+        self.store_root = store_root
+        self.config = config
+        self.window = window
+        self.windowing = windowing
+        self.store_kwargs = store_kwargs
+        self.sidecar_spec = sidecar_spec
+        self.semantic_hash = semantic_hash
+        self.label = window["label"] if window else None
+        self.leaf_path = shard_leaf_path(store_root, shard_key, window=self.label)
+        # Versioned leaf (issue #582, spec §1.5): a run identity names the
+        # fresh version subgroup this attempt writes; ``data_path`` is where
+        # the arrays (and the coverage sidecar) go. Legacy writers keep the
+        # root.
+        self.version = leaf_version_name(run_id) if run_id and get_leaf_versions(config) else None
+        self.data_path = f"{self.leaf_path}/{self.version}" if self.version else self.leaf_path
+        self.identity = None
+        self.box: dict = {}
+        self.write_elapsed = 0.0
+        # Sharded leaf output (issue #236): the sharded leaf template bundles
+        # each dense array's K inner chunks into ONE ShardingCodec object, so
+        # the per-chunk streaming write would read-modify-write that object K
+        # times (the same failure the flat sharded path warns about in
+        # ``runner._process_and_write``). Mirror the flat switch: accumulate
+        # the K carriers via ``chunk_results`` and write the whole leaf once
+        # after the stream (``write_leaf_to_zarr`` — dense + ragged, one
+        # object each). The re-added O(shard) dense term is ~1.3 MB at
+        # production geometry (parent 11 / child 19: 65,536 cells x ~20 B
+        # across the dense arrays) — trivial next to the ragged accumulation
+        # below, which this path folds into the same single-write pass.
+        self.sharded = getattr(grid, "sharded", False)
+        self.chunk_results: list | None = [] if self.sharded else None
+        # O11 staged-array sink (issue #342): the leaf writers record each
+        # assembled slab here (refs on the sharded path; the streaming path
+        # fills a leaf-wide slab chunk by chunk) so the content hashes below
+        # run over the exact in-memory values written — the ratified hash
+        # source. On the streaming path this re-adds the same O(dense leaf)
+        # term the sharded path's slab pass already accepts above (~1.3 MB at
+        # production geometry).
+        self.staged: dict = {}
+        # Ragged fields accumulate across the streamed chunks (leaf-LOCAL
+        # blocks) and are written ONCE after the stream (issue #209): the
+        # leaf's ragged vlen array is a single ShardingCodec object spanning
+        # the shard, so a per-chunk write here would read-modify-write that
+        # object K times. Memory bound (review, PR #211): this re-adds an
+        # O(shard-payload) term to the otherwise O(chunk) streaming path
+        # (issue #91) — at the o8 t-digest scale this fix exists to unlock
+        # (sparse NEON o8: 17.6 M centroids × 8 B ≈ 141 MB of held payload;
+        # ~200 MB peak through the single write, once per-cell ``bytes``-object
+        # overhead and the assembled ~60 MB shard object are counted).
+        # Accepted deliberately: workers run 4 GB (issue #193), the dense side
+        # keeps its O(chunk) stream-and-free bound, and the accumulation is
+        # what deletes the ~K×7-object PUT storm that was ~1/3 of shard wall
+        # at CONUS scale (issue #209). If 88S-scale shards or the #148
+        # streaming budget ever say otherwise, the escape valve is spilling
+        # the ragged field back to per-inner-chunk writes against a
+        # regular-chunked vlen array (the unsharded flat layout) — named here,
+        # not built. Sibling envelope (issue #383): when the /2 declaration
+        # carries leaf-node levels, the column fold at the TAIL of ``finish``
+        # k-way merges this same resident digest load once more — bounded to
+        # one raw-fold-boundary cell per call since issue #538
+        # (``column.write_leaf_column``'s memory note), and this accumulation
+        # is released before that call.
+        self.ragged_chunks: list = []
+        # Occupied-cell sink (issue #200): the worker already holds the
+        # shard's populated cell words; collect them here to derive the
+        # stamp's coverage.
+        self.occupied: list = []
+        from zagg.processing import write_dataframe_to_zarr
+
+        self._write_dataframe = write_dataframe_to_zarr
+
+    def gate(self, *, allow_contraction) -> dict | None:
+        """The leaf identity gate (issue #388): the skipped unit's metadata, or ``None``.
+
+        Runs per ``(shard, window)`` unit, before any read or fold. A
+        skipped/refused unit returns its metadata here having written
+        NOTHING; ``None`` means the unit writes.
+        """
+        # The issue #383 column rides this seam AFTER the gate, and its
+        # declaration moves neither identity half — so the gate verifies the
+        # artifact itself (leaf_column_expectation).
+        from zagg.telemetry import canonical_granule_ids
+
+        column_path, column_declared = leaf_column_expectation(
+            self.store_root, self.shard_key, self.grid, self.config, self.window
+        )
+        self.identity, unit_meta = leaf_identity_gate(
+            self.leaf_path,
+            # ONE canonical id space for both sides of the gate (espg-ruled
+            # 2026-08-17): the driver-stripped bare id, with paired-asset
+            # entries (issue #425) identifying by their primary.
+            canonical_granule_ids(self.granule_urls),
+            semantic_hash=self.semantic_hash,
+            allow_contraction=allow_contraction,
+            sidecar_spec=self.sidecar_spec,
+            store_kwargs=self.store_kwargs,
+            shard_key=self.shard_key,
+            window=self.label,
+            column_path=column_path,
+            column_declared=column_declared,
+        )
+        if unit_meta is None or not unit_meta.get("current"):
+            return unit_meta
+        # A versioned leaf's current version (spec §1.5): the touch
+        # refreshes the pointer root and the siblings only — never a
+        # version's objects, whose checksums the run tags depend on —
+        # and the refs re-plan points into it. The gate verified the
+        # version is stamped and hands its name over (no re-read).
+        current = unit_meta.get("leaf_version")
+        # Lifecycle touch (issue #388 phase 3): a skip must still
+        # reset the purge clock on the unit's whole footprint — leaf
+        # tree, sidecar/sub-map siblings, and the declared column
+        # (the gate already verified declaration and artifact agree,
+        # so the touch never resurrects the column-drift ambiguity).
+        # Fail-open both here and inside: a failed touch logs and
+        # counts, never fails or un-skips the unit.
+        from zagg.config import get_icechunk, get_touch_policy
+        from zagg.lifecycle import touch_current_unit
+
+        try:
+            counts = touch_current_unit(
+                self.leaf_path,
+                column_path=column_path if column_declared else None,
+                sidecar_spec=self.sidecar_spec,
+                store_kwargs=self.store_kwargs,
+                policy=get_touch_policy(self.config),
+                current=current,
+            )
+        except Exception as e:
+            logger.warning(
+                f"lifecycle touch failed for shard {self.shard_key} (fail-open, issue #388): {e}"
+            )
+            counts = {"touched": 0, "failed": 1}
+        unit_meta["touched_objects"] = counts["touched"]
+        unit_meta["touch_failed"] = counts["failed"]
+        # A published target is NOT APPLICABLE, not failed (issue #495
+        # phase 4) — but the pair above records that as 0/0, which is
+        # byte-identical to a touch that never ran. Recorded so the
+        # run parquet and the .status objects say it out loud; absent
+        # when zero, so every non-published record stays as it was.
+        if counts.get("skipped_paths"):
+            unit_meta["touch_skipped_paths"] = counts["skipped_paths"]
+        # The touch moved the checksum every ref into this leaf
+        # carries (§11.3: the ``file://`` mtime; a multipart ETag on
+        # S3), so the refs are re-planned from fresh HEADs: a per-leaf
+        # commit lands them now; in ladder mode the sidecar is
+        # rewritten and the unit is marked ``icechunk_dirty``, so this
+        # run's staged sweep re-gathers its node as dirt-only (issue
+        # #580, PR #581 question (11) ruled (a)).
+        # A versioned leaf's objects were not touched, so its refs
+        # are untouched too: the re-plan is the LEGACY leaf's (§11.6).
+        if counts["touched"] and get_icechunk(self.config) and not current:
+            unit_meta["icechunk"] = _leaf_icechunk_refs(
+                self.store_root,
+                self.grid,
+                self.config,
+                self.shard_key,
+                self.leaf_path,
+                column=str(column_path).rstrip("/").rpartition("/")[2]
+                if column_declared and column_path
+                else None,
+                window=self.window,
+                sidecar_spec=self.sidecar_spec,
+                store_kwargs=self.store_kwargs,
+                version=current,
+            )
+            if unit_meta["icechunk"].get("sidecar"):
+                unit_meta["icechunk_dirty"] = True
+        return unit_meta
+
+    def sinks(self) -> dict:
+        """The ``process_shard`` sink kwargs this leaf's chunks stream into."""
+        return {
+            "chunk_results": self.chunk_results,
+            "write_chunk": None if self.sharded else self._write_chunk,
+            "occupied_out": self.occupied,
+        }
+
+    def _leaf(self):
+        from zagg.store import open_store
+
+        if "store" not in self.box:
+            if self.version is None:
+                # A legacy (in-place) write over a versioned root would clear
+                # every version behind the pointer: refuse (spec §1.5).
+                pointer = read_commit(
+                    open_store(self.leaf_path, read_only=True, **self.store_kwargs)
+                )
+                if pointer and pointer.get("current"):
+                    raise ValueError(
+                        f"leaf {self.leaf_path} is versioned (current {pointer['current']!r}); "
+                        f"a writer without a run_id cannot replace it in place (spec §1.5)"
+                    )
+            store = open_store(self.data_path, **self.store_kwargs)
+            # overwrite=True: any existing prefix here is either debris from a
+            # torn run (D4) or a prior committed write being redone — both are
+            # replaced wholesale; per-leaf state never blocks a retry. Since
+            # issue #341 the template DELETES the leaf prefix up front, so the
+            # wholesale claim is literal: retired members of a narrowed schema
+            # (and the prior attempt's coverage sidecar) are gone before the
+            # new template lands, and no enumeration ever walks stale/orphan
+            # member dirs (the pre-#341 walk warned on the sidecar and could
+            # die on an orphan array dir).
+            #
+            # This DOES widen the redundant-duplicate-writer window (fold
+            # review), and the change is deliberate. ``dispatch._LAMBDA_RETRYABLE``
+            # classifies off the exception string of the ``Invoke`` call itself,
+            # and for ``InvocationType=Event`` a request Lambda accepted whose
+            # HTTP response timed out is indistinguishable from one it never
+            # got — so a retry can produce a second live worker for one shard.
+            # Before: A wrote + stamped, B templated over the top, and if B died
+            # the leaf still held A's objects under A's stamp (stale-but-complete,
+            # certified). After: B's clear removes A's committed leaf first, so a
+            # B that dies mid-write leaves the leaf EMPTY and unstamped. Nothing
+            # is silently corrupt — the stamp is written last, so the leaf reads
+            # as debris and is re-dispatchable (test_leaf_clear_under_a_live_
+            # writer_leaves_debris_not_corruption) — but a redundant retry can now
+            # destroy a leaf that had already succeeded, which write-over could
+            # not. Refusing the clear on a valid stamp is the lever if that
+            # trade stops being acceptable; it is not taken here because D4 makes
+            # "replaced wholesale" the contract and a stamp must never block a
+            # retry.
+            self.grid.emit_shard_template(store, overwrite=True)
+            self.box["store"] = store
+        return self.box["store"]
+
+    def _write_chunk(self, block_index, carrier, ragged):
+        _t0 = time.time()
+        store = self._leaf()
+        local = leaf_block_index(self.grid, block_index, self.shard_key)
+        self._write_dataframe(
+            carrier, store, grid=self.grid, chunk_idx=local, staged_out=self.staged
+        )
+        if ragged:
+            self.ragged_chunks.append((local, ragged))
+        self.write_elapsed += time.time() - _t0
+
+    def finish(self, metadata) -> dict:
+        """Everything after the aggregate: write out, stamp, column, refs, pointer.
+
+        Takes the unit's ``process_shard`` metadata (its chunks already
+        streamed into :meth:`sinks`) and returns it completed. The leaf write
+        order is pinned: dense (streamed, or one object each when sharded) ->
+        ragged (one object, issue #209) -> O11 hashes (in memory, issue #580)
+        -> coverage sidecar -> stamp -> granule-id sibling (issue #388; after
+        the stamp, inside the bracket) -> leaf pyramid column (issue #383) ->
+        Icechunk refs commit (issue #580; last, after the one post-stamp phase
+        that can still fail the unit) -> pointer swap (issue #582).
+        """
+        from zagg.processing import write_leaf_to_zarr, write_ragged_leaf_to_zarr
+        from zagg.store import open_store
+
+        shard_key, grid, window, box, staged = (
+            self.shard_key,
+            self.grid,
+            self.window,
+            self.box,
+            self.staged,
+        )
+        store_kwargs = self.store_kwargs
+        # Windowed stamp truth (D15): convert the worker's dataset-unit extent
+        # to ISO-8601 UTC once, here — the same strings feed the stamp below
+        # and the dispatcher's root-summary union (via the returned metadata).
+        time_range = None
+        if window is not None and metadata.get("time_range") is not None:
+            from zagg.windows import iso_time_range
+
+            time_range = iso_time_range(metadata["time_range"], self.windowing)
+            metadata["time_range"] = time_range
+        # The seam stamps the identity half (issue #388): a caller that never
+        # resolved the hash itself (the Lambda handler) still records it in
+        # the leaf sidecar via ``telemetry.build_record``'s validated metadata
+        # fallback. The identity classification rides so run stats can count
+        # ``unrecorded-ids`` rewrites apart from ordinary ones.
+        if self.semantic_hash is not None:
+            metadata.setdefault("semantic_hash", self.semantic_hash)
+        if self.identity is not None:
+            metadata["identity"] = self.identity["classification"]
+        # Sharded leaf: ONE whole-leaf write per array (dense + ragged
+        # together, issue #236), after the stream. The leaf template is
+        # emitted here (still lazily, via ``_leaf``), so a shard that produced
+        # no chunks never creates the ``.zarr/`` prefix — same contract as the
+        # streaming path's first ``_write_chunk``.
+        if self.sharded and self.chunk_results and not metadata.get("error"):
+            _t0 = time.time()
+            write_leaf_to_zarr(
+                self.chunk_results,
+                self._leaf(),
+                grid=grid,
+                shard_key=int(shard_key),
+                staged_out=staged,
+            )
+            self.write_elapsed += time.time() - _t0
+        # Stamp ONLY a fully-written leaf: an errored shard (or one that
+        # streamed no chunks) stays unstamped — debris by definition (D4). The
+        # stamp is the last write, so its presence certifies everything before
+        # it landed — the box payload rides it (zero extra requests), the
+        # exact-occupancy bitmap sidecar is PUT just before it (issue #200
+        # phase 2), and both inherit its debris semantics: a torn worker's
+        # coverage never becomes visible. The write order is pinned in the
+        # method docstring.
+        if "store" in box and not metadata.get("error"):
+            _t0 = time.time()
+            if not self.sharded:
+                write_ragged_leaf_to_zarr(
+                    self.ragged_chunks, box["store"], grid=grid, staged_out=staged
+                )
+            self.write_elapsed += time.time() - _t0
+            # O11 content hashes (issue #342, spec §5): computed in-worker at
+            # write, from the STAGED arrays (the ratified source — the write
+            # path already holds every slab, so this is a memory-bandwidth
+            # pass). Dense and ragged arrays are staged on BOTH leaf paths:
+            # the sharded one-object-per-array pass and the per-chunk
+            # streaming path (``sharded`` is forced off whenever a leaf holds
+            # one inner chunk — the ``chunk_inner``-unset default).
+            # ``resolution: chunk`` companions are the one read-back fallback
+            # inside ``hash_arrays``: they are written per chunk-block, never
+            # as a leaf slab. Computed BEFORE the stamp (issue #580) so the
+            # record rides the stamp itself — the D4 seal then certifies the
+            # digest of the bytes it seals — and the caller's D20 sidecar
+            # (``telemetry.build_record``) carries the same record off
+            # ``metadata``. Hive-only by ratified decision (3): flat layouts
+            # have no leaf sidecar or stamp to record into, and no flat writer
+            # computes hashes — those stores stay verifiable by running the §5
+            # recipe manually. Fail-open: the record is telemetry-class (D9),
+            # and §5.3 reads absence as unverifiable, never tampered — a
+            # dropped record is strictly safer than a wrong one (the §5.2
+            # raise gate lands here as a warning + a stamp without the key).
+            _t0 = time.time()
+            from zagg.content_hash import staged_record
+
+            record = staged_record(box["store"], staged, f"leaf {self.leaf_path}")
+            if record is not None:
+                metadata["content_hashes"] = record
+                # Same "populated phase_timings" gate as the write stamp
+                # below: the timing rides an existing dict, never seeds one.
+                if "phase_timings" in metadata:
+                    metadata["phase_timings"]["hash"] = time.time() - _t0
+            _t0 = time.time()
+            words = np.concatenate(self.occupied) if self.occupied else None
+            if words is not None and words.size == 0:
+                words = None
+            bitmap = None
+            # D14 popcount (issue #246): a fully-occupied subtree stamps
+            # ``encoding: "full"``, no sidecar. Gated on windowing (/2 stores
+            # only) so schedule-none output stays object-for-object identical
+            # to pre-#246 runs (the mortie spec files "full" under /2).
+            depth = int(grid.child_order) - int(grid.parent_order)
+            full = window is not None and words is not None and np.unique(words).size == 4**depth
+            # Depth 0 (child_order == parent_order, a legal one-cell-per-shard
+            # config) skips the sidecar: a 1-bit bitmap says nothing the stamp
+            # itself doesn't, and encode would raise AFTER the chunk writes,
+            # leaving the shard permanently unstampable debris (review
+            # finding, PR #208 round 2). The envelope simply omits the pointer
+            # — box only.
+            if words is not None and not full and depth > 0:
+                bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
+                write_coverage_sidecar(self.data_path, bitmap, **store_kwargs)
+            stamp = stamp_commit(
+                box["store"],
+                cells_with_data=metadata.get("cells_with_data", 0),
+                granule_count=metadata.get("granule_count", 0),
+                coverage=build_coverage(
+                    shard_key, words, grid.child_order, bitmap=bitmap, full=full
+                ),
+                window=self.label,
+                time_range=time_range,
+                content_hashes=metadata.get("content_hashes"),
+            )
+            # The recorded granule-id list, as this leaf's own sibling object
+            # (issue #388): AFTER the stamp, so it never certifies a leaf that
+            # did not land, and written here rather than at the caller's
+            # sidecar PUT because ``granule_urls`` is the very list the
+            # identity gate compares — one source for the recorded id space,
+            # on both backends. Fail-open inside (telemetry class, D9). Inside
+            # the write bracket: it is a write this seam performs, so
+            # ``phase_timings["write"]`` must account for it.
+            from zagg.telemetry import canonical_granule_ids, write_granule_ids
+
+            write_granule_ids(
+                self.leaf_path,
+                # Same canonical identity as the gate above: the recorded and
+                # planned id spaces must share one shape (``write_granule_ids``
+                # canonicalizes too — this keeps the two call sites reading
+                # alike).
+                canonical_granule_ids(self.granule_urls),
+                spec=self.sidecar_spec,
+                **store_kwargs,
+            )
+            self.write_elapsed += time.time() - _t0
+        # Write-phase split (issue #249): read/index/aggregate come from
+        # ``process_shard``; ``write`` is the leaf write-out above (template +
+        # dense chunks + ragged + coverage sidecar + stamp). Same gate as the
+        # flat Lambda handler's issue #100 write bracket: only a clean,
+        # actually-written shard carries it, so a time-to-failure never lands
+        # as a write duration and a no-data shard (no leaf) stays write-less.
+        if not metadata.get("error") and "phase_timings" in metadata and "store" in box:
+            metadata["phase_timings"]["write"] = self.write_elapsed
+        # Release the aggregate the column fold does not need (issue #538):
+        # the K sharded carriers and the streamed ragged blocks are written
+        # and dead from here — nothing below reads them — so the fold's
+        # transient rides beside ``staged`` alone, not on top of a second copy
+        # of the leaf. The per-cell payload ``bytes`` ``staged`` shares with
+        # them survive by reference; only the containers go. Exactly one clear
+        # does work per path: ``chunk_results`` is the sharded sink,
+        # ``ragged_chunks`` the streaming one, and the two are exclusive.
+        if self.chunk_results is not None:
+            self.chunk_results.clear()
+        self.ragged_chunks.clear()
+        # Leaf pyramid column (issue #383): written AFTER the leaf's own
+        # commit, from the same resident staged slabs — the fleet side of #381
+        # points (1)-(3). Gated inside on the /2 declaration carrying
+        # leaf-node levels (``output.pyramid.overviews``); a failure FAILS THE
+        # UNIT, and the idempotent retry rewrites leaf + column wholesale.
+        # The window filter injection never touches ``config.output``, so the
+        # windowed per-unit config copy carries the declaration unchanged.
+        if not metadata.get("error") and "store" in box:
+            from zagg.column import write_leaf_column
+
+            _t0 = time.time()
+            try:
+                column = write_leaf_column(
+                    self.store_root,
+                    shard_key,
+                    grid,
+                    self.config,
+                    staged,
+                    window=self.label,
+                    time_range=time_range,
+                    granule_count=metadata.get("granule_count", 0),
+                    store_kwargs=store_kwargs,
+                )
+            except Exception as e:
+                # Reported, not raised: the leaf is already COMMITTED here, so
+                # a raise would discard the caller's whole telemetry envelope
+                # (the D20 stats record, the leaf sidecar, the D22 sub-map)
+                # for data that landed. ``metadata["error"]`` is the same
+                # unit-failure channel a failed ``process_shard`` uses — the
+                # Lambda handler returns 500 on it and the dispatcher retries,
+                # identical retry semantics — while the caller keeps a
+                # coherent metadata dict to build its failure record from.
+                logger.error(f"leaf column write failed for shard {shard_key}: {e}")
+                metadata["error"] = f"leaf column: {e}"
+                metadata["column_error"] = str(e)
+            else:
+                if column is not None:
+                    metadata["leaf_column"] = column
+                    if "phase_timings" in metadata:
+                        metadata["phase_timings"]["column"] = time.time() - _t0
+        # Icechunk companion refs (issue #580, spec §11.4): AFTER the stamp —
+        # the refs point at objects the stamp has just certified — and after
+        # the #383 column fold, which is the LAST post-stamp phase that can
+        # still fail the unit. That ordering is load-bearing: a failed unit is
+        # retried, the retry rewrites leaf + column wholesale (same keys, new
+        # bytes, new inner-chunk offsets), and refs committed before the fold
+        # would leave the branch tip — not merely a superseded snapshot —
+        # indexing the discarded attempt's offsets (review finding). Gated on
+        # the same clean-unit condition, so the block only ever indexes a unit
+        # that actually succeeded. Fail-open itself (D9): the leaf is
+        # normative, the repo a regenerable index, so a refs failure logs and
+        # rides the stats sidecar (``icechunk.error``) but never fails the
+        # unit. Its own phase, not ``write``: the HEADs, the index GETs and
+        # the commit are index cost, not leaf cost. Gated also on the knob the
+        # init step read (``output.icechunk``); a run whose init failed lands
+        # here too and records the open error.
+        if not metadata.get("error") and "store" in box:
+            from zagg.config import get_icechunk
+
+            if get_icechunk(self.config):
+                _t0 = time.time()
+                metadata["icechunk"] = _leaf_icechunk_refs(
+                    self.store_root,
+                    grid,
+                    self.config,
+                    shard_key,
+                    self.leaf_path,
+                    column=metadata.get("leaf_column"),
+                    window=window,
+                    sidecar_spec=self.sidecar_spec,
+                    store_kwargs=store_kwargs,
+                    version=self.version,
+                )
+                if "phase_timings" in metadata:
+                    metadata["phase_timings"]["icechunk"] = time.time() - _t0
+        # Pointer swap (issue #582, spec §1.5 step 4): the stable root's stamp
+        # now names this attempt's version — one PUT, after the refs, so for a
+        # single writer the repo and the pointer agree on the version. Two
+        # racing attempts under ``commit: "leaf"`` (refs A, refs B, swap B,
+        # swap A) can leave ``main`` and the pointer naming DIFFERENT complete
+        # versions; both are retained (one referenced, one current) and the
+        # collector reclaims neither, until the next run converges them. Only
+        # a clean unit swaps: a failed column leaves the previous version live
+        # and the retry writes a new one.
+        if self.version and "store" in box and not metadata.get("error"):
+            _t0 = time.time()
+            write_pointer_stamp(open_store(self.leaf_path, **store_kwargs), stamp, self.version)
+            metadata["leaf_version"] = self.version
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["write"] = (
+                    metadata["phase_timings"].get("write", 0.0) + time.time() - _t0
+                )
+        return metadata
+
+
 def process_and_write_hive(
     shard_key,
     granule_urls,
@@ -1674,6 +2213,7 @@ def process_and_write_hive(
     semantic_hash=None,
     sidecar_spec=None,
     run_id=None,
+    windows=None,
 ):
     """Process one shard into its own hive leaf store (issue #199 phase 2).
 
@@ -1692,7 +2232,8 @@ def process_and_write_hive(
     When ``grid.sharded`` (issue #236) the dense chunks are not streamed:
     the K carriers accumulate and the whole leaf is written once
     (``write_leaf_to_zarr`` — one ShardingCodec object per array), mirroring
-    the flat sharded switch in ``runner._process_and_write``.
+    the flat sharded switch in ``runner._process_and_write``. The per-leaf
+    state and the post-aggregate tail live on :class:`_LeafUnit`.
 
     ``run_id`` (issue #582, spec §1.5) makes the leaf VERSIONED: the arrays
     go to a fresh version subgroup ``run-{run_id}-{attempt}`` under the
@@ -1725,6 +2266,27 @@ def process_and_write_hive(
     popcount (``encoding: "full"``). ``None`` is byte-identical to
     pre-windowing behavior.
 
+    ``windows`` (issue #586 phase 2) is the bulk per-shard multi-window unit:
+    the list of the shard's windows, each ``{"label", "start", "end",
+    "granules"?}`` with ``granules`` the indices into ``granule_urls`` of the
+    window's own granule subset (what the fan-out unit would have been
+    dispatched with — the gate compares it and the sibling records it).
+    The shard is read ONCE with no filter injected; ``process_shard`` bins
+    the reads on ``time_field`` and aggregates one window at a time, and
+    each window's leaf, column, refs and pointer are finished — exactly as a
+    ``window`` unit's are — before the next window aggregates, so peak
+    memory holds one window's slab beside the shard's reads rather than N.
+    The return is the SHARD's metadata: the read-phase fields once,
+    ``total_obs`` / ``cells_with_data`` summed, ``time_range`` the windows'
+    union, ``error`` the first failed window's (a window that kept no data
+    reports the fan-out's benign error and fails nothing; prefixed with its
+    label; nothing re-fires a failed invoke, so a RE-RUN of the shard redoes
+    the failed window while the gate skips the windows that landed), ``current`` / ``refused`` only when EVERY window was, and
+    ``windows`` — one metadata dict per window in dispatch order, each the
+    shape a ``window`` unit returns plus ``window`` / ``unit_windows`` /
+    the shard's ``duration_s``, which is what the caller builds one D20
+    record per emitted leaf from. ``window`` and ``windows`` are exclusive.
+
     ``skip_if_current`` (issue #388) arms the worker-side leaf identity gate
     (:func:`leaf_identity_gate`) BEFORE any fold: a unit whose planned
     ``(semantic_hash, granule-id set)`` pair matches the leaf's recorded D20
@@ -1753,14 +2315,10 @@ def process_and_write_hive(
     contraction guard later diffs, kept out of the sidecar and the response
     envelope so an identity check stays one small GET.
     """
-    from zagg.processing import (
-        process_shard,
-        write_dataframe_to_zarr,
-        write_leaf_to_zarr,
-        write_ragged_leaf_to_zarr,
-    )
-    from zagg.store import open_store
+    from zagg.processing import process_shard
 
+    if window is not None and windows is not None:
+        raise ValueError("process_and_write_hive takes window= or windows=, not both")
     # D19 identity half (issue #388): resolve BEFORE the window filter
     # injection below — recorded sidecars carry the RUN config's hash, and the
     # per-unit windowed config copy must not perturb the comparison.
@@ -1772,6 +2330,34 @@ def process_and_write_hive(
         except Exception as e:
             logger.warning(f"semantic hash unavailable (fail-open, issue #388): {e}")
 
+    unit_kwargs = dict(
+        store_kwargs=store_kwargs,
+        run_id=run_id,
+        sidecar_spec=sidecar_spec,
+        semantic_hash=semantic_hash,
+    )
+    shard_kwargs = dict(
+        s3_credentials=s3_creds,
+        config=config,
+        driver=driver,
+        handoff=handoff,
+        aoi_payload=aoi_payload,
+        profile=profile,
+    )
+    if windows is not None:
+        return _process_windows(
+            shard_key,
+            granule_urls,
+            grid,
+            store_root,
+            config,
+            windows=windows,
+            skip_if_current=skip_if_current,
+            allow_contraction=allow_contraction,
+            unit_kwargs=unit_kwargs,
+            shard_kwargs=shard_kwargs,
+        )
+
     windowing = None
     time_range_of = None
     if window is not None:
@@ -1780,471 +2366,184 @@ def process_and_write_hive(
         # Inject the window's observation filter into a per-unit config copy
         # (the issue #43 machinery — see windowed_cell_config).
         config, windowing = windowed_cell_config(config, window)
+        shard_kwargs["config"] = config
         time_range_of = windowing["time_field"]
 
-    leaf_path = shard_leaf_path(store_root, shard_key, window=window["label"] if window else None)
-    # Versioned leaf (issue #582, spec §1.5): a run identity names the fresh
-    # version subgroup this attempt writes; ``data_path`` is where the arrays
-    # (and the coverage sidecar) go. Legacy writers keep the root.
-    from zagg.config import get_leaf_versions
-
-    version = leaf_version_name(run_id) if run_id and get_leaf_versions(config) else None
-    data_path = f"{leaf_path}/{version}" if version else leaf_path
-
+    unit = _LeafUnit(
+        shard_key,
+        granule_urls,
+        grid,
+        store_root,
+        config,
+        window=window,
+        windowing=windowing,
+        **unit_kwargs,
+    )
     # Leaf identity gate (issue #388): per (shard, window) unit, before any
     # read or fold. A skipped/refused unit returns here having written NOTHING.
-    identity = None
     if skip_if_current:
-        # The issue #383 column rides this seam AFTER the gate, and its
-        # declaration moves neither identity half — so the gate verifies the
-        # artifact itself (leaf_column_expectation).
-        from zagg.telemetry import canonical_granule_ids
-
-        column_path, column_declared = leaf_column_expectation(
-            store_root, shard_key, grid, config, window
-        )
-        identity, unit_meta = leaf_identity_gate(
-            leaf_path,
-            # ONE canonical id space for both sides of the gate (espg-ruled
-            # 2026-08-17): the driver-stripped bare id, with paired-asset
-            # entries (issue #425) identifying by their primary.
-            canonical_granule_ids(granule_urls),
-            semantic_hash=semantic_hash,
-            allow_contraction=allow_contraction,
-            sidecar_spec=sidecar_spec,
-            store_kwargs=store_kwargs,
-            shard_key=shard_key,
-            window=window["label"] if window else None,
-            column_path=column_path,
-            column_declared=column_declared,
-        )
-        if unit_meta is not None:
-            if unit_meta.get("current"):
-                # A versioned leaf's current version (spec §1.5): the touch
-                # refreshes the pointer root and the siblings only — never a
-                # version's objects, whose checksums the run tags depend on —
-                # and the refs re-plan points into it. The gate verified the
-                # version is stamped and hands its name over (no re-read).
-                current = unit_meta.get("leaf_version")
-                # Lifecycle touch (issue #388 phase 3): a skip must still
-                # reset the purge clock on the unit's whole footprint — leaf
-                # tree, sidecar/sub-map siblings, and the declared column
-                # (the gate already verified declaration and artifact agree,
-                # so the touch never resurrects the column-drift ambiguity).
-                # Fail-open both here and inside: a failed touch logs and
-                # counts, never fails or un-skips the unit.
-                from zagg.config import get_touch_policy
-                from zagg.lifecycle import touch_current_unit
-
-                try:
-                    counts = touch_current_unit(
-                        leaf_path,
-                        column_path=column_path if column_declared else None,
-                        sidecar_spec=sidecar_spec,
-                        store_kwargs=store_kwargs,
-                        policy=get_touch_policy(config),
-                        current=current,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"lifecycle touch failed for shard {shard_key} (fail-open, issue #388): {e}"
-                    )
-                    counts = {"touched": 0, "failed": 1}
-                unit_meta["touched_objects"] = counts["touched"]
-                unit_meta["touch_failed"] = counts["failed"]
-                # A published target is NOT APPLICABLE, not failed (issue #495
-                # phase 4) — but the pair above records that as 0/0, which is
-                # byte-identical to a touch that never ran. Recorded so the
-                # run parquet and the .status objects say it out loud; absent
-                # when zero, so every non-published record stays as it was.
-                if counts.get("skipped_paths"):
-                    unit_meta["touch_skipped_paths"] = counts["skipped_paths"]
-                # The touch moved the checksum every ref into this leaf
-                # carries (§11.3: the ``file://`` mtime; a multipart ETag on
-                # S3), so the refs are re-planned from fresh HEADs: a per-leaf
-                # commit lands them now; in ladder mode the sidecar is
-                # rewritten and the unit is marked ``icechunk_dirty``, so this
-                # run's staged sweep re-gathers its node as dirt-only (issue
-                # #580, PR #581 question (11) ruled (a)).
-                from zagg.config import get_icechunk
-
-                # A versioned leaf's objects were not touched, so its refs
-                # are untouched too: the re-plan is the LEGACY leaf's (§11.6).
-                if counts["touched"] and get_icechunk(config) and not current:
-                    unit_meta["icechunk"] = _leaf_icechunk_refs(
-                        store_root,
-                        grid,
-                        config,
-                        shard_key,
-                        leaf_path,
-                        column=str(column_path).rstrip("/").rpartition("/")[2]
-                        if column_declared and column_path
-                        else None,
-                        window=window,
-                        sidecar_spec=sidecar_spec,
-                        store_kwargs=store_kwargs,
-                        version=current,
-                    )
-                    if unit_meta["icechunk"].get("sidecar"):
-                        unit_meta["icechunk_dirty"] = True
-            return unit_meta
-
-    box: dict = {}
-    _write_elapsed = 0.0
-
-    def _leaf():
-        if "store" not in box:
-            if version is None:
-                # A legacy (in-place) write over a versioned root would clear
-                # every version behind the pointer: refuse (spec §1.5).
-                pointer = read_commit(open_store(leaf_path, read_only=True, **store_kwargs))
-                if pointer and pointer.get("current"):
-                    raise ValueError(
-                        f"leaf {leaf_path} is versioned (current {pointer['current']!r}); "
-                        f"a writer without a run_id cannot replace it in place (spec §1.5)"
-                    )
-            store = open_store(data_path, **store_kwargs)
-            # overwrite=True: any existing prefix here is either debris from a
-            # torn run (D4) or a prior committed write being redone — both are
-            # replaced wholesale; per-leaf state never blocks a retry. Since
-            # issue #341 the template DELETES the leaf prefix up front, so the
-            # wholesale claim is literal: retired members of a narrowed schema
-            # (and the prior attempt's coverage sidecar) are gone before the
-            # new template lands, and no enumeration ever walks stale/orphan
-            # member dirs (the pre-#341 walk warned on the sidecar and could
-            # die on an orphan array dir).
-            #
-            # This DOES widen the redundant-duplicate-writer window (fold
-            # review), and the change is deliberate. ``dispatch._LAMBDA_RETRYABLE``
-            # classifies off the exception string of the ``Invoke`` call itself,
-            # and for ``InvocationType=Event`` a request Lambda accepted whose
-            # HTTP response timed out is indistinguishable from one it never
-            # got — so a retry can produce a second live worker for one shard.
-            # Before: A wrote + stamped, B templated over the top, and if B died
-            # the leaf still held A's objects under A's stamp (stale-but-complete,
-            # certified). After: B's clear removes A's committed leaf first, so a
-            # B that dies mid-write leaves the leaf EMPTY and unstamped. Nothing
-            # is silently corrupt — the stamp is written last, so the leaf reads
-            # as debris and is re-dispatchable (test_leaf_clear_under_a_live_
-            # writer_leaves_debris_not_corruption) — but a redundant retry can now
-            # destroy a leaf that had already succeeded, which write-over could
-            # not. Refusing the clear on a valid stamp is the lever if that
-            # trade stops being acceptable; it is not taken here because D4 makes
-            # "replaced wholesale" the contract and a stamp must never block a
-            # retry.
-            grid.emit_shard_template(store, overwrite=True)
-            box["store"] = store
-        return box["store"]
-
-    # Sharded leaf output (issue #236): the sharded leaf template bundles each
-    # dense array's K inner chunks into ONE ShardingCodec object, so the
-    # per-chunk streaming write below would read-modify-write that object K
-    # times (the same failure the flat sharded path warns about in
-    # ``runner._process_and_write``). Mirror the flat switch: accumulate the K
-    # carriers via ``chunk_results`` and write the whole leaf once after the
-    # stream (``write_leaf_to_zarr`` — dense + ragged, one object each). The
-    # re-added O(shard) dense term is ~1.3 MB at production geometry
-    # (parent 11 / child 19: 65,536 cells x ~20 B across the dense arrays) —
-    # trivial next to the ragged accumulation below, which this path folds
-    # into the same single-write pass.
-    sharded = getattr(grid, "sharded", False)
-    chunk_results: list | None = [] if sharded else None
-
-    # O11 staged-array sink (issue #342): the leaf writers record each
-    # assembled slab here (refs on the sharded path; the streaming path fills
-    # a leaf-wide slab chunk by chunk) so the content hashes below run over
-    # the exact in-memory values written — the ratified hash source. On the
-    # streaming path this re-adds the same O(dense leaf) term the sharded
-    # path's slab pass already accepts above (~1.3 MB at production geometry).
-    staged: dict = {}
-
-    # Ragged fields accumulate across the streamed chunks (leaf-LOCAL blocks)
-    # and are written ONCE after the stream (issue #209): the leaf's ragged
-    # vlen array is a single ShardingCodec object spanning the shard, so a
-    # per-chunk write here would read-modify-write that object K times.
-    # Memory bound (review, PR #211): this re-adds an O(shard-payload) term to
-    # the otherwise O(chunk) streaming path (issue #91) — at the o8 t-digest
-    # scale this fix exists to unlock (sparse NEON o8: 17.6 M centroids × 8 B
-    # ≈ 141 MB of held payload; ~200 MB peak through the single write, once
-    # per-cell ``bytes``-object overhead and the assembled ~60 MB shard object
-    # are counted). Accepted deliberately: workers run 4 GB (issue #193), the
-    # dense side keeps its O(chunk) stream-and-free bound, and the
-    # accumulation is what deletes the ~K×7-object PUT storm that was ~1/3 of
-    # shard wall at CONUS scale (issue #209). If 88S-scale shards or the #148
-    # streaming budget ever say otherwise, the escape valve is spilling the
-    # ragged field back to per-inner-chunk writes against a regular-chunked
-    # vlen array (the unsharded flat layout) — named here, not built.
-    # Sibling envelope (issue #383): when the /2 declaration carries leaf-node
-    # levels, the column fold at the TAIL of this function k-way merges this
-    # same resident digest load once more — bounded to one raw-fold-boundary
-    # cell per call since issue #538 (``column.write_leaf_column``'s memory
-    # note), and this accumulation is released before that call.
-    ragged_chunks: list = []
-
-    def _write_chunk(block_index, carrier, ragged):
-        nonlocal _write_elapsed
-        _t0 = time.time()
-        store = _leaf()
-        local = leaf_block_index(grid, block_index, shard_key)
-        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local, staged_out=staged)
-        if ragged:
-            ragged_chunks.append((local, ragged))
-        _write_elapsed += time.time() - _t0
-
-    # Occupied-cell sink (issue #200): the worker already holds the shard's
-    # populated cell words; collect them here to derive the stamp's coverage.
-    occupied: list = []
+        skipped = unit.gate(allow_contraction=allow_contraction)
+        if skipped is not None:
+            return skipped
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
         granule_urls,
-        s3_credentials=s3_creds,
-        config=config,
-        driver=driver,
-        handoff=handoff,
-        aoi_payload=aoi_payload,
-        chunk_results=chunk_results,
-        write_chunk=None if sharded else _write_chunk,
-        occupied_out=occupied,
         time_range_of=time_range_of,
-        profile=profile,
+        **shard_kwargs,
+        **unit.sinks(),
     )
-    # Windowed stamp truth (D15): convert the worker's dataset-unit extent to
-    # ISO-8601 UTC once, here — the same strings feed the stamp below and the
-    # dispatcher's root-summary union (via the returned metadata).
-    time_range = None
-    if window is not None and metadata.get("time_range") is not None:
-        from zagg.windows import iso_time_range
+    return unit.finish(metadata)
 
-        time_range = iso_time_range(metadata["time_range"], windowing)
-        metadata["time_range"] = time_range
-    # The seam stamps the identity half (issue #388): a caller that never
-    # resolved the hash itself (the Lambda handler) still records it in the
-    # leaf sidecar via ``telemetry.build_record``'s validated metadata
-    # fallback. The identity classification rides so run stats can count
-    # ``unrecorded-ids`` rewrites apart from ordinary ones.
-    if semantic_hash is not None:
-        metadata.setdefault("semantic_hash", semantic_hash)
-    if identity is not None:
-        metadata["identity"] = identity["classification"]
-    # Sharded leaf: ONE whole-leaf write per array (dense + ragged together,
-    # issue #236), after the stream. The leaf template is emitted here (still
-    # lazily, via ``_leaf``), so a shard that produced no chunks never creates
-    # the ``.zarr/`` prefix — same contract as the streaming path's first
-    # ``_write_chunk``.
-    if sharded and chunk_results and not metadata.get("error"):
-        _t0 = time.time()
-        write_leaf_to_zarr(
-            chunk_results, _leaf(), grid=grid, shard_key=int(shard_key), staged_out=staged
+
+def _process_windows(
+    shard_key,
+    granule_urls,
+    grid,
+    store_root,
+    config,
+    *,
+    windows,
+    skip_if_current,
+    allow_contraction,
+    unit_kwargs,
+    shard_kwargs,
+) -> dict:
+    """The bulk per-shard multi-window unit (issue #586 phase 2); see the seam's docstring.
+
+    Gates every window first (a skipped window costs no read), then reads the
+    shard once and finishes each remaining window's leaf inside the worker's
+    per-window callback. The returned shard metadata is assembled by
+    :func:`_shard_meta`.
+    """
+    from zagg.config import get_windowing
+    from zagg.processing import process_shard
+
+    windowing = get_windowing(config)
+    if windowing is None:
+        raise ValueError(
+            "windows were dispatched but the config declares no output.windowing "
+            "block — dispatcher/config drift, refusing to guess the time_field"
         )
-        _write_elapsed += time.time() - _t0
-    # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
-    # no chunks) stays unstamped — debris by definition (D4). The stamp is the
-    # last write, so its presence certifies everything before it landed — the
-    # box payload rides it (zero extra requests), the exact-occupancy bitmap
-    # sidecar is PUT just before it (issue #200 phase 2), and both inherit
-    # its debris semantics: a torn worker's coverage never becomes visible.
-    # The leaf write order is pinned: dense (streamed, or one object each when
-    # sharded) -> ragged (one object, issue #209) -> O11 hashes (in memory,
-    # issue #580) -> coverage sidecar -> stamp -> granule-id sibling (issue
-    # #388; after the stamp, inside the bracket) -> leaf pyramid column (issue
-    # #383) -> Icechunk refs commit (issue #580; last, after the one
-    # post-stamp phase that can still fail the unit).
-    if "store" in box and not metadata.get("error"):
-        _t0 = time.time()
-        if not sharded:
-            write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid, staged_out=staged)
-        _write_elapsed += time.time() - _t0
-        # O11 content hashes (issue #342, spec §5): computed in-worker at
-        # write, from the STAGED arrays (the ratified source — the write path
-        # already holds every slab, so this is a memory-bandwidth pass).
-        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
-        # one-object-per-array pass and the per-chunk streaming path
-        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
-        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
-        # are the one read-back fallback inside ``hash_arrays``: they are
-        # written per chunk-block, never as a leaf slab. Computed BEFORE the
-        # stamp (issue #580) so the record rides the stamp itself — the D4
-        # seal then certifies the digest of the bytes it seals — and the
-        # caller's D20 sidecar (``telemetry.build_record``) carries the same
-        # record off ``metadata``. Hive-only by ratified decision (3): flat
-        # layouts have no leaf sidecar or stamp to record into, and no flat
-        # writer computes hashes — those stores stay verifiable by running
-        # the §5 recipe manually. Fail-open: the record is telemetry-class
-        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
-        # dropped record is strictly safer than a wrong one (the §5.2 raise
-        # gate lands here as a warning + a stamp without the key).
-        _t0 = time.time()
-        from zagg.content_hash import staged_record
-
-        record = staged_record(box["store"], staged, f"leaf {leaf_path}")
-        if record is not None:
-            metadata["content_hashes"] = record
-            # Same "populated phase_timings" gate as the write stamp below:
-            # the timing rides an existing dict, never seeds one.
-            if "phase_timings" in metadata:
-                metadata["phase_timings"]["hash"] = time.time() - _t0
-        _t0 = time.time()
-        words = np.concatenate(occupied) if occupied else None
-        if words is not None and words.size == 0:
-            words = None
-        bitmap = None
-        # D14 popcount (issue #246): a fully-occupied subtree stamps
-        # ``encoding: "full"``, no sidecar. Gated on windowing (/2 stores
-        # only) so schedule-none output stays object-for-object identical to
-        # pre-#246 runs (the mortie spec files "full" under /2).
-        depth = int(grid.child_order) - int(grid.parent_order)
-        full = window is not None and words is not None and np.unique(words).size == 4**depth
-        # Depth 0 (child_order == parent_order, a legal one-cell-per-shard
-        # config) skips the sidecar: a 1-bit bitmap says nothing the stamp
-        # itself doesn't, and encode would raise AFTER the chunk writes,
-        # leaving the shard permanently unstampable debris (review finding,
-        # PR #208 round 2). The envelope simply omits the pointer — box only.
-        if words is not None and not full and depth > 0:
-            bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
-            write_coverage_sidecar(data_path, bitmap, **store_kwargs)
-        stamp = stamp_commit(
-            box["store"],
-            cells_with_data=metadata.get("cells_with_data", 0),
-            granule_count=metadata.get("granule_count", 0),
-            coverage=build_coverage(shard_key, words, grid.child_order, bitmap=bitmap, full=full),
-            window=window["label"] if window else None,
-            time_range=time_range,
-            content_hashes=metadata.get("content_hashes"),
+    t0 = time.time()
+    units: dict = {}
+    metas: dict = {}
+    todo = []
+    for w in windows:
+        urls = (
+            [granule_urls[i] for i in w["granules"]]
+            if w.get("granules") is not None
+            else list(granule_urls)
         )
-        # The recorded granule-id list, as this leaf's own sibling object
-        # (issue #388): AFTER the stamp, so it never certifies a leaf that
-        # did not land, and written here rather than at the caller's sidecar
-        # PUT because ``granule_urls`` is the very list the identity gate
-        # compares — one source for the recorded id space, on both backends.
-        # Fail-open inside (telemetry class, D9). Inside the write bracket:
-        # it is a write this seam performs, so ``phase_timings["write"]``
-        # must account for it.
-        from zagg.telemetry import canonical_granule_ids, write_granule_ids
-
-        write_granule_ids(
-            leaf_path,
-            # Same canonical identity as the gate above: the recorded and
-            # planned id spaces must share one shape (``write_granule_ids``
-            # canonicalizes too — this keeps the two call sites reading alike).
-            canonical_granule_ids(granule_urls),
-            spec=sidecar_spec,
-            **store_kwargs,
+        unit = _LeafUnit(
+            shard_key, urls, grid, store_root, config, window=w, windowing=windowing, **unit_kwargs
         )
-        _write_elapsed += time.time() - _t0
-    # Write-phase split (issue #249): read/index/aggregate come from
-    # ``process_shard``; ``write`` is the leaf write-out above (template +
-    # dense chunks + ragged + coverage sidecar + stamp). Same gate as the flat
-    # Lambda handler's issue #100 write bracket: only a clean, actually-written
-    # shard carries it, so a time-to-failure never lands as a write duration
-    # and a no-data shard (no leaf) stays write-less.
-    if not metadata.get("error") and "phase_timings" in metadata and "store" in box:
-        metadata["phase_timings"]["write"] = _write_elapsed
-    # Release the aggregate the column fold does not need (issue #538): the
-    # K sharded carriers and the streamed ragged blocks are written and dead
-    # from here — nothing below reads them — so the fold's transient rides
-    # beside ``staged`` alone, not on top of a second copy of the leaf. The
-    # per-cell payload ``bytes`` ``staged`` shares with them survive by
-    # reference; only the containers go. Exactly one clear does work per
-    # path: ``chunk_results`` is the sharded sink, ``ragged_chunks`` the
-    # streaming one, and the two are exclusive. (``_df_out`` needs no
-    # release — ``process_shard`` returns an empty frame whenever either
-    # sink is in play, which here is always; review finding.)
-    if chunk_results is not None:
-        chunk_results.clear()
-    ragged_chunks.clear()
-    # Leaf pyramid column (issue #383): written AFTER the leaf's own commit,
-    # from the same resident staged slabs — the fleet side of #381 points
-    # (1)-(3). Gated inside on the /2 declaration carrying leaf-node levels
-    # (``output.pyramid.overviews``); a failure FAILS THE UNIT, and the
-    # idempotent retry rewrites leaf + column wholesale.
-    # The window filter injection above never touches ``config.output``, so
-    # the windowed per-unit config copy carries the declaration unchanged.
-    if not metadata.get("error") and "store" in box:
-        from zagg.column import write_leaf_column
-
-        _t0 = time.time()
-        try:
-            column = write_leaf_column(
-                store_root,
-                shard_key,
-                grid,
-                config,
-                staged,
-                window=window["label"] if window else None,
-                time_range=time_range,
-                granule_count=metadata.get("granule_count", 0),
-                store_kwargs=store_kwargs,
-            )
-        except Exception as e:
-            # Reported, not raised: the leaf is already COMMITTED here, so a
-            # raise would discard the caller's whole telemetry envelope (the
-            # D20 stats record, the leaf sidecar, the D22 sub-map) for data
-            # that landed. ``metadata["error"]`` is the same unit-failure
-            # channel a failed ``process_shard`` uses — the Lambda handler
-            # returns 500 on it and the dispatcher retries, identical retry
-            # semantics — while the caller keeps a coherent metadata dict to
-            # build its failure record from.
-            logger.error(f"leaf column write failed for shard {shard_key}: {e}")
-            metadata["error"] = f"leaf column: {e}"
-            metadata["column_error"] = str(e)
+        units[w["label"]] = unit
+        skipped = unit.gate(allow_contraction=allow_contraction) if skip_if_current else None
+        if skipped is not None:
+            metas[w["label"]] = skipped
         else:
-            if column is not None:
-                metadata["leaf_column"] = column
-                if "phase_timings" in metadata:
-                    metadata["phase_timings"]["column"] = time.time() - _t0
-    # Icechunk companion refs (issue #580, spec §11.4): AFTER the stamp — the
-    # refs point at objects the stamp has just certified — and after the #383
-    # column fold, which is the LAST post-stamp phase that can still fail the
-    # unit. That ordering is load-bearing: a failed unit is retried, the retry
-    # rewrites leaf + column wholesale (same keys, new bytes, new inner-chunk
-    # offsets), and refs committed before the fold would leave the branch tip
-    # — not merely a superseded snapshot — indexing the discarded attempt's
-    # offsets (review finding). Gated on the same clean-unit condition, so the
-    # block only ever indexes a unit that actually succeeded. Fail-open itself
-    # (D9): the leaf is normative, the repo a regenerable index, so a refs
-    # failure logs and rides the stats sidecar (``icechunk.error``) but never
-    # fails the unit. Its own phase, not ``write``: the HEADs, the index GETs
-    # and the commit are index cost, not leaf cost. Gated also on the knob the
-    # init step read (``output.icechunk``); a run whose init failed lands here
-    # too and records the open error.
-    if not metadata.get("error") and "store" in box:
-        from zagg.config import get_icechunk
+            todo.append(w)
+    base: dict = {
+        "shard_key": int(shard_key),
+        "cells_with_data": 0,
+        "total_obs": 0,
+        "granule_count": len(granule_urls),
+        "duration_s": 0.0,
+        "error": None,
+    }
+    if todo:
+        # Read only what the windows left to write need (review finding (2)):
+        # the union of their granule subsets, in the unit's order, each
+        # window's indices re-based onto it — so an append that lands in one
+        # window does not re-read the history of the windows the gate skipped.
+        if all(w.get("granules") is not None for w in todo):
+            keep = sorted({i for w in todo for i in w["granules"]})
+            at = {i: k for k, i in enumerate(keep)}
+            granule_urls = [granule_urls[i] for i in keep]
+            todo = [{**w, "granules": [at[i] for i in w["granules"]]} for w in todo]
 
-        if get_icechunk(config):
-            _t0 = time.time()
-            metadata["icechunk"] = _leaf_icechunk_refs(
-                store_root,
-                grid,
-                config,
-                shard_key,
-                leaf_path,
-                column=metadata.get("leaf_column"),
-                window=window,
-                sidecar_spec=sidecar_spec,
-                store_kwargs=store_kwargs,
-                version=version,
-            )
-            if "phase_timings" in metadata:
-                metadata["phase_timings"]["icechunk"] = time.time() - _t0
-    # Pointer swap (issue #582, spec §1.5 step 4): the stable root's stamp now
-    # names this attempt's version — one PUT, after the refs, so for a single
-    # writer the repo and the pointer agree on the version. Two racing
-    # attempts under ``commit: "leaf"`` (refs A, refs B, swap B, swap A) can
-    # leave ``main`` and the pointer naming DIFFERENT complete versions; both
-    # are retained (one referenced, one current) and the collector reclaims
-    # neither, until the next run converges them. Only a clean unit swaps: a
-    # failed column leaves the previous version live and the retry writes a
-    # new one.
-    if version and "store" in box and not metadata.get("error"):
-        _t0 = time.time()
-        write_pointer_stamp(open_store(leaf_path, **store_kwargs), stamp, version)
-        metadata["leaf_version"] = version
-        if "phase_timings" in metadata:
-            metadata["phase_timings"]["write"] = (
-                metadata["phase_timings"].get("write", 0.0) + time.time() - _t0
-            )
-    return metadata
+        def _emit(w, aggregate):
+            # One window's failure (a write PUT, its own spill reduce, the
+            # legacy-over-versioned refusal) is that window's error, the way a
+            # failed fan-out unit costs only its leaf: the windows already
+            # landed keep their metadata (and so their records and sidecars),
+            # and the rest still run. A failure of the shared read raised
+            # before any window emits, and still fails the invoke.
+            unit = units[w["label"]]
+            try:
+                metas[w["label"]] = unit.finish(aggregate(**unit.sinks()))
+            except Exception as e:
+                logger.exception(f"shard {shard_key} window {w['label']} failed: {e}")
+                metas[w["label"]] = {
+                    "shard_key": int(shard_key),
+                    "window": w["label"],
+                    "cells_with_data": 0,
+                    "total_obs": 0,
+                    "granule_count": len(unit.granule_urls),
+                    "error": f"{type(e).__name__}: {e}",
+                }
+
+        _df_out, base = process_shard(
+            grid,
+            int(shard_key),
+            granule_urls,
+            time_range_of=windowing["time_field"],
+            windows=todo,
+            time_field=windowing["time_field"],
+            emit_window=_emit,
+            **shard_kwargs,
+        )
+    base["duration_s"] = time.time() - t0
+    return _shard_meta(base, [metas[w["label"]] for w in windows])
+
+
+def _shard_meta(base: dict, window_metas: list) -> dict:
+    """The bulk unit's shard metadata from its per-window metadata (issue #586).
+
+    Every window meta is completed with the shard's ``duration_s`` (the
+    invoke's, so a per-leaf record's fleet-safety columns describe the invoke
+    that produced it), and every written one with ``unit_windows``; the shard meta carries the
+    window-independent fields once, the sums, the time-range union, the
+    first failed window's error (a benign no-data window is not a failure),
+    and ``current`` / ``refused`` only when
+    every window skipped that way.
+    """
+    from zagg.dispatch import BENIGN_ERRORS
+    from zagg.windows import union_time_range
+
+    n = len(window_metas)
+    written = [m for m in window_metas if not (m.get("current") or m.get("refused"))]
+    for m in window_metas:
+        m["duration_s"] = base["duration_s"]
+    # The leaves this invoke emitted (review finding (12)): the windows it
+    # wrote or tried to, not the ones the gate skipped — the N rows a per-
+    # invoke sum de-duplicates. A skipped window has no record to carry it.
+    for m in written:
+        m["unit_windows"] = len(written)
+    meta = {**base, "windows": window_metas}
+    # The sums count the windows that landed; a failed window's partial
+    # aggregate is not output (a failed fan-out unit counts nothing).
+    for key in ("cells_with_data", "total_obs"):
+        meta[key] = sum(int(m.get(key) or 0) for m in written if not m.get("error"))
+    if n and not written:
+        meta["current" if all(m.get("current") for m in window_metas) else "refused"] = True
+    # A window whose sink kept nothing reports a benign no-work error, as its
+    # ``(shard, window)`` fan-out unit would (status ``no_data``, never a cell
+    # error): it is not a failure of the shard. Only non-benign windows fail
+    # it; a shard whose every written window is benign reports the bare
+    # benign string, so the whole-shard case still classifies as no data.
+    failed = [m for m in written if m.get("error") and m["error"] not in BENIGN_ERRORS]
+    if failed:
+        first = failed[0]
+        more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
+        meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
+    elif written and all(m.get("error") for m in written):
+        meta["error"] = written[0]["error"]
+    time_range = union_time_range(*(m.get("time_range") for m in written))
+    if time_range is not None:
+        meta["time_range"] = time_range
+    return meta
 
 
 def _read_json(obj_store, key: str) -> dict | None:

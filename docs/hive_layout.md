@@ -110,6 +110,7 @@ output:
   store_layout: hive
   windowing:                        # absent = schedule none = morton-hive/1
     schedule: yearly                # none | yearly | monthly | daily | explicit
+    unit: shard                     # shard (default) | window — the dispatch unit
     time_field: delta_time          # per-observation timestamp column
                                     #   (a declared data_source column)
     epoch: "2018-01-01T00:00:00Z"   # dataset zero as an ISO-8601 UTC instant
@@ -162,14 +163,67 @@ output:
   `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
   `TAI−UTC = 37 s`; stdlib `datetime` has no leap-second table) — boundaries
   are accurate to ≤ 1 leap second, none declared since 2017.
-- **Dispatch fans one work unit per (shard, window).** The ShardMap's
-  per-granule `time_start`/`time_end` subset granules per window; inside the
-  worker an observation-level filter on `time_field` (a pair of structured
-  `ge`/`lt` predicates riding the ordinary filter machinery) splits
-  boundary-straddling granules exactly — an observation on a boundary instant
-  belongs to the *later* window. Legacy shardmaps without granule times
-  dispatch every granule to every window (the filter keeps it correct) and
-  need `bounds.temporal` to enumerate generative windows.
+- **Dispatch is one work unit per shard, emitting every window its granules
+  span** (`unit: shard`, the default —
+  [issue #586](https://github.com/englacial/zagg/issues/586) phase 2). The
+  ShardMap's per-granule `time_start`/`time_end` decide which granules belong
+  to which window, and the worker reads the shard's granules ONCE, bins each
+  read on `time_field` into the windows (the same half-open `[start, end)`
+  predicate, applied to the read chunk instead of inside the read — an
+  observation on a boundary instant belongs to the *later* window), then
+  aggregates and finishes one window at a time — leaf, stamp, granule-id
+  sibling, leaf column, refs, pointer — releasing each window's reads before
+  the next one pools, so peak memory holds one window's slab beside the
+  shard's reads rather than N. Under `aggregation.streaming` each window
+  gets its own aggregator at the fan-out unit's own threshold, flushed on
+  its own granule cadence and drained as soon as the read passes its last
+  member granule (so the resident tail buffers are the open windows', not
+  all N; under `mode: merge` every window's running state stays resident
+  until its leaf is written), plus one shared cap on the open spill blocks
+  together (`SPILL_TMP_FRACTION` of free `/tmp`), with every block close
+  first joining all the windows' in-flight reduces so one block reduces at a
+  time. A cap close is the one bulk-only fold, and on a config with no
+  cross-block fold law it fails the shard (`SpillOverflowError`) where every
+  fan-out unit would have stayed single-block: dispatch `unit: window` there. The leaves are
+  byte-identical to the per-window fan-out's. `unit: window` keeps that
+  fan-out — one invoke per (shard, window), the window's granule subset,
+  an observation-level `ge`/`lt` filter pair injected into the read — for
+  runs that want the smaller per-invoke footprint at the cost of reading
+  each shard once per window. The shard event carries the shard's whole
+  granule list plus each window's index list, so it is about N× a
+  per-window event: at ~100 B per ATL03 s3 href the 250 KiB async (Event)
+  budget holds ~2,400 granules, and a 4,600-granule pole shard × 7 windows
+  is ~478 KB (every per-window event ~68 KB). Such a shard fails at
+  dispatch on an async run (`invocation="sync"`, or `unit: window`, is the
+  remedy), and the per-leaf `submap` block is dropped — sub-maps deferred
+  to the sweep CLI — at a correspondingly lower granule count. The unit is a dispatch choice: the leaves,
+  the manifest's temporal block and the D19 semantic hash are the same
+  either way. The raster path always dispatches per window (membership is
+  per acquisition at dispatch) and rejects the key. Legacy shardmaps
+  without granule times dispatch every granule to every window (the
+  per-observation split keeps it correct) and need `bounds.temporal` to
+  enumerate generative windows.
+- **Run records stay one row per leaf.** A shard unit that emits N leaves
+  writes N D20 records — each leaf's own sidecar, sub-map (its granule
+  subset) and run-parquet row, with `window` naming the leaf, so the
+  sweep's run-record discovery and `Run.attach` read them as before. The
+  invoke-level telemetry (`duration_s`, `max_memory_mb`, `gb_seconds`, the
+  `read` phase, and `n_obs_read` — the shard's decoded rows, so the #374
+  read-vs-keep ratio is per invoke: `n_obs_read` over the rows' summed
+  `n_obs`) repeats across the invoke's N rows and each carries
+  `unit_windows: N` — the leaves the invoke emitted, windows the gate
+  skipped not counted (null on a per-window unit) — so per-invoke quantiles stay
+  the fleet-safety numbers and a per-invoke sum de-duplicates on
+  `(run_id, shard_key)` where `unit_windows` is set. A window whose inputs
+  are current under the skip-if-current gate is skipped inside the shard
+  invoke (no record, as for a skipped unit); a window that kept no data
+  reports the fan-out's benign no-data error and fails nothing. A window
+  that fails costs only its own leaf — the others still land and keep their
+  records and sidecars — but marks the invoke failed
+  (`error: "window {label}: ..."`). Nothing re-fires it automatically (a
+  body-level error is not retried and a `failed` status object is
+  terminal): a re-run of the shard rewrites the failed window while the
+  gate skips the windows that landed.
 - **Stamps carry the truth, the manifest the schema** (D15): each windowed
   leaf's commit stamp records its `window` label and the ACTUAL written
   `time_range` as ISO-8601 UTC strings (both ends at whole-second

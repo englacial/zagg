@@ -1919,7 +1919,7 @@ class TestWindowedRunnerWiring:
         from zagg import runner
         from zagg.runner import agg
 
-        _windowed(cfg)
+        _windowed(cfg, unit="window")
         catalog_path, shard = self._catalog(tmp_path)
         root = str(tmp_path / "out")
         calls = []

@@ -204,6 +204,9 @@ def process_shard(
     occupied_out: list | None = None,
     time_range_of: str | None = None,
     profile: bool = False,
+    windows: list[dict] | None = None,
+    time_field: str | None = None,
+    emit_window: Callable | None = None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -316,6 +319,31 @@ def process_shard(
         rollups and the raster per-stage stats); it no longer changes this
         function's behavior. (The ``write`` phase runs in the caller, outside
         this function.)
+    windows : list of dict, optional
+        Bulk multi-window emit (issue #586 phase 2): the unit's time windows,
+        ``{"label", "start", "end", "granules"?}`` — bounds half-open in
+        dataset units, ``granules`` the indices (into ``granule_urls``) of the
+        granules that belong to the window. The shard is read ONCE; each group
+        read is split on ``time_field`` into the windows' sinks
+        (:class:`~zagg.processing.windowed.WindowBins`), and the aggregate
+        tail then runs once per window, in order, through ``emit_window``:
+        ``emit_window(window, aggregate)`` is called per window with a
+        callable that takes this function's own sink kwargs
+        (``chunk_results`` / ``write_chunk`` / ``ragged_out`` /
+        ``occupied_out``) and returns that window's metadata dict — the same
+        shape a ``(shard, window)`` unit's metadata has, plus ``window`` and
+        ``unit_windows`` — after which the window's reads are released before
+        the next window aggregates. The sink kwargs given to this function
+        are ignored on that path (each window brings its own); the return is
+        an empty carrier plus the shard-level metadata (read-phase fields, the
+        windows' summed ``total_obs`` / ``cells_with_data`` / timings). A
+        window whose sink is empty reports ``No data after filtering`` exactly
+        as a fan-out unit whose filtered read kept nothing.
+    time_field : str, optional
+        The per-observation timestamp column ``windows`` bins on (the windowing
+        declaration's ``time_field``). Required with ``windows``.
+    emit_window : callable, optional
+        The per-window consumer described under ``windows``. Required with it.
 
     Returns
     -------
@@ -479,18 +507,31 @@ def process_shard(
 
     streaming_cfg = get_streaming(config)
     spill_mode = streaming_cfg is not None and streaming_cfg["mode"] == "spill"
-    if streaming_cfg is None:
+
+    def _make_buffered():
+        if spill_mode:
+            return SpillAggregator(
+                config,
+                grid,
+                handoff,
+                streaming_cfg["buffer_granules"],
+                block_bytes=streaming_cfg["block_bytes"],
+            )
+        return StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
+
+    # Bulk multi-window emit (issue #586): the windows' sinks stand in for the
+    # shard's single one — a list of reads per window, or one streaming
+    # aggregator per window (each at the fan-out unit's own threshold).
+    bins = None
+    if windows is not None:
+        if not time_field or emit_window is None:
+            raise ValueError("process_shard(windows=...) requires time_field and emit_window")
+        from zagg.processing.windowed import WindowBins
+
+        bins = WindowBins(windows, time_field, _make_buffered if streaming_cfg else None)
         buffered = None
-    elif spill_mode:
-        buffered = SpillAggregator(
-            config,
-            grid,
-            handoff,
-            streaming_cfg["buffer_granules"],
-            block_bytes=streaming_cfg["block_bytes"],
-        )
     else:
-        buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
+        buffered = None if streaming_cfg is None else _make_buffered()
 
     # Per-phase timing (issue #100; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default, and the cost is a
@@ -622,10 +663,10 @@ def process_shard(
         """
         nonlocal granule_errors
         if granule_workers == 1:
-            for entry in granule_urls:
+            for index, entry in enumerate(granule_urls):
                 s3_url = _entry_url(entry)
                 try:
-                    yield s3_url, *_read_granule(entry)
+                    yield index, s3_url, *_read_granule(entry)
                 except Exception as e:
                     granule_errors += 1
                     _record_read_error(f"processing file {s3_url}", e)
@@ -633,13 +674,13 @@ def process_shard(
             with ThreadPoolExecutor(
                 max_workers=granule_workers, thread_name_prefix="zagg-granule"
             ) as pool:
-                urls = iter(granule_urls)
+                urls = iter(enumerate(granule_urls))
                 in_flight = deque(
-                    (_entry_url(u), pool.submit(_read_granule, u))
-                    for u in islice(urls, granule_workers)
+                    (i, _entry_url(u), pool.submit(_read_granule, u))
+                    for i, u in islice(urls, granule_workers)
                 )
                 while in_flight:
-                    s3_url, future = in_flight.popleft()
+                    index, s3_url, future = in_flight.popleft()
                     try:
                         reads, group_errors, granule_io = future.result()
                     except Exception as e:
@@ -651,10 +692,10 @@ def process_shard(
                     # granule_workers in flight while the main thread folds
                     # (including streaming granule_done flushes) — the ≤ K
                     # bound and the fold order are unchanged.
-                    for u in islice(urls, 1):
-                        in_flight.append((_entry_url(u), pool.submit(_read_granule, u)))
+                    for i, u in islice(urls, 1):
+                        in_flight.append((i, _entry_url(u), pool.submit(_read_granule, u)))
                     if reads is not None:
-                        yield s3_url, reads, group_errors, granule_io
+                        yield index, s3_url, reads, group_errors, granule_io
 
     # Observations READ (issue #374): base-rate rows decoded across every
     # granule BEFORE the shard mask, filters, and read-plan segment padding
@@ -665,18 +706,23 @@ def process_shard(
     obs_read_total: int | None = None
 
     # Read files and filter spatially, folding granules in original order.
-    for s3_url, reads, group_errors, granule_io in _iter_granule_reads():
+    for index, s3_url, reads, group_errors, granule_io in _iter_granule_reads():
         read_errors += group_errors
         if "obs_read" in granule_io:
             obs_read_total = (obs_read_total or 0) + int(granule_io["obs_read"])
         try:
-            for chunk in reads:
-                if buffered is not None:
-                    buffered.add_read(chunk)
-                else:
-                    all_reads.append(chunk)
+            if bins is not None:
+                bins.add_reads(reads, index)
+            else:
+                for chunk in reads:
+                    if buffered is not None:
+                        buffered.add_read(chunk)
+                    else:
+                        all_reads.append(chunk)
             files_processed += 1
-            if buffered is not None:
+            if bins is not None:
+                bins.granule_done(index)
+            elif buffered is not None:
                 buffered.granule_done()
         except (SpillOverflowError, SpillReduceError):
             # A spill block overflowed under a non-mergeable config
@@ -719,6 +765,8 @@ def process_shard(
         # deliberately charges ALL group+merge cost to ``read`` — the tail
         # flush must not fall between phases and vanish from the accounting.
         buffered.flush()
+    if bins is not None:
+        bins.flush()
     phase_timings["read"] = time.time() - _read_t0
 
     # Pre-filter read volume (issue #374), stamped as soon as the read loop is
@@ -729,314 +777,384 @@ def process_shard(
     if obs_read_total is not None:
         metadata["total_obs_read"] = obs_read_total
 
-    if buffered.empty if buffered is not None else not all_reads:
-        # Distinguish a genuinely-empty read from one where a group read raised
-        # (issue #116): a raised read is a real error masquerading as "no data",
-        # so report it as such instead of the misleading text. Some groups may
-        # have returned ``None`` (legitimately empty) rather than raised, so the
-        # message is "no data AND N raised", not "all groups raised".
-        if read_errors or granule_errors:
-            # Name the SCOPE of the failures, not just a count (fold review):
-            # "3 granule reads raised" and "3 group reads raised" point at very
-            # different causes (credentials/endpoint vs schema/variable).
-            raised = ", ".join(
-                f"{n} {scope} reads raised"
-                for n, scope in ((read_errors, "group"), (granule_errors, "granule"))
-                if n
-            )
-            exemplars = " | ".join(read_error_exemplars)
-            if auth_errors:
-                # Its own failure CLASS (issue #449): the GEDI template shipped
-                # without a credentials_provider, so NSIDC creds hit LP DAAC's
-                # lp-prod-protected and the shard reported the data-shaped "No
-                # data after filtering". The fault is the config, not the data,
-                # and the message must say so. Reached only on a DEFINITE match
-                # (a status code or a denial token in the exception) — the
-                # empty-body shape those 403s also produce is a hint on the
-                # generic branch below, not this class (fold review).
-                logger.error(
-                    f"  Access denied reading source granules for shard {label} "
-                    f"({auth_errors} auth-shaped failures of {raised}) - skipping"
+    # The aggregate tail, from the no-data check to the carrier return, as a
+    # function of its sinks so the bulk multi-window path (issue #586) can run
+    # it once per window over that window's reads; the single-unit path calls
+    # it exactly once over the shard's. The parameters shadow the enclosing
+    # names on purpose — the body is the tail verbatim.
+    def _aggregate(
+        all_reads,
+        buffered,
+        *,
+        metadata,
+        phase_timings,
+        chunk_results=None,
+        write_chunk=None,
+        ragged_out=None,
+        occupied_out=None,
+    ):
+        if buffered.empty if buffered is not None else not all_reads:
+            # Distinguish a genuinely-empty read from one where a group read raised
+            # (issue #116): a raised read is a real error masquerading as "no data",
+            # so report it as such instead of the misleading text. Some groups may
+            # have returned ``None`` (legitimately empty) rather than raised, so the
+            # message is "no data AND N raised", not "all groups raised".
+            if read_errors or granule_errors:
+                # Name the SCOPE of the failures, not just a count (fold review):
+                # "3 granule reads raised" and "3 group reads raised" point at very
+                # different causes (credentials/endpoint vs schema/variable).
+                raised = ", ".join(
+                    f"{n} {scope} reads raised"
+                    for n, scope in ((read_errors, "group"), (granule_errors, "granule"))
+                    if n
                 )
-                metadata["error"] = (
-                    f"Access denied reading source granules ({auth_errors} auth-shaped "
-                    f"failures; {raised}): check data_source.credentials_provider names "
-                    f"the DAAC hosting this product; e.g. {exemplars}"
-                )
-            else:
-                # Empty-body HINT (fold review, issue #449): the None-body
-                # signature cannot prove a denial — h5coro returns the same
-                # ``None`` for a missing object, throttling, a timeout or a
-                # reset — so it appends likely causes to the generic message
-                # instead of asserting the auth class. Credentials/DAAC
-                # mismatch leads the list because it is the one cause the
-                # operator can only find by being told to look.
-                hint = ""
-                if empty_body_errors:
-                    hint = (
-                        f"; {empty_body_errors} read(s) got an EMPTY body — likely a denied "
-                        f"read (check data_source.credentials_provider names the DAAC hosting "
-                        f"this product), a missing object, or throttling"
+                exemplars = " | ".join(read_error_exemplars)
+                if auth_errors:
+                    # Its own failure CLASS (issue #449): the GEDI template shipped
+                    # without a credentials_provider, so NSIDC creds hit LP DAAC's
+                    # lp-prod-protected and the shard reported the data-shaped "No
+                    # data after filtering". The fault is the config, not the data,
+                    # and the message must say so. Reached only on a DEFINITE match
+                    # (a status code or a denial token in the exception) — the
+                    # empty-body shape those 403s also produce is a hint on the
+                    # generic branch below, not this class (fold review).
+                    logger.error(
+                        f"  Access denied reading source granules for shard {label} "
+                        f"({auth_errors} auth-shaped failures of {raised}) - skipping"
                     )
-                logger.warning(
-                    f"  No data after filtering for shard {label} and {raised}{hint} - skipping"
-                )
-                # Carry the exemplars in the error text too (issue #341): this
-                # string is what surfaces in the status object / run summary, so
-                # it must be a one-glance diagnosis, not just a count.
-                metadata["error"] = f"No data after filtering ({raised}{hint}; e.g. {exemplars})"
-        else:
-            logger.info(f"  No data after filtering for shard {label} - skipping")
-            metadata["error"] = "No data after filtering"
-        metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
-        metadata["phase_timings"] = phase_timings
-        return pd.DataFrame(), metadata
+                    metadata["error"] = (
+                        f"Access denied reading source granules ({auth_errors} auth-shaped "
+                        f"failures; {raised}): check data_source.credentials_provider names "
+                        f"the DAAC hosting this product; e.g. {exemplars}"
+                    )
+                else:
+                    # Empty-body HINT (fold review, issue #449): the None-body
+                    # signature cannot prove a denial — h5coro returns the same
+                    # ``None`` for a missing object, throttling, a timeout or a
+                    # reset — so it appends likely causes to the generic message
+                    # instead of asserting the auth class. Credentials/DAAC
+                    # mismatch leads the list because it is the one cause the
+                    # operator can only find by being told to look.
+                    hint = ""
+                    if empty_body_errors:
+                        hint = (
+                            f"; {empty_body_errors} read(s) got an EMPTY body — likely a denied "
+                            f"read (check data_source.credentials_provider names the DAAC hosting "
+                            f"this product), a missing object, or throttling"
+                        )
+                    logger.warning(
+                        f"  No data after filtering for shard {label} and {raised}{hint} - skipping"
+                    )
+                    # Carry the exemplars in the error text too (issue #341): this
+                    # string is what surfaces in the status object / run summary, so
+                    # it must be a one-glance diagnosis, not just a count.
+                    metadata["error"] = (
+                        f"No data after filtering ({raised}{hint}; e.g. {exemplars})"
+                    )
+            else:
+                logger.info(f"  No data after filtering for shard {label} - skipping")
+                metadata["error"] = "No data after filtering"
+            metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
+            metadata["phase_timings"] = phase_timings
+            return pd.DataFrame(), metadata
 
-    data_vars = get_data_vars(config)
-    agg_fields = get_agg_fields(config)
-    dense_vars = [v for v in data_vars if get_output_signature(agg_fields[v])["kind"] != "ragged"]
-    use_arrow = _has_vector_fields(config)
+        data_vars = get_data_vars(config)
+        agg_fields = get_agg_fields(config)
+        dense_vars = [
+            v for v in data_vars if get_output_signature(agg_fields[v])["kind"] != "ragged"
+        ]
+        use_arrow = _has_vector_fields(config)
 
-    # K = number of finer Zarr chunks this shard owns (issue #30 item 3). K==1 is
-    # the unchanged single-chunk path; K>1 fans the shard into ``grid.iter_chunks``.
-    chunks_per_shard = int(getattr(grid, "chunks_per_shard", 1))
-    if chunk_results is not None and write_chunk is not None:
-        raise ValueError(
-            "process_shard takes either chunk_results (accumulate) or write_chunk "
-            "(stream-and-free, issue #91), not both."
-        )
-    if write_chunk is not None and ragged_out is not None:
-        # When streaming, each chunk's ragged goes straight to write_chunk, so a
-        # ragged_out sink would be left silently empty — reject the ambiguity (as the
-        # chunk_results+write_chunk guard above does) rather than mislead the caller.
-        raise ValueError(
-            "process_shard ignores ragged_out when write_chunk is given (the chunk's "
-            "ragged is delivered to the callback); pass one or the other, not both."
-        )
-    # A K>1 grid needs one of the two multi-chunk sinks: ``chunk_results`` to
-    # accumulate the K carriers or ``write_chunk`` to stream-and-free them (#91).
-    streaming = write_chunk is not None
-    if chunks_per_shard > 1 and chunk_results is None and not streaming:
-        raise ValueError(
-            f"grid has chunks_per_shard={chunks_per_shard} (chunk_inner set, issue #30 "
-            f"item 3) but process_shard was called without a chunk_results sink or a "
-            f"write_chunk callback (issue #91); the K per-chunk carriers cannot be "
-            f"returned through the single df_out. Pass chunk_results=[] or write_chunk=... "
-            f"(the runner does)."
-        )
+        # K = number of finer Zarr chunks this shard owns (issue #30 item 3). K==1 is
+        # the unchanged single-chunk path; K>1 fans the shard into ``grid.iter_chunks``.
+        chunks_per_shard = int(getattr(grid, "chunks_per_shard", 1))
+        if chunk_results is not None and write_chunk is not None:
+            raise ValueError(
+                "process_shard takes either chunk_results (accumulate) or write_chunk "
+                "(stream-and-free, issue #91), not both."
+            )
+        if write_chunk is not None and ragged_out is not None:
+            # When streaming, each chunk's ragged goes straight to write_chunk, so a
+            # ragged_out sink would be left silently empty — reject the ambiguity (as the
+            # chunk_results+write_chunk guard above does) rather than mislead the caller.
+            raise ValueError(
+                "process_shard ignores ragged_out when write_chunk is given (the chunk's "
+                "ragged is delivered to the callback); pass one or the other, not both."
+            )
+        # A K>1 grid needs one of the two multi-chunk sinks: ``chunk_results`` to
+        # accumulate the K carriers or ``write_chunk`` to stream-and-free them (#91).
+        streaming = write_chunk is not None
+        if chunks_per_shard > 1 and chunk_results is None and not streaming:
+            raise ValueError(
+                f"grid has chunks_per_shard={chunks_per_shard} (chunk_inner set, issue #30 "
+                f"item 3) but process_shard was called without a chunk_results sink or a "
+                f"write_chunk callback (issue #91); the K per-chunk carriers cannot be "
+                f"returned through the single df_out. Pass chunk_results=[] or write_chunk=... "
+                f"(the runner does)."
+            )
 
-    _index_t0 = time.time()
+        _index_t0 = time.time()
 
-    # ---- Pool the shard's reads ONCE (shared across all K chunks) -------------
-    # The shard is read+grouped a single time; only the ``chunk_precompute``
-    # reduction (``chunk_scalars``, issue #30 item 1) moves INTO the per-chunk loop
-    # below (issue #82 phase 6). A ``resolution: chunk`` companion is per Zarr chunk,
-    # so the gain/offset anchor must be reduced over each chunk's own observations,
-    # not the whole pooled shard. At K==1 the lone chunk == the whole shard, so the
-    # anchor is identical to the old shard-level reduction (byte-for-byte unchanged).
-    # Concat the per-group reads and split observations by cell (carrier-agnostic;
-    # both carriers feed identical numpy arrays into _group_columns). The buffered
-    # path (issue #148 phase 4) already grouped-and-merged per flush, so its
-    # running state replaces the shard-wide pool.
-    if buffered is not None:
-        col_arrays, cell_to_slice = {}, {}
-        n_obs_total = buffered.n_obs_total
-        logger.info(f"  Read {n_obs_total:,} observations ({buffered.flushes} buffer flushes)")
-    else:
-        col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
-        logger.info(f"  Read {n_obs_total:,} observations")
-
-    # Actual time extent (issue #246): min/max of the declared time column
-    # over the pooled (post-filter) observations — two reductions on an array
-    # already in hand. The buffered/streaming path holds no pooled columns, so
-    # windowed streaming stamps simply omit their time_range (documented).
-    if time_range_of is not None and time_range_of in col_arrays and n_obs_total:
-        col = col_arrays[time_range_of]
-        metadata["time_range"] = [float(col.min()), float(col.max())]
-
-    # Occupied-cell sink (issue #200): both paths already hold the shard's
-    # populated cell words — ``cell_to_slice`` pooled, the streaming running
-    # state merged (via ``occupied_cells``) — so
-    # the occupied set is in hand with no extra observation pass.
-    if occupied_out is not None:
+        # ---- Pool the shard's reads ONCE (shared across all K chunks) -------------
+        # The shard is read+grouped a single time; only the ``chunk_precompute``
+        # reduction (``chunk_scalars``, issue #30 item 1) moves INTO the per-chunk loop
+        # below (issue #82 phase 6). A ``resolution: chunk`` companion is per Zarr chunk,
+        # so the gain/offset anchor must be reduced over each chunk's own observations,
+        # not the whole pooled shard. At K==1 the lone chunk == the whole shard, so the
+        # anchor is identical to the old shard-level reduction (byte-for-byte unchanged).
+        # Concat the per-group reads and split observations by cell (carrier-agnostic;
+        # both carriers feed identical numpy arrays into _group_columns). The buffered
+        # path (issue #148 phase 4) already grouped-and-merged per flush, so its
+        # running state replaces the shard-wide pool.
         if buffered is not None:
-            occupied_out.append(buffered.occupied_cells())
+            col_arrays, cell_to_slice = {}, {}
+            n_obs_total = buffered.n_obs_total
+            logger.info(f"  Read {n_obs_total:,} observations ({buffered.flushes} buffer flushes)")
         else:
-            occupied_out.append(
-                np.fromiter(cell_to_slice.keys(), dtype=np.uint64, count=len(cell_to_slice))
-            )
+            col_arrays, cell_to_slice, n_obs_total = _concat_and_group(all_reads, grid, handoff)
+            logger.info(f"  Read {n_obs_total:,} observations")
 
-    phase_timings["index"] = time.time() - _index_t0
-    _aggregate_t0 = time.time()
+        # Actual time extent (issue #246): min/max of the declared time column
+        # over the pooled (post-filter) observations — two reductions on an array
+        # already in hand. The buffered/streaming path holds no pooled columns, so
+        # windowed streaming stamps simply omit their time_range (documented).
+        if time_range_of is not None and time_range_of in col_arrays and n_obs_total:
+            col = col_arrays[time_range_of]
+            metadata["time_range"] = [float(col.min()), float(col.max())]
 
-    # ---- Aggregate + build one carrier per finer chunk -----------------------
-    # ``iter_chunks`` is the K-chunk seam (issue #30 item 3); a minimal grid (e.g.
-    # a test stub) without it is implicitly K==1 — fall back to the single chunk
-    # ``(block_index(shard_key), children(shard_key))``, the byte-identical path.
-    if hasattr(grid, "iter_chunks"):
-        chunk_iter = grid.iter_chunks(shard_key)
-    else:
-        # Minimal stub: derive the lone chunk's children and (only when a sink
-        # needs it) its block index. ``block_index`` may be absent on a stub that
-        # never returns through ``chunk_results``; default to () in that case.
-        fallback_block = grid.block_index(shard_key) if hasattr(grid, "block_index") else ()
-        chunk_iter = iter([(fallback_block, grid.children(shard_key))])
+        # Occupied-cell sink (issue #200): both paths already hold the shard's
+        # populated cell words — ``cell_to_slice`` pooled, the streaming running
+        # state merged (via ``occupied_cells``) — so
+        # the occupied set is in hand with no extra observation pass.
+        if occupied_out is not None:
+            if buffered is not None:
+                occupied_out.append(buffered.occupied_cells())
+            else:
+                occupied_out.append(
+                    np.fromiter(cell_to_slice.keys(), dtype=np.uint64, count=len(cell_to_slice))
+                )
 
-    cells_with_data = 0
-    single_carrier = None
-    single_ragged: dict = {}
-    for block_index, chunk_children in chunk_iter:
-        chunk_children = np.asarray(chunk_children)
-        if spill_mode:
-            # Spill path (issue #217): the chunk's partition is read back and
-            # driven through the pooled aggregation machinery (single-block) or
-            # emitted from the cross-block merged state (multi-block); either
-            # way the return is the full _aggregate_chunk_cells 5-tuple, so
-            # companion-carrying ragged fields and chunk_precompute are served.
-            (
-                stats_arrays,
-                ragged_payloads,
-                ragged_idx,
-                ragged_channels,
-                cwd,
-            ) = buffered.chunk_outputs(chunk_children, agg_fields)
-        elif buffered is not None:
-            # Buffered path (issue #148 phase 4): emit this chunk's outputs from
-            # the running merged state; chunk_precompute is rejected at validation
-            # so there are no chunk scalars to evaluate. Companion-carrying
-            # ragged fields (issue #87's located channel, spec §8.3's temporal
-            # one) are likewise rejected by validate_streaming, so the channel
-            # sink is empty here by construction.
-            stats_arrays, ragged_payloads, ragged_idx, cwd = buffered.chunk_outputs(
-                chunk_children, agg_fields
-            )
-            ragged_channels = {}
+        phase_timings["index"] = time.time() - _index_t0
+        _aggregate_t0 = time.time()
+
+        # ---- Aggregate + build one carrier per finer chunk -----------------------
+        # ``iter_chunks`` is the K-chunk seam (issue #30 item 3); a minimal grid (e.g.
+        # a test stub) without it is implicitly K==1 — fall back to the single chunk
+        # ``(block_index(shard_key), children(shard_key))``, the byte-identical path.
+        if hasattr(grid, "iter_chunks"):
+            chunk_iter = grid.iter_chunks(shard_key)
         else:
-            # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
-            # from the shard's sorted column arrays, then reduce the anchor over them.
-            chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
-            chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
-            (
+            # Minimal stub: derive the lone chunk's children and (only when a sink
+            # needs it) its block index. ``block_index`` may be absent on a stub that
+            # never returns through ``chunk_results``; default to () in that case.
+            fallback_block = grid.block_index(shard_key) if hasattr(grid, "block_index") else ()
+            chunk_iter = iter([(fallback_block, grid.children(shard_key))])
+
+        cells_with_data = 0
+        single_carrier = None
+        single_ragged: dict = {}
+        for block_index, chunk_children in chunk_iter:
+            chunk_children = np.asarray(chunk_children)
+            if spill_mode:
+                # Spill path (issue #217): the chunk's partition is read back and
+                # driven through the pooled aggregation machinery (single-block) or
+                # emitted from the cross-block merged state (multi-block); either
+                # way the return is the full _aggregate_chunk_cells 5-tuple, so
+                # companion-carrying ragged fields and chunk_precompute are served.
+                (
+                    stats_arrays,
+                    ragged_payloads,
+                    ragged_idx,
+                    ragged_channels,
+                    cwd,
+                ) = buffered.chunk_outputs(chunk_children, agg_fields)
+            elif buffered is not None:
+                # Buffered path (issue #148 phase 4): emit this chunk's outputs from
+                # the running merged state; chunk_precompute is rejected at validation
+                # so there are no chunk scalars to evaluate. Companion-carrying
+                # ragged fields (issue #87's located channel, spec §8.3's temporal
+                # one) are likewise rejected by validate_streaming, so the channel
+                # sink is empty here by construction.
+                stats_arrays, ragged_payloads, ragged_idx, cwd = buffered.chunk_outputs(
+                    chunk_children, agg_fields
+                )
+                ragged_channels = {}
+            else:
+                # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
+                # from the shard's sorted column arrays, then reduce the anchor over them.
+                chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
+                chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
+                (
+                    stats_arrays,
+                    ragged_payloads,
+                    ragged_idx,
+                    ragged_channels,
+                    cwd,
+                ) = _aggregate_chunk_cells(
+                    chunk_children,
+                    col_arrays,
+                    cell_to_slice,
+                    chunk_scalars,
+                    config,
+                    data_vars,
+                    agg_fields,
+                    # Already gathered for the precompute above — the toc hoist reuses
+                    # it instead of rebuilding the same index (review finding, PR #478).
+                    chunk_pooled=chunk_pooled,
+                )
+            cells_with_data += cwd
+            # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
+            # over THIS chunk's cells (order-aligned with the carrier). None when the
+            # flag is off, so the carrier is byte-for-byte unchanged. A non-None payload
+            # against a grid that can't expand it is a manifest/grid mismatch — raise
+            # rather than silently drop the column (which would leave an all-False mask).
+            chunk_aoi_mask = None
+            if aoi_payload is not None:
+                if not hasattr(grid, "aoi_mask_from_payload"):
+                    raise ValueError(
+                        f"manifest carries an aoi_mask payload but grid "
+                        f"{type(grid).__name__} cannot expand it (no aoi_mask_from_payload)"
+                    )
+                chunk_aoi_mask = grid.aoi_mask_from_payload(aoi_payload, chunk_children)
+            carrier = _build_output(
                 stats_arrays,
-                ragged_payloads,
-                ragged_idx,
-                ragged_channels,
-                cwd,
-            ) = _aggregate_chunk_cells(
-                chunk_children,
-                col_arrays,
-                cell_to_slice,
-                chunk_scalars,
-                config,
-                data_vars,
+                dense_vars,
                 agg_fields,
-                # Already gathered for the precompute above — the toc hoist reuses
-                # it instead of rebuilding the same index (review finding, PR #478).
-                chunk_pooled=chunk_pooled,
+                grid,
+                shard_key,
+                use_arrow=use_arrow,
+                children=(chunk_children if chunks_per_shard > 1 else None),
+                aoi_mask=chunk_aoi_mask,
             )
-        cells_with_data += cwd
-        # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
-        # over THIS chunk's cells (order-aligned with the carrier). None when the
-        # flag is off, so the carrier is byte-for-byte unchanged. A non-None payload
-        # against a grid that can't expand it is a manifest/grid mismatch — raise
-        # rather than silently drop the column (which would leave an all-False mask).
-        chunk_aoi_mask = None
-        if aoi_payload is not None:
-            if not hasattr(grid, "aoi_mask_from_payload"):
-                raise ValueError(
-                    f"manifest carries an aoi_mask payload but grid "
-                    f"{type(grid).__name__} cannot expand it (no aoi_mask_from_payload)"
-                )
-            chunk_aoi_mask = grid.aoi_mask_from_payload(aoi_payload, chunk_children)
-        carrier = _build_output(
-            stats_arrays,
-            dense_vars,
-            agg_fields,
-            grid,
-            shard_key,
-            use_arrow=use_arrow,
-            children=(chunk_children if chunks_per_shard > 1 else None),
-            aoi_mask=chunk_aoi_mask,
-        )
-        # A companion-carrying field appends one element per declared channel, in
-        # the ``write._ragged_entry`` order (``locations`` then ``times`` — issue
-        # #87 and spec §8.3): the located 3-tuple, the temporal-only 4-tuple with
-        # a ``None`` location slot, and the both-channels 4-tuple. A field with
-        # neither channel keeps the 2-tuple contract unchanged.
-        ragged = (
-            {
-                name: (
-                    ragged_payloads[name],
-                    ragged_idx[name],
-                    *_channel_entry(ragged_channels.get(name, {})),
-                )
-                for name in ragged_payloads
-            }
-            if handoff != "arrow-kernel"
-            else {}
-        )
-        if streaming:
-            # Stream-and-free (issue #91): write this chunk now and drop its refs so
-            # peak output-side memory holds ~1 chunk, not all K. Nothing is stashed.
-            write_chunk(block_index, carrier, ragged)
-            del carrier, ragged
-        elif chunk_results is not None:
-            chunk_results.append((block_index, carrier, ragged))
+            # A companion-carrying field appends one element per declared channel, in
+            # the ``write._ragged_entry`` order (``locations`` then ``times`` — issue
+            # #87 and spec §8.3): the located 3-tuple, the temporal-only 4-tuple with
+            # a ``None`` location slot, and the both-channels 4-tuple. A field with
+            # neither channel keeps the 2-tuple contract unchanged.
+            ragged = (
+                {
+                    name: (
+                        ragged_payloads[name],
+                        ragged_idx[name],
+                        *_channel_entry(ragged_channels.get(name, {})),
+                    )
+                    for name in ragged_payloads
+                }
+                if handoff != "arrow-kernel"
+                else {}
+            )
+            if streaming:
+                # Stream-and-free (issue #91): write this chunk now and drop its refs so
+                # peak output-side memory holds ~1 chunk, not all K. Nothing is stashed.
+                write_chunk(block_index, carrier, ragged)
+                del carrier, ragged
+            elif chunk_results is not None:
+                chunk_results.append((block_index, carrier, ragged))
+            else:
+                # K==1 path: stash the lone chunk's carrier + ragged for the 2-tuple
+                # return / ``ragged_out`` sink below (byte-for-byte the old behavior).
+                single_carrier = carrier
+                single_ragged = ragged
+
+        logger.info(f"  Statistics: {cells_with_data} cells with data")
+
+        if spill_mode:
+            # Every partition was consumed by the chunk loop; this releases any
+            # remainder (defensive) and the cached grouped partition.
+            buffered.close()
+
+        phase_timings["aggregate"] = time.time() - _aggregate_t0
+        if spill_mode:
+            # The espg-approved /tmp throughput instrumentation (issue #217):
+            # exact bytes spilled plus the wall spent in partition appends and
+            # read-backs. Read-backs can land in either the read phase (block
+            # closes mid-read) or the aggregate phase (single-block reduce).
+            phase_timings["spill_write_s"] = buffered.spill_write_s
+            phase_timings["spill_read_s"] = buffered.spill_read_s
+            phase_timings["spill_bytes"] = buffered.spill_bytes
+            # Fold-regime marker (issue #370): blocks closed at the threshold.
+            # 0 = exact single-block regime; > 0 = this leaf's outputs were folded
+            # across blocks. Split out of the seconds-only timings by build_record,
+            # like spill_bytes.
+            phase_timings["spill_blocks_closed"] = buffered.closed_blocks
+        metadata["phase_timings"] = phase_timings
+
+        duration = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Completed shard {label} in {duration:.1f}s")
+
+        metadata["cells_with_data"] = cells_with_data
+        metadata["total_obs"] = n_obs_total
+        metadata["duration_s"] = duration
+        # "Read" already means "kept" in the two lines above (worker.py:673/:676),
+        # which is what CloudWatch greps for today, so this one says "Decoded" —
+        # one verb, one meaning (review finding, issue #374).
+        if obs_read_total is not None:
+            logger.info(
+                f"  Decoded {obs_read_total:,} observations pre-filter, kept {n_obs_total:,}"
+            )
+
+        # K==1: deliver the lone chunk's carrier as the 2-tuple ``df_out`` and its
+        # ragged via ``ragged_out`` (unchanged contract). K>1: the carriers + ragged
+        # were appended to ``chunk_results`` (accumulate) or already handed to
+        # ``write_chunk`` (stream, issue #91); either way nothing is stashed, so return
+        # an empty carrier here.
+        if chunk_results is not None or streaming:
+            df_out = pd.DataFrame()
         else:
-            # K==1 path: stash the lone chunk's carrier + ragged for the 2-tuple
-            # return / ``ragged_out`` sink below (byte-for-byte the old behavior).
-            single_carrier = carrier
-            single_ragged = ragged
+            df_out = single_carrier if single_carrier is not None else pd.DataFrame()
+            if ragged_out is not None:
+                for name, payload in single_ragged.items():
+                    ragged_out[name] = payload
 
-    logger.info(f"  Statistics: {cells_with_data} cells with data")
+        return df_out, metadata
 
-    if spill_mode:
-        # Every partition was consumed by the chunk loop; this releases any
-        # remainder (defensive) and the cached grouped partition.
-        buffered.close()
+    if windows is None:
+        return _aggregate(
+            all_reads,
+            buffered,
+            metadata=metadata,
+            phase_timings=phase_timings,
+            chunk_results=chunk_results,
+            write_chunk=write_chunk,
+            ragged_out=ragged_out,
+            occupied_out=occupied_out,
+        )
 
-    phase_timings["aggregate"] = time.time() - _aggregate_t0
-    if spill_mode:
-        # The espg-approved /tmp throughput instrumentation (issue #217):
-        # exact bytes spilled plus the wall spent in partition appends and
-        # read-backs. Read-backs can land in either the read phase (block
-        # closes mid-read) or the aggregate phase (single-block reduce).
-        phase_timings["spill_write_s"] = buffered.spill_write_s
-        phase_timings["spill_read_s"] = buffered.spill_read_s
-        phase_timings["spill_bytes"] = buffered.spill_bytes
-        # Fold-regime marker (issue #370): blocks closed at the threshold.
-        # 0 = exact single-block regime; > 0 = this leaf's outputs were folded
-        # across blocks. Split out of the seconds-only timings by build_record,
-        # like spill_bytes.
-        phase_timings["spill_blocks_closed"] = buffered.closed_blocks
-    metadata["phase_timings"] = phase_timings
+    # Bulk multi-window emit (issue #586 phase 2): one aggregate pass per
+    # window, in dispatch order, over that window's sink alone; the consumer
+    # writes the window's leaf inside ``emit_window`` and the window's reads
+    # are released before the next one pools, so the slab, the outputs and
+    # the spill read-back are bounded by one window. ``granule_count`` is the
+    # window's own membership when the dispatcher sent one (the fan-out
+    # unit's ``len(granule_urls)``); the read-phase fields are the shard's.
+    totals = {"cells_with_data": 0, "total_obs": 0}
+    sums: dict = {}
+    try:
+        for w in windows:
+            reads_w, buffered_w = bins.sink(w["label"])
+            meta_w = {**metadata, "window": w["label"], "unit_windows": len(windows)}
+            if w.get("granules") is not None:
+                meta_w["granule_count"] = len(w["granules"])
+            timings_w = dict(phase_timings)
 
-    duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"Completed shard {label} in {duration:.1f}s")
+            def _aggregate_window(_r=reads_w, _b=buffered_w, _m=meta_w, _t=timings_w, **sinks):
+                _aggregate(_r, _b, metadata=_m, phase_timings=_t, **sinks)
+                return _m
 
-    metadata["cells_with_data"] = cells_with_data
-    metadata["total_obs"] = n_obs_total
-    metadata["duration_s"] = duration
-    # "Read" already means "kept" in the two lines above (worker.py:673/:676),
-    # which is what CloudWatch greps for today, so this one says "Decoded" —
-    # one verb, one meaning (review finding, issue #374).
-    if obs_read_total is not None:
-        logger.info(f"  Decoded {obs_read_total:,} observations pre-filter, kept {n_obs_total:,}")
-
-    # K==1: deliver the lone chunk's carrier as the 2-tuple ``df_out`` and its
-    # ragged via ``ragged_out`` (unchanged contract). K>1: the carriers + ragged
-    # were appended to ``chunk_results`` (accumulate) or already handed to
-    # ``write_chunk`` (stream, issue #91); either way nothing is stashed, so return
-    # an empty carrier here.
-    if chunk_results is not None or streaming:
-        df_out = pd.DataFrame()
-    else:
-        df_out = single_carrier if single_carrier is not None else pd.DataFrame()
-        if ragged_out is not None:
-            for name, payload in single_ragged.items():
-                ragged_out[name] = payload
-
-    return df_out, metadata
+            emit_window(w, _aggregate_window)
+            bins.release(w["label"])
+            for key in totals:
+                totals[key] += int(meta_w.get(key) or 0)
+            for phase, secs in (meta_w.get("phase_timings") or {}).items():
+                if phase != "read":
+                    sums[phase] = sums.get(phase, 0.0) + secs
+    finally:
+        bins.close()
+    metadata.update(totals)
+    metadata["phase_timings"] = {**phase_timings, **sums}
+    metadata["duration_s"] = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Completed shard {label}: {len(windows)} windows in {metadata['duration_s']:.1f}s")
+    return pd.DataFrame(), metadata
 
 
 def process_morton_cell(

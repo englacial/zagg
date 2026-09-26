@@ -3990,7 +3990,8 @@ class TestDispatchRunStats:
         from zagg import runner
         from zagg.telemetry import build_record, flatten_record
 
-        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 2048)
+        # Two inline rows fit; six do not (a flattened row is ~1 KB).
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 3072)
         client = self._Client()
         rows = self._rows(n_ok=5, n_fail=1)
         # A fallback-success row (success=True) the caller marked inline-required.
