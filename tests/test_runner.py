@@ -4561,7 +4561,10 @@ class TestLambdaSkipAndDirtOnly:
     assembly as the local backend (PR #581 question (11)).
     """
 
-    def _drive(self, monkeypatch, atl06_config, *, body, overwrite=False):
+    def _drive(self, monkeypatch, atl06_config, *, body, overwrite=False, init=None, staged=None):
+        """``init`` is the stubbed icechunk init record (``None``: no repo);
+        ``staged`` the stubbed staged sweep's summary. ``seen["order"]`` logs
+        the stage sweep and the icechunk finalize in call order (issue #582)."""
         from unittest.mock import MagicMock
 
         import boto3
@@ -4570,7 +4573,15 @@ class TestLambdaSkipAndDirtOnly:
         from zagg import runner
         from zagg.concurrency import ConcurrencyReport
 
-        seen: dict = {"cells": [], "stage": [], "sweep": 0}
+        seen: dict = {"cells": [], "stage": [], "sweep": 0, "order": [], "finalize": []}
+        monkeypatch.setattr(runner, "_invoke_lambda_icechunk_init", lambda *a, **k: init)
+
+        def finalize(*a, **k):
+            seen["order"].append("finalize")
+            seen["finalize"].append((a, k))
+            return {"tag": "run-x"}
+
+        monkeypatch.setattr(runner, "_invoke_lambda_icechunk_finalize", finalize)
         monkeypatch.setattr(
             runner,
             "get_nsidc_s3_credentials",
@@ -4619,9 +4630,13 @@ class TestLambdaSkipAndDirtOnly:
         monkeypatch.setattr(
             runner, "_invoke_lambda_sweep", lambda *a, **k: seen.update(sweep=seen["sweep"] + 1)
         )
-        monkeypatch.setattr(
-            runner, "_invoke_lambda_stage_sweep", lambda *a, **k: seen["stage"].append((a, k))
-        )
+
+        def stage(*a, **k):
+            seen["order"].append("stage")
+            seen["stage"].append((a, k))
+            return staged
+
+        monkeypatch.setattr(runner, "_invoke_lambda_stage_sweep", stage)
         summary = runner._run_lambda(
             atl06_config,
             _run_catalog(),
@@ -4636,6 +4651,9 @@ class TestLambdaSkipAndDirtOnly:
             function_name="fn",
         )
         return summary, seen
+
+    #: A touched current unit: it rides dirt-only, so the staged sweep is chained.
+    _DIRTY = {"current": True, "total_obs": 0, "icechunk_dirty": True}
 
     def test_the_gate_is_armed_like_the_local_backend(self, monkeypatch, atl06_config):
         from zagg.semantics import semantic_hash
@@ -4665,6 +4683,37 @@ class TestLambdaSkipAndDirtOnly:
         ((args, kwargs),) = seen["stage"]
         assert args[3] == []  # no dirty leaf
         assert kwargs["dirt_only"] == [(k, None) for k in (10, 11, 12, 13)]
+
+    @pytest.mark.parametrize(
+        "staged, reason",
+        [
+            (None, "staged sweep dispatch failed"),
+            ({"barrier_timed_out": True, "finisher": {"fired": True, "landed": True}}, "barrier"),
+            ({"barrier_timed_out": False, "finisher": {"fired": True, "landed": False}}, "land"),
+        ],
+    )
+    def test_an_incomplete_staged_sweep_leaves_the_run_untagged(
+        self, monkeypatch, atl06_config, staged, reason
+    ):
+        # Stage nodes are Event invokes: a sweep that did not complete may
+        # still have node commits in flight, so no tag (issue #582).
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, body=self._DIRTY, init={"snapshot": "s0"}, staged=staged
+        )
+        assert seen["order"] == ["stage"] and seen["finalize"] == []
+        assert reason in summary["icechunk_finalize"]["skipped"]
+
+    def test_a_staged_sweep_that_fired_nothing_still_tags(self, monkeypatch, atl06_config):
+        staged = {
+            "skipped": "no dispatch nodes",
+            "barrier_timed_out": False,
+            "finisher": {"fired": False, "landed": False},
+        }
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, body=self._DIRTY, init={"snapshot": "s0"}, staged=staged
+        )
+        assert seen["order"] == ["stage", "finalize"]
+        assert summary["icechunk_finalize"] == {"tag": "run-x"}
 
 
 class TestFinalizeGuard:
