@@ -1,0 +1,63 @@
+{
+  "attributes": {
+    "role": "column",
+    "zagg_column": {
+      "spec": "zagg-column/1",
+      "node": "11213",
+      "order": 4,
+      "source_cell_order": 6,
+      "window": "all",
+      "fields": {
+        "count": {
+          "class": "exact",
+          "method": "sum",
+          "nan_policy": "skip"
+        },
+        "h_tdigest": {
+          "class": "approximate",
+          "method": "tdigest_kway",
+          "delta": 16,
+          "overview_delta": 16,
+          "dtype": "float32",
+          "inner_shape": [
+            2
+          ]
+        }
+      },
+      "groups": {
+        "5": {
+          "regime": "leaf-column",
+          "merges_from_raw": 1,
+          "n_cells": 4
+        },
+        "4": {
+          "regime": "leaf-column",
+          "merges_from_raw": 1,
+          "n_cells": 1
+        }
+      },
+      "cells_with_data_order": 5,
+      "generated_at": "2026-09-26T03:48:51+00:00"
+    },
+    "morton_hive_commit": {
+      "spec": "morton-hive/1",
+      "complete": true,
+      "cells_with_data": 3,
+      "granule_count": 1,
+      "written_at": "2026-09-26T03:48:51+00:00",
+      "content_hashes": {
+        "arrays": {
+          "4/count": "71f269d578d413efdf624d699f2d8430be995bd75dba859bd9a782e7c89c3118",
+          "4/h_tdigest": "426e08cf5ffff12ae644bfede36cf45904ad79a128d9686053b0dc08f6dede9e",
+          "4/morton": "92cedd52796c6c0844af1ce3e7e7636ed28804f6bf8f9d10ceab93edf1a29805",
+          "5/count": "6380596d3ca826d3ccda1b07f368ca3b43b486b7aaa0ca17e055ac8bf0b2c064",
+          "5/h_tdigest": "2850bd5d0e8ea6c4273a771ce6e0377a30bfe4a6dee083c08758fdf0afbe4bf4",
+          "5/morton": "2d7a07b3e2db265b2050fedfd968fb6763f5b012c87033526852bffc90b059d2"
+        },
+        "combined": "061277118c8cc4c0b8ae3c62fe6515fefa8f9ccb717bd3104f4c8797edbcc918"
+      }
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

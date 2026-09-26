@@ -29,6 +29,11 @@ timestamps and compressed bytes may differ across zstd versions — the
 conformance tests assert decoded values, never object bytes.
 
 - ``minimal/`` — one UNLOCATED digest field (`h_tdigest`) + `count`.
+- ``versioned/`` — ``minimal/``'s inputs written as a VERSIONED leaf (spec
+  §1.5, issue #582): the stable root is a pointer stamp naming ``current``,
+  the arrays sit in the ``run-{run_id}-{attempt}`` subgroup with their own
+  stamp. ``expected["leaf"]`` is the version path (every leaf-shaped
+  assertion applies to it); ``pointer`` / ``version`` pin the resolution.
 - ``kitchen_sink/`` — located signal/noise strata + `composition` + `count`
   (the `atl03_tdigest_strata_healpix.yaml` field shapes), including a
   single-photon cell that packs the §3.1 golden word `0xFF000000FF0000FF`
@@ -510,7 +515,19 @@ def _o11_hashes(leaf_path: str) -> dict:
     return {"arrays": dict(sorted(hashes.items())), "combined": combined}
 
 
-def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False) -> None:
+#: The fixed run identity the ``versioned/`` fixture is written under: its
+#: version subgroup is ``run-{FIXTURE_RUN_ID}-{attempt}`` (spec §1.5), the
+#: attempt nonce drawn by the writer and recorded in the expected file.
+FIXTURE_RUN_ID = "specfixture"
+
+
+def build(
+    out: Path,
+    kitchen_sink: bool,
+    pyramid: dict | None = None,
+    flux: bool = False,
+    run_id: str | None = None,
+) -> None:
     import zagg.processing as processing
     from zagg import hive
     from zagg.grids import HealpixGrid
@@ -543,12 +560,22 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None, flux: bool
             root,
             cfg,
             store_kwargs={},
+            # ``run_id`` makes the leaf VERSIONED (spec §1.5, issue #582): the
+            # arrays land in a version subgroup behind the root's pointer
+            # stamp; ``None`` writes the legacy in-place leaf.
+            run_id=run_id,
         )
     finally:
         processing.process_shard = original
     assert meta.get("error") is None, meta
 
-    leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
+    pointer_rel = hive.shard_leaf_path("", shard).lstrip("/")
+    leaf_rel = pointer_rel
+    if run_id is not None:
+        # ``leaf`` is where the ARRAYS are — the version subgroup — so every
+        # leaf-shaped assertion runs unchanged against it; ``pointer`` is the
+        # stable root a reader resolves through, ``version`` its ``current``.
+        leaf_rel = f"{pointer_rel}/{meta['leaf_version']}"
     expected = {
         "shard": SHARD_KEY,
         "leaf": leaf_rel,
@@ -563,6 +590,10 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None, flux: bool
         "cells": expected_cells,
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
     }
+    if run_id is not None:
+        expected["pointer"] = pointer_rel
+        expected["version"] = meta["leaf_version"]
+        expected["run_id"] = run_id
     if flux:
         # The §2.0 declaration + provenance the conformance tests assert
         # against the committed array attrs (issue #424).
@@ -1624,6 +1655,9 @@ def main() -> None:
         "multiscales": lambda: build_multiscales(args.out / "multiscales"),
         "demoted": lambda: build_demoted(args.out / "demoted"),
         "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
+        "versioned": lambda: build(
+            args.out / "versioned", kitchen_sink=False, run_id=FIXTURE_RUN_ID
+        ),
         "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
         "temporal": lambda: build_temporal(args.out / "temporal"),
     }
