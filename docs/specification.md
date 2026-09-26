@@ -3552,7 +3552,10 @@ base grid; `url_prefix` is the virtual chunk container's prefix (§11.3);
 `levels` carries, per level group (keyed by cell order), its node order,
 its artifact kind, its chunk-axis order (the inner-chunk order for the base,
 the node order for a one-chunk-per-node level), its cell order and its
-manifest split (§11.5); `commit`, `commit_order` and `split_order` are
+manifest split (§11.5); `retired`, present only once a `declare-pyramid`
+operation has delisted a level (§11.4 **Operations**), maps each delisted
+level's cell order to its last `levels` entry, so its surviving group keeps
+its manifest split; `commit`, `commit_order` and `split_order` are
 the ladder's knobs (§11.4, §11.5), read back by every stage node so the
 sweep needs no config. The repo root group's attrs are exactly these two
 keys: `zagg_icechunk` and the `multiscales` mirror (the mirror is absent
@@ -3890,7 +3893,10 @@ that would write nothing commits nothing. The two operations of `/1`:
   references it keeps reading (a later re-declaration relists the group
   after checking its array model); a listed level whose geometry the
   manifest would change is refused: an array-model change is a `/2`
-  revision, never an operation. The commit metadata records the manifest's
+  revision, never an operation. A delisted level's entry moves to the
+  block's `retired` map (§11.1), whose splits every later split save —
+  this operation's and the §11.5 ratchet's — persists with the listed
+  levels', and a re-declaration moves it back to `levels`. The commit metadata records the manifest's
   `semantic_hash` and the levels `added` / `dropped`. The manifest retrofit
   (`zagg.sweep_overview.declare_pyramid`, `python -m zagg.sweep <root>
   --declare-pyramid <config>`) performs this operation itself after its
