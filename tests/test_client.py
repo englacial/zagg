@@ -390,7 +390,8 @@ class TestDispatch:
     def test_hive_setup_handshake_precedes_cells(self, catalog):
         stub = StubLambdaClient()
         run = _run(catalog, client=stub)
-        run.dispatch().wait(timeout=10)
+        handle = run.dispatch()
+        handle.wait(timeout=10)
         modes = stub.modes()
         first_cell = modes.index(None)
         assert modes[:first_cell] == [
@@ -418,6 +419,9 @@ class TestDispatch:
         (fin_event,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
         assert fin_event["icechunk_init"] == run._icechunk_init
         assert fin_event["run_id"] == stats_event["run_id"]
+        # The finalize outcome is surfaced on the handle, not write-only: the
+        # stub's bare envelope is a fail-open error the caller can read.
+        assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
         # Post-run tail (all worker invokes, D8): finalize backstop + fail-open
         # coverage/stats rollups.
         assert "finalize" in modes

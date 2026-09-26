@@ -169,6 +169,12 @@ class RunHandle:
         self._finisher: threading.Thread | None = None
         self._finalize_error: BaseException | None = None
         self._tail_error: BaseException | None = None
+        #: The run's Icechunk finalize record (issue #582) once the tail has
+        #: run — ``{path, tag, snapshot, ...}``, or ``{"error": ...}`` from the
+        #: fail-open invoke; ``None`` while the tail is in flight, when the
+        #: run stood up no repo, and on a reattached handle (the tail does
+        #: not re-run there). Read it after :meth:`wait` or a drained harvest.
+        self.icechunk_finalize: dict | None = None
 
     def __len__(self) -> int:
         return len(self.futures)
@@ -409,7 +415,6 @@ class Run:
         # tail's run-record write; None until dispatch() fires the invoke,
         # and None for good when the knob is off.
         self._icechunk_init: dict | None = None
-        self._icechunk_finalize: dict | None = None
         runner._check_signature(self.grid, catalog_data)
 
     def __repr__(self) -> str:
@@ -1282,9 +1287,9 @@ class Run:
         # Icechunk run finalize (issue #582): the facade chains no staged
         # sweep, so every commit of the run is a per-leaf one and has landed
         # by now; tag the tip. Synchronous, fail-open, the same seam
-        # ``runner._run_lambda`` takes.
+        # ``runner._run_lambda`` takes; the record lands on the handle.
         if self._icechunk_init is not None:
-            self._icechunk_finalize = runner._invoke_lambda_icechunk_finalize(
+            handle.icechunk_finalize = runner._invoke_lambda_icechunk_finalize(
                 client,
                 self.function_name,
                 self.store,
