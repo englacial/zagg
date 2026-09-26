@@ -3872,7 +3872,9 @@ reads as a log — and it touches no leaf. Before the commit the session is
 codecs, fill value — everything but attrs) MUST be identical before and
 after, the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
 `url_prefix` MUST hold, and every level the block lists MUST have its
-group; a session that fails is discarded and nothing lands. An operation
+group; a session that fails is discarded and nothing lands. moczarr's
+validator (issue #582 phase 6) runs in addition when it lands; the check
+above is zagg's own. An operation
 that would write nothing commits nothing. The two operations of `/1`:
 
 - **`set-attrs <path> <json>`** merges the JSON object into the attrs of the
@@ -3903,14 +3905,6 @@ that would write nothing commits nothing. The two operations of `/1`:
   manifest write when the store has a repo (fail-open, D9; its summary's
   `icechunk` key carries the report or the error), so one operator step
   declares both planes; the standalone form re-runs it.
-
-`rename-template` (issue #582's third operation) has no object: the #299
-rename landed as named product roots (#316), a product's root is its
-repo's container prefix (§11.1), and an Icechunk virtual reference carries
-its location verbatim, so a product move is a re-index, not a metadata
-commit. #584's `declare-schedule` / `set-t0` are operations of the `/2`
-array model (the `t0` coordinate) and of the (f″) dispatcher rule, and
-land with them.
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
 come out of the object's own index, but the sizes and checksums do not. For
