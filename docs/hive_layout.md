@@ -209,9 +209,14 @@ output:
   the fleet-safety numbers and a per-invoke sum de-duplicates on
   `(run_id, shard_key)` where `unit_windows` is set. A window whose inputs
   are current under the skip-if-current gate is skipped inside the shard
-  invoke (no record, as for a skipped unit); a window that fails marks the
-  invoke failed (`error: "window {label}: ..."`), and the retry re-runs the
-  shard with the landed windows skipped by the gate.
+  invoke (no record, as for a skipped unit); a window that kept no data
+  reports the fan-out's benign no-data error and fails nothing. A window
+  that fails costs only its own leaf — the others still land and keep their
+  records and sidecars — but marks the invoke failed
+  (`error: "window {label}: ..."`). Nothing re-fires it automatically (a
+  body-level error is not retried and a `failed` status object is
+  terminal): a re-run of the shard rewrites the failed window while the
+  gate skips the windows that landed.
 - **Stamps carry the truth, the manifest the schema** (D15): each windowed
   leaf's commit stamp records its `window` label and the ACTUAL written
   `time_range` as ISO-8601 UTC strings (both ends at whole-second

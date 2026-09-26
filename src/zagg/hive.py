@@ -2279,9 +2279,9 @@ def process_and_write_hive(
     The return is the SHARD's metadata: the read-phase fields once,
     ``total_obs`` / ``cells_with_data`` summed, ``time_range`` the windows'
     union, ``error`` the first failed window's (a window that kept no data
-    reports the fan-out's benign error and fails nothing; prefixed with its label, so
-    the dispatcher's retry re-runs the shard and the gate skips the windows
-    that landed), ``current`` / ``refused`` only when EVERY window was, and
+    reports the fan-out's benign error and fails nothing; prefixed with its
+    label; nothing re-fires a failed invoke, so a RE-RUN of the shard redoes
+    the failed window while the gate skips the windows that landed), ``current`` / ``refused`` only when EVERY window was, and
     ``windows`` — one metadata dict per window in dispatch order, each the
     shape a ``window`` unit returns plus ``window`` / ``unit_windows`` /
     the shard's ``duration_s``, which is what the caller builds one D20
