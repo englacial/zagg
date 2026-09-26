@@ -139,11 +139,11 @@ def _apply_retention(repo, retain_runs: int, counts: dict) -> None:
 def _is_newest_run(repo, run_id: str) -> bool:
     """Whether the newest ``init``/``finalize`` commit on ``main`` names ``run_id``.
 
-    Walks the ancestry from the tip; any later run's init (a block change)
-    or finalize makes this run no longer the newest. A run whose own init
-    committed nothing (an unchanged block) reads as not the newest either —
-    the conservative answer, since the walk then cannot tell it from a
-    later run's.
+    Walks the ancestry from the tip; the first init or finalize met is the
+    newest run's, since every run opens with an ``init {run_id}`` commit
+    (``init_repo``, empty when the block is unchanged) and closes with its
+    finalize. A later run's init or finalize makes this run no longer the
+    newest.
     """
     for info in repo.ancestry(branch=BRANCH):
         head, _, rest = info.message.partition(" ")

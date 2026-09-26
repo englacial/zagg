@@ -454,16 +454,26 @@ class TestInit:
         assert axis._0 == 0 and size == out["levels"]["6"]["split"]["chunks"]
         assert isinstance(sizes[-1][0], icechunk.ManifestSplitCondition.AnyArray)
 
-    def test_rerun_reopens_without_a_commit(self, cfg, tmp_path):
+    def test_rerun_reopens_with_an_empty_init_commit(self, cfg, tmp_path):
+        # An unchanged block rewrites nothing, but every run still opens with
+        # its ``init {run_id}`` commit (empty; issue #582): the ancestry
+        # brackets each run, and finalize's newest-run check is exact.
         grid = _grid(cfg)
         root = str(tmp_path / "store")
         first = icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
         second = icechunk_refs.init_repo(root, grid, cfg, run_id="run-2", store_kwargs={})
         assert second["created"] is False
-        assert second["snapshot"] == first["snapshot"]
+        assert second["snapshot"] != first["snapshot"]
         assert second["levels"] == first["levels"]
-        _group, repo = _open(root)
-        assert [s.message for s in repo.ancestry(branch="main")][0] == f"init {RUN_ID}"
+        group, repo = _open(root)
+        history = list(repo.ancestry(branch="main"))
+        assert [s.message for s in history][:2] == ["init run-2", f"init {RUN_ID}"]
+        assert history[0].metadata == {"run_id": "run-2"}
+        assert history[1].metadata == {"run_id": RUN_ID}
+        # The empty init changed no node: the block reads exactly as before.
+        assert group.attrs[icechunk_refs.ICECHUNK_ATTR] == icechunk_refs.read_block(
+            root, store_kwargs={}
+        )
 
     def test_rerun_with_another_geometry_raises(self, cfg, tmp_path):
         # A store whose leaves were cleared but whose root survived reopens the
@@ -509,7 +519,8 @@ class TestInit:
         first = self._init(cfg, root, split_order=3)
         again = self._init(cfg, root, split_order=3)
         assert again["created"] is False and again["split_ratchet"] is None
-        assert again["snapshot"] == first["snapshot"]  # nothing committed
+        assert again["snapshot"] != first["snapshot"]  # the run's empty init commit only
+        assert icechunk_refs.read_block(root, store_kwargs={})["split_order"] == 3
         assert again["options"]["split_order"] == 3
 
     def test_split_ratchet_finer_config_adopts_the_store(self, cfg, tmp_path, caplog):
@@ -522,7 +533,7 @@ class TestInit:
             again = self._init(cfg, root, split_order=3, commit_order=2)  # finer than the store
         assert "finer than the store's recorded 2" in caplog.text
         assert again["options"]["split_order"] == 2 and again["split_ratchet"] is None
-        assert again["levels"] == first["levels"] and again["snapshot"] == first["snapshot"]
+        assert again["levels"] == first["levels"] and again["snapshot"] != first["snapshot"]
         # Reopened repo: the persisted split is untouched (still the store's).
         repo = icechunk_refs.open_repo(root, store_kwargs={})
         (cond, dims), *_ = repo.config.manifest.splitting.split_sizes
@@ -1032,7 +1043,7 @@ class TestHandlerMode:
         assert body["path"] == f"{root}/icechunk"
         assert icechunk_refs.read_block(root, store_kwargs={})["shard_order"] == 4
         again = json.loads(handler_mod.lambda_handler(self._event(root, cfg), None)["body"])
-        assert again["created"] is False and again["snapshot"] == body["snapshot"]
+        assert again["created"] is False and again["snapshot"] != body["snapshot"]  # empty init
 
     def test_error_returns_500_never_raises(self, handler_mod, cfg, tmp_path):
         event = self._event(str(tmp_path / "store"), cfg)

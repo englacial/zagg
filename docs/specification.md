@@ -3766,7 +3766,11 @@ order, created here once because Icechunk's create is not safe under
 concurrent callers), its array nodes (§11.2) defined and the `multiscales`
 mirror in its root attrs. Idempotent: a repo that already carries a matching
 block is reopened, never re-templated; a block for another geometry or
-container is refused. The ladder settings are not compared: `split_order`
+container is refused. **Every run commits its `init {run_id}`** — empty
+when the block is unchanged, with `run_id` in the commit metadata — so the
+ancestry brackets each run between its init and its finalize (the repo is
+its own run log, and finalize's newest-run check below reads it). The
+ladder settings are not compared: `split_order`
 follows the §11.5 ratchet (a finer config adopts the store's value, a
 coarser one re-cuts), and `commit` / `commit_order` are per-run.
 

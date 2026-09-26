@@ -616,7 +616,9 @@ def read_block(store_root: str, *, store_kwargs: dict) -> dict | None:
 _COMPAT_KEYS = ("shard_order", "chunk_order", "cell_order", "url_prefix")
 
 
-def _update_block(repo, updates: dict, message: str, *, local: bool, path: str) -> str:
+def _update_block(
+    repo, updates: dict, message: str, *, local: bool, path: str, run_id: str | None = None
+) -> str:
     """Rewrite root-attrs keys of the repo in one commit; the snapshot id."""
     import zarr
 
@@ -625,7 +627,8 @@ def _update_block(repo, updates: dict, message: str, *, local: bool, path: str) 
     block = dict(cast("Mapping[str, Any]", root.attrs[ICECHUNK_ATTR]))
     block.update(updates)
     root.attrs[ICECHUNK_ATTR] = block
-    snapshot, _rebases = _commit(session, message, local=local, path=path)
+    metadata = {"run_id": run_id} if run_id else None
+    snapshot, _rebases = _commit(session, message, local=local, path=path, metadata=metadata)
     return snapshot
 
 
@@ -681,7 +684,9 @@ def init_repo(
         session = repo.writable_session(BRANCH)
         with vlen_dtype_warning_suppressed():
             spec.to_zarr(session.store, "", overwrite=False)
-        snapshot, _rebases = _commit(session, f"init {run_id}", local=local, path=path)
+        snapshot, _rebases = _commit(
+            session, f"init {run_id}", local=local, path=path, metadata={"run_id": run_id}
+        )
         return {
             "path": path,
             "snapshot": snapshot,
@@ -726,14 +731,27 @@ def init_repo(
     for key in ("commit", "commit_order"):
         if existing.get(key) != options[key]:
             updates[key] = options[key]
-    snapshot = ro.snapshot_id
     if updates:
         label = (
             f"split ratchet {ratchet['from']}->{ratchet['to']} {run_id}"
             if ratchet
             else f"init {run_id}"
         )
-        snapshot = _update_block(repo, updates, label, local=local, path=path)
+        snapshot = _update_block(repo, updates, label, local=local, path=path, run_id=run_id)
+    else:
+        # Every run opens with an ``init {run_id}`` commit (§11.4) — empty
+        # when the block is unchanged — so the ancestry brackets each run
+        # between its init and its finalize: the repo is its own run log,
+        # and finalize's newest-run check (a reattached client's guard) is
+        # exact rather than blind to a run that changed nothing at init.
+        snapshot, _rebases = _commit(
+            repo.writable_session(BRANCH),
+            f"init {run_id}",
+            local=local,
+            path=path,
+            metadata={"run_id": run_id},
+            allow_empty=True,
+        )
     return {
         "path": path,
         "snapshot": snapshot,
