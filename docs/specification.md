@@ -366,6 +366,22 @@ stamp `spec` value marks versioning either: a leaf is versioned exactly when
 its root stamp names `current` — the one marker, orthogonal to the naming
 dialect the `spec` token carries.
 
+The root's states, for readers and for a writer's skip gate: **no root
+`zarr.json`** — debris (D4), as today; the (4) PUT is what creates the root
+group of a fresh leaf. **A root stamp without `current`** — a legacy leaf,
+arrays at the root. **A root stamp naming `current`** — arrays at the
+version. A pointer naming a **missing or unstamped** version is a corrupted
+leaf that a reader, and a writer's skip gate, treats as debris: the pointer
+is only ever written after the version is stamped, so the state arises only
+from out-of-band deletion. The root's mirrored §5.3 `content_hashes` are
+computed over the version store, so their keys are relative to the version
+root (`{cell_order}/morton`, not `{current}/{cell_order}/morton`) — identical
+in form to a legacy leaf's; a verifier opening the pointer resolves
+`current` first. **A writer about to clear-and-template a leaf root whose
+stamp names `current` MUST refuse**: it is a legacy or stale writer against
+a versioned leaf, and clearing the root would delete every version and
+every earlier tag's referents with it.
+
 ### 1.6 Succession
 
 The `ragged` attrs block is `/1`'s element contract. The candidate successor

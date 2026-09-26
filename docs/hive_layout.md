@@ -674,7 +674,12 @@ that died before its pointer swap is left for the collector. The run tag
 legacy leaf** (every store written before this revision): readers open the
 root and follow `current` when present, else read the root itself
 (`zagg.hive.resolve_leaf`) — no migration, and a store mixes both kinds
-after its first post-revision write.
+after its first post-revision write. A pointer naming a missing or unstamped
+version is a corrupted leaf, read as debris; a writer about to
+clear-and-template a root whose stamp names `current` MUST refuse (it is a
+legacy or stale writer against a versioned leaf). The root's mirrored
+`content_hashes` keys are relative to the version root, identical in form to
+a legacy leaf's.
 
 **Reader caveat — `t_max` floors, so the recorded range can end up to 1 s
 early.** Both ends render through `windows.iso_utc`'s whole-second
