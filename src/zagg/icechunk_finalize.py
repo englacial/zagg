@@ -31,8 +31,9 @@ One finalize does, in order:
 ``rewrite_manifests`` is NOT run here: a split ratchet (§11.5) is a rare,
 deliberate, whole-repo operation with no run to attach to; finalize reports
 it as ``rewrite_pending`` for the operator step. Idempotent: a run whose tag
-exists returns it and does nothing else, so a retried invoke is harmless.
-A reattached client (``Run.attach``) finalizes ``newest_only``: only while
+exists returns it and does nothing else, so a retried invoke is harmless,
+and two concurrent finalizes of one run are safe: the loser of the
+``create_tag`` race reads the winner's tag. A reattached client (``Run.attach``) finalizes ``newest_only``: only while
 its run is still the newest on the repo, else it writes nothing and the
 run stays covered by the next run's tag.
 """
@@ -177,6 +178,8 @@ def finalize_repo(
     ``tagged: False`` and ``snapshot: None``. Tagging it would name the
     current tip, a later run's leaves included, after this run.
     """
+    import icechunk
+
     from zagg import __version__
 
     t0 = time.perf_counter()
@@ -228,7 +231,21 @@ def finalize_repo(
         metadata=metadata,
         allow_empty=True,
     )
-    repo.create_tag(tag, snapshot)
+    try:
+        repo.create_tag(tag, snapshot)
+    except icechunk.IcechunkError:
+        # Two live finalizes of one run (a reattached handle beside its
+        # dispatcher): the loser reads the winner's tag, idempotent.
+        if tag not in repo.list_tags():
+            raise
+        logger.info(f"icechunk finalize: {tag} was created concurrently at {path}")
+        return {
+            **record,
+            "snapshot": repo.lookup_tag(tag),
+            "tagged": False,
+            **counts,
+            "commit_s": time.perf_counter() - t0,
+        }
     if split_ratchet:
         logger.warning(
             f"icechunk finalize: split ratchet {split_ratchet['from']}->{split_ratchet['to']} "

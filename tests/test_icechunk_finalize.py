@@ -95,6 +95,33 @@ class TestFinalize:
         assert again["tags_deleted"] == 0 and again["gc"] is None
         assert _messages(_open(root)).count("finalize r1") == 1
 
+    def test_a_concurrent_tag_reads_the_winners(self, repo, monkeypatch):
+        # Two live finalizes of one run: the other lands its tag between this
+        # one's list_tags check and create_tag, whose retry then raises the
+        # real AlreadyExistsError — the loser returns the winner's tag.
+        import icechunk
+
+        root, _grid = repo
+        real = icechunk.Repository.create_tag
+
+        def racing(self, tag, snapshot_id):
+            real(self, tag, snapshot_id)  # the winner
+            real(self, tag, snapshot_id)  # this finalize: already exists
+
+        monkeypatch.setattr(icechunk.Repository, "create_tag", racing)
+        out = _finalize(root, "r1")
+        assert out["tagged"] is False and out["snapshot"] == _open(root).lookup_tag("run-r1")
+
+    def test_a_tag_failure_without_the_tag_raises(self, repo, monkeypatch):
+        import icechunk
+
+        def broken(self, tag, snapshot_id):
+            raise icechunk.IcechunkError("storage down")
+
+        monkeypatch.setattr(icechunk.Repository, "create_tag", broken)
+        with pytest.raises(icechunk.IcechunkError, match="storage down"):
+            _finalize(repo[0], "r1")
+
     def test_missing_repo_raises(self, tmp_path):
         with pytest.raises(ValueError, match="not initialized"):
             _finalize(str(tmp_path / "nope"), "r1")
