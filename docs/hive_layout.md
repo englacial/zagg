@@ -1516,11 +1516,14 @@ mode in the worker config. The default `commit_order` is a function of
 the shard order and the width (`zagg.icechunk_refs.finest_dispatch_order`).
 
 `retain_runs` is the run-tag retention (spec §11.4): `0` keeps every run
-(the default — history only grows, one finalize snapshot per run); K > 0
-has each finalize delete the run tags beyond the K − 1 newest, expire the
-snapshots older than the oldest retained run and garbage-collect the repo
+(the default — history only grows, every commit kept); K > 0 has each
+finalize delete the run tags beyond the K − 1 newest, expire the snapshots
+older than the oldest retained run's finalize and garbage-collect the repo
 objects nothing retained references (the cutoff is always a run tag's
-commit time, never "now"). Leaf objects are never touched by any of it.
+commit time, never "now"). The expiry squashes every commit before that
+cutoff — the oldest retained run's own intermediate commits included — into
+its finalize snapshot; the newer runs keep theirs until a later cutoff
+passes them. Leaf objects are never touched by any of it.
 
 `output.icechunk: false` opts a hive run out (default on; excluded from the
 D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves and raster

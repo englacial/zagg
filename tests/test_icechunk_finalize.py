@@ -110,8 +110,14 @@ class TestFinalize:
 
 
 class TestRetention:
-    def _runs(self, root, n, retain_runs):
-        return [_finalize(root, f"r{i}", retain_runs=retain_runs) for i in range(1, n + 1)]
+    def _runs(self, root, n, retain_runs, *, leaf=False):
+        """``n`` finalized runs; ``leaf`` lands one ``leaf r{i}`` commit before each."""
+        outs = []
+        for i in range(1, n + 1):
+            if leaf:
+                _open(root).writable_session("main").commit(f"leaf r{i}", allow_empty=True)
+            outs.append(_finalize(root, f"r{i}", retain_runs=retain_runs))
+        return outs
 
     def test_zero_keeps_every_run(self, repo):
         root, _grid = repo
@@ -122,7 +128,7 @@ class TestRetention:
 
     def test_k_keeps_the_k_newest_and_collects_the_rest(self, repo):
         root, _grid = repo
-        outs = self._runs(root, 3, 2)
+        outs = self._runs(root, 3, 2, leaf=True)
         r = _open(root)
         assert sorted(r.list_tags()) == ["run-r2", "run-r3"]
         # r1: no earlier tag -> nothing to expire; r2: r1 retained (K - 1 =
@@ -133,9 +139,10 @@ class TestRetention:
         assert outs[0]["gc"] is None and outs[0]["snapshots_expired"] == 0
         assert outs[1]["snapshots_expired"] >= 1 and outs[1]["gc"]["snapshots_deleted"] >= 1
         assert outs[2]["snapshots_expired"] >= 1 and outs[2]["gc"]["bytes_deleted"] > 0
-        # History reads tag to tag: one finalize snapshot per retained run.
-        assert _messages(r)[:2] == ["finalize r3", "finalize r2"]
-        assert "finalize r1" not in _messages(r)
+        # Everything older than the oldest retained finalize (r2's) is
+        # squashed into it — r2's own leaf commit included; the newest run
+        # keeps its intermediate commit until it ages past a later cutoff.
+        assert _messages(r) == ["finalize r3", "leaf r3", "finalize r2", "Repository initialized"]
         assert r.lookup_tag("run-r2") == outs[1]["snapshot"]
 
     def test_a_retention_error_still_commits_and_tags(self, repo, monkeypatch, caplog):
