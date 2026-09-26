@@ -91,9 +91,6 @@ _SEMANTIC_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 # so equality across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
 _SUM_OR_NONE_KEYS = (
-    # Nullable like the read counters: a rollup over records that never
-    # measured the invocation wall stays None, so ``merge([r]) == r`` holds.
-    "duration_total_s",
     "gb_seconds",
     "est_cost_usd",
     "n_obs_read",
@@ -503,6 +500,18 @@ def merge(records: Iterable[dict]) -> dict:
     for key in _SUM_OR_NONE_KEYS:
         vals = [r.get(key) for r in records if r.get(key) is not None]
         out[key] = sum(vals) if vals else None
+    # ``duration_total_s`` (issue #589) is the billed wall: None when no part
+    # measured it (so ``merge([r]) == r``), else each part counts its total or,
+    # for an older leaf, its ``duration_s`` -- build_record's pricing fallback,
+    # so a mixed-vintage rollup never reads below its aggregate clock.
+    totals = [r.get("duration_total_s") for r in records]
+    out["duration_total_s"] = (
+        None
+        if all(t is None for t in totals)
+        else sum(
+            t if t is not None else (r.get("duration_s") or 0) for t, r in zip(totals, records)
+        )
+    )
     for key in _MAX_OR_NONE_KEYS:
         vals = [r.get(key) for r in records if r.get(key) is not None]
         out[key] = max(vals) if vals else None

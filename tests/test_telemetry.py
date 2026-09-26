@@ -482,13 +482,17 @@ class TestMerge:
     def test_duration_total_sums_or_none(self):
         # Populated totals sum; a rollup over records that never measured the
         # invocation wall stays None (the merge identity law), and a mixed
-        # fold sums only the populated parts (the n_obs_read disposition).
+        # fold counts an older part at its duration_s (build_record's
+        # pricing fallback), so the rollup total never reads below duration_s.
         a = _record(1, duration=10.0, duration_total=13.0)
         b = _record(2, duration=5.0, duration_total=6.5)
         assert merge([a, b])["duration_total_s"] == pytest.approx(19.5)
         assert merge([a, b])["duration_s"] == pytest.approx(15.0)
         assert merge([_record(1), _record(2)])["duration_total_s"] is None
-        assert merge([a, _record(2)])["duration_total_s"] == pytest.approx(13.0)
+        mixed = merge([a, _record(2, duration=5.0)])
+        assert mixed["duration_total_s"] == pytest.approx(13.0 + 5.0)
+        assert mixed["duration_total_s"] >= mixed["duration_s"]
+        assert merge([a])["duration_total_s"] == 13.0
 
     def test_cost_fields_shared_lambda_survives(self):
         cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
