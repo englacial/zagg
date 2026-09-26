@@ -3318,15 +3318,36 @@ pinned.
 
 **Status: contract** (`zagg-icechunk/1`, issue
 [#580](https://github.com/englacial/zagg/issues/580), stage 1 — refs-only,
-additive). The leaves remain the normative, self-describing data plane
-(§1–§10); the companion is a derived index over their bytes. Stage 2 (a
-follow-up issue) is where the repo becomes the authoritative *metadata*
-plane; nothing in this section presupposes it.
+additive; issue [#582](https://github.com/englacial/zagg/issues/582), stage
+2 — the two-plane statement, run tags and finalize below). The leaves remain
+the normative, self-describing data plane (§1–§10); the companion is a
+derived index over their bytes.
 
-**Succession.** Stage 2 is a `/2` revision, declared — as `/1` is — in the
-`zagg_icechunk.spec` token (§11.1), so a reader discriminates the two from
-the repo's own attrs. `/1` remains valid and readable indefinitely: existing
-repos never require rewriting, whatever timing `/2` lands on.
+**Two planes.** A hive store is two planes with different mutability:
+
+- the **data plane** is the leaf shard objects — immutable: a leaf key is
+  never overwritten (§1.5); a leaf's content identity is its §5.3 O11 digest
+  in the commit stamp plus the ETag every virtual reference carries (§11.3);
+- the **metadata plane** is the one repository — authoritative for what
+  *evolves*: convention and attrs blocks (the `dggs` `latitude` token, spec
+  markers, `/1`→`/2` flips), the pyramid declaration mirrored as
+  `multiscales`, and the run history (tags, §11.4). A leaf's own
+  `zarr.json` keeps being written (a leaf stays a valid standalone zarr) but
+  is **frozen with the leaf**: shape, dtype, chunking and codecs never
+  diverge from the repo's array model; attrs may, by design, and the repo's
+  are the ones a reader binds to.
+
+"Backfill" is therefore not a category: an evolving fact is written to the
+repo in a commit, never by rewriting leaves. Stage 2's remaining items —
+native overview chunks, the metadata-commit operations, the virtual-target
+sweep — are tracked on the issue.
+
+**Succession.** A change to the repo's ARRAY MODEL is a `/2` revision,
+declared — as `/1` is — in the `zagg_icechunk.spec` token (§11.1), so a
+reader discriminates the two from the repo's own attrs; run tags and the
+finalize commit are additive on `/1`. `/1` remains valid and readable
+indefinitely: existing repos never require rewriting, whatever timing `/2`
+lands on.
 
 A morton hive is many leaf zarrs. The companion presents every leaf of one
 order as **one zarr hierarchy** by recording each leaf's inner chunks as
@@ -3612,6 +3633,51 @@ container is refused. The ladder settings are not compared: `split_order`
 follows the §11.5 ratchet (a finer config adopts the store's value, a
 coarser one re-cuts), and `commit` / `commit_order` are per-run.
 
+**Finalize.** `finalize {run_id}` — the once-per-run close
+(`mode="icechunk_finalize"` on Lambda, in-process on the local backend),
+invoked by the dispatcher AFTER every commit of the run has landed: after
+the staged sweep returned under the ladder (its finisher makes the last
+commit), after the fan-out drained under `commit: "leaf"`. Never by a stage
+node — tags, expiry and collection are singleton repo operations, and never
+inside the staged sweep's finisher, which is lease-scoped, load-bearing
+store-root machinery while the repo is fail-open (and which a per-leaf run
+does not have). One finalize, in order:
+
+1. **retention** — `output.icechunk.retain_runs` = K. `0` (the default)
+   keeps every run and does nothing here. K > 0: the run tags beyond the
+   K − 1 newest are deleted (only `run-` tags, only here), snapshots older
+   than the oldest retained run's finalize commit **expire**
+   (`expire_snapshots`), and repo objects no retained snapshot references
+   and older than it are **collected** (`garbage_collect`) — the cutoff is
+   always a run tag's commit time, never "now", so a concurrent writer's
+   in-flight objects are never collected. Expiry squashes a retained run's
+   own intermediate commits (its `init`, its stage-node commits) into the
+   finalize snapshot that follows them, so history reads **tag to tag, one
+   snapshot per run**. Neither step touches a virtual target: Icechunk
+   manages none of the leaf objects (the virtual-target sweep is a stage-2
+   item on the issue);
+2. one content-free **`finalize {run_id}` commit** whose commit metadata
+   identifies the run — `run_id`, `semantic_hash` (the D19 digest the leaves
+   were stamped with), `zagg_version`, the block's `commit` /
+   `commit_order` / `split_order` — and records the retention counts
+   (`retain_runs`, `tags_deleted`, `snapshots_expired`, `gc`), so the repo
+   is its own durable run record (`ancestry(tag=…)` answers "which config
+   built this");
+3. the **tag `run-{run_id}`** on that commit. Tags are immutable and keyed
+   by the run, not the semantic hash: every append under one template
+   shares a hash, so a hash-named tag would collide on the second run.
+
+Idempotent: a finalize whose tag already exists returns it and writes
+nothing. Fail-open (D9) at the dispatcher like the init; the record rides
+the run summary as `icechunk_finalize` (`{path, tag, snapshot, tagged,
+retain_runs, tags_deleted, snapshots_expired, gc, rewrite_pending,
+commit_s}` or `{error}`), not the run parquet, whose write precedes the
+staged sweep on both backends; the tag itself is the durable outcome.
+`rewrite_manifests` is NOT run by finalize: a §11.5 split ratchet is a
+rare, deliberate, whole-repo operation with no run to attach to (at the
+globe it may exceed one invoke), so finalize reports it as
+`rewrite_pending: {from, to}` for the operator step.
+
 A **replaced** leaf (§1.5 leaf immutability) is re-indexed by the next staged
 sweep that gathers it: the new sidecar's refs supersede the old ones on
 `main`. Snapshots older than that commit still reference the replaced keys —
@@ -3703,9 +3769,9 @@ ratchet: the init records the new `split_order` and per-level splits in the
 block and in the repo's saved splitting config **before any commit of the
 run**, so every manifest the run writes is already at the new cut, and
 flags the run record with `icechunk_split_ratchet: "{from}->{to}"`, which
-a later finalize reads to run Icechunk's `rewrite_manifests` once over the
-old manifests (not run by the writer; mixed cuts are valid — each manifest
-carries its own extents). A repo is never re-split finer. `split_order` is
+the run's finalize (§11.4) reports as `rewrite_pending` for an **operator**
+`rewrite_manifests` pass over the old manifests (not run by the writer or
+by finalize; mixed cuts are valid — each manifest carries its own extents). A repo is never re-split finer. `split_order` is
 a layout knob outside the D19 semantic core: it changes no leaf byte.
 `commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`.
 
@@ -3738,10 +3804,27 @@ Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
 across windows and so cannot share one chunk axis; stage 1 records no refs
 for them (the sidecar says `skipped: windowed`) and the ladder does not run
 on a windowed store. Raster hive products (`(time, cells)` arrays, never
-sharded) are likewise out of stage 1's writer scope. The sweep-built §4
+sharded) are likewise out of stage 1's writer scope. Both are tracked as a
+`/2` array-model revision (a leading window dimension per level; issue
+[#584](https://github.com/englacial/zagg/issues/584)); the finalize and
+tags of §11.4 apply to them unchanged once they have a repo. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview
 level has its group in the store's one repo, and its refs. None of these change the leaf format, the
 t-digest storage or the moczarr reader.
+
+**Scale (informative).** Snapshot size is proportional to the manifest
+count (≈100 B per entry) and manifest bytes to leaves per manifest
+(≈2.5 KB per leaf-array), which is what §11.5's split rule balances; a
+per-level squash is not available in one repo (a snapshot lists every
+manifest, `rewrite_manifests` is whole-repo, there is no branch merge), so
+finalize is one whole-repo pass per run. **One repo per o3 region** — o6
+nodes committing into their region's repo, the hive manifest becoming a
+repo catalog, each region keeping the group-per-level layout — is the
+documented escape hatch should a single repo's snapshot ever be the
+bottleneck; it is never a default at any store size (espg, 2026-09-26): the
+split ratchet governs that dimension first, and the hatch trades "one zarr"
+for "one zarr per region". Whether it is ever needed is read off the first
+global run's per-node `icechunk_rebases` / `icechunk_commit_s` stage rows.
 
 A skip-if-current unit's lifecycle touch (#388) refreshes its objects in
 place and so moves their checksums (§11.3); the unit re-plans its refs from
