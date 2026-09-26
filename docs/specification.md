@@ -334,7 +334,10 @@ version's stamp and naming it as `current`. What readers see: a **path**
 reader (the D3 address, the stamp, the pointer) sees the previous state until
 (4) lands; an **Icechunk** reader of `main` sees the new version at its
 commit — under `commit: "leaf"` that is step (3), before the swap; under the
-ladder it is the staged sweep's node commit, which may follow (4). A retry **always** writes a
+ladder it is the staged sweep's node commit, which may follow (4). Two
+racing attempts of one unit under `commit: "leaf"` may leave `main` and the
+pointer naming different complete versions; both are retained (one
+referenced, one `current`), and the collector reclaims neither. A retry **always** writes a
 new version — same run or not, it draws a fresh `attempt` — so no writer
 ever opens, clears or resumes a prefix another writer may hold. An attempt
 that died before its pointer swap leaves a version that is not `current`:
