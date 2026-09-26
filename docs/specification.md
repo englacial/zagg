@@ -316,8 +316,13 @@ replacement writes a **new** version subgroup and moves the pointer; the
 superseded version's objects stay at their keys until the §11 garbage
 collector finds no retained snapshot naming them. Consequently a reference
 taken under any stamp stays valid for as long as its version exists — a run
-tag reads the store exactly as that run left it — and a same-key rewrite of
-committed bytes never happens.
+tag reads every **base leaf** exactly as that run left it — and a same-key
+rewrite of a base leaf's committed bytes never happens. Only base leaves are
+versioned: the §4.6 leaf column and every overview level, which §11.3 also
+indexes, are still rewritten at their keys, so a run tag reads them only as
+the latest run left them and a superseded ref into one fails checksum-loud
+(the legacy semantics) until they are native Icechunk overviews (issue
+[#584](https://github.com/englacial/zagg/issues/584)).
 
 The **write order** is normative: (1) write the version subgroup's arrays;
 (2) stamp the version (its own root `zarr.json`, whose `spec` is `/1` or `/2`
