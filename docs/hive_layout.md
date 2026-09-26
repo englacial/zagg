@@ -189,7 +189,14 @@ output:
   fan-out — one invoke per (shard, window), the window's granule subset,
   an observation-level `ge`/`lt` filter pair injected into the read — for
   runs that want the smaller per-invoke footprint at the cost of reading
-  each shard once per window. The unit is a dispatch choice: the leaves,
+  each shard once per window. The shard event carries the shard's whole
+  granule list plus each window's index list, so it is about N× a
+  per-window event: at ~100 B per ATL03 s3 href the 250 KiB async (Event)
+  budget holds ~2,400 granules, and a 4,600-granule pole shard × 7 windows
+  is ~478 KB (every per-window event ~68 KB). Such a shard fails at
+  dispatch on an async run (`invocation: sync`, or `unit: window`, is the
+  remedy), and the per-leaf `submap` block is dropped — sub-maps deferred
+  to the sweep CLI — at a correspondingly lower granule count. The unit is a dispatch choice: the leaves,
   the manifest's temporal block and the D19 semantic hash are the same
   either way. The raster path always dispatches per window (membership is
   per acquisition at dispatch) and rejects the key. Legacy shardmaps
