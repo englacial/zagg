@@ -1323,8 +1323,17 @@ class Run:
             # the knob is off — the same value runner._run_lambda threads.
             icechunk_init=self._icechunk_init,
         )
-        stage_chained = False
-        if layout == "hive" and get_sweep(self.config):
+        # The finalize gate is decided from the config BEFORE the try (review,
+        # PR #591): any exception inside the block — a malformed stats record,
+        # a failed rollup invoke — then leaves ``stage_chained`` set with
+        # ``handle.stage_sweep`` None, so the finalize records ``{skipped}``
+        # rather than tagging a tip the staged sweep never reached. Cleared
+        # only on the explicit no-work branch below.
+        sweeps = layout == "hive" and get_sweep(self.config)
+        stage_chained = (
+            sweeps and self.config.output.get("sweep") == "stages" and not self._attached
+        )
+        if sweeps:
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
@@ -1345,15 +1354,13 @@ class Run:
                 # backstop). Touched current units ride as dirt-only (#580).
                 # Not on a reattached handle: attach is observe-only, and the
                 # sweep (with its lease) is the dispatcher's. Hive is
-                # HEALPix-only (validated), so parent_order is set here.
+                # HEALPix-only (validated), so parent_order is set here; were
+                # it not, ``int(None)`` raises into the fail-open gate, as on
+                # the CLI.
                 dirt_only = dirt_only_leaves(ok_bodies)
-                if (
-                    (leaves or dirt_only)
-                    and self.config.output.get("sweep") == "stages"
-                    and not self._attached
-                    and self._parent_order is not None
-                ):
-                    stage_chained = True
+                if stage_chained and not (leaves or dirt_only):
+                    stage_chained = False
+                if stage_chained:
                     logger.info(
                         f"chaining staged sweep over {len(leaves)} leaves "
                         f"({len(dirt_only)} dirt-only) for run {run_id}"

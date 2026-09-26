@@ -1394,6 +1394,21 @@ class TestStagedSweepTail:
         assert seen["order"] == ["finalize"] and handle.stage_sweep is None
         assert "sweep" not in stub.modes()
 
+    def test_a_block_failure_before_the_chain_still_gates(self, catalog, monkeypatch):
+        # A raise anywhere in the sweep block (here a malformed stats record)
+        # must not fire the finalize ungated: the gate is decided from the
+        # config before the try, so the tag is withheld (review, PR #591).
+        import zagg.sweep
+
+        def boom(records):
+            raise ValueError("malformed stats record")
+
+        monkeypatch.setattr(zagg.sweep, "leaves_from_stats_records", boom)
+        _run_, handle, stub, seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
+        assert seen["order"] == [] and "icechunk_finalize" not in stub.modes()
+        assert handle.stage_sweep is None
+        assert handle.icechunk_finalize == {"skipped": "staged sweep dispatch failed"}
+
     def test_a_leaf_pinned_run_still_chains_and_gates(self, catalog, monkeypatch):
         # ``stages`` materializes the overviews whether or not the run walks
         # the ref ladder, and its nodes still commit overview refs under
