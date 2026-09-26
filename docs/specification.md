@@ -305,8 +305,13 @@ reader computes) is a **pointer root**: the root `zarr.json` carries the
 commit stamp as before plus one key, `current`, naming the **version
 subgroup** that holds the arrays — `{id}.zarr/{current}/{cell_order}/…`, a
 complete, self-describing zarr leaf with its own stamp, whose objects are
-**never rewritten once stamped**. The version name is the run that wrote it,
-`run-{run_id}` (the same token that tags the run in the §11 repo). A
+**never rewritten once stamped**. The version name is per **attempt**:
+`run-{run_id}-{attempt}`, where `run_id` is the run's id (`uuid4().hex`)
+and `attempt` is a per-invocation nonce — 8 hex characters of a fresh
+`uuid4`, drawn by the writer for each unit it writes — so two writers of one
+unit (a duplicate-invoke retry, a redundant fleet worker) never share a
+prefix. The run's tag `run-{run_id}` in the §11 repo still groups all of a
+run's versions by prefix. A
 replacement writes a **new** version subgroup and moves the pointer; the
 superseded version's objects stay at their keys until the §11 garbage
 collector finds no retained snapshot naming them. Consequently a reference
@@ -321,10 +326,13 @@ exactly as the legacy rule assigns it — windowed ⇒ `/2`);
 pointer — one PUT of the stable root `zarr.json`, mirroring the version's
 stamp and naming it as `current`; (5) the lifecycle touch refreshes the
 stable root and the current version only, never a superseded one. Until (4)
-lands the leaf reads as it did before the write. A retry of the same unit in
-the **same run** that finds its own version already stamped resumes at (3),
-never rewriting stamped bytes; an unstamped version is debris and is
-rewritten wholesale (D4). A different run always writes a different version.
+lands the leaf reads as it did before the write. A retry **always** writes a
+new version — same run or not, it draws a fresh `attempt` — so no writer
+ever opens, clears or resumes a prefix another writer may hold. An attempt
+that died before its pointer swap leaves a version that is not `current`:
+unreferenced (under `commit: "ladder"`, where only the sidecar named it) or
+referenced by `main` (under `commit: "leaf"`, refs already committed); the
+§11.4 collector reclaims it under its reference rule.
 
 **Readers carry one rule**: open the stable root; if its stamp names
 `current`, the arrays are under `{root}/{current}/`, else under `{root}/`
@@ -719,7 +727,7 @@ distinguishes an overview from a leaf — classification is §4.3's job.
 
 A **versioned leaf** (§1.5; a stamp naming `current`) adds nothing at the node: its
 stable `{id}.zarr` / `{id}_{window}.zarr` entry is unchanged, and its
-versions are **subgroups** of that entry named `run-{run_id}` — so the D5
+versions are **subgroups** of that entry named `run-{run_id}-{attempt}` — so the D5
 node invariant, the walker's child classification and every prefix-scoped
 rule see the same children as before. The stable root's stamp names the
 current version; the version subgroup carries the arrays. A version name is
@@ -3572,7 +3580,7 @@ decoding the replacement at a stale offset. That granularity is the local
 form's one caveat: a replacement landing within the **same second** as the
 original passes the check (an object store's ETag has no such window). On a
 **versioned** leaf (§1.5; a stamp naming `current`) the recorded `location` is the
-version subgroup's object — `{leaf}/run-{run_id}/{p}/c/0` — which is never
+version subgroup's object — `{leaf}/run-{run_id}-{attempt}/{p}/c/0` — which is never
 rewritten, so the checksum is a guard against out-of-band tampering only and
 a replacement invalidates no earlier reference. The writer records which form it used under
 `icechunk.checksum` in the leaf's stats sidecar (`"etag"` or

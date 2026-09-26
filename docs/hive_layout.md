@@ -646,8 +646,8 @@ actual `[t_min, t_max]` written, as ISO-8601 UTC strings.
 **Versioned leaves ([specification §1.5](specification.md#15-storage-geometries), issue
 [#582](https://github.com/englacial/zagg/issues/582)).** The stable
 `{id}.zarr/zarr.json` is a **pointer stamp**: it carries the stamp above plus
-`"current": "run-{run_id}"`, and the arrays live in that **version
-subgroup** — `{id}.zarr/run-{run_id}/{cell_order}/…`, a complete leaf with its
+`"current": "run-{run_id}-{attempt}"`, and the arrays live in that **version
+subgroup** — `{id}.zarr/run-{run_id}-{attempt}/{cell_order}/…`, a complete leaf with its
 own stamp, never rewritten once stamped. That stamp keeps `spec`
 `morton-hive/1` or `/2` exactly as above (windowed ⇒ `/2`): no `spec` value
 marks versioning — `current` alone does. A replacement writes a new version
@@ -655,9 +655,12 @@ and swaps the pointer (one PUT), so an earlier run tag in the Icechunk repo
 keeps reading the version it indexed; superseded versions are reclaimed by
 the operator-run collector (`tools/icechunk_gc_targets.py`, dry-run default).
 Write order: version arrays → version stamp → refs against the version's
-objects → pointer swap → lifecycle touch of the root and current version. A
-same-run retry that finds its version stamped resumes at the refs; a
-different run always writes a new version. **A stamp without `current` is a
+objects → pointer swap → lifecycle touch of the root and current version.
+`attempt` is a per-invocation nonce (8 hex characters of a fresh `uuid4`), so
+two writers of one unit — a duplicate-invoke retry, a redundant fleet worker —
+never share a prefix: a retry **always** writes a new version, and an attempt
+that died before its pointer swap is left for the collector. The run tag
+`run-{run_id}` still groups all of a run's versions by prefix. **A stamp without `current` is a
 legacy leaf** (every store written before this revision): readers open the
 root and follow `current` when present, else read the root itself
 (`zagg.hive.resolve_leaf`) — no migration, and a store mixes both kinds
