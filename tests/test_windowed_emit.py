@@ -619,6 +619,30 @@ class TestBulkEndToEnd:
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "far"), fakes=far)
         assert meta["error"] in BENIGN_ERRORS
 
+    def test_one_window_failing_keeps_the_landed_windows(self, monkeypatch, tmp_path):
+        # Review finding (4): a raise in one window's finish is that window's
+        # error; the windows around it land and keep their metadata, so the
+        # caller still records (and sidecars) them.
+        from zagg.telemetry import build_record
+
+        finish = hive._LeafUnit.finish
+
+        def _flaky(self, metadata):
+            if self.label == "2019":
+                raise RuntimeError("PUT failed")
+            return finish(self, metadata)
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _flaky)
+        root = str(tmp_path / "bulk")
+        meta = _run_bulk(monkeypatch, _cfg(), root)
+        assert [m["error"] for m in meta["windows"]] == [None, "RuntimeError: PUT failed", None]
+        assert meta["error"] == "window 2019: RuntimeError: PUT failed"
+        assert meta["total_obs"] == 7  # 2018 + 2020; the failed window counts nothing
+        grid = _grid(_cfg())
+        assert [_leaf_obs(root, _shard_word(), w, grid) for w in ("2018", "2020")] == [1, 6]
+        rec = build_record(shard_key=_shard_word(), metadata=meta["windows"][1], window="2019")
+        assert rec["success"] is False and rec["unit_windows"] == 3
+
     def test_window_and_windows_are_exclusive(self, monkeypatch, tmp_path):
         with pytest.raises(ValueError, match="not both"):
             hive.process_and_write_hive(
@@ -895,6 +919,44 @@ def handler_mod():
     return mod
 
 
+def _handler_event(cfg, tmp_path):
+    shard, urls, windows = _bulk_unit(cfg)
+    signature = {
+        "type": "healpix",
+        "indexing_scheme": "nested",
+        "parent_order": 6,
+        "child_order": 8,
+        "layout": "fullsphere",
+    }
+    return {
+        "shard_key": shard,
+        "parent_order": 6,
+        "child_order": 8,
+        "granule_urls": urls,
+        "store_path": str(tmp_path / "hive-out"),
+        "s3_credentials": {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        "config": asdict(cfg),
+        "windows": windows,
+        "run_id": "rid",
+        "submap": {
+            "grid_signature": signature,
+            "metadata": {"short_name": "ATL06", "version": "007"},
+            "granules": _records(),
+        },
+    }
+
+
+def _handle(handler_mod, event):
+    ctx = MagicMock()
+    ctx.aws_request_id, ctx.function_name, ctx.memory_limit_in_mb = (
+        "req-1",
+        "process-shard",
+        2048,
+    )
+    ctx.get_remaining_time_in_millis.return_value = 900_000
+    return handler_mod._handle_process(event, ctx)
+
+
 class TestHandler:
     def test_bulk_event_emits_every_window_with_one_record_each(
         self, handler_mod, monkeypatch, tmp_path
@@ -904,40 +966,10 @@ class TestHandler:
         from zagg.telemetry import read_sidecar
 
         cfg = _cfg()
-        shard, urls, windows = _bulk_unit(cfg)
         _patch(monkeypatch)
-        records = _records()
-        signature = {
-            "type": "healpix",
-            "indexing_scheme": "nested",
-            "parent_order": 6,
-            "child_order": 8,
-            "layout": "fullsphere",
-        }
-        event = {
-            "shard_key": shard,
-            "parent_order": 6,
-            "child_order": 8,
-            "granule_urls": urls,
-            "store_path": str(tmp_path / "hive-out"),
-            "s3_credentials": {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
-            "config": asdict(cfg),
-            "windows": windows,
-            "run_id": "rid",
-            "submap": {
-                "grid_signature": signature,
-                "metadata": {"short_name": "ATL06", "version": "007"},
-                "granules": records,
-            },
-        }
-        ctx = MagicMock()
-        ctx.aws_request_id, ctx.function_name, ctx.memory_limit_in_mb = (
-            "req-1",
-            "process-shard",
-            2048,
-        )
-        ctx.get_remaining_time_in_millis.return_value = 900_000
-        resp = handler_mod._handle_process(event, ctx)
+        event = _handler_event(cfg, tmp_path)
+        shard = event["shard_key"]
+        resp = _handle(handler_mod, event)
         assert resp["statusCode"] == 200, resp["body"]
         body = json.loads(resp["body"])
         # The body: the shard's totals plus one metadata per window, and the
@@ -973,3 +1005,32 @@ class TestHandler:
             assert [[g["id"] for g in shard_granules] for shard_granules in submap["granules"]] == [
                 ids
             ]
+
+    def test_a_failed_window_keeps_the_landed_windows_records(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        # Review finding (4) on the Lambda path: the landed windows keep their
+        # records and sidecars; the failed one rides the list unsuccessful.
+        from zagg.telemetry import read_sidecar
+
+        finish = hive._LeafUnit.finish
+
+        def _flaky(self, metadata):
+            if self.label == "2019":
+                raise RuntimeError("PUT failed")
+            return finish(self, metadata)
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _flaky)
+        _patch(monkeypatch)
+        event = _handler_event(_cfg(), tmp_path)
+        body = json.loads(_handle(handler_mod, event)["body"])
+        assert body["error"] == "window 2019: RuntimeError: PUT failed"
+        assert [(r["window"], r["success"]) for r in body["stats"]] == [
+            ("2018", True),
+            ("2019", False),
+            ("2020", True),
+        ]
+        store, shard = event["store_path"], event["shard_key"]
+        assert read_sidecar(hive.shard_leaf_path(store, shard, window="2018"))["n_obs"] == 1
+        assert read_sidecar(hive.shard_leaf_path(store, shard, window="2020"))["n_obs"] == 6
+        assert read_sidecar(hive.shard_leaf_path(store, shard, window="2019")) is None

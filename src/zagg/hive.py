@@ -2464,8 +2464,25 @@ def _process_windows(
             todo = [{**w, "granules": [at[i] for i in w["granules"]]} for w in todo]
 
         def _emit(w, aggregate):
+            # One window's failure (a write PUT, its own spill reduce, the
+            # legacy-over-versioned refusal) is that window's error, the way a
+            # failed fan-out unit costs only its leaf: the windows already
+            # landed keep their metadata (and so their records and sidecars),
+            # and the rest still run. A failure of the shared read raised
+            # before any window emits, and still fails the invoke.
             unit = units[w["label"]]
-            metas[w["label"]] = unit.finish(aggregate(**unit.sinks()))
+            try:
+                metas[w["label"]] = unit.finish(aggregate(**unit.sinks()))
+            except Exception as e:
+                logger.exception(f"shard {shard_key} window {w['label']} failed: {e}")
+                metas[w["label"]] = {
+                    "shard_key": int(shard_key),
+                    "window": w["label"],
+                    "cells_with_data": 0,
+                    "total_obs": 0,
+                    "granule_count": len(unit.granule_urls),
+                    "error": f"{type(e).__name__}: {e}",
+                }
 
         _df_out, base = process_shard(
             grid,
@@ -2501,6 +2518,10 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
         m["unit_windows"] = n
     written = [m for m in window_metas if not (m.get("current") or m.get("refused"))]
     meta = {**base, "windows": window_metas}
+    # The sums count the windows that landed; a failed window's partial
+    # aggregate is not output (a failed fan-out unit counts nothing).
+    for key in ("cells_with_data", "total_obs"):
+        meta[key] = sum(int(m.get(key) or 0) for m in written if not m.get("error"))
     if n and not written:
         meta["current" if all(m.get("current") for m in window_metas) else "refused"] = True
     # A window whose sink kept nothing reports a benign no-work error, as its
