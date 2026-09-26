@@ -659,6 +659,10 @@ version's objects (a commit under `commit: "leaf"`, the ladder sidecar under
 `commit: "ladder"`) → (4) pointer swap. A path reader sees the previous state
 until (4); an Icechunk reader sees the new version at its commit — (3) per
 leaf, the staged sweep's node commit (possibly after (4)) under the ladder.
+Version objects are **never touched**: the skip-path lifecycle touch of a
+versioned unit refreshes the root `zarr.json` and the unit's siblings only
+([The lifecycle touch](#the-lifecycle-touch)), so an expiration rule MUST NOT
+cover version subgroups.
 `attempt` is a per-invocation nonce (8 hex characters of a fresh `uuid4`), so
 two writers of one unit — a duplicate-invoke retry, a redundant fleet worker —
 never share a prefix: a retry **always** writes a new version, and an attempt
@@ -1277,6 +1281,23 @@ bucket — see below): every object in its footprint gets a fresh
 (stamp, arrays, in-leaf `coverage.moc`), the stats sidecar, its granule-id
 sibling and the sub-map sibling, and the declared column tree plus its own
 sidecar.
+
+On a **versioned** leaf ([Versioned leaves](#the-commit-stamp), spec §1.5) the
+footprint is exactly: the object `{id}.zarr/zarr.json` (the pointer stamp —
+never `{id}.zarr/` as a tree), the stats sidecar, the granule-id sibling, the
+sub-map, the Icechunk ref sidecar, and the declared column tree plus its
+sidecar. No version subgroup — current or superseded — is touched: its
+objects are write-once and carry the checksums the repo's refs pin, so a
+self-copy (a re-minted multipart ETag) or an `os.utime` would break every
+snapshot and run tag that indexes them. Their lifetime belongs to the
+collector (`tools/icechunk_gc_targets.py`), not to bucket expiration, so an
+expiration rule over the leaf tree MUST NOT cover version subgroups — a rule
+that does ages out the **current** version under a live pointer on the
+rule's clock, whatever the collector decides, and bounds every tag's
+readability by the rule's age. S3 lifecycle filters select by prefix, tag or
+size and cannot exclude a nested name, so in practice a store with versioned
+leaves carries no expiration rule over its hive tree (the `icechunk/`
+exclusion below is the same posture for the repo).
 Local stores use `os.utime`; S3 uses a server-side self-copy (`CopyObject`
 onto itself, `MetadataDirective: REPLACE`) that preserves content, the ETag
 of non-multipart objects, and the object's storage class. A local run's
@@ -1341,8 +1362,8 @@ footprint of leaf tree + stats sidecar + `granules.json` + sub-map + declared
 column + the Icechunk ref sidecar (`icechunk_refs.json`, the ladder's input
 for that leaf — a skipped leaf must keep it as fresh as the leaf it
 describes, or the next staged sweep gathers a hole), `touch_store_root`
-covers the root trio, and neither reaches the repo. The touch does move the
-checksum every ref into the unit carries (spec §11.3: the `file://` mtime; the
+covers the root trio, and neither reaches the repo. On a **legacy** leaf the
+touch does move the checksum every ref into the unit carries (spec §11.3: the `file://` mtime; the
 ETag of a multipart-uploaded S3 object, which a self-copy re-mints), so a
 touched unit re-plans its refs from fresh HEADs: under `commit: "leaf"` it
 commits them at once; under the ladder it rewrites its ref sidecar and is
@@ -1355,7 +1376,10 @@ their refs, but no overview or column is re-folded, since no data changed
 (each stage row counts them as `icechunk_regathered`; PR #581 question (11),
 ruled (a)). This narrows the #388 contract: a current unit writes no stats
 record, no sidecar and no sub-map, but it may enter the sweep work set as
-dirt-only when its touch moved ref checksums and the repo is on. The ref sidecar's touch is unconditional: it is issued even when
+dirt-only when its touch moved ref checksums and the repo is on. A
+**versioned** leaf never does: its touch reaches no version object, so no
+ref checksum moves and the dirt-only re-gather applies to legacy leaves
+only. The ref sidecar's touch is unconditional: it is issued even when
 `output.icechunk` is off or the run used `commit: "leaf"`, where the object
 does not exist — harmless (an absent sibling is neither touched nor failed),
 at the cost of one extra request per unit on an all-skip rerun. The repo is not a root-trio-style

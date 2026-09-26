@@ -337,6 +337,20 @@ unreferenced (under `commit: "ladder"`, where only the sidecar named it) or
 referenced by `main` (under `commit: "leaf"`, refs already committed); the
 §11.4 collector reclaims it under its reference rule.
 
+**The lifecycle touch never reaches a version.** The #388 skip-path touch of
+a versioned unit (a write path's objects are fresh and need none) refreshes
+exactly the stable root `zarr.json` — the pointer stamp, one object, never
+`{root}/` as a tree — and the unit's sibling objects: the stats sidecar, the
+granule-id sibling, the sub-map, the Icechunk ref sidecar, and the column
+tree plus its sidecar when declared. Those siblings stay unversioned, keyed
+off the leaf stem and rewritten per run. A version subgroup's objects —
+current or superseded — are **never touched**, so no touch re-mints an ETag
+or moves an mtime that a recorded reference carries (§11.3). Their lifetime
+is governed by the §11.4 collector, **not** by bucket expiration: an
+expiration rule on a store holding versioned leaves MUST NOT cover version
+subgroups — the same posture the repo's own `icechunk/` prefix takes — or
+the untouched current version ages out under a live pointer.
+
 **Readers carry one rule**: open the stable root; if its stamp names
 `current`, the arrays are under `{root}/{current}/`, else under `{root}/`
 itself. **Absent `current` is a legacy leaf** — every store written before
@@ -3584,8 +3598,9 @@ form's one caveat: a replacement landing within the **same second** as the
 original passes the check (an object store's ETag has no such window). On a
 **versioned** leaf (§1.5; a stamp naming `current`) the recorded `location` is the
 version subgroup's object — `{leaf}/run-{run_id}-{attempt}/{p}/c/0` — which is never
-rewritten, so the checksum is a guard against out-of-band tampering only and
-a replacement invalidates no earlier reference. The writer records which form it used under
+rewritten and never touched (§1.5), so the checksum is a guard against
+out-of-band tampering only and neither a replacement nor a lifecycle touch
+invalidates an earlier reference. The writer records which form it used under
 `icechunk.checksum` in the leaf's stats sidecar (`"etag"` or
 `"last_modified"`).
 
@@ -3916,8 +3931,8 @@ split ratchet governs that dimension first, and the hatch trades "one zarr"
 for "one zarr per region". Whether it is ever needed is read off the first
 global run's per-node `icechunk_rebases` / `icechunk_commit_s` stage rows.
 
-A skip-if-current unit's lifecycle touch (#388) refreshes its objects in
-place and so moves their checksums (§11.3); the unit re-plans its refs from
+A skip-if-current **legacy** unit's lifecycle touch (#388) refreshes its
+objects in place and so moves their checksums (§11.3); the unit re-plans its refs from
 fresh HEADs — committed at once under `commit: "leaf"`; under the ladder it
 rewrites its sidecar and enters the same run's staged sweep as a
 **dirt-only** leaf, whose nodes re-gather and commit its refs without
@@ -3926,4 +3941,6 @@ carries `icechunk_dirty`, the dispatcher assembles the dirt-only set from
 those bodies, and each stage event carries its node slice as `dirt_only`
 (`[[shard_key, window], …]`, absent when empty). A current unit therefore still writes no
 stats record, sidecar or sub-map, but may enter the sweep work set as
-dirt-only when its touch moved ref checksums and the repo is on.
+dirt-only when its touch moved ref checksums and the repo is on. A **versioned** unit (§1.5) never
+enters this path: its touch reaches no version object, moves no ref checksum,
+and so is never dirt-only — its `main` refs stand as committed.
