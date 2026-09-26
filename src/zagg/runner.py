@@ -5837,6 +5837,7 @@ def _invoke_lambda_icechunk_finalize(
     run_id,
     icechunk_init=None,
     output_creds_event=None,
+    newest_only=False,
 ) -> dict:
     """One synchronous ``mode="icechunk_finalize"`` invoke (issue #582); its record.
 
@@ -5846,7 +5847,9 @@ def _invoke_lambda_icechunk_finalize(
     dispatcher fires it last, after the staged sweep returned. Blocking so
     the summary can carry the tag; fail-open on the same shapes as the init
     invoke (a stale deployment's 400, a throttle, a refused finalize, a 200
-    that is not the success envelope), never an empty dict.
+    that is not the success envelope), never an empty dict. ``newest_only``
+    (``Run.attach``) rides the event: the worker then finalizes only while
+    the run is the newest on the repo (``{"skipped"}`` otherwise).
     """
     event = {
         "mode": "icechunk_finalize",
@@ -5859,6 +5862,8 @@ def _invoke_lambda_icechunk_finalize(
     }
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
+    if newest_only:
+        event["newest_only"] = True
     t0 = time.perf_counter()
     try:
         response = lambda_client.invoke(

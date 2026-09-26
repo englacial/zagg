@@ -1614,6 +1614,8 @@ def _handle_icechunk_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
             retain_runs=resolve_retain_runs(config),
             store_kwargs=_output_store_kwargs(event),
             split_ratchet=init.get("split_ratchet") if isinstance(init, dict) else None,
+            # ``Run.attach``'s finalize: only while the run is the newest.
+            newest_only=bool(event.get("newest_only")),
         )
         return {
             "statusCode": 200,

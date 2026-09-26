@@ -3823,7 +3823,10 @@ commits are kept; the next run's tag covers them). One finalize, in order:
    shares a hash, so a hash-named tag would collide on the second run.
 
 Idempotent: a finalize whose tag already exists returns it and writes
-nothing. Fail-open (D9) at the dispatcher like the init; the record rides
+nothing. A reattached client (`Run.attach`) finalizes only while its run is
+the newest on the repo (no later `init` or `finalize` commit on `main`),
+else it writes nothing and records `{skipped}`, so an untagged old run
+stays covered by the next run's tag as before. Fail-open (D9) at the dispatcher like the init; the record rides
 the run summary as `icechunk_finalize` (`{path, tag, snapshot, tagged,
 retain_runs, tags_deleted, snapshots_expired, gc, retention_error,
 rewrite_pending, commit_s}`, `{error}` or `{skipped}`), not the run parquet,
