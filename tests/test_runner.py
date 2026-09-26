@@ -4558,7 +4558,9 @@ class TestLambdaSkipAndDirtOnly:
     hive run without ``overwrite``), counts a current unit apart from
     ``cells_with_data`` with no run-parquet row, and hands a unit the worker
     marked ``icechunk_dirty`` to the staged sweep as dirt-only — the same
-    assembly as the local backend (PR #581 question (11)).
+    assembly as the local backend (PR #581 question (11)). The tail's
+    Icechunk finalize (issue #582) fires after the staged sweep, and only
+    when that sweep completed.
     """
 
     def _drive(self, monkeypatch, atl06_config, *, body, overwrite=False, init=None, staged=None):
@@ -4574,7 +4576,9 @@ class TestLambdaSkipAndDirtOnly:
         from zagg.concurrency import ConcurrencyReport
 
         seen: dict = {"cells": [], "stage": [], "sweep": 0, "order": [], "finalize": []}
-        monkeypatch.setattr(runner, "_invoke_lambda_icechunk_init", lambda *a, **k: init)
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_icechunk_init", lambda *a, **k: (seen.update(init=k), init)[1]
+        )
 
         def finalize(*a, **k):
             seen["order"].append("finalize")
@@ -4683,6 +4687,26 @@ class TestLambdaSkipAndDirtOnly:
         ((args, kwargs),) = seen["stage"]
         assert args[3] == []  # no dirty leaf
         assert kwargs["dirt_only"] == [(k, None) for k in (10, 11, 12, 13)]
+
+    def test_the_finalize_runs_once_after_the_stage_sweep(self, monkeypatch, atl06_config):
+        # _run_lambda's tail (issue #582): after the staged sweep returned,
+        # carrying the init record and the SAME pinned config the init got.
+        init = {"snapshot": "s0", "split_ratchet": None}
+        staged = {"barrier_timed_out": False, "finisher": {"fired": True, "landed": True}}
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, body=self._DIRTY, init=init, staged=staged
+        )
+        assert seen["order"] == ["stage", "finalize"]
+        ((args, kwargs),) = seen["finalize"]
+        assert args[1:] == ("fn", "s3://out/x.zarr") and kwargs["icechunk_init"] is init
+        assert kwargs["config_dict"] is seen["init"]["config_dict"]
+        assert kwargs["config_dict"]["output"]["icechunk"]["commit"] in ("ladder", "leaf")
+        assert isinstance(kwargs["run_id"], str) and kwargs["run_id"]
+        assert summary["icechunk"] is init and summary["icechunk_finalize"] == {"tag": "run-x"}
+
+    def test_no_init_record_no_finalize(self, monkeypatch, atl06_config):
+        summary, seen = self._drive(monkeypatch, atl06_config, body=self._DIRTY, init=None)
+        assert seen["order"] == ["stage"] and summary["icechunk_finalize"] is None
 
     @pytest.mark.parametrize(
         "staged, reason",
