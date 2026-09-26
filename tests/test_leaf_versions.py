@@ -152,6 +152,79 @@ class TestWriter:
         assert _mtimes(f"{leaf}/6") == legacy  # the converted leaf's root arrays stay
         assert hive.resolve_leaf(leaf)[0] == f"{leaf}/{v}"
 
+    def test_an_errored_column_leaves_the_previous_pointer_live(self, monkeypatch, cfg, tmp_path):
+        # The swap is gated on a clean unit: a failed post-stamp column fold
+        # leaves the attempt's version stamped but NOT current (the retry
+        # writes a fresh one; the collector reclaims the orphan).
+        from zagg import column
+
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        (shard,) = _shards(grid, 1)
+        v1 = _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id=RUN_A)["leaf_version"]
+
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(column, "write_leaf_column", boom)
+        meta = _write_leaf(monkeypatch, grid, root, shard, fill=9.0, refs=False, run_id=RUN_B)
+        leaf = hive.shard_leaf_path(root, shard)
+        assert meta["error"] == "leaf column: boom" and "leaf_version" not in meta
+        assert hive.read_commit(leaf)["current"] == v1
+        (orphan,) = [v for v in _versions(leaf) if v != v1]
+        assert orphan.startswith(f"run-{RUN_B}-") and hive.read_commit(f"{leaf}/{orphan}")
+
+    def test_a_no_data_shard_creates_neither_version_nor_pointer(self, monkeypatch, cfg, tmp_path):
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        (shard,) = _shards(grid, 1)
+        meta = _write_leaf(
+            monkeypatch, grid, root, shard, skip_chunks=(0, 1, 2, 3), refs=False, run_id=RUN_A
+        )
+        assert "leaf_version" not in meta
+        assert not Path(hive.shard_leaf_path(root, shard)).exists()
+
+    def test_the_streaming_path_writes_a_versioned_leaf(self, monkeypatch, cfg, tmp_path):
+        grid = _grid(cfg, sharded=False)
+        root = str(tmp_path / "store")
+        (shard,) = _shards(grid, 1)
+        meta = _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id=RUN_A)
+        leaf = hive.shard_leaf_path(root, shard)
+        version = meta["leaf_version"]
+        assert _versions(leaf) == [version] and hive.read_commit(leaf)["current"] == version
+        assert not (Path(leaf) / "6").exists()
+        assert zarr.open_group(f"{leaf}/{version}", mode="r")["6"]["count"].shape == (16,)
+
+    def test_the_streaming_legacy_refusal_raises(self, monkeypatch, cfg, tmp_path):
+        # The refusal fires in the lazy ``_leaf()`` opener, inside
+        # ``process_shard``'s ``write_chunk`` callback: it propagates as a
+        # raise (the unit fails loudly), exactly as on the sharded path.
+        grid = _grid(cfg, sharded=False)
+        root = str(tmp_path / "store")
+        (shard,) = _shards(grid, 1)
+        v1 = _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id=RUN_A)["leaf_version"]
+        with pytest.raises(ValueError, match="is versioned"):
+            _write_leaf(monkeypatch, grid, root, shard, refs=False)
+        assert hive.read_commit(hive.shard_leaf_path(root, shard))["current"] == v1
+
+    def test_a_windowed_leaf_is_versioned(self, monkeypatch, tmp_path):
+        from test_column import _run_unit
+
+        meta, leaf = _run_unit(
+            tmp_path,
+            monkeypatch,
+            pyramid=False,
+            window={"label": "2019", "start": 0.0, "end": 1.0},
+            windowing={"schedule": "yearly", "time_field": "t", "epoch": "2018-01-01T00:00:00Z"},
+            run_id=RUN_A,
+        )
+        assert meta.get("error") is None and leaf.name.endswith("_2019.zarr")
+        version = meta["leaf_version"]
+        data_path, stamp = hive.resolve_leaf(str(leaf))
+        assert data_path == f"{leaf}/{version}" and stamp["window"] == "2019"
+        assert hive.read_commit(data_path)["spec"] == "morton-hive/2"
+        assert hive.read_coverage_bitmap(str(leaf)) is not None
+
 
 class TestPointerRule:
     def test_leaf_data_path(self):
