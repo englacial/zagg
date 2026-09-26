@@ -1416,9 +1416,10 @@ class TestStagedSweepTail:
         assert handle.icechunk_finalize == {"skipped": "staged sweep dispatch failed"}
 
     def test_a_leaf_pinned_run_still_chains_and_gates(self, catalog, monkeypatch):
-        # ``stages`` materializes the overviews whether or not the run walks
-        # the ref ladder, and its nodes still commit overview refs under
-        # ``commit: "leaf"``: the gate is on the sweep, not the commit mode.
+        # No ``/2`` ladder declared, so the dispatch pins ``commit: "leaf"``,
+        # yet ``stages`` still chains the sweep and the finalize gate follows
+        # the sweep's summary regardless of the pinned mode: the gate is on
+        # the sweep, not the commit mode.
         _run_, handle, stub, seen = self._drive(catalog, monkeypatch, staged=None, ladder=False)
         (init,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_init"]
         assert init["config"]["output"]["icechunk"]["commit"] == "leaf"
