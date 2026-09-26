@@ -77,7 +77,11 @@ class WindowBins:
     that belong to it; ``granule_done`` advances only those windows' buffer
     cadence, reproducing the fan-out unit's flush boundaries. A payload
     without ``granules`` counts every granule (the legacy-shardmap rule: no
-    spans, every granule rides every window).
+    spans, every granule rides every window). A window with membership is
+    flushed once the read passes its last member, so the resident tail
+    buffers are those of the windows still being read, not all N; under
+    ``mode: merge`` each window's running state stays resident until its
+    leaf is written.
 
     Under spill, N aggregators fill N blocks side by side on one ``/tmp``.
     Each keeps the fan-out unit's own threshold (so its fold regime matches
@@ -102,6 +106,12 @@ class WindowBins:
             w["label"]: (set(w["granules"]) if w.get("granules") is not None else None)
             for w in self.windows
         }
+        # A window's last member granule: once the (index-ordered) read passes
+        # it, no more of the window's rows can come, so its tail buffer is
+        # flushed there — the fan-out unit's end-of-read flush, at the same
+        # granule boundary — instead of parking until the shard's read ends.
+        self._last = {label: (max(m) if m else None) for label, m in self._members.items()}
+        self._drained: set = set()
         spills = [a for a in self.buffered.values() if isinstance(a, SpillAggregator)]
         self._tmp_cap = None
         if spills:
@@ -133,6 +143,10 @@ class WindowBins:
         for label, agg in self.buffered.items():
             if self._member(label, index):
                 agg.granule_done()
+            last = self._last[label]
+            if last is not None and index >= last and label not in self._drained:
+                agg.flush()
+                self._drained.add(label)
         self._enforce_tmp_cap()
 
     def flush(self) -> None:

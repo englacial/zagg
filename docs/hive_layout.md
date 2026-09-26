@@ -176,7 +176,10 @@ output:
   the next one pools, so peak memory holds one window's slab beside the
   shard's reads rather than N. Under `aggregation.streaming` each window
   gets its own aggregator at the fan-out unit's own threshold, flushed on
-  its own granule cadence, plus one shared cap on the open spill blocks
+  its own granule cadence and drained as soon as the read passes its last
+  member granule (so the resident tail buffers are the open windows', not
+  all N; under `mode: merge` every window's running state stays resident
+  until its leaf is written), plus one shared cap on the open spill blocks
   together (`SPILL_TMP_FRACTION` of free `/tmp`). The leaves are
   byte-identical to the per-window fan-out's. `unit: window` keeps that
   fan-out — one invoke per (shard, window), the window's granule subset,

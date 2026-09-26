@@ -397,12 +397,35 @@ class TestWindowBins:
         a, b, c = (bins.buffered[k] for k in "abc")
         assert (a.done, b.done, c.done) == (1, 2, 2)
         assert len(a.reads) == 1 and len(b.reads) == 1 and c.reads == []
+        # a and b drained as the read passed their last member (finding (6));
+        # c (no membership) waits for the end-of-read flush.
+        assert (a.flushed, b.flushed, c.flushed) == (1, 1, 0)
         bins.flush()
-        assert (a.flushed, b.flushed, c.flushed) == (1, 1, 1)
+        assert (a.flushed, b.flushed, c.flushed) == (2, 2, 1)
         bins.release("a")
         assert a.closed and "a" not in bins.buffered
         bins.close()
         assert b.closed and c.closed and bins.buffered == {}
+
+    def test_a_window_drains_once_the_read_passes_its_last_member(self):
+        # Review finding (6): the tail buffer is flushed at the window's last
+        # member granule, not parked until the shard's read ends; a failed
+        # (never-yielded) last member drains at the next granule read.
+        from zagg.processing.windowed import WindowBins
+
+        windows = [
+            {"label": "a", "start": 0.0, "end": 10.0, "granules": [0, 2]},
+            {"label": "b", "start": 10.0, "end": 20.0, "granules": [1, 3]},
+        ]
+        bins = WindowBins(windows, "t", _FakeAgg)
+        a, b = bins.buffered["a"], bins.buffered["b"]
+        bins.granule_done(0)
+        bins.granule_done(1)
+        assert (a.flushed, b.flushed) == (0, 0)
+        bins.granule_done(2)
+        assert (a.flushed, b.flushed) == (1, 0)
+        bins.granule_done(4)  # granule 3 failed to read: b drains here
+        assert (a.flushed, b.flushed) == (1, 1)
 
     def test_pooled_bins_are_lists_per_window(self):
         from zagg.processing.windowed import WindowBins
