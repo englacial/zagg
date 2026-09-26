@@ -3789,7 +3789,8 @@ so a staged sweep that did not complete — its dispatch failed, a barrier
 expired or the finisher did not land — may still have node commits in
 flight: the dispatcher then does NOT finalize and records
 `icechunk_finalize: {skipped: <reason>}` and the run stays untagged (its
-commits are kept; the next run's tag covers them). One finalize, in order:
+commits are kept; the next run's tag covers them; the `finalize` operation
+below tags it once the ladder is complete). One finalize, in order:
 
 1. **retention** — `output.icechunk.retain_runs` = K. `0` (the default)
    keeps every run and does nothing here. K > 0: the run tags beyond the
@@ -3893,7 +3894,7 @@ after, the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
 group; a session that fails is discarded and nothing lands. moczarr's
 validator (issue #582 phase 6) runs in addition when it lands; the check
 above is zagg's own. An operation
-that would write nothing commits nothing. The two operations of `/1`:
+that would write nothing commits nothing. The operations of `/1`:
 
 - **`set-attrs <path> <json>`** merges the JSON object into the attrs of the
   root group (`/`), a level group (`/{cells}`) or an array
@@ -3923,6 +3924,21 @@ that would write nothing commits nothing. The two operations of `/1`:
   manifest write when the store has a repo (fail-open, D9; its summary's
   `icechunk` key carries the report or the error), so one operator step
   declares both planes; the standalone form re-runs it.
+- **`finalize <run_id>`** tags a ladder run its dispatcher left untagged —
+  the staged sweep completed but the dispatcher died before its finalize
+  (the state described under **Finalize** above). It reads the run's
+  dispatch manifest (`<store>.status/run-<run_id>/manifest.json`) for the
+  run's own config — its `retain_runs` and the D19 hash — refuses without
+  it, refuses unless the newest `sweep_stats_*_stages.json` written since
+  the run's `dispatched_at` shows a completed sweep (the finisher wrote it,
+  and no barrier expired), and then runs the **Finalize** above `newest_only`:
+  it can only ever tag the repo's newest run — an older untagged run stays
+  covered by the next run's tag, and tagging it would name later commits —
+  and an existing tag is a no-op. It is the §11.4 finalize itself, not a
+  validated array-model commit (it is content-free); there is no `--force`
+  (a run whose sweep did not complete has no tip that means "this run":
+  `python -m zagg.sweep <store> --stages` completes the ladder first) and
+  no retention override.
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
 come out of the object's own index, but the sizes and checksums do not. For

@@ -1405,7 +1405,8 @@ class Run:
         :func:`runner._staged_sweep_incomplete`'s reason when the chained
         sweep may still have node commits in flight, and the run is then left
         untagged with ``{"skipped": reason}`` on the handle (the next run's
-        tag covers it, spec §11.4).
+        tag covers it, spec §11.4; ``python -m zagg.icechunk_ops <store>
+        finalize <run_id>`` tags it once the ladder is complete).
         Gated on the dispatch's init record, or — on a reattached run, which
         never held one — on the config's knob (``get_icechunk``; the worker
         refuses a repo-less store and the invoke fails open). A reattached

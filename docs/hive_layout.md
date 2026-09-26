@@ -1582,6 +1582,7 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   ```
   python -m zagg.icechunk_ops <store_root> set-attrs /19 '{"dggs": {...}}'   # root "/", a level "/{cells}", an array "/{cells}/{array}"; null deletes a key
   python -m zagg.icechunk_ops <store_root> declare-pyramid config.yaml     # levels + multiscales follow the manifest's declaration
+  python -m zagg.icechunk_ops <store_root> finalize <run_id>              # tag a completed-but-untagged ladder run (the repo's newest run only)
   ```
 
   Before the commit the array model of every array must be unchanged and
@@ -1591,6 +1592,16 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   split), delists a no-longer-declared one without deleting its group, and
   refuses a geometry change (that is a `/2` revision). The manifest
   retrofit runs `declare-pyramid` itself ([above](#retrofitting-the-pyramid-declaration)).
+  `finalize` ([issue #588](https://github.com/englacial/zagg/issues/588))
+  is the repair for a ladder run whose dispatcher died after the staged
+  sweep completed but before its finalize (`icechunk_finalize: {skipped}`
+  on the CLI summary / `handle.icechunk_finalize` on the facade, or no
+  record at all): it reads the run's dispatch manifest for its config
+  (`retain_runs`, the semantic hash — no `--retain-runs`), refuses unless
+  the newest `sweep_stats_*_stages.json` since the dispatch shows a
+  completed sweep, and tags `newest_only` — an older untagged run stays
+  covered by the next run's tag. No `--force`: an incomplete sweep is
+  completed with `python -m zagg.sweep <store> --stages` first.
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M
