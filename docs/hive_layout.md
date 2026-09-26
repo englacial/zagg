@@ -652,7 +652,10 @@ own stamp, never rewritten once stamped. That stamp keeps `spec`
 `morton-hive/1` or `/2` exactly as above (windowed ⇒ `/2`): no `spec` value
 marks versioning — `current` alone does. A replacement writes a new version
 and swaps the pointer (one PUT), so an earlier run tag in the Icechunk repo
-keeps reading the version it indexed; superseded versions are reclaimed by
+keeps reading the base-leaf version it indexed (columns and overviews are
+still rewritten at their keys until issue
+[#584](https://github.com/englacial/zagg/issues/584), so a tag reads those
+only as the latest run left them); superseded versions are reclaimed by
 the operator-run collector (`tools/icechunk_gc_targets.py`, dry-run default).
 Write order: (1) version arrays → (2) version stamp → (3) refs against the
 version's objects (a commit under `commit: "leaf"`, the ladder sidecar under
