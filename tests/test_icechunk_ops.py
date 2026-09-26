@@ -577,8 +577,11 @@ class TestFinalizeOperation:
     def test_refuses_without_a_dispatch_manifest(self, monkeypatch, cfg, tmp_path):
         _grid_, root = _store(monkeypatch, cfg, tmp_path)
         self._record(root)
-        with pytest.raises(ValueError, match="no dispatch manifest"):
+        with pytest.raises(ValueError, match="no dispatch manifest") as err:
             icechunk_ops.finalize(root, RUN, store_kwargs={})
+        # The write is best-effort: the text says so and names the fallback.
+        assert "normally has one" in str(err.value)
+        assert "the next run's tag covers its commits" in str(err.value)
 
     def test_skips_a_run_that_is_no_longer_the_newest(self, monkeypatch, cfg, tmp_path):
         # A later run's init commit makes this one an older untagged run: the

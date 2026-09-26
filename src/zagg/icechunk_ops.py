@@ -25,7 +25,8 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
   when the store has a repo, so one operator step declares both planes.
 - ``finalize`` — tag a ladder run its dispatcher left untagged (issue
   #588): the run's staged sweep completed but the dispatcher died before
-  its finalize. Reads the run's dispatch manifest for its config, refuses
+  its finalize. Reads the run's dispatch manifest for its config (a
+  best-effort write — a run whose manifest was dropped is refused), refuses
   unless the newest staged-sweep record written since the run's init
   commit (the repo's clock, not the dispatcher's) shows a completed sweep,
   then runs the §11.4 finalize ``newest_only`` — so it can
@@ -413,6 +414,10 @@ def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
     invoke's worker-side write, issue #327) carries the very config the run
     dispatched — its ``retain_runs`` and the D19 hash the leaves were stamped
     with — which is why ``finalize`` takes no config and no ``--retain-runs``.
+    The write is best-effort: a hive run's block rides the fire-and-forget
+    setup ``Event`` invoke, which drops it over the async payload cap (the
+    ``shards`` list scales with the run) and writes nothing on a lost invoke
+    or a failed PUT — such a run cannot be finalized here.
     """
     from zagg.client_transport import MANIFEST_NAME, read_dispatch_manifest, run_status_prefix
     from zagg.config import load_config_from_dict
@@ -422,8 +427,11 @@ def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
     if manifest is None or not manifest.get("config"):
         raise ValueError(
             f"no dispatch manifest with a config at {prefix}/{MANIFEST_NAME}: finalize reads "
-            f"the run's retain_runs and semantic hash from it (a Lambda-dispatched run has "
-            f"one; a local-backend run finalizes in-process)"
+            f"the run's retain_runs and semantic hash from it. A Lambda-dispatched run "
+            f"normally has one; when it was dropped (a large hive run's setup event over "
+            f"the async payload cap, or a lost setup invoke or failed write) this operation "
+            f"cannot finalize the run, and the next run's tag covers its commits. A "
+            f"local-backend run finalizes in-process"
         )
     return load_config_from_dict(manifest["config"])
 
