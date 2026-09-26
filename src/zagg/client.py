@@ -69,6 +69,7 @@ from zagg.config import (
     get_driver,
     get_handoff,
     get_icechunk,
+    get_icechunk_options,
     get_output_endpoint_url,
     get_output_region,
     get_parent_order,
@@ -1301,7 +1302,14 @@ class Run:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         self._finalize_icechunk(handle, client, config_dict, output_creds_event, run_id)
 
-    def _finalize_icechunk(self, handle, client, config_dict, output_creds_event, run_id):
+    def _finalize_icechunk(
+        self,
+        handle: RunHandle,
+        client: Any,
+        config_dict: dict,
+        output_creds_event: dict | None,
+        run_id: str,
+    ) -> None:
         """The tail's Icechunk run finalize (issue #582); the record on the handle.
 
         The facade chains no staged sweep, so every commit of the run is a
@@ -1319,7 +1327,6 @@ class Run:
         this one untagged (the next run's tag covers it, spec §11.4).
         """
         from zagg import runner
-        from zagg.config import get_icechunk, get_icechunk_options
 
         if self._icechunk_init is None:
             if not (self._attached and get_icechunk(self.config)):
