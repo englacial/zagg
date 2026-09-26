@@ -81,6 +81,7 @@ class TestFinalize:
             "tags_deleted": 0,
             "snapshots_expired": 0,
             "gc": None,
+            "retention_error": None,
         }
         # K = 0: nothing expired, nothing collected, the init history intact.
         assert out["gc"] is None and out["snapshots_expired"] == 0
@@ -136,6 +137,29 @@ class TestRetention:
         assert _messages(r)[:2] == ["finalize r3", "finalize r2"]
         assert "finalize r1" not in _messages(r)
         assert r.lookup_tag("run-r2") == outs[1]["snapshot"]
+
+    def test_a_retention_error_still_commits_and_tags(self, repo, monkeypatch, caplog):
+        # Retention is fail-open (review finding): a lost delete_tag race
+        # (RefNotFoundError on icechunk 2.2.2) is recorded, never costs the tag.
+        import icechunk
+
+        root, _grid = repo
+        self._runs(root, 2, 0)
+
+        def boom(self, tag):
+            raise RuntimeError(f"ref not found `{tag}`")
+
+        monkeypatch.setattr(icechunk.Repository, "delete_tag", boom)
+        with caplog.at_level(logging.WARNING, logger="zagg.icechunk_finalize"):
+            out = _finalize(root, "r3", retain_runs=1)
+        assert out["tagged"] is True and out["tags_deleted"] == 0
+        assert out["retention_error"] == "RuntimeError: ref not found `run-r2`"
+        assert "fail-open" in caplog.text
+        r = _open(root)
+        assert r.lookup_tag("run-r3") == out["snapshot"]
+        info = r.lookup_snapshot(out["snapshot"])
+        assert info.message == "finalize r3"
+        assert info.metadata["retention_error"] == out["retention_error"]
 
     def test_only_run_tags_are_ever_deleted(self, repo):
         root, _grid = repo

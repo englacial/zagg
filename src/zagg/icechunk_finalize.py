@@ -17,7 +17,8 @@ One finalize does, in order:
    and unreferenced repo objects older than it are garbage-collected. The
    default K = 0 retains everything and runs none of it. Only ``run-`` tags
    are ever deleted, and only here; virtual targets (the leaves) are never
-   touched by any of it (icechunk manages none of them);
+   touched by any of it (icechunk manages none of them). Fail-open: an error
+   is recorded as ``retention_error`` and steps 2 and 3 still run;
 2. one empty ``finalize {run_id}`` commit whose METADATA identifies the run
    (``run_id``, ``semantic_hash``, ``zagg_version``, the ladder knobs) and
    records the retention counts, so the repo is its own durable run record;
@@ -82,30 +83,46 @@ def _retain(repo, retain_runs: int) -> dict:
     run's commits are all newer than any earlier tag, and a concurrent
     writer's in-flight objects are never collected. With no earlier tag
     there is nothing to expire.
+
+    Fail-open (review finding): retention is the optional half of finalize,
+    so any error — two finalizes racing on one ``delete_tag``, a garbage
+    collection cut off by the invoke's ceiling — is logged and recorded as
+    ``retention_error`` next to the counts reached so far, and the caller
+    still commits and tags the run.
     """
     counts: dict[str, Any] = {
         "retain_runs": retain_runs,
         "tags_deleted": 0,
         "snapshots_expired": 0,
         "gc": None,
+        "retention_error": None,
     }
     if retain_runs <= 0:
         return counts
+    try:
+        _apply_retention(repo, retain_runs, counts)
+    except Exception as e:
+        logger.warning(f"icechunk retention failed, the run is still tagged (fail-open): {e}")
+        counts["retention_error"] = f"{type(e).__name__}: {e}"
+    return counts
+
+
+def _apply_retention(repo, retain_runs: int, counts: dict) -> None:
+    """:func:`_retain`'s work, filling ``counts`` as each step lands."""
     tags = _run_tags_newest_first(repo)
     keep, drop = tags[: retain_runs - 1], tags[retain_runs - 1 :]
     for tag, _when in drop:
         repo.delete_tag(tag)
-    counts["tags_deleted"] = len(drop)
+        counts["tags_deleted"] += 1
     cutoff: datetime | None = keep[-1][1] if keep else (drop[0][1] if drop else None)
     if cutoff is None:
-        return counts
+        return
     counts["snapshots_expired"] = len(repo.expire_snapshots(cutoff))
     gc = repo.garbage_collect(cutoff)
     counts["gc"] = {
         k: int(getattr(gc, k))
         for k in ("snapshots_deleted", "manifests_deleted", "chunks_deleted", "bytes_deleted")
     }
-    return counts
 
 
 def finalize_repo(
@@ -121,9 +138,11 @@ def finalize_repo(
 
     Refuses (raises) a missing or mismatched repo — callers are fail-open
     (D9). Returns ``{"path", "tag", "snapshot", "tagged", "retain_runs",
-    "tags_deleted", "snapshots_expired", "gc", "rewrite_pending",
-    "commit_s"}``; ``tagged`` is ``False`` when the tag already existed (a
-    retried finalize), in which case nothing is written.
+    "tags_deleted", "snapshots_expired", "gc", "retention_error",
+    "rewrite_pending", "commit_s"}``; ``tagged`` is ``False`` when the tag
+    already existed (a retried finalize), in which case nothing is written.
+    A retention failure never costs the commit or the tag (fail-open,
+    ``retention_error``); a failed commit or tag raises.
     """
     from zagg import __version__
 
@@ -142,6 +161,7 @@ def finalize_repo(
             "tags_deleted": 0,
             "snapshots_expired": 0,
             "gc": None,
+            "retention_error": None,
             "commit_s": time.perf_counter() - t0,
         }
     counts = _retain(repo, retain_runs)
