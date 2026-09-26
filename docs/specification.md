@@ -3940,8 +3940,13 @@ that would write nothing commits nothing. The operations of `/1`:
   finisher wrote it, and no barrier expired), and then runs the **Finalize** above `newest_only`:
   it can only ever tag the repo's newest run — an older untagged run stays
   covered by the next run's tag, and tagging it would name later commits —
-  and an existing tag is a no-op. It is the §11.4 finalize itself, not a
-  validated array-model commit (it is content-free); there is no `--force`
+  and an existing tag is a no-op. It is the **Finalize** above invoked by
+  an operator, listed here for discoverability — not a validated
+  array-model operation, and an exception to this list's rules: its commit
+  metadata carries `run_id` / `semantic_hash` / the retention counts, not
+  an `operation` key; it commits even though content-free; and with
+  `retain_runs` > 0 it runs the retention (tag deletion, expiry,
+  collection). There is no `--force`
   (a run whose sweep did not complete has no tip that means "this run":
   `python -m zagg.sweep <store> --stages` completes the ladder first) and
   no retention override. The record names the sweep's own run id, so it is
