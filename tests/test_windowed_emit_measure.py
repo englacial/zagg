@@ -12,8 +12,6 @@ from zagg.grids.morton import morton_word
 from zagg.hive import MANIFEST_NAME, shard_leaf_path
 from zagg.telemetry import build_record, failure_record, flatten_record, write_run_parquet
 
-pytest.importorskip("pyarrow")
-
 REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO / "tools"))
 

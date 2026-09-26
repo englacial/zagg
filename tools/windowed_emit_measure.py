@@ -75,7 +75,7 @@ def _run_frames(store) -> list:
     import pandas as pd
 
     return [
-        pd.read_parquet(io.BytesIO(_get(store, o["path"])))
+        pd.read_parquet(io.BytesIO(_get(store, o["path"])), engine="fastparquet")
         for o in _root_objects(store)
         if _RUN_PARQUET.match(o["path"].rsplit("/", 1)[-1])
     ]
