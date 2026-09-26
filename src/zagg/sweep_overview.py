@@ -934,12 +934,16 @@ def declare_pyramid(
             {"from": fresh["semantic_hash"], "to": migrate_to} if migrate_to else None
         ),
         # The §11.4 ``declare-pyramid`` follow-through into the store's Icechunk
-        # repo (issue #582): ``None`` when nothing was written or there is no
-        # repo, else :func:`zagg.icechunk_ops.declare_pyramid`'s report.
+        # repo (issue #582): ``None`` only when there is no repo, else
+        # :func:`zagg.icechunk_ops.declare_pyramid`'s report (``unchanged``
+        # when the repo already carries the declaration).
         "icechunk": None,
     }
     if prior == block and mirror_current and migrate_to is None:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
+        # The repo may still lag the manifest (a failed follow-through, a repo
+        # built before the retrofit): the operation is idempotent, so re-run it.
+        summary["icechunk"] = _declare_into_repo(store_root, config, fresh, store_kwargs)
         return summary
     fresh["pyramid"] = block
     if migrate_to is not None:
