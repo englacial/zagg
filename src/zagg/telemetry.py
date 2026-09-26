@@ -255,6 +255,19 @@ def lambda_env() -> dict | None:
     }
 
 
+def billed_seconds(body: dict | None) -> float:
+    """A worker result body's billed seconds (issue #589).
+
+    The invocation wall ``duration_total_s`` when the worker stamped it, else
+    the aggregate clock ``duration_s`` (older workers) -- the same fallback
+    :func:`build_record` prices with, so the dispatcher's cost and
+    timeout-margin figures agree with the record's ``est_cost_usd``.
+    """
+    b = body or {}
+    total = b.get("duration_total_s")
+    return total if total is not None else b.get("duration_s", 0)
+
+
 def build_record(
     *,
     shard_key,
@@ -294,8 +307,16 @@ def build_record(
     is the caller's own value and is trusted as given.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
-    ``duration_s`` (the billed-duration approximation the dispatcher's cost
-    estimate already uses).
+    ``duration_total_s`` — the invocation wall from handler entry to this
+    record (issue #589) — falling back to ``duration_s`` for a record
+    without one (a worker predating the key, the column sidecar, failure
+    rows). ``duration_s`` stays the read + index + aggregate wall, the
+    meaning every existing pin and readout reads. The write side,
+    ``phase_timings.{write,hash,column,icechunk}`` (``phase_*`` in the run
+    parquet), lands AFTER it on the sharded (fleet) leaf path — what the
+    total covers and the fallback undercounts by (~23–70 s per unit on the
+    #586 measurement); the unsharded streaming path writes inside
+    ``process_shard``, so there the two clocks overlap.
     """
     error = metadata.get("error")
     if semantic_hash is None:
@@ -303,9 +324,12 @@ def build_record(
         if isinstance(fallback, str) and _SEMANTIC_HASH_RE.match(fallback):
             semantic_hash = fallback
     duration_s = float(metadata.get("duration_s") or 0.0)
+    # Nullable, like ``n_obs_read``: absence means unmeasured, never zero.
+    duration_total_s = _opt_float(metadata.get("duration_total_s"))
     gb_seconds = est_cost = None
     if lambda_config and lambda_config.get("memory_mb"):
-        gb_seconds = duration_s * lambda_config["memory_mb"] / 1024.0
+        billed = duration_total_s if duration_total_s is not None else duration_s
+        gb_seconds = billed * lambda_config["memory_mb"] / 1024.0
         # Arch-keyed rate (issue #298's price table, folded in here): the
         # record prices with the same table as the dispatcher's cost block.
         arch = _ARCH_ALIASES.get(str(lambda_config.get("arch") or "").lower())
@@ -375,6 +399,7 @@ def build_record(
         "cells_with_data": int(metadata.get("cells_with_data") or 0),
         "phase_timings": phase_timings,
         "duration_s": duration_s,
+        "duration_total_s": duration_total_s,
         "spill_bytes": spill_bytes,
         # Fold-regime marker (issue #370): blocks closed at the spill threshold.
         # 0/absent = exact single-block leaf; > 0 = the leaf's outputs were
@@ -477,6 +502,18 @@ def merge(records: Iterable[dict]) -> dict:
     for key in _SUM_OR_NONE_KEYS:
         vals = [r.get(key) for r in records if r.get(key) is not None]
         out[key] = sum(vals) if vals else None
+    # ``duration_total_s`` (issue #589) is the billed wall: None when no part
+    # measured it (so ``merge([r]) == r``), else each part counts its total or,
+    # for an older leaf, its ``duration_s`` -- build_record's pricing fallback,
+    # so a mixed-vintage rollup never reads below its aggregate clock.
+    totals = [r.get("duration_total_s") for r in records]
+    out["duration_total_s"] = (
+        None
+        if all(t is None for t in totals)
+        else sum(
+            t if t is not None else (r.get("duration_s") or 0) for t, r in zip(totals, records)
+        )
+    )
     for key in _MAX_OR_NONE_KEYS:
         vals = [r.get(key) for r in records if r.get(key) is not None]
         out[key] = max(vals) if vals else None
@@ -534,6 +571,7 @@ _ROW_SCALARS = (
     "n_obs_read",
     "cells_with_data",
     "duration_s",
+    "duration_total_s",
     "gb_seconds",
     "est_cost_usd",
     "spill_bytes",

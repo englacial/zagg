@@ -957,6 +957,19 @@ class TestInvokeLambdaCellAsync:
         assert result["retries"] == 0
         assert result["granule_count"] == 1
 
+    def test_lambda_duration_is_the_billed_wall(self):
+        # Issue #589: a body carrying both clocks feeds measure_cost,
+        # cost_usd() and the timeout margin from the invocation wall.
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.invoke.return_value = {"StatusCode": 202}
+        result = self._invoke(
+            client,
+            lambda: self._envelope({"total_obs": 7, "duration_s": 3.5, "duration_total_s": 5.0}),
+        )
+        assert result["lambda_duration"] == 5.0
+
     def test_polls_until_result_lands(self, monkeypatch):
         from unittest.mock import MagicMock
 
@@ -3990,7 +4003,9 @@ class TestDispatchRunStats:
         from zagg import runner
         from zagg.telemetry import build_record, flatten_record
 
-        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 2048)
+        # Six rows (~6 KB) overflow; the two inline rows (~2.1 KB, a row is
+        # ~1 KB wide since the issue #589 column) still fit.
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 4096)
         client = self._Client()
         rows = self._rows(n_ok=5, n_fail=1)
         # A fallback-success row (success=True) the caller marked inline-required.

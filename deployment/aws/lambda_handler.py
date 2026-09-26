@@ -1939,6 +1939,9 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             # inside stays gated on ``profile`` (raster.py).
             if "phase_timings" in meta:
                 body["phase_timings"] = meta["phase_timings"]
+            # Invocation wall to the record (issue #589; uniform column with
+            # the point path — a raster ``duration_s`` already spans the write).
+            body["duration_total_s"] = time.time() - start_time
             # Per-shard stats record (issue #297): envelope ride + the leaf
             # sidecar (only when the unit wrote a leaf — ``leaf_written`` is the
             # accurate signal, set iff a slab streamed and the leaf was stamped;
@@ -2074,6 +2077,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         }
         if profile:
             body["phase_timings"]["stages"] = stage_stats
+        body["duration_total_s"] = time.time() - start_time  # issue #589, as above
         # Stats record (issue #297): envelope ride only — a flat store has no
         # per-shard leaf for a sidecar sibling (see the PR #302 discussion).
         from zagg.telemetry import build_record, lambda_env, raster_granule_ids
@@ -2137,6 +2141,9 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # process-cumulative (like ``ru_maxrss``), so snapshot at entry and diff at
     # the telemetry stamp below for THIS invocation's user+sys seconds.
     cpu_t0 = os.times()
+    # Invocation wall clock (issue #589): entry -> the stats record, so the
+    # billed duration covers the write side ``duration_s`` stops before.
+    t_entry = time.time()
 
     try:
         # Validate required parameters. ``child_order`` is HEALPix-specific and
@@ -2395,6 +2402,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         metadata["cpu_seconds"] = round(
             (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system), 3
         )
+        # Whole-invocation wall (issue #589): ``duration_s`` is the worker's
+        # read + index + aggregate clock, stamped before the leaf write, hash,
+        # column fold and refs commit — this is what the record prices from.
+        metadata["duration_total_s"] = time.time() - t_entry
 
         # Per-shard stats record (issue #297): rides the response envelope
         # (``body["stats"]``) so the dispatcher builds the run parquet with no

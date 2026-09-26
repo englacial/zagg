@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from zagg.dispatch import BENIGN_ERRORS
+from zagg.telemetry import billed_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -1000,7 +1001,7 @@ class StatusPoller:
             "status_code": status_code,
             "body": body,
             "wall_time": self._clock() - start,
-            "lambda_duration": (body or {}).get("duration_s", 0),
+            "lambda_duration": billed_seconds(body),
             "error": error,
             "retries": entry.attempts - 1,
             "timeout": False,
