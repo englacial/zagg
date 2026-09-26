@@ -1306,13 +1306,24 @@ class Run:
         Synchronous, fail-open, the same seam ``runner._run_lambda`` takes.
         Gated on the dispatch's init record, or — on a reattached run, which
         never held one — on the config's knob (``get_icechunk``; the worker
-        refuses a repo-less store and the invoke fails open).
+        refuses a repo-less store and the invoke fails open). A reattached
+        run finalizes only under the manifest config's pinned ``commit:
+        "leaf"``: a ``"ladder"`` run (``runner._run_lambda`` under ``sweep:
+        "stages"``) lands its last commits in the staged sweep that dispatcher
+        chains after the tail marker, so its finalize is that dispatcher's
+        alone and attach never fires it (``{"skipped"}`` on the handle).
         """
         from zagg import runner
-        from zagg.config import get_icechunk
+        from zagg.config import get_icechunk, get_icechunk_options
 
-        if self._icechunk_init is None and not (self._attached and get_icechunk(self.config)):
-            return
+        if self._icechunk_init is None:
+            if not (self._attached and get_icechunk(self.config)):
+                return
+            if get_icechunk_options(self.config)["commit"] != "leaf":
+                handle.icechunk_finalize = {
+                    "skipped": "attached ladder run; its dispatcher finalizes after the staged sweep"
+                }
+                return
         handle.icechunk_finalize = runner._invoke_lambda_icechunk_finalize(
             client,
             self.function_name,
