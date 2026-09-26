@@ -1260,6 +1260,23 @@ class TestRasterHiveWorker:
         assert red.shape == (1, grid.cells_per_shard)
         assert (red[0, :][valid] == 555).all()
 
+    def test_refuses_a_versioned_root(self, tmp_path):
+        # The raster writer stays legacy; its clear-and-template must not
+        # delete a versioned leaf's versions (spec §1.5, issue #582).
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.store import open_store
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        leaf = hive.shard_leaf_path(root, shard)
+        pointer = {"complete": True}
+        hive.write_pointer_stamp(open_store(leaf), pointer, "run-r-cafef00d")
+        with pytest.raises(ValueError, match="is versioned"):
+            process_and_write_raster_hive(
+                shard, granules, grid, root, cfg, store_kwargs={}, window=None
+            )
+        assert hive.read_commit(leaf)["current"] == "run-r-cafef00d"
+
     def test_schedule_none_bare_leaf(self, tmp_path):
         from zagg import hive
         from zagg.processing.raster import process_and_write_raster_hive
