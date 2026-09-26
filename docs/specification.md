@@ -3641,7 +3641,12 @@ commit), after the fan-out drained under `commit: "leaf"`. Never by a stage
 node — tags, expiry and collection are singleton repo operations, and never
 inside the staged sweep's finisher, which is lease-scoped, load-bearing
 store-root machinery while the repo is fail-open (and which a per-leaf run
-does not have). One finalize, in order:
+does not have). On the Lambda backend the stage nodes are `Event` invokes,
+so a staged sweep that did not complete — its dispatch failed, a barrier
+expired or the finisher did not land — may still have node commits in
+flight: the dispatcher then does NOT finalize and records
+`icechunk_finalize: {skipped: <reason>}` and the run stays untagged (its
+commits are kept; the next run's tag covers them). One finalize, in order:
 
 1. **retention** — `output.icechunk.retain_runs` = K. `0` (the default)
    keeps every run and does nothing here. K > 0: the run tags beyond the
@@ -3671,7 +3676,7 @@ Idempotent: a finalize whose tag already exists returns it and writes
 nothing. Fail-open (D9) at the dispatcher like the init; the record rides
 the run summary as `icechunk_finalize` (`{path, tag, snapshot, tagged,
 retain_runs, tags_deleted, snapshots_expired, gc, rewrite_pending,
-commit_s}` or `{error}`), not the run parquet, whose write precedes the
+commit_s}`, `{error}` or `{skipped}`), not the run parquet, whose write precedes the
 staged sweep on both backends; the tag itself is the durable outcome.
 `rewrite_manifests` is NOT run by finalize: a §11.5 split ratchet is a
 rare, deliberate, whole-repo operation with no run to attach to (at the

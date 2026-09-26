@@ -4342,6 +4342,7 @@ def _run_lambda(
         # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
         # come from the envelope stats records; a stale deployed worker's
         # record-less envelope simply contributes no leaf.
+        stage_chained, staged = False, None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -4375,7 +4376,8 @@ def _run_lambda(
                 # _run_local: their nodes re-gather refs, nothing is re-folded.
                 dirt_only = dirt_only_leaves(ok_bodies)
                 if (leaves or dirt_only) and config.output.get("sweep") == "stages":
-                    _invoke_lambda_stage_sweep(
+                    stage_chained = True
+                    staged = _invoke_lambda_stage_sweep(
                         state["lambda_client"],
                         function_name,
                         store_path,
@@ -4391,8 +4393,16 @@ def _run_lambda(
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
         # worker invoke AFTER the staged sweep returned (its finisher is the
         # last ladder commit) — the dispatcher never writes (D8). Fail-open.
-        summary["icechunk_finalize"] = (
-            _invoke_lambda_icechunk_finalize(
+        # The stage nodes are Event invokes, so a sweep that did not complete
+        # may still have node commits in flight: no tag then (review finding).
+        skip = _staged_sweep_incomplete(staged) if stage_chained else None
+        if icechunk_init is None:
+            summary["icechunk_finalize"] = None
+        elif skip is not None:
+            logger.warning(f"icechunk finalize skipped, run left untagged (issue #582): {skip}")
+            summary["icechunk_finalize"] = {"skipped": skip}
+        else:
+            summary["icechunk_finalize"] = _invoke_lambda_icechunk_finalize(
                 state["lambda_client"],
                 function_name,
                 store_path,
@@ -4401,9 +4411,6 @@ def _run_lambda(
                 icechunk_init=icechunk_init,
                 output_creds_event=output_creds_event,
             )
-            if icechunk_init is not None
-            else None
-        )
         logger.info(
             f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
         )
@@ -5793,6 +5800,25 @@ def _finalize_icechunk_local(
     except Exception as e:
         logger.warning(f"icechunk finalize failed (fail-open, issue #582): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _staged_sweep_incomplete(staged: dict | None) -> str | None:
+    """Why a chained fleet staged sweep may still have commits in flight, or ``None``.
+
+    The fleet finalize's gate (issue #582): the stage nodes are ``Event``
+    invokes, so a failed dispatch (the seam's ``None``), an expired barrier or
+    a finisher that did not land leaves node commits unaccounted for — a tag
+    then would not be "the store as the run left it" (spec §11.4). A sweep
+    that fired nothing (``skipped``) has nothing in flight.
+    """
+    if staged is None:
+        return "staged sweep dispatch failed"
+    if staged.get("barrier_timed_out"):
+        return "staged sweep barrier timed out"
+    finisher = staged.get("finisher") or {}
+    if finisher.get("fired") and not finisher.get("landed"):
+        return "staged sweep finisher did not land"
+    return None
 
 
 def _invoke_lambda_icechunk_finalize(
