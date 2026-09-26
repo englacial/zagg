@@ -505,13 +505,43 @@ class TestFinalizeOperation:
         return (datetime.now(timezone.utc) + timedelta(seconds=offset_s)).strftime("%Y%m%dT%H%M%SZ")
 
     def _record(self, root, ts=None, **fields):
-        """A staged-sweep run record at the store root, as the finisher writes it."""
+        """A staged-sweep run record at the store root, as the finisher writes it.
+
+        The root-record shape of ``sweep_stages.run_stage_finisher`` through
+        ``_write_stage_record`` (``{"spec", "mode": "stages", **summary}``),
+        with the sweep's own run id and ``run_finisher``'s block; ``fields``
+        override it.
+        """
         from zagg.store import open_object_store, put_object
+        from zagg.sweep import SWEEP_SPEC
 
         ts = ts or self._stamp()
-        record = {"mode": "stages", "barrier_timed_out": False, "finisher": {}, **fields}
+        record = {
+            "spec": SWEEP_SPEC,
+            "mode": "stages",
+            "run_id": "sweep-0001",
+            "store_root": root,
+            "shard_order": 4,
+            "transport": "lambda",
+            "n_leaves": 1,
+            "skipped_leaves": 0,
+            "stage_records": 1,
+            "stages": [],
+            "levels": {},
+            "barrier_timed_out": False,
+            "finisher": {
+                "root_moc": True,
+                "manifest_updated": True,
+                "objects_touched": 0,
+                "touch_failures": 0,
+                "lease_released": True,
+            },
+            "lease": {"released": True},
+            "duration_s": 1.0,
+            **fields,
+        }
         key = f"sweep_stats_{ts}_stages.json"
-        put_object(open_object_store(root), key, json.dumps(record).encode())
+        put_object(open_object_store(root), key, json.dumps(record, indent=1).encode())
         return key
 
     def test_tags_a_completed_newest_untagged_run(self, monkeypatch, cfg, tmp_path):
@@ -552,6 +582,23 @@ class TestFinalizeOperation:
         with pytest.raises(ValueError, match=reason):
             icechunk_ops.finalize(root, RUN, store_kwargs={})
         assert len(_messages(root)) == n and not _open(root)[1].list_tags()
+
+    @pytest.mark.parametrize("newer_complete", [False, True])
+    def test_the_newest_record_decides(self, monkeypatch, cfg, tmp_path, newer_complete):
+        # Two records since the init: only the newest stands for the ladder. A
+        # newer barrier-expired record refuses despite an older complete one;
+        # a newer complete one tags despite an older incomplete one.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        self._record(root, ts=self._stamp(60), barrier_timed_out=newer_complete)
+        newer = self._record(root, ts=self._stamp(120), barrier_timed_out=not newer_complete)
+        if newer_complete:
+            out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+            assert out["tagged"] is True and out["stage_record"] == newer
+        else:
+            with pytest.raises(ValueError, match=f"{newer} does not show a completed sweep"):
+                icechunk_ops.finalize(root, RUN, store_kwargs={})
+            assert not _open(root)[1].list_tags()
 
     def test_refuses_without_a_record_since_the_init_commit(self, monkeypatch, cfg, tmp_path):
         # No record at all, then one older than the run's init commit — though
