@@ -2184,11 +2184,10 @@ unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
 `dggs` block carries the §1 `latitude` token, so each fixture is the
 absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
 for both (the sidecar copy and §1's own evidence paragraph are the record
-for what those artifacts mean); likewise no committed leaf is **versioned**
-(§1.5; a stamp naming `current`) — a versioned-leaf fixture (pointer root, `current`,
-one version subgroup) joins the set with the writer that produces it (issue
-[#582](https://github.com/englacial/zagg/issues/582)), added **standalone**:
-it does not wait on the deferred regeneration of the other fixtures below.
+for what those artifacts mean). The one **versioned** leaf (§1.5; a stamp
+naming `current`) is `versioned/` below, added standalone with the writer
+that produces it (issue [#582](https://github.com/englacial/zagg/issues/582));
+the older leaf fixtures stay legacy and pin the absent-`current` rule.
 Regeneration of those is deferred because it would
 also install the §4.9 `multiscales` mirror that `column/` pins the
 **absence** of, retiring an unrelated pin.
@@ -2202,6 +2201,18 @@ never sharded, §8/#247):
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
+- **`versioned/`** — `minimal/`'s inputs written as a **versioned leaf**
+  (§1.5, issue [#582](https://github.com/englacial/zagg/issues/582)): the
+  stable root `{id}.zarr/zarr.json` is a pointer stamp naming `current`
+  (`run-{run_id}-{attempt}`), and the arrays, the coverage sidecar and the
+  version's own stamp sit in that subgroup — nothing else at the root.
+  `versioned.expected.json` records `pointer` (the root), `version` (the
+  `current` value) and `run_id`, with `leaf` pointing at the version so
+  every leaf-shaped assertion applies unchanged; the conformance suite
+  decodes the pointer from the on-disk JSON alone and pins that one reader
+  rule (open the root; follow `current` when named, else read the root)
+  resolves `minimal/` and `versioned/` alike. The pointer's `spec` is the
+  legacy token (`/1`): versioning is the `current` key, never a token.
 - **`flux/`** — the §2.0 `weights` declaration surface: one flux-declared
   digest field (`rx_flux`, `weights: "flux"` stamped beside the `ragged`
   block, `gain` provenance attrs) plus `count`. Its payloads carry
