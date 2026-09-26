@@ -1,8 +1,11 @@
 # Windowed-emit measurement config (issue #586 phase 1) -- the live ATL03 store's
-# build template (atl03_tdigest_strata_healpix.yaml, copied verbatim below the
-# marker) plus the three knobs the measurement varies: a YEARLY window schedule
-# on the store's own ``delta_time`` clock, the staged sweep, and the dense
-# overview ladder from 13 down. Run it against ONE order-6 cell into a scratch
+# build template (atl03_tdigest_strata_healpix.yaml, byte-identical below the
+# marker except that its ``pyramid: false`` line is REPLACED by the knob block)
+# carrying the three knobs the measurement varies: a YEARLY window schedule on
+# the store's own ``delta_time`` clock, the staged sweep, and the dense overview
+# ladder from 13 down. Yearly windows are calendar years, so the catalog dates
+# below give 9 windows (2018..2026), the first (2018, from Oct 14) and last
+# (2026, to Sep 1) partial: read the per-unit quantiles with that in mind. Run it against ONE order-6 cell into a scratch
 # store, never the live store. The config differs between the arms ONLY in
 # ``output.windowing`` (delete the block for the baseline arm), but the RUNS also
 # differ in Icechunk: an unset ``output.icechunk`` resolves ON for the unwindowed
