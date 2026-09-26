@@ -57,8 +57,9 @@ whole shard.
 **Hive products are read one leaf at a time**: a leaf zarr (issue #199) is
 exactly this layout scoped to one shard — the same ``{group}`` path, the
 ``morton`` sibling, the versioned ragged attrs, and the whole-leaf
-ShardingCodec (one stored span) — so open the leaf store
-(``hive.shard_leaf_path``) and pass the same ``field`` path. The readers are
+ShardingCodec (one stored span) — so open the leaf store, resolved through
+its root stamp (``hive.resolve_leaf``: a versioned leaf's arrays sit under the
+version its stamp names, spec §1.5), and pass the same ``field`` path. The readers are
 store-scoped and never traverse the hive digit tree (leaf discovery is the
 walker's/coverage MOC's job, issue #200).
 
