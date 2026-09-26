@@ -254,8 +254,20 @@ class TestRetrofitFollowThrough:
         assert summary["icechunk"]["added"] == ["1", "2", "3", "4", "5"]
         group, _repo = _open(root)
         assert group.attrs[MULTISCALES_ATTR] == hive.read_manifest(root)[MULTISCALES_ATTR]
-        # An unchanged declaration writes neither plane.
-        assert declare_pyramid(root, cfg, chunk_order=5)["icechunk"] is None
+        # An unchanged declaration writes neither plane, but still vets the repo.
+        n = len(_messages(root))
+        assert declare_pyramid(root, cfg, chunk_order=5)["icechunk"]["unchanged"] is True
+        assert len(_messages(root)) == n
+
+    def test_an_unchanged_manifest_still_repairs_a_lagging_repo(self, monkeypatch, cfg, tmp_path):
+        from zagg.sweep_overview import declare_pyramid
+
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)  # the manifest is declared, the repo is not
+        summary = declare_pyramid(root, cfg, chunk_order=5)
+        assert summary["updated"] is False
+        assert summary["icechunk"]["added"] == ["1", "2", "3", "4", "5"]
 
     def test_without_a_repo_and_on_a_repo_error(self, monkeypatch, cfg, tmp_path):
         from zagg import sweep_overview
