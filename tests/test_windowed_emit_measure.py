@@ -64,6 +64,7 @@ def _store(tmp_path, *, windows):
     # the ladder's stage rows: Icechunk is OFF on a windowed store (spec 11.6)
     stages = [
         {"dispatch_order": 3, "written": 4, "icechunk_commits": 0, "icechunk_rebases": 0},
+        {"dispatch_order": 3, "written": 2, "icechunk_commits": 1, "icechunk_rebases": 0},
         {
             "dispatch_order": 0,
             "written": 1,
@@ -75,6 +76,9 @@ def _store(tmp_path, *, windows):
     if windows:
         stages = [{k: v for k, v in s.items() if not k.startswith("icechunk_")} for s in stages]
     (root / "sweep_stats_20260101T000000Z_stages.json").write_text(json.dumps({"stages": stages}))
+    # an older sweep record: kept apart, not mixed into the newest one's sums
+    older = {"stages": [{"dispatch_order": 0, "written": 99, "icechunk_commits": 99}]}
+    (root / "sweep_stats_20251231T000000Z_stages.json").write_text(json.dumps(older))
     return str(root)
 
 
@@ -98,15 +102,21 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     assert base["objects"]["sibling_bytes"] == {"all.pyramid": 20}
     assert win["objects"]["leaves_per_shard"]["p100"] == 3.0
     assert win["objects"]["sibling_bytes"] == {f"{w}.pyramid": 20 for w in ("2019", "2020", "2021")}
-    # ladder: the stage rows' icechunk counters
-    assert win["ladder"]["stage_records"] == base["ladder"]["stage_records"] == 2
-    assert [s["icechunk_commits"] for s in base["ladder"]["stages"]] == [0, 2]
+    # ladder: the newest record's batch rows summed per dispatch order
+    assert win["ladder"]["batch_rows"] == base["ladder"]["batch_rows"] == 3
+    assert base["ladder"]["record"] == "sweep_stats_20260101T000000Z_stages.json"
+    assert len(base["ladder"]["records"]) == 2
+    assert [
+        (s["dispatch_order"], s["batches"], s["written"], s["icechunk_commits"])
+        for s in base["ladder"]["stages"]
+    ] == [(0, 1, 1, 2), (3, 2, 6, 1)]
+    assert [s["icechunk_commits"] for s in win["ladder"]["stages"]] == [None, None]
     tool.print_table([base, win])
     out = capsys.readouterr().out
     assert "windows per shard" in out
     # measured on the baseline, not measured (``-``, never ``0``) on the windowed arm
     (commits,) = [ln.split() for ln in out.splitlines() if ln.startswith("icechunk commits")]
-    assert commits[-2:] == ["2", "-"]
+    assert commits[-2:] == ["3", "-"]
     assert out.count("yearly") == 1 and out.count("none") == 1
 
 
@@ -149,4 +159,4 @@ def test_empty_store_is_reported_not_fatal(tmp_path):
     root.mkdir()
     result = tool.measure(str(root), store_kwargs={})
     assert result["fleet"] == {"runs": 0, "units": 0}
-    assert result["objects"]["shards_listed"] == 0 and result["ladder"]["stage_records"] == 0
+    assert result["objects"]["shards_listed"] == 0 and result["ladder"]["batch_rows"] == 0

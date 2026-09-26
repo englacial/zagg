@@ -9,8 +9,9 @@ the WINDOWED arm of the same order-6 cell, built with
   quantiles, timeouts/errors, GB-seconds;
 - the object numbers off the tree: leaves, objects and bytes per shard (one
   LIST per shard node; capped by ``--max-shards``);
-- the ladder numbers off the staged sweep record (``sweep_stats_*_stages.json``):
-  per-stage ``icechunk_commits`` / ``icechunk_rebases`` / ``icechunk_commit_s``,
+- the ladder numbers off the staged sweep record (``sweep_stats_*_stages.json``,
+  the newest one; each record kept apart in the JSON), summed per
+  ``dispatch_order`` over its per-batch rows: ``icechunk_commits`` / ``icechunk_rebases`` / ``icechunk_commit_s``,
   objects written. Icechunk is OFF on a windowed store (spec section 11.6), so
   its stage rows carry no ``icechunk_*`` keys and the table prints ``-`` (not
   measured), not ``0``: the arms' ladders compare like for like only once
@@ -185,25 +186,57 @@ def object_numbers(store, store_root: str, shard_keys, max_shards: int) -> dict:
     }
 
 
-def ladder_numbers(store) -> dict:
-    """Per-stage counters off the staged sweep records at the root."""
-    stages = []
-    for o in _root_objects(store):
-        if _STAGE_RECORD.match(o["path"].rsplit("/", 1)[-1]):
-            record = json.loads(_get(store, o["path"]))
-            stages.extend(record.get("stages") or [])
-    keys = (
-        "written",
-        "icechunk_commits",
-        "icechunk_rebases",
-        "icechunk_commit_s",
-        "icechunk_refs",
-        "icechunk_s",
-    )
-    rows = [
-        {"dispatch_order": s.get("dispatch_order"), **{k: s.get(k) for k in keys}} for s in stages
+_LADDER_KEYS = (
+    "written",
+    "icechunk_commits",
+    "icechunk_rebases",
+    "icechunk_commit_s",
+    "icechunk_refs",
+    "icechunk_s",
+)
+
+
+def _per_order(rows: list) -> list:
+    """Stage rows summed per ``dispatch_order``: under ``--backend lambda`` the
+    finisher writes one row per BATCH, so an order that fanned out to N batches
+    has N rows. A counter no row carries stays ``None`` (not measured)."""
+    by_order: dict = {}
+    for row in rows:
+        agg = by_order.setdefault(
+            row.get("dispatch_order"), {"batches": 0, **dict.fromkeys(_LADDER_KEYS)}
+        )
+        agg["batches"] += 1
+        for k in _LADDER_KEYS:
+            if row.get(k) is not None:
+                agg[k] = (agg[k] or 0) + row[k]
+    return [
+        {"dispatch_order": order, **agg}
+        for order, agg in sorted(by_order.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))
     ]
-    return {"stage_records": len(rows), "stages": rows}
+
+
+def ladder_numbers(store) -> dict:
+    """Per-``dispatch_order`` counters off the staged sweep records at the root.
+
+    Each ``sweep_stats_*_stages.json`` record is kept apart by name (a re-sweep
+    writes another; mixing them would double-count). ``stages`` / ``batch_rows``
+    are the NEWEST record's (the names are timestamp-first, so the last sorted);
+    ``records`` holds every record's per-order rows.
+    """
+    names = sorted(
+        o["path"] for o in _root_objects(store) if _STAGE_RECORD.match(o["path"].rsplit("/", 1)[-1])
+    )
+    records, rows = {}, []
+    for name in names:
+        rows = json.loads(_get(store, name)).get("stages") or []
+        records[name.rsplit("/", 1)[-1]] = _per_order(rows)
+    latest = next(reversed(records), None)
+    return {
+        "record": latest,
+        "batch_rows": len(rows),
+        "stages": records.get(latest, []),
+        "records": records,
+    }
 
 
 def measure(store_root: str, *, store_kwargs: dict, max_shards: int = 64) -> dict:
@@ -238,8 +271,8 @@ def _fmt(v) -> str:
 
 
 def _stage_sum(result: dict, key: str):
-    """``key`` summed over the stage rows; ``None`` (printed ``-``) when no row
-    carries it — a windowed store's ladder runs without Icechunk."""
+    """``key`` summed over the newest record's per-order rows; ``None`` (printed
+    ``-``) when no row carries it — a windowed store's ladder runs without Icechunk."""
     values = [s[key] for s in result["ladder"]["stages"] if s.get(key) is not None]
     return sum(values) if values else None
 
@@ -265,7 +298,13 @@ def print_table(results: list[dict]) -> None:
         ("objects per shard p50/p90/max", lambda r: _fmt(r["objects"].get("objects_per_shard"))),
         ("bytes per shard p50/p90/max", lambda r: _fmt(r["objects"].get("bytes_per_shard"))),
         ("total leaf bytes", lambda r: _fmt(r["objects"].get("total_leaf_bytes"))),
-        ("stage rows", lambda r: _fmt(r["ladder"].get("stage_records"))),
+        (
+            "sweep records / orders / batches",
+            lambda r: (
+                f"{len(r['ladder']['records'])} / {len(r['ladder']['stages'])}"
+                f" / {r['ladder']['batch_rows']}"
+            ),
+        ),
         ("icechunk commits (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_commits"))),
         ("icechunk rebases (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_rebases"))),
         ("icechunk commit_s (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_commit_s"))),
