@@ -201,7 +201,9 @@ output:
   subset) and run-parquet row, with `window` naming the leaf, so the
   sweep's run-record discovery and `Run.attach` read them as before. The
   invoke-level telemetry (`duration_s`, `max_memory_mb`, `gb_seconds`, the
-  `read` phase) repeats across the invoke's N rows and each carries
+  `read` phase, and `n_obs_read` — the shard's decoded rows, so the #374
+  read-vs-keep ratio is per invoke: `n_obs_read` over the rows' summed
+  `n_obs`) repeats across the invoke's N rows and each carries
   `unit_windows: N` — the leaves the invoke emitted, windows the gate
   skipped not counted (null on a per-window unit) — so per-invoke quantiles stay
   the fleet-safety numbers and a per-invoke sum de-duplicates on

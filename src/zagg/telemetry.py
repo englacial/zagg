@@ -351,10 +351,12 @@ def build_record(
         # Bulk multi-window emit (issue #586 phase 2): the number of leaves
         # the shard invoke that wrote this leaf emitted, when it emitted more
         # than its own — one record per leaf, so ``duration_s`` /
-        # ``max_memory_mb`` / ``gb_seconds`` / the read phase repeat across
-        # the N rows of one invoke (per-invoke quantiles stay the fleet-safety
-        # numbers); a per-invoke SUM de-duplicates on ``(run_id, shard_key)``
-        # where this is set. ``None`` on a ``(shard, window)`` fan-out unit
+        # ``max_memory_mb`` / ``gb_seconds`` / the read phase / ``n_obs_read``
+        # (the shard's decoded rows: one read feeds every window) repeat
+        # across the N rows of one invoke (per-invoke quantiles stay the
+        # fleet-safety numbers; the #374 read-vs-keep ratio is per invoke,
+        # ``n_obs_read`` over the rows' summed ``n_obs``); a per-invoke SUM
+        # de-duplicates on ``(run_id, shard_key)`` where this is set. ``None`` on a ``(shard, window)`` fan-out unit
         # and on unwindowed runs.
         "unit_windows": _opt_int(metadata.get("unit_windows")),
         "run_id": run_id,

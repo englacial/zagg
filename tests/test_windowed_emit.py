@@ -674,6 +674,9 @@ class TestBulkEndToEnd:
         assert all(m["error"] is None and m["shard_key"] == meta["shard_key"] for m in windows)
         # The read phase is the shard's, once; the rest are per window.
         assert len({m["phase_timings"]["read"] for m in windows}) == 1
+        # So is the decoded-row count (finding (11)): invoke-level, repeating.
+        assert [m["total_obs_read"] for m in windows] == [meta["total_obs_read"]] * 3
+        assert meta["total_obs_read"] >= meta["total_obs"]
         assert all(
             {"index", "aggregate", "write", "hash"} <= set(m["phase_timings"]) for m in windows
         )
