@@ -202,8 +202,11 @@ class MocFamily(SweepFamily):
         self._temporal_fields: dict | None = None
         self._cell_order = 0
 
-    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs) -> None:
+    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs, stamp=None) -> None:
         """Read one leaf's §10 temporal contribution; fail-open per SHARD (D9).
+
+        ``stamp`` is the leaf's root stamp: a versioned leaf's arrays are read
+        from the version it names (spec §1.5), resolved inside the fail-open.
 
         A store declaring no temporal field short-circuits after one manifest
         read. An unreadable companion is logged and skipped rather than
@@ -220,6 +223,7 @@ class MocFamily(SweepFamily):
         word is not.
         """
         from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.hive import leaf_data_path
 
         if self._temporal_fields is None:
             from zagg.hive import read_manifest
@@ -237,7 +241,12 @@ class MocFamily(SweepFamily):
         if not self._temporal_fields or decimal in self._temporal_failed:
             return
         try:
-            got = read_leaf_temporal(leaf, self._cell_order, self._temporal_fields, **store_kwargs)
+            got = read_leaf_temporal(
+                leaf_data_path(leaf, stamp),
+                self._cell_order,
+                self._temporal_fields,
+                **store_kwargs,
+            )
         except Exception as e:
             logger.warning(
                 f"sweep[moc]: dropping shard {decimal} from the temporal section — "
@@ -261,7 +270,7 @@ class MocFamily(SweepFamily):
         stamp = read_commit(open_store(leaf, **store_kwargs))
         if stamp is None:
             return None  # absent leaf or unstamped debris (D4)
-        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs)
+        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs, stamp)
         payload = _moc_payload([morton_word(decimal)], stamp.get("time_range"))
         return payload, stamp.get("written_at")
 

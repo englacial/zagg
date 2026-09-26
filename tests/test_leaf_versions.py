@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import zarr
-from test_icechunk_refs import _grid, _ladder_run, _shards, _write_leaf
+from test_icechunk_refs import _LEAVES, _grid, _ladder_run, _shards, _write_leaf
 
 from zagg import hive, icechunk_refs, lifecycle
 from zagg.config import default_config
@@ -308,6 +308,73 @@ class TestSkipGate:
         assert hive._leaf_is_committed(leaf, {}, 1) is None
         hive.stamp_commit(open_store(f"{leaf}/{version}"), cells_with_data=1, granule_count=1)
         assert hive._leaf_is_committed(leaf, {}, 1)["current"] == version
+
+
+def _temporal_probe(monkeypatch):
+    """Stub the §10 temporal knobs; the reader opens the cell-order group it is
+    handed exactly as ``read_leaf_temporal`` does, so a root-level open of a
+    versioned leaf fails the way production would (GroupNotFoundError)."""
+    from zagg import coverage_toc
+
+    seen = []
+
+    def fake(leaf_root, cell_order, fields, **_kw):
+        zarr.open_group(leaf_root, path=str(cell_order), mode="r")["count"]
+        seen.append(leaf_root)
+
+    monkeypatch.setattr(coverage_toc, "read_leaf_temporal", fake)
+    monkeypatch.setattr(coverage_toc, "temporal_fields", lambda m: {"h": {}})
+    monkeypatch.setattr(coverage_toc, "temporal_cell_order", lambda m: 6)
+    return seen
+
+
+class TestReaders:
+    """Every leaf-array reader resolves through the root stamp (spec §1.5)."""
+
+    def _store(self, monkeypatch, cfg, tmp_path, *, converted=False):
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(grid, dataset={"short_name": "X"}))
+        (shard,) = _shards(grid, 1)
+        if converted:  # a legacy write first: the root keeps stale arrays
+            _write_leaf(monkeypatch, grid, root, shard, refs=False)
+        meta = _write_leaf(monkeypatch, grid, root, shard, fill=3.0, refs=False, run_id=RUN_A)
+        leaf = hive.shard_leaf_path(root, shard)
+        return root, leaf, f"{leaf}/{meta['leaf_version']}"
+
+    def test_moc_sweep_temporal_reads_the_version(self, monkeypatch, cfg, tmp_path):
+        from zagg.sweep import MocFamily
+
+        root, _leaf, version = self._store(monkeypatch, cfg, tmp_path)
+        seen = _temporal_probe(monkeypatch)
+        family = MocFamily()
+        assert family.read_leaf(root, _LEAVES[0], None, None, {}) is not None
+        assert seen == [version] and not family._temporal_failed
+
+    def test_coverage_refresh_temporal_reads_the_version(self, monkeypatch, cfg, tmp_path):
+        from zagg.coverage import refresh_root_coverage
+
+        root, _leaf, version = self._store(monkeypatch, cfg, tmp_path)
+        seen = _temporal_probe(monkeypatch)
+        refresh_root_coverage(root)
+        assert seen == [version]
+
+    def test_pyramid_check_leaf_group_reads_the_version(self, monkeypatch, cfg, tmp_path):
+        from zagg.pyramid_check_core import _Harness
+
+        root, leaf, version = self._store(monkeypatch, cfg, tmp_path, converted=True)
+        harness = _Harness(
+            root,
+            hive.read_manifest(root),
+            {},
+            rng=np.random.default_rng(0),
+            sample_nodes=None,
+            sample_cells=None,
+        )
+        got = harness.leaf_group(_LEAVES[0])["h_mean"][:]
+        np.testing.assert_array_equal(got, zarr.open_group(version, mode="r")["6"]["h_mean"][:])
+        stale = zarr.open_group(leaf, mode="r")["6"]["h_mean"][:]  # the converted root
+        assert not np.array_equal(got, stale)
 
 
 class TestKnob:
