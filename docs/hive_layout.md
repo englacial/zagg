@@ -533,7 +533,11 @@ python -m zagg.sweep s3://bucket/store --stages --partitions 16
 
 or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
 chained immediately after a fleet run with the opt-in `output.sweep:
-"stages"` (auto-scoped to the run's own footprint). Work is discovered from
+"stages"` (auto-scoped to the run's own footprint) — from `python -m zagg`
+and from the `client` facade's `Run.dispatch` alike ([issue
+#588](https://github.com/englacial/zagg/issues/588); the facade's post-run
+tail chains it after the run record and the rollup sweep, and the summary
+rides the handle as `handle.stage_sweep`). Work is discovered from
 the **run records** (listing-based; the root `coverage.moc` is an
 accelerator for sibling candidates, never the source of truth — a fleet
 append with no subsequent sweep leaves it stale, and discovery still finds
@@ -1508,8 +1512,9 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   column's declared member and one per declared overview level, keyed by
   cell order — defines their array nodes, one manifest split per group, the
   virtual chunk container and the `multiscales` mirror, and commits
-  `init {run_id}` (every run — empty when the block is unchanged, so the
-  ancestry brackets each run). Idempotent — a rerun reopens; a repo built for another
+  `init {run_id}` (every run — empty when the block is unchanged, labelled
+  `split ratchet {from}->{to} {run_id}` when it re-cuts, so the ancestry
+  brackets each run). Idempotent — a rerun reopens; a repo built for another
   geometry or container is refused, while `split_order` follows the ratchet
   below and `commit` / `commit_order` are per-run, never compared. The record (`path`, `snapshot`, `created`, `options`,
   `levels`, `ladder`, `split_ratchet`) rides the run summary under
@@ -1552,8 +1557,10 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   `icechunk_rebases` off the stage records.
 - **`mode: "icechunk_finalize"`** ([issue #582](https://github.com/englacial/zagg/issues/582),
   spec §11.4), one synchronous invoke AFTER every commit of the run landed —
-  after the staged sweep returned under the ladder, after the fan-out under
-  `commit: "leaf"` (the local backend calls
+  after the staged sweep returned under the ladder (on both Lambda
+  dispatchers, the CLI and the `client` facade: a sweep that did not
+  complete leaves the run untagged, `icechunk_finalize: {skipped}`), after
+  the fan-out under `commit: "leaf"` (the local backend calls
   `zagg.icechunk_finalize.finalize_repo` in-process at the same point): applies
   the `retain_runs` retention below, makes one content-free `finalize
   {run_id}` commit whose metadata names the run (`run_id`, `semantic_hash`,
@@ -1564,7 +1571,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   here. The record rides the run summary under `icechunk_finalize`; the tag
   is the durable outcome (`repo.lookup_tag("run-…")`, `ancestry(tag=…)`).
   `Run.attach` fires it too, off the config's knob and only for a pinned
-  `commit: "leaf"` run (a ladder run's is its dispatcher's), with
+  `commit: "leaf"` run with no `sweep: "stages"` (a `sweep: "stages"`
+  run's is its dispatcher's, after the staged sweep), with
   `newest_only: true` (written only while the run is the newest on the repo,
   else `{skipped}`) and `icechunk_init: null`, so `rewrite_pending` is
   always null there.
@@ -1575,6 +1583,7 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   ```
   python -m zagg.icechunk_ops <store_root> set-attrs /19 '{"dggs": {...}}'   # root "/", a level "/{cells}", an array "/{cells}/{array}"; null deletes a key
   python -m zagg.icechunk_ops <store_root> declare-pyramid config.yaml     # levels + multiscales follow the manifest's declaration
+  python -m zagg.icechunk_ops <store_root> finalize <run_id>              # tag a completed-but-untagged ladder run (the repo's newest run only)
   ```
 
   Before the commit the array model of every array must be unchanged and
@@ -1584,6 +1593,21 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   split), delists a no-longer-declared one without deleting its group, and
   refuses a geometry change (that is a `/2` revision). The manifest
   retrofit runs `declare-pyramid` itself ([above](#retrofitting-the-pyramid-declaration)).
+  `finalize` ([issue #588](https://github.com/englacial/zagg/issues/588))
+  is the repair for a ladder run whose dispatcher died after the staged
+  sweep completed but before its finalize (`icechunk_finalize: {skipped}`
+  on the CLI summary / `handle.icechunk_finalize` on the facade, or no
+  record at all): it reads the run's dispatch manifest for its config
+  (`retain_runs`, the semantic hash — no `--retain-runs`; the manifest
+  write is best-effort, so a run whose manifest was dropped — a large hive
+  run over the async payload cap, a lost setup invoke — is refused and
+  left to the next run's tag), refuses unless
+  the newest `sweep_stats_*_stages.json` since the run's init commit
+  (the repo's clock) shows a completed sweep, and tags `newest_only` — an
+  older untagged run stays covered by the next run's tag. The record is
+  tied to the run by time only, so with overlapping runs on one store a
+  sibling run's sweep record can vouch for it. No `--force`: an incomplete sweep is
+  completed with `python -m zagg.sweep <store> --stages` first.
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M
@@ -1615,7 +1639,8 @@ warning; a coarser value re-cuts new manifests from this run on and flags
 the run parquet's `icechunk_split_ratchet` for a later `rewrite_manifests`
 pass over the old ones. `tuple_width` is unchanged (3). An unset `commit`
 resolves to `ladder` only when the run walks it — the dispatcher chains the
-staged sweep (`output.sweep: "stages"`; the `client` facade never does) and
+staged sweep (`output.sweep: "stages"`, on every dispatcher: the CLI, the
+local backend and the `client` facade, issue #588) and
 the store declares a `/2` ladder with at least one composable field
 (`zagg.icechunk_refs.ladder_walks`) — and to `leaf` otherwise, so no run
 writes sidecars nothing gathers. The Lambda dispatchers ship the resolved

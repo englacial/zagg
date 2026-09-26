@@ -77,6 +77,7 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_sweep,
+    get_touch_policy,
     get_windowing,
     load_config,
     load_config_from_dict,
@@ -153,6 +154,15 @@ class RunHandle:
     harvest loop means a completed run; :meth:`wait` is the explicit form (and
     the only one taking a timeout). Only a handle nobody drains truncates the
     tail — the finisher is a daemon so that case cannot hang exit.
+
+    Under ``output.sweep: "stages"`` the tail also chains the staged sweep
+    (issue #588), invoke-and-poll on the finisher thread, so the join can
+    block up to the fleet's total barrier budget
+    (:data:`zagg.sweep_fleet.DEFAULT_TOTAL_BARRIER_BUDGET_S`, 7,200 s) after
+    the last shard settles. A process exit or kernel restart in that window
+    cuts the sweep off while it holds the store lease; the lease's TTL expiry
+    is the designed recovery (see ``runner._invoke_lambda_stage_sweep``, "If
+    the dispatcher dies mid-barrier"), and the run is left untagged.
     """
 
     def __init__(
@@ -175,11 +185,18 @@ class RunHandle:
         #: fail-open invoke; ``None`` while the tail is in flight and when
         #: the knob is off (or, on a dispatch, the run stood up no repo). A
         #: reattached handle finalizes off the knob: ``{"error": ...}`` when
-        #: the store has no repo, ``{"skipped": ...}`` for a ladder run (its
-        #: dispatcher finalizes) or when a later run has committed since
+        #: the store has no repo, ``{"skipped": ...}`` for a ``sweep:
+        #: "stages"`` run (its dispatcher finalizes) or when a later run has committed since
         #: (newest-only); an already-tagged run is a no-op. Read it after
         #: :meth:`wait` or a drained harvest.
         self.icechunk_finalize: dict | None = None
+        #: The tail's staged-sweep summary (issue #588) once the tail chained
+        #: one — ``output.sweep: "stages"`` with leaves or dirt-only units —
+        #: the same dict ``runner._run_lambda`` reports; ``None`` while the
+        #: tail is in flight, when no staged sweep was chained, or when its
+        #: dispatch failed (fail-open, D9 — ``icechunk_finalize`` then says
+        #: ``{"skipped"}``).
+        self.stage_sweep: dict | None = None
 
     def __len__(self) -> int:
         return len(self.futures)
@@ -340,7 +357,10 @@ class RunHandle:
         (``runner._RUN_STATS_VERIFY_WINDOW_S``, 20 s as shipped) and re-fires
         once if it has not — so even a fully successful run can spend ~2x that
         window here. Anything under ~40 s risks a false ``TimeoutError``; pass
-        ``None`` to just block (review finding, PR #333).
+        ``None`` to just block (review finding, PR #333). Under ``output.sweep:
+        "stages"`` the tail also runs the staged sweep (issue #588), bounded by
+        :data:`zagg.sweep_fleet.DEFAULT_TOTAL_BARRIER_BUDGET_S` (7,200 s), so
+        size ``timeout`` off that budget there, or pass ``None``.
         """
         if self._finisher is not None:
             self._finisher.join(timeout)
@@ -720,7 +740,13 @@ class Run:
         Returns as soon as the setup handshake completes (worker-side template
         / manifest write — one short synchronous invoke; hive additionally
         fail-fast-pings first): the fan-out itself runs in the background and
-        each shard's outcome arrives through its future.
+        each shard's outcome arrives through its future. The config ships
+        with its Icechunk ``commit`` mode pinned the way ``runner._run_lambda``
+        pins it (issue #588): ``ladder`` when ``output.sweep: "stages"`` walks
+        a ``/2`` ladder — the tail chains that staged sweep — else ``leaf``.
+        Under ``sweep: "stages"`` the handle's tail chains the staged sweep
+        whatever the mode, so draining it can block up to the fleet's total
+        barrier budget (see :class:`RunHandle`).
 
         Parameters
         ----------
@@ -822,9 +848,11 @@ class Run:
         )
 
         s3_creds = self._source_credentials or runner._resolve_source_credentials(self.config)
-        # The facade chains no staged sweep, so the ref ladder never runs
-        # here: an unset icechunk ``commit`` ships pinned per-leaf (#580).
-        config_dict = asdict(runner._pin_icechunk_commit(self.config, self.grid, stages=False))
+        # The Icechunk commit mode ships resolved (#580): the tail chains the
+        # staged sweep under ``output.sweep: "stages"`` exactly as
+        # ``runner._run_lambda`` does (issue #588), so the same pin applies —
+        # ``ladder`` when the run walks it, ``leaf`` otherwise.
+        config_dict = asdict(runner._pin_icechunk_commit(self.config, self.grid, stages=True))
         output_creds_event = runner._build_output_creds_event(
             self._output_credentials, self._output_endpoint_url, self.region
         )
@@ -1140,8 +1168,20 @@ class Run:
         flat only under ``consolidate_metadata``), then the fail-open rollups:
         root ``coverage.moc``, the run-stats record, and the sweep trigger —
         each a fire-and-forget worker invoke (D8), each swallowed on failure
-        exactly like ``_run_lambda``'s tail. A finalize failure goes through the
-        shared :func:`runner._finalize_with_retry` (issue #335 — one contract
+        exactly like ``_run_lambda``'s tail — then, under ``output.sweep:
+        "stages"``, the STAGED sweep (issue #588; the same
+        :func:`runner._invoke_lambda_stage_sweep` seam, invoke-and-poll, never
+        a write) and last the Icechunk finalize, gated like the CLI's on a
+        completed staged sweep (:func:`runner._staged_sweep_incomplete`). The
+        tail marker precedes the staged sweep, as on the CLI. A reattached
+        handle chains no staged sweep (:meth:`Run.attach` is observe-only;
+        the sweep is the dispatcher's). The staged sweep blocks this daemon
+        finisher up to :data:`zagg.sweep_fleet.DEFAULT_TOTAL_BARRIER_BUDGET_S`
+        (7,200 s); a process exit or kernel restart meanwhile cuts it off while
+        it holds the store lease, whose TTL expiry is the designed recovery
+        (``runner._invoke_lambda_stage_sweep``, "If the dispatcher dies
+        mid-barrier") — the run is then left untagged. A finalize failure goes
+        through the shared :func:`runner._finalize_with_retry` (issue #335 — one contract
         for the CLI and the facade): it warns immediately (``RuntimeWarning`` —
         notebook-visible while the tail is still running), retries once after a
         fixed 5 s backoff, and only a still-failing finalize is recorded on the
@@ -1283,13 +1323,22 @@ class Run:
             # the knob is off — the same value runner._run_lambda threads.
             icechunk_init=self._icechunk_init,
         )
-        if layout == "hive" and get_sweep(self.config):
+        # The finalize gate is decided from the config BEFORE the try (review,
+        # PR #591): any exception inside the block — a malformed stats record,
+        # a failed rollup invoke — then leaves ``stage_chained`` set with
+        # ``handle.stage_sweep`` None, so the finalize records ``{skipped}``
+        # rather than tagging a tip the staged sweep never reached. Cleared
+        # only on the explicit no-work branch below.
+        sweeps = layout == "hive" and get_sweep(self.config)
+        stage_chained = (
+            sweeps and self.config.output.get("sweep") == "stages" and not self._attached
+        )
+        if sweeps:
             try:
-                from zagg.sweep import leaves_from_stats_records
+                from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
-                leaves = leaves_from_stats_records(
-                    [(r.get("body") or {}).get("stats") for r in ok_results]
-                )
+                ok_bodies = [r.get("body") or {} for r in ok_results]
+                leaves = leaves_from_stats_records([b.get("stats") for b in ok_bodies])
                 if leaves:
                     runner._invoke_lambda_sweep(
                         client,
@@ -1298,9 +1347,45 @@ class Run:
                         leaves,
                         output_creds_event=output_creds_event,
                     )
+                # Post-fleet STAGED chaining (issues #384/#519, here #588) —
+                # the same opt-in and the same seam as ``_run_lambda``'s
+                # tail: invoke and poll the stage records, never write (D8);
+                # fail-open (D9: ``python -m zagg.sweep --stages`` is the
+                # backstop). Touched current units ride as dirt-only (#580).
+                # Not on a reattached handle: attach is observe-only, and the
+                # sweep (with its lease) is the dispatcher's. Hive is
+                # HEALPix-only (validated), so parent_order is set here; were
+                # it not, ``int(None)`` raises into the fail-open gate, as on
+                # the CLI.
+                dirt_only = dirt_only_leaves(ok_bodies)
+                if stage_chained and not (leaves or dirt_only):
+                    stage_chained = False
+                if stage_chained:
+                    logger.info(
+                        f"chaining staged sweep over {len(leaves)} leaves "
+                        f"({len(dirt_only)} dirt-only) for run {run_id}"
+                    )
+                    handle.stage_sweep = runner._invoke_lambda_stage_sweep(
+                        client,
+                        self.function_name,
+                        self.store,
+                        leaves,
+                        shard_order=int(self._parent_order),
+                        output_creds_event=output_creds_event,
+                        store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
+                        touch_policy=get_touch_policy(self.config),
+                        dirt_only=dirt_only,
+                    )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
-        self._finalize_icechunk(handle, client, config_dict, output_creds_event, run_id)
+        self._finalize_icechunk(
+            handle,
+            client,
+            config_dict,
+            output_creds_event,
+            run_id,
+            skip=runner._staged_sweep_incomplete(handle.stage_sweep) if stage_chained else None,
+        )
 
     def _finalize_icechunk(
         self,
@@ -1309,20 +1394,28 @@ class Run:
         config_dict: dict,
         output_creds_event: dict | None,
         run_id: str,
+        skip: str | None = None,
     ) -> None:
         """The tail's Icechunk run finalize (issue #582); the record on the handle.
 
-        The facade chains no staged sweep, so every commit of the run is a
-        per-leaf one and has landed once every shard settled; tag the tip.
-        Synchronous, fail-open, the same seam ``runner._run_lambda`` takes.
+        Fired AFTER every commit of the run landed — after the fan-out under
+        ``commit: "leaf"``, after the staged sweep the tail chained under the
+        ladder (issue #588) — synchronous, fail-open, the same seam
+        ``runner._run_lambda`` takes and the same gate: ``skip`` is
+        :func:`runner._staged_sweep_incomplete`'s reason when the chained
+        sweep may still have node commits in flight, and the run is then left
+        untagged with ``{"skipped": reason}`` on the handle (the next run's
+        tag covers it, spec §11.4; ``python -m zagg.icechunk_ops <store>
+        finalize <run_id>`` tags it once the ladder is complete).
         Gated on the dispatch's init record, or — on a reattached run, which
         never held one — on the config's knob (``get_icechunk``; the worker
         refuses a repo-less store and the invoke fails open). A reattached
         run finalizes only under the manifest config's pinned ``commit:
-        "leaf"``: a ``"ladder"`` run (``runner._run_lambda`` under ``sweep:
-        "stages"``) lands its last commits in the staged sweep that dispatcher
-        chains after the tail marker, so its finalize is that dispatcher's
-        alone and attach never fires it (``{"skipped"}`` on the handle). An
+        "leaf"`` AND no ``sweep: "stages"``: a ``sweep: "stages"`` run's
+        dispatcher chains the staged sweep after the tail marker whatever the
+        commit mode (its nodes commit overview refs under ``"leaf"`` too), so
+        its last commits land there, its finalize is that dispatcher's alone
+        and attach never fires it (``{"skipped"}`` on the handle). An
         attached finalize is ``newest_only``: a later run on the repo leaves
         this one untagged (the next run's tag covers it, spec §11.4).
         """
@@ -1331,11 +1424,19 @@ class Run:
         if self._icechunk_init is None:
             if not (self._attached and get_icechunk(self.config)):
                 return
-            if get_icechunk_options(self.config)["commit"] != "leaf":
+            if (
+                get_icechunk_options(self.config)["commit"] != "leaf"
+                or self.config.output.get("sweep") == "stages"
+            ):
                 handle.icechunk_finalize = {
-                    "skipped": "attached ladder run; its dispatcher finalizes after the staged sweep"
+                    "skipped": 'attached sweep: "stages" run; its dispatcher finalizes '
+                    "after the staged sweep"
                 }
                 return
+        elif skip is not None:
+            logger.warning(f"icechunk finalize skipped, run left untagged (issue #582): {skip}")
+            handle.icechunk_finalize = {"skipped": skip}
+            return
         handle.icechunk_finalize = runner._invoke_lambda_icechunk_finalize(
             client,
             self.function_name,

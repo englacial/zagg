@@ -465,3 +465,190 @@ class TestCli:
         with pytest.raises(ValueError, match="not initialized"):
             icechunk_ops.main([str(tmp_path / "bare"), "set-attrs", "/", '{"a": 1}'])
         assert len(_messages(root)) == n
+
+
+# -- finalize (issue #588) --------------------------------------------------------
+
+
+class TestFinalizeOperation:
+    """``finalize <run_id>``: tag a completed, untagged ladder run — the newest only."""
+
+    DISPATCHED = "2026-01-01T00:00:00+00:00"
+
+    def _manifest(self, root, run_id, cfg, *, dispatched_at=DISPATCHED):
+        """The run's dispatch manifest, as the setup worker writes it (issue #327)."""
+        from dataclasses import asdict
+
+        import obstore
+
+        from zagg import client_transport as ct
+        from zagg.semantics import semantic_hash
+        from zagg.store import open_object_store
+
+        manifest = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "shards": ["1"],
+            "semantic_hash": semantic_hash(cfg),
+            "dispatched_at": dispatched_at,
+            "dataset": None,
+            "config": asdict(cfg),
+        }
+        store = open_object_store(ct.run_status_prefix(root, run_id))
+        obstore.put(store, ct.MANIFEST_NAME, json.dumps(manifest).encode())
+
+    @staticmethod
+    def _stamp(offset_s=60):
+        """A record-key stamp ``offset_s`` from now (the run's init commit is ~now)."""
+        from datetime import datetime, timedelta, timezone
+
+        return (datetime.now(timezone.utc) + timedelta(seconds=offset_s)).strftime("%Y%m%dT%H%M%SZ")
+
+    def _record(self, root, ts=None, **fields):
+        """A staged-sweep run record at the store root, as the finisher writes it.
+
+        The root-record shape of ``sweep_stages.run_stage_finisher`` through
+        ``_write_stage_record`` (``{"spec", "mode": "stages", **summary}``),
+        with the sweep's own run id and ``run_finisher``'s block; ``fields``
+        override it.
+        """
+        from zagg.store import open_object_store, put_object
+        from zagg.sweep import SWEEP_SPEC
+
+        ts = ts or self._stamp()
+        record = {
+            "spec": SWEEP_SPEC,
+            "mode": "stages",
+            "run_id": "sweep-0001",
+            "store_root": root,
+            "shard_order": 4,
+            "transport": "lambda",
+            "n_leaves": 1,
+            "skipped_leaves": 0,
+            "stage_records": 1,
+            "stages": [],
+            "levels": {},
+            "barrier_timed_out": False,
+            "finisher": {
+                "root_moc": True,
+                "manifest_updated": True,
+                "objects_touched": 0,
+                "touch_failures": 0,
+                "lease_released": True,
+            },
+            "lease": {"released": True},
+            "duration_s": 1.0,
+            **fields,
+        }
+        key = f"sweep_stats_{ts}_stages.json"
+        put_object(open_object_store(root), key, json.dumps(record, indent=1).encode())
+        return key
+
+    def test_tags_a_completed_newest_untagged_run(self, monkeypatch, cfg, tmp_path):
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        # The dispatched config is what the manifest carries: its knob rules.
+        cfg.output["icechunk"] = {"commit": "ladder", "retain_runs": 2}
+        self._manifest(root, RUN, cfg)
+        key = self._record(root)
+        out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert out["operation"] == "finalize" and out["run_id"] == RUN
+        assert out["stage_record"] == key and out["tagged"] is True and "skipped" not in out
+        assert out["retain_runs"] == 2  # the run config's knob, not a flag
+        _group, repo = _open(root)
+        assert repo.lookup_tag(f"run-{RUN}") == out["snapshot"]
+        head = next(iter(repo.ancestry(branch="main")))
+        assert head.message == f"finalize {RUN}"
+        assert head.metadata["run_id"] == RUN and head.metadata["retain_runs"] == 2
+        # Idempotent: the tag exists, nothing is written, the report says so.
+        n = len(_messages(root))
+        again = icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert again["tagged"] is False and again["skipped"] == f"run-{RUN} already exists"
+        assert again["snapshot"] == out["snapshot"] and len(_messages(root)) == n
+
+    @pytest.mark.parametrize(
+        "fields, reason",
+        [
+            ({"barrier_timed_out": True}, "a barrier expired"),
+            ({"finisher": None}, "no finisher block"),
+            # The in-process sweep's failure record; refused even with a finisher block.
+            ({"error": "RuntimeError: boom", "finisher": {"lease_released": True}}, "sweep failed"),
+        ],
+    )
+    def test_refuses_an_incomplete_sweep_record(self, monkeypatch, cfg, tmp_path, fields, reason):
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        self._record(root, **fields)
+        n = len(_messages(root))
+        with pytest.raises(ValueError, match=reason):
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert len(_messages(root)) == n and not _open(root)[1].list_tags()
+
+    @pytest.mark.parametrize("newer_complete", [False, True])
+    def test_the_newest_record_decides(self, monkeypatch, cfg, tmp_path, newer_complete):
+        # Two records since the init: only the newest stands for the ladder. A
+        # newer barrier-expired record refuses despite an older complete one;
+        # a newer complete one tags despite an older incomplete one.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        self._record(root, ts=self._stamp(60), barrier_timed_out=newer_complete)
+        newer = self._record(root, ts=self._stamp(120), barrier_timed_out=not newer_complete)
+        if newer_complete:
+            out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+            assert out["tagged"] is True and out["stage_record"] == newer
+        else:
+            with pytest.raises(ValueError, match=f"{newer} does not show a completed sweep"):
+                icechunk_ops.finalize(root, RUN, store_kwargs={})
+            assert not _open(root)[1].list_tags()
+
+    def test_refuses_without_a_record_since_the_init_commit(self, monkeypatch, cfg, tmp_path):
+        # No record at all, then one older than the run's init commit — though
+        # newer than the manifest's ``dispatched_at``: the anchor is the repo's
+        # clock, so neither can stand for this run's ladder.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        with pytest.raises(ValueError, match="no staged-sweep record"):
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+        self._record(root, ts=self._stamp(-3600))
+        with pytest.raises(ValueError, match="since run r1's init commit"):
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert not _open(root)[1].list_tags()
+
+    def test_refuses_a_run_with_no_init_commit(self, monkeypatch, cfg, tmp_path):
+        # A manifest and a record, but the repo never saw the run open.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, "r9", cfg)
+        self._record(root)
+        with pytest.raises(ValueError, match="no init commit for run r9"):
+            icechunk_ops.finalize(root, "r9", store_kwargs={})
+        assert not _open(root)[1].list_tags()
+
+    def test_refuses_without_a_dispatch_manifest(self, monkeypatch, cfg, tmp_path):
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._record(root)
+        with pytest.raises(ValueError, match="no dispatch manifest") as err:
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+        # The write is best-effort: the text says so and names the fallback.
+        assert "normally has one" in str(err.value)
+        assert "the next run's tag covers its commits" in str(err.value)
+
+    def test_skips_a_run_that_is_no_longer_the_newest(self, monkeypatch, cfg, tmp_path):
+        # A later run's init commit makes this one an older untagged run: the
+        # next run's tag covers it, and tagging it would name later commits.
+        grid, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        self._record(root)
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r2", store_kwargs={})
+        n = len(_messages(root))
+        out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert out["tagged"] is False and out["snapshot"] is None
+        assert out["skipped"] == f"a later run has committed since run {RUN}"
+        assert len(_messages(root)) == n and not _open(root)[1].list_tags()
+
+    def test_cli(self, monkeypatch, cfg, tmp_path, capsys):
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        self._record(root)
+        assert icechunk_ops.main([root, "finalize", RUN]) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["operation"] == "finalize" and out["tagged"] is True
+        assert out["tag"] == f"run-{RUN}"

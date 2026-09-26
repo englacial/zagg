@@ -3767,7 +3767,9 @@ concurrent callers), its array nodes (§11.2) defined and the `multiscales`
 mirror in its root attrs. Idempotent: a repo that already carries a matching
 block is reopened, never re-templated; a block for another geometry or
 container is refused. **Every run commits its `init {run_id}`** — empty
-when the block is unchanged, with `run_id` in the commit metadata — so the
+when the block is unchanged, labelled `split ratchet {from}->{to} {run_id}`
+instead when its init re-cuts (§11.5), with `run_id` in the commit
+metadata either way — so the
 ancestry brackets each run between its init and its finalize (the repo is
 its own run log, and finalize's newest-run check below reads it). The
 ladder settings are not compared: `split_order`
@@ -3778,7 +3780,9 @@ coarser one re-cuts), and `commit` / `commit_order` are per-run.
 (`mode="icechunk_finalize"` on Lambda, in-process on the local backend),
 invoked by the dispatcher AFTER every commit of the run has landed: after
 the staged sweep returned under the ladder (its finisher makes the last
-commit), after the fan-out drained under `commit: "leaf"`. Never by a stage
+commit; every dispatcher that chains the sweep — the CLI, the local backend
+and the `client` facade — finalizes at this point), after the fan-out
+drained under `commit: "leaf"`. Never by a stage
 node — tags, expiry and collection are singleton repo operations, and never
 inside the staged sweep's finisher, which is lease-scoped, load-bearing
 store-root machinery while the repo is fail-open (and which a per-leaf run
@@ -3787,7 +3791,8 @@ so a staged sweep that did not complete — its dispatch failed, a barrier
 expired or the finisher did not land — may still have node commits in
 flight: the dispatcher then does NOT finalize and records
 `icechunk_finalize: {skipped: <reason>}` and the run stays untagged (its
-commits are kept; the next run's tag covers them). One finalize, in order:
+commits are kept; the next run's tag covers them; the `finalize` operation
+below tags it once the ladder is complete). One finalize, in order:
 
 1. **retention** — `output.icechunk.retain_runs` = K. `0` (the default)
    keeps every run and does nothing here. K > 0: the run tags beyond the
@@ -3831,10 +3836,11 @@ nothing, and two finalizes of one run are safe: the loser reads the
 winner's tag. A reattached client (`Run.attach`) fires a finalize of its
 own, off the config's knob (it never held the init record, so the event
 carries `icechunk_init: null` and `rewrite_pending` is always null there),
-and only for a pinned `commit: "leaf"` run: a ladder run's finalize is its
-dispatcher's, after the staged sweep, and attach records `{skipped}`. It
-finalizes only while its run is the newest on the repo (no later `init` or
-`finalize` commit on `main`), else it writes nothing and records
+and only for a pinned `commit: "leaf"` run with no `sweep: "stages"`: a
+`sweep: "stages"` run's finalize is its dispatcher's, after the staged sweep
+(whose nodes commit under either mode), and attach records `{skipped}`. It
+finalizes only while its run is the newest on the repo (no later init —
+`init` or `split ratchet` — or `finalize` commit on `main`), else it writes nothing and records
 `{skipped}`, so an untagged old run stays covered by the next run's tag as
 before. Fail-open (D9) at the dispatcher like the init; the record rides
 the run summary as `icechunk_finalize` (`{path, tag, snapshot, tagged,
@@ -3890,7 +3896,7 @@ after, the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
 group; a session that fails is discarded and nothing lands. moczarr's
 validator (issue #582 phase 6) runs in addition when it lands; the check
 above is zagg's own. An operation
-that would write nothing commits nothing. The two operations of `/1`:
+that would write nothing commits nothing. The operations of `/1`:
 
 - **`set-attrs <path> <json>`** merges the JSON object into the attrs of the
   root group (`/`), a level group (`/{cells}`) or an array
@@ -3920,6 +3926,33 @@ that would write nothing commits nothing. The two operations of `/1`:
   manifest write when the store has a repo (fail-open, D9; its summary's
   `icechunk` key carries the report or the error), so one operator step
   declares both planes; the standalone form re-runs it.
+- **`finalize <run_id>`** tags a ladder run its dispatcher left untagged —
+  the staged sweep completed but the dispatcher died before its finalize
+  (the state described under **Finalize** above). It reads the run's
+  dispatch manifest (`<store>.status/run-<run_id>/manifest.json`) for the
+  run's own config — its `retain_runs` and the D19 hash — refuses without
+  it (a Lambda-dispatched run normally has one, but the write is
+  best-effort: a large hive run's setup event drops it over the async
+  payload cap, and a lost setup invoke or failed write leaves none; such a
+  run is not finalizable here and the next run's tag covers it), refuses unless the newest `sweep_stats_*_stages.json` written since
+  the run's init commit (its `written_at` on `main`, the repo's clock —
+  a run with no init commit is refused) shows a completed sweep (the
+  finisher wrote it, and no barrier expired), and then runs the **Finalize** above `newest_only`:
+  it can only ever tag the repo's newest run — an older untagged run stays
+  covered by the next run's tag, and tagging it would name later commits —
+  and an existing tag is a no-op. It is the **Finalize** above invoked by
+  an operator, listed here for discoverability — not a validated
+  array-model operation, and an exception to this list's rules: its commit
+  metadata carries `run_id` / `semantic_hash` / the retention counts, not
+  an `operation` key; it commits even though content-free; and with
+  `retain_runs` > 0 it runs the retention (tag deletion, expiry,
+  collection). There is no `--force`
+  (a run whose sweep did not complete has no tip that means "this run":
+  `python -m zagg.sweep <store> --stages` completes the ladder first) and
+  no retention override. The record names the sweep's own run id, so it is
+  tied to the run by time alone: with overlapping runs on one store (the
+  retention casualty case above) a sibling run's completed sweep record can vouch
+  for this run.
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
 come out of the object's own index, but the sizes and checksums do not. For
