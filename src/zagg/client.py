@@ -69,6 +69,7 @@ from zagg.config import (
     get_driver,
     get_handoff,
     get_icechunk,
+    get_icechunk_options,
     get_output_endpoint_url,
     get_output_region,
     get_parent_order,
@@ -169,6 +170,16 @@ class RunHandle:
         self._finisher: threading.Thread | None = None
         self._finalize_error: BaseException | None = None
         self._tail_error: BaseException | None = None
+        #: The run's Icechunk finalize record (issue #582) once the tail has
+        #: run — ``{path, tag, snapshot, ...}``, or ``{"error": ...}`` from the
+        #: fail-open invoke; ``None`` while the tail is in flight and when
+        #: the knob is off (or, on a dispatch, the run stood up no repo). A
+        #: reattached handle finalizes off the knob: ``{"error": ...}`` when
+        #: the store has no repo, ``{"skipped": ...}`` for a ladder run (its
+        #: dispatcher finalizes) or when a later run has committed since
+        #: (newest-only); an already-tagged run is a no-op. Read it after
+        #: :meth:`wait` or a drained harvest.
+        self.icechunk_finalize: dict | None = None
 
     def __len__(self) -> int:
         return len(self.futures)
@@ -409,6 +420,9 @@ class Run:
         # tail's run-record write; None until dispatch() fires the invoke,
         # and None for good when the knob is off.
         self._icechunk_init: dict | None = None
+        #: A reattached run (``Run.attach``) never held the init record: its
+        #: tail finalizes the repo off the config's knob instead (issue #582).
+        self._attached = False
         runner._check_signature(self.grid, catalog_data)
 
     def __repr__(self) -> str:
@@ -587,7 +601,10 @@ class Run:
         immediately (no re-dispatch), and a shard with no status object by
         the drop deadline — anchored at the manifest's ``dispatched_at`` —
         resolves ``failed-unknown``. The post-run tail runs only if not
-        already recorded (the run's ``tail.json`` marker, checked read-only);
+        already recorded (the run's ``tail.json`` marker, checked read-only)
+        — except its Icechunk finalize (issue #582), which a reattached
+        handle always fires when the config's knob is on, since the marker
+        precedes it in the tail and the finalize is idempotent;
         when it does run it is the same worker-invoke tail as a live handle
         (D8 intact — this method's own store traffic is reads).
 
@@ -1085,7 +1102,12 @@ class Run:
             if tail_done_check is not None:
                 futures_wait(list(handle.futures.values()))
                 if tail_done_check():
+                    # The marker precedes the Icechunk finalize in the tail,
+                    # so a client that died between the two left the run
+                    # untagged: finalize anyway (idempotent — an existing tag
+                    # returns at once), then skip the rest (issue #582).
                     logger.info(f"post-run tail already recorded for run {run_id}; skipping")
+                    self._finalize_icechunk(handle, client, config_dict, output_creds_event, run_id)
                     return
             self._run_tail(
                 handle,
@@ -1278,3 +1300,49 @@ class Run:
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        self._finalize_icechunk(handle, client, config_dict, output_creds_event, run_id)
+
+    def _finalize_icechunk(
+        self,
+        handle: RunHandle,
+        client: Any,
+        config_dict: dict,
+        output_creds_event: dict | None,
+        run_id: str,
+    ) -> None:
+        """The tail's Icechunk run finalize (issue #582); the record on the handle.
+
+        The facade chains no staged sweep, so every commit of the run is a
+        per-leaf one and has landed once every shard settled; tag the tip.
+        Synchronous, fail-open, the same seam ``runner._run_lambda`` takes.
+        Gated on the dispatch's init record, or — on a reattached run, which
+        never held one — on the config's knob (``get_icechunk``; the worker
+        refuses a repo-less store and the invoke fails open). A reattached
+        run finalizes only under the manifest config's pinned ``commit:
+        "leaf"``: a ``"ladder"`` run (``runner._run_lambda`` under ``sweep:
+        "stages"``) lands its last commits in the staged sweep that dispatcher
+        chains after the tail marker, so its finalize is that dispatcher's
+        alone and attach never fires it (``{"skipped"}`` on the handle). An
+        attached finalize is ``newest_only``: a later run on the repo leaves
+        this one untagged (the next run's tag covers it, spec §11.4).
+        """
+        from zagg import runner
+
+        if self._icechunk_init is None:
+            if not (self._attached and get_icechunk(self.config)):
+                return
+            if get_icechunk_options(self.config)["commit"] != "leaf":
+                handle.icechunk_finalize = {
+                    "skipped": "attached ladder run; its dispatcher finalizes after the staged sweep"
+                }
+                return
+        handle.icechunk_finalize = runner._invoke_lambda_icechunk_finalize(
+            client,
+            self.function_name,
+            self.store,
+            config_dict=config_dict,
+            run_id=run_id,
+            icechunk_init=self._icechunk_init,
+            output_creds_event=output_creds_event,
+            newest_only=self._attached,
+        )

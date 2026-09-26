@@ -1227,8 +1227,10 @@ class RasterStrategy:
             # Icechunk companion init record (issue #580): the key is present
             # on every strategy's summary so a caller can read it unguarded;
             # always None here — raster is out of stage 1's writer scope
-            # (spec §11.6), so no repo is ever initialized on this path.
+            # (spec §11.6), so no repo is ever initialized on this path —
+            # nor finalized (issue #582).
             "icechunk": None,
+            "icechunk_finalize": None,
         }
         if profile:
             # Straggler-maxed stage seconds + summed work counts (issue #250);
@@ -1711,8 +1713,10 @@ class RasterStrategy:
             # the two paths' summaries keep one shape for this field.
             "finalize_error": finalize_error_str,
             # Icechunk companion init record (issue #580), as on the local
-            # raster path: always None, raster is outside §11.6's scope.
+            # raster path: always None, raster is outside §11.6's scope; so
+            # is its finalize record (issue #582).
             "icechunk": None,
+            "icechunk_finalize": None,
         }
         if profile:
             # Straggler-maxed stage seconds (+ the write bucket) and summed
@@ -3182,6 +3186,9 @@ def _run_local(
                     allow_contraction=allow_contraction,
                     semantic_hash=run_semantic_hash,
                     sidecar_spec=manifest["spec"],
+                    # Versioned leaves (issue #582): the run identity names
+                    # the version subgroup each unit writes.
+                    run_id=run_id,
                     **extra,
                 )
                 # A current/refused unit wrote nothing — no record, no
@@ -3446,6 +3453,12 @@ def _run_local(
                 store_kwargs=store_kwargs,
                 touch_policy=get_touch_policy(config),
             )
+    # Icechunk run finalize (issue #582, spec §11.4): AFTER every commit of
+    # the run — the staged sweep's ladder commits included — tag the tip
+    # ``run-{run_id}`` and apply retention. In-process here, fail-open.
+    summary["icechunk_finalize"] = _finalize_icechunk_local(
+        config, store_path, run_id, icechunk_init, run_semantic_hash, store_kwargs
+    )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -4336,6 +4349,7 @@ def _run_lambda(
         # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
         # come from the envelope stats records; a stale deployed worker's
         # record-less envelope simply contributes no leaf.
+        stage_chained, staged = False, None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -4369,7 +4383,8 @@ def _run_lambda(
                 # _run_local: their nodes re-gather refs, nothing is re-folded.
                 dirt_only = dirt_only_leaves(ok_bodies)
                 if (leaves or dirt_only) and config.output.get("sweep") == "stages":
-                    _invoke_lambda_stage_sweep(
+                    stage_chained = True
+                    staged = _invoke_lambda_stage_sweep(
                         state["lambda_client"],
                         function_name,
                         store_path,
@@ -4382,6 +4397,27 @@ def _run_lambda(
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # Icechunk run finalize (issue #582, spec §11.4): one synchronous
+        # worker invoke AFTER the staged sweep returned (its finisher is the
+        # last ladder commit) — the dispatcher never writes (D8). Fail-open.
+        # The stage nodes are Event invokes, so a sweep that did not complete
+        # may still have node commits in flight: no tag then (review finding).
+        skip = _staged_sweep_incomplete(staged) if stage_chained else None
+        if icechunk_init is None:
+            summary["icechunk_finalize"] = None
+        elif skip is not None:
+            logger.warning(f"icechunk finalize skipped, run left untagged (issue #582): {skip}")
+            summary["icechunk_finalize"] = {"skipped": skip}
+        else:
+            summary["icechunk_finalize"] = _invoke_lambda_icechunk_finalize(
+                state["lambda_client"],
+                function_name,
+                store_path,
+                config_dict=config_dict,
+                run_id=run_id,
+                icechunk_init=icechunk_init,
+                output_creds_event=output_creds_event,
+            )
         logger.info(
             f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
         )
@@ -5741,6 +5777,117 @@ def _invoke_lambda_icechunk_init(
         f"Icechunk repo {record.get('path')} "
         f"{'created' if record.get('created') else 'reopened'} at snapshot {record.get('snapshot')}"
     )
+    return record
+
+
+def _finalize_icechunk_local(
+    config, store_path, run_id, icechunk_init, semantic_hash, store_kwargs
+) -> dict | None:
+    """The local backend's in-process Icechunk finalize (issue #582); its record.
+
+    ``None`` when the run stood up no repo (``icechunk_init`` is ``None``:
+    knob off or non-hive); ``{"error": ...}`` when the fail-open finalize did
+    not land — a failed init leaves no repo to tag, and that is recorded here
+    rather than skipped, so the two failures read apart in the summary; else
+    :func:`zagg.icechunk_finalize.finalize_repo`'s record.
+    """
+    if icechunk_init is None:
+        return None
+    from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
+
+    try:
+        return finalize_repo(
+            store_path,
+            run_id=run_id,
+            semantic_hash=semantic_hash,
+            retain_runs=resolve_retain_runs(config),
+            store_kwargs=store_kwargs,
+            split_ratchet=icechunk_init.get("split_ratchet"),
+        )
+    except Exception as e:
+        logger.warning(f"icechunk finalize failed (fail-open, issue #582): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _staged_sweep_incomplete(staged: dict | None) -> str | None:
+    """Why a chained fleet staged sweep may still have commits in flight, or ``None``.
+
+    The fleet finalize's gate (issue #582): the stage nodes are ``Event``
+    invokes, so a failed dispatch (the seam's ``None``), an expired barrier or
+    a finisher that did not land leaves node commits unaccounted for — a tag
+    then would not be "the store as the run left it" (spec §11.4). A sweep
+    that fired nothing (``skipped``) has nothing in flight.
+    """
+    if staged is None:
+        return "staged sweep dispatch failed"
+    if staged.get("barrier_timed_out"):
+        return "staged sweep barrier timed out"
+    finisher = staged.get("finisher") or {}
+    if finisher.get("fired") and not finisher.get("landed"):
+        return "staged sweep finisher did not land"
+    return None
+
+
+def _invoke_lambda_icechunk_finalize(
+    lambda_client,
+    function_name,
+    store_path,
+    *,
+    config_dict,
+    run_id,
+    icechunk_init=None,
+    output_creds_event=None,
+    newest_only=False,
+) -> dict:
+    """One synchronous ``mode="icechunk_finalize"`` invoke (issue #582); its record.
+
+    The fleet twin of :func:`_finalize_icechunk_local` and the closing
+    bracket of :func:`_invoke_lambda_icechunk_init`: the worker tags the
+    run's tip and applies retention AFTER every commit of the run — so the
+    dispatcher fires it last, after the staged sweep returned. Blocking so
+    the summary can carry the tag; fail-open on the same shapes as the init
+    invoke (a stale deployment's 400, a throttle, a refused finalize, a 200
+    that is not the success envelope), never an empty dict. ``newest_only``
+    (``Run.attach``) rides the event: the worker then finalizes only while
+    the run is the newest on the repo (``{"skipped"}`` otherwise).
+    """
+    event = {
+        "mode": "icechunk_finalize",
+        "store_path": store_path,
+        "run_id": run_id,
+        "config": config_dict,
+        # The init record rides so a split ratchet this run applied is
+        # reported as pending its operator rewrite (spec §11.5).
+        "icechunk_init": icechunk_init,
+    }
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    if newest_only:
+        event["newest_only"] = True
+    t0 = time.perf_counter()
+    try:
+        response = lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(event),
+        )
+        payload = response["Payload"].read().decode("utf-8")
+        if response.get("FunctionError"):
+            raise RuntimeError(payload)
+        result = json.loads(payload)
+        body = json.loads(result.get("body") or "{}")
+        if result.get("statusCode") != 200:
+            raise RuntimeError(
+                f"statusCode {result.get('statusCode')}: {body.get('error') or result.get('body')!r}"
+            )
+        if not body.get("ok") or not body.get("tag"):
+            raise RuntimeError(f"unexpected icechunk_finalize body: {body!r}")
+    except Exception as e:
+        logger.warning(f"icechunk finalize invoke failed (fail-open, issue #582): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+    record = {k: v for k, v in body.items() if k not in ("ok", "mode")}
+    record["invoke_s"] = time.perf_counter() - t0
+    logger.info(f"Icechunk repo {record.get('path')} tagged {record.get('tag')}")
     return record
 
 

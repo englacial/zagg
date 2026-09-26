@@ -236,6 +236,20 @@ nodes; idempotent, fail-open at the dispatcher):
     "output_credentials": dict (optional, same shape as process mode),
 }
 
+Icechunk-finalize mode (issue #582, spec §11.4 — the once-per-run close; one
+synchronous RequestResponse invoke from the dispatcher AFTER every commit of
+the run landed, i.e. after the staged sweep returned; fail-open at the
+dispatcher; idempotent — an existing run tag is returned, nothing rewritten):
+{
+    "mode": "icechunk_finalize",
+    "store_path": str,
+    "config": dict,             # same single-source config; retain_runs read here
+    "run_id": str,              # the tag is "run-{run_id}"
+    "icechunk_init": dict (optional) -- the run's init record; its
+        split_ratchet is reported back as rewrite_pending,
+    "output_credentials": dict (optional, same shape as process mode),
+}
+
 Extract mode (chunk-boundary geometry extraction, issue #148 — one parquet per
 granule under an S3 prefix; a batch of granules per invocation for the fan-out):
 {
@@ -716,7 +730,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="sweep"`` folds the D22 rollup families worker-side (issue #300);
     ``mode="icechunk_init"`` creates-or-opens the order's Icechunk companion
-    repo before the fan-out (issue #580);
+    repo before the fan-out (issue #580); ``mode="icechunk_finalize"`` tags
+    the run's tip after every commit landed (issue #582);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -747,6 +762,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_stats(event)
     if mode == "icechunk_init":
         return _handle_icechunk_init(event)
+    if mode == "icechunk_finalize":
+        return _handle_icechunk_finalize(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -1568,6 +1585,50 @@ def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def _handle_icechunk_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Tag the run's tip and apply retention on the companion repo (issue #582, spec §11.4).
+
+    The closing bracket of :func:`_handle_icechunk_init`: one synchronous
+    invoke per run, posted by the dispatcher AFTER the staged sweep returned
+    (its finisher makes the last ladder commit) or, under ``commit: "leaf"``,
+    after the fan-out drained — never by a stage node (tags, expiry and GC are
+    singleton repo operations). The ``semantic_hash`` in the commit metadata
+    is computed here from the same forwarded ``config`` the workers ran on,
+    so it cannot drift from what the leaves were stamped with. The body
+    echoes :func:`zagg.icechunk_finalize.finalize_repo`'s record; a 500
+    carries the error and the dispatcher treats either fail-open.
+    """
+    logger.info(f"Icechunk finalize mode: repo for {event.get('store_path')}")
+    try:
+        from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
+        from zagg.semantics import semantic_hash
+
+        config = load_config_from_dict(event["config"])
+        init = event.get("icechunk_init") or {}
+        record = finalize_repo(
+            event["store_path"],
+            # Required like init's: the tag is ``run-{run_id}`` and an
+            # unattributable one could never be matched to a run record.
+            run_id=str(event["run_id"]),
+            semantic_hash=semantic_hash(config),
+            retain_runs=resolve_retain_runs(config),
+            store_kwargs=_output_store_kwargs(event),
+            split_ratchet=init.get("split_ratchet") if isinstance(init, dict) else None,
+            # ``Run.attach``'s finalize: only while the run is the newest.
+            newest_only=bool(event.get("newest_only")),
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "icechunk_finalize", **record}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "icechunk_finalize"}),
+        }
+
+
 def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
     """Write the run-level stats parquet at the store root (issue #313).
 
@@ -2204,6 +2265,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 skip_if_current=bool(event.get("skip_if_current")),
                 allow_contraction=bool(event.get("allow_contraction")),
                 semantic_hash=event.get("semantic_hash"),
+                # Versioned leaves (issue #582, spec §1.5): the run identity
+                # names the version subgroup; an event without one (a
+                # hand-rolled or older dispatcher) writes a legacy leaf.
+                run_id=event.get("run_id"),
             )
         else:
             # Flat layout: lazy store + one-time template check, opened on the

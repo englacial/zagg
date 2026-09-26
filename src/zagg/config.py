@@ -1307,6 +1307,17 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
         )
+    # Versioned leaves (issue #582, spec §1.5): a boolean kill-switch, default
+    # ON for hive (get_leaf_versions resolves it); ``false`` keeps the legacy
+    # in-place leaf for readers that do not yet follow ``current``.
+    leaf_versions = config.output.get("leaf_versions")
+    if leaf_versions is not None and not isinstance(leaf_versions, bool):
+        raise ValueError(f"output.leaf_versions must be a boolean (got {leaf_versions!r})")
+    if leaf_versions and get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.leaf_versions requires output.store_layout: hive (a version subgroup "
+            "lives under a hive leaf's stable root)"
+        )
     # Icechunk companion repo (issue #580, spec §11): same posture as sweep —
     # boolean when present, default ON for hive (get_icechunk resolves it),
     # explicit true on a non-hive store is a config mistake (the repo indexes
@@ -1321,11 +1332,20 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
         # shard-order-relative checks run at init (icechunk_refs.resolve_options,
         # where the shard order is known); the shape and the one invariant
         # that needs no geometry — a commit must write whole manifests — here.
-        unknown = set(icechunk) - {"commit", "commit_order", "split_order"}
+        unknown = set(icechunk) - {"commit", "commit_order", "split_order", "retain_runs"}
         if unknown:
             raise ValueError(
                 f"output.icechunk has unknown key(s) {sorted(unknown)} (accepts commit, "
-                f"commit_order, split_order)"
+                f"commit_order, split_order, retain_runs)"
+            )
+        # Run-tag retention (issue #582): how many run tags finalize keeps;
+        # 0 (the default) keeps every run and never expires or collects.
+        retain = icechunk.get("retain_runs")
+        if retain is not None and (
+            isinstance(retain, bool) or not isinstance(retain, int) or retain < 0
+        ):
+            raise ValueError(
+                f"output.icechunk.retain_runs must be a non-negative integer (got {retain!r})"
             )
         commit = icechunk.get("commit")
         if commit is not None and commit not in ("ladder", "leaf"):
@@ -3396,6 +3416,25 @@ def get_sweep(config: PipelineConfig) -> bool:
     return bool(flag)
 
 
+def get_leaf_versions(config: PipelineConfig) -> bool:
+    """Whether hive leaves are written VERSIONED (issue #582, spec §1.5).
+
+    Default ON for hive-layout stores: each unit's arrays go to a fresh
+    ``run-{run_id}-{attempt}`` subgroup under the stable leaf root, whose
+    stamp names it as ``current``, so a replacement never rewrites bytes an
+    earlier run tag references. ``output.leaf_versions: false`` keeps the
+    legacy in-place leaf — the switch for a store whose readers do not yet
+    follow ``current``. Default ON carries spec §1.5's operator
+    preconditions: no bucket expiration rule over the hive tree (the
+    collector owns version lifetime) and readers that follow ``current``.
+    Layout, not semantics: outside the D19 core.
+    """
+    flag = config.output.get("leaf_versions")
+    if flag is None:
+        return get_store_layout(config) == "hive"
+    return bool(flag)
+
+
 def get_icechunk(config: PipelineConfig) -> bool:
     """Whether the Icechunk companion repo is written (issue #580, spec §11).
 
@@ -3429,13 +3468,14 @@ def get_icechunk_options(config: PipelineConfig) -> dict:
     """The raw ``output.icechunk`` ladder knobs, absent keys ``None`` (issue #580 phase 6).
 
     ``{"commit": "ladder" | "leaf" | None, "commit_order": int | None,
-    "split_order": int | None}`` — a boolean or absent knob yields all-``None``;
-    :func:`zagg.icechunk_refs.resolve_options` applies the shard-order
-    defaults and the §11.5 invariants.
+    "split_order": int | None, "retain_runs": int | None}`` — a boolean or
+    absent knob yields all-``None``; :func:`zagg.icechunk_refs.resolve_options`
+    applies the shard-order defaults and the §11.5 invariants, and
+    :func:`zagg.icechunk_finalize.resolve_retain_runs` the retention default.
     """
     flag = config.output.get("icechunk")
     block = flag if isinstance(flag, dict) else {}
-    return {k: block.get(k) for k in ("commit", "commit_order", "split_order")}
+    return {k: block.get(k) for k in ("commit", "commit_order", "split_order", "retain_runs")}
 
 
 def get_pyramid(config: PipelineConfig) -> dict | None:

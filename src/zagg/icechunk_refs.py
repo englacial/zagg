@@ -158,6 +158,23 @@ def split_block(grid, split_order: int, *, base_chunk_order: int | None = None) 
     return {"chunks": 4**m, "order": int(grid.chunk_order) - m}
 
 
+def block_splits(block: dict) -> dict:
+    """``{order: split}`` for every level group ``block`` names, cut at its ``split_order``.
+
+    Listed and ``retired`` (delisted by ``declare-pyramid``, group kept) alike.
+
+    :func:`split_block`'s rule from each entry's recorded chunk axis, so the
+    splits follow the block as it stands (a ratchet included), not the one a
+    caller read earlier.
+    """
+    base, split_order = int(block["chunk_order"]), int(block["split_order"])
+    splits = {}
+    for order, level in {**(block.get("retired") or {}), **(block.get("levels") or {})}.items():
+        m = split_exponent(base, split_order, int(level["chunk_order"]))
+        splits[order] = {"chunks": 4**m, "order": int(level["chunk_order"]) - m}
+    return splits
+
+
 def finest_dispatch_order(shard_order: int, tuple_width: int | None = None) -> int:
     """The finest staged-sweep dispatch node order — the default ``commit_order``.
 
@@ -599,7 +616,9 @@ def read_block(store_root: str, *, store_kwargs: dict) -> dict | None:
 _COMPAT_KEYS = ("shard_order", "chunk_order", "cell_order", "url_prefix")
 
 
-def _update_block(repo, updates: dict, message: str, *, local: bool, path: str) -> str:
+def _update_block(
+    repo, updates: dict, message: str, *, local: bool, path: str, run_id: str | None = None
+) -> str:
     """Rewrite root-attrs keys of the repo in one commit; the snapshot id."""
     import zarr
 
@@ -608,7 +627,8 @@ def _update_block(repo, updates: dict, message: str, *, local: bool, path: str) 
     block = dict(cast("Mapping[str, Any]", root.attrs[ICECHUNK_ATTR]))
     block.update(updates)
     root.attrs[ICECHUNK_ATTR] = block
-    snapshot, _rebases = _commit(session, message, local=local, path=path)
+    metadata = {"run_id": run_id} if run_id else None
+    snapshot, _rebases = _commit(session, message, local=local, path=path, metadata=metadata)
     return snapshot
 
 
@@ -664,7 +684,9 @@ def init_repo(
         session = repo.writable_session(BRANCH)
         with vlen_dtype_warning_suppressed():
             spec.to_zarr(session.store, "", overwrite=False)
-        snapshot, _rebases = _commit(session, f"init {run_id}", local=local, path=path)
+        snapshot, _rebases = _commit(
+            session, f"init {run_id}", local=local, path=path, metadata={"run_id": run_id}
+        )
         return {
             "path": path,
             "snapshot": snapshot,
@@ -695,9 +717,12 @@ def init_repo(
         ratchet = {"from": stored, "to": wanted}
         spec = repo_group_spec(grid, store_root, options, manifest)
         block = spec.attributes[ICECHUNK_ATTR]
-        splits = {order: level["split"] for order, level in block["levels"].items()}
+        retired = existing.get("retired") or {}
+        splits = block_splits({**block, "retired": retired})
         repo = _save_splits(repo, store_root, splits, store_kwargs)
         updates.update(split_order=wanted, levels=block["levels"])
+        if retired:
+            updates["retired"] = {o: {**lvl, "split": splits[o]} for o, lvl in retired.items()}
         logger.warning(
             f"icechunk split_order ratchets {stored} -> {wanted} at {path}: new manifests are "
             f"cut at order {wanted}; the old ones await a rewrite_manifests pass (spec §11.5)"
@@ -706,14 +731,27 @@ def init_repo(
     for key in ("commit", "commit_order"):
         if existing.get(key) != options[key]:
             updates[key] = options[key]
-    snapshot = ro.snapshot_id
     if updates:
         label = (
             f"split ratchet {ratchet['from']}->{ratchet['to']} {run_id}"
             if ratchet
             else f"init {run_id}"
         )
-        snapshot = _update_block(repo, updates, label, local=local, path=path)
+        snapshot = _update_block(repo, updates, label, local=local, path=path, run_id=run_id)
+    else:
+        # Every run opens with an ``init {run_id}`` commit (§11.4) — empty
+        # when the block is unchanged — so the ancestry brackets each run
+        # between its init and its finalize: the repo is its own run log,
+        # and finalize's newest-run check (a reattached client's guard) is
+        # exact rather than blind to a run that changed nothing at init.
+        snapshot, _rebases = _commit(
+            repo.writable_session(BRANCH),
+            f"init {run_id}",
+            local=local,
+            path=path,
+            metadata={"run_id": run_id},
+            allow_empty=True,
+        )
     return {
         "path": path,
         "snapshot": snapshot,
@@ -735,7 +773,9 @@ def _leaf_rel(store_root: str, leaf_path: str) -> str:
     return leaf_path.rstrip("/")[len(root) + 1 :]
 
 
-def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> list[dict]:
+def leaf_ref_plan(
+    grid, shard_key, store_root: str, *, store_kwargs: dict, version: str | None = None
+) -> list[dict]:
     """Per-array virtual refs for one committed leaf (§11.3), read off its objects.
 
     One entry per template array the leaf holds an object for:
@@ -745,12 +785,16 @@ def leaf_ref_plan(grid, shard_key, store_root: str, *, store_kwargs: dict) -> li
     [(key, location, length, checksum), ...], "refs"}`` for a regular one (one
     object per chunk, from a LIST). ``path`` is the array's name in its order
     group (``count``); ``key`` a chunk key under it. Arrays with no object
-    emit no entry.
+    emit no entry. ``version`` is a versioned leaf's version subgroup (spec
+    §1.5, issue #582): the refs then point into ``{leaf}/{version}/…``, the
+    objects a replacement never rewrites; ``None`` plans a legacy leaf.
     """
     from zagg.hive import shard_leaf_path
 
     (rank,) = grid.block_index(int(shard_key))
     leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
+    if version:
+        leaf_rel = f"{leaf_rel}/{version}"
     return object_ref_plan(grid, leaf_rel, rank, store_root, store_kwargs=store_kwargs)
 
 
@@ -865,7 +909,15 @@ def object_ref_plan(
 # ── commits ─────────────────────────────────────────────────────────────────
 
 
-def _commit(session, message: str, *, local: bool, path: str = "") -> tuple[str, int]:
+def _commit(
+    session,
+    message: str,
+    *,
+    local: bool,
+    path: str = "",
+    metadata: dict | None = None,
+    allow_empty: bool = False,
+) -> tuple[str, int]:
     """Commit with rebase-on-conflict; returns ``(snapshot_id, rebases)``.
 
     The loop is icechunk's own ``rebase_with`` pattern, unrolled so the
@@ -874,7 +926,9 @@ def _commit(session, message: str, *, local: bool, path: str = "") -> tuple[str,
 
     On the local backend the commit is serialized through this process's lock
     for ``path`` (:func:`_local_commit_lock`); other repos in the same
-    interpreter are unaffected.
+    interpreter are unaffected. ``metadata`` and ``allow_empty`` are the
+    finalize commit's (:mod:`zagg.icechunk_finalize`): a run-identifying,
+    content-free snapshot.
     """
     import icechunk
 
@@ -883,7 +937,7 @@ def _commit(session, message: str, *, local: bool, path: str = "") -> tuple[str,
     with lock:
         while True:
             try:
-                return session.commit(message), rebases
+                return session.commit(message, metadata, allow_empty=allow_empty), rebases
             except icechunk.ConflictError:
                 if rebases >= REBASE_TRIES:
                     raise
@@ -985,7 +1039,14 @@ def commit_units(
 
 
 def leaf_units(
-    grid, config, shard_key, store_root: str, *, column: str | None, store_kwargs: dict
+    grid,
+    config,
+    shard_key,
+    store_root: str,
+    *,
+    column: str | None,
+    store_kwargs: dict,
+    version: str | None = None,
 ) -> list[dict]:
     """The units a committed leaf contributes (§11.4): its base arrays + its column's level.
 
@@ -1005,17 +1066,19 @@ def leaf_units(
 
     (rank,) = grid.block_index(int(shard_key))
     leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
+    node_rel = leaf_rel.rsplit("/", 1)[0]
     units = [
         {
             "level": int(grid.child_order),
-            "entries": object_ref_plan(grid, leaf_rel, rank, store_root, store_kwargs=store_kwargs),
+            "entries": leaf_ref_plan(
+                grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
+            ),
         }
     ]
     plan = leaf_column_plan(config, grid) if column else None
     if plan is None:
         return units
     _resolutions, fields = plan
-    node_rel = leaf_rel.rsplit("/", 1)[0]
     cfg = _overview_config(fields)
     for res in leaf_level_cells(config, grid):
         if int(res) >= int(grid.child_order):
@@ -1051,7 +1114,15 @@ def vet_leaf_repo(store_root: str, grid, *, store_kwargs: dict):
 
 
 def record_leaf(
-    store_root: str, grid, shard_key, *, store_kwargs: dict, window=None, units=None, repo=None
+    store_root: str,
+    grid,
+    shard_key,
+    *,
+    store_kwargs: dict,
+    window=None,
+    units=None,
+    repo=None,
+    version: str | None = None,
 ) -> dict:
     """The per-leaf commit (``commit: "leaf"``): refs + ``leaf {decimal}`` (§11.4).
 
@@ -1075,7 +1146,9 @@ def record_leaf(
     if repo is None:
         repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs)
     if units is None:
-        plan = leaf_ref_plan(grid, shard_key, store_root, store_kwargs=store_kwargs)
+        plan = leaf_ref_plan(
+            grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
+        )
         units = [{"level": int(grid.child_order), "entries": plan}]
     if not any(entry["refs"] for unit in units for entry in unit["entries"]):
         return {"skipped": "empty"}
@@ -1115,6 +1188,7 @@ __all__ = [
     "repo_group_spec",
     "repo_path",
     "resolve_options",
+    "block_splits",
     "split_block",
     "split_exponent",
     "vet_leaf_repo",

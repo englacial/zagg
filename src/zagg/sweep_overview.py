@@ -933,9 +933,17 @@ def declare_pyramid(
         "semantic_hash_migration": (
             {"from": fresh["semantic_hash"], "to": migrate_to} if migrate_to else None
         ),
+        # The §11.4 ``declare-pyramid`` follow-through into the store's Icechunk
+        # repo (issue #582): ``None`` only when there is no repo, else
+        # :func:`zagg.icechunk_ops.declare_pyramid`'s report (``unchanged``
+        # when the repo already carries the declaration).
+        "icechunk": None,
     }
     if prior == block and mirror_current and migrate_to is None:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
+        # The repo may still lag the manifest (a failed follow-through, a repo
+        # built before the retrofit): the operation is idempotent, so re-run it.
+        summary["icechunk"] = _declare_into_repo(store_root, config, fresh, store_kwargs)
         return summary
     fresh["pyramid"] = block
     if migrate_to is not None:
@@ -963,7 +971,51 @@ def declare_pyramid(
         write_semantic_core(store_root, config, **store_kwargs)
     if mirror is None:
         _remove_multiscales_group(store, store_root)
+    summary["icechunk"] = _declare_into_repo(store_root, config, fresh, store_kwargs)
     return summary
+
+
+def _declare_into_repo(store_root: str, config, manifest: dict, store_kwargs: dict):
+    """Mirror the declaration just written into the store's repo, when it has one.
+
+    The metadata plane tracks the manifest (spec §11 head): the repo's level
+    groups and ``multiscales`` root attrs follow the ``/2`` block in one
+    ``declare-pyramid`` commit (:func:`zagg.icechunk_ops.declare_pyramid`).
+    Fail-open like every repo write (D9): ``None`` without a repo, the
+    report, or ``{"error": ...}`` — the manifest PUT above already landed and
+    ``python -m zagg.icechunk_ops <store> declare-pyramid`` re-runs the step.
+    """
+    from zagg.icechunk_refs import read_block
+
+    try:
+        block = read_block(store_root, store_kwargs=store_kwargs)
+        if block is None:
+            return None
+        from zagg.grids import from_config
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.icechunk_ops import declare_pyramid as declare_into_repo
+
+        # The retrofit vets the manifest, not the config's grid (the
+        # ``chunk_order=`` lever exists because that grid may not describe the
+        # store): a config grid the block disagrees with is rebuilt from the
+        # block, the store's truth, as the retrofit rebuilds from the manifest.
+        grid = from_config(config)
+        keys = ("shard_order", "cell_order", "chunk_order")
+        have = (grid.parent_order, grid.child_order, grid.chunk_order)
+        if tuple(int(v) for v in have) != tuple(block[k] for k in keys):
+            grid = HealpixGrid(
+                block["shard_order"],
+                block["cell_order"],
+                config=config,
+                chunk_inner=block["chunk_order"],
+                sharded=True,
+            )
+        return declare_into_repo(
+            store_root, config, store_kwargs=store_kwargs, manifest=manifest, grid=grid
+        )
+    except Exception as exc:
+        logger.warning(f"declare_pyramid: the icechunk repo was not updated ({exc!r})")
+        return {"error": repr(exc)}
 
 
 def _remove_multiscales_group(store, store_root: str) -> None:
@@ -1081,7 +1133,7 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
     """
     import zarr
 
-    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
     from zagg.store import open_store
     from zagg.sweep import discover_leaves
 
@@ -1105,8 +1157,16 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
     leaf = None
     for key, window in refs:
         path = shard_leaf_path(store_root, key, window=window)
-        if read_commit(open_store(path, read_only=True, **store_kwargs)) is not None:
-            leaf = path
+        stamp = read_commit(open_store(path, read_only=True, **store_kwargs))
+        if stamp is not None:
+            # A versioned leaf's arrays live under its current version
+            # (spec §1.5, issue #582); the stamp just read is the pointer. An
+            # invalid ``current`` is a corrupt leaf: probe the next one.
+            try:
+                leaf = leaf_data_path(path, stamp)
+            except ValueError as e:
+                logger.warning(f"declare_pyramid: skipping corrupt leaf {path} ({e})")
+                continue
             break
     if leaf is None:
         # Two very different stores that must not report the same thing: no run
@@ -1823,7 +1883,7 @@ def _fold_node(
     import zarr
 
     from zagg.grids.morton import morton_word
-    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
     from zagg.stats.composition import merge_composition_kway
     from zagg.store import open_store
     from zagg.windows import union_time_range
@@ -1887,6 +1947,11 @@ def _fold_node(
             # Fold the whole leaf's contribution BEFORE touching the slabs, so
             # a corrupt leaf skips cleanly instead of half-applying.
             try:
+                if stamp.get("current"):
+                    # Versioned leaf (spec §1.5): the arrays are the current
+                    # version's; the root stamp already read is its pointer.
+                    # Inside the try: an invalid ``current`` skips THIS leaf.
+                    leaf_store = open_store(leaf_data_path(leaf, stamp), **store_kwargs)
                 group = zarr.open_group(leaf_store, path=str(cell_order), mode="r", zarr_format=3)
                 morton = group["morton"]
                 if morton.shape != (leaf_cells,):

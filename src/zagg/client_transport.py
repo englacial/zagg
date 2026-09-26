@@ -517,6 +517,7 @@ def attach_run(
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url or get_output_endpoint_url(config),
     )
+    run._attached = True  # the tail finalizes the repo off the knob (issue #582)
     client = lambda_client
     if client is None:
         import boto3

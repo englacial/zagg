@@ -221,6 +221,15 @@ def _put_status(store, shard_key, status="ok", attempt_id=None, **fields):
     obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
 
 
+def _pinned_config(commit):
+    """The dispatched config as a manifest records it: ``output.icechunk.commit`` pinned."""
+    from dataclasses import asdict
+
+    cfg = default_config("atl06")
+    cfg.output["icechunk"] = {"commit": commit}
+    return asdict(cfg)
+
+
 def _put_manifest(store, run_id, shards, dispatched_at=None, config=None):
     """Hand-craft one dispatch manifest (what the worker writes off setup)."""
     from dataclasses import asdict
@@ -332,6 +341,7 @@ class TestEventDispatch:
         first_cell = modes.index(None)
         assert modes[:first_cell] == ["ping", "setup", "icechunk_init"]
         assert "finalize" in modes and "coverage" in modes and "stats" in modes
+        assert modes[-1] == "icechunk_finalize"  # the tail's last invoke (issue #582)
 
     def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):
         # An oversized row set on an EVENT run keeps its run record: the tail
@@ -942,12 +952,26 @@ class TestAttach:
         assert set(results) == set(_WORDS)
         assert all(r["body"]["total_obs"] == 7 for r in results.values())
         assert handle.status() == {"pending": 0, "ok": 3, "failed": 0}
-        # The tail was recorded (tail.json): the reattached handle fires NOTHING.
-        assert fresh.events == []
+        handle.wait(timeout=10)
+        # The tail was recorded (tail.json): the reattached handle re-fires
+        # NOTHING of it except the Icechunk finalize (issue #582) — the marker
+        # precedes the finalize in the tail, so a client that died between the
+        # two left the run untagged; the finalize is idempotent, so a tagged
+        # run costs one no-op invoke. Off the config's knob: attach never held
+        # the dispatch's init record, and the event says so.
+        assert fresh.modes() == ["icechunk_finalize"]
+        (_n, kind, event) = fresh.events[0]
+        assert kind == "RequestResponse" and event["run_id"] == run_id
+        assert event["store_path"] == _STORE and event["icechunk_init"] is None
+        # Newest-only: a later run on the repo leaves this one to its tag.
+        assert event["newest_only"] is True
+        # The stub's canned body is a fail-open record, and wait() did not raise.
+        assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
 
     def test_attach_mid_run_resolves_late_shards_and_runs_the_tail(self, status_store):
         # Mid-run state: manifest + two settled shards; the third lands later.
-        _put_manifest(status_store, "midrun", _WORDS)
+        # The dispatcher pinned ``commit: "leaf"`` into the manifest's config.
+        _put_manifest(status_store, "midrun", _WORDS, config=_pinned_config("leaf"))
         body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
         _put_status(status_store, _WORDS[0], body=dict(body))
         _put_status(status_store, _WORDS[1], body=dict(body))
@@ -963,10 +987,61 @@ class TestAttach:
         # finalize backstop + coverage + stats — and zero cell re-dispatches.
         modes = [m for m in stub.modes() if m]
         assert "finalize" in modes and "stats" in modes
+        assert modes[-1] == "icechunk_finalize"  # the tail's last invoke, off the knob
         assert stub.cell_events() == []
-        # ... and the stats leg recorded the marker: a second attach skips it.
+        # ... and the stats leg recorded the marker: a second attach skips the
+        # tail and fires only the idempotent finalize.
         again = EventStubLambdaClient(status_store)
-        Run.attach(_STORE, "midrun", lambda_client=again).results()
+        again_handle = Run.attach(_STORE, "midrun", lambda_client=again)
+        again_handle.results()
+        again_handle.wait(timeout=10)
+        assert again.modes() == ["icechunk_finalize"]
+
+    def test_attach_never_finalizes_a_ladder_run(self, status_store):
+        # ``runner._run_lambda`` under ``sweep: "stages"`` pins ``commit:
+        # "ladder"``: its last commits land in the staged sweep chained AFTER
+        # the tail marker, so the finalize is that dispatcher's alone — attach
+        # fires none on either path (mid-run tail, then recorded tail).
+        _put_manifest(status_store, "ladder", _WORDS, config=_pinned_config("ladder"))
+        body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        for word in _WORDS:
+            _put_status(status_store, word, body=dict(body))
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "ladder", lambda_client=stub)
+        handle.results()
+        handle.wait(timeout=10)
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "icechunk_finalize" not in modes
+        assert "staged sweep" in handle.icechunk_finalize["skipped"]
+        again = EventStubLambdaClient(status_store)
+        again_handle = Run.attach(_STORE, "ladder", lambda_client=again)
+        again_handle.results()
+        again_handle.wait(timeout=10)
+        assert again.events == []
+        assert "staged sweep" in again_handle.icechunk_finalize["skipped"]
+
+    def test_attach_never_finalizes_a_run_whose_knob_is_off(self, status_store):
+        # ``output.icechunk: false`` in the dispatched config: no repo was
+        # stood up, so a reattached handle fires no finalize on either path.
+        from dataclasses import asdict
+
+        cfg = default_config("atl06")
+        cfg.output["icechunk"] = False
+        _put_manifest(status_store, "knoboff", _WORDS, config=asdict(cfg))
+        body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        for word in _WORDS:
+            _put_status(status_store, word, body=dict(body))
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "knoboff", lambda_client=stub)
+        handle.results()
+        handle.wait(timeout=10)
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "icechunk_finalize" not in modes
+        assert handle.icechunk_finalize is None
+        again = EventStubLambdaClient(status_store)
+        again_handle = Run.attach(_STORE, "knoboff", lambda_client=again)
+        again_handle.results()
+        again_handle.wait(timeout=10)
         assert again.events == []
 
     def test_attach_failed_status_raises_without_redispatch(self, status_store):
