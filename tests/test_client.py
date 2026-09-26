@@ -369,6 +369,20 @@ class TestDispatch:
             assert event["config"]["output"]["icechunk"] == {"commit": "leaf"}
         assert "icechunk" not in cfg.output  # the caller's config is untouched
 
+    def test_icechunk_knob_off_stands_up_and_finalizes_nothing(self, catalog):
+        # ``output.icechunk: false``: no init invoke, no finalize invoke, and
+        # the handle's record stays None (issue #582).
+        cfg = default_config("atl06")
+        cfg.output["icechunk"] = False
+        stub = StubLambdaClient()
+        run = _run(catalog, client=stub, config=cfg)
+        handle = run.dispatch()
+        handle.wait(timeout=10)
+        modes = stub.modes()
+        assert "stats" in modes
+        assert "icechunk_init" not in modes and "icechunk_finalize" not in modes
+        assert run._icechunk_init is None and handle.icechunk_finalize is None
+
     def test_pairless_report_stays_out_of_the_cell_submap(self, catalog):
         # The sibling join's exclusion report (issue #425) holds one entry per
         # unpaired granule — unbounded in the catalog size — so it must not
@@ -425,6 +439,9 @@ class TestDispatch:
         # The finalize outcome is surfaced on the handle, not write-only: the
         # stub's bare envelope is a fail-open error the caller can read.
         assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
+        # A dispatched run is never an attached one: its finalize is not
+        # newest-only.
+        assert run._attached is False and "newest_only" not in fin_event
         # Post-run tail (all worker invokes, D8): finalize backstop + fail-open
         # coverage/stats rollups.
         assert "finalize" in modes

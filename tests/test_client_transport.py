@@ -965,7 +965,8 @@ class TestAttach:
         assert event["store_path"] == _STORE and event["icechunk_init"] is None
         # Newest-only: a later run on the repo leaves this one to its tag.
         assert event["newest_only"] is True
-        assert handle.icechunk_finalize is not None  # the stub's canned body -> fail-open record
+        # The stub's canned body is a fail-open record, and wait() did not raise.
+        assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
 
     def test_attach_mid_run_resolves_late_shards_and_runs_the_tail(self, status_store):
         # Mid-run state: manifest + two settled shards; the third lands later.
