@@ -201,6 +201,52 @@ class TestDeclarePyramid:
         assert again["unchanged"] is True and again["added"] == []
         assert _messages(root)[0] == "declare-pyramid" and _messages(root)[1] != "declare-pyramid"
 
+    def test_a_ref_commit_into_an_added_level_reads_back(self, monkeypatch, cfg, tmp_path):
+        import numpy as np
+        from zarr.core.buffer import default_buffer_prototype
+        from zarr.storage import LocalStore
+
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)
+        r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
+        assert "5" in r["added"]
+        group, repo = _open(root)
+        target = group["5"]["count"]
+        # An object carrying one chunk of the level's own array model.
+        obj = LocalStore(str(tmp_path / "store" / "obj"))
+        meta = target.metadata.to_buffer_dict(default_buffer_prototype())["zarr.json"]
+        zarr.core.sync.sync(obj.set("count/zarr.json", meta))
+        written = zarr.open_array(obj, path="count", mode="r+")
+        chunk = tuple(slice(0, c) for c in written.chunks)
+        values = np.arange(np.prod(written.chunks), dtype=written.dtype).reshape(written.chunks)
+        written[chunk] = values
+        key = "c/" + "/".join("0" * written.ndim)
+        location = icechunk_refs.container_prefix(root) + f"obj/count/{key}"
+        length = (tmp_path / "store" / "obj" / "count" / key).stat().st_size
+        unit = {
+            "level": 5,
+            "entries": [
+                {
+                    "path": "count",
+                    "refs": 1,
+                    "sharded": False,
+                    "chunks": [(f"count/{key}", location, length, None)],
+                }
+            ],
+        }
+        out = icechunk_refs.commit_units(root, [unit], "refs into /5", store_kwargs={})
+        assert out["levels"] == [5] and out["snapshot"]
+        group, repo = _open(root)
+        np.testing.assert_array_equal(group["5"]["count"][chunk], values)
+        # The repo's persisted split for /5 is the level's own cut (§11.5).
+        block = group.attrs[ICECHUNK_ATTR]
+        assert icechunk_refs.block_splits(block)["5"] == block["levels"]["5"]["split"]
+        want = icechunk_refs._repo_config(root, icechunk_refs.block_splits(block), {})
+        assert repo.config.manifest.splitting == want.manifest.splitting
+        manifests = repo.inspect_snapshot(out["snapshot"])["manifests"]
+        assert [m["num_chunk_refs"] for m in manifests] == [1]
+
     def test_a_refused_declaration_leaves_the_split_config(self, monkeypatch, cfg, tmp_path):
         grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
         cfg.output.pop("pyramid")
@@ -407,3 +453,15 @@ class TestCli:
         assert icechunk_ops.main([root, "declare-pyramid", "cfg.yaml"]) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["operation"] == "declare-pyramid" and out["added"] == ["1", "2", "3", "4", "5"]
+
+    def test_error_paths(self, monkeypatch, cfg, tmp_path, capsys):
+        _grid_, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+        n = len(_messages(root))
+        with pytest.raises(json.JSONDecodeError):
+            icechunk_ops.main([root, "set-attrs", "/", "{not json"])
+        with pytest.raises(SystemExit):
+            icechunk_ops.main([root, "rename-template", "x"])
+        assert "invalid choice" in capsys.readouterr().err
+        with pytest.raises(ValueError, match="not initialized"):
+            icechunk_ops.main([str(tmp_path / "bare"), "set-attrs", "/", '{"a": 1}'])
+        assert len(_messages(root)) == n
