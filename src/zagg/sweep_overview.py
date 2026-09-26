@@ -1081,7 +1081,7 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
     """
     import zarr
 
-    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
     from zagg.store import open_store
     from zagg.sweep import discover_leaves
 
@@ -1105,8 +1105,11 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
     leaf = None
     for key, window in refs:
         path = shard_leaf_path(store_root, key, window=window)
-        if read_commit(open_store(path, read_only=True, **store_kwargs)) is not None:
-            leaf = path
+        stamp = read_commit(open_store(path, read_only=True, **store_kwargs))
+        if stamp is not None:
+            # A versioned leaf's arrays live under its current version
+            # (spec §1.5, issue #582); the stamp just read is the pointer.
+            leaf = leaf_data_path(path, stamp)
             break
     if leaf is None:
         # Two very different stores that must not report the same thing: no run
@@ -1823,7 +1826,7 @@ def _fold_node(
     import zarr
 
     from zagg.grids.morton import morton_word
-    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
     from zagg.stats.composition import merge_composition_kway
     from zagg.store import open_store
     from zagg.windows import union_time_range
@@ -1884,6 +1887,10 @@ def _fold_node(
             stamp = read_commit(leaf_store)
             if stamp is None:
                 continue  # absent leaf or unstamped debris (D4)
+            if stamp.get("current"):
+                # Versioned leaf (spec §1.5): the arrays are the current
+                # version's; the root stamp already read is its pointer.
+                leaf_store = open_store(leaf_data_path(leaf, stamp), **store_kwargs)
             # Fold the whole leaf's contribution BEFORE touching the slabs, so
             # a corrupt leaf skips cleanly instead of half-applying.
             try:

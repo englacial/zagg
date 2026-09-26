@@ -85,7 +85,16 @@ def _carrier(grid, shard, fill):
 
 
 def _write_leaf(
-    monkeypatch, grid, root, shard, *, fill=1.0, ragged=None, skip_chunks=(), refs=False
+    monkeypatch,
+    grid,
+    root,
+    shard,
+    *,
+    fill=1.0,
+    ragged=None,
+    skip_chunks=(),
+    refs=False,
+    run_id=None,
 ):
     """One leaf through the production writer; returns the worker metadata.
 
@@ -133,9 +142,18 @@ def _write_leaf(
         }
 
     monkeypatch.setattr(processing, "process_shard", fake)
+    # ``run_id`` makes the leaf VERSIONED (issue #582); ``None`` writes the
+    # legacy in-place leaf these refs tests were written against.
     return hive.process_and_write_hive(
-        shard, ["s3://bucket/g.h5"], grid, {}, root, grid.config, store_kwargs={}
+        shard, ["s3://bucket/g.h5"], grid, {}, root, grid.config, store_kwargs={}, run_id=run_id
     )
+
+
+def _leaf_arrays(root, shard):
+    """The leaf's cell-order group, resolved through its root stamp (a versioned leaf's
+    arrays live under ``current``, spec §1.5; a legacy leaf's at the root)."""
+    data_path, _stamp = hive.resolve_leaf(hive.shard_leaf_path(root, shard))
+    return zarr.open_group(data_path, mode="r")["6"]
 
 
 def _open(root):
@@ -673,7 +691,7 @@ class TestLeafRefs:
         ]
         for shard in shards:
             (rank,) = grid.block_index(shard)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             span = slice(rank * 16, (rank + 1) * 16)
             for name in ("count", "h_mean", "morton"):
                 np.testing.assert_array_equal(group["6"][name][span], leaf[name][:])
@@ -761,7 +779,7 @@ class TestLeafRefs:
         # The record names the FORM, never a per-chunk value.
         assert out["refs"] > 0 and out["checksum"] == "last_modified"
         group, _repo = _open(root)
-        leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+        leaf = _leaf_arrays(root, shard)
         np.testing.assert_array_equal(
             group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
         )
@@ -1058,7 +1076,7 @@ class TestWorkerWiring:
         ] == f"leaf {morton_decimal(shard)}"
         assert repo.lookup_branch("main") == ice["snapshot"]
         (rank,) = grid.block_index(shard)
-        leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+        leaf = _leaf_arrays(root, shard)
         np.testing.assert_array_equal(
             group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
         )
@@ -1395,7 +1413,7 @@ class TestLocalRunEndToEnd:
         for shard in shards:
             (rank,) = grid.block_index(shard)
             span = slice(rank * 16, (rank + 1) * 16)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             for name in ("count", "h_mean", "morton"):
                 np.testing.assert_array_equal(group["6"][name][span], leaf[name][:])
             assert np.isnan(group["6"]["h_mean"][span][8:12]).all()  # inner chunk 2
@@ -1606,7 +1624,7 @@ class TestLadder:
         for shard in shards:
             (rank,) = grid.block_index(shard)
             span = slice(rank * 16, (rank + 1) * 16)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             for name in ("count", "h_mean", "morton"):
                 np.testing.assert_array_equal(group["6"][name][span], leaf[name][:])
             assert np.isnan(group["6"]["h_mean"][span][8:12]).all()
@@ -1682,7 +1700,7 @@ class TestLadder:
         assert messages[0].startswith("finalize ") and messages[1] == "node 1"
         for shard in shards:
             (rank,) = grid.block_index(shard)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             np.testing.assert_array_equal(
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
@@ -1729,7 +1747,7 @@ class TestLadder:
         group, _repo = _open(root)
         for shard in shards:
             (rank,) = grid.block_index(shard)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             np.testing.assert_array_equal(
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
@@ -1783,7 +1801,7 @@ class TestLadder:
         # The surviving sibling is still indexed by the node's commit.
         group, _repo = _open(root)
         (rank,) = grid.block_index(shards[1])
-        leaf_group = zarr.open_group(hive.shard_leaf_path(root, shards[1]), mode="r")["6"]
+        leaf_group = _leaf_arrays(root, shards[1])
         np.testing.assert_array_equal(
             group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf_group["count"][:]
         )
@@ -1849,7 +1867,7 @@ class TestLadder:
         assert "4" not in group  # still absent: nothing was written into it
         for shard in shards:
             (rank,) = grid.block_index(shard)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             np.testing.assert_array_equal(
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
@@ -1872,6 +1890,9 @@ class TestLadder:
 
     @pytest.mark.parametrize("commit", ["leaf", "ladder"])
     def test_skip_touch_re_records_the_leaf_refs(self, monkeypatch, cfg, tmp_path, commit):
+        # LEGACY leaves (issue #582): the touch moves a checksum only when it
+        # touches the arrays, which a versioned leaf's never are (spec §1.5).
+        cfg.output["leaf_versions"] = False
         # The skip-if-current touch refreshes the leaf's objects in place,
         # moving the checksum every ref into them carries (the file:// mtime
         # here; a multipart ETag on S3). The touched unit re-plans from fresh
@@ -1902,13 +1923,16 @@ class TestLadder:
         group["5"]["count"][:]  # the touched column's level reads too (no stale checksum)
         for i, shard in enumerate(shards):
             (rank,) = grid.block_index(shard)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             np.testing.assert_array_equal(
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
             assert leaf["count"][0] == (i + 1) * 10
 
     def test_skip_touch_regathers_dirt_only_in_the_same_run(self, monkeypatch, cfg, tmp_path):
+        # LEGACY leaves (issue #582): the touch moves a checksum only when it
+        # touches the arrays, which a versioned leaf's never are (spec §1.5).
+        cfg.output["leaf_versions"] = False
         # Question (11), ruled (a): under the ladder, a touched current unit
         # enters the run's staged sweep as DIRT-ONLY, so the same run
         # re-gathers its node and commits the rewritten sidecar -- the repo
@@ -1954,12 +1978,15 @@ class TestLadder:
         group["5"]["count"][:]  # the touched column's level reads (no stale checksum)
         for shard in shards:
             (rank,) = grid.block_index(shard)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             np.testing.assert_array_equal(
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
 
     def test_skip_touch_regathers_dirt_only_over_the_fleet(self, monkeypatch, cfg, tmp_path):
+        # LEGACY leaves (issue #582): the touch moves a checksum only when it
+        # touches the arrays, which a versioned leaf's never are (spec §1.5).
+        cfg.output["leaf_versions"] = False
         # The same all-skip rerun, on the production path: each unit is
         # re-dispatched through the Lambda handler with the event the fleet
         # dispatcher builds (the gate armed with the run's digest), the
@@ -2022,7 +2049,7 @@ class TestLadder:
         group["5"]["count"][:]  # the touched column's level reads (no stale checksum)
         for shard in shards:
             (rank,) = grid.block_index(shard)
-            leaf = zarr.open_group(hive.shard_leaf_path(root, shard), mode="r")["6"]
+            leaf = _leaf_arrays(root, shard)
             np.testing.assert_array_equal(
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
