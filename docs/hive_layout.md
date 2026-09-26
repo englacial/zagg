@@ -27,6 +27,8 @@ the same per-shard write path (see [Status](#status)).
   {sign+base}/{d1}/.../{d_n}/    <- one decimal digit per level (D2)
     {full_id}.zarr/              <- vanilla zarr v3 leaf, one per shard (D3)
     {full_id}_{window}.zarr/     <- time-windowed leaf (D13, morton-hive/2)
+      run-{run_id}/              <- a VERSIONED leaf's arrays (morton-hive/3): the
+                                    root zarr.json names the current version
 ```
 
 - **Ids are morton decimal strings** (D1): sign + base digit (`1..6` /
@@ -640,6 +642,25 @@ stamp, so coverage shares the debris semantics: no stamp, no visible coverage.
 A windowed leaf's stamp ([Time windows](#time-windows-morton-hive2)) declares
 `spec: "morton-hive/2"` and adds `window` (the label) plus `time_range` — the
 actual `[t_min, t_max]` written, as ISO-8601 UTC strings.
+
+**Versioned leaves (`morton-hive/3`,
+[specification §1.5](specification.md#15-storage-geometries), issue
+[#582](https://github.com/englacial/zagg/issues/582)).** The stable
+`{id}.zarr/zarr.json` is a **pointer stamp**: it carries the stamp above plus
+`"current": "run-{run_id}"`, and the arrays live in that **version
+subgroup** — `{id}.zarr/run-{run_id}/{cell_order}/…`, a complete leaf with its
+own stamp, never rewritten once stamped. A replacement writes a new version
+and swaps the pointer (one PUT), so an earlier run tag in the Icechunk repo
+keeps reading the version it indexed; superseded versions are reclaimed by
+the operator-run collector (`tools/icechunk_gc_targets.py`, dry-run default).
+Write order: version arrays → version stamp → refs against the version's
+objects → pointer swap → lifecycle touch of the root and current version. A
+same-run retry that finds its version stamped resumes at the refs; a
+different run always writes a new version. **A stamp without `current` is a
+legacy leaf** (every store written before this revision): readers open the
+root and follow `current` when present, else read the root itself
+(`zagg.hive.resolve_leaf`) — no migration, and a store mixes both kinds
+after its first post-revision write.
 
 **Reader caveat — `t_max` floors, so the recorded range can end up to 1 s
 early.** Both ends render through `windows.iso_utc`'s whole-second
@@ -1653,6 +1674,9 @@ be added later by the sweep as a derived artifact). Readers:
    (`zagg.hive.shard_leaf_path`), open the leaf zarr, and **check the commit
    stamp** (`zagg.hive.read_commit`) before trusting the contents; the
    stamp's coverage payload pre-filters the AOI (`box_and`/`bitmap_and`).
+   If the stamp names `current` (a versioned leaf, `morton-hive/3`), the
+   arrays are under `{leaf}/{current}/` (`zagg.hive.resolve_leaf`); the
+   stamp's first GET is the pointer, so following it costs no extra request.
 4. Discovery without a root MOC falls back to the delimiter-LIST walk:
    recurse on `[1-4]/` children; a `*.zarr` entry is data at that node; no
    digit children ⇒ nothing finer. Never LIST per observation in a join

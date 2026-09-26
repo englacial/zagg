@@ -287,18 +287,51 @@ it, and lands the stamp last. This is what lets a byte-range index into a
 leaf — the §11 Icechunk companion refs, moczarr's 2-GET reads — trust
 `(key, offset, length)` for as long as the stamp it was taken under stands.
 
-A replacement is not, however, a change of **keys**. Clear-then-template
+**Versioned leaves (`morton-hive/3`).** On a **legacy** leaf (stamp `spec`
+`/1` or `/2`) a replacement is not a change of **keys**: clear-then-template
 rewrites the same key layout, and on an unversioned bucket the new object
 lands at exactly the key an old reference names — so a reference taken under
 a superseded stamp does *not* 404: it reads the new object's bytes at a stale
-offset and would silently mis-decode. Two things close that. The replacing
-writer re-records its refs against the new leaf (§11.4); and every recorded
-reference carries the referenced object's **ETag** — or, on a local store,
-its `last_modified` — **as its Icechunk checksum** (§11.3), which Icechunk
-verifies on read, so a reference not yet re-recorded fails **loudly** instead
-of returning wrong bytes. Stage 2's content-pinned
-keys retire the case. Issue
-[#580](https://github.com/englacial/zagg/issues/580).
+offset and would silently mis-decode. Every recorded reference therefore
+carries the referenced object's **ETag** — or, on a local store, its
+`last_modified` — **as its Icechunk checksum** (§11.3), which Icechunk
+verifies on read, so a stale reference fails **loudly** instead of returning
+wrong bytes (issue [#580](https://github.com/englacial/zagg/issues/580)).
+
+A **versioned** leaf retires the case (issue
+[#582](https://github.com/englacial/zagg/issues/582), espg ruling
+2026-09-26). Its stable prefix `{id}.zarr/` (§4.2; the D3 address every
+reader computes) is a **pointer root**: the root `zarr.json` carries the
+commit stamp as before plus one key, `current`, naming the **version
+subgroup** that holds the arrays — `{id}.zarr/{current}/{cell_order}/…`, a
+complete, self-describing zarr leaf with its own stamp, whose objects are
+**never rewritten once stamped**. The version name is the run that wrote it,
+`run-{run_id}` (the same token that tags the run in the §11 repo). A
+replacement writes a **new** version subgroup and moves the pointer; the
+superseded version's objects stay at their keys until the §11 garbage
+collector finds no retained snapshot naming them. Consequently a reference
+taken under any stamp stays valid for as long as its version exists — a run
+tag reads the store exactly as that run left it — and a same-key rewrite of
+committed bytes never happens.
+
+The **write order** is normative: (1) write the version subgroup's arrays;
+(2) stamp the version (its own root `zarr.json`, `spec: "morton-hive/3"`);
+(3) record the refs against the version's objects (§11.3); (4) swap the
+pointer — one PUT of the stable root `zarr.json`, mirroring the version's
+stamp and naming it as `current`; (5) the lifecycle touch refreshes the
+stable root and the current version only, never a superseded one. Until (4)
+lands the leaf reads as it did before the write. A retry of the same unit in
+the **same run** that finds its own version already stamped resumes at (3),
+never rewriting stamped bytes; an unstamped version is debris and is
+rewritten wholesale (D4). A different run always writes a different version.
+
+**Readers carry one rule**: open the stable root; if its stamp names
+`current`, the arrays are under `{root}/{current}/`, else under `{root}/`
+itself. **Absent `current` is a legacy leaf** — every store written before
+this revision — so no store requires migration and a store legitimately
+mixes legacy and versioned leaves after its first post-revision write. The
+manifest's own `spec` (§4.2's window-naming dialect) does not move: leaf
+versioning is a per-leaf fact the stamp declares.
 
 ### 1.6 Succession
 
@@ -680,6 +713,15 @@ is `{window}.zarr`, and the reserved token **`all`** names the all-time fold
 (`all.zarr` — the same token that names a `schedule: none` store's leaves;
 excluded from the window grammar forever). Nothing about the *name*
 distinguishes an overview from a leaf — classification is §4.3's job.
+
+A **versioned leaf** (§1.5, `morton-hive/3`) adds nothing at the node: its
+stable `{id}.zarr` / `{id}_{window}.zarr` entry is unchanged, and its
+versions are **subgroups** of that entry named `run-{run_id}` — so the D5
+node invariant, the walker's child classification and every prefix-scoped
+rule see the same children as before. The stable root's stamp names the
+current version; the version subgroup carries the arrays. A version name is
+never a cell-order digit group (it always begins with `run-`), so a reader
+enumerating a leaf root tells the two apart by name.
 
 ### 4.3 The `role` and `zagg_overview` attrs
 
@@ -2093,7 +2135,10 @@ unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
 `dggs` block carries the §1 `latitude` token, so each fixture is the
 absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
 for both (the sidecar copy and §1's own evidence paragraph are the record
-for what those artifacts mean). Regeneration is deferred because it would
+for what those artifacts mean); likewise no committed leaf is **versioned**
+(§1.5, `morton-hive/3`) — a versioned-leaf fixture (pointer root, `current`,
+one version subgroup) joins the set with the writer that produces it (issue
+[#582](https://github.com/englacial/zagg/issues/582)). Regeneration is deferred because it would
 also install the §4.9 `multiscales` mirror that `column/` pins the
 **absence** of, retiring an unrelated pin.
 
@@ -3518,12 +3563,15 @@ that object's **`last_modified`**, ceiled to the next whole second: Icechunk
 compares a recorded datetime against the object's modification time at
 **whole-second granularity**, so the exact sub-second `mtime` fails the very
 object it was read from while the ceiling passes it. Icechunk verifies either
-form on read, so a reference into a leaf that has since been
-wholesale-replaced (§1.5 leaf immutability — same keys, new bytes) fails
-loudly rather than decoding the replacement at a stale offset. That
-granularity is the local form's one caveat: a replacement landing within the
-**same second** as the original passes the check (an object store's ETag has
-no such window). The writer records which form it used under
+form on read, so a reference into a **legacy** leaf that has since been
+wholesale-replaced (§1.5 — same keys, new bytes) fails loudly rather than
+decoding the replacement at a stale offset. That granularity is the local
+form's one caveat: a replacement landing within the **same second** as the
+original passes the check (an object store's ETag has no such window). On a
+**versioned** leaf (§1.5, `morton-hive/3`) the recorded `location` is the
+version subgroup's object — `{leaf}/run-{run_id}/{p}/c/0` — which is never
+rewritten, so the checksum is a guard against out-of-band tampering only and
+a replacement invalidates no earlier reference. The writer records which form it used under
 `icechunk.checksum` in the leaf's stats sidecar (`"etag"` or
 `"last_modified"`).
 
@@ -3700,14 +3748,20 @@ rare, deliberate, whole-repo operation with no run to attach to (at the
 globe it may exceed one invoke), so finalize reports it as
 `rewrite_pending: {from, to}` for the operator step.
 
-A **replaced** leaf (§1.5 leaf immutability) is re-indexed by the next staged
-sweep that gathers it: the new sidecar's refs supersede the old ones on
-`main`. Snapshots older than that commit still reference the replaced keys —
-and because clear-then-template reuses those keys, their refs resolve to a
-**live** object rather than 404ing. The per-ref checksum (§11.3) is what
-makes that a loud failure instead of a silent mis-decode. Icechunk's garbage
-collection does not manage virtual targets, and stage 1 does not pin history
-across a replacement (stage 2's content-pinned keys do).
+A **replaced** leaf is re-indexed by the run that replaces it (per-leaf
+commit or the next staged sweep): the new refs supersede the old ones on
+`main`. On a **legacy** leaf (§1.5) snapshots older than that commit still
+reference the replaced keys — and because clear-then-template reuses those
+keys, their refs resolve to a **live** object rather than 404ing; the per-ref
+checksum (§11.3) is what makes that a loud failure instead of a silent
+mis-decode. On a **versioned** leaf the old refs name the superseded
+version's objects, which stay in place, so every earlier snapshot and run
+tag keeps reading. Icechunk's garbage collection never touches a virtual
+target; the **virtual-target collector** (`tools/icechunk_gc_targets.py`,
+operator-run, dry-run by default) deletes a leaf's version subgroups that
+are neither its `current` nor referenced by any retained snapshot or tag
+(`main` and every `run-` tag), reports the reclaimable bytes, never touches
+a legacy leaf, and refuses a store without a repo.
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
 come out of the object's own index, but the sizes and checksums do not. For
