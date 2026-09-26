@@ -221,6 +221,15 @@ def _put_status(store, shard_key, status="ok", attempt_id=None, **fields):
     obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
 
 
+def _pinned_config(commit):
+    """The dispatched config as a manifest records it: ``output.icechunk.commit`` pinned."""
+    from dataclasses import asdict
+
+    cfg = default_config("atl06")
+    cfg.output["icechunk"] = {"commit": commit}
+    return asdict(cfg)
+
+
 def _put_manifest(store, run_id, shards, dispatched_at=None, config=None):
     """Hand-craft one dispatch manifest (what the worker writes off setup)."""
     from dataclasses import asdict
@@ -958,7 +967,8 @@ class TestAttach:
 
     def test_attach_mid_run_resolves_late_shards_and_runs_the_tail(self, status_store):
         # Mid-run state: manifest + two settled shards; the third lands later.
-        _put_manifest(status_store, "midrun", _WORDS)
+        # The dispatcher pinned ``commit: "leaf"`` into the manifest's config.
+        _put_manifest(status_store, "midrun", _WORDS, config=_pinned_config("leaf"))
         body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
         _put_status(status_store, _WORDS[0], body=dict(body))
         _put_status(status_store, _WORDS[1], body=dict(body))
@@ -983,6 +993,29 @@ class TestAttach:
         again_handle.results()
         again_handle.wait(timeout=10)
         assert again.modes() == ["icechunk_finalize"]
+
+    def test_attach_never_finalizes_a_ladder_run(self, status_store):
+        # ``runner._run_lambda`` under ``sweep: "stages"`` pins ``commit:
+        # "ladder"``: its last commits land in the staged sweep chained AFTER
+        # the tail marker, so the finalize is that dispatcher's alone — attach
+        # fires none on either path (mid-run tail, then recorded tail).
+        _put_manifest(status_store, "ladder", _WORDS, config=_pinned_config("ladder"))
+        body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        for word in _WORDS:
+            _put_status(status_store, word, body=dict(body))
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "ladder", lambda_client=stub)
+        handle.results()
+        handle.wait(timeout=10)
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "icechunk_finalize" not in modes
+        assert "staged sweep" in handle.icechunk_finalize["skipped"]
+        again = EventStubLambdaClient(status_store)
+        again_handle = Run.attach(_STORE, "ladder", lambda_client=again)
+        again_handle.results()
+        again_handle.wait(timeout=10)
+        assert again.events == []
+        assert "staged sweep" in again_handle.icechunk_finalize["skipped"]
 
     def test_attach_never_finalizes_a_run_whose_knob_is_off(self, status_store):
         # ``output.icechunk: false`` in the dispatched config: no repo was
