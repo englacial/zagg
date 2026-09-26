@@ -3424,7 +3424,10 @@ def get_leaf_versions(config: PipelineConfig) -> bool:
     stamp names it as ``current``, so a replacement never rewrites bytes an
     earlier run tag references. ``output.leaf_versions: false`` keeps the
     legacy in-place leaf — the switch for a store whose readers do not yet
-    follow ``current``. Layout, not semantics: outside the D19 core.
+    follow ``current``. Default ON carries spec §1.5's operator
+    preconditions: no bucket expiration rule over the hive tree (the
+    collector owns version lifetime) and readers that follow ``current``.
+    Layout, not semantics: outside the D19 core.
     """
     flag = config.output.get("leaf_versions")
     if flag is None:

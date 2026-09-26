@@ -690,6 +690,12 @@ clear-and-template a root whose stamp names `current` MUST refuse (it is a
 legacy or stale writer against a versioned leaf). The root's mirrored
 `content_hashes` keys are relative to the version root, identical in form to
 a legacy leaf's.
+**Operator preconditions (normative, spec §1.5).** Versioned leaves are the
+hive default (`output.leaf_versions: false` opts a run out). A store written
+with them MUST carry no bucket expiration rule over its hive tree (the
+collector owns version lifetime — see [The lifecycle touch](#the-lifecycle-touch)),
+and its readers MUST follow `current` (moczarr takes that change before the
+next fleet run).
 
 **Reader caveat — `t_max` floors, so the recorded range can end up to 1 s
 early.** Both ends render through `windows.iso_utc`'s whole-second
@@ -1313,9 +1319,10 @@ expiration rule over the leaf tree MUST NOT cover version subgroups — a rule
 that does ages out the **current** version under a live pointer on the
 rule's clock, whatever the collector decides, and bounds every tag's
 readability by the rule's age. S3 lifecycle filters select by prefix, tag or
-size and cannot exclude a nested name, so in practice a store with versioned
-leaves carries no expiration rule over its hive tree (the `icechunk/`
-exclusion below is the same posture for the repo).
+size and cannot exclude a nested name, so a store with versioned leaves
+MUST carry no expiration rule over its hive tree (spec §1.5's operator
+precondition; the `icechunk/` exclusion below is the same posture for the
+repo).
 Local stores use `os.utime`; S3 uses a server-side self-copy (`CopyObject`
 onto itself, `MetadataDirective: REPLACE`) that preserves content, the ETag
 of non-multipart objects, and the object's storage class. A local run's
