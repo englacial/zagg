@@ -1363,8 +1363,8 @@ def leaf_block_index(grid, block_index, shard_key) -> tuple:
     return tuple(int(s.start) // int(c) for s, c in zip(region, grid.chunk_shape))
 
 
-def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> bool:
-    """Is a STAMPED leaf present at ``leaf_path``? (issue #388 skip precondition)
+def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> dict | None:
+    """The root stamp of a COMMITTED leaf at ``leaf_path``, else ``None`` (issue #388).
 
     The D20 stats sidecar is a SIBLING of the leaf ``.zarr``
     (:func:`zagg.telemetry.sidecar_path`), so the two diverge, and the
@@ -1380,17 +1380,27 @@ def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> bool:
     miss``); the gate follows it. ``leaf_path`` is the per-``(shard, window)``
     leaf on both seams, so the windowed stamp is the one checked. Fail-open
     toward RECOMPUTE: an unreadable store reads as uncommitted.
+
+    A root stamp naming ``current`` (a versioned leaf, issue #582) is
+    committed only when the named version is stamped too: a pointer to a
+    missing or unstamped version is debris (spec §1.5), so the gate rewrites
+    it instead of certifying it forever — one more GET, versioned leaves only.
     """
     from zagg.store import open_store
 
     try:
-        return read_commit(open_store(leaf_path, **store_kwargs)) is not None
+        stamp = read_commit(open_store(leaf_path, **store_kwargs))
+        if stamp is not None and stamp.get("current"):
+            version = leaf_data_path(leaf_path, stamp)
+            if read_commit(open_store(version, **store_kwargs)) is None:
+                return None
+        return stamp
     except Exception as e:
         logger.warning(
             f"skip-if-current: leaf stamp unreadable for shard {shard_key} "
             f"(rewriting, issue #388): {e}"
         )
-        return False
+        return None
 
 
 def leaf_column_expectation(store_root, shard_key, grid, config, window):
@@ -1457,7 +1467,8 @@ def leaf_identity_gate(
       metadata as ``metadata["identity"]`` so run stats can count
       ``unrecorded-ids`` rewrites apart from ordinary ones.
     - ``meta`` — an early-return unit metadata dict when the unit must NOT
-      fold: ``{"current": True}`` on an identity match, ``{"refused": True,
+      fold: ``{"current": True}`` on an identity match (plus ``leaf_version``,
+      the live version, on a versioned leaf — spec §1.5), ``{"refused": True,
       "missing_granules": [...]}`` on a contraction without
       ``allow_contraction``. ``None`` means proceed with the wholesale D4
       rewrite exactly as today — including a contraction explicitly allowed
@@ -1521,12 +1532,14 @@ def leaf_identity_gate(
             leaf_path, recorded, spec=sidecar_spec, store_kwargs=store_kwargs
         ),
     )
+    leaf_stamp = None
     if identity["action"] == "skip":
         drift = None
-        if not _leaf_is_committed(leaf_path, store_kwargs, shard_key):
+        leaf_stamp = _leaf_is_committed(leaf_path, store_kwargs, shard_key)
+        if leaf_stamp is None:
             drift = "unstamped-leaf"
-        elif column_path is not None and column_declared is not _leaf_is_committed(
-            column_path, store_kwargs, shard_key
+        elif column_path is not None and column_declared is not (
+            _leaf_is_committed(column_path, store_kwargs, shard_key) is not None
         ):
             drift = "column-drift"
         if drift is not None:
@@ -1551,7 +1564,12 @@ def leaf_identity_gate(
     }
     if identity["action"] == "skip":
         logger.info(f"shard {shard_key}: current (identity match, issue #388) — fold skipped")
-        return identity, {**base, "current": True}
+        meta = {**base, "current": True}
+        if leaf_stamp.get("current"):
+            # The versioned leaf's live version (spec §1.5), from the stamp the
+            # gate already read: the caller's touch/refs use it, never a re-read.
+            meta["leaf_version"] = leaf_stamp["current"]
+        return identity, meta
     if identity["action"] == "refuse":
         missing = identity["missing"]
         if allow_contraction:
@@ -1805,10 +1823,9 @@ def process_and_write_hive(
                 # A versioned leaf's current version (spec §1.5): the touch
                 # refreshes the pointer root and the siblings only — never a
                 # version's objects, whose checksums the run tags depend on —
-                # and the refs re-plan points into it.
-                current = (
-                    read_commit(open_store(leaf_path, read_only=True, **store_kwargs)) or {}
-                ).get("current")
+                # and the refs re-plan points into it. The gate verified the
+                # version is stamped and hands its name over (no re-read).
+                current = unit_meta.get("leaf_version")
                 # Lifecycle touch (issue #388 phase 3): a skip must still
                 # reset the purge clock on the unit's whole footprint — leaf
                 # tree, sidecar/sub-map siblings, and the declared column

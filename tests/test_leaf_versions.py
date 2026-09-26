@@ -257,6 +257,8 @@ class TestLifecycle:
         assert again["cells_current"] == 2
         for meta in again["results"]:
             assert meta["current"] is True and meta["touched_objects"] > 0
+            # The gate hands the live version over (no second root read).
+            assert meta["leaf_version"] == versions[meta["shard_key"]][0]
             assert "icechunk" not in meta and not meta.get("icechunk_dirty")
         for s in shards:
             assert _versions(hive.shard_leaf_path(root, s)) == versions[s]
@@ -269,6 +271,43 @@ class TestLifecycle:
             np.testing.assert_array_equal(
                 group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
+
+
+class TestSkipGate:
+    def test_a_dangling_pointer_is_rewritten_not_skipped(self, monkeypatch, cfg, tmp_path):
+        # The spec §1.5 rule on the WRITER's gate: a pointer naming a missing
+        # version is debris, so a matching identity still rewrites (a fresh
+        # version lands and the pointer moves) instead of skipping forever.
+        import shutil
+
+        shards = _shards(_grid(cfg), 1)
+        block = {"commit": "ladder"}
+        _g, root, _first = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block=block, shards=shards
+        )
+        leaf = hive.shard_leaf_path(root, shards[0])
+        (gone,) = _versions(leaf)
+        shutil.rmtree(f"{leaf}/{gone}")
+        _g, _root, again = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block=block, shards=shards
+        )
+        assert again["cells_current"] == 0
+        (meta,) = again["results"]
+        assert not meta.get("current") and meta["identity"] == "unstamped-leaf"
+        (fresh,) = _versions(leaf)
+        assert fresh != gone and hive.read_commit(leaf)["current"] == fresh
+        assert hive.read_commit(f"{leaf}/{fresh}") is not None
+
+    def test_an_unstamped_version_is_debris_to_the_gate(self, cfg, tmp_path):
+        from zagg.store import open_store
+
+        leaf = str(tmp_path / "1.zarr")
+        version = hive.leaf_version_name(RUN_A, "cafef00d")
+        zarr.open_group(open_store(f"{leaf}/{version}"), mode="w")  # torn: no stamp
+        hive.write_pointer_stamp(open_store(leaf), {"complete": True}, version)
+        assert hive._leaf_is_committed(leaf, {}, 1) is None
+        hive.stamp_commit(open_store(f"{leaf}/{version}"), cells_with_data=1, granule_count=1)
+        assert hive._leaf_is_committed(leaf, {}, 1)["current"] == version
 
 
 class TestKnob:
