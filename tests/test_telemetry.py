@@ -33,6 +33,7 @@ def _record(
     n_obs=1000,
     cells=7,
     duration=12.5,
+    duration_total=None,
     granules=("s3://b/g1.h5", "s3://b/g2.h5"),
     phases=None,
     memory=512.0,
@@ -47,6 +48,8 @@ def _record(
         "cells_with_data": cells,
         "granule_count": len(granules),
         "duration_s": duration,
+        # Invocation wall (issue #589); absent on records predating the key.
+        **({"duration_total_s": duration_total} if duration_total is not None else {}),
         "max_memory_mb": memory,
         "container_hwm_mb": memory + 100 if memory is not None else None,
         "phase_timings": {"read": 8.0, "index": 1.0, "aggregate": 2.0}
@@ -112,8 +115,25 @@ class TestBuildRecord:
         cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
         rec = _record(duration=10.0, lambda_config=cfg)
         assert rec["lambda"] == cfg
+        # No invocation wall on the record (a worker predating issue #589):
+        # the price falls back to the aggregate clock, and the column is
+        # null — unmeasured, never zero.
+        assert rec["duration_total_s"] is None
         assert rec["gb_seconds"] == pytest.approx(40.0)
         assert rec["est_cost_usd"] == pytest.approx(40.0 * 0.0000133334)
+
+    def test_duration_total_prices_cost_when_present(self):
+        # Issue #589: the write side (leaf write, hash, column fold, refs)
+        # runs AFTER ``duration_s`` is stamped, so the invocation wall is what
+        # Lambda bills; ``duration_s`` keeps its read/aggregate meaning.
+        cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
+        rec = _record(duration=10.0, duration_total=13.0, lambda_config=cfg)
+        assert rec["duration_s"] == 10.0 and rec["duration_total_s"] == 13.0
+        assert rec["gb_seconds"] == pytest.approx(52.0)
+        assert rec["est_cost_usd"] == pytest.approx(52.0 * 0.0000133334)
+        # Off-Lambda the total is recorded but unpriced, like duration_s.
+        local = _record(duration=10.0, duration_total=13.0)
+        assert local["duration_total_s"] == 13.0 and local["gb_seconds"] is None
 
     def test_unknown_arch_falls_back_to_default_rate(self):
         # The record prices via the #298 arch table; an unmapped arch uses the
@@ -450,6 +470,17 @@ class TestMerge:
         # Differing lambda blocks collapse to None (absorbing identity).
         assert m["lambda"] is None
 
+    def test_duration_total_sums_or_none(self):
+        # Populated totals sum; a rollup over records that never measured the
+        # invocation wall stays None (the merge identity law), and a mixed
+        # fold sums only the populated parts (the n_obs_read disposition).
+        a = _record(1, duration=10.0, duration_total=13.0)
+        b = _record(2, duration=5.0, duration_total=6.5)
+        assert merge([a, b])["duration_total_s"] == pytest.approx(19.5)
+        assert merge([a, b])["duration_s"] == pytest.approx(15.0)
+        assert merge([_record(1), _record(2)])["duration_total_s"] is None
+        assert merge([a, _record(2)])["duration_total_s"] == pytest.approx(13.0)
+
     def test_cost_fields_shared_lambda_survives(self):
         cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
         a = _record(1, duration=10.0, lambda_config=cfg)
@@ -784,6 +815,10 @@ class TestRunParquet:
         # The point-path read counter is a column of every run parquet too, so
         # the read-vs-keep ratio is queryable alongside n_obs (issue #374).
         assert "n_obs_read" in row
+        # The invocation wall is a column beside duration_s (issue #589): null
+        # here (no total on the record), populated when the worker stamped it.
+        assert row["duration_total_s"] is None
+        assert flatten_record(_record(duration_total=13.0))["duration_total_s"] == 13.0
         assert "phase_timings" not in row and "lambda" not in row  # flattened away
 
     def test_n_obs_read_flattens_to_a_column(self):

@@ -549,6 +549,9 @@ class TestProcessRasterHiveMode:
         # Always-on sample/write collection flows into the record.
         assert {"sample", "write"} <= set(record["phase_timings"])
         assert record["max_memory_mb"] is not None
+        # The invocation wall rides the raster record too (issue #589): one
+        # column across paths, stamped just before the record is built.
+        assert record["duration_total_s"] >= record["duration_s"]
         # Read-volume counters (issue #297): whole tiles are fetched+decoded to
         # sample the shard's cells. The decoded/sampled ratio reads as
         # over-provision only when the output grid is coarser than the source; a

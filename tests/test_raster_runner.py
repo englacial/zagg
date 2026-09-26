@@ -1056,6 +1056,9 @@ class TestRasterHiveLocalBackend:
         assert record["shard_key"] == int(shard)
         assert record["invoked_by"] is None and record["lambda"] is None
         assert {"sample", "write"} <= set(record["phase_timings"])
+        # The local backend records the unit wall too (issue #589), unpriced.
+        assert record["duration_total_s"] >= record["duration_s"]
+        assert record["gb_seconds"] is None
         # Read-volume counters (issue #297) ride the local record too. Order of
         # decoded vs sampled is regime-bound (a grid finer than the source
         # inverts it), so assert each counter is positive, not their ratio.
