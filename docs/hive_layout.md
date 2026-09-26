@@ -684,7 +684,10 @@ that died before its pointer swap is left for the collector. The run tag
 legacy leaf** (every store written before this revision): readers open the
 root and follow `current` when present, else read the root itself
 (`zagg.hive.resolve_leaf`) — no migration, and a store mixes both kinds
-after its first post-revision write. A pointer naming a missing or unstamped
+after its first post-revision write. A root stamp naming `current` over a
+root that also holds `{cell_order}/…` arrays is a **converted legacy leaf**:
+the root arrays are the last legacy write, read only by readers that ignore
+`current`. A pointer naming a missing or unstamped
 version is a corrupted leaf, read as debris; a writer about to
 clear-and-template a root whose stamp names `current` MUST refuse (it is a
 legacy or stale writer against a versioned leaf). The root's mirrored

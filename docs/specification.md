@@ -370,7 +370,9 @@ The root's states, for readers and for a writer's skip gate: **no root
 `zarr.json`** — debris (D4), as today; the (4) PUT is what creates the root
 group of a fresh leaf. **A root stamp without `current`** — a legacy leaf,
 arrays at the root. **A root stamp naming `current`** — arrays at the
-version. A pointer naming a **missing or unstamped** version is a corrupted
+version. **A root stamp naming `current` over a root that also holds
+`{cell_order}/…` arrays** — a converted legacy leaf; the root arrays are the
+last legacy write, read only by readers that ignore `current`. A pointer naming a **missing or unstamped** version is a corrupted
 leaf that a reader, and a writer's skip gate, treats as debris: the pointer
 is only ever written after the version is stamped, so the state arises only
 from out-of-band deletion. The root's mirrored §5.3 `content_hashes` are
