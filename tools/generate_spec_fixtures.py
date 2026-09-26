@@ -688,6 +688,7 @@ def _expected_multiscales(levels: list, s: int) -> list:
         }
     ]
 
+
 def build_demoted(out: Path) -> None:
     """The §4.3 ``demotions`` fixture (issue #518): the packed rail, recorded.
 
