@@ -2278,7 +2278,8 @@ def process_and_write_hive(
     memory holds one window's slab beside the shard's reads rather than N.
     The return is the SHARD's metadata: the read-phase fields once,
     ``total_obs`` / ``cells_with_data`` summed, ``time_range`` the windows'
-    union, ``error`` the first failed window's (prefixed with its label, so
+    union, ``error`` the first failed window's (a window that kept no data
+    reports the fan-out's benign error and fails nothing; prefixed with its label, so
     the dispatcher's retry re-runs the shard and the gate skips the windows
     that landed), ``current`` / ``refused`` only when EVERY window was, and
     ``windows`` — one metadata dict per window in dispatch order, each the
@@ -2478,9 +2479,11 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     invoke's, so a per-leaf record's fleet-safety columns describe the invoke
     that produced it) and ``unit_windows``; the shard meta carries the
     window-independent fields once, the sums, the time-range union, the
-    first failed window's error, and ``current`` / ``refused`` only when
+    first failed window's error (a benign no-data window is not a failure),
+    and ``current`` / ``refused`` only when
     every window skipped that way.
     """
+    from zagg.dispatch import BENIGN_ERRORS
     from zagg.windows import union_time_range
 
     n = len(window_metas)
@@ -2491,11 +2494,18 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     meta = {**base, "windows": window_metas}
     if n and not written:
         meta["current" if all(m.get("current") for m in window_metas) else "refused"] = True
-    failed = [m for m in written if m.get("error")]
+    # A window whose sink kept nothing reports a benign no-work error, as its
+    # ``(shard, window)`` fan-out unit would (status ``no_data``, never a cell
+    # error): it is not a failure of the shard. Only non-benign windows fail
+    # it; a shard whose every written window is benign reports the bare
+    # benign string, so the whole-shard case still classifies as no data.
+    failed = [m for m in written if m.get("error") and m["error"] not in BENIGN_ERRORS]
     if failed:
         first = failed[0]
         more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
+    elif written and all(m.get("error") for m in written):
+        meta["error"] = written[0]["error"]
     time_range = union_time_range(*(m.get("time_range") for m in written))
     if time_range is not None:
         meta["time_range"] = time_range

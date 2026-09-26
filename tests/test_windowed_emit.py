@@ -576,6 +576,23 @@ class TestBulkEndToEnd:
         ].endswith("(+2 more)")
         assert not (tmp_path / "bulk").exists()  # no leaf prefix for a no-data shard
 
+    def test_an_empty_window_is_benign_beside_landed_ones(self, monkeypatch, tmp_path):
+        # Review finding (1): A's span covers 2018 but its in-shard rows are
+        # all 2019, so the 2018 window's sink is empty — a benign no-data
+        # unit on the fan-out, never a failed shard.
+        from zagg.dispatch import BENIGN_ERRORS
+
+        fakes = {**_fakes(), "s3://bucket/granuleA.h5": _h5([400.0, 401.0, 402.0])}
+        meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"), fakes=fakes)
+        assert [m["error"] for m in meta["windows"]] == ["No data after filtering", None, None]
+        assert meta["error"] is None and meta["total_obs"] == 11
+        # Every written window benign: the bare string, so the shard is no_data.
+        far = {u: _h5([400.0]) for u in _fakes()}
+        for h in far.values():
+            h._arrays["/lat"] = np.full(1, 10.0)
+        meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "far"), fakes=far)
+        assert meta["error"] in BENIGN_ERRORS
+
     def test_window_and_windows_are_exclusive(self, monkeypatch, tmp_path):
         with pytest.raises(ValueError, match="not both"):
             hive.process_and_write_hive(
