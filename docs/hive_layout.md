@@ -27,8 +27,8 @@ the same per-shard write path (see [Status](#status)).
   {sign+base}/{d1}/.../{d_n}/    <- one decimal digit per level (D2)
     {full_id}.zarr/              <- vanilla zarr v3 leaf, one per shard (D3)
     {full_id}_{window}.zarr/     <- time-windowed leaf (D13, morton-hive/2)
-      run-{run_id}/              <- a VERSIONED leaf's arrays (morton-hive/3): the
-                                    root zarr.json names the current version
+      run-{run_id}/              <- a VERSIONED leaf's arrays: the root
+                                    zarr.json names the current version
 ```
 
 - **Ids are morton decimal strings** (D1): sign + base digit (`1..6` /
@@ -643,13 +643,14 @@ A windowed leaf's stamp ([Time windows](#time-windows-morton-hive2)) declares
 `spec: "morton-hive/2"` and adds `window` (the label) plus `time_range` — the
 actual `[t_min, t_max]` written, as ISO-8601 UTC strings.
 
-**Versioned leaves (`morton-hive/3`,
-[specification §1.5](specification.md#15-storage-geometries), issue
+**Versioned leaves ([specification §1.5](specification.md#15-storage-geometries), issue
 [#582](https://github.com/englacial/zagg/issues/582)).** The stable
 `{id}.zarr/zarr.json` is a **pointer stamp**: it carries the stamp above plus
 `"current": "run-{run_id}"`, and the arrays live in that **version
 subgroup** — `{id}.zarr/run-{run_id}/{cell_order}/…`, a complete leaf with its
-own stamp, never rewritten once stamped. A replacement writes a new version
+own stamp, never rewritten once stamped. That stamp keeps `spec`
+`morton-hive/1` or `/2` exactly as above (windowed ⇒ `/2`): no `spec` value
+marks versioning — `current` alone does. A replacement writes a new version
 and swaps the pointer (one PUT), so an earlier run tag in the Icechunk repo
 keeps reading the version it indexed; superseded versions are reclaimed by
 the operator-run collector (`tools/icechunk_gc_targets.py`, dry-run default).
@@ -1674,7 +1675,7 @@ be added later by the sweep as a derived artifact). Readers:
    (`zagg.hive.shard_leaf_path`), open the leaf zarr, and **check the commit
    stamp** (`zagg.hive.read_commit`) before trusting the contents; the
    stamp's coverage payload pre-filters the AOI (`box_and`/`bitmap_and`).
-   If the stamp names `current` (a versioned leaf, `morton-hive/3`), the
+   If the stamp names `current` (a versioned leaf), the
    arrays are under `{leaf}/{current}/` (`zagg.hive.resolve_leaf`); the
    stamp's first GET is the pointer, so following it costs no extra request.
 4. Discovery without a root MOC falls back to the delimiter-LIST walk:

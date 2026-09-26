@@ -287,8 +287,8 @@ it, and lands the stamp last. This is what lets a byte-range index into a
 leaf — the §11 Icechunk companion refs, moczarr's 2-GET reads — trust
 `(key, offset, length)` for as long as the stamp it was taken under stands.
 
-**Versioned leaves (`morton-hive/3`).** On a **legacy** leaf (stamp `spec`
-`/1` or `/2`) a replacement is not a change of **keys**: clear-then-template
+**Versioned leaves.** On a **legacy** leaf (a stamp without `current`) a
+replacement is not a change of **keys**: clear-then-template
 rewrites the same key layout, and on an unversioned bucket the new object
 lands at exactly the key an old reference names — so a reference taken under
 a superseded stamp does *not* 404: it reads the new object's bytes at a stale
@@ -315,7 +315,8 @@ tag reads the store exactly as that run left it — and a same-key rewrite of
 committed bytes never happens.
 
 The **write order** is normative: (1) write the version subgroup's arrays;
-(2) stamp the version (its own root `zarr.json`, `spec: "morton-hive/3"`);
+(2) stamp the version (its own root `zarr.json`, whose `spec` is `/1` or `/2`
+exactly as the legacy rule assigns it — windowed ⇒ `/2`);
 (3) record the refs against the version's objects (§11.3); (4) swap the
 pointer — one PUT of the stable root `zarr.json`, mirroring the version's
 stamp and naming it as `current`; (5) the lifecycle touch refreshes the
@@ -330,8 +331,10 @@ rewritten wholesale (D4). A different run always writes a different version.
 itself. **Absent `current` is a legacy leaf** — every store written before
 this revision — so no store requires migration and a store legitimately
 mixes legacy and versioned leaves after its first post-revision write. The
-manifest's own `spec` (§4.2's window-naming dialect) does not move: leaf
-versioning is a per-leaf fact the stamp declares.
+manifest's own `spec` (§4.2's window-naming dialect) does not move, and no
+stamp `spec` value marks versioning either: a leaf is versioned exactly when
+its root stamp names `current` — the one marker, orthogonal to the naming
+dialect the `spec` token carries.
 
 ### 1.6 Succession
 
@@ -714,7 +717,7 @@ is `{window}.zarr`, and the reserved token **`all`** names the all-time fold
 excluded from the window grammar forever). Nothing about the *name*
 distinguishes an overview from a leaf — classification is §4.3's job.
 
-A **versioned leaf** (§1.5, `morton-hive/3`) adds nothing at the node: its
+A **versioned leaf** (§1.5; a stamp naming `current`) adds nothing at the node: its
 stable `{id}.zarr` / `{id}_{window}.zarr` entry is unchanged, and its
 versions are **subgroups** of that entry named `run-{run_id}` — so the D5
 node invariant, the walker's child classification and every prefix-scoped
@@ -2136,7 +2139,7 @@ unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
 absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
 for both (the sidecar copy and §1's own evidence paragraph are the record
 for what those artifacts mean); likewise no committed leaf is **versioned**
-(§1.5, `morton-hive/3`) — a versioned-leaf fixture (pointer root, `current`,
+(§1.5; a stamp naming `current`) — a versioned-leaf fixture (pointer root, `current`,
 one version subgroup) joins the set with the writer that produces it (issue
 [#582](https://github.com/englacial/zagg/issues/582)). Regeneration is deferred because it would
 also install the §4.9 `multiscales` mirror that `column/` pins the
@@ -3568,7 +3571,7 @@ wholesale-replaced (§1.5 — same keys, new bytes) fails loudly rather than
 decoding the replacement at a stale offset. That granularity is the local
 form's one caveat: a replacement landing within the **same second** as the
 original passes the check (an object store's ETag has no such window). On a
-**versioned** leaf (§1.5, `morton-hive/3`) the recorded `location` is the
+**versioned** leaf (§1.5; a stamp naming `current`) the recorded `location` is the
 version subgroup's object — `{leaf}/run-{run_id}/{p}/c/0` — which is never
 rewritten, so the checksum is a guard against out-of-band tampering only and
 a replacement invalidates no earlier reference. The writer records which form it used under
