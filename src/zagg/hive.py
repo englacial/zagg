@@ -2453,6 +2453,15 @@ def _process_windows(
         "error": None,
     }
     if todo:
+        # Read only what the windows left to write need (review finding (2)):
+        # the union of their granule subsets, in the unit's order, each
+        # window's indices re-based onto it — so an append that lands in one
+        # window does not re-read the history of the windows the gate skipped.
+        if all(w.get("granules") is not None for w in todo):
+            keep = sorted({i for w in todo for i in w["granules"]})
+            at = {i: k for k, i in enumerate(keep)}
+            granule_urls = [granule_urls[i] for i in keep]
+            todo = [{**w, "granules": [at[i] for i in w["granules"]]} for w in todo]
 
         def _emit(w, aggregate):
             unit = units[w["label"]]

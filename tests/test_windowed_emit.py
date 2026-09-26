@@ -563,11 +563,23 @@ class TestBulkEndToEnd:
         assert [m["unit_windows"] for m in again["windows"]] == [3, 3, 3]
         # A new granule in 2020 only: 2018 and 2019 stay current, 2020 rewrites.
         monkeypatch.undo()
-        fakes = {**_fakes(), "s3://bucket/granuleD.h5": _h5([900.0])}
+
+        class _Opened(dict):
+            seen: set = set()
+
+            def __getitem__(self, key):
+                self.seen.add(key)
+                return super().__getitem__(key)
+
+        fakes = _Opened({**_fakes(), "s3://bucket/granuleD.h5": _h5([900.0])})
         records = _records() + [_timed_rec("D", "2020-06-18T00:00:00Z", "2020-06-19T00:00:00Z")]
         third = _run_bulk(
             monkeypatch, cfg, root, fakes=fakes, records=records, **{**gate, "run_id": "r3"}
         )
+        # Only the 2020 window's granules are read (review finding (2)): A
+        # rides 2018/2019 alone, both current, so it is never opened.
+        assert fakes.seen == {f"s3://bucket/granule{g}.h5" for g in "BCD"}
+        assert third["granule_count"] == 3 and third["files_processed"] == 3
         assert "current" not in third
         assert [m.get("current") for m in third["windows"]] == [True, True, None]
         assert third["windows"][2]["total_obs"] == 7 and third["windows"][2][
