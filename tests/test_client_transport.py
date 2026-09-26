@@ -943,8 +943,18 @@ class TestAttach:
         assert set(results) == set(_WORDS)
         assert all(r["body"]["total_obs"] == 7 for r in results.values())
         assert handle.status() == {"pending": 0, "ok": 3, "failed": 0}
-        # The tail was recorded (tail.json): the reattached handle fires NOTHING.
-        assert fresh.events == []
+        handle.wait(timeout=10)
+        # The tail was recorded (tail.json): the reattached handle re-fires
+        # NOTHING of it except the Icechunk finalize (issue #582) — the marker
+        # precedes the finalize in the tail, so a client that died between the
+        # two left the run untagged; the finalize is idempotent, so a tagged
+        # run costs one no-op invoke. Off the config's knob: attach never held
+        # the dispatch's init record, and the event says so.
+        assert fresh.modes() == ["icechunk_finalize"]
+        (_n, kind, event) = fresh.events[0]
+        assert kind == "RequestResponse" and event["run_id"] == run_id
+        assert event["store_path"] == _STORE and event["icechunk_init"] is None
+        assert handle.icechunk_finalize is not None  # the stub's canned body -> fail-open record
 
     def test_attach_mid_run_resolves_late_shards_and_runs_the_tail(self, status_store):
         # Mid-run state: manifest + two settled shards; the third lands later.
@@ -964,10 +974,38 @@ class TestAttach:
         # finalize backstop + coverage + stats — and zero cell re-dispatches.
         modes = [m for m in stub.modes() if m]
         assert "finalize" in modes and "stats" in modes
+        assert modes[-1] == "icechunk_finalize"  # the tail's last invoke, off the knob
         assert stub.cell_events() == []
-        # ... and the stats leg recorded the marker: a second attach skips it.
+        # ... and the stats leg recorded the marker: a second attach skips the
+        # tail and fires only the idempotent finalize.
         again = EventStubLambdaClient(status_store)
-        Run.attach(_STORE, "midrun", lambda_client=again).results()
+        again_handle = Run.attach(_STORE, "midrun", lambda_client=again)
+        again_handle.results()
+        again_handle.wait(timeout=10)
+        assert again.modes() == ["icechunk_finalize"]
+
+    def test_attach_never_finalizes_a_run_whose_knob_is_off(self, status_store):
+        # ``output.icechunk: false`` in the dispatched config: no repo was
+        # stood up, so a reattached handle fires no finalize on either path.
+        from dataclasses import asdict
+
+        cfg = default_config("atl06")
+        cfg.output["icechunk"] = False
+        _put_manifest(status_store, "knoboff", _WORDS, config=asdict(cfg))
+        body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        for word in _WORDS:
+            _put_status(status_store, word, body=dict(body))
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "knoboff", lambda_client=stub)
+        handle.results()
+        handle.wait(timeout=10)
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "icechunk_finalize" not in modes
+        assert handle.icechunk_finalize is None
+        again = EventStubLambdaClient(status_store)
+        again_handle = Run.attach(_STORE, "knoboff", lambda_client=again)
+        again_handle.results()
+        again_handle.wait(timeout=10)
         assert again.events == []
 
     def test_attach_failed_status_raises_without_redispatch(self, status_store):
