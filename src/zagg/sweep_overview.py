@@ -933,6 +933,10 @@ def declare_pyramid(
         "semantic_hash_migration": (
             {"from": fresh["semantic_hash"], "to": migrate_to} if migrate_to else None
         ),
+        # The §11.4 ``declare-pyramid`` follow-through into the store's Icechunk
+        # repo (issue #582): ``None`` when nothing was written or there is no
+        # repo, else :func:`zagg.icechunk_ops.declare_pyramid`'s report.
+        "icechunk": None,
     }
     if prior == block and mirror_current and migrate_to is None:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
@@ -963,7 +967,31 @@ def declare_pyramid(
         write_semantic_core(store_root, config, **store_kwargs)
     if mirror is None:
         _remove_multiscales_group(store, store_root)
+    summary["icechunk"] = _declare_into_repo(store_root, config, fresh, store_kwargs)
     return summary
+
+
+def _declare_into_repo(store_root: str, config, manifest: dict, store_kwargs: dict):
+    """Mirror the declaration just written into the store's repo, when it has one.
+
+    The metadata plane tracks the manifest (spec §11 head): the repo's level
+    groups and ``multiscales`` root attrs follow the ``/2`` block in one
+    ``declare-pyramid`` commit (:func:`zagg.icechunk_ops.declare_pyramid`).
+    Fail-open like every repo write (D9): ``None`` without a repo, the
+    report, or ``{"error": ...}`` — the manifest PUT above already landed and
+    ``python -m zagg.icechunk_ops <store> declare-pyramid`` re-runs the step.
+    """
+    from zagg.icechunk_refs import read_block
+
+    try:
+        if read_block(store_root, store_kwargs=store_kwargs) is None:
+            return None
+        from zagg.icechunk_ops import declare_pyramid as declare_into_repo
+
+        return declare_into_repo(store_root, config, store_kwargs=store_kwargs, manifest=manifest)
+    except Exception as exc:
+        logger.warning(f"declare_pyramid: the icechunk repo was not updated ({exc!r})")
+        return {"error": repr(exc)}
 
 
 def _remove_multiscales_group(store, store_root: str) -> None:
