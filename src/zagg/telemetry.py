@@ -258,6 +258,19 @@ def lambda_env() -> dict | None:
     }
 
 
+def billed_seconds(body: dict | None) -> float:
+    """A worker result body's billed seconds (issue #589).
+
+    The invocation wall ``duration_total_s`` when the worker stamped it, else
+    the aggregate clock ``duration_s`` (older workers) -- the same fallback
+    :func:`build_record` prices with, so the dispatcher's cost and
+    timeout-margin figures agree with the record's ``est_cost_usd``.
+    """
+    b = body or {}
+    total = b.get("duration_total_s")
+    return total if total is not None else b.get("duration_s", 0)
+
+
 def build_record(
     *,
     shard_key,

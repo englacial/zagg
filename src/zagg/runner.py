@@ -76,6 +76,7 @@ from zagg.processing import (
 )
 from zagg.semantics import semantic_hash as _semantic_hash
 from zagg.store import open_object_store, open_store
+from zagg.telemetry import billed_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -4819,7 +4820,7 @@ def _invoke_lambda_event(
                 "status_code": result.get("statusCode"),
                 "body": body,
                 "wall_time": time.time() - wall_start,
-                "lambda_duration": body.get("duration_s", 0),
+                "lambda_duration": billed_seconds(body),
                 "error": last_error if function_error else body.get("error"),
                 "retries": attempt,
                 "timeout": is_timeout,
@@ -4897,7 +4898,7 @@ def _poll_lambda_result(
                 "status_code": result.get("statusCode"),
                 "body": body,
                 "wall_time": wall_time,
-                "lambda_duration": body.get("duration_s", 0),
+                "lambda_duration": billed_seconds(body),
                 "error": body.get("error"),
                 "retries": retries,
                 "timeout": False,
@@ -6329,7 +6330,7 @@ def _invoke_lambda_cell(
                 "status_code": result.get("statusCode"),
                 "body": body,
                 "wall_time": time.time() - wall_start,
-                "lambda_duration": body.get("duration_s", 0),
+                "lambda_duration": billed_seconds(body),
                 "error": last_error if function_error else body.get("error"),
                 "retries": attempt,
                 "timeout": is_timeout,
