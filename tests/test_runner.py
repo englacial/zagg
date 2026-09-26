@@ -1812,6 +1812,7 @@ class TestSummaryKeysByteIdentical:
         # Icechunk companion init record (issue #580): always present, None
         # off-hive / opted out, {"error"} on a fail-open init.
         "icechunk",
+        "icechunk_finalize",
     } | _IDENTITY_KEYS
     _LAMBDA_KEYS = {
         "total_cells",
@@ -1837,6 +1838,7 @@ class TestSummaryKeysByteIdentical:
         "finalize_error",
         # Icechunk companion init record (issue #580), as on the local backend.
         "icechunk",
+        "icechunk_finalize",
         "function_timeout_s",
         "worker_max_s",
         "worker_median_s",
