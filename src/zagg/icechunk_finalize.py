@@ -13,7 +13,9 @@ repo is fail-open, and because a per-leaf run has no finisher at all.
 One finalize does, in order:
 
 1. retention — with ``retain_runs`` = K > 0, the run tags beyond the K − 1
-   newest are deleted, snapshots older than the oldest retained run expire,
+   newest are deleted, snapshots older than the oldest retained run's
+   finalize expire (squashed into it, that run's own intermediate commits
+   included; the newer runs keep theirs until a later cutoff passes them),
    and unreferenced repo objects older than it are garbage-collected. The
    default K = 0 retains everything and runs none of it. Only ``run-`` tags
    are ever deleted, and only here; virtual targets (the leaves) are never

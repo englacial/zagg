@@ -3655,10 +3655,13 @@ commits are kept; the next run's tag covers them). One finalize, in order:
    (`expire_snapshots`), and repo objects no retained snapshot references
    and older than it are **collected** (`garbage_collect`) — the cutoff is
    always a run tag's commit time, never "now", so a concurrent writer's
-   in-flight objects are never collected. Expiry squashes a retained run's
-   own intermediate commits (its `init`, its stage-node commits) into the
-   finalize snapshot that follows them, so history reads **tag to tag, one
-   snapshot per run**. Neither step touches a virtual target: Icechunk
+   in-flight objects are never collected. Expiry squashes every commit
+   older than the oldest retained run's finalize — that run's own `init`,
+   leaf and stage-node commits included — into that finalize snapshot; the
+   runs newer than it (the K − 1 newest, this one included) keep their
+   intermediate commits until a later finalize's cutoff passes them. History
+   therefore reads one snapshot per run only up to the oldest retained tag,
+   and per commit after it. Neither step touches a virtual target: Icechunk
    manages none of the leaf objects (the virtual-target sweep is a stage-2
    item on the issue). Retention is fail-open inside finalize: an error (two
    finalizes racing on one tag delete, a collection cut off by the invoke's
@@ -3677,9 +3680,9 @@ commits are kept; the next run's tag covers them). One finalize, in order:
 Idempotent: a finalize whose tag already exists returns it and writes
 nothing. Fail-open (D9) at the dispatcher like the init; the record rides
 the run summary as `icechunk_finalize` (`{path, tag, snapshot, tagged,
-retain_runs, tags_deleted, snapshots_expired, gc, retention_error, rewrite_pending,
-commit_s}`, `{error}` or `{skipped}`), not the run parquet, whose write precedes the
-staged sweep on both backends; the tag itself is the durable outcome.
+retain_runs, tags_deleted, snapshots_expired, gc, retention_error,
+rewrite_pending, commit_s}`, `{error}` or `{skipped}`), not the run parquet,
+whose write precedes the staged sweep on both backends; the tag itself is the durable outcome.
 `rewrite_manifests` is NOT run by finalize: a §11.5 split ratchet is a
 rare, deliberate, whole-repo operation with no run to attach to (at the
 globe it may exceed one invoke), so finalize reports it as
