@@ -382,6 +382,17 @@ stamp names `current` MUST refuse**: it is a legacy or stale writer against
 a versioned leaf, and clearing the root would delete every version and
 every earlier tag's referents with it.
 
+**Operator preconditions.** Hive writers produce versioned leaves by default
+(`output.leaf_versions`; `false` opts a run out to the legacy leaf). A store
+written with versioned leaves MUST carry **no bucket expiration rule over its
+hive tree**: an S3 lifecycle filter selects by prefix, tag or size and cannot
+exclude the nested version subgroups, and the #388 touch refreshes only the
+pointer root, so any rule over the tree ages the current version out under a
+live pointer — version lifetime is owned by the §11.4 collector alone. Its
+readers MUST **follow `current`** (the one rule above): a reader that opens
+the root's arrays gets a 404 on a fresh versioned leaf and, on a converted
+legacy leaf, silently reads the last legacy write.
+
 ### 1.6 Succession
 
 The `ragged` attrs block is `/1`'s element contract. The candidate successor
