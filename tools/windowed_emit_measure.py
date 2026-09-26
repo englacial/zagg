@@ -115,8 +115,23 @@ def fleet_numbers(store) -> dict:
     return out
 
 
+def _is_leaf(top: str, decimal: str) -> bool:
+    """``{id}.zarr`` / ``{id}_{window}.zarr`` of THIS shard; a leaf column
+    (``all.pyramid.zarr`` / ``{window}.pyramid.zarr``) or any other object at the
+    node is a sibling."""
+    from zagg.windows import split_leaf_name
+
+    if not top.endswith(".zarr") or top.endswith(".pyramid.zarr"):
+        return False
+    try:
+        return split_leaf_name(top)[0] == decimal
+    except ValueError:
+        return False
+
+
 def object_numbers(store, store_root: str, shard_keys, max_shards: int) -> dict:
-    """Leaves, objects and bytes per shard node (one LIST each), plus the siblings."""
+    """Leaves, objects and bytes per shard node (one LIST each), plus the siblings
+    (leaf columns, overview objects) summed apart by name."""
     import obstore
 
     from zagg.hive import shard_leaf_path
@@ -124,13 +139,14 @@ def object_numbers(store, store_root: str, shard_keys, max_shards: int) -> dict:
     leaves, objects, bytes_, siblings = [], [], [], defaultdict(int)
     for shard in list(shard_keys)[:max_shards]:
         leaf = shard_leaf_path(store_root, shard)
-        node = leaf.rsplit("/", 1)[0] + "/"
+        node, base = leaf.rsplit("/", 1)
+        node, decimal = node + "/", base.removesuffix(".zarr")
         rel = node[len(store_root.rstrip("/")) + 1 :]
         per_leaf: dict = defaultdict(lambda: [0, 0])
         for batch in obstore.list(store, rel):
             for o in batch:
                 top = o["path"][len(rel) :].split("/", 1)[0]
-                if top.endswith(".zarr") and not top.startswith("all."):
+                if _is_leaf(top, decimal):
                     per_leaf[top][0] += 1
                     per_leaf[top][1] += o["size"]
                 else:

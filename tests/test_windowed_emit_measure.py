@@ -55,10 +55,11 @@ def _store(tmp_path, *, windows):
                     )
                 )
             )
-    # a stage-column sibling at one node, counted apart from the leaves
+    # the leaf columns (one per window, at the shard node) are siblings, not leaves
     node = Path(shard_leaf_path(str(root), SHARDS[0])).parent
-    (node / "all.pyramid.zarr").mkdir()
-    (node / "all.pyramid.zarr" / "zarr.json").write_bytes(b"{}" * 10)
+    for column in [f"{w}.pyramid.zarr" for w in windows or ("all",)]:
+        (node / column).mkdir()
+        (node / column / "zarr.json").write_bytes(b"{}" * 10)
     write_run_parquet(str(root), rows, run_id="run-a")
     (root / "sweep_stats_20260101T000000Z_stages.json").write_text(
         json.dumps(
@@ -102,6 +103,8 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     assert win["objects"]["objects_per_shard"]["p50"] == 6.0
     assert win["objects"]["total_leaf_bytes"] == 3 * 2 * 102
     assert base["objects"]["sibling_bytes"] == {"all.pyramid": 20}
+    assert win["objects"]["leaves_per_shard"]["p100"] == 3.0
+    assert win["objects"]["sibling_bytes"] == {f"{w}.pyramid": 20 for w in ("2019", "2020", "2021")}
     # ladder: the stage rows' icechunk counters
     assert win["ladder"]["stage_records"] == 2
     assert [s["icechunk_commits"] for s in win["ladder"]["stages"]] == [0, 2]
