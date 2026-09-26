@@ -83,26 +83,40 @@ def _array_model(session) -> dict[str, dict]:
     return model
 
 
-def _validate(session, before: dict[str, dict], allow_new: tuple[str, ...], block: dict) -> None:
-    """The pre-commit check; raises ``ValueError`` and the caller discards the session."""
+def _validate(
+    session, before: dict[str, dict], allow_new: tuple[str, ...], block: dict, path: str
+) -> None:
+    """The pre-commit check; raises ``ValueError`` and the caller discards the session.
+
+    It runs on the session as mutated, not after a rebase: ``_commit`` rebases
+    with ``ConflictDetector``, which refuses any conflicting change, so a
+    rebase never merges a foreign array-model change into what was checked.
+    """
     import zarr
 
     after = _array_model(session)
-    for path, meta in before.items():
-        if path not in after:
-            raise ValueError(f"operation would remove array {path!r}")
-        if after[path] != meta:
-            raise ValueError(f"operation would change the array model of {path!r} (spec §11.2)")
-    for path in after:
-        if path not in before and not path.startswith(allow_new):
-            raise ValueError(f"operation would add array {path!r}")
+    for array, meta in before.items():
+        if array not in after:
+            raise ValueError(f"operation would remove array {array!r}")
+        if after[array] != meta:
+            raise ValueError(f"operation would change the array model of {array!r} (spec §11.2)")
+    for array in after:
+        if array not in before and not array.startswith(allow_new):
+            raise ValueError(f"operation would add array {array!r}")
     root = zarr.open_group(session.store, mode="r")
     got = root.attrs.get(ICECHUNK_ATTR)
     if not isinstance(got, dict):
         raise ValueError(f"operation would remove the root {ICECHUNK_ATTR!r} block")
-    _check_block(got, {k: block.get(k) for k in _FIXED_BLOCK_KEYS}, "")
+    # ``cell_order`` apart: in ``_check_block`` it would also vet the level
+    # keying and blame the repo for what is this operation's refusal.
+    _check_block(got, {k: block.get(k) for k in _FIXED_BLOCK_KEYS if k != "cell_order"}, path)
+    if got.get("cell_order") != block.get("cell_order"):
+        raise ValueError(f"operation would move the block's cell_order at {path}")
+    levels = set(got.get("levels") or {})
+    if str(block.get("cell_order")) not in levels:
+        raise ValueError(f"operation would delist the base level /{block.get('cell_order')}")
     groups = {name for name, _ in root.members()}
-    missing = sorted(set(got.get("levels") or {}) - groups, key=int)
+    missing = sorted(levels - groups, key=int)
     if missing:
         raise ValueError(f"operation lists levels {missing} that have no group")
 
@@ -137,7 +151,7 @@ def _operation(
     if details.get("unchanged"):
         logger.info(f"icechunk {name}: nothing to change at {path}")
         return report
-    _validate(session, before, allow_new, block)
+    _validate(session, before, allow_new, block, path)
     message = message or name
     meta = {"operation": name, "zagg_version": __version__, **(metadata or {})}
     snapshot, rebases = _commit(
