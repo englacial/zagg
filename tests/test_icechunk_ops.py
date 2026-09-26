@@ -540,7 +540,8 @@ class TestFinalizeOperation:
         [
             ({"barrier_timed_out": True}, "a barrier expired"),
             ({"finisher": None}, "no finisher block"),
-            ({"mode": "families"}, "not a staged-sweep record"),
+            # The in-process sweep's failure record; refused even with a finisher block.
+            ({"error": "RuntimeError: boom", "finisher": {"lease_released": True}}, "sweep failed"),
         ],
     )
     def test_refuses_an_incomplete_sweep_record(self, monkeypatch, cfg, tmp_path, fields, reason):

@@ -366,10 +366,13 @@ def _stage_record_incomplete(record: dict) -> str | None:
     off the durable record instead of the dispatcher's summary: the finisher
     writes it as its last act, so its existence says the finisher landed;
     an expired barrier (propagated into the record, ``barrier_timed_out``)
-    says a stage node may still have been committing when it did.
+    says a stage node may still have been committing when it did. The
+    in-process sweep writes the record on failure too, with ``error`` — refused
+    whatever else it carries. (``mode`` is not checked: :data:`_STAGE_RECORD_RE`
+    already pins it, every ``_stages`` record is written with ``"stages"``.)
     """
-    if record.get("mode") != "stages":
-        return "not a staged-sweep record"
+    if record.get("error"):
+        return f"the sweep failed ({record['error']})"
     if record.get("barrier_timed_out"):
         return "a barrier expired, so node commits may still have been in flight"
     if not isinstance(record.get("finisher"), dict):
