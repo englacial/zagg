@@ -10,7 +10,7 @@ import pytest
 
 from zagg.grids.morton import morton_word
 from zagg.hive import MANIFEST_NAME, shard_leaf_path
-from zagg.telemetry import build_record, flatten_record, write_run_parquet
+from zagg.telemetry import build_record, failure_record, flatten_record, write_run_parquet
 
 pytest.importorskip("pyarrow")
 
@@ -112,6 +112,19 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "windows per shard" in out and "icechunk rebases (sum)" in out
     assert out.count("yearly") == 1 and out.count("none") == 1
+
+
+def test_timeouts_match_the_dispatcher_error_strings(tmp_path):
+    root = _store(tmp_path, windows=None)
+    errors = (
+        "Lambda timeout: Task timed out after 900.00 seconds",
+        "worker timed out, was OOM-killed, or crashed before writing its result",
+        "ValueError: bad granule",
+    )
+    rows = [flatten_record(failure_record(shard_key=SHARDS[0], error=e)) for e in errors]
+    write_run_parquet(root, rows, run_id="run-b")
+    fleet = tool.measure(root, store_kwargs={})["fleet"]
+    assert fleet["errors"] == 3 and fleet["timeouts"] == 2
 
 
 def test_cli_writes_json(tmp_path):

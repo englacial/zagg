@@ -34,6 +34,9 @@ import numpy as np
 _RUN_PARQUET = re.compile(r"^stats_.*\.parquet$")
 _STAGE_RECORD = re.compile(r"^sweep_stats_.*_stages\.json$")
 _QUANTILES = (0.5, 0.9, 1.0)
+# the dispatcher's timeout ``error_class`` shapes: sync "Lambda timeout" and the
+# async poll deadline "worker timed out, was OOM-killed, or crashed ..."
+_TIMEOUT = r"timeout|timed out"
 
 
 def _store(store_root: str, store_kwargs: dict):
@@ -104,7 +107,7 @@ def fleet_numbers(store) -> dict:
         "duration_s": _quantiles(ok.get("duration_s", [])),
         "max_memory_mb": _quantiles(ok.get("max_memory_mb", [])),
         "errors": int((~df["success"]).sum()) if "success" in df else 0,
-        "timeouts": int(df["error_class"].fillna("").str.contains("Timeout").sum())
+        "timeouts": int(df["error_class"].fillna("").str.contains(_TIMEOUT, case=False).sum())
         if "error_class" in df
         else 0,
         "gb_seconds": _total(ok, "gb_seconds"),
