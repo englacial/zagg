@@ -3660,13 +3660,15 @@ commits are kept; the next run's tag covers them). One finalize, in order:
    finalize snapshot that follows them, so history reads **tag to tag, one
    snapshot per run**. Neither step touches a virtual target: Icechunk
    manages none of the leaf objects (the virtual-target sweep is a stage-2
-   item on the issue);
+   item on the issue). Retention is fail-open inside finalize: an error (two
+   finalizes racing on one tag delete, a collection cut off by the invoke's
+   ceiling) is recorded as `retention_error` and steps 2 and 3 still run;
 2. one content-free **`finalize {run_id}` commit** whose commit metadata
    identifies the run — `run_id`, `semantic_hash` (the D19 digest the leaves
    were stamped with), `zagg_version`, the block's `commit` /
    `commit_order` / `split_order` — and records the retention counts
-   (`retain_runs`, `tags_deleted`, `snapshots_expired`, `gc`), so the repo
-   is its own durable run record (`ancestry(tag=…)` answers "which config
+   (`retain_runs`, `tags_deleted`, `snapshots_expired`, `gc`,
+   `retention_error`), so the repo is its own durable run record (`ancestry(tag=…)` answers "which config
    built this");
 3. the **tag `run-{run_id}`** on that commit. Tags are immutable and keyed
    by the run, not the semantic hash: every append under one template
@@ -3675,7 +3677,7 @@ commits are kept; the next run's tag covers them). One finalize, in order:
 Idempotent: a finalize whose tag already exists returns it and writes
 nothing. Fail-open (D9) at the dispatcher like the init; the record rides
 the run summary as `icechunk_finalize` (`{path, tag, snapshot, tagged,
-retain_runs, tags_deleted, snapshots_expired, gc, rewrite_pending,
+retain_runs, tags_deleted, snapshots_expired, gc, retention_error, rewrite_pending,
 commit_s}`, `{error}` or `{skipped}`), not the run parquet, whose write precedes the
 staged sweep on both backends; the tag itself is the durable outcome.
 `rewrite_manifests` is NOT run by finalize: a §11.5 split ratchet is a
