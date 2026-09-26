@@ -109,6 +109,45 @@ class TestFinalize:
         assert len(_messages(_open(root))) == before + 1  # the finalize commit only
 
 
+def _empty_commit(root, message):
+    """One content-free commit on ``main``, as a later run's init or a leaf's would land."""
+    session = _open(root).writable_session("main")
+    session.commit(message, allow_empty=True)
+
+
+class TestNewestOnly:
+    """``newest_only`` (the ``Run.attach`` finalize): only the repo's newest run is tagged."""
+
+    def test_tags_the_newest_run(self, repo):
+        root, _grid = repo
+        _empty_commit(root, "leaf 123")  # a leaf commit names no run
+        out = _finalize(root, "r0", newest_only=True)
+        assert out["tagged"] is True and "skipped" not in out
+        assert _open(root).lookup_tag("run-r0") == out["snapshot"]
+
+    @pytest.mark.parametrize("later", ["init r1", "finalize r1"])
+    def test_skips_when_a_later_run_committed(self, repo, later):
+        root, _grid = repo
+        _finalize(root, "rprev")  # an earlier tag retention would otherwise drop
+        _empty_commit(root, later)
+        before = _messages(_open(root))
+        out = _finalize(root, "r0", newest_only=True, retain_runs=1)
+        assert out["skipped"] == "a later run has committed since run r0"
+        assert out["tagged"] is False and out["snapshot"] is None
+        assert out["tags_deleted"] == 0 and out["gc"] is None
+        r = _open(root)
+        assert _messages(r) == before  # no commit
+        assert set(r.list_tags()) == {"run-rprev"}  # no tag, no retention
+
+    def test_existing_tag_is_a_no_op(self, repo):
+        root, _grid = repo
+        first = _finalize(root, "r0")
+        _empty_commit(root, "init r1")
+        again = _finalize(root, "r0", newest_only=True)
+        assert again["tagged"] is False and again["snapshot"] == first["snapshot"]
+        assert "skipped" not in again
+
+
 class TestRetention:
     def _runs(self, root, n, retain_runs, *, leaf=False):
         """``n`` finalized runs; ``leaf`` lands one ``leaf r{i}`` commit before each."""
@@ -305,6 +344,17 @@ class TestLambdaFinalizeInvoke:
             "output_credentials": {"accessKeyId": "a", "secretAccessKey": "s"},
         }
 
+    def test_newest_only_rides_the_event(self):
+        from zagg import runner
+
+        client = _Client(_envelope({"ok": True, "tag": "run-r1", "skipped": "later"}))
+        out = runner._invoke_lambda_icechunk_finalize(
+            client, "fn", "s3://b/p", config_dict={}, run_id="r1", newest_only=True
+        )
+        assert out["skipped"] == "later"
+        ((_kind, event),) = client.events
+        assert event["newest_only"] is True
+
     @pytest.mark.parametrize(
         "response, raise_exc, match",
         [
@@ -366,6 +416,22 @@ class TestHandlerMode:
             handler_mod.lambda_handler(self._event(root, cfg, "icechunk_finalize"), None)["body"]
         )
         assert again["tagged"] is False and again["snapshot"] == body["snapshot"]
+
+    def test_newest_only_rides_the_event(self, handler_mod, cfg, repo):
+        root, _grid = repo
+        _empty_commit(root, "init r2")  # a later run started after r1
+        resp = handler_mod.lambda_handler(
+            self._event(root, cfg, "icechunk_finalize", newest_only=True), None
+        )
+        assert resp["statusCode"] == 200, resp
+        body = json.loads(resp["body"])
+        assert body["skipped"] and body["tagged"] is False and body["tag"] == "run-r1"
+        assert not _open(root).list_tags()
+        # Without the field the dispatcher's finalize tags as before.
+        body = json.loads(
+            handler_mod.lambda_handler(self._event(root, cfg, "icechunk_finalize"), None)["body"]
+        )
+        assert body["tagged"] is True
 
     def test_run_id_is_required(self, handler_mod, cfg, repo):
         root, _grid = repo

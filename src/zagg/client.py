@@ -1311,7 +1311,9 @@ class Run:
         "leaf"``: a ``"ladder"`` run (``runner._run_lambda`` under ``sweep:
         "stages"``) lands its last commits in the staged sweep that dispatcher
         chains after the tail marker, so its finalize is that dispatcher's
-        alone and attach never fires it (``{"skipped"}`` on the handle).
+        alone and attach never fires it (``{"skipped"}`` on the handle). An
+        attached finalize is ``newest_only``: a later run on the repo leaves
+        this one untagged (the next run's tag covers it, spec §11.4).
         """
         from zagg import runner
         from zagg.config import get_icechunk, get_icechunk_options
@@ -1332,4 +1334,5 @@ class Run:
             run_id=run_id,
             icechunk_init=self._icechunk_init,
             output_creds_event=output_creds_event,
+            newest_only=self._attached,
         )

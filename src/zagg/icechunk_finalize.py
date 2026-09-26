@@ -32,6 +32,9 @@ One finalize does, in order:
 deliberate, whole-repo operation with no run to attach to; finalize reports
 it as ``rewrite_pending`` for the operator step. Idempotent: a run whose tag
 exists returns it and does nothing else, so a retried invoke is harmless.
+A reattached client (``Run.attach``) finalizes ``newest_only``: only while
+its run is still the newest on the repo, else it writes nothing and the
+run stays covered by the next run's tag.
 """
 
 from __future__ import annotations
@@ -132,6 +135,22 @@ def _apply_retention(repo, retain_runs: int, counts: dict) -> None:
     }
 
 
+def _is_newest_run(repo, run_id: str) -> bool:
+    """Whether the newest ``init``/``finalize`` commit on ``main`` names ``run_id``.
+
+    Walks the ancestry from the tip; any later run's init (a block change)
+    or finalize makes this run no longer the newest. A run whose own init
+    committed nothing (an unchanged block) reads as not the newest either —
+    the conservative answer, since the walk then cannot tell it from a
+    later run's.
+    """
+    for info in repo.ancestry(branch=BRANCH):
+        head, _, rest = info.message.partition(" ")
+        if head in ("init", "finalize"):
+            return rest == run_id
+    return False
+
+
 def finalize_repo(
     store_root: str,
     *,
@@ -140,6 +159,7 @@ def finalize_repo(
     retain_runs: int = 0,
     store_kwargs: dict,
     split_ratchet: dict | None = None,
+    newest_only: bool = False,
 ) -> dict:
     """Retention, the ``finalize {run_id}`` commit and the run tag; the record.
 
@@ -150,6 +170,12 @@ def finalize_repo(
     already existed (a retried finalize), in which case nothing is written.
     A retention failure never costs the commit or the tag (fail-open,
     ``retention_error``); a failed commit or tag raises.
+
+    ``newest_only`` (the ``Run.attach`` path): an untagged run that is no
+    longer the newest on the repo (:func:`_is_newest_run`) is left alone —
+    no retention, no commit, no tag; the record carries ``skipped`` with
+    ``tagged: False`` and ``snapshot: None``. Tagging it would name the
+    current tip, a later run's leaves included, after this run.
     """
     from zagg import __version__
 
@@ -164,6 +190,20 @@ def finalize_repo(
             **record,
             "snapshot": repo.lookup_tag(tag),
             "tagged": False,
+            "retain_runs": retain_runs,
+            "tags_deleted": 0,
+            "snapshots_expired": 0,
+            "gc": None,
+            "retention_error": None,
+            "commit_s": time.perf_counter() - t0,
+        }
+    if newest_only and not _is_newest_run(repo, run_id):
+        logger.info(f"icechunk finalize: a later run has committed at {path}; {tag} not written")
+        return {
+            **record,
+            "snapshot": None,
+            "tagged": False,
+            "skipped": f"a later run has committed since run {run_id}",
             "retain_runs": retain_runs,
             "tags_deleted": 0,
             "snapshots_expired": 0,

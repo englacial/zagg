@@ -963,6 +963,8 @@ class TestAttach:
         (_n, kind, event) = fresh.events[0]
         assert kind == "RequestResponse" and event["run_id"] == run_id
         assert event["store_path"] == _STORE and event["icechunk_init"] is None
+        # Newest-only: a later run on the repo leaves this one to its tag.
+        assert event["newest_only"] is True
         assert handle.icechunk_finalize is not None  # the stub's canned body -> fail-open record
 
     def test_attach_mid_run_resolves_late_shards_and_runs_the_tail(self, status_store):
