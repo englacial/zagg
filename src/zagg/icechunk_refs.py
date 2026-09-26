@@ -161,13 +161,15 @@ def split_block(grid, split_order: int, *, base_chunk_order: int | None = None) 
 def block_splits(block: dict) -> dict:
     """``{order: split}`` for every level group ``block`` names, cut at its ``split_order``.
 
+    Listed and ``retired`` (delisted by ``declare-pyramid``, group kept) alike.
+
     :func:`split_block`'s rule from each entry's recorded chunk axis, so the
     splits follow the block as it stands (a ratchet included), not the one a
     caller read earlier.
     """
     base, split_order = int(block["chunk_order"]), int(block["split_order"])
     splits = {}
-    for order, level in (block.get("levels") or {}).items():
+    for order, level in {**(block.get("retired") or {}), **(block.get("levels") or {})}.items():
         m = split_exponent(base, split_order, int(level["chunk_order"]))
         splits[order] = {"chunks": 4**m, "order": int(level["chunk_order"]) - m}
     return splits
@@ -710,9 +712,12 @@ def init_repo(
         ratchet = {"from": stored, "to": wanted}
         spec = repo_group_spec(grid, store_root, options, manifest)
         block = spec.attributes[ICECHUNK_ATTR]
-        splits = {order: level["split"] for order, level in block["levels"].items()}
+        retired = existing.get("retired") or {}
+        splits = block_splits({**block, "retired": retired})
         repo = _save_splits(repo, store_root, splits, store_kwargs)
         updates.update(split_order=wanted, levels=block["levels"])
+        if retired:
+            updates["retired"] = {o: {**lvl, "split": splits[o]} for o, lvl in retired.items()}
         logger.warning(
             f"icechunk split_order ratchets {stored} -> {wanted} at {path}: new manifests are "
             f"cut at order {wanted}; the old ones await a rewrite_manifests pass (spec §11.5)"

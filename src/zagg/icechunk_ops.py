@@ -17,8 +17,9 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
 - ``declare-pyramid`` — bring the repo's levels and ``multiscales`` mirror to
   the manifest's declaration (the §4.9 block ``sweep_overview.declare_pyramid``
   installs): a newly declared level gains its group and its manifest split; a
-  level the manifest no longer declares leaves ``levels`` but keeps its group
-  (its refs stay readable on every snapshot that names them); a level whose
+  level the manifest no longer declares moves from ``levels`` to ``retired``
+  and keeps its group and split (its refs stay readable on every snapshot
+  that names them); a level whose
   geometry the manifest would change is refused — an array-model change is a
   ``/2`` revision, never an operation. The retrofit tool calls this itself
   when the store has a repo, so one operator step declares both planes.
@@ -231,6 +232,10 @@ def declare_pyramid(
             )
     added = sorted(levels.keys() - recorded.keys(), key=int)
     dropped = sorted(recorded.keys() - levels.keys(), key=int)
+    # A delisted level's entry moves to ``retired`` (its group stays, and so
+    # must its manifest split); relisting moves it back.
+    retired = {**(block.get("retired") or {}), **{o: recorded[o] for o in dropped}}
+    retired = {o: lvl for o, lvl in retired.items() if o not in levels}
 
     def mutate(session, _block):
         import zarr
@@ -250,7 +255,9 @@ def declare_pyramid(
             with vlen_dtype_warning_suppressed():
                 spec.members[order].to_zarr(session.store, order, overwrite=False)
         attrs = root.attrs.asdict()
-        new_block = {**attrs[ICECHUNK_ATTR], "levels": levels}
+        new_block = {**attrs[ICECHUNK_ATTR], "levels": levels, "retired": retired}
+        if not retired:
+            new_block.pop("retired")
         unchanged = (
             new_block == attrs[ICECHUNK_ATTR]
             and attrs.get(MULTISCALES_ATTR) == mirror

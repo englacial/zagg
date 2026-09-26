@@ -250,6 +250,43 @@ class TestDeclarePyramid:
             "6",
         ]
 
+    def test_a_delisted_level_keeps_its_split_through_a_ratchet_and_relisting(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        cfg.output["icechunk"] = {"commit": "leaf", "split_order": 3}
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+
+        def saved():
+            group, repo = _open(root)
+            block = group.attrs[ICECHUNK_ATTR]
+            want = icechunk_refs._repo_config(root, icechunk_refs.block_splits(block), {})
+            assert repo.config.manifest.splitting == want.manifest.splitting
+            # One condition per level group, listed or retired, plus the catch-all.
+            assert len(repo.config.manifest.splitting.split_sizes) == 7
+            return block
+
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)
+        icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
+        cfg.output["pyramid"] = False
+        _write_manifest(root, grid)
+        icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})  # delist /1../5
+        block = saved()
+        assert sorted(block["retired"], key=int) == ["1", "2", "3", "4", "5"]
+        # An init ratchet re-saves the splits: the retired groups keep theirs, recut.
+        cfg.output["icechunk"] = {"commit": "leaf", "split_order": 2, "commit_order": 2}
+        out = icechunk_refs.init_repo(root, grid, cfg, run_id="r2", store_kwargs={})
+        assert out["split_ratchet"] == {"from": 3, "to": 2}
+        block = saved()
+        assert block["retired"]["5"]["split"] == icechunk_refs.block_splits(block)["5"]
+        # Relisting moves the entries back.
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)
+        r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
+        assert r["added"] == ["1", "2", "3", "4", "5"]
+        block = saved()
+        assert "retired" not in block and len(block["levels"]) == 6
+
     def test_another_geometry_or_a_changed_level_is_refused(self, monkeypatch, cfg, tmp_path):
         grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
         cfg.output.pop("pyramid")
