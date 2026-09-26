@@ -2187,7 +2187,9 @@ for both (the sidecar copy and §1's own evidence paragraph are the record
 for what those artifacts mean); likewise no committed leaf is **versioned**
 (§1.5; a stamp naming `current`) — a versioned-leaf fixture (pointer root, `current`,
 one version subgroup) joins the set with the writer that produces it (issue
-[#582](https://github.com/englacial/zagg/issues/582)). Regeneration is deferred because it would
+[#582](https://github.com/englacial/zagg/issues/582)), added **standalone**:
+it does not wait on the deferred regeneration of the other fixtures below.
+Regeneration of those is deferred because it would
 also install the §4.9 `multiscales` mirror that `column/` pins the
 **absence** of, retiring an unrelated pin.
 
