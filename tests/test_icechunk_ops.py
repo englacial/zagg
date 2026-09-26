@@ -342,7 +342,6 @@ class TestRetrofitFollowThrough:
         assert summary["icechunk"]["added"] == ["1", "2", "3", "4", "5"]
 
     def test_without_a_repo_and_on_a_repo_error(self, monkeypatch, cfg, tmp_path):
-        from zagg import sweep_overview
         from zagg.sweep_overview import declare_pyramid
 
         cfg.output["pyramid"] = False
@@ -356,16 +355,19 @@ class TestRetrofitFollowThrough:
         _write_manifest(root, grid)
         icechunk_refs.init_repo(root, grid, cfg, run_id=RUN, store_kwargs={})
         cfg.output.pop("pyramid")
-        monkeypatch.setattr(
-            sweep_overview,
-            "_declare_into_repo",
-            lambda *a, **k: {"error": "RuntimeError('boom')"},
-        )
+        head = _messages(root)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        # The callee raises, so ``_declare_into_repo``'s own fail-open catch runs.
+        monkeypatch.setattr(icechunk_ops, "declare_pyramid", boom)
         summary = declare_pyramid(root, cfg, chunk_order=5)
         assert summary["updated"] is True and summary["icechunk"] == {
             "error": "RuntimeError('boom')"
         }
         assert hive.read_manifest(root)[MULTISCALES_ATTR]
+        assert _messages(root) == head
 
 
 class TestCli:
