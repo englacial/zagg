@@ -3767,7 +3767,9 @@ concurrent callers), its array nodes (§11.2) defined and the `multiscales`
 mirror in its root attrs. Idempotent: a repo that already carries a matching
 block is reopened, never re-templated; a block for another geometry or
 container is refused. **Every run commits its `init {run_id}`** — empty
-when the block is unchanged, with `run_id` in the commit metadata — so the
+when the block is unchanged, labelled `split ratchet {from}->{to} {run_id}`
+instead when its init re-cuts (§11.5), with `run_id` in the commit
+metadata either way — so the
 ancestry brackets each run between its init and its finalize (the repo is
 its own run log, and finalize's newest-run check below reads it). The
 ladder settings are not compared: `split_order`
@@ -3837,8 +3839,8 @@ carries `icechunk_init: null` and `rewrite_pending` is always null there),
 and only for a pinned `commit: "leaf"` run with no `sweep: "stages"`: a
 `sweep: "stages"` run's finalize is its dispatcher's, after the staged sweep
 (whose nodes commit under either mode), and attach records `{skipped}`. It
-finalizes only while its run is the newest on the repo (no later `init` or
-`finalize` commit on `main`), else it writes nothing and records
+finalizes only while its run is the newest on the repo (no later init —
+`init` or `split ratchet` — or `finalize` commit on `main`), else it writes nothing and records
 `{skipped}`, so an untagged old run stays covered by the next run's tag as
 before. Fail-open (D9) at the dispatcher like the init; the record rides
 the run summary as `icechunk_finalize` (`{path, tag, snapshot, tagged,
