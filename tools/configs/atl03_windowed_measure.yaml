@@ -9,11 +9,19 @@
 # Operator invocation (live AWS -- espg runs it; see tools/windowed_emit_measure.py
 # for the readout):
 #
-#   # 1. catalog: one order-6 cell over the Sierra Nevada (mortie cell 3232131,
-#   #    bbox from mortie.mort2bbox), the full mission to date
+#   # 1. catalog: one order-6 cell over the Sierra Nevada (mortie cell 3232131),
+#   #    the full mission to date. Catalog by the cell's own diamond, pulled in
+#   #    1e-3 deg so its edges do not touch the neighbours: coverage is then
+#   #    exactly the cell's 64 order-9 shards. (``--bbox`` of mortie.mort2bbox
+#   #    covers 169 shards across 8 order-6 cells; the unshrunk diamond 88-100.)
+#   uv run python -c "import json, mortie; from shapely.geometry import Polygon, mapping; \
+#   from zagg.grids.morton import morton_word; \
+#   ring = mortie.mort2polygon(morton_word('3232131'), step=32); \
+#   json.dump(mapping(Polygon([(x, y) for y, x in ring]).buffer(-1e-3)), \
+#   open('/tmp/o6_sierra.geojson', 'w'))"
 #   uv run python -m zagg.catalog --config tools/configs/atl03_windowed_measure.yaml \
 #       --short-name ATL03 --start-date 2018-10-14 --end-date 2026-09-01 \
-#       --bbox -120.2344,37.2925,-118.8281,38.8074 --output /tmp/o6_sierra.json
+#       --polygon /tmp/o6_sierra.geojson --output /tmp/o6_sierra.json
 #   # 2. windowed arm
 #   uv run python -m zagg --config tools/configs/atl03_windowed_measure.yaml \
 #       --catalog /tmp/o6_sierra.json --backend lambda \
