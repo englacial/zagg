@@ -354,6 +354,16 @@ class TestRetrofitFollowThrough:
         assert summary["updated"] is False
         assert summary["icechunk"]["added"] == ["1", "2", "3", "4", "5"]
 
+    def test_a_config_grid_off_the_store_follows_the_block(self, monkeypatch, cfg, tmp_path):
+        from zagg.sweep_overview import declare_pyramid
+
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)  # built at chunk 5
+        cfg.output.pop("pyramid")
+        cfg.output["grid"] = {k: v for k, v in cfg.output["grid"].items() if k != "chunk_inner"}
+        summary = declare_pyramid(root, cfg, chunk_order=5)  # the config's grid says chunk 4
+        assert "error" not in summary["icechunk"]
+        assert summary["icechunk"]["added"] == ["1", "2", "3", "4", "5"]
+
     def test_without_a_repo_and_on_a_repo_error(self, monkeypatch, cfg, tmp_path):
         from zagg.sweep_overview import declare_pyramid
 

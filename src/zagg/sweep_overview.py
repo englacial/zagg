@@ -988,11 +988,31 @@ def _declare_into_repo(store_root: str, config, manifest: dict, store_kwargs: di
     from zagg.icechunk_refs import read_block
 
     try:
-        if read_block(store_root, store_kwargs=store_kwargs) is None:
+        block = read_block(store_root, store_kwargs=store_kwargs)
+        if block is None:
             return None
+        from zagg.grids import from_config
+        from zagg.grids.healpix import HealpixGrid
         from zagg.icechunk_ops import declare_pyramid as declare_into_repo
 
-        return declare_into_repo(store_root, config, store_kwargs=store_kwargs, manifest=manifest)
+        # The retrofit vets the manifest, not the config's grid (the
+        # ``chunk_order=`` lever exists because that grid may not describe the
+        # store): a config grid the block disagrees with is rebuilt from the
+        # block, the store's truth, as the retrofit rebuilds from the manifest.
+        grid = from_config(config)
+        keys = ("shard_order", "cell_order", "chunk_order")
+        have = (grid.parent_order, grid.child_order, grid.chunk_order)
+        if tuple(int(v) for v in have) != tuple(block[k] for k in keys):
+            grid = HealpixGrid(
+                block["shard_order"],
+                block["cell_order"],
+                config=config,
+                chunk_inner=block["chunk_order"],
+                sharded=True,
+            )
+        return declare_into_repo(
+            store_root, config, store_kwargs=store_kwargs, manifest=manifest, grid=grid
+        )
     except Exception as exc:
         logger.warning(f"declare_pyramid: the icechunk repo was not updated ({exc!r})")
         return {"error": repr(exc)}

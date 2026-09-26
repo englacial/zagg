@@ -210,12 +210,13 @@ def set_attrs(
 
 
 def declare_pyramid(
-    store_root: str, config, *, store_kwargs: dict, manifest: dict | None = None
+    store_root: str, config, *, store_kwargs: dict, manifest: dict | None = None, grid=None
 ) -> dict:
     """Bring the repo's levels and ``multiscales`` mirror to the manifest's declaration.
 
-    ``config`` is the store's pipeline config (the grid it defines must be the
-    repo's: the compatibility keys are vetted before anything is written).
+    ``config`` is the store's pipeline config (the grid it defines — or
+    ``grid``, when given — must be the repo's: the compatibility keys are
+    vetted before anything is written).
     Levels are :func:`zagg.icechunk_refs.level_grids` of the manifest — the
     base plus the ``/2`` declaration's datasets. Returns the report with
     ``levels`` (as recorded), ``added``, ``dropped`` (left in the repo,
@@ -226,7 +227,8 @@ def declare_pyramid(
     from zagg.hive import MANIFEST_NAME, read_manifest
     from zagg.icechunk_refs import level_geometry
 
-    grid = from_config(config)
+    if grid is None:
+        grid = from_config(config)
     if manifest is None:
         manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
