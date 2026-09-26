@@ -449,6 +449,44 @@ class TestReaders:
         stale = zarr.open_group(leaf, mode="r")["6"]["h_mean"][:]  # the converted root
         assert not np.array_equal(got, stale)
 
+    def _bad_pointer_store(self, monkeypatch, cfg, tmp_path):
+        """Two versioned leaves; the FIRST one's root stamp names an invalid ``current``."""
+        from zagg.store import open_store
+
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        shards = _shards(grid, 2)
+        for shard in shards:
+            _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id=RUN_A)
+        bad = hive.shard_leaf_path(root, shards[0])
+        hive.write_pointer_stamp(open_store(bad), hive.read_commit(bad), "not-a-version")
+        return root, shards
+
+    def test_an_invalid_pointer_skips_one_leaf_of_the_overview_fold(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        from zagg.sweep_overview import _fold_node
+
+        root, _shards_ = self._bad_pointer_store(monkeypatch, cfg, tmp_path)
+        counts = {"failed": 0}
+        fields = {"count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0}}
+        result = _fold_node(root, "1111", 3, [None], list(_LEAVES[:2]), fields, 6, 4, counts, {})
+        assert counts["failed"] == 1  # the bad leaf, not the whole node
+        assert np.asarray(result["slabs"]["count"]).sum() > 0  # the good leaf folded
+
+    def test_an_invalid_pointer_is_skipped_by_the_declaration_probe(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        from zagg import sweep
+        from zagg.sweep_overview import _validate_block_against_store
+
+        root, shards = self._bad_pointer_store(monkeypatch, cfg, tmp_path)
+        monkeypatch.setattr(sweep, "discover_leaves", lambda *_a, **_k: [(s, None) for s in shards])
+        block = {"overview": {"fields": {"count": {"class": "exact", "dtype": "int32"}}}}
+        got = _validate_block_against_store(root, {"cell_order": 6}, block, {})
+        good = hive.shard_leaf_path(root, shards[1])
+        assert got == f"leaf {good}/{hive.read_commit(good)['current']}"
+
 
 class TestKnob:
     def test_default_on_for_hive_off_otherwise(self, cfg):
