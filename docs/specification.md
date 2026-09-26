@@ -3655,7 +3655,15 @@ commits are kept; the next run's tag covers them). One finalize, in order:
    (`expire_snapshots`), and repo objects no retained snapshot references
    and older than it are **collected** (`garbage_collect`) — the cutoff is
    always a run tag's commit time, never "now", so a concurrent writer's
-   in-flight objects are never collected. Expiry squashes every commit
+   in-flight objects are never collected. Its **session** is not protected:
+   a writer (or reader) whose base snapshot is older than the cutoff loses
+   that base, and its commit fails on rebase (a storage error, not a
+   conflict — no retry recovers it; the leaf's or node's refs are lost
+   fail-open until a re-gather). The cutoff is never newer than the previous
+   run's finalize (K = 1 or 2; a larger K reaches further back), so the only
+   casualty is a session opened before the previous run's finalize and still
+   open across this one — overlapping runs on one store. The default K = 0
+   never expires anything. Expiry squashes every commit
    older than the oldest retained run's finalize — that run's own `init`,
    leaf and stage-node commits included — into that finalize snapshot; the
    runs newer than it (the K − 1 newest, this one included) keep their
