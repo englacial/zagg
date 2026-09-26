@@ -1508,7 +1508,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   column's declared member and one per declared overview level, keyed by
   cell order — defines their array nodes, one manifest split per group, the
   virtual chunk container and the `multiscales` mirror, and commits
-  `init {run_id}`. Idempotent — a rerun reopens; a repo built for another
+  `init {run_id}` (every run — empty when the block is unchanged, so the
+  ancestry brackets each run). Idempotent — a rerun reopens; a repo built for another
   geometry or container is refused, while `split_order` follows the ratchet
   below and `commit` / `commit_order` are per-run, never compared. The record (`path`, `snapshot`, `created`, `options`,
   `levels`, `ladder`, `split_ratchet`) rides the run summary under

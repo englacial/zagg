@@ -166,6 +166,19 @@ class TestNewestOnly:
         assert _messages(r) == before  # no commit
         assert set(r.list_tags()) == {"run-rprev"}  # no tag, no retention
 
+    def test_a_repeat_run_with_an_unchanged_block_is_the_newest(self, repo):
+        # The usual repeat run changes nothing at init, yet its (empty) ``init``
+        # commit still marks it as the newest run: the reattached finalize
+        # tags it rather than skipping (issue #582).
+        root, grid = repo
+        _finalize(root, "r0")
+        cfg = grid.config
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r1", store_kwargs={})
+        _empty_commit(root, "leaf 123")
+        out = _finalize(root, "r1", newest_only=True)
+        assert out["tagged"] is True and "skipped" not in out
+        assert _messages(_open(root))[:3] == ["finalize r1", "leaf 123", "init r1"]
+
     def test_existing_tag_is_a_no_op(self, repo):
         root, _grid = repo
         first = _finalize(root, "r0")
