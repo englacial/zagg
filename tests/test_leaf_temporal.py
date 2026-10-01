@@ -234,6 +234,43 @@ class TestAccumulatorLaws:
         assert word == w_word
         _same(counts, w_counts)
 
+    def test_the_occupancy_feed_keys_buckets_and_counts_nothing(self):
+        # The raw route's feed for every field but the counting one (§10.3,
+        # espg ruling 2026-10-01): the words join the envelope and mark their
+        # buckets occupied at ZERO, so the cover stays the union across
+        # fields while the total is the counted field's alone — and the
+        # zero-count keys survive the merge, the cap and the record.
+        counted = _instants(200, seed=11)
+        other = _stamps(BASE_NS + 40 * DAY_NS + np.arange(5) * 3 * COUNT_SPAN)
+        acc = LeafTemporalAccumulator()
+        acc.add_weighted(counted, np.ones(len(counted)))
+        acc.add_occupancy(other)
+        acc.add_occupancy(counted[:50])  # already-counted buckets gain nothing
+        word, counts = acc.finish()
+        assert word == int(toc_reduce(np.concatenate([counted, other])))
+        assert int(counts.obs.sum()) == len(counted)
+        expect = count_words(counted)
+        zero = counts.obs == 0
+        np.testing.assert_array_equal(counts.words[zero], count_words(other).words)
+        np.testing.assert_array_equal(counts.words[~zero], expect.words)
+        np.testing.assert_array_equal(counts.obs[~zero], expect.obs)
+        np.testing.assert_array_equal(
+            cover_from_counts(counts)[0], quantize_words(np.concatenate([counted, other]))
+        )
+        # Coarsening sums zero into its ancestor like any count.
+        coarse = coarsen_counts(counts, COUNT_ORDER - 6)
+        assert int(coarse.obs.sum()) == len(counted)
+        # The record carries the zero buckets and decodes self-consistently.
+        record = json.loads(json.dumps(build_leaf_temporal(word, counts, ["g", "h"])))
+        got_word, got = leaf_temporal_contribution(record)
+        assert got_word == word and record["n_obs"] == len(counted)
+        _same(got, counts)
+        # An occupancy-only accumulator still publishes its envelope.
+        only = LeafTemporalAccumulator()
+        only.add_occupancy(other)
+        only_word, only_counts = only.finish()
+        assert only_word == int(toc_reduce(other)) and int(only_counts.obs.sum()) == 0
+
     def test_a_merged_centroid_counts_at_its_midpoint(self):
         # A range word carrying weight w lands whole in the bucket of its
         # envelope midpoint (§10.3); the envelope word still joins in full.

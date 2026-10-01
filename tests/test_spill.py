@@ -1261,42 +1261,163 @@ class TestLeafTemporalFold:
         assert len(fed) == 6 and sum(fed) == expected[2]
         assert max(fed) <= 150 < expected[2]
 
-    def test_two_temporal_fields_count_once_per_observation(self, monkeypatch):
-        """The two §10 producers disagree on `n_obs` for a MULTI-field store.
+    def _two_field_leaf(self, monkeypatch, tmp_path, key=None, *, nan_cells=(), step=3.0):
+        """One leaf through the PRODUCTION writer under two temporal fields.
 
-        The worker folds the chunk's one shared clock column, so a second
-        declared field adds nothing to the count; the sweep's raw route reads
-        one companion per field and counts once PER FIELD (§10.3's
-        `obs_total` rule, `read_leaf_temporal`'s docstring). Both sides are
-        pinned here on one shard so the factor-of-`f` discrepancy is visible
-        rather than latent — which rule the two producers should share is
-        issue #575's standing question for review.
+        ``g_tdigest`` and ``h_tdigest`` both declare a per-centroid companion
+        over the one shared clock; ``g`` digests ``g_ph``, which is ``h_ph``
+        with ``nan_cells``' rows blanked, so the two payloads' NaN masks
+        differ. ``step`` is the clock spacing in seconds: at 60 s a cell's 50
+        observations span their own order-24 buckets (2^39 ns ≈ 550 s).
+        Returns ``(root, leaf_data_path, dfs, meta)``.
         """
-        from zagg.leaf_temporal import LeafTemporalAccumulator
+        from zagg import hive
 
         variables = _companion_variables()
-        variables["g_tdigest"] = {
-            **variables["h_tdigest"],
-            "location": "leaf_id",
-            "temporal": "per-centroid",
-        }
-        cfg = _config(variables=variables, output=_TIME_SOURCE)
+        variables["g_tdigest"] = {**variables["h_tdigest"], "source": "g_ph"}
+        cfg = _config(variables=variables, output={**_TIME_SOURCE, "store_layout": "hive"})
+        # The leaf template carries only DECLARED coordinates (the bare
+        # ``process_shard`` tests above never emit one).
+        cfg.aggregation["coordinates"] = {"morton": {"dtype": "uint64", "fill_value": 0}}
         grid = _grid(cfg)
-        key = _shard_key()
-        dfs = self._dfs(grid, key)
-        acc = LeafTemporalAccumulator()
-        _, ragged, meta = _run(monkeypatch, cfg, grid, key, list(dfs), temporal_out=acc)
+        key = _shard_key() if key is None else key
+        dfs = _with_clock(_granule_dfs(grid, key, _CELL_LISTS, seed=7), step=step)
+        blank = {int(grid.children(key)[ci]) for ci in nan_cells}
+        for df in dfs:
+            df["g_ph"] = df["h_ph"].where(~df["leaf_id"].isin(blank), np.nan)
+        reads = iter(dfs)
+        monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(grid, dataset={"short_name": "X"}))
+        meta = hive.process_and_write_hive(
+            key,
+            [f"s3://b/g{i}.h5" for i in range(len(dfs))],
+            grid,
+            _CREDS,
+            root,
+            cfg,
+            store_kwargs={},
+            handoff="pandas",  # the fake reads are DataFrames
+        )
+        assert meta.get("error") is None
+        return root, hive.resolve_leaf(hive.shard_leaf_path(root, key))[0], dfs, meta
+
+    def test_two_temporal_fields_count_once_per_observation(self, monkeypatch, tmp_path):
+        """Both §10 producers count a MULTI-field leaf once per observation.
+
+        espg ruling of 2026-10-01 on issue #575, option (b): the worker folds
+        the one shared clock column, and the sweep's raw route counts over
+        ONE field — the first declared, in name order, holding a word —
+        while the other fields mark occupancy only. On one leaf the two
+        routes therefore publish the same envelope word and the same total,
+        where the retired once-per-field rule made the raw route's total
+        ``f`` times the worker's.
+        """
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.hive import read_manifest
+        from zagg.leaf_temporal import leaf_temporal_contribution, read_leaf_temporal_record
+
+        root, leaf, dfs, meta = self._two_field_leaf(monkeypatch, tmp_path)
         n = meta["total_obs"]
+        manifest = read_manifest(root)
+        fields, order = temporal_fields(manifest), temporal_cell_order(manifest)
+        assert sorted(fields) == ["g_tdigest", "h_tdigest"]
         # Worker: once per observation, whatever the declared field count.
-        self._assert_fold(acc.finish(), dfs, self._expected(dfs), n)
-        # Sweep: once per field — the same observations weighed twice, because
-        # each field's committed companion is read and counted on its own.
-        per_field = {
-            name: int(sum(float(np.asarray(p).reshape(-1, 2)[:, 1].sum()) for p in ragged[name][0]))
-            for name in ("h_tdigest", "g_tdigest")
+        record = read_leaf_temporal_record(leaf)
+        assert record["source"] == "worker" and record["fields"] == sorted(fields)
+        worker = leaf_temporal_contribution(record)
+        self._assert_fold(worker, dfs, self._expected(dfs), n)
+        # Sweep, raw route: the same word, the same total — not 2 * n.
+        raw = read_leaf_temporal(leaf, order, fields)
+        assert raw[0] == worker[0]
+        assert int(raw[1].obs.sum()) == int(worker[1].obs.sum()) == n
+        # ...counted over the first field in name order, ``g_tdigest``: its
+        # counts are the single-field read's, and ``h_tdigest`` only adds
+        # occupied buckets at zero.
+        counted = read_leaf_temporal(leaf, order, {"g_tdigest": fields["g_tdigest"]})
+        other = read_leaf_temporal(leaf, order, {"h_tdigest": fields["h_tdigest"]})
+        assert set(raw[1].words) == set(counted[1].words) | set(other[1].words)
+        by_word = dict(zip(raw[1].words.tolist(), raw[1].obs.tolist(), strict=True))
+        expect = dict(zip(counted[1].words.tolist(), counted[1].obs.tolist(), strict=True))
+        assert by_word == {w: expect.get(w, 0) for w in by_word}
+
+    def test_differing_nan_masks_count_the_counting_field(self, monkeypatch, tmp_path):
+        """What the raw route's count MEANS when the fields' NaN masks differ.
+
+        A payload digest drops non-finite rows, so the raw route's total is
+        the counting field's finite observations — a lower bound on the
+        worker's clocked-observation count, never more. An observation finite
+        only in ANOTHER field is not counted, but its bucket is still keyed,
+        at zero: occupancy (and the §10.5 cover derived from the keys) stays
+        the union across fields.
+        """
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.hive import read_manifest
+        from zagg.leaf_temporal import leaf_temporal_contribution, read_leaf_temporal_record
+
+        root, leaf, dfs, meta = self._two_field_leaf(
+            monkeypatch, tmp_path, nan_cells={4}, step=60.0
+        )
+        manifest = read_manifest(root)
+        fields, order = temporal_fields(manifest), temporal_cell_order(manifest)
+        worker = leaf_temporal_contribution(read_leaf_temporal_record(leaf))
+        n_clocked = meta["total_obs"]
+        n_finite_g = int(sum(df["g_ph"].notna().sum() for df in dfs))
+        assert n_finite_g < n_clocked
+        assert int(worker[1].obs.sum()) == n_clocked  # the clock counts NaN rows
+        raw = read_leaf_temporal(leaf, order, fields)
+        assert int(raw[1].obs.sum()) == n_finite_g  # g's finite observations, once each
+        assert raw[0] == worker[0]  # the envelope still joins both fields
+        g_only = read_leaf_temporal(leaf, order, {"g_tdigest": fields["g_tdigest"]})
+        h_only = read_leaf_temporal(leaf, order, {"h_tdigest": fields["h_tdigest"]})
+        # Buckets only ``h`` occupies are keyed at zero; everything ``g``
+        # counted is counted exactly as the single-field read counts it.
+        by_word = dict(zip(raw[1].words.tolist(), raw[1].obs.tolist(), strict=True))
+        g_counts = dict(zip(g_only[1].words.tolist(), g_only[1].obs.tolist(), strict=True))
+        h_alone = set(h_only[1].words.tolist()) - set(g_counts)
+        assert h_alone and all(by_word[w] == 0 for w in h_alone)
+        assert by_word == {**dict.fromkeys(h_alone, 0), **g_counts}
+        # The worker's exact buckets are the same key set: every clocked
+        # observation, finite in ``g`` or not.
+        np.testing.assert_array_equal(raw[1].words, worker[1].words)
+
+    def test_a_part_backfilled_store_totals_under_one_rule(self, monkeypatch, tmp_path):
+        """A root total summed over a worker record and a backfilled leaf.
+
+        Two shards of one two-field store: one keeps its worker record, the
+        other lost it and is backfilled by the sweep. Under the retired rule
+        the root ``obs_total`` was ``n + 2n`` — a sum under two rules; now it
+        is the store's observation count.
+        """
+        import os
+
+        from mortie import geo2mort
+
+        from zagg.coverage_toc import coverage_toc_counts
+        from zagg.grids.morton import morton_decimal
+        from zagg.hive import read_root_coverage
+        from zagg.leaf_temporal import LEAF_TEMPORAL_NAME, read_leaf_temporal_record
+        from zagg.sweep import run_sweep
+
+        key_a, key_b = _shard_key(), int(geo2mort(-60.0, 40.0, order=6)[0])
+        root, _leaf_a, _dfs_a, meta_a = self._two_field_leaf(monkeypatch, tmp_path, key_a)
+        _root, leaf_b, _dfs_b, meta_b = self._two_field_leaf(monkeypatch, tmp_path, key_b)
+        os.remove(f"{leaf_b}/{LEAF_TEMPORAL_NAME}")
+        summary = run_sweep(root, [(key_a, None), (key_b, None)], families=["moc"], record=False)
+        moc = summary["families"]["moc"]
+        assert moc["temporal_routes"] == {"records": 1, "materialized": 1, "raw": 0}
+        backfilled = read_leaf_temporal_record(leaf_b)
+        assert backfilled["source"] == "sweep" and backfilled["n_obs"] == meta_b["total_obs"]
+        envelope = read_root_coverage(root)
+        assert set(envelope["temporal"]["shards"]) == {
+            str(morton_decimal(key_a)),
+            str(morton_decimal(key_b)),
         }
-        assert set(per_field.values()) == {n}
-        assert sum(per_field.values()) == 2 * n
+        total = meta_a["total_obs"] + meta_b["total_obs"]
+        assert envelope["temporal"]["counts"]["obs_total"] == total
+        assert int(coverage_toc_counts(envelope).obs.sum()) == total
 
     def test_a_config_without_a_temporal_field_feeds_nothing(self, monkeypatch):
         from zagg.leaf_temporal import LeafTemporalAccumulator

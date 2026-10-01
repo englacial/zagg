@@ -37,11 +37,14 @@ and answers "within the hour?" from the record alone.
 Two producers fill :class:`LeafTemporalAccumulator`, recorded in
 ``source``: **the worker** (``"worker"``) folds per-OBSERVATION words, one
 exact timestamp each; **the sweep's backfill** (``"sweep"``) folds a leaf's
-committed per-centroid companions with the centroid weights as counts
-(:func:`zagg.coverage_toc.read_leaf_temporal`) — a weight-1 centroid is an
-exact instant, a merged one is counted at its envelope's midpoint. The
-envelope word is identical from either (the join is a semilattice) and the
-count is the same; the worker's buckets are the exact ones.
+committed per-centroid companions (:func:`zagg.coverage_toc.read_leaf_temporal`)
+— ONE field's centroids with their weights as counts (the counting field,
+spec §10.3: the first declared field holding a word in the leaf), the other
+fields' words as zero-count occupancy; a weight-1 centroid is an exact
+instant, a merged one is counted at its envelope's midpoint. The envelope
+word is identical from either (the join is a semilattice) and both count an
+observation once — the same total, up to observations whose counting-field
+value was non-finite; the worker's buckets are the exact ones.
 """
 
 from __future__ import annotations
@@ -283,7 +286,8 @@ class LeafTemporalAccumulator:
 
     Two feeds, one state: :meth:`add_words` takes a chunk's per-observation
     toc words (the worker), :meth:`add_weighted` a chunk's per-centroid
-    companions with their weights (the sweep's raw route). Each fold joins
+    companions with their weights (the sweep's raw route, for the one field
+    it counts over — :meth:`add_occupancy` takes the others'). Each fold joins
     the envelope word (``toc_reduce``, associative) and adds the chunk's
     counted cover into the running one (:func:`merge_counts`, exact), so the
     held state is a few hundred rows regardless of the shard.
@@ -313,6 +317,17 @@ class LeafTemporalAccumulator:
         words = np.asarray(words, dtype=np.uint64).ravel()
         if words.size:
             self._fold(words, np.asarray(weights, dtype=np.float64).ravel())
+
+    def add_occupancy(self, words) -> None:
+        """Fold words that are counted ELSEWHERE: envelope and occupied buckets, zero count.
+
+        The raw route's feed for every declared field but the counting one
+        (spec §10.3): the words join the envelope and key their buckets, so
+        the cover stays the union across fields, and add nothing to ``obs``.
+        """
+        words = np.asarray(words, dtype=np.uint64).ravel()
+        if words.size:
+            self._fold(words, np.zeros(words.size, dtype=np.float64))
 
     def _fold_pending(self) -> None:
         words = np.concatenate(self._pending) if len(self._pending) > 1 else self._pending[0]

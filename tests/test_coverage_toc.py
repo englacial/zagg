@@ -826,8 +826,18 @@ class TestOnCommittedStores:
         assert both[0] not in (one[0], other[0])  # neither field alone covers it
         section = build_temporal_section({"11213": [both]}, ["g_tdigest", "h_tdigest"])
         assert int(section["shards"]["11213"]) == both[0]
-        # §10.3's once-per-field counting rule, seen from the count side.
-        assert section["counts"]["obs_total"] == int(one[1].obs.sum()) + int(other[1].obs.sum())
+        # §10.3's count rule (espg ruling 2026-10-01, issue #575): counted over
+        # ONE field — the first in name order holding a word, here the grafted
+        # ``g_tdigest`` — so the same payload rows are not weighed twice, while
+        # ``h_tdigest``'s instants still key their buckets, at zero.
+        assert int(one[1].obs.sum()) == int(other[1].obs.sum())  # the same payload rows
+        assert section["counts"]["obs_total"] == int(other[1].obs.sum())
+        counts = both[1]
+        assert set(counts.words.tolist()) == set(one[1].words.tolist()) | set(
+            other[1].words.tolist()
+        )
+        zero = set(counts.words[counts.obs == 0].tolist())
+        assert zero == set(one[1].words.tolist()) - set(other[1].words.tolist()) and zero
 
     def test_a_manifest_without_a_cell_order_publishes_no_section(self, tmp_path, caplog):
         """A required key missing is a broken manifest, not group ``"0"``.

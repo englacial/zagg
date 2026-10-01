@@ -151,21 +151,30 @@ def temporal_cell_order(manifest: dict | None) -> int | None:
 def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kwargs):
     """One leaf's contribution from its raw companions: ``(word, counts)`` or ``None``.
 
-    Reads each declared field's payload and its §8.3 sibling by NAME (never a
-    member enumeration), row-aligned per §1.1, ONE ragged chunk at a time
-    (issue #575): the arrays are chunked at 4,096 rows, and each chunk is
-    decoded, folded into a :class:`zagg.leaf_temporal.LeafTemporalAccumulator`
-    and released, so memory is bounded by the chunk rather than the leaf — a
-    CA-scale leaf is a million rows per field, which read whole is what
-    killed the families pass at the 4 GB tier. The envelope word is
-    ``toc_reduce`` over every sibling word the leaf holds, unioned across the
-    declared fields — coverage as "any data". ``counts`` is the leaf's §10.3
-    counted cover: each centroid counted at its envelope's representative
-    instant (exact for a weight-1 centroid, the midpoint for a merged one)
-    with the payload's own weight, so its total is the leaf's temporal
-    observation count — where ``fields`` names more than one field, once per
-    field. ``None`` when the leaf holds no temporal row at all (an unpopulated
-    or pre-companion leaf), which is absence, not failure.
+    Reads the declared fields' §8.3 siblings by NAME (never a member
+    enumeration), ONE ragged chunk at a time (issue #575): the arrays are
+    chunked at 4,096 rows, and each chunk is decoded, folded into a
+    :class:`zagg.leaf_temporal.LeafTemporalAccumulator` and released, so
+    memory is bounded by the chunk rather than the leaf — a CA-scale leaf is
+    a million rows per field, which read whole is what killed the families
+    pass at the 4 GB tier. The envelope word is ``toc_reduce`` over every
+    sibling word the leaf holds, unioned across the declared fields —
+    coverage as "any data".
+
+    ``counts`` is the leaf's §10.3 counted cover, counted over ONE field
+    (espg ruling of 2026-10-01 on issue #575): the **counting field** is the
+    first declared field, in ascending name order, that holds a companion
+    word in this leaf. Each of its centroids is counted at its envelope's
+    representative instant (exact for a weight-1 centroid, the midpoint for a
+    merged one) with the payload's own weight, row-aligned per §1.1, so the
+    total is the number of observations that field aggregated — once per
+    observation, the quantity the worker's record counts. Every other field
+    contributes OCCUPANCY only: its words join the envelope and mark their
+    buckets with a zero count, so the key set (and the §10.5 cover derived
+    from it) stays the union across fields while nothing is counted twice;
+    its payload is not read at all. ``None`` when the leaf holds no temporal
+    row at all (an unpopulated or pre-companion leaf), which is absence, not
+    failure.
 
     This is the sweep's RAW route, for leaves written before the worker
     record existed; a leaf carrying ``temporal.toc`` is read from that
@@ -182,6 +191,7 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
         open_store(leaf_root, **store_kwargs), path=str(cell_order), mode="r", zarr_format=3
     )
     acc = LeafTemporalAccumulator()
+    counting: str | None = None
     for name in sorted(fields):
         meta = fields[name]
         try:
@@ -206,14 +216,22 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
             )
         step = int(sibling.chunks[0]) or n
         for start in range(0, n, step):
-            raw_words = sibling[start : start + step]
+            rows = [
+                (i, row)
+                for i, row in enumerate(sibling[start : start + step])
+                if row is not None and len(row)
+            ]
+            if not rows:
+                continue
+            if counting is None:
+                counting = name  # the first declared field holding a word
+            words_parts = [decode_digest(row, "uint64", ()) for _i, row in rows]
+            if name != counting:
+                acc.add_occupancy(np.concatenate(words_parts))
+                continue
             raw_payload = payload[start : start + step]
-            words_parts: list[np.ndarray] = []
             weight_parts: list[np.ndarray] = []
-            for i, row in enumerate(raw_words):
-                if row is None or not len(row):
-                    continue
-                words = decode_digest(row, "uint64", ())
+            for (i, _row), words in zip(rows, words_parts, strict=True):
                 cell = decode_digest(raw_payload[i], dtype, (2,))
                 if len(cell) != len(words):
                     raise ValueError(
@@ -221,10 +239,8 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
                         f"{len(cell)}-centroid payload — the companion must be row-aligned "
                         f"with its digest (spec §1.1)"
                     )
-                words_parts.append(words)
                 weight_parts.append(cell[:, 1])
-            if words_parts:
-                acc.add_weighted(np.concatenate(words_parts), np.concatenate(weight_parts))
+            acc.add_weighted(np.concatenate(words_parts), np.concatenate(weight_parts))
     return acc.finish()
 
 
@@ -287,8 +303,8 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
     MAP and the map is the thing that unions. It is deliberately not narrowed
     to the surviving counts' own fields: doing so would describe the map with
     a list that no longer covers it. §10.1 says so, and makes the list an
-    upper bound for the once-per-field count rule rather than an exact
-    description of the installed block.
+    upper bound rather than an exact description of the installed block (it
+    carries no multiplicity: §10.3 counts an observation once).
 
     An unknown-spec section on the INCOMING side contributes nothing — the
     same strict gate the enclosing envelope uses. On the EXISTING side it is

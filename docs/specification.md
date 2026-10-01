@@ -3045,10 +3045,11 @@ new section here; keys are never repurposed in place.
   companions the **`shards` map** was derived from. It is the map's
   provenance, and it composes as a **union** across producers (§10.4): after a
   merge it names every field any contributing producer read, which is not
-  necessarily the set the installed `counts` was built over. A reader MUST
-  therefore treat it as an upper bound when applying the once-per-field count
-  rule of §10.3, not as a per-block field list. Informative for tier 1 (the
-  words are already unioned across fields by construction).
+  necessarily the set the installed `counts` was built over — an upper
+  bound, not a per-block field list. It carries no multiplicity: §10.3
+  counts an observation once however many fields are named here.
+  Informative for tier 1 (the words are already unioned across fields by
+  construction).
 - **`shards`** (required) — tier 1, below.
 - **`counts`** (optional) — tier 2, below (a `digest` key under this `spec`
   is the block this revision retired before any published store carried
@@ -3117,7 +3118,12 @@ still whole.
 > different temporal extents would be better served by per-field maps. If that
 > case earns it, it arrives as an additional key under `temporal` (e.g.
 > `shards_by_field`) in a later revision — `shards` keeps this meaning
-> unchanged.
+> unchanged. The **count side** of this question is closed (espg ruling of
+> 2026-10-01 on [#575](https://github.com/englacial/zagg/issues/575)):
+> §10.3's `counts` weighs an observation **once**, not once per field, so
+> the union map and the counted cover both describe "any data"; a per-field
+> *count* breakdown, if a store ever earns one, would likewise arrive as an
+> additional key and leave `counts` unchanged.
 
 ### 10.3 Tier 2 — the root counted cover
 
@@ -3160,31 +3166,55 @@ have for the cover sibling:
   coalescing is never applied to this buffer: a coalesced range would no
   longer name a bucket a count could belong to.
 - **`obs`** (required) — the observation count in each bucket, row-aligned
-  with `words`. Exact integers.
+  with `words`. Exact integers, and **possibly 0**: a word marks its bucket
+  *occupied*, and on a multi-field leaf read from its companions a bucket
+  can be occupied by a field other than the one counted (below). A reader
+  MUST accept a zero count; "is there data in this window" reads `words`,
+  "how much" sums `obs`.
 - **`count`** (required) — the bucket count `k`. A reader MUST refuse a
   block whose buffers disagree with it or with each other (§1.1's row
   alignment, broken).
 - **`obs_total`** (required) — the sum of `obs`, which a reader MUST refuse
   a block for disagreeing with. It is the number of temporal observations
-  the listed fields contributed; where `fields` names more than one field,
-  an observation that contributes to several of them is counted **once per
-  field** — the open question §10.2 flags, seen from the count side.
-  `fields` bounds that set from above rather than naming it exactly (§10.1).
+  counted, **once per observation** however many fields `fields` names
+  (espg ruling of 2026-10-01 on
+  [issue #575](https://github.com/englacial/zagg/issues/575), retiring the
+  once-per-field rule this bullet carried — under which the two producers
+  below disagreed by a factor of the field count; no published store
+  declared more than one temporal field while it stood).
 
-  **The two producers do not agree on this when `fields` names more than one
-  field.** A block derived from a leaf's committed §8.3 companions (the
-  sweep's raw route) reads one companion per declared field and so counts an
-  observation **once per field**, the rule above. A §10.6 record written by
-  the leaf's own worker folds the chunk's ONE shared clock column and so
-  counts each clocked observation **once**, whatever number of fields declare
-  a companion over it. For a store with `f` temporal fields the two feeds
-  therefore differ by a factor of `f` on the same leaf, and on a store that
-  mixes them — some leaves recorded, some backfilled — the root `obs_total`
-  is a sum of counts under two rules and is **not a single well-defined
-  quantity**. Readers MUST NOT treat a multi-field `obs_total` as an exact
-  observation count; the `obs` ratios within one block are unaffected, and a
-  single-field store (every published one to date) has no discrepancy. Which
-  rule both producers should meet is open — see §10.2's question.
+**What is counted (normative).** Both producers count an observation once:
+
+- **The leaf's own worker** (a §10.6 record, `source: "worker"`) folds the
+  ONE clock column every declared field shares: each clocked observation
+  the leaf aggregated is one count in the bucket of its own instant,
+  whatever its payload values were.
+- **A producer reading a leaf's committed §8.3 companions** (the raw route:
+  a sweep or refresh backfill, §10.6's `source: "sweep"` / `"refresh"`)
+  counts over **one field, the counting field**: the first of the declared
+  temporal fields, in ascending name order (the order `fields` lists them),
+  that holds at least one companion word **in that leaf**. Each of its
+  centroids is counted with its payload weight. Every other declared field
+  contributes **occupancy only**: its companion words join the §10.2
+  envelope and mark the bucket of each word's representative instant as
+  occupied — a key in `words` with nothing added to `obs` — and its payload
+  is not read. The key set, and so the §10.5 cover derived from it, stays
+  the union across fields that §10.2 and §10.5 require ("any data"), while
+  no observation is weighed twice. The rule is per leaf, so a field the
+  leaf lacks (one added to the store later) or holds no word for is passed
+  over and the next declared field counts.
+
+The raw route's count is therefore the counting field's total payload
+weight: the clocked observations whose value **in the counting field** was
+finite (a digest drops non-finite rows; the clock does not). It is a lower
+bound on the worker's count for the same leaf, with equality when no
+clocked observation was non-finite in the counting field; an observation
+finite only in another field is in an occupied bucket and uncounted. That
+is the one divergence left between the producers, and it does not grow
+with the field count. A root `obs_total` summed over a store that mixes
+worker-recorded and backfilled leaves is a single quantity under this one
+rule — the store's clocked observations, less those the backfilled leaves'
+counting fields dropped as non-finite.
 
 **How an observation lands in a bucket.** Its instant is its §8.3 word's
 *representative instant*: the instant itself for a timestamp word, the
@@ -3652,23 +3682,25 @@ which is that rule pinned as bytes.
   `fields` omit or exceed the set the manifest declares as absent (the
   declaration moved under it — a field postdates the record, or has since
   been dropped) and re-derive over the manifest's declared set; zagg's sweep
-  does, and materializes the re-derived record in its place. Equality is
-  what makes the two feeds comparable: a record folded over a field the
-  manifest no longer declares would contribute counts a record-less leaf in
-  the same store does not.
+  does, and materializes the re-derived record in its place (in a legacy
+  leaf; a version is never written into, above). Equality is what keeps
+  every record a function of the *current* declaration: a raw-route
+  record's counting field and its occupancy union (§10.3) are chosen over
+  the declared set, so a declaration that moved can move both, and a record
+  folded over a field the manifest no longer declares would claim coverage
+  a record-less leaf in the same store does not.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
-  MUST equal the counts block's `obs_total`: for a worker record the number
-  of clocked observations the leaf aggregated, **once per observation** (the
-  worker folds one shared clock column, so a second declared field adds
-  nothing to the count), for a sweep record the total weight of the
-  companions it folded, **once per field** (§10.3's rule). The two therefore
-  agree only where `fields` names a single field — and there only up to a
-  clocked observation whose payload value was non-finite, which the payload
-  companion drops and the worker's clock does not. With `f` declared
-  temporal fields a sweep record's `n_obs` is about `f ×` a worker record's
-  for the same leaf, so `n_obs` from a mixed store is a lower bound on
-  neither rule's count; §10.3's `obs_total` bullet carries the same warning
-  for the root, and the rule the two producers should share is open.
+  MUST equal the counts block's `obs_total`, **once per observation** from
+  either producer (§10.3's count rule): for a worker record the number of
+  clocked observations the leaf aggregated (the worker folds one shared
+  clock column, so a second declared field adds nothing), for a sweep or
+  refresh record the total payload weight of the leaf's **counting field**
+  (§10.3) — the first declared field, in name order, holding a companion
+  word in the leaf. The two agree up to the clocked observations whose
+  counting-field value was non-finite, which the payload digest drops and
+  the worker's clock does not; a raw-route `n_obs` is a lower bound on the
+  worker's for the same leaf, and the number of declared fields does not
+  enter either.
 - **`word`** (required) — the §10.2 envelope word for THIS leaf, as a
   decimal string: the grammar's join (`toc_reduce`) over every observation
   word the leaf holds. Because the join is a semilattice, it is identical
@@ -3684,8 +3716,9 @@ which is that rule pinned as bytes.
   coarsened under `cap`), `cap`, the two row-aligned buffers, `count` and
   `obs_total`, with §10.3's MUST-checks. Counted from the per-observation
   words (worker: each instant its own bucket, exact) or from the
-  per-centroid companions with the centroid weights as counts (sweep: a
-  merged centroid at its envelope midpoint, §10.3).
+  per-centroid companions (sweep: the counting field's centroids with
+  their weights as counts, a merged centroid at its envelope midpoint; the
+  other fields' words as zero-count occupancy — §10.3).
 - **`cover`** (required) — the leaf's §10.5 word set, **derived from the
   `counts` this record carries** — after their cap, not before it — by
   §10.3's law (its keys, `toc_normalize`d, at its order), and carried so a
