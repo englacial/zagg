@@ -93,7 +93,12 @@ dependencies = [
     # no aliases (espg/mortie#187) -- moc_and / moc_intersects / moc_to_order /
     # toc_reduce take ``offsets=``, decimal_to_word and arrow.from_wkb are the
     # array forms, polygons_to_morton_mocs is the only ring coverer -- so every
-    # call in this package only resolves from 1.0.0 on.
+    # call in this package only resolves from 1.0.0 on. 1.0.0 is also the floor
+    # for N-D shape pass-through in the elementwise converters (espg/mortie#219
+    # / espg/mortie#220, issue #543): processing.apriori._chunk_shard_mask feeds
+    # a 2-D (n_chunks, samples_per_chunk) lat/lon pair straight through
+    # grid.assign -> shards_of and reduces with .any(axis=1), so the floor holds
+    # on this reason alone even if the #559 name retirement ever stops binding.
     "mortie>=1.0.0",
     "earthaccess",
     "boto3",

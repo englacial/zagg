@@ -1665,7 +1665,7 @@ class TestLadder:
             assert objects, f"no order-{k} overview written"
             for obj in objects:
                 node = "".join(obj.relative_to(root).parts[:-1])
-                rank = int(np.asarray(mort2healpix(np.asarray([morton_word(node)]))[0])[0])
+                rank = mort2healpix(morton_word(node))[0]
                 src = zarr.open_group(str(obj), mode="r")[str(r)]
                 n = 4 ** (r - k)
                 np.testing.assert_array_equal(

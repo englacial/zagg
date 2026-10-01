@@ -111,9 +111,11 @@ def _chunk_shard_mask(bdf, grid, shard_key: int, samples_per_chunk: int) -> np.n
     pts /= np.linalg.norm(pts, axis=-1, keepdims=True)
     lats = np.degrees(np.arcsin(np.clip(pts[..., 2], -1.0, 1.0)))
     lons = np.degrees(np.arctan2(pts[..., 1], pts[..., 0]))
-    leaf = grid.assign(lats.ravel(), lons.ravel())
+    # assign/shards_of pass the 2-D (n_chunks, samples_per_chunk) shape through
+    # (mortie ≥1.0 N-D support, espg/mortie#219; rectilinear is elementwise numpy).
+    leaf = grid.assign(lats, lons)
     in_shard = np.asarray(grid.shards_of(leaf)) == shard_key
-    return in_shard.reshape(len(bdf), samples_per_chunk).any(axis=1)
+    return in_shard.any(axis=1)
 
 
 def _plan_from_boundaries(
