@@ -1489,6 +1489,71 @@ class TestLeafTemporalFold:
         assert int(raw[1].obs.sum()) == sum(flux_obs.values()) < meta["total_obs"]
         assert any(v == 0 for v in flux_obs.values())  # counted, yet rounds to 0
 
+    @staticmethod
+    def _drop_field(leaf, order, name):
+        """Remove a field's payload and companion from a written leaf (schema evolution)."""
+        import shutil
+
+        for array in (name, f"{name}_times"):
+            shutil.rmtree(f"{leaf}/{order}/{array}")
+
+    @pytest.mark.parametrize("gap", ["no-word", "no-arrays"])
+    def test_a_first_field_without_a_word_is_passed_over(self, monkeypatch, tmp_path, gap):
+        """§10.3's per-leaf clause: the counting field is the first HOLDING a word.
+
+        ``g_tdigest`` sorts first, but this leaf either holds no ``g`` word
+        anywhere (every ``g_ph`` row NaN) or lacks ``g``'s arrays entirely (a
+        field declared after the leaf was written). Either way ``h_tdigest``
+        counts: the raw total is ``h``'s single-field read, not zero.
+        """
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.hive import read_manifest
+
+        every_cell = {ci for cells in _CELL_LISTS for ci in cells}
+        nan_cells = every_cell if gap == "no-word" else ()
+        root, leaf, _dfs, meta = self._two_field_leaf(monkeypatch, tmp_path, nan_cells=nan_cells)
+        manifest = read_manifest(root)
+        fields, order = temporal_fields(manifest), temporal_cell_order(manifest)
+        assert sorted(fields)[0] == "g_tdigest"
+        if gap == "no-arrays":
+            self._drop_field(leaf, order, "g_tdigest")
+        else:
+            assert read_leaf_temporal(leaf, order, {"g_tdigest": fields["g_tdigest"]}) is None
+        h_only = read_leaf_temporal(leaf, order, {"h_tdigest": fields["h_tdigest"]})
+        raw = read_leaf_temporal(leaf, order, fields)
+        assert int(raw[1].obs.sum()) == int(h_only[1].obs.sum()) == meta["total_obs"]
+        np.testing.assert_array_equal(raw[1].words, h_only[1].words)
+        np.testing.assert_array_equal(raw[1].obs, h_only[1].obs)
+
+    def test_the_per_leaf_counting_field_composes_at_the_root(self, monkeypatch, tmp_path):
+        """Two backfilled leaves of one store whose counting fields differ.
+
+        One leaf holds both fields (``g_tdigest`` counts), the other lacks
+        ``g``'s arrays (``h_tdigest`` counts); the sweep's root total is the
+        sum of both leaves' observations.
+        """
+        import os
+
+        from mortie import geo2mort
+
+        from zagg.coverage_toc import temporal_cell_order
+        from zagg.hive import read_manifest, read_root_coverage
+        from zagg.leaf_temporal import LEAF_TEMPORAL_NAME, read_leaf_temporal_record
+        from zagg.sweep import run_sweep
+
+        key_a, key_b = _shard_key(), int(geo2mort(-60.0, 40.0, order=6)[0])
+        root, leaf_a, _dfs_a, meta_a = self._two_field_leaf(monkeypatch, tmp_path, key_a)
+        _root, leaf_b, _dfs_b, meta_b = self._two_field_leaf(monkeypatch, tmp_path, key_b)
+        self._drop_field(leaf_b, temporal_cell_order(read_manifest(root)), "g_tdigest")
+        for leaf in (leaf_a, leaf_b):
+            os.remove(f"{leaf}/{LEAF_TEMPORAL_NAME}")
+        summary = run_sweep(root, [(key_a, None), (key_b, None)], families=["moc"], record=False)
+        assert summary["families"]["moc"]["temporal_routes"]["materialized"] == 2
+        assert read_leaf_temporal_record(leaf_a)["n_obs"] == meta_a["total_obs"]
+        assert read_leaf_temporal_record(leaf_b)["n_obs"] == meta_b["total_obs"]
+        total = meta_a["total_obs"] + meta_b["total_obs"]
+        assert read_root_coverage(root)["temporal"]["counts"]["obs_total"] == total
+
     def test_a_part_backfilled_store_totals_under_one_rule(self, monkeypatch, tmp_path):
         """A root total summed over a worker record and a backfilled leaf.
 
