@@ -628,6 +628,31 @@ class TestPyramidCheck:
         assert entry["status"] == "fail"
         assert f"[{cell}]: stored morton" in entry["mismatches"][0]
 
+    @pytest.mark.parametrize("decl", ["absent", "v1-era"])
+    def test_an_unwindowed_store_without_a_declaration_still_checks_its_leaves(
+        self, tmp_path, decl
+    ):
+        from zagg.pyramid_check import validate_pyramid
+
+        gen = _generator()
+        root = tmp_path / "ks"
+        gen.build(root, kitchen_sink=True)
+        path = root / "morton_hive.json"
+        manifest = json.loads(path.read_text())
+        if decl == "absent":
+            del manifest["pyramid"]
+        else:
+            manifest["pyramid"]["overview"]["fields"] = {}
+        path.write_text(json.dumps(manifest))
+        report = validate_pyramid(str(root), full=True, roster="list")
+        declaration = report["checks"]["declaration"]
+        assert declaration["status"] == "fail"
+        assert ("a v1-era declaration" in declaration["detail"]) == (decl == "v1-era")
+        entry = report["checks"]["coordinates"]
+        assert entry["status"] == "pass", entry
+        assert "4 stored coordinate(s) agree" in entry["detail"]
+        assert report["checks"]["materialization"]["status"] == "skip"
+
     def test_an_unlocated_unwindowed_store_passes_on_the_stored_array(self, tmp_path):
         from zagg.pyramid_check import validate_pyramid
 

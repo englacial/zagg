@@ -35,7 +35,8 @@ The printed checklist mirrors issue #434's phases: declaration (the
 build-side contract), the leaf cell coordinates, materialization (the sweep's
 output), read-back, then the conservation checks. ``coordinates`` (issue #586
 phase 3, spec §1.5 "The cell coordinate") is the one check about the LEAVES
-themselves and the one a windowed store gets: per sampled leaf it derives the
+themselves — the one a windowed store gets, and the one an unwindowed store
+gets even when its ``declaration`` fails: per sampled leaf it derives the
 cell words from the leaf id and the rank, requires every location word of a
 sampled occupied cell to lie inside the derived cell, and — where a leaf
 still stores a ``morton`` array, which a windowed leaf no longer does —
@@ -192,6 +193,30 @@ def validate_pyramid(
                 continue
             checks[name] = _entry("skip", reason)
 
+    def leaves_only():
+        # ``coordinates`` is about the leaves alone, so an unwindowed store whose
+        # declaration FAILED still gets it, as a windowed store does (review
+        # finding): the roster needs only ``shard_order``. No leaves, no check.
+        try:
+            leaves, source = _leaf_roster(store_root, manifest, store_kwargs, roster)
+        except Exception as exc:
+            checks["coordinates"] = _entry("fail", f"no leaf roster: {exc}")
+            return
+        report["roster"] = {"source": source, "leaves": len(leaves)}
+        if leaves:
+            _coordinates_check(
+                store_root,
+                manifest,
+                [(dec, None) for dec in leaves],
+                store_kwargs,
+                checks,
+                report,
+                seed=seed,
+                sample_nodes=sample_nodes,
+                sample_cells=sample_cells,
+                full=full,
+            )
+
     manifest = read_manifest(store_root, **store_kwargs)
     checks["idempotency"] = _entry(
         "skip", "production sweeps are fleet-side (issue #547); asserted in fixture mode"
@@ -267,6 +292,7 @@ def validate_pyramid(
             )
         checks["declaration"] = _entry("fail", detail)
         skip_rest("no declaration", after="declaration")
+        leaves_only()
         return _finish(report, CHECKS)
     if not fields:
         checks["declaration"] = _entry(
@@ -275,6 +301,7 @@ def validate_pyramid(
             f"{report['field_classes']}) — a v1-era declaration; redeclare per issue #547",
         )
         skip_rest("no composable fields", after="declaration")
+        leaves_only()
         return _finish(report, CHECKS)
     if report["pyramid_spec"] == "zagg-pyramid/2":
         # The /2 arm (the espg ruling of 2026-09-11 on issue #547: the
