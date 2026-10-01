@@ -1149,9 +1149,10 @@ class TestDisjointness:
             return basename
 
         def spy_col(store_root, node, *args, **kwargs):
-            basename = orig_col(store_root, node, *args, **kwargs)
-            per_worker[current["worker"]].add(f"{node}/{basename}")
-            return basename
+            written = orig_col(store_root, node, *args, **kwargs)
+            if written is not None:
+                per_worker[current["worker"]].add(f"{node}/{written['object']}")
+            return written
 
         monkeypatch.setattr(stages_mod, "stage_node", spy_node)
         monkeypatch.setattr(stage_mod, "_write_stage_overview", spy_ov)
@@ -1657,8 +1658,8 @@ class TestWindowedStageSweep:
     """Review finding: the windowed / all-time arm was implemented but
     untested. Two windows, ``all_time: true`` — per-window artifacts fold as
     gathers/merges exactly like the unwindowed path, and the all-time fold is
-    ALWAYS a stage-merge over the per-window gen-1 tier (never a merged
-    all-time relay, which would breach the merge-source law); no all-time
+    ALWAYS a stage-merge, of the node's own per-window overviews since issue
+    #586 phase 4 (``tests/test_sweep_units.py`` owns that fold); no all-time
     stage column exists."""
 
     WINDOWS = ("2019", "2020")
@@ -1712,8 +1713,9 @@ class TestWindowedStageSweep:
         # Per-window gather carries gen-1 bytes; regimes as unwindowed.
         w_attrs = dict(_artifact(root, "1/1/1/2019.zarr").attrs)["zagg_overview"]
         assert w_attrs["regime"] == "stage-gather" and w_attrs["merges_from_raw"] == 1
-        # The all-time fold is a merge of the per-window gen-1 tier — even at
-        # a gather level — at exactly 2 merges from raw.
+        # The all-time fold is a merge even at a gather level, where its
+        # sources — the per-window overviews — are gen-1 content: exactly 2
+        # merges from raw.
         a_attrs = dict(_artifact(root, "1/1/1/all.zarr").attrs)["zagg_overview"]
         assert a_attrs["regime"] == "stage-merge" and a_attrs["merges_from_raw"] == 2
         # Exact math: all-time root cell = both windows' leaf sums.

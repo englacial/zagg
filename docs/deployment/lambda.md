@@ -550,6 +550,9 @@ staged arm, reusing that event's credential resolution and its
 | `dispatch` | stage | The tuple's dispatch order. The worker runs exactly that one tuple |
 | `nodes` | stage | This invoke's dispatch nodes, as morton decimals. Must be non-empty and every entry must sit at exactly `dispatch` order — the worker refuses otherwise. In the example above the store is shard-order 6, so at `tuple_width: 3` the dispatch orders are 3 and 0, and an order-3 dispatch takes 4-digit nodes |
 | `batch` | stage | Optional (defaults to `0`); which batch of that tuple this is, and what names the record object |
+| `unit` | stage | Optional ([issue #586](https://github.com/englacial/zagg/issues/586)). Which of the nodes' stage units this invoke runs: `"window"` — ONE window's fold, named by `window` — or `"close"`, the per-node step that follows a node's window units (the all-time fold). Absent, the worker runs the nodes whole — every window, then the close, serially — which is an unwindowed store's one unit per node and what a dispatcher predating the units sends. Refused by name against an unwindowed store |
+| `window` | stage | The window label. **Required** with `unit: "window"`, refused with anything else |
+| `pipeline_run_id` | both | Optional ([issue #593](https://github.com/englacial/zagg/issues/593)). The id of the aggregation run this sweep **completes** — distinct from `run_id`, the sweep's own. Recorded verbatim in every stage record, `finisher.json` and the store-root run record; absent, they record `null`, which vouches for no run |
 | `tuple_width` | stage | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH`. A finisher takes no tuple width — one on a finisher block is inert |
 | `partition` | stage | Optional `{"index", "of"}`; recorded on the stage rows |
 | `lease_ttl_s` | both | Optional lease TTL override |
@@ -564,15 +567,27 @@ Every store write stays worker-side. The dispatcher only invokes and polls.
 `zagg.sweep_fleet.run_stage_sweep_fleet` mirrors the in-process driver's tuple
 ordering exactly:
 
-1. **fan out** one tuple's dispatch nodes, batched under `max_nodes_per_invoke`
+1. **fan out** one tuple's stage units, batched under `max_nodes_per_invoke`
    *and* the 250 KB async payload cap — whichever binds first closes a batch —
-   with one `InvocationType="Event"` invoke per batch;
+   with one `InvocationType="Event"` invoke per batch. On an unwindowed store
+   a unit is a dispatch node. On a windowed one it is a **`(node, window)`
+   pair** ([issue #586](https://github.com/englacial/zagg/issues/586)): one
+   fan-out per window over the nodes that window is dirty beneath, every
+   window in flight at once, each event carrying its own window's leaf refs
+   alone;
 2. **soft-barrier** — poll the status prefix until every batch's stage record
    lands, or the barrier budget expires. Per #381 point (6) the barrier is a
    *scheduling* preference, not a correctness device: under-coverage is
    recorded in each artifact's own `source_children` and heals on the next
    pass, so an expired barrier logs loudly and the run proceeds;
-3. next tuple; then the **finisher** invoke last — root `coverage.moc`,
+3. on a windowed store that declares `output.pyramid.all_time`, the tuple's
+   **close** units — one per node, the all-time fold over the node's
+   per-window overviews — are fired once its window units are in. The next
+   tuple reads only the window units' stage columns, so it is fired at the
+   same moment and the two share one barrier; the last tuple's closes get
+   their own before the finisher. A store that does not declare the fold
+   fires no close and waits for nothing;
+4. next tuple; then the **finisher** invoke last — root `coverage.moc`,
    manifest per-level actuals, `aggregation.yaml` touch, lease release —
    **unless no tuple produced a dispatch node at all** (every leaf skipped as
    mixed-order, or filtered out by scope), in which case nothing fires, there
@@ -581,6 +596,40 @@ ordering exactly:
    over zero stage records refuses by design, so firing it would buy one
    guaranteed 500 the Event invoke hides plus a full barrier on a record that
    can never land.
+
+The unit list is `zagg.sweep_units.stage_units` — the same function the
+worker's own pass runs — so the records the dispatcher waits for are exactly
+the units the workers execute. A tuple's row in the dispatcher's summary
+counts its window units (`batches` / `records_seen`) and its closes
+(`close_batches` / `close_records_seen`); a unit whose record never landed is
+**named** in `missing_units` (`{batch, nodes, unit, window}`, the first 50;
+`missing_unit_count` is exact), so a dead `(node, window)` is told apart from
+a late tuple. A window unit that *raises* is not one that died: on a windowed
+store the worker counts it, names it in its record's `unit_errors`, and still
+writes the record, so the barrier is met at once. Either way the failure
+costs that window's artifacts and nothing else — the node's other windows
+are separate invokes over separate objects — and the close records the gap
+(`source_windows.missing` on the all-time artifact).
+
+The declaration is handed to the dispatcher (`windowed=`, `all_time=`), like
+`shard_order`, because it never reads the manifest; the runner's tail takes
+both from the config. A caller that says neither gets whole-node events,
+which are correct on every store — the worker then runs a windowed node's
+windows serially.
+
+#### Which function the stage invokes go to
+
+The staged tail runs on its **own tier**: the 8,192 MB / 10 GB-`/tmp` variant
+of the run's function family (`process-shard-8192-disk` for the default
+stack), resolved by `runner._resolve_stage_function_name` — the run's
+function with its `-<memory>[-disk]` suffix replaced, or
+`ZAGG_LAMBDA_STAGE_FUNCTION_NAME` verbatim when set. It is the interim ruled
+on issue #586 (2026-09-26): the 0.55 fleet's order-6 stage died at the 4 GB
+cap on 64 unwindowed leaves. The fold is now streamed block by block
+(`zagg.sweep_fold` — a worker holds one block of inputs, not a level), and
+the tier stays until that has been measured on the fleet; stage nodes sit at
+order 6 and coarser, so the larger function is a small share of a run. The
+dispatcher's role must be allowed to invoke that function.
 
 #### How wide the fan-out is
 
@@ -662,13 +711,18 @@ from zagg.sweep_fleet import run_stage_sweep_fleet
 
 summary = run_stage_sweep_fleet(
     boto3.client("lambda"),
-    "zagg-worker",
+    "zagg-worker",             # the function the STAGE invokes go to
     "s3://bucket/prefix.zarr",
     leaves,                    # [(shard_key, window), ...]
     shard_order=6,
     store_kwargs={"region": "us-west-2"},
     # Omitted here, so the ruled default rides: one dispatch node per invoke.
     # max_nodes_per_invoke=None,   # payload-only packing instead
+    # A windowed store: one invoke per (node, window), plus the per-node
+    # close when the store declares the all-time fold.
+    # windowed=True, all_time=True,
+    # The aggregation run this sweep completes (issue #593), if any.
+    # pipeline_run_id="<run id>",
 )
 ```
 

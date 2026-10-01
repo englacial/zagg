@@ -1365,6 +1365,16 @@ def main(argv=None) -> int:
         "The families sweep does not run in this mode.",
     )
     parser.add_argument(
+        "--pipeline-run-id",
+        default=None,
+        metavar="RUN_ID",
+        help="With --stages: the PIPELINE run this pass completes (issue #593) — the "
+        "run id of an aggregation run whose dispatcher died before its staged sweep "
+        "finished. Recorded in the sweep's run record (pipeline_run_id) beside the "
+        "sweep's own id, so the record vouches for that run by name. Omitted, the "
+        "record carries null and vouches for no run",
+    )
+    parser.add_argument(
         "--tuple-width",
         type=int,
         default=3,
@@ -1413,6 +1423,10 @@ def main(argv=None) -> int:
         "to /2 must not get. Validated against the manifest's own shard/cell orders",
     )
     args = parser.parse_args(argv)
+    if args.pipeline_run_id is not None and not args.stages:
+        # The key lives in the STAGED run record; a families pass has nowhere
+        # to put it, and dropping it silently would look like it was recorded.
+        parser.error("--pipeline-run-id only applies to --stages")
     if args.overviews is not None and args.declare_pyramid is None:
         # --overviews rides the declaration, and a sweep pass would silently
         # ignore it — refuse rather than run something the operator did not ask
@@ -1472,6 +1486,7 @@ def main(argv=None) -> int:
             tuple_width=args.tuple_width,
             partitions=args.partitions if args.partitions != 1 else None,
             store_kwargs=store_kwargs,
+            pipeline_run_id=args.pipeline_run_id,
         )
         print(json.dumps(summary, indent=2))
         return 0

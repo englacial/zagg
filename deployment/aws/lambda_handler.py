@@ -168,6 +168,22 @@ end of run, like coverage mode; also invocable ad hoc):
                                   #   decimals (role="stage")
           "batch": int,           # which batch of that tuple this is; names
                                   #   the record object (role="stage")
+          "unit": "window" | "close",  # optional, role="stage" (issue #586):
+                                  #   which of the nodes' stage units this
+                                  #   invoke runs -- ONE window's fold (named
+                                  #   by "window"), or the per-node close that
+                                  #   follows a node's window units (the
+                                  #   all-time fold). Absent -> the nodes
+                                  #   whole: every window, then the close,
+                                  #   serially -- an unwindowed store's one
+                                  #   unit per node
+          "window": str,          # the window label; REQUIRED with
+                                  #   unit="window", refused otherwise
+          "pipeline_run_id": str, # optional, both roles (issue #593): the
+                                  #   PIPELINE run this sweep completes,
+                                  #   recorded in the stage records beside the
+                                  #   sweep's own run_id. Absent -> null, which
+                                  #   vouches for no run
           "tuple_width": int,     # optional; defaults to
                                   #   zagg.sweep_stage.DEFAULT_TUPLE_WIDTH, the one
                                   #   source the CLI path uses too -- a copied
@@ -1410,6 +1426,8 @@ def _stage_body(
         "run_id": block.get("run_id"),
         "dispatch": out.get("dispatch"),
         "batch": out.get("batch"),
+        "unit": block.get("unit"),
+        "window": block.get("window"),
         "n_nodes": out.get("n_nodes"),
         "n_leaves": n_leaves,
         "stage_records": out.get("stage_records"),
@@ -1485,6 +1503,7 @@ def _handle_stage_sweep(
                 # place that can say the per-level actuals may be short.
                 barrier_timed_out=bool(block.get("barrier_timed_out")),
                 store_kwargs=store_kwargs,
+                pipeline_run_id=block.get("pipeline_run_id"),
             )
         elif role == "stage":
             out = run_stage_worker(
@@ -1501,6 +1520,11 @@ def _handle_stage_sweep(
                 lease_ttl_s=block.get("lease_ttl_s"),
                 store_kwargs=store_kwargs,
                 dirt_only=[(int(k), w) for k, w in event.get("dirt_only") or []],
+                # The (node, window) stage unit (issue #586 phase 4) and the
+                # pipeline run the sweep completes (issue #593).
+                unit=block.get("unit"),
+                window=block.get("window"),
+                pipeline_run_id=block.get("pipeline_run_id"),
             )
         else:
             raise ValueError(f"unknown stage role {role!r} (expected 'stage' or 'finisher')")

@@ -14,7 +14,8 @@ the WINDOWED arm of the same order-6 cell, built with
 - the ladder numbers off the staged sweep record (``sweep_stats_*_stages.json``,
   the newest one; each record kept apart in the JSON), summed per
   ``dispatch_order`` over its per-batch rows: ``icechunk_commits`` / ``icechunk_rebases`` / ``icechunk_commit_s``,
-  objects written. Icechunk is OFF on a windowed store (spec section 11.6), so
+  objects written, and (issue #586 phase 4) the ``(node, window)`` units run,
+  the worker seconds and the streamed fold's peak block of inputs per tuple. Icechunk is OFF on a windowed store (spec section 11.6), so
   its stage rows carry no ``icechunk_*`` keys and the table prints ``-`` (not
   measured), not ``0``: the arms' ladders compare like for like only once
   windowed Icechunk (issue #584) lands.
@@ -226,7 +227,18 @@ _LADDER_KEYS = (
     "icechunk_commit_s",
     "icechunk_refs",
     "icechunk_s",
+    # Issue #586 phase 4: the (node, window) units a row ran, the worker
+    # seconds it took, and what failed. A stage row predating them carries
+    # none (printed ``-``).
+    "window_units",
+    "close_units",
+    "failed",
+    "duration_s",
 )
+#: Stage-row counters that are a HIGH-WATER, not a sum, across a dispatch
+#: order's rows: the streamed fold's largest single block of inputs, in source
+#: cells (``zagg.sweep_fold.FoldMeter``).
+_LADDER_MAX_KEYS = ("fold_peak_cells",)
 
 
 def _per_order(rows: list) -> list:
@@ -236,12 +248,16 @@ def _per_order(rows: list) -> list:
     by_order: dict = {}
     for row in rows:
         agg = by_order.setdefault(
-            row.get("dispatch_order"), {"batches": 0, **dict.fromkeys(_LADDER_KEYS)}
+            row.get("dispatch_order"),
+            {"batches": 0, **dict.fromkeys((*_LADDER_KEYS, *_LADDER_MAX_KEYS))},
         )
         agg["batches"] += 1
         for k in _LADDER_KEYS:
             if row.get(k) is not None:
                 agg[k] = (agg[k] or 0) + row[k]
+        for k in _LADDER_MAX_KEYS:
+            if row.get(k) is not None:
+                agg[k] = max(agg[k] or 0, row[k])
     return [
         {"dispatch_order": order, **agg}
         for order, agg in sorted(by_order.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))
@@ -327,6 +343,13 @@ def _stage_sum(result: dict, key: str):
     return sum(values) if values else None
 
 
+def _stage_orders(result: dict, key: str) -> str:
+    """``key`` per dispatch order, finest first (``8..6 / 5..3 / 2..0`` at width 3):
+    the ladder's per-tuple shape, which a sum across orders would hide."""
+    rows = sorted(result["ladder"]["stages"], key=lambda s: -(s.get("dispatch_order") or 0))
+    return " / ".join(_fmt(s.get(key)) for s in rows) if rows else "-"
+
+
 def print_table(results: list[dict]) -> None:
     rows = [
         ("schedule", lambda r: r["schedule"]),
@@ -356,6 +379,15 @@ def print_table(results: list[dict]) -> None:
                 f" / {r['ladder']['batch_rows']}"
             ),
         ),
+        (
+            "stage units window / close",
+            lambda r: (
+                f"{_fmt(_stage_sum(r, 'window_units'))} / {_fmt(_stage_sum(r, 'close_units'))}"
+            ),
+        ),
+        ("stage worker_s per tuple", lambda r: _stage_orders(r, "duration_s")),
+        ("stage fold peak cells per tuple", lambda r: _stage_orders(r, "fold_peak_cells")),
+        ("stage failed (sum)", lambda r: _fmt(_stage_sum(r, "failed"))),
         ("icechunk commits (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_commits"))),
         ("icechunk rebases (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_rebases"))),
         ("icechunk commit_s (sum)", lambda r: _fmt(_stage_sum(r, "icechunk_commit_s"))),

@@ -660,6 +660,20 @@ class HealpixGrid:
             cell_coordinate=cell_coordinate,
         )
 
+    def chunked_spec(self) -> GroupSpec:
+        """GroupSpec for ONE shard on plain inner chunks — no whole-leaf shard.
+
+        :meth:`shard_spec`'s member set with every per-cell array, ragged
+        ones included, left on its ``cells_per_chunk`` chunk grid (one object
+        per chunk). For an artifact written one chunk at a time and never
+        held whole — the streamed stage column (issue #586 phase 4) — where a
+        ShardingCodec array would be re-read and re-PUT whole on every chunk.
+        Requires an unsharded grid.
+        """
+        if self.sharded:
+            raise ValueError("chunked_spec is the unsharded layout; build the grid sharded=False")
+        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,))
+
     # ── internals ────────────────────────────────────────────────────────
 
     def _spec(self) -> GroupSpec:

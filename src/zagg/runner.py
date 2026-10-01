@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import re
 import statistics
 import threading
 import time
@@ -44,6 +45,7 @@ from zagg.config import (
     get_output_region,
     get_parent_order,
     get_pipeline_type,
+    get_pyramid,
     get_store_layout,
     get_store_path,
     get_sweep,
@@ -102,6 +104,41 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
         return base
     suffix = f"-{worker['memory']}"
     if worker.get("extra_disk"):
+        suffix += "-disk"
+    return base + suffix
+
+
+#: The worker-size variant a staged sweep's invokes run on (issue #586): the
+#: 8,192 MB tier with the 10 GB ``/tmp``. The interim ruled on the issue's
+#: 2026-09-26 amendment — the 0.55 fleet's order-6 stage died at the 4 GB cap
+#: on 64 unwindowed leaves — and it stays until the chunk-streamed fold
+#: (:mod:`zagg.sweep_fold`) has been measured on the fleet. Stage nodes sit at
+#: order 6 and coarser, 1/64th of the shards and fewer, so the tier costs
+#: little. A dispatch default, not a deployment change: the variant is one
+#: the stack already stamps (``deployment/aws/template.yaml``).
+STAGE_SWEEP_WORKER = {"memory": 8192, "extra_disk": True}
+
+_WORKER_SUFFIX_RE = re.compile(r"-(?:2048|4096|8192)(?:-disk)?$")
+
+
+def _resolve_stage_function_name(function_name: str) -> str:
+    """The function a staged sweep's invokes go to (issue #586 phase 4).
+
+    Precedence: env ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME`` wins verbatim (a
+    deployment whose family has no such variant, or an operator pinning the
+    tier down again); otherwise the :data:`STAGE_SWEEP_WORKER` variant of the
+    RUN's own function family — ``function_name`` (already resolved,
+    :func:`_resolve_function_name`) with its ``-<memory>[-disk]`` suffix, if
+    any, replaced. So ``process-shard`` and ``process-shard-4096-disk`` both
+    stage on ``process-shard-8192-disk``, and a ``-test`` family on its own
+    twin. The leaf fan-out is unaffected; only the staged tail moves.
+    """
+    override = os.environ.get("ZAGG_LAMBDA_STAGE_FUNCTION_NAME")
+    if override:
+        return override
+    base = _WORKER_SUFFIX_RE.sub("", function_name)
+    suffix = f"-{STAGE_SWEEP_WORKER['memory']}"
+    if STAGE_SWEEP_WORKER.get("extra_disk"):
         suffix += "-disk"
     return base + suffix
 
@@ -3551,6 +3588,8 @@ def _run_local(
                 dirt_only=dirt_only,
                 store_kwargs=store_kwargs,
                 touch_policy=get_touch_policy(config),
+                # The run this sweep completes (issue #593).
+                pipeline_run_id=run_id,
             )
     # Icechunk run finalize (issue #582, spec §11.4): AFTER every commit of
     # the run — the staged sweep's ladder commits included — tag the tip
@@ -4493,7 +4532,8 @@ def _run_lambda(
                     stage_chained = True
                     staged = _invoke_lambda_stage_sweep(
                         state["lambda_client"],
-                        function_name,
+                        # The staged tail runs on its own tier (issue #586).
+                        _resolve_stage_function_name(function_name),
                         store_path,
                         leaves,
                         shard_order=int(parent_order),
@@ -4501,6 +4541,11 @@ def _run_lambda(
                         store_kwargs=_output_store_kwargs(output_creds_event, region),
                         touch_policy=get_touch_policy(config),
                         dirt_only=dirt_only,
+                        # The (node, window) units and the per-node close.
+                        windowed=get_windowing(config) is not None,
+                        all_time=bool((get_pyramid(config) or {}).get("all_time")),
+                        # The run this sweep completes (issue #593).
+                        pipeline_run_id=run_id,
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
@@ -6067,6 +6112,9 @@ def _invoke_lambda_stage_sweep(
     barrier_timeout_s=None,
     total_barrier_budget_s=None,
     dirt_only=(),
+    windowed=False,
+    all_time=False,
+    pipeline_run_id=None,
 ) -> dict | None:
     """End-of-run STAGED sweep over the fleet (issue #519); its summary.
 
@@ -6115,6 +6163,18 @@ def _invoke_lambda_stage_sweep(
 
     ``dirt_only`` (issue #580) is the run's touched current units, forwarded
     to the workers as the stage event's ``dirt_only`` refs.
+
+    ``windowed`` / ``all_time`` are the store's declaration — a window
+    schedule, and the all-time fold — which select the ``(node, window)``
+    stage units and the per-node close (issue #586 phase 4,
+    :func:`zagg.sweep_units.stage_units`). ``pipeline_run_id`` (issue #593)
+    is the run this sweep completes; the workers record it in the stage
+    records beside the sweep's own id. It is optional so a caller that holds
+    no run id (a standalone staged pass) records ``null``.
+
+    ``function_name`` is the function the STAGE invokes go to — the caller
+    resolves it (:func:`_resolve_stage_function_name`: the 8,192 MB variant
+    of the run's family, the issue #586 interim).
     """
     from zagg.sweep_fleet import run_stage_sweep_fleet
 
@@ -6138,6 +6198,9 @@ def _invoke_lambda_stage_sweep(
             store_kwargs=store_kwargs,
             touch_policy=touch_policy,
             dirt_only=dirt_only,
+            windowed=bool(windowed),
+            all_time=bool(all_time),
+            pipeline_run_id=pipeline_run_id,
             **knobs,
         )
     except Exception as e:

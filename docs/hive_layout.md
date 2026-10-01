@@ -611,6 +611,7 @@ workers over the leaf columns** — a raw leaf is never read above the shard:
 ```
 python -m zagg.sweep s3://bucket/store --stages            # CLI backstop
 python -m zagg.sweep s3://bucket/store --stages --partitions 16
+python -m zagg.sweep s3://bucket/store --stages --pipeline-run-id <run id>
 ```
 
 or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
@@ -638,6 +639,45 @@ tier (the espg merge-source ruling), so **the cadence changes no bytes**:
 `--tuple-width 1` and `--tuple-width 3` build byte-identical ladders, and
 every upfront merge level is uniformly 2 merges from raw (gathers are 1;
 gen 3 is append-later cascade territory only).
+
+**Units.** The unit of stage work is the dispatch node on an unwindowed
+store and the **`(node, window)` pair** on a windowed one
+([issue #586](https://github.com/englacial/zagg/issues/586)): each window's
+overviews and stage column come from that window's leaf columns alone, so a
+node's windows are independent. The fleet runs them concurrently, one invoke
+per window per node; the CLI and the local backend run the same units
+serially. A node's window units share no object — each writes only its own
+`{window}.zarr` / `{window}.pyramid.zarr` and reads its skip key off the
+artifact itself — so one that fails costs its own window and nothing else,
+and is named in the stage record (`unit_errors`). Where the store declares
+`output.pyramid.all_time`, each node then gets one **close**: the all-time
+fold, a k-way merge of the node's per-window overviews into `all.zarr`
+(overview-sized objects at the same node, never leaves — its cost follows
+the window count, not the subtree). It covers every window the node has,
+not only the ones the run touched, records the windows it folded
+(`source_windows`), and is one more merge from raw than its sources — 2 at a
+gather level, 3 at a merge level
+([specification §4.4](specification.md)). A store without the declaration
+has no close and pays no unit for it.
+
+**Memory.** A stage worker folds a level **one block of output cells at a
+time** — read the child members covering the block, fold, write, drop — and
+never holds a level whole (`zagg.sweep_fold`). A block is `4^5` cells; a
+stage-column group wider than that is laid on inner chunks of exactly one
+block, so the block written and the block a parent reads back are single
+chunk objects. Nothing is spilled to `/tmp`: the inputs already live in the
+store. The stage rows report `fold_blocks`, `fold_cells_read` and
+`fold_peak_cells` (the most source cells any one block held).
+
+**Which run a sweep completes.** A sweep has its own `run_id`. When it is
+chained after an aggregation run, that run's id rides along as
+**`pipeline_run_id`** and is written into the sweep's run record
+(`sweep_stats_{ts}_stages.json`) and every stage record
+([issue #593](https://github.com/englacial/zagg/issues/593)), so the record
+names the run it vouches for instead of being linked to it by time. A
+standalone `--stages` pass names the run it is completing with
+`--pipeline-run-id`; without it the key is `null` and the pass vouches for
+no run.
 
 **Scope.** The only argument a sweep takes about *where* is an optional
 node-prefix set — a MOC; a shardmap is accepted as sugar (its keys are the

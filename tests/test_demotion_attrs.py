@@ -117,7 +117,6 @@ class TestStageArtifactDemotions:
             shard_order=NODE_ORDER,
             child_order=NODE_ORDER,
             relay=NODE_ORDER,
-            all_time=False,
         )
 
     def _fold_and_write(self, root, paths):

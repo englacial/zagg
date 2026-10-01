@@ -1150,6 +1150,38 @@ the residual-race backstop of the sweep-admission lease. The `/2` leaf
 entry's artifact is the §4.6 column — declared-but-unmaterialized remains
 legal (§4.5).
 
+**The all-time fold of a windowed store**
+([issue #586](https://github.com/englacial/zagg/issues/586)). Where the
+manifest declares `pyramid.overview.all_time` (§4.5), a windowed store's
+`all.zarr` at a ladder node is folded from **that node's own per-window
+overviews** (`{window}.zarr`, every window the node has), cell for cell at
+the level's resolution — one k-way merge per cell across windows under the
+field's §4.5 law. It is written after the node's per-window artifacts and
+never from the leaf tier, so its cost follows the window count, not the
+subtree. Its `zagg-overview/2` attrs record:
+
+- `regime: "stage-merge"` at every level, a gather level included;
+- `merges_from_raw` **one more than its sources'**: `2` where the level's
+  per-window overviews are gathers of gen-1 members, and **`3`** where they
+  are themselves merges. This is the one stage-written artifact at 3: the
+  per-window ladder — every `{window}.zarr`, and an unwindowed store's
+  `all.zarr` — keeps the never-3 law above, and §4.5's per-entry `actuals`
+  describe that ladder, not the all-time fold;
+- **`source_windows`** — `{"folded", "missing", "unreadable"}` over the
+  window overviews it consumed. `missing` counts a window known to have data
+  beneath the node whose overview was not committed when the fold ran (its
+  stage unit failed, or has not landed): the fold then under-covers that
+  window and the next sweep heals it. The key is present **exactly** on this
+  artifact; a reader MUST tolerate it and MUST NOT require it elsewhere;
+- `source_children` — the folded windows' own counters, **summed**: a window
+  that under-covered its subtree makes the all-time fold short by the same
+  children;
+- `generation` — the consumed window overviews' blocks, summed, with the
+  runs that stamped them (the fold's skip key, §4.5).
+
+An unwindowed store has no such artifact: its single fold is already
+all-time (§4.2) and is an ordinary ladder artifact.
+
 An overview's variable set may therefore be a *subset* of the leaf's —
 heterogeneous variable sets across level nodes are in contract, and a reader
 MUST NOT assume every leaf field exists at every overview order (the
@@ -1403,7 +1435,9 @@ staged sweep's finisher.
   pre-#515 zagg behaves.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
-  single fold is already all-time).
+  single fold is already all-time). On a `/2` store it is folded from the
+  node's per-window overviews (§4.4 "The all-time fold of a windowed
+  store").
 - **`summarize`** (optional) — the opt-in **declared derived summary** for
   `none`-class fields: a mapping from a new, *different* field name to its
   derivation (e.g. an auto-digest of a roster field's raw values), living in
@@ -1459,15 +1493,18 @@ staged sweep's finisher.
   `stage-gather` (a concatenation of gen-1 members, merges-from-raw 1) or
   `stage-merge` (a k-way fold of the relayed gen-1 relay-member partials,
   §4.4, merges-from-raw 2 — **never 3 for an upfront level**; gen 3 belongs
-  only to the append-later cascade regime). `source_children`
+  only to the append-later cascade regime, and to the all-time fold of a
+  windowed store, whose provenance rides its own attrs and never these
+  per-entry actuals — §4.4). `source_children`
   accumulates the run's per-artifact coverage counts; `run_id` names the
   sweep run (stage entries only). The key is **additive**: a reader MUST
   tolerate additional keys on a level entry, and `actuals` says nothing
   about artifacts still being present (overviews are regenerable caches,
   §4.1).
 - **The stage skip key** (`generation`, recorded per artifact in §4.4's
-  attrs, per stage column in §4.6, and in the sweep-internal envelope) is
-  the triple
+  attrs, per stage column in §4.6, and — on an unwindowed store — in the
+  sweep-internal node envelope; a windowed store's stage units read it off
+  the artifact's own attrs) is the triple
 
   ```json
   "generation": {"n_leaves": 16,
@@ -1757,7 +1794,17 @@ commit stamp carries `run_id` too. Cadence decides placement (columns sit
 at dispatch orders), so column EXISTENCE at a given ancestor order is
 orchestration, never contract — a reader binds to the ladder artifacts of
 §4.4, not to stage columns. The root tuple writes no column (nothing
-consumes it). Raster hive stores are column-less by construction: nothing
+consumes it). A stage column's **chunking** is orchestration too
+([issue #586](https://github.com/englacial/zagg/issues/586)): a resolution
+group of at most `4^5` cells is one chunk per array, as a leaf column's is;
+a wider group is laid on regular inner chunks of `4^5` cells, one object per
+chunk and no ShardingCodec, because the staged sweep gathers, writes and
+reads such a group one chunk at a time (it never holds a level whole). The
+arrays, their values, the attrs and the §5 record are the same either way —
+the O11 hash is over decoded values. On a windowed store every window has
+its own stage column (`{window}.pyramid.zarr`), written by that window's own
+stage unit; there is no all-time stage column (a column relays gen-1
+content). Raster hive stores are column-less by construction: nothing
 in this section applies to them (issue #399 owns their overview regime).
 
 ### 4.7 What §4 does not cover (informative)
@@ -1770,6 +1817,36 @@ sub-shardmap is ShardMap JSON) — except the §4.8 sweep-admission lease,
 which is control plane rather than data. The fold *algebra* for overview
 contents is zagg-owned per §2.3; a reader consumes overview arrays exactly
 as it consumes leaf arrays.
+
+**The staged sweep's run records (informative).** A staged sweep leaves one
+run record at the store root, `sweep_stats_{ts}_stages.json`, and — on the
+fleet — one record per stage invoke plus the finisher's under the run's
+status prefix (`zagg-sweep-stage-record/1`). They are telemetry, not
+conformance material, but two of their keys are relied on by tooling and are
+stated here:
+
+- **`run_id`** is the SWEEP's own identity (the §4.8 lease, the stage
+  stamps' skip-key term). **`pipeline_run_id`**
+  ([issue #593](https://github.com/englacial/zagg/issues/593)) is a
+  different thing: the id of the aggregation run the sweep **completes** —
+  the run whose leaves it folded — stamped into the stage event by the
+  dispatcher that chained the sweep and carried verbatim into every stage
+  record and the root record. The key is always present; **`null` means the
+  sweep named no run and vouches for none** (a standalone
+  `python -m zagg.sweep --stages` pass, unless it is given
+  `--pipeline-run-id`). A consumer deciding whether run R's ladder was built
+  MUST match `pipeline_run_id == R`; the record's time alone does not link
+  it to a run.
+- A stage record's **`unit`** / **`window`**
+  ([issue #586](https://github.com/englacial/zagg/issues/586)) say which
+  share of its dispatch nodes the invoke ran: `"window"` with the window
+  label — one `(node, window)` fold; `"close"` — the per-node step that
+  follows a node's window units (the all-time fold of §4.4); `null` — the
+  nodes whole, which is the only form an unwindowed store has. Its per-tuple
+  rows count `window_units` and `close_units`, name a unit that raised in
+  `unit_errors`, and report the streamed fold's accounting (`fold_blocks`,
+  `fold_cells_read`, `fold_peak_cells` — the most source cells any one fold
+  block held).
 
 ### 4.8 The sweep-admission lease (`zagg-sweep-lease/1`)
 
@@ -1801,8 +1878,14 @@ ancestors). A live intent refuses admission naming the runner; a
 partial prior run under the ratchet. The finisher deletes the intent as its
 final act. **Control plane, explicitly**: no data object is ever locked —
 the lease is what makes "every data object has exactly one writer, ever"
-true *across* runs, extending (never amending) the no-locking law. Fleets
-are unaffected: fleet ∥ fleet is governed by the leaf single-writer law and
+true *across* runs, extending (never amending) the no-locking law. Within
+one admitted run the single-writer law holds per object: on a windowed store
+a dispatch node's windows are folded by concurrent stage units
+([issue #586](https://github.com/englacial/zagg/issues/586)), each of which
+writes only its own window's artifacts and reads its skip key from the
+artifact it alone writes, so no object — the sweep-internal node envelope
+included, which a windowed store does not have — is shared between them.
+Fleets are unaffected: fleet ∥ fleet is governed by the leaf single-writer law and
 fleet ∥ sweep is allowed (the stage workers validate every column stamp
 before and after reading its groups and re-read on movement; stage stamps
 carry `run_id`, and a skip-if-current read that sees a foreign stamp

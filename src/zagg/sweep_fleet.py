@@ -13,15 +13,23 @@ worker has no sanctioned write path at all.
 
 The shape, per tuple, finest first:
 
-1. **fan out** — the tuple's dispatch nodes, batched under the async payload
-   cap, one ``InvocationType="Event"`` invoke per batch;
+1. **fan out** — the tuple's stage units (:func:`zagg.sweep_units.stage_units`,
+   the enumeration the workers themselves run), batched under the async
+   payload cap, one ``InvocationType="Event"`` invoke per batch. On an
+   unwindowed store a unit is a dispatch node; on a windowed one it is a
+   ``(node, window)`` pair (issue #586 phase 4), every window of every node
+   in flight at once;
 2. **soft-barrier** — poll the run's status prefix until every batch's stage
    record appears, or the barrier budget runs out. The barrier is a
    SCHEDULING preference, not a correctness device (#381 point (6)):
    under-coverage is recorded in the artifact's own ``source_children`` and
    heals on the next pass, so a timed-out barrier logs loudly and the run
    proceeds rather than stalling;
-3. **next tuple**, then the **finisher** invoke last
+3. **close** — on a windowed store that declares the all-time fold, one
+   close unit per node once its window units are in. The next tuple needs
+   only the window units' stage columns, so it is fired at the same moment
+   and the two share one barrier;
+4. **next tuple**, then the **finisher** invoke last
    (:func:`zagg.sweep_stages.run_stage_finisher`) — root ``coverage.moc``,
    manifest actuals, ``aggregation.yaml`` touch, lease release.
 
@@ -78,6 +86,10 @@ _LIST_FAULT_LIMIT = 5
 #: count a real fan-out reaches, so the measured payload is never smaller than
 #: the one that ships (the index is assigned after packing).
 _BATCH_INDEX_PROBE = 9_999_999
+#: How many unseen units one tuple's row NAMES (``missing_units``); the count
+#: (``missing_unit_count``) is always exact. A wholesale barrier failure on a
+#: wide tuple would otherwise put tens of thousands of rows in the summary.
+_MISSING_UNITS_NAMED = 50
 
 
 def dispatch_nodes(by_shard, dispatch: int, scope=None) -> list:
@@ -87,11 +99,11 @@ def dispatch_nodes(by_shard, dispatch: int, scope=None) -> list:
     (a normalized MOC) filters them exactly as it filters the in-process
     pass's dispatch nodes.
     """
-    from zagg.sweep_stage import _node_at
-    from zagg.sweep_stages import scope_admits
+    from zagg.sweep_units import stage_units
 
-    nodes = sorted({_node_at(d, int(dispatch)) for d in by_shard})
-    return [n for n in nodes if scope_admits(n, scope)]
+    # The node set of the shared enumeration, with the window axis dropped.
+    units = stage_units(by_shard, dispatch, windowed=False, all_time=False, scope=scope)
+    return [unit["node"] for unit in units]
 
 
 def coverage_dispatch_nodes(by_shard, dispatch: int, coverage, scope=None) -> list:
@@ -533,6 +545,9 @@ def run_stage_sweep_fleet(
     total_barrier_budget_s: float = DEFAULT_TOTAL_BARRIER_BUDGET_S,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     dirt_only=(),
+    windowed: bool = False,
+    all_time: bool = False,
+    pipeline_run_id: str | None = None,
 ) -> dict:
     """One staged sweep run over the fleet: tuples, barriers, finisher last.
 
@@ -601,6 +616,23 @@ def run_stage_sweep_fleet(
     nodes' refs without a fold (:func:`zagg.sweep_stages.sweep_stage_pass`).
     The finisher never sees it.
 
+    ``windowed`` / ``all_time`` are the store's declaration (issue #586 phase
+    4) — whether it has a window schedule and whether its pyramid declares
+    the all-time fold — handed IN like ``shard_order``, since this side never
+    reads the manifest. They select the unit shape
+    (:func:`zagg.sweep_units.stage_units`): unwindowed, one invoke per batch
+    of nodes, as ever; windowed, one per batch of nodes PER WINDOW, plus —
+    with ``all_time`` — a close invoke per batch of nodes after them. A
+    tuple's row counts its window units' records, and a unit whose record
+    never landed is named in ``missing_units``, so a dead ``(node, window)``
+    is told apart from a late tuple. Both default off: a caller that does not
+    say gets the whole-node unit, which is correct on every store (the worker
+    then runs the node's windows serially).
+
+    ``pipeline_run_id`` (issue #593) names the pipeline run this sweep
+    completes. It rides every stage event and the finisher's, and the
+    workers record it beside the sweep's own ``run_id``.
+
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
     store root, worker-written); it is read back here when it lands.
@@ -613,6 +645,7 @@ def run_stage_sweep_fleet(
     from zagg.sweep import _normalize_leaves
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
     from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
+    from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW, stage_units
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
@@ -641,11 +674,14 @@ def run_stage_sweep_fleet(
     records_from = run_status_prefix(store_path, run_id)
     summary: dict = {
         "run_id": run_id,
+        "pipeline_run_id": pipeline_run_id,
         "run_started": run_started,
         "store_root": store_path,
         "shard_order": shard_order,
         "tuple_width": tuple_width,
         "max_nodes_per_invoke": max_nodes_per_invoke,
+        "windowed": bool(windowed),
+        "all_time": bool(all_time),
         "scope": None if scope is None else [str(int(w)) for w in scope],
         # Whether the per-tuple node sets were computed from the store's own
         # coverage (issue #547) or from the work set alone. The words
@@ -709,6 +745,66 @@ def run_stage_sweep_fleet(
         )
         summary["invokes"] += 1
 
+    def _fan_out(nodes, leafset, block, dispatch, first_batch, *, dirt) -> dict:
+        """Fire one group of units; ``{record name: unit descriptor}`` for the barrier."""
+        batches = pack_batches(
+            nodes,
+            leafset,
+            block=block,
+            store_path=store_path,
+            output_creds_event=output_creds_event,
+            max_nodes=max_nodes_per_invoke,
+            dirt_only=regather if dirt else None,
+        )
+        fired = {}
+        for batch, (batch_nodes, batch_leaves) in enumerate(batches, start=first_batch):
+            real, dirt_refs = (
+                (None, []) if batch_leaves is None else _split_refs(batch_leaves, dirt_keys)
+            )
+            if (
+                dirt
+                and batch_leaves is None
+                and any(d.startswith(tuple(batch_nodes)) for d in regather)
+            ):
+                logger.warning(
+                    f"stage fleet: node(s) {batch_nodes} overflow the payload cap and fall "
+                    "back to discover — their dirt-only refs (issue #580) are in no run "
+                    "record, so they re-gather on the next manual staged sweep"
+                )
+            _fire(
+                build_stage_event(
+                    store_path,
+                    {**block, "nodes": batch_nodes, "batch": batch},
+                    real,
+                    output_creds_event,
+                    dirt_refs,
+                )
+            )
+            fired[stage_record_name(dispatch, batch)] = {
+                "batch": batch,
+                "nodes": batch_nodes,
+                "unit": block.get("unit"),
+                "window": block.get("window"),
+            }
+        return fired
+
+    def _settle(row, fired, seen, timed_out, prefix="") -> None:
+        """Write one fan-out's barrier outcome into its tuple's row."""
+        missing = [unit for name, unit in sorted(fired.items()) if name not in seen]
+        row[f"{prefix}records_seen"] = len(fired) - len(missing)
+        row["barrier_timed_out"] = bool(row.get("barrier_timed_out")) or (
+            timed_out and bool(missing)
+        )
+        if missing:
+            # Named, so a dead (node, window) is told apart from a late tuple.
+            row["missing_unit_count"] = row.get("missing_unit_count", 0) + len(missing)
+            named = row.setdefault("missing_units", [])
+            named.extend(missing[: max(0, _MISSING_UNITS_NAMED - len(named))])
+
+    # A tuple's close units (the all-time fold) are fired when its window
+    # units are in and awaited with the NEXT fan-out: the next tuple reads
+    # only the window units' stage columns, never an all-time artifact.
+    closing: tuple = ()
     for stage in stage_tuples(shard_order, tuple_width=tuple_width):
         dispatch = int(stage["dispatch"])
         # The ruled computation when a coverage MOC was handed in, the work set
@@ -721,6 +817,14 @@ def run_stage_sweep_fleet(
         )
         if not nodes:
             continue
+        units = stage_units(
+            by_shard,
+            dispatch,
+            windowed=windowed,
+            all_time=all_time,
+            candidates=nodes,
+            dirt_only=regather,
+        )
         block = {
             "role": "stage",
             "run_id": run_id,
@@ -729,55 +833,65 @@ def run_stage_sweep_fleet(
             "tuple_width": tuple_width,
             "records_from": records_from,
         }
+        if pipeline_run_id is not None:
+            block["pipeline_run_id"] = pipeline_run_id
         if lease_ttl_s is not None:
             block["lease_ttl_s"] = int(lease_ttl_s)
-        batches = pack_batches(
-            nodes,
-            by_shard,
-            block=block,
-            store_path=store_path,
-            output_creds_event=output_creds_event,
-            max_nodes=max_nodes_per_invoke,
-            dirt_only=regather,
-        )
-        expected = set()
-        for batch, (batch_nodes, batch_leaves) in enumerate(batches):
-            expected.add(stage_record_name(dispatch, batch))
-            real, dirt = (
-                (None, []) if batch_leaves is None else _split_refs(batch_leaves, dirt_keys)
-            )
-            if batch_leaves is None and any(d.startswith(tuple(batch_nodes)) for d in regather):
-                logger.warning(
-                    f"stage fleet: node(s) {batch_nodes} overflow the payload cap and fall "
-                    "back to discover — their dirt-only refs (issue #580) are in no run "
-                    "record, so they re-gather on the next manual staged sweep"
+        fired: dict = {}
+        if not windowed:
+            fired.update(_fan_out(nodes, by_shard, block, dispatch, 0, dirt=True))
+        else:
+            # One fan-out per window: an event carries the leaf refs of its
+            # own window alone, 1/N of the node's slice.
+            for label in sorted({w for unit in units for w in unit["windows"]}):
+                fired.update(
+                    _fan_out(
+                        [unit["node"] for unit in units if label in unit["windows"]],
+                        {d: {label} for d, ws in by_shard.items() if label in ws},
+                        {**block, "unit": UNIT_WINDOW, "window": label},
+                        dispatch,
+                        len(fired),
+                        dirt=False,
+                    )
                 )
-            _fire(
-                build_stage_event(
-                    store_path,
-                    {**block, "nodes": batch_nodes, "batch": batch},
-                    real,
-                    output_creds_event,
-                    dirt,
-                )
-            )
+        close_nodes = [unit["node"] for unit in units if unit["close"]]
+        if not fired and not close_nodes:
+            continue  # a windowed tuple with no unit: nothing to wait for
         t_stage = time.perf_counter()
-        seen, timed_out = _barrier(expected)
-        summary["stages"].append(
-            {
-                "dispatch_order": dispatch,
-                "orders": list(stage["orders"]),
-                "nodes": len(nodes),
-                "batches": len(batches),
-                "records_seen": len(seen),
-                "barrier_timed_out": timed_out,
-                "barrier_s": time.perf_counter() - t_stage,
-            }
-        )
+        expected = set(fired) | (set(closing[1]) if closing else set())
+        seen, timed_out = _barrier(expected) if expected else (set(), False)
+        row = {
+            "dispatch_order": dispatch,
+            "orders": list(stage["orders"]),
+            "nodes": len(nodes),
+            "batches": len(fired),
+            "barrier_timed_out": False,
+            "barrier_s": time.perf_counter() - t_stage,
+        }
+        _settle(row, fired, seen, timed_out)
+        if closing:
+            _settle(closing[0], closing[1], seen, timed_out, prefix="close_")
+        summary["stages"].append(row)
         logger.info(
-            f"stage fleet: tuple @{dispatch} — {len(nodes)} node(s) in {len(batches)} invoke(s), "
-            f"{len(seen)}/{len(expected)} record(s) in {time.perf_counter() - t_stage:.1f}s"
+            f"stage fleet: tuple @{dispatch} — {len(nodes)} node(s) in {len(fired)} invoke(s), "
+            f"{row['records_seen']}/{len(fired)} record(s) in {row['barrier_s']:.1f}s"
         )
+        closing = ()
+        if close_nodes:
+            closed = _fan_out(
+                close_nodes,
+                by_shard,
+                {**block, "unit": UNIT_CLOSE},
+                dispatch,
+                len(fired),
+                dirt=True,
+            )
+            row["close_batches"] = len(closed)
+            closing = (row, closed)
+    if closing:
+        # The last tuple's close units have no next fan-out to ride with.
+        seen, timed_out = _barrier(set(closing[1]))
+        _settle(closing[0], closing[1], seen, timed_out, prefix="close_")
     if not summary["stages"]:
         # No tuple produced a dispatch node, so no stage record can exist —
         # and the finisher REFUSES a zero-record run by design ("a finisher
@@ -803,6 +917,8 @@ def run_stage_sweep_fleet(
         # short; it rides on the wire so the RUN record says so.
         "barrier_timed_out": stages_timed_out,
     }
+    if pipeline_run_id is not None:
+        finisher_block["pipeline_run_id"] = pipeline_run_id
     if lease_ttl_s is not None:
         # The finisher re-acquires before it releases, so dropping the run's
         # TTL here would move it on the LAST acquire — widening exactly the

@@ -2459,12 +2459,14 @@ class TestByteIdentityOracle:
 
     @pytest.mark.parametrize("width", (1, 3))
     def test_identity_holds_for_a_windowed_store(self, tmp_path, width):
-        # The `window` dimension of the leaf refs, and the `windows` block of
-        # the rollups: every other arm hands both executors ``window=None``
-        # for all four leaves, so the wire's window field was outside the
-        # acceptance. Here each leaf rides twice, once per window, and the
-        # all-time fold sits over the per-window gen-1 tier
-        # (`TestWindowedStageSweep` in test_sweep_stage.py owns that store).
+        # The `window` dimension of the leaf refs: every other arm hands both
+        # executors ``window=None`` for all four leaves, so the wire's window
+        # field was outside the acceptance. Here each leaf rides twice, once
+        # per window, in WHOLE-NODE events (the dispatcher is told nothing
+        # about the store, so each worker runs its node's windows and then its
+        # close); the all-time fold sits over the per-window overviews
+        # (`TestWindowedStageSweep` in test_sweep_stage.py owns that store,
+        # `test_sweep_units.py` the `(node, window)` fan-out).
         from test_sweep_stage import TestWindowedStageSweep
 
         cli, fleet, summary, _ = self._both_arms(

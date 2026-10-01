@@ -76,6 +76,17 @@ def _store(tmp_path, *, windows):
     ]
     if windows:
         stages = [{k: v for k, v in s.items() if not k.startswith("icechunk_")} for s in stages]
+        # the (node, window) unit rows of issue #586 phase 4: one row per
+        # invoke, each with its own units, worker seconds and fold peak
+        units = [(1, 0, 30.0, 256), (1, 0, 20.0, 1024), (0, 1, 5.0, 64)]
+        for row, (n_window, n_close, seconds, peak) in zip(stages, units, strict=True):
+            row.update(
+                window_units=n_window,
+                close_units=n_close,
+                failed=0,
+                duration_s=seconds,
+                fold_peak_cells=peak,
+            )
     (root / "sweep_stats_20260101T000000Z_stages.json").write_text(json.dumps({"stages": stages}))
     # an older sweep record: kept apart, not mixed into the newest one's sums
     older = {"stages": [{"dispatch_order": 0, "written": 99, "icechunk_commits": 99}]}
@@ -115,6 +126,13 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
         for s in base["ladder"]["stages"]
     ] == [(0, 1, 1, 2), (3, 2, 6, 1)]
     assert [s["icechunk_commits"] for s in win["ladder"]["stages"]] == [None, None]
+    # the unit counters sum per dispatch order; the fold peak is a high-water
+    assert [
+        (s["dispatch_order"], s["window_units"], s["close_units"], s["duration_s"])
+        for s in win["ladder"]["stages"]
+    ] == [(0, 0, 1, 5.0), (3, 2, 0, 50.0)]
+    assert [s["fold_peak_cells"] for s in win["ladder"]["stages"]] == [64, 1024]
+    assert [s["fold_peak_cells"] for s in base["ladder"]["stages"]] == [None, None]
     tool.print_table([base, win])
     out = capsys.readouterr().out
     assert "windows per shard" in out
@@ -122,6 +140,11 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     (commits,) = [ln.split() for ln in out.splitlines() if ln.startswith("icechunk commits")]
     assert commits[-2:] == ["3", "-"]
     assert out.count("yearly") == 1 and out.count("none") == 1
+    # per tuple, finest first; a record predating the counters prints ``-``
+    (peak,) = [ln for ln in out.splitlines() if ln.startswith("stage fold peak cells")]
+    assert peak.split()[-6:] == ["-", "/", "-", "1,024", "/", "64"]
+    (units,) = [ln for ln in out.splitlines() if ln.startswith("stage units window / close")]
+    assert units.split()[-6:] == ["-", "/", "-", "2", "/", "1"]
     (total,) = [ln.split() for ln in out.splitlines() if ln.startswith("duration_total_s")]
     assert total[-10:] == ["-", "/", "-", "/", "-", "14.0", "/", "14.0", "/", "14.0"]
 
