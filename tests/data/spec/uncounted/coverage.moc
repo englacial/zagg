@@ -31,10 +31,10 @@
    },
    "encoding": "base64",
    "words": "AO0rSgDZV5SA7StKANpXlIB2LUoA7FqUAHctSgDtWpSAdy1KAO5alA==",
-   "obs": "KQAAAAAAAAAFAAAAAAAAAFkAAAAAAAAAuAAAAAAAAAAbAAAAAAAAAA==",
+   "obs": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
    "count": 5,
-   "obs_total": 346,
-   "uncounted_shards": 0
+   "obs_total": 0,
+   "uncounted_shards": 1
   },
   "cover": "zagg-coverage-toc-cover/1"
  }

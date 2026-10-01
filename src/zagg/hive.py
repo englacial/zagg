@@ -2122,30 +2122,31 @@ def process_and_write_hive(
         # record is debris with everything else — but not the bitmap's
         # posture. The stamp points AT the bitmap (``build_coverage(...,
         # bitmap=...)``), so a stamp without it is a lie and the PUT must
-        # fail closed; nothing points at the record, §10.6 reads its absence
-        # as "read the leaf", and the phase-2 sweep re-materializes it. So it
-        # is fail-OPEN like the D9 granule-id sibling below: a transient 5xx
-        # on a ~1 KB accelerator must not discard a finished shard's read and
-        # aggregate. Absent when the fold saw no clocked observation (an empty
+        # fail closed; nothing points at the record, and §10.6 reads its
+        # absence as "read the leaf". So it is fail-OPEN like the D9
+        # granule-id sibling below: a transient 5xx on a ~1 KB sidecar must
+        # not discard a finished shard's read and aggregate. What a failed PUT
+        # costs is this leaf's COUNTS — nothing else writes the record (§10.6),
+        # so the sweep reads the leaf's coverage only and reports the shard in
+        # the root block's ``uncounted_shards`` until the leaf is next
+        # replaced. Absent when the fold saw no clocked observation (an empty
         # leaf publishes no temporal claim). It goes to ``data_path``, beside
         # the bitmap: on a versioned leaf (spec §1.5) that is the version
-        # subgroup, written here BEFORE the version's stamp — the only moment
-        # a version may gain one, since no producer writes into a stamped
-        # version (§10.6; the sweep never materializes into one).
+        # subgroup, written here BEFORE the version's stamp.
         folded = temporal_acc.finish() if temporal_acc is not None else None
         if folded is not None:
             try:
                 leaf_temporal.write_leaf_temporal(
                     data_path,
                     leaf_temporal.build_leaf_temporal(
-                        *folded, leaf_temporal.temporal_field_names(config), source="worker"
+                        *folded, leaf_temporal.temporal_field_names(config)
                     ),
                     **store_kwargs,
                 )
-            except Exception as exc:  # D9 accelerator: the sweep regenerates it
+            except Exception as exc:  # fail-open: the leaf lands, uncounted
                 logger.warning(
-                    f"leaf temporal record for {data_path} failed to write "
-                    f"({exc}); continuing to the stamp — the sweep reads the leaf (issue #575)"
+                    f"leaf temporal record for {data_path} failed to write ({exc}); continuing "
+                    f"to the stamp — the sweep reads this leaf's coverage only (issue #575)"
                 )
         stamp = stamp_commit(
             box["store"],

@@ -2220,8 +2220,9 @@ Regeneration of those is deferred because it would
 also install the §4.9 `multiscales` mirror that `column/` pins the
 **absence** of, retiring an unrelated pin.
 
-Seven tiny single-shard hive stores plus two metadata-only ones (the
-`pyramid/` declaration and the `multiscales/` companion), all on the same
+Seven tiny single-shard hive stores plus three metadata-only ones (the
+`pyramid/` declaration, the `multiscales/` companion and the `uncounted/`
+root objects), all on the same
 deliberately small geometry — shard order 4, inner-chunk order 5, cell
 order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
 default; `raster_toc/` is the one exception — a `(time, cells)` product is
@@ -2349,8 +2350,8 @@ never sharded, §8/#247):
   `"per-cell"` shape's fold law is the grammar's join over a cell group rather
   than the field's own reducer, so it exists at native resolution only.
 
-  It is also the fixture set's only store with a **root `coverage.moc`**, and
-  so §10's golden: the object was written by the production sweep writer (the
+  It is also the fixture set's only leaf-bearing store with a temporal
+  **root `coverage.moc`**, and so §10's golden: the object was written by the production sweep writer (the
   MOC family's leaf read plus its finisher) and carries the
   `zagg-coverage-toc/1` section — the shard's tier-1 envelope word and the
   tier-2 root **counted cover** (§10.3): two row-aligned `uint64` buffers,
@@ -2364,14 +2365,15 @@ never sharded, §8/#247):
   word it fed the writer, so the writer is pinned rather than self-certified),
   the decoded `words`/`obs` buffers read back — the same exception `column/`'s
   group values are — and `obs_total`, the cell plan's own observation count,
-  which §10.3's count rule says the block's `obs_total` MUST equal. The one
+  which §10.3's count rule says the block's `obs_total` MUST equal at the
+  `uncounted_shards: 0` the block carries. The one
   leaf also carries the **§10.6 record**, `temporal.toc`
   ([#575](https://github.com/englacial/zagg/issues/575)), written by the
   production worker path; `temporal.expected.json`'s `leaf_temporal` block
   records the object name, the required keys, the envelope word (equal to the
   root section's shard word), and the decoded counted cover and cover — each
   derived through §10.3's laws from the generator's own instants, never
-  transcribed from the object. The other
+  transcribed from the object. The other leaf
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
   trees are byte-identical to their pre-§10 selves — which is exactly §10's
@@ -2386,8 +2388,29 @@ never sharded, §8/#247):
   clocked whole buckets past the rest of the plan, so the cover is a
   MULTI-word set with a real hole in it: a reader that quantized every word
   into one bucket would satisfy the parity and containment claims and fail
-  `gap_ns`. The other fixtures carry no `coverage.toc` either, the §10.5
+  `gap_ns`. The other leaf fixtures carry no `coverage.toc` either, the §10.5
   absence pin.
+
+- **`uncounted/`** — the §10.3 **coverage-only** surface
+  ([#575](https://github.com/englacial/zagg/issues/575)): metadata only —
+  the manifest and the two root objects the production sweep writes over
+  `temporal/`'s leaf when that leaf carries **no §10.6 record** (the
+  generator builds the `temporal/` store in a scratch directory, deletes
+  its `temporal.toc`, and runs the same leaf read and finisher; nothing
+  writes the record back). Its `coverage.moc` is the one committed counted
+  cover whose every `obs` is **0** — the same five bucket words `temporal/`
+  counts, occupied and uncounted — under **`uncounted_shards: 1`** and
+  `obs_total: 0`, so a reader that drops zero-count rows, or computes
+  "occupied" as `obs > 0`, or reads `obs_total` as the store's count, fails
+  a §7 fixture. Its `coverage.toc` is the same word set as `temporal/`'s:
+  the cover is the key set, zero counts included. `uncounted.expected.json`
+  records the shard word, the bucket words and the cover — derived from the
+  generator's per-centroid words, each keyed at its representative instant,
+  never read back — the marker, `clocked_obs` (the leaf's real observation
+  count, which `obs_total` is a lower bound on and no object in the fixture
+  carries), and `leaf_content_hash`, the §5 combined digest of the leaf the
+  objects describe, equal to `temporal/`'s: the two fixtures are two
+  readings of one leaf, and the leaf is committed once.
 
 - **`demoted/`** — the §4.3 `demotions` surface
   ([#518](https://github.com/englacial/zagg/issues/518)): the
@@ -2995,7 +3018,7 @@ already carry:
 | tier | key | what | answers |
 |---|---|---|---|
 | 1 | `shards` | one toc word per populated shard — the join over that shard's sibling words | *which* shards hold data during a window |
-| 2 | `counts` | the store-wide counted cover — the exact observation count in every aligned time bucket the store's observations fall in (§10.3) | *how much* data falls in a window |
+| 2 | `counts` | the store-wide counted cover — the observation count in every aligned time bucket the store's observations fall in, exact when every leaf carries its worker's record and a stated lower bound otherwise (§10.3) | *how much* data falls in a window |
 
 Neither tier is new information and neither is truth: like the spatial ranges
 beside them they are a **regenerable accelerator** over the leaf arrays (§8.3,
@@ -3040,7 +3063,8 @@ new section here; keys are never repurposed in place.
     "words": "…",
     "obs": "…",
     "count": 5,
-    "obs_total": 346
+    "obs_total": 346,
+    "uncounted_shards": 0
   }
 }
 ```
@@ -3129,12 +3153,15 @@ still whole.
 > different temporal extents would be better served by per-field maps. If that
 > case earns it, it arrives as an additional key under `temporal` (e.g.
 > `shards_by_field`) in a later revision — `shards` keeps this meaning
-> unchanged. The **count side** of this question is closed (espg ruling of
+> unchanged. The **count side** of this question is closed (espg rulings of
 > 2026-10-01 on [#575](https://github.com/englacial/zagg/issues/575)):
-> §10.3's `counts` weighs an observation **once**, not once per field, so
-> the union map and the counted cover both describe "any data"; a per-field
-> *count* breakdown, if a store ever earns one, would likewise arrive as an
-> additional key and leave `counts` unchanged.
+> §10.3's counts come from the leaf's worker alone, which folds the one
+> clock every declared field shares — an observation is counted **once**
+> however many fields are declared — and a leaf read from its per-field
+> companions contributes coverage and no count, so there is no field to
+> choose a count over. The union map and the counted cover both describe
+> "any data"; a per-field *count* breakdown, if a store ever earns one,
+> would likewise arrive as an additional key and leave `counts` unchanged.
 
 ### 10.3 Tier 2 — the root counted cover
 
@@ -3156,7 +3183,8 @@ have for the cover sibling:
   "words": "…",
   "obs": "…",
   "count": 5,
-  "obs_total": 346
+  "obs_total": 346,
+  "uncounted_shards": 0
 }
 ```
 
@@ -3177,94 +3205,91 @@ have for the cover sibling:
   coalescing is never applied to this buffer: a coalesced range would no
   longer name a bucket a count could belong to.
 - **`obs`** (required) — the observation count in each bucket, row-aligned
-  with `words`. Exact integers, and **possibly 0**: a word marks its bucket
-  *occupied*, and on a multi-field leaf read from its companions a bucket
-  can be occupied by a field other than the one counted (below). A reader
-  MUST accept a zero count; "is there data in this window" reads `words`,
-  "how much" sums `obs`.
+  with `words`. Integers, and **possibly 0**: a word marks its bucket
+  *occupied*, and a leaf that carries no worker record contributes its
+  occupied buckets with nothing counted (*coverage only*, below). A reader
+  MUST accept a zero count and MUST NOT read it as an empty bucket; "is
+  there data in this window" reads `words`, "how much" sums `obs`.
 - **`count`** (required) — the bucket count `k`. A reader MUST refuse a
   block whose buffers disagree with it or with each other (§1.1's row
   alignment, broken).
 - **`obs_total`** (required) — the sum of `obs`, which a reader MUST refuse
   a block for disagreeing with. It is the number of temporal observations
-  counted, **once per observation** however many fields `fields` names
-  (espg ruling of 2026-10-01 on
-  [issue #575](https://github.com/englacial/zagg/issues/575), retiring the
-  once-per-field rule this bullet carried — under which the two producers
-  below disagreed by a factor of the field count; no published store
-  declared more than one temporal field while it stood).
+  counted, **once per observation** however many fields `fields` names:
+  the clocked-observation count of the shards `shards` lists when
+  `uncounted_shards` is 0, a lower bound on it otherwise.
+- **`uncounted_shards`** (required in the root block) — how many of the
+  shards `shards` lists hold at least one leaf that contributed
+  **coverage only** (below): its buckets are keyed in `words` and none of
+  its observations is in `obs`. An integer ≥ 0; a reader MUST refuse a
+  root block that lacks the key or carries anything else.
+  - **0** — every `obs` is the exact number of clocked observations those
+    shards hold in its bucket, and `obs_total` their total.
+  - **greater than 0** — every `obs`, and `obs_total`, is a **lower
+    bound**: that many shards hold observations no producer counted. A
+    bucket at `obs: 0` is occupied by such observations alone; a bucket
+    with a positive count may hold more than it says. The block does not
+    name the shards, so a reader that needs an exact count for a window
+    MUST treat a nonzero marker as "at least this many", never as the
+    count.
 
-**What is counted (normative).** Neither producer counts an observation
-twice, but they do not count the same observations:
+  It describes the walk that built the block, and travels with the block
+  (§10.4 replaces tier 2 whole). A §10.6 record's `counts` block omits it:
+  a record is one leaf's exact count.
 
-- **The leaf's own worker** (a §10.6 record, `source: "worker"`) folds the
-  ONE clock column every declared field shares: each clocked observation
-  the leaf aggregated is one count in the bucket of its own instant,
-  whatever its payload values were.
-- **A producer reading a leaf's committed §8.3 companions** (the raw route:
-  a sweep or refresh backfill, §10.6's `source: "sweep"` / `"refresh"`)
-  counts over **one field, the counting field**: the first of the declared
-  temporal fields, in ascending name order (the order `fields` lists them),
-  that holds at least one companion word **in that leaf**. Each of its
-  centroids is counted with its payload weight. Every other declared field
-  contributes **occupancy only**: its companion words join the §10.2
-  envelope and mark the bucket of each word's representative instant as
-  occupied — a key in `words` with nothing added to `obs` — and its payload
-  is read only to check each cell's companion against its centroid count
-  (§1.1's row alignment, refused on a mismatch as for the counting field),
-  its weights unused. The key set, and so the §10.5 cover derived from it, stays
-  the union across fields that §10.2 and §10.5 require ("any data"), while
-  no observation is weighed twice. The rule is per leaf, so a field the
-  leaf lacks (one added to the store later) or holds no word for is passed
-  over and the next declared field counts.
+**What is counted (normative).** Counts have **one source**: the leaf's own
+worker, which folds the ONE clock column every declared field shares and
+writes the result as the leaf's §10.6 record. Each clocked observation the
+leaf aggregated is one count in the bucket of its own instant, whatever its
+payload values were — a row whose value is non-finite still has a clock —
+and however many fields are declared. A producer composing the root block
+sums those records (the merge law below) and derives no count of its own.
 
-The raw route's count is therefore **one field's** observation count, not
-the leaf's. A payload digest holds only the observations that field
-aggregated — the rows its `where` predicate admits (a stratum digest, §2.1),
-with a finite value (a digest drops non-finite rows; the clock does not) —
-so the raw-route count is a **lower bound** on the worker's
-clocked-observation count for the same leaf, equal only when the counting
-field aggregated every clocked observation. An observation the counting
-field did not aggregate is uncounted (its bucket is still occupied when
-another field aggregated it). On a store
-whose temporal fields partition the observations the bound is far from
-tight: the shipped `atl03_tdigest_strata_healpix.yaml` declares two
-complementary `where` strata over one source, `h_tdigest_signal` and
-`h_tdigest_noise`, and name order makes `h_tdigest_noise` the counting
-field, so a backfilled leaf counts its noise photons only and every signal
-photon lands as zero-count occupancy. A root `obs_total` summed over a store
-that mixes worker-recorded and backfilled leaves is accordingly a sum of
-worker counts (every clocked observation of those leaves) and one-field
-counts (each backfilled leaf's counting-field observations) — a lower bound
-on the store's clocked observations, not that count.
+**Coverage only (normative).** A leaf with no usable record (§10.6 — written
+before the record existed, or whose worker failed to write it, or whose
+record a reader bypasses) is read from its committed §8.3 companions
+instead, and contributes **its coverage and no count** (espg ruling of
+2026-10-01 on [issue #575](https://github.com/englacial/zagg/issues/575),
+retiring the weight-derived count this section carried for such leaves):
 
-**A flux counting field.** The raw route counts the counting field's
-payload **weight**, which is an observation count only where that field's
-weights are counts (§2.0's `"counts"`, the default). The raw route reads no
-`weights` declaration, and name order alone picks the counting field, so it
-can be a `weights: "flux"` field (§2.0 — e.g. GEDI's `rx_flux`) even beside a
-counts field. A raw-route `obs` over a flux counting field is that weight
-column summed per bucket and rounded to an integer — calibrated flux, not
-observations: it is not comparable with a worker record's count for the
-same leaf, a bucket whose flux sums below 0.5 is occupied at `obs: 0`, and a
-root `obs_total` over a part-backfilled flux store adds the two units
-together.
+- every declared field's companion words join the §10.2 envelope, and the
+  bucket of each word's representative instant (below) is keyed in `words`
+  — the union across fields that §10.2 and §10.5 require ("any data");
+- **nothing is added to `obs`**, for any field. A producer MUST NOT derive
+  an observation count from a payload. A digest's weights are one field's:
+  the rows its `where` predicate admits (a stratum digest, §2.1), with a
+  finite value (a digest drops non-finite rows; the clock does not), and
+  calibrated flux rather than counts under `weights: "flux"` (§2.0). No
+  choice of field makes them the leaf's clocked observations — the shipped
+  `atl03_tdigest_strata_healpix.yaml` declares two complementary `where`
+  strata, so either field alone is one stratum — so no count is published
+  for such a leaf, rather than a one-field figure beside the workers'
+  exact ones;
+- each field's payload is still read, for §1.1's row alignment only: a cell
+  whose companion word count disagrees with its centroid count is refused,
+  and the shard omitted under §10.2's whole-word rule. A field the leaf
+  lacks (one added to the store later) or holds no word for contributes
+  nothing;
+- the leaf's shard is counted in `uncounted_shards`.
 
-**How an observation lands in a bucket.** Its instant is its §8.3 word's
+**How a word lands in a bucket.** Its instant is its §8.3 word's
 *representative instant*: the instant itself for a timestamp word, the
-envelope's midpoint for a range word. Under the worker-written leaf record
-(§10.6) every observation enters as a timestamp, so the buckets are exact.
-Under a sweep backfill from a leaf's per-centroid companions (a leaf written
-before the record existed — §10.6's `source: "sweep"`), a merged centroid's
-whole weight lands in the bucket of its envelope midpoint; that is the one
-approximation this tier carries, and it is confined to such leaves.
+envelope's midpoint for a range word. A worker record (§10.6) folds
+per-observation words, every one a timestamp, so its buckets are exact as
+its counts are. A coverage-only leaf folds per-centroid companions: a
+weight-1 centroid's word is its observation's own instant, and a merged
+centroid's is a range, keyed at the ONE bucket of its envelope midpoint.
+That is the one approximation this tier carries, it is confined to such
+leaves, and §10.5's parity paragraph states what it costs the cover.
 
 **Laws (normative).** All exact, none a merge law:
 
 - **Merge** of two covers on one grid — the window leaves of one shard, the
   partitions of a sweep, the children of a ladder node: the per-word **sum**
   over the union of keys. Same order ⇒ same grid ⇒ no rounding. Covers at
-  two orders merge by first coarsening the finer to the coarser.
+  two orders merge by first coarsening the finer to the coarser. A
+  coverage-only leaf merges like any other: its keys join the union and
+  its zeros add nothing.
 - **Coarsen** to an order `o' < o`: each word maps to its order-`o'` ancestor
   bucket, and counts sum per ancestor — exact at the coarser rung. A
   producer applies it only to fit `cap`, by whole orders, recording the
@@ -3317,11 +3342,13 @@ that seam as follows:
 - **Tier 2 is never summed at this seam.** Its values are counts, and
   adding two covers over overlapping shard sets would double-count them
   (§10.3's merge law is for DISJOINT contributors — window leaves,
-  partitions, children). It is **replaced**, and only by a producer whose
-  own map covered every shard the merged map lists; a producer that covered
-  only part of the store publishes no counts and leaves the standing block
-  alone, and a merge that can find no whole-covering block on either side
-  drops it rather than publish a partial one.
+  partitions, children). It is **replaced** — the whole block, its
+  `uncounted_shards` with it, since the marker describes the walk that
+  counted — and only by a producer whose own map covered every shard the
+  merged map lists; a producer that covered only part of the store
+  publishes no counts and leaves the standing block alone, and a merge that
+  can find no whole-covering block on either side drops it rather than
+  publish a partial one.
 - **A producer with no temporal contribution at all leaves an existing section
   untouched** — it is not evidence of absence, only of a walk that did not
   look. Conversely a producer that overwrites the carrier wholesale (an
@@ -3354,7 +3381,10 @@ that seam as follows:
 Conformance for an external reader is §7's `temporal/` fixture: its root
 `coverage.moc` carries this section, and the fixture's `temporal.expected.json`
 records the shard word and the decoded counted cover so the containment and
-count claims above are pinned on committed bytes.
+count claims above are pinned on committed bytes — exact counts, under
+`uncounted_shards: 0`. §7's `uncounted/` is the same leaf read without its
+record: the same buckets at `obs: 0` under `uncounted_shards: 1`, which is
+§10.3's zero-count grammar and lower-bound marker as bytes.
 
 ### 10.5 The word-set cover sibling — `zagg-coverage-toc-cover/1`
 
@@ -3526,11 +3556,17 @@ the quantized tier-1 envelope — with **equality** whenever every leaf behind
 the shard contributed per-observation words (a worker-written §10.6 record,
 or a raw read of a leaf whose centroids are all weight-1): the cover and the
 quantized join are then one law over one set, which is the commutation
-above. A sweep backfill from per-centroid companions counts a merged
-centroid at its envelope's midpoint (§10.3), so such a shard's cover may sit
-strictly inside its tier-1 envelope. Either way it is the cross-object
-consistency check a reader MAY apply cheaply; zagg's suite asserts equality
-on every shard the fixture writes. (Plain equality with the §10.2 word
+above. A leaf with no record is read from its per-centroid companions, and
+a merged centroid is keyed at the one bucket of its envelope's midpoint
+(§10.3), so a shard holding such a leaf may have a cover that sits strictly
+inside its tier-1 envelope — and for that shard the widening-only law above
+is not guaranteed either: an instant a merged centroid absorbed can fall in
+a bucket the cover does not list, though never outside the shard's §10.2
+word. The root block's `uncounted_shards` (§10.3) is the count of shards
+this can affect; at 0 the three consequences above hold on every shard.
+Either way the relation is the cross-object consistency check a reader MAY
+apply cheaply; zagg's suite asserts equality on every shard the fixture
+writes. (Plain equality with the §10.2 word
 itself does NOT hold: that word lives on the grammar's native 2^31/2^32
 grids, the cover on the bucket grid.)
 
@@ -3592,7 +3628,8 @@ pinned.
 ### 10.6 The leaf temporal record — `zagg-leaf-temporal/1`
 
 **Status: contract** ([issue #575](https://github.com/englacial/zagg/issues/575);
-espg ruling of 2026-09-17 on the record's channels).
+espg rulings of 2026-09-17 on the record's channels and of 2026-10-01 on its
+one producer).
 
 §10.2, §10.3 and §10.5 describe the root section's *outputs*; this section
 describes where their per-leaf *inputs* are kept. All three were originally
@@ -3614,36 +3651,49 @@ ignores). A reader of the
 record resolves `current` first, exactly as a reader of the arrays or the
 bitmap does.
 
-It has the bitmap's whole posture. It is a **regenerable accelerator** (D9)
-over the leaf's own arrays, never truth; it is written **before** the commit
-stamp, so an unstamped prefix's record is debris with everything else (D4)
-and the stamp stays the leaf's final write; and it is **additive** — a leaf
-written before this revision simply lacks it, a reader treats absence as
-"read the leaf", and a sweep that had to take the raw route MAY write the
-record it computed into a **legacy** leaf so the store converges (a
-versioned leaf is the exception, below). Like the bitmap it is a foreign
-key inside the otherwise-vanilla leaf: zarr data reads are unaffected, and
-member enumeration warn-skips it. It is not a data object in §1.5's
-write-once sense — it is a leaf-internal accelerator sealed by the same
-stamp — and the §11 Icechunk companion never references it: the ref plan
-enumerates the template's named arrays and reads their chunk keys only,
-so neither this record nor `coverage.moc` is referenced or checksummed, in
-a version or at a legacy root.
+It has the bitmap's placement and most of its posture. It is never truth;
+it is written **before** the commit stamp, so an unstamped prefix's record
+is debris with everything else (D4) and the stamp stays the leaf's final
+write; and it is **additive** — a leaf written before this revision simply
+lacks it, and a reader treats absence as "read the leaf". Its envelope word
+is a **regenerable accelerator** (D9) over the leaf's own arrays, exactly,
+and its cover up to §10.5's merged-centroid approximation. Its **counts
+are not regenerable**: the leaf stores no per-observation clock,
+only per-centroid companions, so the counts exist nowhere but here, and
+reading the leaf in the record's absence yields the leaf's coverage and no
+count (§10.3). Like the bitmap it is a foreign key inside the
+otherwise-vanilla leaf: zarr data reads are unaffected, and member
+enumeration warn-skips it. It is not a data object in §1.5's write-once
+sense — it is a leaf-internal sidecar sealed by the same stamp — and the
+§11 Icechunk companion never references it: the ref plan enumerates the
+template's named arrays and reads their chunk keys only, so neither this
+record nor `coverage.moc` is referenced or checksummed, in a version or at
+a legacy root.
 
-**A stamped version is never written into.** §1.5 fixes a version
-subgroup's objects once its stamp lands, and this record is one of them: on
-a versioned leaf it is written by the version's own worker **before the
-version stamp** (the slot above) or not at all. A producer MUST NOT add a
-record to a stamped version and MUST NOT replace one it finds there — not a
-missing record, not a stale one (the `fields` gate below), not debris. Such
-a leaf simply reads as absence does everywhere: the sweep takes the raw
-route for it on every pass, materializing nothing, until the leaf's next
-replacement writes a fresh version whose worker writes a fresh record. The
-materializing backfill is therefore a **legacy-leaf** operation — which is
-where it is needed, since every leaf written before this record existed is
-a legacy leaf, and a versioned leaf lacks a usable record only when its
-worker's fail-open PUT failed or the manifest's declared field set has
-moved since. The rest follows from the placement: the #388 lifecycle touch
+**Written by the leaf's worker, and by nothing else.** The record is written
+once, by the worker that wrote the leaf, before that leaf's stamp (a
+versioned leaf's: before the **version** stamp) — or not at all. No other
+producer creates one or replaces one: a sweep or refresh that had to read a
+leaf raw MUST NOT write a record for it, and MUST NOT replace a record it
+finds — not a missing one, not a stale one (the `fields` gate below), not
+debris, not one at an unknown revision (espg ruling of 2026-10-01 on
+[issue #575](https://github.com/englacial/zagg/issues/575): no backfill).
+Two reasons, either sufficient:
+
+- **Counts have one source** (§10.3). A record composed from a leaf's
+  companions would carry zero counts, and the next reader would take it
+  for the worker's — the store's counts would be incomplete with nothing
+  left to say so.
+- **A stamped version is never written into.** §1.5 fixes a version
+  subgroup's objects once its stamp lands, and this record is one of them.
+
+A leaf without a usable record therefore reads as absence does everywhere:
+the raw route on every pass, coverage only, its shard counted in the root
+block's `uncounted_shards` (§10.3), until the leaf's next replacement, whose
+worker writes a fresh record. A store written before this revision stays
+record-less — its root section carries tier 1 and a counts block of
+zero-count buckets — and is brought up to date by rewriting its leaves, not
+by a sweep. The rest follows from the placement: the #388 lifecycle touch
 never reaches the record of a versioned leaf (it touches no version object,
 §1.5; on a legacy leaf the record rides the leaf tree like the bitmap), and
 the §11.4 collector reclaims it with its version, which it deletes whole.
@@ -3653,8 +3703,10 @@ points AT the bitmap (§ the stamp's `coverage`), so a stamp published
 without one is a false claim and that write must fail the leaf. Nothing
 points at this record: absence is a defined reading, so a producer that
 fails to write it SHOULD log and **stamp the leaf anyway**, leaving the
-record absent for a later sweep, rather than discard a leaf whose arrays all
-landed. It is an accelerator, and losing one costs a read, not correctness.
+record absent, rather than discard a leaf whose arrays all landed. What
+that costs is the leaf's counts, not correctness: its coverage is still
+read from its arrays, and the root block reports the shard in
+`uncounted_shards` instead of publishing a total that silently omits it.
 
 **Absence is the rule for non-temporal stores.** A leaf is written with a
 record **iff** its config declares a §8.3 `"per-centroid"` field and the
@@ -3698,69 +3750,44 @@ which is that rule pinned as bytes.
 - **`spec`** (required) — `"zagg-leaf-temporal/1"`, the object's OWN marker
   (it gates itself, as the §10.5 sibling does). A reader MUST strict-check
   it; an unknown revision reads as **absent** — read the leaf — never as a
-  refusal, and a producer that meets one MUST preserve it rather than
-  overwrite it (§10.4's succession rule, per leaf). An unmarked or
-  unparsable body is debris a producer MAY replace.
-- **`source`** (required) — `"worker"` when the leaf's own worker wrote the
-  record from per-observation words at commit; `"sweep"` when a sweep
-  materialized it from the leaf's committed §8.3 companions (the backfill
-  route for leaves written before this revision), `"refresh"` when the
-  explicit whole-store refresh walk did — the walk that wrote it, so an
-  operator can tell which pass backfilled a leaf. The vocabulary is open.
+  refusal. No producer overwrites it, nor any other body it finds in the
+  record's place — an unmarked or unparsable one included (above).
+- **`source`** (required) — `"worker"`: the leaf's own worker, from
+  per-observation words at commit, which is this revision's only producer
+  of the record (above). The key stays required and its vocabulary open, as
+  §10.1's is — it is provenance, and a later producer of exact counts would
+  name itself here — so a reader MUST NOT gate on its value.
 - **`generated_at`** (required) — ISO-8601 UTC, the object's own clock.
-- **`fields`** (required) — the sorted payload field names whose clock the
-  record folds: for a worker record every `"per-centroid"` field the config
-  declares, for a sweep record the fields the manifest declared when it was
-  written, ones the leaf itself lacks included (they contribute nothing, and
-  recording only the fields actually read would make the gate below
-  re-derive that leaf on every pass). Provenance, with §10.1 `fields`
+- **`fields`** (required) — the sorted payload field names the writing
+  config declared `"per-centroid"`. Provenance, with §10.1 `fields`
   semantics — and a staleness gate: a reader MAY treat a record whose
   `fields` omit or exceed the set the manifest declares as absent (the
   declaration moved under it — a field postdates the record, or has since
-  been dropped) and re-derive over the manifest's declared set; zagg's sweep
-  does, and materializes the re-derived record in its place (in a legacy
-  leaf; a version is never written into, above). Equality is what keeps
-  every record a function of the *current* declaration: a raw-route
-  record's counting field and its occupancy union (§10.3) are chosen over
-  the declared set, so a declaration that moved can move both, and a record
-  folded over a field the manifest no longer declares would claim coverage
-  a record-less leaf in the same store does not.
+  been dropped) and read the leaf over the manifest's declared set instead;
+  zagg's sweep does, so that every contribution to one section is folded
+  over one declared set. The record is left in place (above), and that
+  leaf contributes coverage only until it is rewritten.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
-  MUST equal the counts block's `obs_total`, **once per observation** from
-  either producer (§10.3's count rule): for a worker record the number of
-  clocked observations the leaf aggregated (the worker folds one shared
-  clock column, so a second declared field adds nothing), for a sweep or
-  refresh record the total payload weight of the leaf's **counting field**
-  (§10.3) — the first declared field, in name order, holding a companion
-  word in the leaf. That field's digest holds only the observations it
-  aggregated — the rows its `where` predicate admits, with a finite value —
-  so a raw-route `n_obs` is ONE field's observation count: a lower bound on
-  the worker's for the same leaf, equal only when the counting field
-  aggregated every clocked observation, and far below it on a store whose
-  temporal fields partition the observations (§10.3's strata example). It
-  is the counting field's payload WEIGHT, an observation count only under
-  `weights: "counts"` (§2.0): for a `weights: "flux"` counting field it is
-  the flux summed and rounded per bucket — not observations, not
-  comparable with a worker record's `n_obs` (§10.3). The number of declared
-  fields does not enter either.
+  MUST equal the counts block's `obs_total`: the number of clocked
+  observations the leaf aggregated, **once each** (§10.3's count rule). The
+  worker folds one shared clock column, so a second declared field adds
+  nothing, and a row whose payload value is non-finite still counts.
 - **`word`** (required) — the §10.2 envelope word for THIS leaf, as a
   decimal string: the grammar's join (`toc_reduce`) over every observation
   word the leaf holds. Because the join is a semilattice, it is identical
   whether folded over the per-observation words (the worker) or over the
-  leaf's per-centroid companions (the sweep), and a shard's §10.2 word is the
-  join over its window leaves' records.
+  leaf's per-centroid companions (a raw read), and a shard's §10.2 word is
+  the join over its window leaves' words.
 - **`temporal_order`** / **`cap`** (required) — the §10.5 pin and cap the
   record was written against, with §10.5's meanings verbatim (24 and 512
   under this revision). One rung serves both blocks: `counts` is counted at
   it, and `cover` is its key set.
 - **`counts`** (required) — the leaf's counted cover, in §10.3's block
-  grammar verbatim: `temporal_order` (the record's pin, lower only when
-  coarsened under `cap`), `cap`, the two row-aligned buffers, `count` and
-  `obs_total`, with §10.3's MUST-checks. Counted from the per-observation
-  words (worker: each instant its own bucket, exact) or from the
-  per-centroid companions (sweep: the counting field's centroids with
-  their weights as counts, a merged centroid at its envelope midpoint; the
-  other fields' words as zero-count occupancy — §10.3).
+  grammar: `temporal_order` (the record's pin, lower only when coarsened
+  under `cap`), `cap`, the two row-aligned buffers, `count` and
+  `obs_total`, with §10.3's MUST-checks — and without `uncounted_shards`,
+  which is the root block's alone. Counted from the per-observation words:
+  each instant in its own bucket, exact.
 - **`cover`** (required) — the leaf's §10.5 word set, **derived from the
   `counts` this record carries** — after their cap, not before it — by
   §10.3's law (its keys, `toc_normalize`d, at its order), and carried so a
@@ -3779,22 +3806,21 @@ which is that rule pinned as bytes.
 
 **Per-leaf containment.** §10.5's parity relation holds on every record at
 the cover block's effective order `o`: `toc_reduce(cover)` lies inside
-`toc_reduce(quantize({word}, o))`, with **equality** for a worker record
-(every instant is an observation word, so the cover and the quantized join
-are one law over one set) and possibly strict containment for a sweep
-record (a merged centroid counted at its midpoint may leave the edges of
-its own envelope uncovered). A reader MAY check it and MUST treat a record
-that fails it as debris.
+`toc_reduce(quantize({word}, o))`, with **equality** for a worker record:
+every instant is an observation word, so the cover and the quantized join
+are one law over one set. A reader MAY check it and MUST treat a record
+that fails it as debris — absent, read the leaf.
 
 **Composition into the root.** A record is one leaf's contribution to the
 §10 section and its §10.5 sibling, composing exactly as a raw-read leaf
 does: a shard's `shards` word is the join over its window leaves' `word`s;
 the root `counts` and each shard's cover block come from the per-word **sum**
 of the leaves' `counts` (§10.3's merge law), capped, the cover then derived.
-A producer that reads records MAY mix them with raw-read leaves in one walk
-— the two feeds meet the same laws — and the whole-word rule of §10.2
-applies unchanged: a shard any of whose leaves failed to read (record or
-raw) is omitted, never published partial.
+A producer that reads records mixes them with raw-read leaves in one walk
+— the two feeds meet the same laws, a raw-read leaf adding its word, its
+zero-count buckets, and its shard to the root block's `uncounted_shards` —
+and the whole-word rule of §10.2 applies unchanged: a shard any of whose
+leaves failed to read (record or raw) is omitted, never published partial.
 
 Conformance is §7's `temporal/` fixture: its one leaf carries the record,
 written by the production worker path, and `temporal.expected.json`'s
@@ -3803,7 +3829,8 @@ envelope word (derived from the generator's per-observation instants, and
 equal to the root section's shard word), the decoded counted cover and the
 decoded cover — each derived through §10.3's laws from those same instants,
 never transcribed — so the record is pinned against the generator's inputs,
-not against itself.
+not against itself. `uncounted/` is the absence side: the root objects over
+that same leaf with the record gone, which no producer wrote back.
 
 ---
 

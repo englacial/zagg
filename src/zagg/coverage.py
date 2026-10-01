@@ -232,9 +232,7 @@ def _is_derived_zarr(zarr_root: str, store_kwargs: dict) -> bool:
     return isinstance(attrs, dict) and ROLE_ATTR in attrs
 
 
-def refresh_root_coverage(
-    store_root: str, *, materialize: bool = True, **store_kwargs
-) -> dict | None:
+def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     """Rebuild the root MOC from a full tree walk — the explicit escape hatch.
 
     THE SANCTIONED ROBUSTNESS PATH, not the hot path: D10 forbids walking
@@ -263,13 +261,10 @@ def refresh_root_coverage(
     shard and never the refresh; and a walk that lost any shard COMPOSES its
     rebuild with the standing section (§10.4) instead of replacing it, so the
     escape hatch can never be the thing that deletes the section. That walk
-    also WRITES: every leaf it had to read raw gets the §10.6 record
-    materialized into its prefix (``source: "refresh"``, issue #575), so the
-    repair is a read plus N leaf PUTs, not a read plus one root write. It is
-    fail-open too — an unwritable leaf logs a warning and still contributes —
-    but on a store the caller can only READ, that is one failed PUT per leaf:
-    pass ``materialize=False`` to keep the escape hatch strictly read-only
-    (the sweep keeps the backfill duty). A successful
+    reads each leaf's §10.6 record where its worker wrote one and the leaf's
+    raw companions otherwise — coverage only, counted into the rebuilt
+    block's ``uncounted_shards`` (§10.3) — and writes NOTHING into a leaf
+    (issue #575): the repair is a read plus the root objects. A successful
     refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
@@ -317,6 +312,7 @@ def refresh_root_coverage(
         toc_fields = {}
     contributions: dict[str, list] = {}
     toc_failed: set[str] = set()
+    uncounted: set[str] = set()
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
     # Decimals accumulate through the walk and parse once at the end (issue
@@ -397,19 +393,9 @@ def refresh_root_coverage(
                     try:
                         # The leaf's ROOT stamp rides along: a versioned
                         # leaf's record and arrays sit under the version it
-                        # names (spec §1.5), and no record is ever
-                        # materialized into one (§10.6).
-                        got, _route = leaf_contribution(
-                            f"{root}/{rel}",
-                            cell_order,
-                            toc_fields,
-                            stamp=stamp,
-                            materialize=materialize,
-                            # This walk's own provenance (§10.6): a record
-                            # the refresh backfilled must not claim the
-                            # sweep wrote it, like every other object here.
-                            source="refresh",
-                            **store_kwargs,
+                        # names (spec §1.5). Read-only (§10.6).
+                        got, route = leaf_contribution(
+                            f"{root}/{rel}", cell_order, toc_fields, stamp=stamp, **store_kwargs
                         )
                     except Exception as e:  # fail-open: the section is a cache
                         # Shard-scoped, not leaf-scoped: §10.2's word must
@@ -426,6 +412,8 @@ def refresh_root_coverage(
                         got = None
                     if got is not None:
                         contributions.setdefault(decimal, []).append(got)
+                        if route == "raw":
+                            uncounted.add(decimal)
                 # D15: windowed stamps carry the leaf's actual time range;
                 # the rebuilt root summary re-derives the union from this
                 # walk's stamps (truth), superseding any cached value.
@@ -448,7 +436,9 @@ def refresh_root_coverage(
         # discard; a foreign-revision object survives under succession).
         delete_cover(store_root, **store_kwargs)
         return None
-    section = build_temporal_section(contributions, toc_fields, source="refresh")
+    section = build_temporal_section(
+        contributions, toc_fields, source="refresh", uncounted=uncounted
+    )
     cover_sec = build_cover_section(contributions, toc_fields, order, source="refresh")
     if toc_failed:
         # Fail-open per leaf is fail-DESTRUCTIVE in aggregate. This walk PUTs

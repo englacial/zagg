@@ -110,6 +110,14 @@ conformance tests assert decoded values, never object bytes.
   leaving them without either root object IS §10's absence rule, and keeps
   those trees byte-identical.
 
+- ``uncounted/`` — the §10.3 COVERAGE-ONLY surface (issue #575): METADATA
+  ONLY — the manifest and the two root objects the production sweep writes
+  over ``temporal/``'s leaf when that leaf carries NO §10.6 record. Its
+  counted-cover block is the only committed one whose ``obs`` are 0
+  (occupied buckets, nothing counted) under ``uncounted_shards: 1``, the
+  marker that makes ``obs_total`` a lower bound. The leaf is not committed
+  twice: its arrays are ``temporal/``'s, pinned by their §5 combined digest.
+
 - ``demoted/`` — the §4.3 ``demotions`` surface (issue #518):
   ``kitchen_sink/``'s store swept under a hand-installed ``/1`` cascade
   manifest whose composition ``of`` divisor is MIS-DECLARED ``class:
@@ -1611,10 +1619,12 @@ def build_temporal(out: Path) -> None:
     # record-first route, issue #575), so on this one-leaf store it IS the
     # record's counted cover — derived from the instants above, never read
     # back — and its total is the cell plan's.
-    from zagg.coverage_toc import coverage_toc_counts
+    from zagg.coverage_toc import coverage_toc_counts, coverage_toc_uncounted
 
     root_counts = coverage_toc_counts(envelope)
     assert root_counts is not None and root_counts.order == TEMPORAL_COVER_ORDER
+    # Every leaf came in with its worker's record, so the block is exact.
+    assert coverage_toc_uncounted(envelope) == 0
     assert np.array_equal(root_counts.words, expect_counts.words), root_counts
     assert np.array_equal(root_counts.obs, expect_counts.obs), root_counts
     assert int(root_counts.obs.sum()) == sum(c["count"] for c in expected_cells)
@@ -1638,6 +1648,8 @@ def build_temporal(out: Path) -> None:
             "spec": "zagg-coverage-toc/1",
             "fields": ["h_tdigest"],
             "shards": {SHARD_KEY: str(shard_word)},
+            # §10.3's exactness marker: 0, so `obs_total` IS the count.
+            "uncounted_shards": 0,
             "obs_total": sum(c["count"] for c in expected_cells),
             "counts": {
                 "temporal_order": TEMPORAL_COVER_ORDER,
@@ -1716,6 +1728,118 @@ def build_temporal(out: Path) -> None:
     )
 
 
+def build_uncounted(out: Path) -> None:
+    """The §10.3 ``uncounted/`` fixture: the root objects over a record-less leaf.
+
+    METADATA ONLY, like ``multiscales/``: the manifest and the two root
+    objects the production sweep writes over ``temporal/``'s leaf when that
+    leaf carries NO §10.6 record. The ``temporal/`` store is built into a
+    scratch directory, the worker's ``temporal.toc`` is deleted — the bytes
+    of a leaf written before the record existed, or of one whose fail-open
+    record PUT failed — and the sweep's own leaf read and finisher run over
+    it. Nothing writes the record back (§10.6), so the leaf contributes its
+    coverage and no count: every ``obs`` is 0 under ``uncounted_shards: 1``.
+
+    The expectations are derived from the generator's per-centroid words
+    (``temporal/``'s recorded ``h_tdigest_times``), each keyed at the bucket
+    of its representative instant — never read back from the object.
+    """
+    import tempfile
+
+    from mortie import toc_reduce
+
+    from zagg import hive
+    from zagg.coverage_toc import (
+        COVER_NAME,
+        COVER_SPEC,
+        TEMPORAL_COVER_ORDER,
+        cover_words,
+        coverage_toc,
+        coverage_toc_counts,
+        coverage_toc_uncounted,
+        read_cover,
+    )
+    from zagg.leaf_temporal import LEAF_TEMPORAL_NAME, count_words, cover_from_counts
+    from zagg.sweep import MocFamily
+
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = Path(tmp) / "temporal"
+        build_temporal(scratch)
+        source = json.loads((Path(tmp) / "temporal.expected.json").read_text())
+        leaf = scratch / source["leaf"]
+        (leaf / LEAF_TEMPORAL_NAME).unlink()
+        for name in (hive.ROOT_COVERAGE_NAME, COVER_NAME):
+            (scratch / name).unlink()
+        family = MocFamily()
+        contribution, _written_at = family.read_leaf(
+            str(scratch), SHARD_KEY, None, "morton-hive/1", {}
+        )
+        family.finish(str(scratch), [{"payload": contribution}], 4, {})
+        assert family.summary() == {"temporal_routes": {"records": 0, "raw": 1}}
+        assert not (leaf / LEAF_TEMPORAL_NAME).exists()  # the sweep writes no record
+        envelope = hive.read_root_coverage(str(scratch))
+        cover_obj = read_cover(str(scratch))
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir(parents=True)
+        for name in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME, COVER_NAME):
+            shutil.copy(scratch / name, out / name)
+
+    words = np.array(
+        [int(w) for cell in source["cells"] for w in cell["h_tdigest_times"]], dtype=np.uint64
+    )
+    shard_word = int(toc_reduce(words))
+    assert coverage_toc(envelope) == {SHARD_KEY: shard_word}
+    # Occupied buckets, nothing counted: one key per representative instant.
+    expect = count_words(words, np.zeros(len(words)))
+    counts = coverage_toc_counts(envelope)
+    assert coverage_toc_uncounted(envelope) == 1
+    assert counts.order == TEMPORAL_COVER_ORDER
+    assert np.array_equal(counts.words, expect.words) and not counts.obs.any(), counts
+    expect_cover, _order = cover_from_counts(expect)
+    assert cover_obj["spec"] == COVER_SPEC
+    assert np.array_equal(cover_words(cover_obj)[SHARD_KEY], expect_cover), cover_obj
+    clocked = sum(cell["count"] for cell in source["cells"])
+    assert clocked > 0
+
+    expected = {
+        "shard": SHARD_KEY,
+        "shard_order": 4,
+        # The leaf these root objects describe: `temporal/`'s, without its
+        # `temporal.toc`. Pinned by the §5 combined digest of its arrays, so
+        # the two fixtures are provably two readings of ONE leaf.
+        "source_fixture": "temporal",
+        "leaf_content_hash": source["content_hashes"]["combined"],
+        "root_coverage": {
+            "object": "coverage.moc",
+            "spec": "zagg-coverage-toc/1",
+            "fields": ["h_tdigest"],
+            "shards": {SHARD_KEY: str(shard_word)},
+            # §10.3's exactness marker: the one shard came in uncounted, so
+            # `obs_total` is a lower bound — on `clocked_obs`, the leaf's
+            # real observation count, which no object in this store carries.
+            "uncounted_shards": 1,
+            "obs_total": 0,
+            "clocked_obs": clocked,
+            "counts": {
+                "temporal_order": TEMPORAL_COVER_ORDER,
+                "words": [str(int(w)) for w in expect.words],
+                "obs": [0] * len(expect.words),
+            },
+        },
+        "cover": {
+            "object": "coverage.toc",
+            "spec": COVER_SPEC,
+            "count": len(expect_cover),
+            "words": [str(int(w)) for w in expect_cover],
+        },
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(
+        f"{out.name}: root objects over a record-less leaf, {len(expect.words)} zero-count buckets"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1745,6 +1869,7 @@ def main() -> None:
         ),
         "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
         "temporal": lambda: build_temporal(args.out / "temporal"),
+        "uncounted": lambda: build_uncounted(args.out / "uncounted"),
     }
     unknown = set(args.only or ()) - set(builders)
     if unknown:

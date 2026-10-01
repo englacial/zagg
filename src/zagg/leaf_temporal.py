@@ -12,12 +12,15 @@ sweep composes the root section from these records instead of reading each
 leaf's raw companion column back, which at CA scale (a million-row ragged
 array per field per leaf) could not finish inside one invoke at all.
 
-The record is the twin of the leaf's ``coverage.moc`` occupancy sidecar: a
-regenerable accelerator (D9) written BEFORE the commit stamp so the stamp
-stays the leaf's final write (D4), additive (an old store simply lacks it;
-the sweep's raw route materializes it once), and never truth — the truth is
-the leaf's own arrays. The normative grammar is ``docs/specification.md``
-§10.6; the counted cover's laws are §10.3.
+The record is the twin of the leaf's ``coverage.moc`` occupancy sidecar:
+written BEFORE the commit stamp so the stamp stays the leaf's final write
+(D4), and additive (an old store simply lacks it). It is written by the
+leaf's worker and by NOTHING else (espg ruling of 2026-10-01 on issue #575:
+no backfill): its word and cover are an accelerator over the leaf's own
+arrays, but its counts are the one thing those arrays do not hold — the
+per-observation clock is not stored — so no later walk can rebuild them. The
+normative grammar is ``docs/specification.md`` §10.6; the counted cover's
+laws are §10.3.
 
 **The counted cover** (:class:`CountedCover`) is ``{bucket word: n_obs}``
 over the leaf's observation instants quantized at the one pinned order,
@@ -34,21 +37,18 @@ about a second), so the word count does not grow with finer order until
 buckets approach pass duration: the pin costs nothing over a coarser one
 and answers "within the hour?" from the record alone.
 
-Two producers fill :class:`LeafTemporalAccumulator`, recorded in
-``source``: **the worker** (``"worker"``) folds per-OBSERVATION words, one
-exact timestamp each; **the sweep's backfill** (``"sweep"``) folds a leaf's
-committed per-centroid companions (:func:`zagg.coverage_toc.read_leaf_temporal`)
-— ONE field's centroids with their weights as counts (the counting field,
-spec §10.3: the first declared field holding a word in the leaf), the other
-fields' words as zero-count occupancy; a weight-1 centroid is an exact
-instant, a merged one is counted at its envelope's midpoint. The envelope
-word is identical from either (the join is a semilattice) and neither counts
-an observation twice, but the sweep counts only the observations the
-counting field aggregated (the rows its ``where`` admits, with a finite
-value): a lower bound on the worker's clocked total, equal only when that
-field aggregated every clocked observation and far below it on a store whose
-temporal fields partition the observations (spec §10.3). The worker's
-buckets are the exact ones.
+Two feeds fill :class:`LeafTemporalAccumulator`. **The worker** folds
+per-OBSERVATION words, one exact timestamp each, counted once: the record's
+feed, and the only source of counts. **The sweep's raw route**
+(:func:`zagg.coverage_toc.read_leaf_temporal`), for a leaf with no usable
+record, folds the leaf's committed per-centroid companions as COVERAGE
+ONLY: every declared field's words join the envelope and key their buckets
+at a zero count (a merged centroid at its envelope's midpoint), and nothing
+is counted — a payload's weights are one field's, not the leaf's clocked
+observations. The envelope word is identical from either (the join is a
+semilattice); the root block reports how many shards came in uncounted
+(``uncounted_shards``, spec §10.3), which is what makes its totals a lower
+bound rather than a silent undercount.
 """
 
 from __future__ import annotations
@@ -146,9 +146,10 @@ def _tally(index: np.ndarray, weights, order: int) -> CountedCover:
 def count_words(words, weights=None, order: int = TEMPORAL_COVER_ORDER) -> CountedCover:
     """Count words into aligned order-``order`` buckets by their representative instant.
 
-    ``weights`` (optional, row-aligned) are observation counts per word — the
-    sweep's per-centroid feed; ``None`` counts each word once (the worker's
-    per-observation feed). Counts are rounded to integers.
+    ``weights`` (optional, row-aligned) are observation counts per word:
+    ``None`` counts each word once (the worker's per-observation feed), and
+    zeros key the buckets without counting (the raw route's coverage-only
+    feed). Counts are rounded to integers.
     """
     words = np.asarray(words, dtype=np.uint64).ravel()
     if words.size == 0:
@@ -199,11 +200,16 @@ def cover_from_counts(counts: CountedCover) -> tuple[np.ndarray, int]:
     return np.asarray(toc_normalize(counts.words), dtype=np.uint64), counts.order
 
 
-def encode_counts(counts: CountedCover) -> dict:
-    """The counted-cover block: two row-aligned §1.4 uint64 buffers, base64'd."""
+def encode_counts(counts: CountedCover, uncounted_shards: int | None = None) -> dict:
+    """The counted-cover block: two row-aligned §1.4 uint64 buffers, base64'd.
+
+    ``uncounted_shards`` is the ROOT block's exactness marker (spec §10.3):
+    how many shards behind it contributed coverage only. A leaf record's
+    block omits it (``None``) — a record is one leaf's exact count.
+    """
     from zagg.sweep_overview import encode_digest
 
-    return {
+    block = {
         "temporal_order": int(counts.order),
         "cap": COVER_CAP,
         "element": {"dtype": "uint64", "shape": [-1]},
@@ -213,6 +219,9 @@ def encode_counts(counts: CountedCover) -> dict:
         "count": int(counts.words.size),
         "obs_total": int(counts.obs.sum()) if counts.obs.size else 0,
     }
+    if uncounted_shards is not None:
+        block["uncounted_shards"] = int(uncounted_shards)
+    return block
 
 
 def _counted_int(block: dict, key: str) -> int:
@@ -289,12 +298,12 @@ class LeafTemporalAccumulator:
     """Fold one leaf's temporal contribution chunk by chunk, never whole.
 
     Two feeds, one state: :meth:`add_words` takes a chunk's per-observation
-    toc words (the worker), :meth:`add_weighted` a chunk's per-centroid
-    companions with their weights (the sweep's raw route, for the one field
-    it counts over — :meth:`add_occupancy` takes the others'). Each fold joins
-    the envelope word (``toc_reduce``, associative) and adds the chunk's
-    counted cover into the running one (:func:`merge_counts`, exact), so the
-    held state is a few hundred rows regardless of the shard.
+    toc words and counts each once (the worker), :meth:`add_occupancy` a
+    chunk's per-centroid companions as coverage only (the sweep's raw
+    route). Each fold joins the envelope word (``toc_reduce``, associative)
+    and adds the chunk's counted cover into the running one
+    (:func:`merge_counts`, exact), so the held state is a few hundred rows
+    regardless of the shard.
     :meth:`finish` returns ``(word, counts)``, or ``None`` when nothing was
     added.
     """
@@ -316,18 +325,12 @@ class LeafTemporalAccumulator:
         if self._pending_rows >= FOLD_ROWS:
             self._fold_pending()
 
-    def add_weighted(self, words, weights) -> None:
-        """Fold a chunk's per-centroid words, each counted ``weights`` times."""
-        words = np.asarray(words, dtype=np.uint64).ravel()
-        if words.size:
-            self._fold(words, np.asarray(weights, dtype=np.float64).ravel())
-
     def add_occupancy(self, words) -> None:
-        """Fold words that are counted ELSEWHERE: envelope and occupied buckets, zero count.
+        """Fold words as COVERAGE ONLY: envelope and occupied buckets, zero count.
 
-        The raw route's feed for every declared field but the counting one
-        (spec §10.3): the words join the envelope and key their buckets, so
-        the cover stays the union across fields, and add nothing to ``obs``.
+        The raw route's feed for every declared field (spec §10.3): the
+        words join the envelope and key their buckets, so the cover is the
+        union across fields, and add nothing to ``obs``.
         """
         words = np.asarray(words, dtype=np.uint64).ravel()
         if words.size:
@@ -359,13 +362,14 @@ class LeafTemporalAccumulator:
         return self._word, self._counts
 
 
-def build_leaf_temporal(word, counts: CountedCover, fields, *, source: str = "worker") -> dict:
-    """The ``zagg-leaf-temporal/1`` record body from one leaf's ``(word, counts)``.
+def build_leaf_temporal(word, counts: CountedCover, fields) -> dict:
+    """The ``zagg-leaf-temporal/1`` record body from the worker's ``(word, counts)``.
 
-    The counted cover is coarsened to the §10.5 cap by whole orders (the
-    block records the order it landed at); the §10.5 cover is derived from
-    it (:func:`cover_from_counts`) and carried so a reader wanting only the
-    word set needs no coarsening of its own.
+    ``source`` is always ``"worker"``: the leaf's own worker is the record's
+    only producer (spec §10.6). The counted cover is coarsened to the §10.5
+    cap by whole orders (the block records the order it landed at); the
+    §10.5 cover is derived from it (:func:`cover_from_counts`) and carried
+    so a reader wanting only the word set needs no coarsening of its own.
     """
     from zagg.hive import _utcnow
 
@@ -378,7 +382,7 @@ def build_leaf_temporal(word, counts: CountedCover, fields, *, source: str = "wo
     cover, cover_order = cover_from_counts(counts)
     return {
         "spec": LEAF_TEMPORAL_SPEC,
-        "source": source,
+        "source": "worker",
         "generated_at": _utcnow(),
         "fields": sorted(fields),
         "n_obs": int(counts.obs.sum()) if counts.obs.size else 0,
@@ -415,7 +419,7 @@ def leaf_temporal_contribution(record: dict) -> tuple[int, CountedCover]:
     the counts, an ``n_obs`` that is not the counts' total, and a cover
     whose envelope escapes the quantized word (§10.5's containment, per
     leaf) — a record that fails its own consistency claims is debris, and
-    the caller regenerates it from the leaf.
+    the caller reads the leaf instead.
     """
     from mortie import toc2time, toc_reduce
 
@@ -444,7 +448,7 @@ def leaf_temporal_contribution(record: dict) -> tuple[int, CountedCover]:
         if lo_c < lo_w or hi_c > hi_w:
             raise ValueError(
                 "leaf temporal record's cover escapes its own word (spec §10.5 containment, "
-                "per leaf) — regenerate it from the leaf"
+                "per leaf)"
             )
     return word, counts
 
@@ -463,10 +467,8 @@ def write_leaf_temporal(leaf_root: str, record: dict, **store_kwargs) -> None:
 def read_leaf_temporal_record(leaf_root: str, **store_kwargs) -> dict | None:
     """The leaf's record as stored, or ``None`` when absent.
 
-    Raw: the spec gate is :func:`load_leaf_temporal`'s, kept separate so a
-    caller can tell a foreign revision (preserve it — the §10.4 succession
-    rule) from absence (materialize one). A body that is not JSON raises,
-    which the caller treats as debris.
+    Raw: the spec gate is :func:`load_leaf_temporal`'s. A body that is not
+    JSON raises, which the caller treats as debris.
     """
     from zagg.hive import _read_json
     from zagg.store import open_object_store
@@ -475,52 +477,34 @@ def read_leaf_temporal_record(leaf_root: str, **store_kwargs) -> dict | None:
 
 
 def leaf_contribution(
-    leaf_root: str,
-    cell_order: int,
-    fields: dict,
-    *,
-    stamp: dict | None = None,
-    materialize: bool = True,
-    source: str = "sweep",
-    **store_kwargs,
+    leaf_root: str, cell_order: int, fields: dict, *, stamp: dict | None = None, **store_kwargs
 ):
     """One leaf's ``(word, counts)`` — record first — and the route it took.
 
-    The families sweep's per-leaf read (issue #575). Returns
-    ``(contribution, route)``: the decoded record with ``"record"`` when the
-    leaf carries a readable ``temporal.toc`` at this revision whose
-    ``fields`` cover every declared field (one small GET, no array opened);
-    otherwise the raw route — :func:`zagg.coverage_toc.read_leaf_temporal`,
-    one ragged chunk at a time — with ``"raw"``, or ``"materialized"`` when
-    ``materialize`` is set and the record it computed was written back, so a
-    store written before the record existed backfills once and converges
-    across partitioned re-fires. ``source`` is the §10.6 provenance the
-    materialized record carries — the caller's own walk, ``"sweep"`` here and
-    ``"refresh"`` from :func:`zagg.coverage.refresh_root_coverage`.
-    ``contribution`` is ``None`` for a leaf holding no temporal row.
+    The families sweep's per-leaf read (issue #575), and READ-ONLY: the
+    record is written by the leaf's worker and by nothing else (spec §10.6).
+    Returns ``(contribution, route)``: the decoded record with ``"record"``
+    when the leaf carries a readable ``temporal.toc`` at this revision whose
+    ``fields`` are the declared set (one small GET, no array opened);
+    otherwise :func:`zagg.coverage_toc.read_leaf_temporal`, one ragged chunk
+    at a time, with ``"raw"`` — the leaf's COVERAGE ONLY, every count zero,
+    which the caller reports in the root block's ``uncounted_shards``
+    (§10.3). ``contribution`` is ``None`` for a leaf holding no temporal row.
 
     ``leaf_root`` is the STABLE leaf root and ``stamp`` its root stamp, as the
     walk already read it (omitted: resolved here, one GET —
     :func:`zagg.hive.resolve_leaf`). The record and the arrays are read from
     where the stamp says the leaf's data lives (spec §1.5): the root of a
     legacy leaf, the ``current`` version of a versioned one, beside its
-    ``coverage.moc``. A VERSIONED leaf is never materialized into, whatever
-    ``materialize`` says: a version's objects are fixed once it is stamped
-    (§1.5), so its record is the worker's or none, and a version lacking a
-    usable one is read raw on every pass until the leaf's next replacement
-    writes a fresh version (§10.6).
+    ``coverage.moc``.
 
-    Succession and debris follow §10.4/§10.6: a record at a FOREIGN revision
-    is preserved (raw route, never overwritten); an unparsable or
-    inconsistent one is debris the materialized record replaces; one whose
-    ``fields`` are not EXACTLY the declared set is stale — it either omits a
-    field that postdates it or names one the declaration has since dropped —
-    and is re-derived over the manifest's current set, so every contribution
-    folds over one declared set. A record whose GET itself fails is neither:
-    the leaf is read (an unreadable accelerator is no more evidence about it
-    than a missing one) and the object is left alone, since a body that did
-    not read may be a foreign revision. Materialization is fail-open (D9): a
-    write that fails is logged and the contribution still returns.
+    Every record that cannot be used is BYPASSED and left exactly as found:
+    one at a foreign revision, an unparsable or inconsistent one, one whose
+    ``fields`` are not exactly the declared set (it omits a field that
+    postdates it, or names one the declaration has since dropped), and one
+    whose GET itself fails (an unreadable accelerator is no more evidence
+    about the leaf than a missing one). The leaf stays on the raw route until
+    its next replacement, whose worker writes a fresh record.
     """
     from zagg.coverage_toc import read_leaf_temporal
     from zagg.hive import leaf_data_path, resolve_leaf
@@ -529,45 +513,29 @@ def leaf_contribution(
         data_path, stamp = resolve_leaf(leaf_root, **store_kwargs)
     else:
         data_path = leaf_data_path(leaf_root, stamp)
-    versioned = bool((stamp or {}).get("current"))
-    foreign = False
     try:
         raw = read_leaf_temporal_record(data_path, **store_kwargs)
-    except ValueError as e:
-        logger.warning(f"leaf temporal: {data_path} record is not JSON ({e}) — re-deriving")
-        raw = None
     except Exception as e:
-        # The GET itself failed (a 403 on the key, a 5xx, a timeout): the
-        # accelerator is not the truth, so read the leaf rather than costing
-        # the shard — and never overwrite a body that could not be read (it
-        # may be a foreign revision, which §10.4 says to preserve).
-        logger.warning(f"leaf temporal: {data_path} record did not read ({e}) — re-deriving")
-        raw, foreign = None, True
+        # Not JSON, or the GET itself failed (a 403 on the key, a 5xx, a
+        # timeout): the record is not the truth about the leaf's coverage, so
+        # read the leaf rather than costing the shard.
+        logger.warning(f"leaf temporal: {data_path} record did not read ({e}) — reading the leaf")
+        raw = None
     record = load_leaf_temporal(raw)
     if record is not None:
         if set(record.get("fields") or []) == set(fields):
             try:
                 return leaf_temporal_contribution(record), "record"
             except (KeyError, TypeError, ValueError) as e:
-                logger.warning(f"leaf temporal: {data_path} record is debris ({e}) — re-deriving")
+                logger.warning(
+                    f"leaf temporal: {data_path} record is debris ({e}) — reading the leaf"
+                )
         else:
             logger.info(
-                f"leaf temporal: {data_path} record's fields are not the declared set — re-deriving"
+                f"leaf temporal: {data_path} record's fields are not the declared set — "
+                f"reading the leaf"
             )
-    elif isinstance(raw, dict) and isinstance(raw.get("spec"), str) and raw["spec"]:
-        # An unknown revision: read the leaf, and leave the object alone.
-        foreign = True
-    got = read_leaf_temporal(data_path, cell_order, fields, **store_kwargs)
-    if got is None or not materialize or foreign or versioned:
-        return got, "raw"
-    try:
-        write_leaf_temporal(
-            data_path, build_leaf_temporal(*got, fields, source=source), **store_kwargs
-        )
-    except Exception as e:
-        logger.warning(f"leaf temporal: could not materialize {data_path} (fail-open, D9): {e}")
-        return got, "raw"
-    return got, "materialized"
+    return read_leaf_temporal(data_path, cell_order, fields, **store_kwargs), "raw"
 
 
 __all__ = [

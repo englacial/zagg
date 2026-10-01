@@ -753,7 +753,7 @@ shard plus two store-root objects:
 | 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
 | root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
 | root sibling | [§10.5](specification.md) word-set cover: a per-shard toc word SET (temporal stores only) | `{store_root}/coverage.toc` | one opt-in GET, temporal consumers only, on demand |
-| leaf record | [§10.6](specification.md) temporal record: the leaf's envelope word + counted cover (temporal stores only) | `{full_id}.zarr/temporal.toc` sidecar (a versioned leaf's: in its `current` version, beside the bitmap) | one small GET — the sweep's per-leaf read; readers never need it |
+| leaf record | [§10.6](specification.md) temporal record: the leaf's envelope word + counted cover (temporal stores only; written by the leaf's worker, never by a sweep) | `{full_id}.zarr/temporal.toc` sidecar (a versioned leaf's: in its `current` version, beside the bitmap) | one small GET — the sweep's per-leaf read; readers never need it |
 
 **Leaf envelope** (on the stamp, `zagg.hive.read_coverage`; strict
 `spec: morton-moc/1` gate — unknown specs read as absent):
@@ -838,74 +838,38 @@ bitmap's slot: after the arrays, before the stamp, fail-open. It exists so
 the families sweep composes the root section and the cover sibling from
 one small GET per leaf instead of reading every leaf's raw `_times` column
 back (a million-row ragged array per field per leaf at California scale,
-which no single invoke could finish). The sweep reads the record first and
-falls back to the raw columns one chunk at a time — counting over ONE
-declared field (the first, in name order, holding a word in the leaf) and
-taking only occupancy from the rest, so no observation is counted twice on
-either route, though the raw route counts only that field's observations, a
-lower bound on the worker's count (§10.3) — materializing the record
-it computed (`source: "sweep"`) so the store converges; the refresh escape
-hatch (`zagg.coverage.refresh_root_coverage`) takes the same route and
-materializes too (`source: "refresh"`) unless called with
-`materialize=False`, which keeps it strictly read-only. On a **versioned**
-leaf the record (like the bitmap) lives in the version subgroup —
-`{full_id}.zarr/run-{run_id}-{attempt}/temporal.toc` — and both walks
-resolve `current` before reading it; a stamped version is never written
-into, so neither walk materializes there: a versioned leaf without a usable
-record is read raw on every pass (`temporal_routes.raw`) until its next
-replacement, and the backfill below is a legacy-leaf operation. Grammar:
+which no single invoke could finish). On a **versioned** leaf the record
+(like the bitmap) lives in the version subgroup —
+`{full_id}.zarr/run-{run_id}-{attempt}/temporal.toc` — and every walk
+resolves `current` before reading it.
+
+**The record is the worker's, or there is none.** It is the only source of
+observation counts: the leaf stores no per-observation clock, so nothing
+can rebuild them afterwards. The sweep and the refresh escape hatch
+(`zagg.coverage.refresh_root_coverage`) read the record first and never
+write one — not for a leaf that lacks it, not over a stale, unparsable or
+foreign-revision one. A leaf without a usable record is read from its raw
+columns one chunk at a time and contributes its **coverage only**: its
+envelope word and its occupied buckets, every count zero (§10.3). So that
+nobody mistakes the result for a total, the root `counts` block carries
+`uncounted_shards` — the number of shards with such a leaf — and its
+`obs_total` is exact at 0 and a lower bound otherwise. The sweep record
+shows the same thing per pass: `temporal_routes: {records, raw}` (how each
+contributing leaf was read; `raw` leaves gave no counts) and, on a pass
+that wrote the section, `uncounted_shards` beside `temporal_shards`.
+
+There is no backfill for a store written before the record existed (espg
+ruling of 2026-10-01 on [issue #575](https://github.com/englacial/zagg/issues/575)):
+such a store is frozen and rebuilt in the current layout, where every leaf
+gets its record at commit. Swept as it stands, it publishes tier 1, the
+cover, and a counts block of zero-count buckets with every shard uncounted
+— and pays the raw column read per leaf on every pass, since nothing
+converges, which at California scale no single invoke can finish
+(`_handle_sweep` in `deployment/aws/lambda_handler.py` works that
+arithmetic). A leaf whose
+worker failed its (fail-open) record PUT is the other way to get a raw
+leaf; it stays raw until that leaf is next rewritten. Grammar:
 [`specification.md`](specification.md) §10.6.
-
-*Backfilling a store written before the record existed* (the sweep record's
-`temporal_routes: {records, materialized, raw}` block shows the split per
-pass — named apart from the root object's `temporal` SECTION, which step 3
-below reads):
-
-1. fire a **partitioned** families pass over the record-less leaves
-   (`runner._invoke_lambda_sweep(..., partitions=4**k)`, issue #377 — a morton
-   digit is two bits, so `sweep_partition.partition_split_order` refuses 2, 8,
-   32 and every other odd power of two) — it cannot write the root section (its
-   finish is deferred) but it lands every leaf's record, one chunk at a time,
-   bounded by the chunk rather than the leaf. **Pick the width against the
-   wall, not against the store**: a partition does 1/N-th of the work but faces
-   the same 900 s invoke, so `leaves × s_per_leaf / N` must fit inside one,
-   rounded up to the next power of four. Here `s_per_leaf` is the RAW-route
-   per-leaf cost — the backfill is precisely the regime where every leaf pays a
-   column read, ~60 s/leaf measured, so CA's 2,726 leaves need 1,024 ways, not
-   the 16 that died. `_handle_sweep` in `deployment/aws/lambda_handler.py`
-   states the rule and works that arithmetic. Re-fire the leaves still without
-   a record, and stop on the pass's OWN records: when every partition's
-   `sweep_stats_{ts}_p{index}of{of}.json` reports `temporal_routes.materialized
-   == 0`, the backfill is done. "Until no record-less leaf remains" is not a
-   terminating condition — a leaf holding no temporal row never gets a record
-   (§10.6: an empty leaf publishes no temporal claim) and that is not an error,
-   so such a store never converges on it, and neither does a versioned leaf
-   whose worker failed to write its record (never materialized into; it stays
-   on `temporal_routes.raw`). Each re-fire also carries all four
-   default families (`stats`, `moc`, `submap`, `overview`):
-   `runner._build_sweep_event` never sets the event's `families` key, so this
-   entry point cannot scope the pass to `moc` ([issue
-   #527](https://github.com/englacial/zagg/issues/527));
-2. fire **one unpartitioned** families pass (`partitions=1`, what the runner
-   tail fires anyway) over the **whole store's** work set — every leaf
-   (`discover: true`, i.e. `zagg.sweep.discover_leaves`), **not** step 1's
-   leftovers: `MocFamily.finish` builds the section from THIS pass's
-   accumulator composed with whatever stands at the root, and on a store being
-   backfilled nothing is standing, so a pass carrying only the record-less
-   leaves publishes a section listing only those shards and step 3 then fails.
-   It composes `coverage.moc`'s `temporal` section and `coverage.toc` from the
-   records alone — one small GET per leaf plus the serial rollup walk, which is
-   the claim step 3 rests on: inside one invoke;
-3. accept when `temporal.shards` and the cover's `shards` both list the
-   store's expected coverage (the distinct successful shard keys across its
-   run records). They can legitimately fall short with the backfill having
-   worked: `MocFamily._accumulate_temporal` is fail-open per SHARD, so one
-   window leaf whose temporal read raises drops its whole shard for the rest of
-   the run (§10.2's whole-word rule — a word joined over whichever windows
-   happened to read is not a conservative envelope). The dropped shards name
-   themselves in that pass's `sweep[moc]: dropping shard ... did not read
-   (...)` warnings and its run record: fix those leaves and re-fire. A shard
-   that drops a second time is its own companion's fault, not the backfill's.
 
 **Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`
 against the AOI to pick candidate shards (one GET, no walk); per leaf,

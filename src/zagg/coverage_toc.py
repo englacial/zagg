@@ -18,9 +18,12 @@ bootstrap discovery (``{store_root}/coverage.moc``):
    nothing was observed.
 
 Both are composed from per-leaf contributions — the leaf's own
-``temporal.toc`` record where the worker wrote one (:mod:`zagg.leaf_temporal`),
-else the leaf's raw §8.3 companions read back chunk by chunk
-(:func:`read_leaf_temporal`).
+``temporal.toc`` record where its worker wrote one (:mod:`zagg.leaf_temporal`),
+the only source of counts; else the leaf's raw §8.3 companions read back
+chunk by chunk (:func:`read_leaf_temporal`), which yield its COVERAGE ONLY
+(espg ruling of 2026-10-01 on issue #575). The root block's
+``uncounted_shards`` says how many shards came in that way: 0 makes its
+counts exact, anything else a lower bound.
 
 A third surface lives BESIDE the bootstrap object (issue #489): the
 **word-set cover sibling** ``{store_root}/coverage.toc`` — per shard, the
@@ -149,45 +152,34 @@ def temporal_cell_order(manifest: dict | None) -> int | None:
 
 
 def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kwargs):
-    """One leaf's contribution from its raw companions: ``(word, counts)`` or ``None``.
+    """One leaf's COVERAGE from its raw companions: ``(word, counts)`` or ``None``.
 
-    Reads the declared fields' §8.3 siblings by NAME (never a member
-    enumeration), ONE ragged chunk at a time (issue #575): the arrays are
-    chunked at 4,096 rows, and each chunk is decoded, folded into a
+    The sweep's RAW route, for a leaf with no usable ``temporal.toc`` record
+    (a leaf carrying one is read from that instead — one small GET). Reads
+    the declared fields' §8.3 siblings by NAME (never a member enumeration),
+    ONE ragged chunk at a time (issue #575): the arrays are chunked at 4,096
+    rows, and each chunk is decoded, folded into a
     :class:`zagg.leaf_temporal.LeafTemporalAccumulator` and released, so
     memory is bounded by the chunk rather than the leaf — a CA-scale leaf is
     a million rows per field, which read whole is what killed the families
-    pass at the 4 GB tier. The envelope word is ``toc_reduce`` over every
+    pass at the 4 GB tier.
+
+    The contribution is coverage and NO count (espg ruling of 2026-10-01 on
+    issue #575; spec §10.3). The envelope word is ``toc_reduce`` over every
     sibling word the leaf holds, unioned across the declared fields —
-    coverage as "any data".
-
-    ``counts`` is the leaf's §10.3 counted cover, counted over ONE field
-    (espg ruling of 2026-10-01 on issue #575): the **counting field** is the
-    first declared field, in ascending name order, that holds a companion
-    word in this leaf. Each of its centroids is counted at its envelope's
+    coverage as "any data". ``counts`` keys the bucket of each word's
     representative instant (exact for a weight-1 centroid, the midpoint for a
-    merged one) with the payload's own weight, row-aligned per §1.1, so the
-    total is the number of observations THAT FIELD aggregated — the rows its
-    ``where`` admits, with a finite value. It is a lower bound on the worker
-    record's clocked count, equal only when the counting field aggregated
-    every clocked observation, and far below it on a store whose temporal
-    fields partition the observations (the ATL03 signal/noise strata, where
-    ``h_tdigest_noise`` counts and every signal photon is occupancy only;
-    spec §10.3). The count is the field's payload WEIGHT, an observation
-    count only under ``weights: "counts"``: a ``"flux"`` counting field's
-    total is its flux rounded per bucket, not observations (spec §10.3).
-    Every other field
-    contributes OCCUPANCY only: its words join the envelope and mark their
-    buckets with a zero count, so the key set (and the §10.5 cover derived
-    from it) stays the union across fields while nothing is counted twice;
-    its payload is read only for the same per-cell §1.1 alignment check, its
-    weights unused. ``None`` when the leaf holds no temporal row at all (an
-    unpopulated or pre-companion leaf), which is absence, not failure.
+    merged one) with ``obs`` 0 throughout: the committed arrays do not hold
+    the leaf's clocked observations — a payload's weights are ONE field's,
+    the rows its ``where`` admits with a finite value, and flux rather than
+    counts under ``weights: "flux"`` — so no observation count is derived
+    from them. Counts come from the worker's record alone, and the caller
+    reports this leaf's shard in the root block's ``uncounted_shards``.
 
-    This is the sweep's RAW route, for leaves written before the worker
-    record existed; a leaf carrying ``temporal.toc`` is read from that
-    instead (one small GET), and what this computes is what that record
-    holds under ``source: "sweep"``.
+    Each field's payload is still read, for the per-cell §1.1 alignment check
+    only (a cell whose companion and centroid counts disagree is refused).
+    ``None`` when the leaf holds no temporal row at all (an unpopulated or
+    pre-companion leaf), which is absence, not failure.
     """
     import zarr
 
@@ -199,7 +191,6 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
         open_store(leaf_root, **store_kwargs), path=str(cell_order), mode="r", zarr_format=3
     )
     acc = LeafTemporalAccumulator()
-    counting: str | None = None
     for name in sorted(fields):
         meta = fields[name]
         try:
@@ -231,13 +222,9 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
             ]
             if not rows:
                 continue
-            if counting is None:
-                counting = name  # the first declared field holding a word
             words_parts = [decode_digest(row, "uint64", ()) for _i, row in rows]
-            # Every field's payload is read for the §1.1 per-cell check; only
-            # the counting field's weights are used.
+            # The payload is read for the §1.1 per-cell check alone.
             raw_payload = payload[start : start + step]
-            weight_parts: list[np.ndarray] = []
             for (i, _row), words in zip(rows, words_parts, strict=True):
                 cell = decode_digest(raw_payload[i], dtype, (2,))
                 if len(cell) != len(words):
@@ -246,15 +233,13 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
                         f"{len(cell)}-centroid payload — the companion must be row-aligned "
                         f"with its digest (spec §1.1)"
                     )
-                weight_parts.append(cell[:, 1])
-            if name == counting:
-                acc.add_weighted(np.concatenate(words_parts), np.concatenate(weight_parts))
-            else:
-                acc.add_occupancy(np.concatenate(words_parts))
+            acc.add_occupancy(np.concatenate(words_parts))
     return acc.finish()
 
 
-def build_temporal_section(contributions: dict, fields, *, source: str = "sweep") -> dict | None:
+def build_temporal_section(
+    contributions: dict, fields, *, source: str = "sweep", uncounted=()
+) -> dict | None:
     """The ``zagg-coverage-toc/1`` section from per-leaf contributions.
 
     ``contributions`` maps a shard's D1 decimal id to the LIST of
@@ -269,8 +254,14 @@ def build_temporal_section(contributions: dict, fields, *, source: str = "sweep"
     (:func:`zagg.leaf_temporal.merge_counts` — exact, order-independent, no
     merge law) coarsened by whole orders to the §10.5 cap
     (:func:`zagg.leaf_temporal.cap_counts`, ancestor sums — exact at the
-    coarser rung). Every leaf of a shard contributes, so the total is the
-    store's temporal observation count.
+    coarser rung). Every leaf of a shard contributes.
+
+    ``uncounted`` names the shards with a leaf that contributed COVERAGE
+    ONLY (the raw route — zero counts, :func:`read_leaf_temporal`). Those
+    among ``contributions`` are counted into the block's
+    ``uncounted_shards`` (§10.3): at 0 the total is the store's temporal
+    observation count, otherwise a lower bound on it — the one thing a
+    reader of the root object cannot otherwise tell.
     """
     from mortie import toc_reduce
 
@@ -294,7 +285,7 @@ def build_temporal_section(contributions: dict, fields, *, source: str = "sweep"
     }
     counts = cap_counts(merge_counts(parts))
     if counts.words.size:
-        section["counts"] = encode_counts(counts)
+        section["counts"] = encode_counts(counts, len(set(uncounted) & set(contributions)))
     return section
 
 
@@ -915,18 +906,40 @@ def coverage_toc_counts(envelope):
 
     §10.3's MUST-checks ride :func:`zagg.leaf_temporal.decode_counts`: the
     two buffers against each other and against the block's ``count``, the
-    counts against ``obs_total``, the order against the pin. A block that
-    fails them is broken, not decorative — and a reference accessor that
-    skipped the check would leave the external reader (moczarr) implementing
-    one zagg does not.
+    counts against ``obs_total``, the order against the pin — and the root
+    block's own ``uncounted_shards`` (:func:`coverage_toc_uncounted`). A
+    block that fails them is broken, not decorative — and a reference
+    accessor that skipped the check would leave the external reader
+    (moczarr) implementing one zagg does not.
+
+    The counts are EXACT only when :func:`coverage_toc_uncounted` is 0;
+    otherwise every one of them, and their total, is a lower bound.
     """
-    section = load_temporal_coverage(envelope)
-    block = (section or {}).get("counts")
-    if not isinstance(block, dict):
+    if coverage_toc_uncounted(envelope) is None:
         return None
     from zagg.leaf_temporal import decode_counts
 
-    return decode_counts(block)
+    return decode_counts(load_temporal_coverage(envelope)["counts"])
+
+
+def coverage_toc_uncounted(envelope) -> int | None:
+    """The root block's ``uncounted_shards``, or ``None`` when it has no counts.
+
+    How many shards behind the root counted cover contributed coverage only
+    (§10.3): 0 makes :func:`coverage_toc_counts` exact, anything else makes
+    it a lower bound. Refuses (``ValueError``) a root block that lacks the
+    key or carries anything but a non-negative integer — the marker is what
+    tells a reader which of the two it is holding.
+    """
+    block = (load_temporal_coverage(envelope) or {}).get("counts")
+    if not isinstance(block, dict):
+        return None
+    from zagg.leaf_temporal import _counted_int
+
+    uncounted = _counted_int(block, "uncounted_shards")
+    if uncounted < 0:
+        raise ValueError(f"counted cover declares uncounted_shards {uncounted} (spec §10.3)")
+    return uncounted
 
 
 def load_cover(obj) -> dict | None:
@@ -1101,6 +1114,7 @@ __all__ = [
     "cover_words",
     "coverage_toc",
     "coverage_toc_counts",
+    "coverage_toc_uncounted",
     "delete_cover",
     "load_cover",
     "load_temporal_coverage",

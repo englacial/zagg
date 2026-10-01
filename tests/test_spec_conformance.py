@@ -29,7 +29,7 @@ import zarr
 from numcodecs import Zstd
 from zarr.storage import LocalStore
 
-from zagg.coverage_toc import coverage_toc, coverage_toc_counts
+from zagg.coverage_toc import coverage_toc, coverage_toc_counts, coverage_toc_uncounted
 from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
@@ -1220,6 +1220,7 @@ class TestFixtureSemanticHash:
         MULTISCALES,
         "raster_toc",
         "temporal",
+        "uncounted",
         "demoted",
     )
 
@@ -1267,6 +1268,9 @@ class TestFixtureSemanticHash:
 
         gen = self._generator()
         assert self._recorded("temporal") == semantic_hash(gen._temporal_config())
+        # `uncounted/` is the same store's root objects over a record-less
+        # leaf (§10.3), so it records the same identity.
+        assert self._recorded("uncounted") == self._recorded("temporal")
 
     def test_every_fixture_is_covered(self):
         # The gate on the gate: a fixture added without a hash pin ships a
@@ -1978,6 +1982,8 @@ class TestRootCoverageTemporalSection:
         assert counts["encoding"] == "base64"
         assert counts["temporal_order"] == exp["counts"]["temporal_order"] == 24
         assert counts["cap"] == 512
+        # §10.3's exactness marker: every leaf came in with its worker's record.
+        assert counts["uncounted_shards"] == exp["uncounted_shards"] == 0
         assert "digest" not in section  # the retired tier-2 block (issue #575)
 
     def test_counts_decode_through_the_native_grammar(self):
@@ -2003,10 +2009,11 @@ class TestRootCoverageTemporalSection:
         assert (start % span == 0).all() and ((end - start) == span).all()
 
     def test_count_conservation(self):
-        """§10.3: `obs_total` is the store's temporal observation count."""
+        """§10.3: at `uncounted_shards` 0, `obs_total` IS the store's observation count."""
         exp = _expected("temporal")
         block = self._envelope()["temporal"]["counts"]
         counts = coverage_toc_counts(self._envelope())
+        assert coverage_toc_uncounted(self._envelope()) == 0
         total = exp["root_coverage"]["obs_total"]
         assert total == sum(cell["count"] for cell in exp["cells"])
         assert int(counts.obs.sum()) == block["obs_total"] == total
@@ -2036,10 +2043,12 @@ class TestRootCoverageTemporalSection:
 
         On this one-leaf store the root block therefore IS the worker's
         counted cover — every observation in its own exact bucket (the
-        generator's per-instant expectation, never read back) — and NOT the
-        midpoint-bucketed fold a raw-route backfill would produce from the
-        per-centroid companions: on this fixture the two differ on three of
-        the five buckets, which is what makes the record-first route visible.
+        generator's per-instant expectation, never read back). The leaf's
+        per-centroid companions could not have produced it: their payload
+        weights, bucketed at each centroid's representative instant, total
+        the same but land differently on three of the five buckets — which
+        is why a raw read of the leaf contributes those buckets and NO count
+        (``uncounted/``, :class:`TestUncountedRootSection`).
         """
         from mortie import toc2time
 
@@ -2057,10 +2066,10 @@ class TestRootCoverageTemporalSection:
         weights = np.concatenate(
             [np.array(cell["h_tdigest"], dtype=np.float64)[:, 1] for cell in exp["cells"]]
         )
-        backfill = count_words(words, weights, block["temporal_order"])
-        np.testing.assert_array_equal(counts.words, backfill.words)  # same buckets ...
-        assert not np.array_equal(counts.obs, backfill.obs)  # ... exact, not midpoint, counts
-        assert int(backfill.obs.sum()) == int(counts.obs.sum())
+        weighed = count_words(words, weights, block["temporal_order"])
+        np.testing.assert_array_equal(counts.words, weighed.words)  # same buckets ...
+        assert not np.array_equal(counts.obs, weighed.obs)  # ... and not the exact counts
+        assert int(weighed.obs.sum()) == int(counts.obs.sum())
         # And every centroid's representative instant overlaps a counted bucket.
         start, end = (np.atleast_1d(np.asarray(x, np.uint64)) for x in toc2time(words))
         mid = start + (end - start) // np.uint64(2)
@@ -2219,6 +2228,103 @@ class TestRootCoverageTemporalSection:
             )
             for t in internal:
                 assert bool(np.any((start.astype(np.uint64) <= t) & (t < end.astype(np.uint64))))
+
+
+class TestUncountedRootSection:
+    """§10.3's coverage-only contribution, on the committed ``uncounted/`` objects.
+
+    ``uncounted/`` is metadata only: the root objects the production sweep
+    writes over ``temporal/``'s leaf when that leaf carries no §10.6 record.
+    It is the one committed counted-cover block whose ``obs`` are 0 and whose
+    ``uncounted_shards`` is not — the zero-count grammar and the lower-bound
+    marker, pinned as bytes for a reader decoding from the spec and the
+    fixtures alone. ``temporal/`` is the same leaf read through its record:
+    the same buckets, exact counts, marker 0.
+    """
+
+    def _envelope(self, name="uncounted"):
+        return json.loads((SPEC_DATA / name / "coverage.moc").read_text())
+
+    def test_it_is_the_temporal_leaf_without_its_record(self):
+        exp = _expected("uncounted")
+        assert exp["source_fixture"] == "temporal"
+        assert exp["leaf_content_hash"] == FROZEN_COMBINED["temporal"]
+        # Metadata only: three root objects, no leaf of its own.
+        assert sorted(p.name for p in (SPEC_DATA / "uncounted").rglob("*")) == [
+            "coverage.moc",
+            "coverage.toc",
+            "morton_hive.json",
+        ]
+
+    def test_zero_counts_decode_through_the_native_grammar(self):
+        """§10.3 with the SPEC-TEXT recipe: `obs: 0` rows are legal and are kept."""
+        exp = _expected("uncounted")["root_coverage"]
+        section = self._envelope()["temporal"]
+        assert section["spec"] == exp["spec"] and section["fields"] == exp["fields"]
+        assert section["shards"] == exp["shards"]
+        block = section["counts"]
+        words = np.frombuffer(base64.b64decode(block["words"]), "<u8")
+        obs = np.frombuffer(base64.b64decode(block["obs"]), "<u8")
+        assert len(words) == len(obs) == block["count"] == len(exp["counts"]["words"]) > 0
+        np.testing.assert_array_equal(words, np.array(exp["counts"]["words"], dtype=np.uint64))
+        assert obs.tolist() == exp["counts"]["obs"] and not obs.any()
+        assert block["obs_total"] == exp["obs_total"] == 0
+        assert block["uncounted_shards"] == exp["uncounted_shards"] == 1
+        # zagg's own reader accepts the block and reports the marker.
+        counts = coverage_toc_counts(self._envelope())
+        np.testing.assert_array_equal(counts.words, words)
+        assert coverage_toc_uncounted(self._envelope()) == 1
+
+    def test_a_zero_count_bucket_is_still_occupied(self):
+        """ "Is there data" reads `words`; a reader keying on `obs > 0` loses it all."""
+        from mortie import toc_normalize
+
+        from zagg.coverage_toc import cover_words
+
+        exp = _expected("uncounted")
+        shard = exp["shard"]
+        uncounted = coverage_toc_counts(self._envelope())
+        exact = coverage_toc_counts(self._envelope("temporal"))
+        # One leaf, two readings: the same occupied buckets and the same
+        # tier-1 word, with the counts present only where the record is.
+        np.testing.assert_array_equal(uncounted.words, exact.words)
+        assert exact.obs.all() and not uncounted.obs.any()
+        assert coverage_toc(self._envelope()) == coverage_toc(self._envelope("temporal"))
+        # The §10.5 sibling is the key set, normalized — zero counts included.
+        cover = json.loads((SPEC_DATA / "uncounted" / "coverage.toc").read_text())
+        np.testing.assert_array_equal(cover_words(cover)[shard], toc_normalize(uncounted.words))
+        assert [str(int(w)) for w in cover_words(cover)[shard]] == exp["cover"]["words"]
+
+    def test_the_total_is_a_lower_bound_not_the_count(self):
+        exp = _expected("uncounted")["root_coverage"]
+        block = self._envelope()["temporal"]["counts"]
+        temporal = _expected("temporal")["root_coverage"]
+        assert block["obs_total"] < exp["clocked_obs"] == temporal["obs_total"]
+        assert temporal["uncounted_shards"] == 0  # ... where the same total is exact
+
+    def test_the_production_sweep_reproduces_it_and_writes_no_record(self, tmp_path):
+        import shutil
+
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        exp = _expected("temporal")
+        root = tmp_path / "temporal"
+        shutil.copytree(SPEC_DATA / "temporal", root)
+        record = root / exp["leaf"] / "temporal.toc"
+        for path in (record, root / "coverage.moc", root / "coverage.toc"):
+            path.unlink()
+        leaves = [(int(morton_word(exp["shard"])), None)]
+        summary = run_sweep(str(root), leaves, families=["moc"], record=False)
+        assert summary["families"]["moc"]["temporal_routes"] == {"records": 0, "raw": 1}
+        assert not record.exists()
+        written = read_root_coverage(str(root))["temporal"]
+        committed = self._envelope()["temporal"]
+        assert written["shards"] == committed["shards"]
+        assert written["counts"] == committed["counts"]
+        cover = json.loads((SPEC_DATA / "uncounted" / "coverage.toc").read_text())
+        assert json.loads((root / "coverage.toc").read_text())["shards"] == cover["shards"]
 
 
 class TestDemotionAttrs:

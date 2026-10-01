@@ -1,0 +1,45 @@
+{
+ "shard": "11213",
+ "shard_order": 4,
+ "source_fixture": "temporal",
+ "leaf_content_hash": "6c7a0c5a3f54684b67e7e2daa66e29ffcf1af102833e7b3c4a4f989e36752887",
+ "root_coverage": {
+  "object": "coverage.moc",
+  "spec": "zagg-coverage-toc/1",
+  "fields": [
+   "h_tdigest"
+  ],
+  "shards": {
+   "11213": "10689250968998868755"
+  },
+  "uncounted_shards": 1,
+  "obs_total": 0,
+  "clocked_obs": 346,
+  "counts": {
+   "temporal_order": 24,
+   "words": [
+    "10689250835854781696",
+    "10689251935366409600",
+    "10690116151505942144",
+    "10690117251017570048",
+    "10690118350529197952"
+   ],
+   "obs": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ },
+ "cover": {
+  "object": "coverage.toc",
+  "spec": "zagg-coverage-toc-cover/1",
+  "count": 2,
+  "words": [
+   "10689250835854781824",
+   "10690116151505942400"
+  ]
+ }
+}

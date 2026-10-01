@@ -1313,10 +1313,11 @@ class TestProcessAndWriteHive:
     def test_a_failed_record_write_still_stamps_the_leaf(self, monkeypatch, cfg, tmp_path, caplog):
         """Issue #575: the record PUT is fail-OPEN, unlike the bitmap's.
 
-        Nothing points at ``temporal.toc`` — §10.6 reads its absence as "read
-        the leaf" and the sweep re-materializes it — so a transient failure on
-        a ~1 KB D9 accelerator must not discard a finished shard's read and
-        aggregate. The leaf still stamps, and the object is simply not there.
+        Nothing points at ``temporal.toc`` and §10.6 reads its absence as
+        "read the leaf", so a transient failure on a ~1 KB sidecar must not
+        discard a finished shard's read and aggregate. The leaf still stamps,
+        and the object is simply not there — for good: no later walk writes
+        it, so the sweep reads this leaf's coverage only (uncounted, §10.3).
         """
         from mortie import time2toc
 
@@ -1357,7 +1358,7 @@ class TestProcessAndWriteHive:
     def test_a_leaf_rewrite_never_leaves_a_stale_record(self, monkeypatch, cfg, tmp_path):
         """Issue #575: a rewritten leaf never keeps the PRIOR attempt's record.
 
-        The phase-2 sweep regenerates on ABSENCE, so the two write-site paths
+        The sweep trusts a record it finds, so the two write-site paths
         that leave no record — a fold that saw no clocked observation
         (``folded is None``) and the fail-open PUT — must not leave an older
         revision's object standing over new arrays. They cannot: since issue

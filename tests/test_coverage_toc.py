@@ -34,6 +34,7 @@ from zagg.coverage_toc import (
     cover_words,
     coverage_toc,
     coverage_toc_counts,
+    coverage_toc_uncounted,
     load_cover,
     load_temporal_coverage,
     merge_cover_sections,
@@ -59,11 +60,11 @@ BASE_NS = 5_344_000_000_000_000_000
 def _leaf(seed: int, n: int = 12):
     """A synthetic per-leaf contribution: ``(word, counts)``.
 
-    Shaped exactly like :func:`zagg.coverage_toc.read_leaf_temporal`'s return
-    — the join over the leaf's observation words and its §10.3 counted cover,
-    each instant weighted like a centroid (the worker's shape, where every
-    word is an exact timestamp; the midpoint-counted range words of a sweep
-    backfill are ``test_leaf_temporal``'s business).
+    Shaped like a leaf RECORD's contribution
+    (:func:`zagg.leaf_temporal.leaf_temporal_contribution`'s return) — the
+    join over the leaf's observation words and its §10.3 counted cover, every
+    word an exact timestamp with a positive count. The zero-count buckets of
+    a record-less leaf (the raw route) are ``test_leaf_temporal``'s business.
     """
     rng = np.random.default_rng(seed)
     starts = np.sort(BASE_NS + seed * 40 * DAY_NS + rng.integers(0, 30 * DAY_NS, n)).astype(
@@ -125,6 +126,21 @@ class TestSectionGrammar:
         section = build_temporal_section(contributions, ["h_tdigest"])
         counts = coverage_toc_counts({"temporal": section})
         assert int(counts.obs.sum()) == section["counts"]["obs_total"] == _total(contributions)
+
+    def test_the_block_says_how_many_shards_came_in_uncounted(self):
+        """§10.3's ``uncounted_shards``: 0 is exact, anything else a lower bound."""
+        contributions = _contributions([1, 2, 3])
+        exact = build_temporal_section(contributions, ["h_tdigest"])
+        assert exact["counts"]["uncounted_shards"] == 0
+        assert coverage_toc_uncounted({"temporal": exact}) == 0
+        # Counted over the shards the section holds — a shard the walk dropped
+        # (or never saw) is not in the block and is not in the marker either.
+        lower = build_temporal_section(
+            contributions, ["h_tdigest"], uncounted={"11210", "11212", "99999"}
+        )
+        assert coverage_toc_uncounted({"temporal": lower}) == 2
+        assert lower["counts"]["obs_total"] == exact["counts"]["obs_total"]
+        assert coverage_toc_uncounted({"temporal": {**exact, "counts": None}}) is None
 
     def test_the_root_cover_lies_inside_the_join_of_every_shard_word(self):
         # §10.5's parity relation at the root: the counts' cover sits inside
@@ -220,6 +236,19 @@ class TestComposition:
         assert merge_temporal_sections({}, good) == good
         assert merge_temporal_sections({"shards": {"1": "2"}}, good) == good
 
+    def test_the_uncounted_marker_rides_its_block_across_the_seam(self):
+        """§10.4: tier 2 is replaced whole, so the marker goes with the counts."""
+        shards = {"11211": [_leaf(1)], "11212": [_leaf(2)]}
+        lower = build_temporal_section(shards, ["h_tdigest"], uncounted={"11212"})
+        exact = build_temporal_section(shards, ["h_tdigest"])
+        assert merge_temporal_sections(lower, exact)["counts"]["uncounted_shards"] == 0
+        assert merge_temporal_sections(exact, lower)["counts"]["uncounted_shards"] == 1
+        # ... and a marker that moved is a content change the next pass writes.
+        assert not section_unchanged(lower, exact)
+        # A partial producer installs neither its counts nor its marker.
+        partial = build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"])
+        assert merge_temporal_sections(lower, partial)["counts"] == lower["counts"]
+
     def test_section_unchanged(self):
         a = build_temporal_section({"11211": [_leaf(1)], "11212": [_leaf(2)]}, ["h_tdigest"])
         assert section_unchanged(a, None)
@@ -280,6 +309,9 @@ class TestAbsence:
             {"obs": build_temporal_section(_contributions([3]), ["h"])["counts"]["obs"]},
             {"obs_total": block["obs_total"] + 1},
             {"temporal_order": TEMPORAL_COVER_ORDER + 1},
+            {"uncounted_shards": None},  # a root block MUST say which it is
+            {"uncounted_shards": -1},
+            {"uncounted_shards": "0"},
         ):
             envelope = {"temporal": {**section, "counts": {**block, **bad}}}
             # ValueError with the spec's own wording, never a bare TypeError
@@ -287,6 +319,9 @@ class TestAbsence:
             # block, and the message is what an external reader implements.
             with pytest.raises(ValueError, match="counted cover declares"):
                 coverage_toc_counts(envelope)
+        missing = {k: v for k, v in block.items() if k != "uncounted_shards"}
+        with pytest.raises(ValueError, match="uncounted_shards"):
+            coverage_toc_counts({"temporal": {**section, "counts": missing}})
 
     def test_a_section_without_counts_still_prunes(self):
         section = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
@@ -761,12 +796,13 @@ class TestOnCommittedStores:
         with pytest.raises(ValueError, match="row-aligned"):
             read_leaf_temporal(leaf, int(manifest["cell_order"]), fields)
 
-    def test_a_misaligned_occupancy_companion_is_refused(self, tmp_path):
-        """§1.1 row alignment, per CELL, on a field that is not the counting one.
+    def test_a_misaligned_companion_is_refused_on_every_field(self, tmp_path):
+        """§1.1 row alignment, per CELL, on every declared field.
 
-        ``z_tdigest`` is grafted beside the committed ``h_tdigest``, which
-        sorts first and so counts; ``z`` contributes occupancy only. One of
-        its cells carries one word more than its payload has centroids — the
+        The raw route uses no payload weight, but it still reads each field's
+        payload to check its companion against it. ``z_tdigest`` is grafted
+        beside the committed ``h_tdigest`` (which aligns); one of ``z``'s
+        cells carries one word more than its payload has centroids — the
         arrays are the same length, so only the per-cell check can see it —
         and the leaf is refused rather than published.
         """
@@ -795,7 +831,7 @@ class TestOnCommittedStores:
             )[:] = values
         fields = temporal_fields(manifest)
         second = {"z_tdigest": {**fields["h_tdigest"], "sibling": "z_tdigest_times"}}
-        assert sorted({**fields, **second})[0] == "h_tdigest"  # z is occupancy only
+        read_leaf_temporal(leaf, order, fields)  # h alone aligns
         with pytest.raises(ValueError, match="row-aligned"):
             read_leaf_temporal(leaf, order, {**fields, **second})
 
@@ -862,20 +898,20 @@ class TestOnCommittedStores:
         both = read_leaf_temporal(leaf, order, {**fields, **second})
         assert both[0] == int(toc_reduce(np.array([one[0], other[0]], dtype=np.uint64)))
         assert both[0] not in (one[0], other[0])  # neither field alone covers it
-        section = build_temporal_section({"11213": [both]}, ["g_tdigest", "h_tdigest"])
+        section = build_temporal_section(
+            {"11213": [both]}, ["g_tdigest", "h_tdigest"], uncounted={"11213"}
+        )
         assert int(section["shards"]["11213"]) == both[0]
-        # §10.3's count rule (espg ruling 2026-10-01, issue #575): counted over
-        # ONE field — the first in name order holding a word, here the grafted
-        # ``g_tdigest`` — so the same payload rows are not weighed twice, while
-        # ``h_tdigest``'s instants still key their buckets, at zero.
-        assert int(one[1].obs.sum()) == int(other[1].obs.sum())  # the same payload rows
-        assert section["counts"]["obs_total"] == int(other[1].obs.sum())
+        # §10.3 (espg ruling 2026-10-01, issue #575): a leaf read from its
+        # companions is COVERAGE ONLY — both fields' instants key their
+        # buckets and nothing is counted, so no field is weighed at all.
         counts = both[1]
         assert set(counts.words.tolist()) == set(one[1].words.tolist()) | set(
             other[1].words.tolist()
         )
-        zero = set(counts.words[counts.obs == 0].tolist())
-        assert zero == set(one[1].words.tolist()) - set(other[1].words.tolist()) and zero
+        assert int(counts.obs.sum()) == 0 and len(counts.words) > len(one[1].words)
+        assert section["counts"]["obs_total"] == 0
+        assert section["counts"]["uncounted_shards"] == 1
 
     def test_a_manifest_without_a_cell_order_publishes_no_section(self, tmp_path, caplog):
         """A required key missing is a broken manifest, not group ``"0"``.

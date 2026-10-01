@@ -133,11 +133,12 @@ class SweepFamily:
         """Per-pass telemetry keys, reported whether or not ``finish`` ran.
 
         A partitioned pass defers ``finish`` (issue #377) but still did per-leaf
-        work worth recording — the issue #575 backfill happens exactly there —
-        so this rides every pass that goes through the bottom-up walk,
-        partitioned or not. A family overriding :attr:`sweep_store` (the
-        whole-tree runner :func:`run_sweep` dispatches to instead of
-        ``_sweep_family``) never reaches this hook and folds its own telemetry.
+        work worth recording — the issue #575 route tally, which is the only
+        place a partition says how its leaves were read — so this rides every
+        pass that goes through the bottom-up walk, partitioned or not. A
+        family overriding :attr:`sweep_store` (the whole-tree runner
+        :func:`run_sweep` dispatches to instead of ``_sweep_family``) never
+        reaches this hook and folds its own telemetry.
         """
         return {}
 
@@ -189,9 +190,10 @@ class MocFamily(SweepFamily):
     The spec §10 TEMPORAL section (issue #480) rides this same walk: every
     stamped leaf of a temporal-declaring store also yields its §8.3 toc
     envelope word and its §10.3 counted cover — from the leaf's own
-    ``temporal.toc`` record where one stands, else read back from its raw
-    companions one chunk at a time and materialized as that record
-    (:func:`zagg.leaf_temporal.leaf_contribution`, issue #575) — accumulated on the family
+    ``temporal.toc`` record where its worker wrote one, else its coverage
+    alone (every count zero), read back from its raw companions one chunk at
+    a time (:func:`zagg.leaf_temporal.leaf_contribution`, issue #575; the
+    walk never writes a record) — accumulated on the family
     INSTANCE — one per run, since :func:`get_family` constructs a fresh one —
     and folded into the section :meth:`finish` writes. It stays OUT of the
     per-node rollup payloads on purpose: those are the skip-if-current
@@ -212,13 +214,16 @@ class MocFamily(SweepFamily):
         #: never published from the window leaves that did read (issue #480).
         self._temporal_failed: set[str] = set()
         #: How each CONTRIBUTING leaf's contribution was obtained (issue
-        #: #575): from its record, from the raw route and materialized, or
-        #: raw only. Counted per contributing leaf — a leaf holding no
+        #: #575): from its worker's record, or raw — coverage only, no
+        #: counts. Counted per contributing leaf — a leaf holding no
         #: temporal row contributes nothing and is not counted at all — and
         #: never decremented: a later window leaf that drops its whole shard
         #: (the ``except`` below) leaves the earlier windows' counts standing,
-        #: so the three need not reconcile with ``temporal_shards``.
-        self._temporal_routes: dict[str, int] = {"record": 0, "materialized": 0, "raw": 0}
+        #: so the two need not reconcile with ``temporal_shards``.
+        self._temporal_routes: dict[str, int] = {"record": 0, "raw": 0}
+        #: Shards with a raw-route leaf: the root block's ``uncounted_shards``
+        #: (spec §10.3), which is what marks its totals a lower bound.
+        self._temporal_uncounted: set[str] = set()
         #: Resolved once, on the first leaf read; ``None`` until then.
         self._temporal_fields: dict | None = None
         self._cell_order = 0
@@ -228,9 +233,9 @@ class MocFamily(SweepFamily):
 
         ``stamp`` is the leaf's root stamp: a versioned leaf's record and
         arrays are read from the version it names (spec §1.5), resolved inside
-        the fail-open — and never written into it (§10.6: a versioned leaf
-        without a usable record stays on the raw route, uncounted as
-        ``materialized``).
+        the fail-open. The read never writes: a leaf without a usable record
+        stays on the raw route — coverage only, its shard uncounted — until
+        its next replacement (§10.6).
 
         A store declaring no temporal field short-circuits after one manifest
         read. An unreadable companion is logged and skipped rather than
@@ -278,30 +283,26 @@ class MocFamily(SweepFamily):
             return
         if got is not None:
             self._temporal_routes[route] += 1
+            if route == "raw":
+                self._temporal_uncounted.add(decimal)
             self._temporal.setdefault(decimal, []).append(got)
 
     def summary(self) -> dict:
-        # ``temporal_routes: {records, materialized, raw}`` (issue #575): how
-        # this pass obtained each leaf's contribution — named apart from the
-        # root object's §10 ``temporal`` section and from ``temporal_shards``,
-        # neither of which it reconciles with. Gated on the DECLARATION, not on
-        # the tally: ``_temporal_fields`` is ``None`` until the first leaf read
-        # and ``{}`` on a non-temporal store, so a non-temporal store's sweep
-        # record stays as it was and a partition that visited no leaf still
-        # says nothing — while a temporal pass that published nothing (every
-        # shard dropped by the fail-open above, the regime the issue #575
-        # backfill runs in) reports zeros rather than reading as a store with
-        # no temporal channel at all.
+        # ``temporal_routes: {records, raw}`` (issue #575): how this pass
+        # obtained each leaf's contribution — ``raw`` leaves gave coverage and
+        # no counts — named apart from the root object's §10 ``temporal``
+        # section and from ``temporal_shards``, neither of which it reconciles
+        # with. Gated on the DECLARATION, not on the tally:
+        # ``_temporal_fields`` is ``None`` until the first leaf read and ``{}``
+        # on a non-temporal store, so a non-temporal store's sweep record stays
+        # as it was and a partition that visited no leaf still says nothing —
+        # while a temporal pass that published nothing (every shard dropped by
+        # the fail-open above) reports zeros rather than reading as a store
+        # with no temporal channel at all.
         if not self._temporal_fields:
             return {}
         routes = self._temporal_routes
-        return {
-            "temporal_routes": {
-                "records": routes["record"],
-                "materialized": routes["materialized"],
-                "raw": routes["raw"],
-            }
-        }
+        return {"temporal_routes": {"records": routes["record"], "raw": routes["raw"]}}
 
     def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
         # ``spec`` is unused here: leaf PATHS are the frozen /1-/2 grammar
@@ -374,7 +375,10 @@ class MocFamily(SweepFamily):
         if not tops:
             return {"root_moc_written": False}
         section = build_temporal_section(
-            self._temporal, self._temporal_fields or {}, source="sweep"
+            self._temporal,
+            self._temporal_fields or {},
+            source="sweep",
+            uncounted=self._temporal_uncounted,
         )
         cover = build_cover_section(
             self._temporal, self._temporal_fields or {}, shard_order, source="sweep"
@@ -426,6 +430,9 @@ class MocFamily(SweepFamily):
             # that landed lists at least these shards and usually more; the
             # run summary reports what the run did.
             out["temporal_shards"] = len(section["shards"])
+            # ... of which this many came in with no counts (§10.3): the
+            # operator's read of whether the root totals are exact.
+            out["uncounted_shards"] = len(self._temporal_uncounted & set(section["shards"]))
         if cover is not None:
             out["cover_shards"] = len(cover["shards"])
         return out

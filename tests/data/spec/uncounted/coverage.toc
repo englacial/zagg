@@ -1,0 +1,24 @@
+{
+ "spec": "zagg-coverage-toc-cover/1",
+ "source": "sweep",
+ "generated_at": "2026-10-01T23:27:51+00:00",
+ "order": 4,
+ "temporal_order": 24,
+ "cap": 512,
+ "fields": [
+  "h_tdigest"
+ ],
+ "element": {
+  "dtype": "uint64",
+  "shape": [
+   -1
+  ]
+ },
+ "encoding": "base64",
+ "shards": {
+  "11213": {
+   "words": "gO0rSgDZV5SAdy1KAOxalA==",
+   "count": 2
+  }
+ }
+}
