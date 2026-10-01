@@ -2447,7 +2447,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if m.get("current") or m.get("refused"):
                 continue
             if m is not metadata:
-                for key in ("max_memory_mb", "container_hwm_mb", "cpu_seconds"):
+                # ``duration_total_s`` (issue #589) with them: the billed wall
+                # is the invoke's, so each leaf's record prices from it and a
+                # roll-up counts it once per ``(run_id, shard_key)``.
+                for key in ("max_memory_mb", "container_hwm_mb", "cpu_seconds", "duration_total_s"):
                     m[key] = metadata[key]
             label = m.get("window") if bulk else (event.get("window") or {}).get("label")
             m["stats"] = build_record(

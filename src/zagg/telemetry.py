@@ -101,6 +101,12 @@ _SUM_OR_NONE_KEYS = (
     "raster_px_sampled",
 )
 _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
+#: Invoke-level fields (issue #586): a bulk multi-window shard unit stamps
+#: these once per INVOKE and repeats them on each of its N leaf records
+#: (``unit_windows: N``), so a sum counts them once per ``(run_id,
+#: shard_key)`` — :func:`merge` and every readout that totals rows. The
+#: ``read`` phase is the invoke's too (the shard is read once).
+INVOKE_LEVEL_KEYS = ("duration_s", "duration_total_s", "gb_seconds", "est_cost_usd", "n_obs_read")
 _EQ_OR_NONE_KEYS = (
     "window",
     # Bulk multi-window unit width (issue #586): every leaf of one shard
@@ -483,6 +489,15 @@ def merge(records: Iterable[dict]) -> dict:
     mismatch (``None`` is absorbing, which is what keeps the fold
     associative). ``merge([r]) == r`` up to key order. Raises ``ValueError``
     on an empty iterable or a ``schema_version`` mismatch.
+
+    The leaf records of one bulk multi-window invoke (issue #586:
+    ``unit_windows`` set, one ``(run_id, shard_key)``) each repeat the
+    invoke's :data:`INVOKE_LEVEL_KEYS` and its ``read`` phase; the fold
+    counts those once per invoke, so a shard's rollup carries the billed
+    wall and the cost of the one invoke that wrote its N leaves, not N
+    times it. The rows of one invoke must meet in ONE call for that — they
+    do: a shard's window leaves fold at the shard node before anything
+    coarser (``sweep._rollup_shard_node``, ``choropleth._resolve_shard``).
     """
     records = list(records)
     if not records:
@@ -506,26 +521,44 @@ def merge(records: Iterable[dict]) -> dict:
                 out[key] = first
         else:
             out[key] = None
+    # One representative per bulk invoke (issue #586) for the invoke-level
+    # sums; every record counts for everything else.
+    seen: set = set()
+    invokes = []
+    for r in records:
+        key = (r.get("run_id"), r.get("shard_key"))
+        if r.get("unit_windows") is not None and None not in key:
+            if key in seen:
+                continue
+            seen.add(key)
+        invokes.append(r)
+    repeated = {id(r) for r in records} - {id(r) for r in invokes}
+
+    def _parts(key):
+        return invokes if key in INVOKE_LEVEL_KEYS else records
+
     for key in _SUM_KEYS:
-        out[key] = sum(r.get(key) or 0 for r in records)
+        out[key] = sum(r.get(key) or 0 for r in _parts(key))
     phase_timings: dict[str, float] = {}
     for r in records:
         for name, secs in (r.get("phase_timings") or {}).items():
+            if name == "read" and id(r) in repeated:
+                continue
             phase_timings[name] = phase_timings.get(name, 0.0) + secs
     out["phase_timings"] = phase_timings
     for key in _SUM_OR_NONE_KEYS:
-        vals = [r.get(key) for r in records if r.get(key) is not None]
+        vals = [r.get(key) for r in _parts(key) if r.get(key) is not None]
         out[key] = sum(vals) if vals else None
     # ``duration_total_s`` (issue #589) is the billed wall: None when no part
     # measured it (so ``merge([r]) == r``), else each part counts its total or,
     # for an older leaf, its ``duration_s`` -- build_record's pricing fallback,
     # so a mixed-vintage rollup never reads below its aggregate clock.
-    totals = [r.get("duration_total_s") for r in records]
+    totals = [r.get("duration_total_s") for r in invokes]
     out["duration_total_s"] = (
         None
         if all(t is None for t in totals)
         else sum(
-            t if t is not None else (r.get("duration_s") or 0) for t, r in zip(totals, records)
+            t if t is not None else (r.get("duration_s") or 0) for t, r in zip(totals, invokes)
         )
     )
     for key in _MAX_OR_NONE_KEYS:

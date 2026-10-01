@@ -207,14 +207,21 @@ output:
   writes N D20 records — each leaf's own sidecar, sub-map (its granule
   subset) and run-parquet row, with `window` naming the leaf, so the
   sweep's run-record discovery and `Run.attach` read them as before. The
-  invoke-level telemetry (`duration_s`, `max_memory_mb`, `gb_seconds`, the
+  invoke-level telemetry (`duration_s`, `duration_total_s` — the billed
+  wall, [issue #589](https://github.com/englacial/zagg/issues/589) —
+  `max_memory_mb`, `gb_seconds` / `est_cost_usd`, the
   `read` phase, and `n_obs_read` — the shard's decoded rows, so the #374
   read-vs-keep ratio is per invoke: `n_obs_read` over the rows' summed
   `n_obs`) repeats across the invoke's N rows and each carries
   `unit_windows: N` — the leaves the invoke emitted, windows the gate
   skipped not counted (null on a per-window unit) — so per-invoke quantiles stay
   the fleet-safety numbers and a per-invoke sum de-duplicates on
-  `(run_id, shard_key)` where `unit_windows` is set. A window whose inputs
+  `(run_id, shard_key)` where `unit_windows` is set. The stats rollup does
+  exactly that (`telemetry.merge`: a shard node's rollup carries the bill of
+  the one invoke that wrote its N leaves, and everything coarser sums shard
+  rollups), as does `tools/windowed_emit_measure.py`; the dispatcher's own
+  cost block and `worker_pct_timeout` read the invoke's result body, one per
+  invoke. A window whose inputs
   are current under the skip-if-current gate is skipped inside the shard
   invoke (no record, as for a skipped unit); a window that kept no data
   reports the fan-out's benign no-data error and fails nothing. A window

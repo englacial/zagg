@@ -44,6 +44,9 @@ def _store(tmp_path, *, windows):
                         metadata={
                             "total_obs": 5,
                             "duration_s": 10.0 if windows else 40.0,
+                            # the billed wall (issue #589): only the windowed
+                            # arm's workers stamp it here
+                            "duration_total_s": 14.0 if windows else None,
                             "max_memory_mb": 500.0,
                             "phase_timings": {"read": 1.0},
                             "gb_seconds": 2.0,
@@ -89,6 +92,9 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     assert base["fleet"]["windows_per_shard"]["p50"] == 1.0
     assert win["fleet"]["windows_per_shard"]["p50"] == 3.0
     assert base["fleet"]["duration_s"]["p50"] == 40.0 and win["fleet"]["duration_s"]["p50"] == 10.0
+    # the billed wall beside it; an older run's rows carry none (``-``, not 0)
+    assert win["fleet"]["duration_total_s"]["p50"] == 14.0
+    assert base["fleet"]["duration_total_s"]["p50"] is None
     assert base["fleet"]["phase_read"]["p100"] == 1.0
     assert base["fleet"]["errors"] == 0 and base["fleet"]["timeouts"] == 0
     # objects: a leaf is two objects here; siblings are counted apart
@@ -116,6 +122,8 @@ def test_measures_both_arms_and_prints_a_table(tmp_path, capsys):
     (commits,) = [ln.split() for ln in out.splitlines() if ln.startswith("icechunk commits")]
     assert commits[-2:] == ["3", "-"]
     assert out.count("yearly") == 1 and out.count("none") == 1
+    (total,) = [ln.split() for ln in out.splitlines() if ln.startswith("duration_total_s")]
+    assert total[-10:] == ["-", "/", "-", "/", "-", "14.0", "/", "14.0", "/", "14.0"]
 
 
 @pytest.mark.parametrize("windows", [None, ("2019", "2020", "2021")])
@@ -191,6 +199,7 @@ def test_a_bulk_invoke_sums_its_per_window_phases():
             "window": ["2019", "2020", "2019"],
             "unit_windows": [2, 2, None],
             "duration_s": [50.0, 50.0, 30.0],
+            "duration_total_s": [80.0, 80.0, 41.0],
             "phase_read": [20.0, 20.0, 10.0],
             "phase_write": [4.0, 6.0, 3.0],
             "phase_spill_bytes": [None, None, None],
@@ -200,3 +209,4 @@ def test_a_bulk_invoke_sums_its_per_window_phases():
     assert len(out) == 2
     assert out.loc[1, ["duration_s", "phase_read", "phase_write"]].tolist() == [50.0, 20.0, 10.0]
     assert out.loc[2, "phase_write"] == 3.0 and pd.isna(out.loc[1, "phase_spill_bytes"])
+    assert out["duration_total_s"].to_dict() == {1: 80.0, 2: 41.0}

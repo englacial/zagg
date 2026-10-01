@@ -5,8 +5,10 @@ the WINDOWED arm of the same order-6 cell, built with
 ``tools/configs/atl03_windowed_measure.yaml`` — print, per store:
 
 - the fleet numbers off the run parquets (``stats_*.parquet`` at the root):
-  units, shards, windows per shard, ``duration_s`` and ``max_memory_mb``
-  quantiles, timeouts/errors, GB-seconds;
+  units, shards, windows per shard, ``duration_s`` (the read + aggregate
+  clock), ``duration_total_s`` (the billed wall, issue #589; ``-`` on a run
+  whose workers predate it) and ``max_memory_mb`` quantiles, timeouts/errors,
+  GB-seconds;
 - the object numbers off the tree: leaves, objects and bytes per shard (one
   LIST per shard node; capped by ``--max-shards``);
 - the ladder numbers off the staged sweep record (``sweep_stats_*_stages.json``,
@@ -113,8 +115,8 @@ def _total(df, col: str):
 def _invokes(df):
     """One row per INVOKE: a bulk multi-window shard unit (issue #586 phase 2)
     writes one run-record row per emitted leaf, each carrying the invoke's
-    ``duration_s`` / ``max_memory_mb`` / ``gb_seconds`` / ``n_obs_read`` /
-    ``phase_read`` and ``unit_windows`` set, so those rows collapse to the
+    ``duration_s`` / ``duration_total_s`` / ``max_memory_mb`` / ``gb_seconds`` /
+    ``n_obs_read`` / ``phase_read`` and ``unit_windows`` set, so those rows collapse to the
     first per ``(run, shard_key)`` — except the per-window phases (every
     ``phase_*`` but ``phase_read``: index, aggregate, write, hash, column, the
     spill counters), which are each leaf's own and SUM to the invoke's. Every
@@ -154,6 +156,7 @@ def fleet_numbers(store) -> dict:
         "shards": int(ok["shard_key"].nunique()),
         "windows_per_shard": _quantiles(per_shard.values),
         "duration_s": _quantiles(ok_invokes.get("duration_s", [])),
+        "duration_total_s": _quantiles(ok_invokes.get("duration_total_s", [])),
         "max_memory_mb": _quantiles(ok_invokes.get("max_memory_mb", [])),
         "errors": int((~df["success"]).sum()) if "success" in df else 0,
         "timeouts": int(df["error_class"].fillna("").str.contains(_TIMEOUT, case=False).sum())
@@ -335,6 +338,7 @@ def print_table(results: list[dict]) -> None:
         ),
         ("windows per shard p50/p90/max", lambda r: _fmt(r["fleet"].get("windows_per_shard"))),
         ("duration_s p50/p90/max", lambda r: _fmt(r["fleet"].get("duration_s"))),
+        ("duration_total_s p50/p90/max", lambda r: _fmt(r["fleet"].get("duration_total_s"))),
         ("max_memory_mb p50/p90/max", lambda r: _fmt(r["fleet"].get("max_memory_mb"))),
         (
             "errors / timeouts",

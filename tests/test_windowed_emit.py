@@ -913,6 +913,11 @@ class TestLocalRunner:
             2,
             2,
         ]
+        # The unit's wall (issue #589) is the invoke's: one value, repeated on
+        # every leaf's row beside ``duration_s`` (PR question (15), option (a)).
+        totals = rows["duration_total_s"].tolist()
+        assert len(set(totals)) == 1 and totals[0] > 0
+        assert totals[0] == summary["results"][0]["duration_total_s"]
         # The root summary unions the windows' ranges.
         env = hive.read_root_coverage(root)
         assert env["time_range"] == ["2018-03-01T00:00:00+00:00", "2020-11-01T00:00:00+00:00"]
@@ -1168,6 +1173,31 @@ class TestHandler:
             assert [[g["id"] for g in shard_granules] for shard_granules in submap["granules"]] == [
                 ids
             ]
+
+    def test_the_billed_wall_is_the_invokes_and_rolls_up_once(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        # PR question (15), option (a): the bulk loop stamps the invocation
+        # wall (issue #589) on every leaf's record, each priced from it; the
+        # dispatcher bills the invoke once off the body, and a roll-up of the
+        # N records carries one invoke's bill, not N.
+        import zagg.telemetry as telemetry
+
+        monkeypatch.setattr(telemetry, "lambda_env", lambda: {"memory_mb": 2048, "arch": "arm64"})
+        _patch(monkeypatch)
+        body = json.loads(_handle(handler_mod, _handler_event(_cfg(), tmp_path))["body"])
+        wall = body["duration_total_s"]
+        assert wall > 0 and wall >= body["duration_s"]
+        assert [r["duration_total_s"] for r in body["stats"]] == [wall] * 3
+        for rec in body["stats"]:
+            assert rec["gb_seconds"] == pytest.approx(wall * 2.0)
+        # The dispatcher's cost block and ``worker_pct_timeout`` read the body.
+        assert telemetry.billed_seconds(body) == wall
+        rolled = telemetry.merge(body["stats"])
+        assert rolled["duration_total_s"] == pytest.approx(wall)
+        assert rolled["gb_seconds"] == pytest.approx(wall * 2.0)
+        assert rolled["est_cost_usd"] == pytest.approx(body["stats"][0]["est_cost_usd"])
+        assert rolled["n_obs"] == 12
 
     def test_a_failed_window_keeps_the_landed_windows_records(
         self, handler_mod, monkeypatch, tmp_path
