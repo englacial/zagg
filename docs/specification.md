@@ -3183,7 +3183,8 @@ have for the cover sibling:
   below disagreed by a factor of the field count; no published store
   declared more than one temporal field while it stood).
 
-**What is counted (normative).** Both producers count an observation once:
+**What is counted (normative).** Neither producer counts an observation
+twice, but they do not count the same observations:
 
 - **The leaf's own worker** (a §10.6 record, `source: "worker"`) folds the
   ONE clock column every declared field shares: each clocked observation
@@ -3204,17 +3205,24 @@ have for the cover sibling:
   leaf lacks (one added to the store later) or holds no word for is passed
   over and the next declared field counts.
 
-The raw route's count is therefore the counting field's total payload
-weight: the clocked observations whose value **in the counting field** was
-finite (a digest drops non-finite rows; the clock does not). It is a lower
-bound on the worker's count for the same leaf, with equality when no
-clocked observation was non-finite in the counting field; an observation
-finite only in another field is in an occupied bucket and uncounted. That
-is the one divergence left between the producers, and it does not grow
-with the field count. A root `obs_total` summed over a store that mixes
-worker-recorded and backfilled leaves is a single quantity under this one
-rule — the store's clocked observations, less those the backfilled leaves'
-counting fields dropped as non-finite.
+The raw route's count is therefore **one field's** observation count, not
+the leaf's. A payload digest holds only the observations that field
+aggregated — the rows its `where` predicate admits (a stratum digest, §2.1),
+with a finite value (a digest drops non-finite rows; the clock does not) —
+so the raw-route count is a **lower bound** on the worker's
+clocked-observation count for the same leaf, equal only when the counting
+field aggregated every clocked observation. An observation the counting
+field did not aggregate is in an occupied bucket and uncounted. On a store
+whose temporal fields partition the observations the bound is far from
+tight: the shipped `atl03_tdigest_strata_healpix.yaml` declares two
+complementary `where` strata over one source, `h_tdigest_signal` and
+`h_tdigest_noise`, and name order makes `h_tdigest_noise` the counting
+field, so a backfilled leaf counts its noise photons only and every signal
+photon lands as zero-count occupancy. A root `obs_total` summed over a store
+that mixes worker-recorded and backfilled leaves is accordingly a sum of
+worker counts (every clocked observation of those leaves) and one-field
+counts (each backfilled leaf's counting-field observations) — a lower bound
+on the store's clocked observations, not that count.
 
 **How an observation lands in a bucket.** Its instant is its §8.3 word's
 *representative instant*: the instant itself for a timestamp word, the
@@ -3696,11 +3704,13 @@ which is that rule pinned as bytes.
   clock column, so a second declared field adds nothing), for a sweep or
   refresh record the total payload weight of the leaf's **counting field**
   (§10.3) — the first declared field, in name order, holding a companion
-  word in the leaf. The two agree up to the clocked observations whose
-  counting-field value was non-finite, which the payload digest drops and
-  the worker's clock does not; a raw-route `n_obs` is a lower bound on the
-  worker's for the same leaf, and the number of declared fields does not
-  enter either.
+  word in the leaf. That field's digest holds only the observations it
+  aggregated — the rows its `where` predicate admits, with a finite value —
+  so a raw-route `n_obs` is ONE field's observation count: a lower bound on
+  the worker's for the same leaf, equal only when the counting field
+  aggregated every clocked observation, and far below it on a store whose
+  temporal fields partition the observations (§10.3's strata example). The
+  number of declared fields does not enter either.
 - **`word`** (required) — the §10.2 envelope word for THIS leaf, as a
   decimal string: the grammar's join (`toc_reduce`) over every observation
   word the leaf holds. Because the join is a semilattice, it is identical

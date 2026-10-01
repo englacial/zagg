@@ -167,8 +167,13 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     word in this leaf. Each of its centroids is counted at its envelope's
     representative instant (exact for a weight-1 centroid, the midpoint for a
     merged one) with the payload's own weight, row-aligned per §1.1, so the
-    total is the number of observations that field aggregated — once per
-    observation, the quantity the worker's record counts. Every other field
+    total is the number of observations THAT FIELD aggregated — the rows its
+    ``where`` admits, with a finite value. It is a lower bound on the worker
+    record's clocked count, equal only when the counting field aggregated
+    every clocked observation, and far below it on a store whose temporal
+    fields partition the observations (the ATL03 signal/noise strata, where
+    ``h_tdigest_noise`` counts and every signal photon is occupancy only;
+    spec §10.3). Every other field
     contributes OCCUPANCY only: its words join the envelope and mark their
     buckets with a zero count, so the key set (and the §10.5 cover derived
     from it) stays the union across fields while nothing is counted twice;

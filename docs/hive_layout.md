@@ -830,8 +830,9 @@ back (a million-row ragged array per field per leaf at California scale,
 which no single invoke could finish). The sweep reads the record first and
 falls back to the raw columns one chunk at a time — counting over ONE
 declared field (the first, in name order, holding a word in the leaf) and
-taking only occupancy from the rest, so a multi-field leaf counts each
-observation once on either route (§10.3) — materializing the record
+taking only occupancy from the rest, so no observation is counted twice on
+either route, though the raw route counts only that field's observations, a
+lower bound on the worker's count (§10.3) — materializing the record
 it computed (`source: "sweep"`) so the store converges; the refresh escape
 hatch (`zagg.coverage.refresh_root_coverage`) takes the same route and
 materializes too (`source: "refresh"`) unless called with

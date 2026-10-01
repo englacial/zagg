@@ -1261,7 +1261,9 @@ class TestLeafTemporalFold:
         assert len(fed) == 6 and sum(fed) == expected[2]
         assert max(fed) <= 150 < expected[2]
 
-    def _two_field_leaf(self, monkeypatch, tmp_path, key=None, *, nan_cells=(), step=3.0):
+    def _two_field_leaf(
+        self, monkeypatch, tmp_path, key=None, *, nan_cells=(), step=3.0, strata=False
+    ):
         """One leaf through the PRODUCTION writer under two temporal fields.
 
         ``g_tdigest`` and ``h_tdigest`` both declare a per-centroid companion
@@ -1269,12 +1271,26 @@ class TestLeafTemporalFold:
         with ``nan_cells``' rows blanked, so the two payloads' NaN masks
         differ. ``step`` is the clock spacing in seconds: at 60 s a cell's 50
         observations span their own order-24 buckets (2^39 ns ≈ 550 s).
+        ``strata`` instead declares the shipped ATL03 strata shape
+        (``atl03_tdigest_strata_healpix.yaml``): ``h_tdigest_signal`` and
+        ``h_tdigest_noise``, complementary ``build_tdigest_where`` predicates
+        over ``h_ph``, so the two fields partition the observations.
         Returns ``(root, leaf_data_path, dfs, meta)``.
         """
         from zagg import hive
 
         variables = _companion_variables()
-        variables["g_tdigest"] = {**variables["h_tdigest"], "source": "g_ph"}
+        if strata:
+            base = variables.pop("h_tdigest")
+            where = "h_ph > 0"
+            for name, pred in (("h_tdigest_signal", where), ("h_tdigest_noise", f"~({where})")):
+                variables[name] = {
+                    **base,
+                    "function": "zagg.stats.tdigest.build_tdigest_where",
+                    "params": {**base["params"], "where": pred},
+                }
+        else:
+            variables["g_tdigest"] = {**variables["h_tdigest"], "source": "g_ph"}
         cfg = _config(variables=variables, output={**_TIME_SOURCE, "store_layout": "hive"})
         # The leaf template carries only DECLARED coordinates (the bare
         # ``process_shard`` tests above never emit one).
@@ -1284,7 +1300,8 @@ class TestLeafTemporalFold:
         dfs = _with_clock(_granule_dfs(grid, key, _CELL_LISTS, seed=7), step=step)
         blank = {int(grid.children(key)[ci]) for ci in nan_cells}
         for df in dfs:
-            df["g_ph"] = df["h_ph"].where(~df["leaf_id"].isin(blank), np.nan)
+            if not strata:
+                df["g_ph"] = df["h_ph"].where(~df["leaf_id"].isin(blank), np.nan)
         reads = iter(dfs)
         monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
@@ -1382,6 +1399,46 @@ class TestLeafTemporalFold:
         # The worker's exact buckets are the same key set: every clocked
         # observation, finite in ``g`` or not.
         np.testing.assert_array_equal(raw[1].words, worker[1].words)
+
+    def test_complementary_strata_count_one_stratum(self, monkeypatch, tmp_path):
+        """The raw route on a store whose temporal fields PARTITION the observations.
+
+        The shipped ATL03 strata shape: ``h_tdigest_signal`` and
+        ``h_tdigest_noise`` are complementary ``where`` strata over one
+        source, so each observation is in exactly one digest. Name order makes
+        ``h_tdigest_noise`` the counting field, so the raw route counts the
+        noise observations only — a lower bound on the worker's clocked count,
+        far below it — and every signal observation is zero-count occupancy.
+        Pins the present rule (espg ruling of 2026-10-01 on issue #575), not
+        an endorsement of it for stratified stores.
+        """
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.hive import read_manifest
+        from zagg.leaf_temporal import leaf_temporal_contribution, read_leaf_temporal_record
+
+        # At 300 s a bucket (~550 s) holds one or two observations, so some
+        # buckets hold signal only, and the worker's stay under the §10.5 cap.
+        root, leaf, dfs, meta = self._two_field_leaf(monkeypatch, tmp_path, strata=True, step=300.0)
+        manifest = read_manifest(root)
+        fields, order = temporal_fields(manifest), temporal_cell_order(manifest)
+        assert sorted(fields) == ["h_tdigest_noise", "h_tdigest_signal"]
+        n_clocked = meta["total_obs"]
+        n_signal = int(sum((df["h_ph"] > 0).sum() for df in dfs))
+        n_noise = n_clocked - n_signal
+        assert 0 < n_noise < n_clocked and n_signal > 0
+        worker = leaf_temporal_contribution(read_leaf_temporal_record(leaf))
+        assert int(worker[1].obs.sum()) == n_clocked  # every clocked observation
+        raw = read_leaf_temporal(leaf, order, fields)
+        assert int(raw[1].obs.sum()) == n_noise  # the name-order-first stratum only
+        assert raw[0] == worker[0]  # the envelope joins both strata on either route
+        noise = read_leaf_temporal(leaf, order, {"h_tdigest_noise": fields["h_tdigest_noise"]})
+        signal = read_leaf_temporal(leaf, order, {"h_tdigest_signal": fields["h_tdigest_signal"]})
+        assert int(signal[1].obs.sum()) == n_signal
+        by_word = dict(zip(raw[1].words.tolist(), raw[1].obs.tolist(), strict=True))
+        noise_counts = dict(zip(noise[1].words.tolist(), noise[1].obs.tolist(), strict=True))
+        signal_alone = set(signal[1].words.tolist()) - set(noise_counts)
+        assert signal_alone and all(by_word[w] == 0 for w in signal_alone)
+        assert by_word == {**dict.fromkeys(signal_alone, 0), **noise_counts}
 
     def test_a_part_backfilled_store_totals_under_one_rule(self, monkeypatch, tmp_path):
         """A root total summed over a worker record and a backfilled leaf.

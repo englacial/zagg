@@ -42,9 +42,13 @@ committed per-centroid companions (:func:`zagg.coverage_toc.read_leaf_temporal`)
 spec §10.3: the first declared field holding a word in the leaf), the other
 fields' words as zero-count occupancy; a weight-1 centroid is an exact
 instant, a merged one is counted at its envelope's midpoint. The envelope
-word is identical from either (the join is a semilattice) and both count an
-observation once — the same total, up to observations whose counting-field
-value was non-finite; the worker's buckets are the exact ones.
+word is identical from either (the join is a semilattice) and neither counts
+an observation twice, but the sweep counts only the observations the
+counting field aggregated (the rows its ``where`` admits, with a finite
+value): a lower bound on the worker's clocked total, equal only when that
+field aggregated every clocked observation and far below it on a store whose
+temporal fields partition the observations (spec §10.3). The worker's
+buckets are the exact ones.
 """
 
 from __future__ import annotations
