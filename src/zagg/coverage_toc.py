@@ -180,9 +180,9 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     contributes OCCUPANCY only: its words join the envelope and mark their
     buckets with a zero count, so the key set (and the §10.5 cover derived
     from it) stays the union across fields while nothing is counted twice;
-    its payload is not read at all. ``None`` when the leaf holds no temporal
-    row at all (an unpopulated or pre-companion leaf), which is absence, not
-    failure.
+    its payload is read only for the same per-cell §1.1 alignment check, its
+    weights unused. ``None`` when the leaf holds no temporal row at all (an
+    unpopulated or pre-companion leaf), which is absence, not failure.
 
     This is the sweep's RAW route, for leaves written before the worker
     record existed; a leaf carrying ``temporal.toc`` is read from that
@@ -234,9 +234,8 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
             if counting is None:
                 counting = name  # the first declared field holding a word
             words_parts = [decode_digest(row, "uint64", ()) for _i, row in rows]
-            if name != counting:
-                acc.add_occupancy(np.concatenate(words_parts))
-                continue
+            # Every field's payload is read for the §1.1 per-cell check; only
+            # the counting field's weights are used.
             raw_payload = payload[start : start + step]
             weight_parts: list[np.ndarray] = []
             for (i, _row), words in zip(rows, words_parts, strict=True):
@@ -248,7 +247,10 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
                         f"with its digest (spec §1.1)"
                     )
                 weight_parts.append(cell[:, 1])
-            acc.add_weighted(np.concatenate(words_parts), np.concatenate(weight_parts))
+            if name == counting:
+                acc.add_weighted(np.concatenate(words_parts), np.concatenate(weight_parts))
+            else:
+                acc.add_occupancy(np.concatenate(words_parts))
     return acc.finish()
 
 

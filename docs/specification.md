@@ -3199,7 +3199,9 @@ twice, but they do not count the same observations:
   contributes **occupancy only**: its companion words join the §10.2
   envelope and mark the bucket of each word's representative instant as
   occupied — a key in `words` with nothing added to `obs` — and its payload
-  is not read. The key set, and so the §10.5 cover derived from it, stays
+  is read only to check each cell's companion against its centroid count
+  (§1.1's row alignment, refused on a mismatch as for the counting field),
+  its weights unused. The key set, and so the §10.5 cover derived from it, stays
   the union across fields that §10.2 and §10.5 require ("any data"), while
   no observation is weighed twice. The rule is per leaf, so a field the
   leaf lacks (one added to the store later) or holds no word for is passed

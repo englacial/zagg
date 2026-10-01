@@ -761,6 +761,44 @@ class TestOnCommittedStores:
         with pytest.raises(ValueError, match="row-aligned"):
             read_leaf_temporal(leaf, int(manifest["cell_order"]), fields)
 
+    def test_a_misaligned_occupancy_companion_is_refused(self, tmp_path):
+        """§1.1 row alignment, per CELL, on a field that is not the counting one.
+
+        ``z_tdigest`` is grafted beside the committed ``h_tdigest``, which
+        sorts first and so counts; ``z`` contributes occupancy only. One of
+        its cells carries one word more than its payload has centroids — the
+        arrays are the same length, so only the per-cell check can see it —
+        and the leaf is refused rather than published.
+        """
+        import zarr
+
+        from zagg.coverage_toc import read_leaf_temporal
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path
+
+        root = self._copy(tmp_path, "temporal")
+        manifest = json.loads((Path(root) / "morton_hive.json").read_text())
+        order = int(manifest["cell_order"])
+        leaf = shard_leaf_path(root, int(morton_word("11213")))
+        group = zarr.open_group(leaf, path=str(order), mode="a", zarr_format=3)
+        payload, sibling = group["h_tdigest"], group["h_tdigest_times"]
+        words = sibling[:]
+        i = next(j for j, row in enumerate(words) if row is not None and len(row))
+        words[i] = bytes(words[i]) + bytes(words[i])[:8]  # one word too many
+        for name, values in (("z_tdigest", payload[:]), ("z_tdigest_times", words)):
+            group.create_array(
+                name,
+                shape=payload.shape,
+                chunks=payload.chunks,
+                dtype=payload.metadata.data_type,
+                overwrite=True,
+            )[:] = values
+        fields = temporal_fields(manifest)
+        second = {"z_tdigest": {**fields["h_tdigest"], "sibling": "z_tdigest_times"}}
+        assert sorted({**fields, **second})[0] == "h_tdigest"  # z is occupancy only
+        with pytest.raises(ValueError, match="row-aligned"):
+            read_leaf_temporal(leaf, order, {**fields, **second})
+
     def test_refresh_drops_only_the_shard_whose_leaf_failed(self, tmp_path, monkeypatch):
 
         root = self._copy(tmp_path, "temporal")
