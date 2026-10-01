@@ -3214,7 +3214,8 @@ with a finite value (a digest drops non-finite rows; the clock does not) —
 so the raw-route count is a **lower bound** on the worker's
 clocked-observation count for the same leaf, equal only when the counting
 field aggregated every clocked observation. An observation the counting
-field did not aggregate is in an occupied bucket and uncounted. On a store
+field did not aggregate is uncounted (its bucket is still occupied when
+another field aggregated it). On a store
 whose temporal fields partition the observations the bound is far from
 tight: the shipped `atl03_tdigest_strata_healpix.yaml` declares two
 complementary `where` strata over one source, `h_tdigest_signal` and
