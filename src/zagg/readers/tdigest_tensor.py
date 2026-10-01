@@ -17,7 +17,9 @@ A ragged field is ONE ``variable_length_bytes`` array on the cell grid::
                                   the uint64 per-row toc words, row-aligned the
                                   same way. Both shipped templates write it.
     {group}/morton             <- per-cell uint64 morton coordinate (zagg's
-                                  standard HEALPix coordinate array)
+                                  standard HEALPix coordinate array); a
+                                  WINDOWED hive leaf stores none and the
+                                  readers derive it (spec §1.5)
 
 The element interpretation is self-describing via the array attrs
 (``grids.base.RAGGED_ELEMENT_ATTR``)::
@@ -448,18 +450,38 @@ def _subtree_span(arr, morton, field, subtree) -> tuple[tuple[int, int] | None, 
     return span, spans
 
 
-def _open_morton(store: Store, field: str, zarr_format):
-    """The sibling per-cell ``morton`` coordinate array (chunk identity source)."""
+def _open_morton(store: Store, field: str, zarr_format, n_cells: int):
+    """The per-cell ``morton`` coordinate (chunk identity source), stored or derived.
+
+    The sibling array where the store carries one. A WINDOWED hive leaf
+    stores none (spec §1.5 "The cell coordinate", issue #586 phase 3): there
+    the words are derived from the leaf's own stamp
+    (:func:`zagg.hive.derived_leaf_words`) and returned as an ``ndarray`` of
+    all ``n_cells`` — which slices exactly like the array, but is dense: a
+    derived word is never the ``0`` unwritten fill, so occupancy must come
+    from the payload array (:func:`_coordinate_derived`).
+    """
     parent, _, _name = field.rpartition("/")
     path = f"{parent}/morton" if parent else "morton"
     try:
         return zarr.open_array(store, path=path, mode="r", zarr_format=zarr_format)
     except (FileNotFoundError, KeyError) as e:
+        from zagg import hive
+
+        words = hive.derived_leaf_words(hive.read_commit(store), n_cells)
+        if words is not None:
+            return words
         raise ValueError(
             f"{field!r} has no sibling 'morton' coordinate array at {path!r}; the "
             f"vlen readers derive each chunk's coverage-cell id from the per-cell "
-            f"morton coordinate (issue #209)"
+            f"morton coordinate (issue #209), which only a windowed hive leaf may "
+            f"leave unstored (spec §1.5)"
         ) from e
+
+
+def _coordinate_derived(morton) -> bool:
+    """Whether ``morton`` is a derived coordinate (see :func:`_open_morton`)."""
+    return isinstance(morton, np.ndarray)
 
 
 def _cells_order(words: np.ndarray, field: str, start: int) -> int:
@@ -801,7 +823,7 @@ def read_tensors(
     is_float = np.issubdtype(out_dtype, np.floating)
 
     arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
-    morton = _open_morton(store, field, zarr_format)
+    morton = _open_morton(store, field, zarr_format, int(arr.shape[0]))
     side, depth = _tensor_side(arr, field)
     cells_per_chunk = side * side
 
@@ -981,7 +1003,7 @@ def read_raw_values(
         too-deep ``subtree``.
     """
     arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
-    morton = _open_morton(store, field, zarr_format)
+    morton = _open_morton(store, field, zarr_format, int(arr.shape[0]))
     side, depth = _tensor_side(arr, field)
     cells_per_chunk = side * side
 
@@ -1068,7 +1090,7 @@ def read_locations(
     # Sweep the SIBLING only — skipping the payload array halves the bytes
     # read for a locations-only pass (the digest payload is not consumed here).
     loc_arr, loc_dtype, loc_shape, _loc_meta = _open_ragged(store, loc_field, zarr_format)
-    morton = _open_morton(store, field, zarr_format)
+    morton = _open_morton(store, field, zarr_format, int(loc_arr.shape[0]))
     side, depth = _tensor_side(loc_arr, loc_field)
     cells_per_chunk = side * side
 
@@ -1146,7 +1168,8 @@ def cell_index(
         no stored chunk carries ``morton_index``.
     """
     arr, _dt, _sh, _meta = _open_ragged(store, field, zarr_format)
-    morton = _open_morton(store, field, zarr_format)
+    morton = _open_morton(store, field, zarr_format, int(arr.shape[0]))
+    derived = _coordinate_derived(morton)
     side, depth = _tensor_side(arr, field)
     cells_per_chunk = side * side
     if not (0 <= int(row) < side and 0 <= int(col) < side):
@@ -1160,6 +1183,12 @@ def cell_index(
             start = span_start + offset
             if not np.any(words) or _chunk_word(words, field, start) != target:
                 continue
+            # A derived coordinate names every chunk of the span, written or
+            # not, so whether THIS chunk is stored is the payload's to say
+            # (one inner-chunk read; the stored coordinate answers it for
+            # free, its unwritten chunks holding the ``0`` fill).
+            if derived and not any(len(raw) for raw in arr[start : start + cells_per_chunk]):
+                break
             return start + rank
     raise ValueError(
         f"no stored read chunk of {field!r} carries morton id {target} — "

@@ -514,6 +514,11 @@ class TestProcessRasterHiveMode:
         assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/2"
         assert stamp["window"] == "20260713"
         assert body["cells_with_data"] == stamp["cells_with_data"] > 0
+        # The fleet path writes the same windowed leaf the local one does:
+        # no per-cell `morton` array (issue #586 phase 3).
+        group = Path(leaf) / str(event["config"]["output"]["grid"]["child_order"])
+        assert sorted(p.name for p in group.iterdir() if p.is_dir()) == ["red", "time"]
+        assert not any(k.endswith("/morton") for k in stamp["content_hashes"]["arrays"])
 
     def test_schedule_none_bare_leaf(self, handler_mod, tmp_path):
         from zagg import hive
@@ -526,6 +531,9 @@ class TestProcessRasterHiveMode:
         leaf = hive.shard_leaf_path(event["store_path"], event["shard_key"])
         stamp = hive.read_commit(leaf)
         assert stamp and stamp["spec"] == "morton-hive/1" and "window" not in stamp
+        # An unwindowed raster leaf keeps its stored coordinate.
+        group = Path(leaf) / str(event["config"]["output"]["grid"]["child_order"])
+        assert (group / "morton" / "zarr.json").exists()
 
     def test_hive_leaf_gets_stats_sidecar(self, handler_mod, tmp_path):
         # Issue #297: the raster hive worker writes the stats record SIBLING

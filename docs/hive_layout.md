@@ -234,6 +234,27 @@ output:
   to a `yearly` store adds leaves the schedule already describes — no
   manifest touch; the explicit list is the noted exception (appending outside
   it re-templates).
+- **No per-cell `morton` array** ([issue #586](https://github.com/englacial/zagg/issues/586)
+  phase 3, [specification §1.5](specification.md#15-storage-geometries) "The
+  cell coordinate"): every window of a shard shares the shard's cells axis,
+  so a windowed leaf does not store the coordinate — cell `j` carries the
+  word of the shard's `j`-th child at the cell order
+  (`zagg.grids.morton.cell_words`; one stride of 4,194,304 across an order-9
+  shard at cell order 19), derived from the leaf id and the rank. That is
+  32 KiB per occupied inner chunk and two objects per leaf not written —
+  8.4 MB per full order-9 shard, per window. Every write path drops it (the
+  shard unit, `unit: window`, the streaming and spill modes, the raster
+  writer, versioned leaves), on the local backend and the Lambda handler
+  alike; unwindowed leaves keep their stored array unchanged. zagg's readers
+  derive it when it is absent — the sweep fold and the column backfill pin
+  the leaf's extent on a declared field instead, the tensor readers derive
+  the words from the leaf's own stamp — and windowed leaves written before
+  this change, which do store it, read as before. The leaf columns and
+  overviews still store `morton` in every group. `python -m
+  zagg.pyramid_check` holds the derivation against the data: its
+  `coordinates` check requires every location word of a sampled cell to lie
+  inside the derived cell, and reports a store with no located field as
+  *derivation only* rather than as a pass.
 - **Coverage gains `encoding: "full"`** (D14): a popcount at stamp time marks
   a fully-occupied subtree — no bitmap sidecar object is written, and readers
   short-circuit the exact intersection through the shard's own MOC
@@ -688,7 +709,9 @@ per-array sha256 over decoded values plus the combined digest — computed
 from the arrays the worker just wrote, before the stamp lands, so the stamp
 certifies the digest of what it seals. The D20 stats sidecar carries the
 same record; a leaf stamped before the key existed is unverifiable from the
-stamp alone, never tampered.
+stamp alone, never tampered. A **windowed** leaf's record has no
+`{cell_order}/morton` key: that leaf stores no coordinate array (see
+[Time windows](#time-windows-morton-hive2)).
 
 A leaf whose root metadata lacks the stamp is **debris**: incomplete,
 ignorable, safe to overwrite on retry (the writer re-emits the leaf template
@@ -793,7 +816,7 @@ shard plus two store-root objects:
 |---|---|---|---|
 | 0 — morton box | canonical ≤ 4-member cover of the occupied cells (DCA children, each tightened) | `coverage` payload on the commit stamp | free — rides the stamp GET readers already make |
 | 1 — exact bitmap | zstd-compressed bit field over the shard subtree at `cell_order` | `{full_id}.zarr/coverage.moc` sidecar | one opt-in GET |
-| 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
+| 2 — exact truth | the leaf's `morton` coordinate (a stored array; derived from the leaf id on a windowed leaf) and its data arrays | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
 | root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
 | root sibling | [§10.5](specification.md) word-set cover: a per-shard toc word SET (temporal stores only) | `{store_root}/coverage.toc` | one opt-in GET, temporal consumers only, on demand |
 
@@ -1753,7 +1776,9 @@ carrying the spec §8.1 `temporal` declaration at `shape: "coordinate"`
 and no CF attrs under
 `output.time_encoding: toc` — which the shipped Sentinel-2 config sets, issue
 #443) and `morton` (packed u64 words) as the sole cell
-coordinate — `cell_ids` (NESTED) rides only the `emit_cell_ids` transition hatch
+coordinate — stored on an unwindowed leaf, derived on a windowed one, which
+stores no such array ([Time windows](#time-windows-morton-hive2));
+`cell_ids` (NESTED) rides only the `emit_cell_ids` transition hatch
 (issue #304) — plus one
 `(T_leaf, cells_per_shard)` array per configured band, chunked
 `(1, cells_per_chunk)`. The leaf's time axis is the unit's **own acquisition
@@ -1820,6 +1845,10 @@ be added later by the sweep as a derived artifact). Readers:
    for a reader that already GETs the root stamp and then addresses chunks by
    key (moczarr's 2-GET path, zagg's readers). A zarr-python reader that
    opens the version **group** pays one GET for its `{current}/zarr.json`.
+   A **windowed** leaf has no `{cell_order}/morton` array to open: the cell
+   words are the shard's children at the cell order
+   (`zagg.grids.morton.cell_words(shard, cell_order)`), the shard being the
+   leaf id the path was computed from.
 4. Discovery without a root MOC falls back to the delimiter-LIST walk:
    recurse on `[1-4]/` children; a `*.zarr` entry is data at that node; no
    digit children ⇒ nothing finer. Never LIST per observation in a join

@@ -67,6 +67,7 @@ from zagg.pyramid_check_core import (
     _check_node,
     _column_object_rel,
     _committed,
+    _coordinates_check,
     _entry,
     _field_groups,
     _finish,
@@ -148,6 +149,18 @@ def validate_v2(
         checks["materialization"] = _entry("fail", f"empty leaf roster (source {roster_source})")
         skip_rest("empty roster", after="materialization")
         return _finish(report, CHECKS_V2)
+    _coordinates_check(
+        store_root,
+        manifest,
+        [(dec, None) for dec in leaves],
+        store_kwargs,
+        checks,
+        report,
+        seed=seed,
+        sample_nodes=sample_nodes,
+        sample_cells=sample_cells,
+        full=full,
+    )
 
     # -- [2] materialization: the above-shard ladder (shared leg).
     probes, declared, state = _ladder_materialization(

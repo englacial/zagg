@@ -110,6 +110,15 @@ conformance tests assert decoded values, never object bytes.
   leaving them without either root object IS §10's absence rule, and keeps
   those trees byte-identical.
 
+- ``windowed/`` — the §1.5 DERIVED-COORDINATE surface (issue #586 phase 3):
+  ``minimal/``'s geometry and cell plan with a located digest field, written
+  as one WINDOWED leaf (``{id}_{window}.zarr``, ``morton-hive/2``). It stores
+  NO per-cell ``morton`` array — the one fixture that does not — and its
+  expected file records the derived words (from mortie, never read back),
+  their stride, and the order-19 instance of the law on an order-9 shard in
+  each hemisphere. The located sibling lets a reader check the derivation
+  on committed bytes: each location word lies inside its cell's derived word.
+
 - ``demoted/`` — the §4.3 ``demotions`` surface (issue #518):
   ``kitchen_sink/``'s store swept under a hand-installed ``/1`` cascade
   manifest whose composition ``of`` divisor is MIS-DECLARED ``class:
@@ -1632,6 +1641,259 @@ def build_temporal(out: Path) -> None:
     )
 
 
+#: The ``windowed/`` fixture's window (issue #586 phase 3): one ``yearly``
+#: label, its observations clocked inside it on the declared time field.
+WINDOWED_LABEL = "2019"
+#: Order-9 shards the ``windowed/`` expectations pin the ORDER-19 instance of
+#: the §1.5 derivation law on — one per hemisphere; the southern word sets
+#: bit 63 (base cells 7-11), the case a signed reader gets wrong.
+WINDOWED_ORDER19_SHARDS = ("3232131144", "-5112333142")
+
+
+def _windowed_config():
+    """The ``windowed/`` fixture's config: a located digest + ``count``, windowed.
+
+    Constructed rather than validated, like :func:`_temporal_config` — the
+    fake ``process_shard`` stands in for a reader, so ``data_source`` declares
+    only what the window machinery consults (the ``time_field`` column).
+    """
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        data_source={"groups": ["g"], "variables": {"h": "/h", "delta_time": "/dt"}},
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0},
+                "h_tdigest": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest",
+                    "source": "h",
+                    "location": "leaf_id",
+                    "inner_shape": [2],
+                    "dtype": "float32",
+                    "fill_value": 0,
+                    "params": {"delta": DELTA},
+                },
+            },
+        },
+        output={
+            "store_layout": "hive",
+            "grid": {
+                "type": "healpix",
+                "parent_order": 4,
+                "child_order": 6,
+                "chunk_inner": 5,
+                "sharded": True,
+            },
+            "windowing": {
+                "schedule": "yearly",
+                "time_field": "delta_time",
+                "epoch": "2018-01-01T00:00:00Z",
+            },
+        },
+    )
+
+
+def _fake_windowed_shard(grid, by_chunk, time_range):
+    """``process_shard`` stand-in for ``windowed/``: dense + one located field.
+
+    The carrier still holds the ``morton`` column the real worker builds —
+    it is the WRITER that drops it for a windowed leaf, which is the path
+    this fixture pins.
+    """
+
+    def fake(g, shard_key, urls, **kwargs):
+        occupied = []
+        for ordinal, (block, children) in enumerate(grid.iter_chunks(int(shard_key))):
+            cells = by_chunk.get(ordinal, {})
+            if not cells:
+                kwargs["chunk_results"].append((block, pd.DataFrame(), {}))
+                continue
+            n = grid.cells_per_chunk
+            df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
+            df["count"] = np.array(
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+            )
+            ids = sorted(cells)
+            ragged = {
+                "h_tdigest": (
+                    [cells[i]["h_tdigest"][0] for i in ids],
+                    ids,
+                    [cells[i]["h_tdigest"][1] for i in ids],
+                )
+            }
+            kwargs["chunk_results"].append((block, df, ragged))
+            occupied.extend(int(children[i]) for i in sorted(cells))
+        kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
+        return pd.DataFrame(), {
+            "shard_key": int(shard_key),
+            "cells_with_data": len(occupied),
+            "total_obs": sum(c["count"] for cells in by_chunk.values() for c in cells.values()),
+            "granule_count": 1,
+            "files_processed": 1,
+            "duration_s": 0.0,
+            "time_range": time_range,
+            "error": None,
+        }
+
+    return fake
+
+
+def build_windowed(out: Path) -> None:
+    """The §1.5 derived-coordinate ``windowed/`` fixture (issue #586 phase 3).
+
+    ``minimal/``'s geometry and cell plan with a LOCATED digest field, written
+    as one WINDOWED leaf (``{id}_{window}.zarr``, a ``morton-hive/2`` stamp).
+    A windowed leaf stores no per-cell ``morton`` array: its cell words are
+    derived from the leaf id and the rank, and the ``derivation`` block of the
+    expected file records them — from mortie, never read back — beside the
+    order-19 instance of the law (one stride across an order-9 shard, both
+    hemispheres). The located sibling is what lets a reader CHECK the
+    derivation on committed bytes: every location word of a cell lies inside
+    that cell's derived word.
+    """
+    from mortie import clip2order, orders_of
+
+    import zagg.processing as processing
+    from zagg import hive
+    from zagg.config import get_windowing
+    from zagg.grids import HealpixGrid
+    from zagg.grids.morton import cell_words, morton_word
+    from zagg.stats.tdigest import build_tdigest
+    from zagg.windows import parse_utc, utc_to_offset, window_range
+
+    cfg = _windowed_config()
+    windowing = get_windowing(cfg)
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    shard = morton_word(SHARD_KEY)
+    derived = cell_words(shard, 6)
+    rng = np.random.default_rng(586)
+
+    to_dataset = {k: windowing[k] for k in ("epoch", "scale", "units")}
+    lo, hi = window_range(WINDOWED_LABEL, windowing["schedule"])
+    window = {
+        "label": WINDOWED_LABEL,
+        "start": utc_to_offset(lo, **to_dataset),
+        "end": utc_to_offset(hi, **to_dataset),
+    }
+    # The leaf's written extent, in dataset units (the worker's own return).
+    time_range = (
+        utc_to_offset(parse_utc("2019-03-01T00:00:00Z"), **to_dataset),
+        utc_to_offset(parse_utc("2019-09-01T00:00:00Z"), **to_dataset),
+    )
+
+    by_chunk: dict = {}
+    expected_cells = []
+    for chunk, local, n in [(0, 0, 40), (0, 2, 1), (1, 1, 5), (3, 3, 300)]:
+        cell_index = chunk * grid.cells_per_chunk + local
+        cell_word = int(derived[cell_index])
+        h = np.round(rng.normal(30.0, 5.0, n), 3).astype(np.float64)
+        words = np.asarray(_point_words(grid, cell_word, n, rng))
+        digest, locs = build_tdigest(h, DELTA, locations=words)
+        # The claim the fixture exists to pin, asserted on the INPUTS: every
+        # location word's ancestor at the cell order is the derived cell word.
+        assert np.all(orders_of(locs) >= 6), orders_of(locs)
+        assert np.all(clip2order(6, np.asarray(locs, dtype=np.uint64)) == derived[cell_index])
+        by_chunk.setdefault(chunk, {})[local] = {"count": n, "h_tdigest": (digest, locs)}
+        expected_cells.append(
+            {
+                "index": cell_index,
+                # DERIVED — the leaf stores no coordinate to read it from.
+                "morton": str(cell_word),
+                "count": n,
+                "h_tdigest": [[float(m), float(w)] for m, w in digest],
+                "h_tdigest_locations": [str(int(w)) for w in locs],
+                "location_orders": [int(o) for o in orders_of(locs)],
+            }
+        )
+    assert EMPTY_CHUNK not in by_chunk
+    # Heterogeneous orders (§2.2): the 300-observation cell merges, so its
+    # words are common ancestors coarser than the order-29 points beside them.
+    assert len({o for c in expected_cells for o in c["location_orders"]}) > 1
+
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    root = str(out)
+    hive.ensure_manifest(
+        root,
+        hive.build_manifest(
+            grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"}, windowing=windowing
+        ),
+    )
+    original = processing.process_shard
+    processing.process_shard = _fake_windowed_shard(grid, by_chunk, time_range)
+    try:
+        meta = hive.process_and_write_hive(
+            shard,
+            ["s3://fixture/a.h5"],
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            window=window,
+            sidecar_spec=hive.HIVE_SPEC_V2,
+        )
+    finally:
+        processing.process_shard = original
+    assert meta.get("error") is None, meta
+
+    leaf_rel = hive.shard_leaf_path("", shard, window=WINDOWED_LABEL).lstrip("/")
+    assert not (out / leaf_rel / grid.group_path / "morton").exists()
+
+    order19 = []
+    for dec in WINDOWED_ORDER19_SHARDS:
+        word = morton_word(dec)
+        words = cell_words(word, 19)
+        strides = np.unique(np.diff(words))
+        assert len(words) == 4**10 and len(strides) == 1, (dec, strides)
+        order19.append(
+            {
+                "shard": dec,
+                "shard_word": str(word),
+                "bit63": int(word >> 63),
+                "n_cells": len(words),
+                "first": str(int(words[0])),
+                "last": str(int(words[-1])),
+                "stride": str(int(strides[0])),
+            }
+        )
+    assert {e["bit63"] for e in order19} == {0, 1}, order19
+
+    expected = {
+        "shard": SHARD_KEY,
+        "shard_word": str(shard),
+        "leaf": leaf_rel,
+        "window": WINDOWED_LABEL,
+        "group": grid.group_path,
+        "shard_order": 4,
+        "chunk_order": 5,
+        "cell_order": 6,
+        "cells_per_chunk": grid.cells_per_chunk,
+        "chunks_per_shard": grid.chunks_per_shard,
+        "empty_chunk": EMPTY_CHUNK,
+        "delta": DELTA,
+        # §1.5 "The cell coordinate": the words a reader must derive for this
+        # leaf's cells axis (rank order), their one stride at this cell
+        # order, and the order-19 instance of the same law.
+        "derivation": {
+            "words": [str(int(w)) for w in derived],
+            "stride": str(int(derived[1] - derived[0])),
+            "order19": order19,
+        },
+        "cells": expected_cells,
+        "content_hashes": _o11_hashes(str(out / leaf_rel)),
+    }
+    assert f"{grid.group_path}/morton" not in expected["content_hashes"]["arrays"]
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(
+        f"{out.name}: windowed leaf {leaf_rel}, {len(expected_cells)} populated cells, "
+        f"no stored morton"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1661,6 +1923,7 @@ def main() -> None:
         ),
         "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
         "temporal": lambda: build_temporal(args.out / "temporal"),
+        "windowed": lambda: build_windowed(args.out / "windowed"),
     }
     unknown = set(args.only or ()) - set(builders)
     if unknown:

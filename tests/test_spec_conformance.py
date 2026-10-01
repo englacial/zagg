@@ -57,6 +57,8 @@ RAGGED_ARRAYS = [
     ("temporal", "h_tdigest", "float32", (2,)),
     ("temporal", "h_tdigest_locations", "uint64", ()),
     ("temporal", "h_tdigest_times", "uint64", ()),
+    ("windowed", "h_tdigest", "float32", (2,)),
+    ("windowed", "h_tdigest_locations", "uint64", ()),
 ]
 SENTINEL = 2**64 - 1
 
@@ -93,6 +95,10 @@ FROZEN_COMBINED = {
     # Re-pinned for the §10.5 gap cell (issue #489): the last cell's clock
     # moved, so its two toc companions -- and only those -- hash differently.
     "temporal": "6c7a0c5a3f54684b67e7e2daa66e29ffcf1af102833e7b3c4a4f989e36752887",
+    # The §1.5 derived-coordinate fixture (issue #586 phase 3) — asserted by
+    # TestDerivedCellCoordinate. A WINDOWED leaf: the digest is over three
+    # arrays, with no ``6/morton`` among them.
+    "windowed": "5b712e804d5120bac66031739483f319fb1bdf346d82e2d0b087f9bd2ddec170",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -129,6 +135,12 @@ FROZEN_ARRAYS = {
         "temporal",
         "6/h_tdigest_times",
     ): "03a1e44b982a553c8a419f66563d712b7f070c5f0761e1982f9912740ffee468",
+    # The located sibling a windowed leaf's derived coordinate is checked
+    # against (§1.5, issue #586 phase 3).
+    (
+        "windowed",
+        "6/h_tdigest_locations",
+    ): "701d6902b05f31e90be26279b150cb53749016403b377d20f1402d4256674347",
 }
 
 
@@ -1221,6 +1233,7 @@ class TestFixtureSemanticHash:
         "raster_toc",
         "temporal",
         "demoted",
+        "windowed",
     )
 
     @pytest.mark.parametrize(
@@ -1267,6 +1280,16 @@ class TestFixtureSemanticHash:
 
         gen = self._generator()
         assert self._recorded("temporal") == semantic_hash(gen._temporal_config())
+
+    def test_the_windowed_fixture_hash_is_reproducible(self):
+        # The §1.5 fixture (issue #586 phase 3) is built from its own config
+        # literal. ``output.windowing`` is leaf-shaping, so this digest is not
+        # the unwindowed product's — and dropping the stored coordinate moved
+        # nothing in it: the derivation is layout, not semantics.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("windowed") == semantic_hash(gen._windowed_config())
 
     def test_every_fixture_is_covered(self):
         # The gate on the gate: a fixture added without a hash pin ships a
@@ -1330,7 +1353,7 @@ class TestFixtureGranuleIdentity:
     #: ``test_every_fixture_is_covered`` is, so a new fixture cannot ship one
     #: unguarded.
     SIBLINGS = sorted(
-        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules.json")
+        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules*.json")
     )
 
     def test_every_leaf_fixture_carries_the_sibling(self):
@@ -1340,11 +1363,16 @@ class TestFixtureGranuleIdentity:
         # leaf, hence no sibling), which is why this keys on the leaf.
         # The sibling sits beside the STABLE root (``pointer`` on a versioned
         # fixture, §1.5), never inside a version subgroup.
-        want = {
-            f"{name}/{Path(exp.get('pointer', exp['leaf'])).parent.as_posix()}/granules.json"
-            for name in TestFixtureSemanticHash.COVERED
-            if (exp := _expected(name)).get("leaf")
-        }
+        # A windowed leaf's sibling takes the window into its name
+        # (``granules_{window}.json``, the sidecar grammar).
+        from zagg.telemetry import granule_ids_key
+
+        want = set()
+        for name in TestFixtureSemanticHash.COVERED:
+            if not (exp := _expected(name)).get("leaf"):
+                continue
+            root = Path(exp.get("pointer", exp["leaf"]))
+            want.add(f"{name}/{root.parent.as_posix()}/{granule_ids_key(root.name)}")
         assert set(self.SIBLINGS) == want
 
     @pytest.mark.parametrize("rel", SIBLINGS)
@@ -2302,3 +2330,159 @@ class TestVersionedLeaf:
             assert data == SPEC_DATA / name / exp["leaf"]
             count = zarr.open_array(LocalStore(str(data)), path=f"{exp['group']}/count", mode="r")
             assert int(count[:].sum()) == sum(c["count"] for c in exp["cells"])
+
+
+class TestDerivedCellCoordinate:
+    """§1.5 "The cell coordinate" — a windowed leaf stores no ``morton`` array.
+
+    Pinned on the committed ``windowed/`` leaf (issue #586 phase 3): the
+    array is absent, the §5 key set has no entry for it, and the words a
+    reader must DERIVE — the shard's children at the cell order, in nested
+    order — are the fixture's recorded ones, reproduced here three ways:
+    through mortie, through the strided arithmetic the law reduces to at
+    ``cell_order <= 27``, and through the shipping readers. The located
+    sibling is what holds the derivation against committed bytes.
+    """
+
+    NAME = "windowed"
+
+    def test_the_leaf_stores_no_coordinate(self):
+        exp = _expected(self.NAME)
+        group = _leaf_dir(self.NAME, exp) / exp["group"]
+        assert sorted(p.name for p in group.iterdir() if p.is_dir()) == [
+            "count",
+            "h_tdigest",
+            "h_tdigest_locations",
+        ]
+        # The dggs block still NAMES the coordinate; it is derived, not stored.
+        attrs = json.loads((group / "zarr.json").read_text())["attributes"]
+        assert attrs["dggs"]["coordinate"] == "morton"
+        assert attrs["dggs"]["refinement_level"] == exp["cell_order"]
+
+    def test_the_stamp_is_windowed_and_its_key_set_has_no_coordinate(self):
+        exp = _expected(self.NAME)
+        stamp = json.loads((_leaf_dir(self.NAME, exp) / "zarr.json").read_text())["attributes"][
+            "morton_hive_commit"
+        ]
+        assert stamp["spec"] == "morton-hive/2" and stamp["window"] == exp["window"]
+        assert Path(exp["leaf"]).name == f"{exp['shard']}_{exp['window']}.zarr"
+        # §5.3: the stamp's copy and the fixture's record are one key set,
+        # and `{cell_order}/morton` is not in it.
+        assert stamp["content_hashes"] == exp["content_hashes"]
+        assert sorted(exp["content_hashes"]["arrays"]) == [
+            "6/count",
+            "6/h_tdigest",
+            "6/h_tdigest_locations",
+        ]
+        assert (
+            TestContentHashes._hash_leaf(_leaf_dir(self.NAME, exp))
+            == (exp["content_hashes"]["arrays"])
+        )
+        assert exp["content_hashes"]["combined"] == FROZEN_COMBINED[self.NAME]
+
+    def test_the_unwindowed_fixtures_still_store_theirs(self):
+        # The other half of the rule: every unwindowed leaf keeps its array,
+        # key and bytes — no committed fixture moved (the FROZEN literals
+        # above are the byte pin; this is the presence pin).
+        for name in (*FIXTURES, "flux", "temporal", "raster_toc"):
+            exp = _expected(name)
+            assert (_leaf_dir(name, exp) / exp["group"] / "morton" / "zarr.json").exists()
+            assert f"{exp['group']}/morton" in exp["content_hashes"]["arrays"]
+
+    def test_the_derivation_law_reproduces_the_recorded_words(self):
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import cell_words, morton_word
+
+        exp = _expected(self.NAME)
+        want = np.array([int(w) for w in exp["derivation"]["words"]], dtype=np.uint64)
+        shard = morton_word(exp["shard"])
+        assert shard == int(exp["shard_word"])
+        # The law, in mortie's terms: cell j is the shard's j-th child.
+        np.testing.assert_array_equal(
+            np.asarray(generate_morton_children(shard, exp["cell_order"]), dtype=np.uint64), want
+        )
+        np.testing.assert_array_equal(cell_words(shard, exp["cell_order"]), want)
+        # ... and the arithmetic it reduces to at cell_order <= 27, from the
+        # spec text alone: one stride of 2**(60 - 2c) from the first child.
+        stride = 2 ** (60 - 2 * exp["cell_order"])
+        assert int(exp["derivation"]["stride"]) == stride
+        assert [int(want[0]) + j * stride for j in range(len(want))] == [int(w) for w in want]
+        for cell in exp["cells"]:
+            assert int(want[cell["index"]]) == int(cell["morton"])
+
+    def test_the_order_19_instance_is_one_stride_in_both_hemispheres(self):
+        # The production geometry (order-9 shards, order-19 cells): 4,194,304
+        # between consecutive cells across the whole shard. The southern
+        # shard's word sets bit 63 — the case a signed reader gets wrong.
+        from zagg.grids.morton import cell_words, morton_word
+
+        pins = _expected(self.NAME)["derivation"]["order19"]
+        assert sorted(p["bit63"] for p in pins) == [0, 1]
+        for pin in pins:
+            word = morton_word(pin["shard"])
+            assert word == int(pin["shard_word"]) and word >> 63 == pin["bit63"]
+            words = cell_words(word, 19)
+            assert words.dtype == np.uint64 and len(words) == pin["n_cells"] == 4**10
+            assert int(pin["stride"]) == 4_194_304 == 2 ** (60 - 2 * 19)
+            assert int(words[0]) == int(pin["first"]) and int(words[-1]) == int(pin["last"])
+            expected = np.uint64(int(pin["first"])) + np.arange(4**10, dtype=np.uint64) * np.uint64(
+                4_194_304
+            )
+            np.testing.assert_array_equal(words, expected)
+
+    def test_every_location_word_lies_inside_its_derived_cell(self):
+        # The check that needs no stored coordinate: decode each word's own
+        # order (they are heterogeneous, §2.2) and take its ancestor at the
+        # cell order. Stated twice — mortie's clip, and the decimal-prefix
+        # rule ("a string prefix is the spatial ancestor").
+        from mortie import clip2order, orders_of
+
+        from zagg.grids.morton import morton_decimal, words_in_cell
+
+        exp = _expected(self.NAME)
+        store = _leaf_store(self.NAME, exp)
+        orders_seen = set()
+        for cell in exp["cells"]:
+            words = read_cell(store, f"{exp['group']}/h_tdigest_locations", cell["index"])
+            np.testing.assert_array_equal(
+                words, np.array(cell["h_tdigest_locations"], dtype=np.uint64)
+            )
+            derived = int(cell["morton"])
+            orders = [int(o) for o in orders_of(words)]
+            assert orders == cell["location_orders"] and min(orders) >= exp["cell_order"]
+            orders_seen.update(orders)
+            assert (clip2order(exp["cell_order"], words) == np.uint64(derived)).all()
+            assert words_in_cell(words, derived).all()
+            prefix = morton_decimal(derived)
+            assert all(morton_decimal(int(w)).startswith(prefix) for w in words)
+            # A neighbouring cell's word is NOT this cell's: the check bites.
+            other = int(exp["derivation"]["words"][(cell["index"] + 1) % 16])
+            assert not words_in_cell(words, other).any()
+        assert len(orders_seen) > 1  # heterogeneous on committed bytes
+
+    def test_the_shipping_readers_derive_the_chunk_words(self):
+        # No stored coordinate to read: the readers derive it from the leaf's
+        # own stamp, and report the same read-chunk ids a stored one gives.
+        from mortie import clip2order
+
+        from zagg.readers.tdigest_tensor import cell_index as resolve_index
+
+        exp = _expected(self.NAME)
+        store = _leaf_store(self.NAME, exp)
+        derived = np.array([int(w) for w in exp["derivation"]["words"]], dtype=np.uint64)
+        chunk_words = clip2order(exp["chunk_order"], derived)
+        per_chunk = exp["cells_per_chunk"]
+        rows = list(read_locations(store, f"{exp['group']}/h_tdigest"))
+        assert len(rows) == len(exp["cells"])
+        got = {}
+        for word, (row, col), locs in rows:
+            index = resolve_index(store, f"{exp['group']}/h_tdigest", word, row, col)
+            assert int(chunk_words[index]) == word and index // per_chunk != exp["empty_chunk"]
+            got[index] = [str(int(w)) for w in locs]
+        assert got == {c["index"]: c["h_tdigest_locations"] for c in exp["cells"]}
+        # The empty chunk is in the stored span but holds no payload: its id
+        # resolves to nothing, as it does under a stored coordinate.
+        empty = int(chunk_words[exp["empty_chunk"] * per_chunk])
+        with pytest.raises(ValueError, match="no stored read chunk"):
+            resolve_index(store, f"{exp['group']}/h_tdigest", empty, 0, 0)

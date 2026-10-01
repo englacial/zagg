@@ -32,8 +32,16 @@ Two modes share every check:
   idempotency is asserted there, and this harness only reads.
 
 The printed checklist mirrors issue #434's phases: declaration (the
-build-side contract), materialization (the sweep's output), read-back, then
-the conservation checks. Digest comparisons re-fold contributors with the
+build-side contract), the leaf cell coordinates, materialization (the sweep's
+output), read-back, then the conservation checks. ``coordinates`` (issue #586
+phase 3, spec §1.5 "The cell coordinate") is the one check about the LEAVES
+themselves and the one a windowed store gets: per sampled leaf it derives the
+cell words from the leaf id and the rank, requires every location word of a
+sampled occupied cell to lie inside the derived cell, and — where a leaf
+still stores a ``morton`` array, which a windowed leaf no longer does —
+compares the stored word with the derived one. A store with no located field
+and no stored coordinate is reported as *derivation only* (``skip``), never
+as a pass. Digest comparisons re-fold contributors with the
 k-way merge law at the manifest's overview δ (issue #424) and re-sort
 centroids by mean before any CDF interpolation — concatenation does not
 preserve the sort, and an unsorted digest interpolates garbage (the
@@ -68,6 +76,7 @@ from zagg.pyramid_check_core import (
     WEIGHT_RTOL,  # noqa: F401
     _check_node,
     _composable_fields,
+    _coordinates_check,
     _entry,
     _field_groups,
     _finish,
@@ -81,8 +90,13 @@ from zagg.pyramid_check_core import (
 logger = logging.getLogger(__name__)
 
 #: Checklist keys, in print order (mirrors issue #434's phases) — the ``/1`` arm.
+#: ``coordinates`` is the leaf cell-coordinate check (issue #586 phase 3, spec
+#: §1.5): derived cell words against the located fields' location words and,
+#: where a leaf still stores one, its ``morton`` array. It is the one check a
+#: WINDOWED store gets — its leaves are the ones that store no coordinate.
 CHECKS = (
     "declaration",
+    "coordinates",
     "materialization",
     "readback",
     "counts",
@@ -95,6 +109,7 @@ CHECKS = (
 #: (``columns``), between the ladder materialization and the value checks.
 CHECKS_V2 = (
     "declaration",
+    "coordinates",
     "materialization",
     "columns",
     "readback",
@@ -197,6 +212,34 @@ def validate_pyramid(
             "(both issue #547 targets are unwindowed)",
         )
         skip_rest("windowed store", after="declaration")
+        # ... except the leaf cell-coordinate check, which is about the leaves
+        # alone: a windowed leaf stores no ``morton`` array (issue #586 phase
+        # 3), so this is where its derived words are held against what the
+        # store does carry. The roster is the run records' (leaf, window) set.
+        try:
+            from zagg.grids.morton import morton_decimal
+            from zagg.sweep import discover_leaves
+
+            refs = [
+                (morton_decimal(key), window)
+                for key, window in discover_leaves(store_root, store_kwargs=store_kwargs)
+            ]
+        except Exception as exc:
+            checks["coordinates"] = _entry("fail", f"no leaf roster from the run records: {exc}")
+            return _finish(report, CHECKS)
+        report["roster"] = {"source": "run records", "leaves": len(refs)}
+        _coordinates_check(
+            store_root,
+            manifest,
+            refs,
+            store_kwargs,
+            checks,
+            report,
+            seed=seed,
+            sample_nodes=sample_nodes,
+            sample_cells=sample_cells,
+            full=full,
+        )
         return _finish(report, CHECKS)
     ladder = _ladder(manifest)
     fields = _composable_fields(manifest)
@@ -269,6 +312,18 @@ def validate_pyramid(
         checks["materialization"] = _entry("fail", f"empty leaf roster (source {roster_source})")
         skip_rest("empty roster", after="materialization")
         return _finish(report, CHECKS)
+    _coordinates_check(
+        store_root,
+        manifest,
+        [(dec, None) for dec in leaves],
+        store_kwargs,
+        checks,
+        report,
+        seed=seed,
+        sample_nodes=sample_nodes,
+        sample_cells=sample_cells,
+        full=full,
+    )
 
     # -- [2] materialization: declared node roster vs stored overview objects.
     # "Materialized" means COMMITTED, in the sweep's own sense: ``role:

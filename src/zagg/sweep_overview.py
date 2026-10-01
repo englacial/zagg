@@ -1883,7 +1883,7 @@ def _fold_node(
     import zarr
 
     from zagg.grids.morton import morton_word
-    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
+    from zagg.hive import leaf_cells_shape, leaf_data_path, read_commit, shard_leaf_path
     from zagg.stats.composition import merge_composition_kway
     from zagg.store import open_store
     from zagg.windows import union_time_range
@@ -1953,10 +1953,12 @@ def _fold_node(
                     # Inside the try: an invalid ``current`` skips THIS leaf.
                     leaf_store = open_store(leaf_data_path(leaf, stamp), **store_kwargs)
                 group = zarr.open_group(leaf_store, path=str(cell_order), mode="r", zarr_format=3)
-                morton = group["morton"]
-                if morton.shape != (leaf_cells,):
+                # The stored ``morton`` extent, or — on a windowed leaf, which
+                # stores no coordinate (spec §1.5) — a declared field's.
+                axis = leaf_cells_shape(group, fields, windowed=window is not None)
+                if axis is not None and axis != (leaf_cells,):
                     raise ValueError(
-                        f"morton shape {morton.shape} is not the manifest cell_order "
+                        f"cells-axis shape {axis} is not the manifest cell_order "
                         f"{cell_order} subtree ({leaf_cells} cells); mixed-order source "
                         f"leaves are unsupported this round (issue #347: sweep fold "
                         f"semantics + the writer-side append guard)"

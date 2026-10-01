@@ -1141,6 +1141,64 @@ def read_coverage(leaf_store) -> dict | None:
     return dict(coverage)
 
 
+def leaf_cells_shape(group, names, *, windowed: bool) -> tuple | None:
+    """The shape pinning a leaf's cells axis, for the mixed-order guards (issue #347).
+
+    An unwindowed leaf: its stored ``morton`` coordinate's shape (an absent
+    array raises ``KeyError``, as it always has). A windowed leaf stores no
+    coordinate (spec §1.5 "The cell coordinate", issue #586 phase 3), so the
+    guard stands on the first of ``names`` the leaf carries — every per-cell
+    array shares the cells axis — and reads ``None`` when it carries none of
+    them (nothing folds from such a leaf, so there is nothing to guard).
+    """
+    if not windowed:
+        return tuple(group["morton"].shape)
+    for name in names:
+        try:
+            return tuple(group[name].shape[:1])
+        except KeyError:
+            continue
+    return None
+
+
+def derived_leaf_words(stamp: dict | None, n_cells: int) -> np.ndarray | None:
+    """A WINDOWED leaf's per-cell words, derived from its own stamp (spec §1.5).
+
+    For a reader holding a leaf-rooted store rather than the leaf's path
+    (whose ``{id}`` is the normative leaf id, D3): every member of the stamp's
+    tier-0 box is the shard itself or a descendant (:func:`build_coverage`
+    refuses anything else), and a leaf's cells axis is exactly one shard
+    subtree, so the box member's ancestor at ``cell_order - log4(n_cells)`` is
+    the shard, and the words are :func:`zagg.grids.morton.cell_words` over it.
+
+    ``None`` unless ``stamp`` is a windowed leaf's: an unwindowed leaf stores
+    its ``morton`` array, so its absence there stays the caller's error.
+    Raises ``ValueError`` when a windowed stamp cannot identify the shard.
+    """
+    if not stamp or stamp.get("window") is None:
+        return None
+    from zagg.grids.morton import cell_words, morton_word
+
+    coverage = stamp.get("coverage") or {}
+    box = [m for m in coverage.get("box") or [] if m]
+    depth = (int(n_cells).bit_length() - 1) // 2
+    if coverage.get("spec") != COVERAGE_SPEC or not box or 4**depth != int(n_cells):
+        raise ValueError(
+            f"windowed leaf (window {stamp.get('window')!r}) stores no 'morton' coordinate "
+            f"and its stamp cannot identify the shard to derive one from (coverage "
+            f"{coverage.get('spec')!r}, {n_cells} cells)"
+        )
+    cell_order = int(coverage["cell_order"])
+    member = str(box[0])
+    shard = member[: len(_decimal_base(member)) + cell_order - depth]
+    if _decimal_order(shard) != cell_order - depth:
+        raise ValueError(
+            f"coverage box member {member} is coarser than the order-{cell_order - depth} "
+            f"shard a {n_cells}-cell order-{cell_order} axis implies"
+        )
+    return cell_words(morton_word(shard), cell_order)
+
+
 def _decimal_base(decimal: str) -> str:
     """The ``{sign+base}`` component of a D1 decimal id."""
     return decimal[:2] if decimal.startswith("-") else decimal[:1]
@@ -1708,6 +1766,11 @@ class _LeafUnit:
         self.identity = None
         self.box: dict = {}
         self.write_elapsed = 0.0
+        # A windowed leaf stores no per-cell ``morton`` array (issue #586
+        # phase 3, spec §1.5 "The cell coordinate"): the word is derived from
+        # the leaf id and the rank, so the template omits the member and the
+        # writers drop the carrier column. An unwindowed leaf is unchanged.
+        self.omit: tuple = ("morton",) if window is not None else ()
         # Sharded leaf output (issue #236): the sharded leaf template bundles
         # each dense array's K inner chunks into ONE ShardingCodec object, so
         # the per-chunk streaming write would read-modify-write that object K
@@ -1912,7 +1975,7 @@ class _LeafUnit:
             # trade stops being acceptable; it is not taken here because D4 makes
             # "replaced wholesale" the contract and a stamp must never block a
             # retry.
-            self.grid.emit_shard_template(store, overwrite=True)
+            self.grid.emit_shard_template(store, overwrite=True, cell_coordinate=not self.omit)
             self.box["store"] = store
         return self.box["store"]
 
@@ -1921,7 +1984,12 @@ class _LeafUnit:
         store = self._leaf()
         local = leaf_block_index(self.grid, block_index, self.shard_key)
         self._write_dataframe(
-            carrier, store, grid=self.grid, chunk_idx=local, staged_out=self.staged
+            carrier,
+            store,
+            grid=self.grid,
+            chunk_idx=local,
+            staged_out=self.staged,
+            omit=self.omit,
         )
         if ragged:
             self.ragged_chunks.append((local, ragged))
@@ -1981,6 +2049,7 @@ class _LeafUnit:
                 grid=grid,
                 shard_key=int(shard_key),
                 staged_out=staged,
+                omit=self.omit,
             )
             self.write_elapsed += time.time() - _t0
         # Stamp ONLY a fully-written leaf: an errored shard (or one that

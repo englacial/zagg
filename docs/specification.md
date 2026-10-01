@@ -151,7 +151,10 @@ A ragged field `{field}` under a product group is up to four sibling arrays:
 {group}/{field}_times       <- TEMPORAL fields only (§8.3, issue #410): per-row
                                uint64 toc words, row-aligned with {field}
 {group}/morton              <- per-cell uint64 morton coordinate (zagg's standard
-                               HEALPix coordinate array; the chunk-identity source)
+                               HEALPix coordinate array; the chunk-identity source).
+                               STORED on an unwindowed leaf, DERIVED on a windowed
+                               one, which stores no such array (§1.5 "The cell
+                               coordinate")
 ```
 
 - Each populated cell's value MUST be the raw **little-endian** bytes of an
@@ -265,7 +268,8 @@ only. The 2-GET random-access recipe follows: fetch the
 cell.
 
 **Subtree spans.** The cells axis MUST be in canonical nested order — the
-per-cell `morton` coordinate ascending, every aligned power-of-four span
+per-cell `morton` coordinate (stored or derived, "The cell coordinate"
+below) ascending, every aligned power-of-four span
 sharing its ancestor cell (the ordering every §1 identity derivation and the
 rank-space deinterleave already presuppose; a zagg writer has never produced
 anything else, this sentence makes it citable). Consequently the order-`k`
@@ -277,6 +281,84 @@ chunks (the 2-GET recipe generalized to a span), on the per-inner-chunk
 geometry only the covering chunk objects — never a whole-array sweep. The
 span property is normative; a dedicated subtree reader is implementation
 (zagg: [issue #351](https://github.com/englacial/zagg/issues/351)).
+
+**The cell coordinate.** The per-cell `morton` coordinate is a pure function
+of the leaf and the rank, and this is its law (issue
+[#586](https://github.com/englacial/zagg/issues/586), espg ruling
+2026-10-01): **the cells axis of a leaf is the shard's children at the cell
+order, in canonical nested order, and cell `j` carries the packed word of the
+`j`-th child.** In mortie's terms that is
+`generate_morton_children(shard, cell_order)[j]`: the shard's own base cell
+and order-`p` tuples, then the `c − p` tuples that spell `j` in base 4 (most
+significant first), under the suffix of order `c` (mortie spec §1). The
+**shard** is the leaf's id — the `{id}` of its name, `{id}.zarr` or
+`{id}_{window}.zarr` (§4.2), the D3 address every reader computes. For a cell
+order `c ≤ 27`, where mortie's suffix is the order itself and every tuple is
+two bits, the law reduces to one arithmetic progression across the whole
+shard, in both hemispheres:
+
+```text
+word[j] = word[0] + j · 2^(60 − 2c)        word[0] = shard word + (c − p)
+```
+
+— **4,194,304 per cell at cell order 19**, the instance the §7 `windowed/`
+fixture pins on an order-9 shard in each hemisphere (a southern word sets bit
+63; the progression is unsigned). At cell orders 28 and 29 mortie's suffix
+packs the last tuples (mortie §1), the stride is not uniform, and only the
+children law applies — so the law is mortie's children, and the stride is an
+instance of it, never the definition.
+
+Whether the coordinate is **stored** depends on the leaf:
+
+- An **unwindowed** leaf (`{id}.zarr`, a `morton-hive/1` stamp) MUST store it
+  as `{cell_order}/morton`, exactly as at every earlier revision. Its written
+  inner chunks hold the derived words and its unwritten ones the `0` fill
+  (§7), so the stored array doubles as a chunk-occupancy record.
+- A **windowed** leaf (`{id}_{window}.zarr`, a `morton-hive/2` stamp naming
+  `window`) written from this revision on MUST NOT store it. N windows of one
+  shard would each carry the same 8 bytes per cell — 8.4 MB per full order-9
+  shard at cell order 19, of an array that carries no information. This binds
+  point and raster leaves alike (for a raster leaf the derived word simply is
+  the coordinate of its `(time, cells)` arrays), and a versioned leaf's
+  version subgroups with them. The group's `dggs` attrs still read
+  `"coordinate": "morton"`: that names the coordinate, it does not promise an
+  array of that name.
+- Windowed leaves written **before** this revision store the array, and
+  remain valid as they stand — no leaf requires rewriting. So **readers carry
+  one rule: use `{cell_order}/morton` where the leaf has it, and derive it
+  where a windowed leaf does not.** A derived word is never `0`: a reader of
+  a derived coordinate MUST take occupancy from the payload arrays (or the
+  stamp's coverage), never from the coordinate. Absence on an *unwindowed*
+  leaf is corruption, not a licence to derive, and MUST be refused.
+- The §4 artifacts — overview zarrs and leaf columns — are not leaves: each
+  of their resolution groups stores its `morton` array at every revision,
+  under a windowed store too (§4.4, §4.6).
+
+*(Informative.)* A reader holding only a leaf-rooted store, not the leaf's
+path, can recover the id from the leaf's own stamp: every member of the
+tier-0 coverage box is the shard or a descendant of it, and the cells axis is
+exactly one shard subtree, so the ancestor of any box member at order
+`cell_order − log4(n_cells)` is the shard
+(`zagg.hive.derived_leaf_words`; `zagg.grids.morton.cell_words` is the
+derivation every zagg reader goes through).
+
+**The containment check.** A derived coordinate has no stored twin to be
+compared with, so what verifies it is the data. For a located field
+(§2.2/§9), every location word stored in cell `j` MUST lie inside cell `j`:
+**the word's ancestor at the cell order equals the derived word `word[j]`.**
+Location words are heterogeneous in order (§2.2), so a checker MUST decode
+each word's order from the word and MUST NOT assume order 29 — two order-29
+point words in one order-19 cell merge to an area word (order 20, say) whose
+order-19 ancestor is still the cell, and a spill-block close or an overview
+fold coarsens words but never past the cell they were folded in. The one
+word that can be coarser than its cell is a §9 area word ingested from an
+input resolved only above the cell order (no shipped config does this);
+there the check is that the cell lies inside the word — the two on one
+ancestor line. A leaf with **no located field** carries no stored morton
+word at all and rests on the derivation alone: a checker MUST report that as
+derivation-only, never as a pass (zagg: the `coordinates` check of
+`python -m zagg.pyramid_check`, which also compares the stored array with
+the derivation wherever a leaf still stores one).
 
 **Leaf immutability.** A committed leaf's data objects are **write-once**:
 once the commit stamp lands, a writer MUST NOT modify bytes at an existing
@@ -778,6 +860,12 @@ is `{window}.zarr`, and the reserved token **`all`** names the all-time fold
 (`all.zarr` — the same token that names a `schedule: none` store's leaves;
 excluded from the window grammar forever). Nothing about the *name*
 distinguishes an overview from a leaf — classification is §4.3's job.
+
+A **windowed leaf** (`{id}_{window}.zarr`) is the one leaf form that stores
+no per-cell `morton` array: every window of a shard shares the shard's cells
+axis, so the coordinate is derived from the `{id}` and the rank (§1.5 "The
+cell coordinate"). The overview and column artifacts named in this section
+store theirs regardless.
 
 A **versioned leaf** (§1.5; a stamp naming `current`) adds nothing at the node: its
 stable `{id}.zarr` / `{id}_{window}.zarr` entry is unchanged, and its
@@ -1960,7 +2048,8 @@ zagg version).
 
 **Contract.** The hash set covers **every named zarr array beneath the leaf
 root** — data fields, the ragged vlen payload arrays and their
-`{field}_locations` siblings, `morton`, every coordinate — keyed by the
+`{field}_locations` siblings, `morton` (where the leaf stores it — a windowed
+leaf does not, §1.5), every coordinate — keyed by the
 array's **path relative to the leaf root** (e.g. `"8/morton"`).
 
 The scope is therefore **discovery-based**: both shipped implementations
@@ -2040,6 +2129,13 @@ stats sidecar, both under `content_hashes`, in the structured shape:
   "combined": "…"
 }
 ```
+
+A **windowed leaf's** key set has no `{cell_order}/morton` entry — in the
+stamp and the sidecar alike — because the array is not stored (§1.5 "The
+cell coordinate"). The scope is discovery-based (§5.1), so this follows from
+the array's absence and is not a second rule; a verifier holding a record of
+the same window from a pre-revision writer reports the difference as §5.1's
+"array missing" outcome, never as a mismatch.
 
 A writer MUST emit the structured shape. A reader SHOULD also accept the
 flat shape (`{array_key: hash, "combined": hash}` — `combined` is reserved
@@ -2208,7 +2304,7 @@ Regeneration of those is deferred because it would
 also install the §4.9 `multiscales` mirror that `column/` pins the
 **absence** of, retiring an unrelated pin.
 
-Seven tiny single-shard hive stores plus two metadata-only ones (the
+Nine tiny single-shard hive stores plus two metadata-only ones (the
 `pyramid/` declaration and the `multiscales/` companion), all on the same
 deliberately small geometry — shard order 4, inner-chunk order 5, cell
 order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
@@ -2365,6 +2461,30 @@ never sharded, §8/#247):
   `gap_ns`. The other fixtures carry no `coverage.toc` either, the §10.5
   absence pin.
 
+- **`windowed/`** — the §1.5 **derived-coordinate** surface (issue
+  [#586](https://github.com/englacial/zagg/issues/586)): `minimal/`'s
+  geometry and cell plan with one located digest field (`h_tdigest` +
+  `h_tdigest_locations`) and `count`, written as one **windowed** leaf —
+  `{id}_2019.zarr`, a `morton-hive/2` stamp naming `window`, under a manifest
+  carrying the D15 temporal block. It is the one fixture leaf with **no
+  `morton` array**: the group holds three arrays, and the stamp's §5.3 key
+  set has no `6/morton` entry. `windowed.expected.json` records, in a
+  `derivation` block, the sixteen words a reader must derive for the cells
+  axis — computed from mortie, never read back — their stride at this cell
+  order (`2^48`), and the **order-19 instance** of the law: for one order-9
+  shard in each hemisphere, the first and last of its 1,048,576 cell words
+  and the one stride between them, `4194304` (the southern shard's word sets
+  bit 63). Each populated cell records its derived `morton`, its location
+  words and their decoded orders, which are heterogeneous on these bytes —
+  order-29 point words beside merged centroids' ancestors, some of them the
+  cell itself — so the conformance suite asserts §1.5's containment check on
+  committed bytes: every location word's ancestor at the cell order is the
+  derived word, and a neighbouring cell's word is not. The shipping readers
+  are run over it too, and report the read-chunk ids a stored coordinate
+  would give. Its §4.6 column (`2019.pyramid.zarr`) stores `morton` in every
+  group, the pin that the artifacts are unchanged. Every other fixture leaf
+  is unwindowed and keeps its stored array, byte for byte.
+
 - **`demoted/`** — the §4.3 `demotions` surface
   ([#518](https://github.com/englacial/zagg/issues/518)): the
   `kitchen_sink/` store swept under a hand-installed `/1` cascade manifest
@@ -2383,8 +2503,9 @@ never sharded, §8/#247):
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
 ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and
 that sparsity reaches the dense arrays too: the `morton` coordinate and
-`count` hold their fill across that chunk, so a reader MUST NOT assume the
-coordinate is dense across a shard), populated chunks contain empty cells
+`count` hold their fill across that chunk, so a reader MUST NOT assume a
+**stored** coordinate is dense across a shard — a derived one, `windowed/`,
+always is), populated chunks contain empty cells
 (the `b""` fill), and one cell's digest carries **merged** centroids whose
 location words are common ancestors (§2.2).
 
@@ -2424,7 +2545,8 @@ itself on both sides, which is also the only mechanism that catches a future
 zagg↔moczarr divergence (neither side's fixture can: espg/moczarr#23).
 
 **Conformance criteria for an external reader**: decode every ragged array
-per §1–§2, the composition array per §3, and every declared word-typed
+per §1–§2, derive the per-cell coordinate of a leaf that stores none per §1.5
+(`windowed/`), the composition array per §3, and every declared word-typed
 array — the time coordinate and both temporal companion shapes per §8, the
 located companion per §9 — reproducing the expected decoded values exactly (byte-exact
 float32/uint64 — no tolerance), and reproduce `content_hashes` per §5. zagg's own suite additionally decodes
