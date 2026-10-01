@@ -5871,11 +5871,12 @@ def _invoke_lambda_icechunk_finalize(
     function_name,
     store_path,
     *,
-    config_dict,
+    config_dict=None,
     run_id,
     icechunk_init=None,
     output_creds_event=None,
     newest_only=False,
+    operator_checks=False,
 ) -> dict:
     """One synchronous ``mode="icechunk_finalize"`` invoke (issue #582); its record.
 
@@ -5888,20 +5889,30 @@ def _invoke_lambda_icechunk_finalize(
     that is not the success envelope), never an empty dict. ``newest_only``
     (``Run.attach``) rides the event: the worker then finalizes only while
     the run is the newest on the repo (``{"skipped"}`` otherwise).
+
+    ``operator_checks`` (the operator's ``icechunk_ops finalize``, issue
+    #588): the event carries NO ``config`` and no init record — ``mode``,
+    ``store_path``, ``run_id``, ``newest_only`` and ``operator_checks`` only.
+    The worker reads the run's dispatch manifest for the config and runs the
+    operator's precondition checks itself; a check that does not hold comes
+    back as ``{"refused": reason}``. A worker that predates the flag fails on
+    the missing ``config`` before any write, where a forwarded config would
+    have let it tag without the checks.
     """
-    event = {
-        "mode": "icechunk_finalize",
-        "store_path": store_path,
-        "run_id": run_id,
-        "config": config_dict,
+    event = {"mode": "icechunk_finalize", "store_path": store_path, "run_id": run_id}
+    if operator_checks:
+        newest_only = True
+    else:
+        event["config"] = config_dict
         # The init record rides so a split ratchet this run applied is
         # reported as pending its operator rewrite (spec §11.5).
-        "icechunk_init": icechunk_init,
-    }
+        event["icechunk_init"] = icechunk_init
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     if newest_only:
         event["newest_only"] = True
+    if operator_checks:
+        event["operator_checks"] = True
     t0 = time.perf_counter()
     try:
         response = lambda_client.invoke(
@@ -5918,6 +5929,8 @@ def _invoke_lambda_icechunk_finalize(
             raise RuntimeError(
                 f"statusCode {result.get('statusCode')}: {body.get('error') or result.get('body')!r}"
             )
+        if body.get("refused"):
+            return {"refused": body["refused"]}
         if not body.get("ok") or not body.get("tag"):
             raise RuntimeError(f"unexpected icechunk_finalize body: {body!r}")
     except Exception as e:

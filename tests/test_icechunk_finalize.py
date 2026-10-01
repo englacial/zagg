@@ -414,6 +414,35 @@ class TestLambdaFinalizeInvoke:
         ((_kind, event),) = client.events
         assert event["newest_only"] is True
 
+    def test_operator_checks_event_carries_no_config(self):
+        # The operator finalize (issue #588): the worker reads the run's
+        # manifest for the config, so a worker predating the flag fails on the
+        # missing key instead of tagging without the checks. A refusal is a
+        # 200 the dispatcher hands back as such, not a fail-open error.
+        from zagg import runner
+
+        refused = {"ok": False, "mode": "icechunk_finalize", "refused": "no staged-sweep record"}
+        client = _Client(_envelope(refused))
+        out = runner._invoke_lambda_icechunk_finalize(
+            client,
+            "fn",
+            "s3://b/p",
+            run_id="r1",
+            operator_checks=True,
+            output_creds_event={"accessKeyId": "a", "secretAccessKey": "s"},
+        )
+        assert out == {"refused": "no staged-sweep record"}
+        ((kind, event),) = client.events
+        assert kind == "RequestResponse"
+        assert event == {
+            "mode": "icechunk_finalize",
+            "store_path": "s3://b/p",
+            "run_id": "r1",
+            "output_credentials": {"accessKeyId": "a", "secretAccessKey": "s"},
+            "newest_only": True,
+            "operator_checks": True,
+        }
+
     @pytest.mark.parametrize(
         "response, raise_exc, match",
         [

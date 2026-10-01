@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 
 import pytest
@@ -470,8 +471,8 @@ class TestCli:
 # -- finalize (issue #588) --------------------------------------------------------
 
 
-class TestFinalizeOperation:
-    """``finalize <run_id>``: tag a completed, untagged ladder run — the newest only."""
+class _FinalizeFixtures:
+    """A run's dispatch manifest and staged-sweep records, as the workers write them."""
 
     DISPATCHED = "2026-01-01T00:00:00+00:00"
 
@@ -556,6 +557,10 @@ class TestFinalizeOperation:
         key = f"sweep_stats_{ts}_stages.json"
         put_object(open_object_store(root), key, json.dumps(record, indent=1).encode())
         return key
+
+
+class TestFinalizeOperation(_FinalizeFixtures):
+    """``finalize <run_id>``: tag a completed, untagged ladder run — the newest only."""
 
     def test_tags_a_completed_newest_untagged_run(self, monkeypatch, cfg, tmp_path):
         _grid_, root = _store(monkeypatch, cfg, tmp_path)
@@ -678,10 +683,345 @@ class TestFinalizeOperation:
         assert len(_messages(root)) == n and not _open(root)[1].list_tags()
 
     def test_cli(self, monkeypatch, cfg, tmp_path, capsys):
+        # A local store finalizes in-process, whatever function is named: no
+        # worker can reach the path, and no Lambda client is ever built.
         _grid_, root = _store(monkeypatch, cfg, tmp_path)
         self._manifest(root, RUN, cfg)
         self._record(root)
-        assert icechunk_ops.main([root, "finalize", RUN]) == 0
+        monkeypatch.setattr(icechunk_ops, "_lambda_client", _fail("built a Lambda client"))
+        assert icechunk_ops.main([root, "finalize", RUN, "--function-name", "fn"]) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["operation"] == "finalize" and out["tagged"] is True
-        assert out["tag"] == f"run-{RUN}"
+        assert out["tag"] == f"run-{RUN}" and "invoke_s" not in out
+
+    def test_refusals_are_finalize_refused(self, monkeypatch, cfg, tmp_path):
+        # The four precondition refusals share one type (a ``ValueError``), so
+        # the worker can tell a refusal from a failure.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no dispatch manifest"):
+            icechunk_ops.finalize_run(root, RUN, store_kwargs={})
+        self._manifest(root, RUN, cfg)
+        self._manifest(root, "r9", cfg)
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no init commit"):
+            icechunk_ops.finalize_run(root, "r9", store_kwargs={})
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no staged-sweep record"):
+            icechunk_ops.finalize_run(root, RUN, store_kwargs={})
+        self._record(root, barrier_timed_out=True)
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="a barrier expired"):
+            icechunk_ops.finalize_run(root, RUN, store_kwargs={})
+        assert issubclass(icechunk_ops.FinalizeRefusedError, ValueError)
+
+
+# -- finalize on a non-local store: the worker's (issue #588 phase 4) --------------
+
+REMOTE = "s3://bucket/store"
+
+#: The whole operator event: no ``config``, no init record.
+OPERATOR_EVENT = {
+    "mode": "icechunk_finalize",
+    "store_path": REMOTE,
+    "run_id": RUN,
+    "newest_only": True,
+    "operator_checks": True,
+}
+
+
+def _fail(what):
+    def touched(*_a, **_k):
+        raise AssertionError(f"the operator's host {what}")
+
+    return touched
+
+
+class _Worker:
+    """A stub Lambda client: a canned response, or the REAL handler on a local store.
+
+    With ``handler`` the invoke runs ``lambda_handler`` in-process on
+    ``root``, which stands for the bucket the event names; ``working`` is
+    true only inside the invoke, so the audit can tell the worker's store
+    access from the host's.
+    """
+
+    def __init__(self, body=None, *, status=200, handler=None, root=None):
+        self.events: list = []
+        self.working = False
+        self._body, self._status, self._handler, self._root = body, status, handler, root
+
+    def invoke(self, **kwargs):
+        event = json.loads(kwargs["Payload"])
+        self.events.append((kwargs["FunctionName"], kwargs["InvocationType"], event))
+        if self._handler is None:
+            result = {"statusCode": self._status, "body": json.dumps(self._body)}
+        else:
+            self.working = True
+            try:
+                result = self._handler.lambda_handler({**event, "store_path": self._root}, None)
+            finally:
+                self.working = False
+        return {"Payload": io.BytesIO(json.dumps(result).encode())}
+
+
+@pytest.fixture
+def on_host(monkeypatch):
+    """``with on_host(worker):`` — the operator's host, where any store or repo access fails.
+
+    The D8 audit for the operator command: inside the block the object
+    reads, writes and listings, the repo open and
+    :func:`icechunk_ops.finalize_run` itself may run only while ``worker``
+    is serving an invoke (never, without a worker).
+    """
+    import contextlib
+
+    import obstore
+
+    state = {"host": False, "worker": None}
+
+    def guard(module, name):
+        real = getattr(module, name)
+
+        def guarded(*a, **k):
+            worker = state["worker"]
+            if state["host"] and not (worker is not None and worker.working):
+                raise AssertionError(f"the operator's host called {name}")
+            return real(*a, **k)
+
+        monkeypatch.setattr(module, name, guarded)
+
+    for name in ("get", "put", "list", "list_with_delimiter"):
+        guard(obstore, name)
+    guard(icechunk_refs, "open_repo")
+    guard(icechunk_ops, "finalize_run")
+
+    @contextlib.contextmanager
+    def host(worker=None):
+        state.update(host=True, worker=worker)
+        try:
+            yield
+        finally:
+            state.update(host=False, worker=None)
+
+    return host
+
+
+@pytest.fixture(scope="module")
+def handler_mod():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py"
+    spec = importlib.util.spec_from_file_location("zagg_lambda_handler_588", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_REPORT = {
+    "ok": True,
+    "mode": "icechunk_finalize",
+    "operation": "finalize",
+    "run_id": RUN,
+    "stage_record": "sweep_stats_20260101T000100Z_stages.json",
+    "path": f"{REMOTE}/icechunk",
+    "tag": f"run-{RUN}",
+    "snapshot": "SNAP",
+    "tagged": True,
+}
+
+
+class TestFinalizeInvoke:
+    """On a non-local store the command fires one worker invoke and writes nothing itself."""
+
+    def _client(self, monkeypatch, worker):
+        regions = []
+        monkeypatch.setattr(
+            icechunk_ops, "_lambda_client", lambda region: regions.append(region) or worker
+        )
+        return regions
+
+    def test_cli_fires_one_invoke_and_touches_no_store(self, monkeypatch, on_host, capsys):
+        worker = _Worker(_REPORT)
+        regions = self._client(monkeypatch, worker)
+        argv = [REMOTE, "--region", "us-east-9", "finalize", RUN, "--function-name", "fn"]
+        with on_host():
+            assert icechunk_ops.main(argv) == 0
+        assert worker.events == [("fn", "RequestResponse", OPERATOR_EVENT)]
+        assert regions == ["us-east-9"]
+        out = json.loads(capsys.readouterr().out)
+        assert out.pop("invoke_s") >= 0.0
+        assert out == {k: v for k, v in _REPORT.items() if k not in ("ok", "mode")}
+
+    def test_function_name_is_the_flag_then_the_environment(self, monkeypatch):
+        monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard-test")
+        worker = _Worker(_REPORT)
+        icechunk_ops.finalize(REMOTE, RUN, store_kwargs={}, lambda_client=worker)
+        icechunk_ops.finalize(
+            REMOTE, RUN, store_kwargs={}, lambda_client=worker, function_name="fn"
+        )
+        assert [name for name, _kind, _event in worker.events] == ["process-shard-test", "fn"]
+        assert all(event == OPERATOR_EVENT for _name, _kind, event in worker.events)
+
+    def test_refuses_without_a_function_and_never_runs_on_the_host(self, monkeypatch, on_host):
+        # No fallback to an in-process finalize: no invoke, no store access.
+        monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        monkeypatch.setattr(icechunk_ops, "_lambda_client", _fail("built a Lambda client"))
+        with (
+            on_host(),
+            pytest.raises(icechunk_ops.FinalizeRefusedError, match="--function-name") as e,
+        ):
+            icechunk_ops.main([REMOTE, "finalize", RUN])
+        assert "ZAGG_LAMBDA_FUNCTION_NAME" in str(e.value)
+
+    def test_a_worker_refusal_is_raised_with_its_reason(self, on_host):
+        worker = _Worker({"ok": False, "mode": "icechunk_finalize", "refused": "no record"})
+        with on_host(), pytest.raises(icechunk_ops.FinalizeRefusedError, match="^no record$"):
+            icechunk_ops.finalize(
+                REMOTE, RUN, store_kwargs={}, lambda_client=worker, function_name="fn"
+            )
+        assert len(worker.events) == 1
+
+    @pytest.mark.parametrize(
+        "body, status, match",
+        [
+            ({"error": "'config'", "mode": "icechunk_finalize"}, 500, "'config'"),
+            ({"error": "Missing shard_key"}, 400, "statusCode 400"),
+            ({"ok": True, "mode": "icechunk_finalize"}, 200, "unexpected icechunk_finalize body"),
+        ],
+    )
+    def test_a_worker_failure_raises_and_is_not_retried(self, on_host, body, status, match):
+        worker = _Worker(body, status=status)
+        with on_host(), pytest.raises(RuntimeError, match=match) as err:
+            icechunk_ops.finalize(
+                REMOTE, RUN, store_kwargs={}, lambda_client=worker, function_name="fn"
+            )
+        assert "nothing was written from this host" in str(err.value)
+        # Only the missing-config failure is read as a worker older than the operation.
+        assert ("predates the operator finalize" in str(err.value)) == (status == 500)
+        assert len(worker.events) == 1
+
+
+class TestFinalizeThroughTheWorker(_FinalizeFixtures):
+    """``operator_checks`` in the real handler: the checks, the refusals, the tag."""
+
+    def _invoke(self, handler_mod, root, run_id=RUN, **extra):
+        event = {**OPERATOR_EVENT, "store_path": root, "run_id": run_id, **extra}
+        resp = handler_mod.lambda_handler(event, None)
+        return resp["statusCode"], json.loads(resp["body"])
+
+    def test_cli_finalizes_a_slim_manifest_run_through_the_worker(
+        self, monkeypatch, on_host, handler_mod, cfg, tmp_path, capsys
+    ):
+        # The whole path: the command's one invoke, the handler reading the
+        # (slim) manifest for the config, checking and tagging. Every store
+        # access is inside the invoke.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        cfg.output["icechunk"] = {"commit": "ladder", "retain_runs": 2}
+        self._manifest(root, RUN, cfg, slim=True)
+        key = self._record(root)
+        worker = _Worker(handler=handler_mod, root=root)
+        monkeypatch.setattr(icechunk_ops, "_lambda_client", lambda region: worker)
+        with on_host(worker):
+            assert icechunk_ops.main([REMOTE, "finalize", RUN, "--function-name", "fn"]) == 0
+        assert worker.events == [("fn", "RequestResponse", OPERATOR_EVENT)]
+        out = json.loads(capsys.readouterr().out)
+        assert out["operation"] == "finalize" and out["run_id"] == RUN
+        assert out["tagged"] is True and out["stage_record"] == key and "skipped" not in out
+        assert out["retain_runs"] == 2  # the manifest config's knob: the event has no config
+        _group, repo = _open(root)
+        assert repo.lookup_tag(f"run-{RUN}") == out["snapshot"]
+        head = next(iter(repo.ancestry(branch="main")))
+        assert head.message == f"finalize {RUN}" and head.metadata["retain_runs"] == 2
+        # Idempotent through the worker too: the tag exists, nothing is written.
+        n = len(_messages(root))
+        with on_host(worker):
+            again = icechunk_ops.finalize(
+                REMOTE, RUN, store_kwargs={}, lambda_client=worker, function_name="fn"
+            )
+        assert again["tagged"] is False and again["skipped"] == f"run-{RUN} already exists"
+        assert len(_messages(root)) == n
+
+    @pytest.mark.parametrize(
+        "case, reason",
+        [
+            ("no manifest", "no dispatch manifest"),
+            ("no init commit", "no init commit for run r9"),
+            ("no record", "no staged-sweep record"),
+            ("old record", "since run r1's init commit"),
+            ("barrier", "a barrier expired"),
+            ("no finisher", "no finisher block"),
+            ("sweep error", "the sweep failed"),
+        ],
+    )
+    def test_each_refusal_comes_back_from_the_handler(
+        self, monkeypatch, handler_mod, cfg, tmp_path, case, reason
+    ):
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        run_id = "r9" if case == "no init commit" else RUN
+        if case != "no manifest":
+            self._manifest(root, run_id, cfg)
+        if case == "old record":
+            self._record(root, ts=self._stamp(-3600))
+        elif case != "no record":
+            fields = {
+                "barrier": {"barrier_timed_out": True},
+                "no finisher": {"finisher": None},
+                "sweep error": {"error": "RuntimeError: boom"},
+            }.get(case, {})
+            self._record(root, **fields)
+        n = len(_messages(root))
+        status, body = self._invoke(handler_mod, root, run_id)
+        assert status == 200
+        assert set(body) == {"ok", "mode", "refused"}
+        assert body["ok"] is False and body["mode"] == "icechunk_finalize"
+        assert reason in body["refused"]
+        assert len(_messages(root)) == n and not _open(root)[1].list_tags()
+
+    def test_a_run_no_longer_the_newest_is_skipped_not_refused(
+        self, monkeypatch, handler_mod, cfg, tmp_path
+    ):
+        grid, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        self._record(root)
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r2", store_kwargs={})
+        n = len(_messages(root))
+        # ``operator_checks`` implies ``newest_only``, stated in the event or not.
+        for extra in ({}, {"newest_only": False}):
+            status, body = self._invoke(handler_mod, root, **extra)
+            assert status == 200 and body["ok"] is True and body["tagged"] is False
+            assert body["skipped"] == f"a later run has committed since run {RUN}"
+        assert len(_messages(root)) == n and not _open(root)[1].list_tags()
+
+    def test_a_missing_repo_is_a_500_not_a_refusal(self, handler_mod, cfg, tmp_path):
+        root = str(tmp_path / "bare")
+        self._manifest(root, RUN, cfg)
+        status, body = self._invoke(handler_mod, root)
+        assert status == 500 and "not initialized" in body["error"]
+
+    def test_a_worker_predating_the_flag_fails_before_any_write(
+        self, monkeypatch, handler_mod, cfg, tmp_path
+    ):
+        # A deployed worker that does not know ``operator_checks`` runs the
+        # dispatcher's branch on the operator's event — the event below, the
+        # flag unseen. It carries no ``config``, so the worker fails on the
+        # key before it opens the repo; had the config ridden along, it would
+        # have tagged ``newest_only`` with none of the sweep checks (no stage
+        # record exists here).
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        assert "config" not in OPERATOR_EVENT and "icechunk_init" not in OPERATOR_EVENT
+        stale = {k: v for k, v in OPERATOR_EVENT.items() if k != "operator_checks"}
+        opened = []
+        real = icechunk_refs.open_repo
+        monkeypatch.setattr(
+            icechunk_refs, "open_repo", lambda *a, **k: opened.append(a) or real(*a, **k)
+        )
+        resp = handler_mod.lambda_handler({**stale, "store_path": root}, None)
+        assert resp["statusCode"] == 500
+        assert json.loads(resp["body"]) == {"error": "'config'", "mode": "icechunk_finalize"}
+        assert opened == []
+        assert _messages(root)[0] != f"finalize {RUN}" and not _open(root)[1].list_tags()
+        # The operator's host turns that 500 into a raise that says so.
+        worker = _Worker(json.loads(resp["body"]), status=500)
+        with pytest.raises(RuntimeError, match="predates the operator finalize"):
+            icechunk_ops.finalize(
+                REMOTE, RUN, store_kwargs={}, lambda_client=worker, function_name="fn"
+            )

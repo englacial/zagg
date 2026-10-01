@@ -244,9 +244,17 @@ dispatcher; idempotent — an existing run tag is returned, nothing rewritten):
     "mode": "icechunk_finalize",
     "store_path": str,
     "config": dict,             # same single-source config; retain_runs read here
+        (absent under operator_checks: the worker reads the run's manifest)
     "run_id": str,              # the tag is "run-{run_id}"
     "icechunk_init": dict (optional) -- the run's init record; its
         split_ratchet is reported back as rewrite_pending,
+    "newest_only": bool (optional) -- finalize only while the run is the
+        repo's newest (Run.attach, the operator finalize); else {"skipped"},
+    "operator_checks": bool (optional, issue #588) -- the operator's
+        `icechunk_ops finalize`: no "config" in the event; the worker reads
+        the run's dispatch manifest for it and checks the run's init commit
+        and its newest staged-sweep record before a newest_only finalize. A
+        failed check is a 200 {"ok": false, "refused": reason},
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -1597,12 +1605,40 @@ def _handle_icechunk_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
     so it cannot drift from what the leaves were stamped with. The body
     echoes :func:`zagg.icechunk_finalize.finalize_repo`'s record; a 500
     carries the error and the dispatcher treats either fail-open.
+
+    ``operator_checks`` (the operator's ``python -m zagg.icechunk_ops <store>
+    finalize <run_id>``, issue #588): the event carries no ``config``. The
+    worker runs :func:`zagg.icechunk_ops.finalize_run` — the config off the
+    run's dispatch manifest, the run's init commit, the newest staged-sweep
+    record since it, then the finalize ``newest_only`` — so the operator's
+    host neither reads the repo nor writes. A precondition that does not
+    hold is a 200 ``{"ok": false, "refused": reason}``, nothing written.
+    Without the flag ``config`` is required as before: an event with neither
+    500s on the missing key before any write, which is what a worker that
+    predates the flag does with the operator's event.
     """
     logger.info(f"Icechunk finalize mode: repo for {event.get('store_path')}")
     try:
         from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
         from zagg.semantics import semantic_hash
 
+        if event.get("operator_checks"):
+            from zagg.icechunk_ops import FinalizeRefusedError, finalize_run
+
+            try:
+                record = finalize_run(
+                    event["store_path"],
+                    str(event["run_id"]),
+                    store_kwargs=_output_store_kwargs(event),
+                )
+            except FinalizeRefusedError as e:
+                logger.warning(f"Icechunk finalize refused: {e}")
+                body = {"ok": False, "mode": "icechunk_finalize", "refused": str(e)}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "icechunk_finalize", **record}),
+            }
         config = load_config_from_dict(event["config"])
         init = event.get("icechunk_init") or {}
         record = finalize_repo(

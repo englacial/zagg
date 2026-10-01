@@ -3803,7 +3803,8 @@ expired or the finisher did not land — may still have node commits in
 flight: the dispatcher then does NOT finalize and records
 `icechunk_finalize: {skipped: <reason>}` and the run stays untagged (its
 commits are kept; the next run's tag covers them; the `finalize` operation
-below tags it once the ladder is complete). One finalize, in order:
+below — this same finalize, invoked by an operator and run by a worker —
+tags it once the ladder is complete). One finalize, in order:
 
 1. **retention** — `output.icechunk.retain_runs` = K. `0` (the default)
    keeps every run and does nothing here. K > 0: the run tags beyond the
@@ -3896,7 +3897,9 @@ since nothing rewrites them.
 
 **Operations.** An evolving fact of the metadata plane is written by an
 **operation**: one commit on `main` (`zagg.icechunk_ops`; `python -m
-zagg.icechunk_ops <store> <operation> …`), operator-run, never a worker's.
+zagg.icechunk_ops <store> <operation> …`), operator-run: `set-attrs` and
+`declare-pyramid` commit from the operator's host, never from a worker;
+`finalize` is invoked by the operator and written by a worker (its row).
 An operation's commit message names it, its commit metadata carries
 `operation`, `zagg_version` and the operation's own keys — so `ancestry()`
 reads as a log — and it touches no leaf. Before the commit the session is
@@ -3939,7 +3942,27 @@ that would write nothing commits nothing. The operations of `/1`:
   declares both planes; the standalone form re-runs it.
 - **`finalize <run_id>`** tags a ladder run its dispatcher left untagged —
   the staged sweep completed but the dispatcher died before its finalize
-  (the state described under **Finalize** above). It reads the run's
+  (the state described under **Finalize** above). **It writes where the
+  run's writer is, never from the operator's host.** On an object-store
+  root the command fires ONE synchronous `mode="icechunk_finalize"` invoke
+  whose event is `{mode, store_path, run_id, newest_only: true,
+  operator_checks: true}` — no `config` — and prints the worker's report:
+  every read below, the commit, the tag and the retention are the worker's,
+  under its execution role and in the store's region. The operator's host
+  reads nothing from the store and writes nothing — it may hold invoke
+  rights and no write credentials (a store whose only writer is the worker
+  role), and a retention pass run elsewhere would read the repo out of its
+  region. Only a local store root runs in-process. The function is
+  `--function-name`, else the `ZAGG_LAMBDA_FUNCTION_NAME` environment
+  variable, verbatim (the run config's `worker:` suffix is not applied: that
+  config is in the manifest, which the host does not read); with neither
+  the command refuses, and it never falls back to the host. Because the
+  event carries no `config`, a deployed worker that predates
+  `operator_checks` fails on the missing key before any write; had the
+  config ridden along, it would have tagged `newest_only` with none of the
+  checks below. A check that does not hold is returned as `{ok: false,
+  refused: <reason>}` with nothing written, and the command raises it.
+  Under `operator_checks` the worker reads the run's
   dispatch manifest (`<store>.status/run-<run_id>/manifest.json`) for the
   run's own config — its `retain_runs` and the D19 hash — refuses without
   it (a Lambda-dispatched run has one; a large hive run's is slim — the

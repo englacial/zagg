@@ -39,15 +39,23 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
   The record is tied to the run by time only (it names the sweep's own run
   id): with overlapping runs on one store (§11.4's documented casualty
   case) a sibling run's completed sweep record can vouch for this run.
+  All of that runs **where the writer is**: on an ``s3://`` store the command
+  fires one synchronous ``mode="icechunk_finalize"`` invoke and prints the
+  worker's report — the checks, the commit, the tag and the retention are
+  the worker's, and the operator's host reads nothing from the store and
+  writes nothing (an operator holds invoke rights, not the bucket's; and
+  the repo is not read out of its region). Only a local store finalizes
+  in-process.
 
     python -m zagg.icechunk_ops <store> set-attrs <path> '<json>'
     python -m zagg.icechunk_ops <store> declare-pyramid <config.yaml>
     python -m zagg.icechunk_ops <store> finalize <run_id>
 
 ``<path>`` is ``/`` (the root), ``/{cells}`` (a level group) or
-``/{cells}/{array}``. Operator-side only, never a worker's job; the
-pre-commit check is zagg's half of the validation moczarr's reader will
-run (issue #582 phase 6).
+``/{cells}/{array}``. ``set-attrs`` and ``declare-pyramid`` run on the
+operator's host, never in a worker; ``finalize`` is operator-invoked and
+worker-run (above). The pre-commit check is zagg's half of the validation
+moczarr's reader will run (issue #582 phase 6).
 """
 
 from __future__ import annotations
@@ -55,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -356,6 +365,16 @@ def _group_matches(session, order: str, group_spec) -> bool:
 
 # ── finalize ────────────────────────────────────────────────────────────────
 
+
+class FinalizeRefusedError(ValueError):
+    """A precondition of the operator ``finalize`` does not hold; nothing was written.
+
+    Raised in-process by :func:`finalize_run`; the worker returns it as
+    ``{"ok": false, "refused": reason}`` and :func:`finalize` re-raises it on
+    the operator's host.
+    """
+
+
 #: The staged sweep's store-root run record (``zagg.sweep_stages._write_stage_record``).
 _STAGE_RECORD_RE = re.compile(r"sweep_stats_(\d{8}T\d{6}Z)_stages\.json")
 
@@ -432,7 +451,7 @@ def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
     prefix = run_status_prefix(store_root, run_id)
     manifest = read_dispatch_manifest(prefix, store_kwargs)
     if manifest is None or not manifest.get("config"):
-        raise ValueError(
+        raise FinalizeRefusedError(
             f"no dispatch manifest with a config at {prefix}/{MANIFEST_NAME}: finalize reads "
             f"the run's retain_runs and semantic hash from it. A Lambda-dispatched run "
             f"has one, slim (no shard list) when the run is large; it is missing for a "
@@ -459,17 +478,20 @@ def _run_opened_at(store_root: str, run_id: str, store_kwargs: dict) -> datetime
     for info in repo.ancestry(branch=BRANCH):
         if run_marker(info.message) == ("init", run_id):
             return info.written_at
-    raise ValueError(
+    raise FinalizeRefusedError(
         f"no init commit for run {run_id} on {repo_path(store_root)}: every run opens with "
         f"one (spec §11.4 Init): the run never initialized this repo, or a later run's "
         f"retention has squashed its commits (it is then not the newest run either)"
     )
 
 
-def finalize(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
+def finalize_run(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     """Tag a completed-but-untagged ladder run — the repo's newest — as its dispatcher would have.
 
-    Refuses (raises) without the run's dispatch manifest, without the run's
+    Every check and the write, in the calling process: the worker's
+    ``mode="icechunk_finalize"`` under ``operator_checks``, or
+    :func:`finalize` on a local store. Refuses (:class:`FinalizeRefusedError`)
+    without the run's dispatch manifest, without the run's
     init commit on the repo, without a staged-sweep record written since
     that commit (:func:`_run_opened_at` — the manifest supplies the config
     only), or when that record does not show a completed sweep. Otherwise
@@ -492,7 +514,7 @@ def finalize(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     opened = _run_opened_at(store_root, run_id, store_kwargs)
     found = newest_stage_record(store_root, store_kwargs=store_kwargs, since=opened)
     if found is None:
-        raise ValueError(
+        raise FinalizeRefusedError(
             f"no staged-sweep record at {store_root} since run {run_id}'s init commit "
             f"({opened.isoformat(timespec='seconds')}): complete the ladder first with "
             f"`python -m zagg.sweep {store_root} --stages`, then finalize"
@@ -500,7 +522,7 @@ def finalize(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     name, record = found
     reason = _stage_record_incomplete(record)
     if reason is not None:
-        raise ValueError(
+        raise FinalizeRefusedError(
             f"staged-sweep record {name} does not show a completed sweep ({reason}); "
             f"re-run `python -m zagg.sweep {store_root} --stages`, then finalize"
         )
@@ -522,6 +544,82 @@ def finalize(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     return report
 
 
+def _lambda_client(region: str | None):
+    """A Lambda client for the one finalize invoke: no retry, a read past the 900 s ceiling."""
+    import boto3
+    from botocore.config import Config
+
+    config = Config(read_timeout=960, connect_timeout=10, retries={"max_attempts": 0})
+    return boto3.client("lambda", region_name=region, config=config)
+
+
+def finalize(
+    store_root: str,
+    run_id: str,
+    *,
+    store_kwargs: dict,
+    function_name: str | None = None,
+    lambda_client=None,
+) -> dict:
+    """The operator's ``finalize``: :func:`finalize_run`, run where the writer is.
+
+    A local store runs it in-process. Any other store gets ONE synchronous
+    ``mode="icechunk_finalize"`` invoke with ``operator_checks`` (through
+    :func:`zagg.runner._invoke_lambda_icechunk_finalize`): the worker reads
+    the manifest and the repo, checks, commits, tags and applies retention
+    under its execution role, and this returns its report (plus
+    ``invoke_s``). The operator's host opens neither the store nor the repo
+    and never falls back to finalizing in-process — it may hold no write
+    credentials (a Source Cooperative store's only writer is the worker
+    role), and a retention pass from outside the store's region would read
+    the repo out of it.
+
+    The function is ``function_name`` (``--function-name``), else the
+    ``ZAGG_LAMBDA_FUNCTION_NAME`` environment variable, verbatim — the first
+    two rules of :func:`zagg.runner._resolve_function_name`. Its third, the
+    run config's ``worker:`` suffix, is not applied: that config is in the
+    run's dispatch manifest, which this host does not read. With neither,
+    the operation refuses. The event carries no config, so a deployed worker
+    that predates ``operator_checks`` fails on the missing key before any
+    write instead of tagging without the checks.
+
+    Raises :class:`FinalizeRefusedError` with the worker's reason when a
+    precondition does not hold, ``RuntimeError`` when the invoke failed or
+    the worker errored.
+    """
+    if _is_local(store_root):
+        return finalize_run(store_root, run_id, store_kwargs=store_kwargs)
+    function_name = function_name or os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME")
+    if not function_name:
+        raise FinalizeRefusedError(
+            f"finalize on {store_root} runs in a Lambda worker (the operator's host does not "
+            f"write the store), and no function is named: pass --function-name <name> "
+            f"(function_name=) or set ZAGG_LAMBDA_FUNCTION_NAME to the deployed worker "
+            f"function, e.g. process-shard"
+        )
+    from zagg.runner import _invoke_lambda_icechunk_finalize
+
+    if lambda_client is None:
+        lambda_client = _lambda_client(store_kwargs.get("region"))
+    out = _invoke_lambda_icechunk_finalize(
+        lambda_client, function_name, store_root, run_id=run_id, operator_checks=True
+    )
+    if "refused" in out:
+        raise FinalizeRefusedError(out["refused"])
+    if "error" in out:
+        stale = (
+            "; a missing 'config' is a worker that predates the operator finalize, which "
+            "fails on that key before any write: deploy a current worker"
+            if "'config'" in out["error"]
+            else ""
+        )
+        raise RuntimeError(
+            f"the worker {function_name} did not finalize run {run_id}: {out['error']} "
+            f"(nothing was written from this host{stale})"
+        )
+    return out
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 
@@ -540,6 +638,12 @@ def main(argv=None) -> int:
         "finalize", help="tag a completed, untagged ladder run (the repo's newest run only)"
     )
     p.add_argument("run_id", help="the run id (its dispatch manifest and run-<id> tag name it)")
+    p.add_argument(
+        "--function-name",
+        default=None,
+        help="the Lambda worker that finalizes an s3:// store (default: env "
+        "ZAGG_LAMBDA_FUNCTION_NAME; a local store finalizes in-process)",
+    )
     args = parser.parse_args(argv)
     store_kwargs = {"region": args.region}
     if args.operation == "set-attrs":
@@ -557,7 +661,12 @@ def main(argv=None) -> int:
             args.store_root, load_config(args.config), store_kwargs=store_kwargs
         )
     else:
-        report = finalize(args.store_root, args.run_id, store_kwargs=store_kwargs)
+        report = finalize(
+            args.store_root,
+            args.run_id,
+            store_kwargs=store_kwargs,
+            function_name=args.function_name,
+        )
     print(json.dumps(report, indent=1, default=str))
     return 0
 

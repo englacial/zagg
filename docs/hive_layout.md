@@ -1586,7 +1586,11 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   run's is its dispatcher's, after the staged sweep), with
   `newest_only: true` (written only while the run is the newest on the repo,
   else `{skipped}`) and `icechunk_init: null`, so `rewrite_pending` is
-  always null there.
+  always null there. The operator's `finalize` (below) fires it with
+  `operator_checks: true` and **no `config`**: the worker reads the run's
+  dispatch manifest for the config and runs the operator's checks before a
+  `newest_only` finalize, answering a failed check with `{ok: false,
+  refused: <reason>}`.
 - **Operations** (spec §11.4 **Operations**, issue #582) — the operator's
   way to change what the repo is authoritative for, one validated commit
   each, no leaf touched, the commit metadata naming the operation:
@@ -1594,7 +1598,7 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   ```
   python -m zagg.icechunk_ops <store_root> set-attrs /19 '{"dggs": {...}}'   # root "/", a level "/{cells}", an array "/{cells}/{array}"; null deletes a key
   python -m zagg.icechunk_ops <store_root> declare-pyramid config.yaml     # levels + multiscales follow the manifest's declaration
-  python -m zagg.icechunk_ops <store_root> finalize <run_id>              # tag a completed-but-untagged ladder run (the repo's newest run only)
+  python -m zagg.icechunk_ops <store_root> finalize <run_id> [--function-name <fn>]   # tag a completed-but-untagged ladder run (the repo's newest run only); an s3:// store is finalized by the worker
   ```
 
   Before the commit the array model of every array must be unchanged and
@@ -1623,6 +1627,23 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   tied to the run by time only, so with overlapping runs on one store a
   sibling run's sweep record can vouch for it. No `--force`: an incomplete sweep is
   completed with `python -m zagg.sweep <store> --stages` first.
+  **Where it runs.** On an `s3://` store all of that is the worker's: the
+  command fires one synchronous `mode: "icechunk_finalize"` invoke —
+  `{mode, store_path, run_id, newest_only: true, operator_checks: true}`,
+  no config — and prints the worker's report, so the manifest and record
+  reads, the commit, the tag and the retention run under the execution role
+  in the store's region. The operator's host reads nothing from the store
+  and writes nothing: it needs Lambda invoke rights only (on a Source
+  Cooperative store the worker role is the only writer), and nothing leaves
+  the region but the report. Name the function with `--function-name`, or
+  set `ZAGG_LAMBDA_FUNCTION_NAME` (used verbatim; the run config's
+  `worker:` suffix is not applied, since the only copy of that config the
+  command could consult is the run's dispatch manifest, and it does not
+  read the store). With neither it refuses rather than finalize from the
+  host. A check that does not hold comes back as a refusal with its reason;
+  a deployed worker older than this operation fails on the missing `config`
+  before any write — deploy a current worker. A local store root finalizes
+  in-process.
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M
