@@ -58,7 +58,7 @@ def _shard_for_raster_at(dx):
 
     to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
     lon, lat = to_wgs.transform(ORIGIN[0] + dx + 480.0, ORIGIN[1] - 480.0)
-    leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+    leaf = geo2mort(lat, lon, order=29, points=True)
     return int(clip2order(10, leaf)[0])
 
 
@@ -1056,6 +1056,9 @@ class TestRasterHiveLocalBackend:
         assert record["shard_key"] == int(shard)
         assert record["invoked_by"] is None and record["lambda"] is None
         assert {"sample", "write"} <= set(record["phase_timings"])
+        # The local backend records the unit wall too (issue #589), unpriced.
+        assert record["duration_total_s"] >= record["duration_s"]
+        assert record["gb_seconds"] is None
         # Read-volume counters (issue #297) ride the local record too. Order of
         # decoded vs sampled is regime-bound (a grid finer than the source
         # inverts it), so assert each counter is positive, not their ratio.

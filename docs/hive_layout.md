@@ -636,6 +636,17 @@ certifies the digest of what it seals. The D20 stats sidecar carries the
 same record; a leaf stamped before the key existed is unverifiable from the
 stamp alone, never tampered.
 
+The sidecar (and the run parquet row flattened from it) carries two clocks
+([issue #589](https://github.com/englacial/zagg/issues/589)): `duration_s`
+is the worker's read + index + aggregate wall — it keeps that meaning
+because every existing pin and readout reads it — and `duration_total_s` is
+the whole unit's, handler entry to the record, which is what `gb_seconds` /
+`est_cost_usd` price from. `phase_timings.{write,hash,column,icechunk}` (the
+run parquet flattens them to `phase_*`) are the write side between them. On
+the sharded leaf path (the fleet's) they are all stamped after `duration_s`
+stops; the unsharded streaming path writes from inside `process_shard`, so
+there the two clocks overlap.
+
 A leaf whose root metadata lacks the stamp is **debris**: incomplete,
 ignorable, safe to overwrite on retry (the writer re-emits the leaf template
 with `overwrite=True`, so retries are idempotent). This is *not* consolidated

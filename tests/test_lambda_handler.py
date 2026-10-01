@@ -1099,6 +1099,64 @@ class TestProcessHive:
         # Always-on write bracket (issue #297) flows into the record too.
         assert "write" in record["phase_timings"]
 
+    def test_hive_duration_total_spans_the_write_side(self, handler_mod, monkeypatch, tmp_path):
+        # Issue #589: ``duration_s`` is the worker's read/aggregate clock; on
+        # the fleet's sharded leaf path the leaf write, hash and column fold
+        # all run after it, so the record prices from ``duration_total_s`` —
+        # the handler-entry -> record wall — which must cover the aggregate
+        # AND every write-side phase. (The unsharded streaming path writes
+        # from inside ``process_shard``, where the two clocks overlap.)
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.config import load_config_from_dict
+        from zagg.telemetry import read_sidecar
+
+        event = self._event(tmp_path)
+        event["profile"] = True
+        event["config"]["output"]["grid"]["chunk_inner"] = 8  # sharded, as the fleet
+        # A leaf-node declaration (issue #383) so the worker folds the leaf
+        # column — the largest untimed term of the issue's measurement.
+        event["config"]["output"]["pyramid"] = {"overviews": 10}
+        grid = from_config(load_config_from_dict(event["config"]))
+        assert grid.sharded is True
+
+        def slow_fake(g, shard_key, urls, **kwargs):
+            t0 = time.time()
+            time.sleep(0.02)  # a measurable aggregate, so the bound is not trivial
+            sink = kwargs["chunk_results"]
+            for block, children in grid.iter_chunks(int(shard_key)):
+                sink.append((block, self._carrier_of(grid, children), {}))
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 5,
+                "total_obs": 7,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": time.time() - t0,
+                "phase_timings": {"read": 0.0, "index": 0.0, "aggregate": 0.0},
+                "error": None,
+            }
+
+        monkeypatch.setattr(processing, "process_shard", slow_fake)
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "2048")
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        timings = body["phase_timings"]
+        assert {"write", "hash", "column"} <= set(timings)
+        write_side = timings["write"] + timings["hash"] + timings["column"]
+        assert body["duration_s"] >= 0.02
+        assert body["duration_total_s"] >= body["duration_s"] + write_side
+        # duration_s keeps its meaning: the aggregate clock, not the invocation.
+        assert body["duration_s"] < body["duration_total_s"]
+        record = body["stats"]
+        assert record["duration_total_s"] == body["duration_total_s"]
+        assert record["duration_s"] == body["duration_s"]
+        assert record["gb_seconds"] == pytest.approx(body["duration_total_s"] * 2048 / 1024)
+        # The sidecar carries the same priced record.
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        assert read_sidecar(leaf)["duration_total_s"] == body["duration_total_s"]
+
     def test_hive_no_data_shard_writes_no_sidecar(self, handler_mod, monkeypatch, tmp_path):
         import zagg.processing as processing
         from zagg import hive

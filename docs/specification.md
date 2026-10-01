@@ -2048,6 +2048,17 @@ and is not a legal zagg array name). A leaf with no recorded
 report "nothing recorded" as a distinct outcome from a mismatch (the
 conservative dedup posture — an unverifiable leaf is never a hit).
 
+*(Informative.)* Beyond `content_hashes` and `cells_with_data` (§7), the
+sidecar's remaining keys are D20 telemetry, not conformance material. Two
+of them are clocks: `duration_s` is the worker's read + index + aggregate
+wall, and `duration_total_s`
+([issue #589](https://github.com/englacial/zagg/issues/589)) the whole
+unit's — handler entry to the record — which `gb_seconds` / `est_cost_usd`
+price from. A record without the key (the column sidecar, failure rows,
+older writers) is priced from `duration_s`. Pricing happens only where a
+Lambda config is present: local records carry the total, but `gb_seconds`
+stays null.
+
 **Contract (the stamp copy).** The writer computes the record from the
 arrays it just wrote, *before* the stamp lands, so the D4 seal certifies the
 digest of the bytes it seals; the stamp copy and the sidecar copy are the
