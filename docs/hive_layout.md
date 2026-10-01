@@ -1506,7 +1506,11 @@ order of first appearance and never reordered, so a reader looks a row up
 by label rather than assuming chronological order — and two root arrays,
 `window_start` / `window_end` (`int64`, the manifest's temporal epoch and
 units; the fill value on the unbounded `all` row), carry each row's
-half-open time range. A repo written before the row dimension
+half-open time range. The level groups' `dggs` block (copied from the
+artifact, so `spatial_dimension: "cells"`, `coordinate: "morton"`) binds to
+each row slice `array[w, …]`: pick the row, then read it as the block says
+— `morton` holds the same words in every row that has the node's object.
+A repo written before the row dimension
 (`zagg-icechunk/1`) is refused by the writer with the remedy in the error:
 clear `{store_root}/icechunk/` and let the next run's init re-create it. In a **browser**, icechunk-js reads the
 **dense** arrays today — `morton`, `count`, the per-field summaries; the

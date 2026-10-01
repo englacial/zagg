@@ -3620,6 +3620,15 @@ does (C order; none of the inner codecs depends on the chunk's rank), so a
 reader that decodes a leaf array per §1–§3 decodes the repo array the same
 way, chunk by chunk, and a virtual reference needs no re-encoding.
 
+The level group's `dggs` block is the artifact's, verbatim, so it names
+`spatial_dimension: "cells"` and its cell `coordinate` (`morton`) as the
+artifact does: it binds to **each row slice** `array[w, …]`, which is
+exactly the artifact's 1-D array on the whole sphere. `morton` is a
+function of the cell alone, so every row holding a node's object holds the
+same words there (a row with no object at that node reads fill); a
+convention-following reader selects a row first, then reads the slice as
+the `dggs` block describes.
+
 **Contract — rows.** A **row** is one window of the store's schedule (§4.2,
 the manifest's `temporal` block), or the reserved row **`all`** — the same
 token the leaf and overview names reserve. Which rows a store has follows
