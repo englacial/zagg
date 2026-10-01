@@ -3628,9 +3628,14 @@ its kind, fixed at birth with its schedule:
 - an **unwindowed** store (`schedule: none`) has the single row `all`, its
   only row at every level — it is the one-row case of the model, not a
   different one;
-- a **windowed** store has one row per window, plus `all` for its all-time
-  fold, which is populated at the overview levels only (there is no
-  all-time leaf at the base).
+- a **windowed** store has one row per label its runs have named: a row
+  per window written, and `all` for its all-time fold once a run names it
+  (populated at the overview levels only — there is no all-time leaf at
+  the base). Nothing is allocated that no run named: which labels a
+  windowed run names is the dispatcher's (the `all` fold follows
+  `pyramid.overview.all_time`, §4.5) and lands with the windowed writer
+  (§11.6), and an init that names no label on a windowed store is refused
+  rather than creating a repo with no rows.
 
 The two meanings of `all` never meet in one store. **The row law:** a
 label's row is allocated **once**, by label, in **order of first

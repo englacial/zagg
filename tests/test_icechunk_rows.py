@@ -82,7 +82,12 @@ class TestRunRows:
         assert icechunk_rows.store_rows(None, None) == ["all"]
         assert icechunk_rows.store_rows(None, ["all"]) == ["all"]
         assert icechunk_rows.store_rows(_YEARLY, ["2020", "all", "2020"]) == ["2020", "all"]
-        assert icechunk_rows.store_rows(_YEARLY, None) == []
+        # A windowed store's ``all`` row is allocated only when named, and an
+        # init naming nothing is refused rather than making a zero-row repo.
+        assert icechunk_rows.store_rows(_YEARLY, ["2020"]) == ["2020"]
+        for nothing in (None, []):
+            with pytest.raises(ValueError, match="names no row label"):
+                icechunk_rows.store_rows(_YEARLY, nothing)
         with pytest.raises(ValueError, match="an unwindowed store has the one row 'all'"):
             icechunk_rows.store_rows(None, ["2019"])
         with pytest.raises(ValueError, match="grammar"):
@@ -135,6 +140,12 @@ class TestAllocation:
             "scale": "utc",
         }
         assert dict(start.attrs) == dict(end.attrs) == want
+
+    def test_a_windowed_init_naming_no_row_creates_no_repo(self, cfg, tmp_path):
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        with pytest.raises(ValueError, match="names no row label"):
+            _init(root, grid, cfg, manifest, None)
+        assert icechunk_refs.read_block(root, store_kwargs={}) is None
 
     def test_a_later_run_appends_its_new_rows_and_never_reorders(self, cfg, tmp_path):
         grid, root, manifest = _windowed(cfg, tmp_path)
