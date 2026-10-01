@@ -736,6 +736,7 @@ def init_repo(
     # finalize's newest-run check (a reattached client's guard) is exact.
     snapshot, rows = commit_rows(
         repo,
+        existing,
         updates,
         labels,
         temporal,

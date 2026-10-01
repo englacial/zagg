@@ -253,7 +253,9 @@ def grow_rows(session, rows: list, labels: Iterable[str], temporal: dict | None)
     return grown
 
 
-def commit_rows(repo, updates: dict, labels: list, temporal: dict | None, commit) -> tuple:
+def commit_rows(
+    repo, existing: dict, updates: dict, labels: list, temporal: dict | None, commit
+) -> tuple:
     """A reopened repo's init commit: block ``updates`` + the run's new rows; ``(snapshot, rows)``.
 
     ``commit(session)`` commits and returns the snapshot id — the caller's,
@@ -261,18 +263,30 @@ def commit_rows(repo, updates: dict, labels: list, temporal: dict | None, commit
     allocating rows at once both resize every array, which no rebase
     reconciles (``RebaseFailedError``, issue #584 phase 0): the loser retries
     in a FRESH session, which re-reads the rows the winner recorded and
-    appends after them.
+    appends after them. ``updates`` were computed from ``existing``, so a
+    session whose block changed in anything but ``rows`` — to anything but
+    ``updates`` themselves (the winner made the same ones) — raises instead:
+    re-applying them would overwrite the winner's ratchet or knobs, and the
+    caller fails open as it did when such a race raised before the rows.
     """
     import icechunk
     import zarr
 
     from zagg.icechunk_refs import BRANCH, ICECHUNK_ATTR
 
+    based_on = ({**existing, "rows": None}, {**existing, **updates, "rows": None})
     tries = 0
     while True:
         session = repo.writable_session(BRANCH)
         root = zarr.open_group(session.store, mode="r+")
         block = dict(cast("Any", root.attrs[ICECHUNK_ATTR]))
+        if {**block, "rows": None} not in based_on:
+            keys = {*block, *existing} - {"rows"}
+            changed = sorted(k for k in keys if block.get(k) != existing.get(k))
+            raise ValueError(
+                f"icechunk block changed under this init ({changed}): another run's init "
+                f"landed a different ratchet or knobs; not re-applying stale updates (§11.4)"
+            )
         rows = grow_rows(session, list(block["rows"]), labels, temporal)
         if {**block, **updates, "rows": rows} != block:
             root.attrs[ICECHUNK_ATTR] = {**block, **updates, "rows": rows}

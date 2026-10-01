@@ -187,7 +187,8 @@ class TestAllocation:
             calls.append(1)
             return icechunk_refs._commit(session, "init run-2", local=True, allow_empty=True)[0]
 
-        _snapshot, rows = icechunk_rows.commit_rows(repo, {}, ["2020"], _YEARLY, commit)
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        _snapshot, rows = icechunk_rows.commit_rows(repo, block, {}, ["2020"], _YEARLY, commit)
         assert len(calls) == 2  # the refused attempt, then the fresh session's
         assert rows == ["2019", "2021", "2020"]
         group, _repo = _open(root)
@@ -206,9 +207,47 @@ class TestAllocation:
             _init(root, grid, cfg, manifest, [next(years)], run_id="run-other")
             return icechunk_refs._commit(session, "init run-2", local=True, allow_empty=True)[0]
 
+        block = icechunk_refs.read_block(root, store_kwargs={})
         with pytest.raises(icechunk.RebaseFailedError):
-            icechunk_rows.commit_rows(repo, {}, ["2020"], _YEARLY, commit)
+            icechunk_rows.commit_rows(repo, block, {}, ["2020"], _YEARLY, commit)
         assert "2020" not in icechunk_refs.read_block(root, store_kwargs={})["rows"]
+
+    @pytest.mark.parametrize("b_split", [1, 2])
+    def test_a_lost_race_never_reapplies_a_stale_ratchet(self, cfg, tmp_path, monkeypatch, b_split):
+        # Run A ratchets the store's split 3 -> 2 while run B lands its own
+        # ratchet. A's updates were computed from the order-3 block: over B's
+        # 3 -> 1 they would move the split back toward finer (§11.5 moves one
+        # way), so A raises (its init fails open); over B's identical 3 -> 2
+        # they are B's own, and A's retry lands.
+        grid, root = _grid(cfg), str(tmp_path / "store")
+
+        def init(split, run_id):
+            cfg.output["icechunk"] = {"split_order": split, "commit_order": split}
+            return icechunk_refs.init_repo(root, grid, cfg, run_id=run_id, store_kwargs={})
+
+        init(3, "run-0")
+        real = icechunk_rows.commit_rows
+
+        def racing(repo, existing, updates, labels, temporal, commit):
+            def commit_after_b(session):
+                if not raced:
+                    raced.append(None)  # B's own init goes through here too
+                    raced[0] = init(b_split, "run-B")
+                return commit(session)
+
+            return real(repo, existing, updates, labels, temporal, commit_after_b)
+
+        raced: list = []
+        monkeypatch.setattr(icechunk_refs, "commit_rows", racing)
+        if b_split == 1:
+            with pytest.raises(ValueError, match=r"block changed under this init \(.*split_order"):
+                init(2, "run-A")
+        else:
+            assert init(2, "run-A")["split_ratchet"] == {"from": 3, "to": 2}
+        assert raced[0]["split_ratchet"] == {"from": 3, "to": b_split}
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        assert block["split_order"] == block["commit_order"] == b_split
+        assert block["levels"]["6"]["split"]["order"] == b_split
 
 
 class TestRefsLandAtTheirRow:

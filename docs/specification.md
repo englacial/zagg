@@ -3876,7 +3876,11 @@ event names, and a window label on an unwindowed store — or one its
 schedule does not declare — is refused. Two runs allocating at once both
 resize every array, which Icechunk's rebase does not reconcile: the loser's
 init retries in a fresh session (up to 5), re-reads the rows the winner
-recorded and appends after them.
+recorded and appends after them. A retry re-applies the loser's own block
+changes (a ratchet, the per-run knobs) only when the winner changed nothing
+else, or made the same changes: a block the winner moved otherwise — a
+different ratchet, other knobs — is not overwritten with changes computed
+from the block before it, and the loser's init raises (and fails open).
 
 **Finalize.** `finalize {run_id}` — the once-per-run close
 (`mode="icechunk_finalize"` on Lambda, in-process on the local backend),
