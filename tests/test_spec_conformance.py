@@ -2404,7 +2404,9 @@ class TestDerivedCellCoordinate:
         )
         np.testing.assert_array_equal(cell_words(shard, exp["cell_order"]), want)
         # ... and the arithmetic it reduces to at cell_order <= 27, from the
-        # spec text alone: one stride of 2**(60 - 2c) from the first child.
+        # spec text alone: one stride of 2**(60 - 2c) from the first child,
+        # and the first child is the shard word plus (c - p).
+        assert int(want[0]) - shard == exp["cell_order"] - exp["shard_order"]
         stride = 2 ** (60 - 2 * exp["cell_order"])
         assert int(exp["derivation"]["stride"]) == stride
         assert [int(want[0]) + j * stride for j in range(len(want))] == [int(w) for w in want]
@@ -2426,6 +2428,7 @@ class TestDerivedCellCoordinate:
             assert words.dtype == np.uint64 and len(words) == pin["n_cells"] == 4**10
             assert int(pin["stride"]) == 4_194_304 == 2 ** (60 - 2 * 19)
             assert int(words[0]) == int(pin["first"]) and int(words[-1]) == int(pin["last"])
+            assert int(pin["first"]) - int(pin["shard_word"]) == 19 - 9  # word[0] = shard + (c - p)
             expected = np.uint64(int(pin["first"])) + np.arange(4**10, dtype=np.uint64) * np.uint64(
                 4_194_304
             )
