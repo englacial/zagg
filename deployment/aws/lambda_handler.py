@@ -233,6 +233,10 @@ nodes; idempotent, fail-open at the dispatcher):
     "config": dict,             # same single-source config as setup/ping
     "parent_order": int (optional, same meaning as setup),
     "run_id": str,              # stamped into the "init {run_id}" commit
+    "rows": [str, ...] (optional) -- the run's row labels (issue #584, spec
+        §11.2), allocated by this init in order of first appearance; an
+        unwindowed run sends ["all"]. Absent/empty -> an unwindowed store
+        still gets its one "all" row.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -1546,7 +1550,7 @@ def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
     the same forwarded ``config`` (+ ``parent_order``) the workers fan out
     on, so the repo's array model cannot drift from the leaf template. The
     body echoes :func:`zagg.icechunk_refs.init_repo`'s record (repo ``path``,
-    ``snapshot``, ``created``, ``split``); a 500 carries the error and the
+    ``snapshot``, ``created``, ``split``, ``rows``); a 500 carries the error and the
     dispatcher treats either failure fail-open (the leaves never depend on
     the index).
     """
@@ -1572,6 +1576,11 @@ def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
             # matters most.
             run_id=str(event["run_id"]),
             store_kwargs=_output_store_kwargs(event),
+            # The run's row labels (issue #584, spec §11.2): allocated here,
+            # once, before the fan-out, so every commit of the run finds its
+            # row. An older dispatcher sends none; an unwindowed store's one
+            # ``all`` row is allocated regardless.
+            rows=event.get("rows"),
         )
         return {
             "statusCode": 200,

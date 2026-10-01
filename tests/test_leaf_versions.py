@@ -342,7 +342,7 @@ class TestLifecycle:
             (rank,) = grid.block_index(shard)
             leaf = zarr.open_group(hive.resolve_leaf(hive.shard_leaf_path(root, shard))[0])["6"]
             np.testing.assert_array_equal(
-                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+                group["6"]["count"][0, rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
 
 

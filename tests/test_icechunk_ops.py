@@ -125,7 +125,7 @@ class TestValidation:
             return {}
 
         def resize(session, _block):
-            zarr.open_array(session.store, path="6/count", mode="r+").resize((8,))
+            zarr.open_array(session.store, path="6/count", mode="r+").resize((1, 8))
             return {}
 
         def drop_block(session, _block):
@@ -175,7 +175,7 @@ class TestDeclarePyramid:
         )
         assert block["levels"] == fresh["levels"] == r["levels"]
         assert group.attrs[MULTISCALES_ATTR] == manifest[MULTISCALES_ATTR]
-        assert {k for k, _ in group.members()} == set(block["levels"])
+        assert {k for k, _ in group.groups()} == set(block["levels"])
         # Each new group carries the level's array model, and the repo's
         # persisted manifest splits cover it (a commit into it cuts at its
         # own order, §11.5).
@@ -224,14 +224,17 @@ class TestDeclarePyramid:
         key = "c/" + "/".join("0" * written.ndim)
         location = icechunk_refs.container_prefix(root) + f"obj/count/{key}"
         length = (tmp_path / "store" / "obj" / "count" / key).stat().st_size
+        # A unit's chunk keys are the object's cell-axis plan; the commit
+        # places them at the unit's row (the ``all`` row here, §11.3).
         unit = {
             "level": 5,
+            "row": "all",
             "entries": [
                 {
                     "path": "count",
                     "refs": 1,
                     "sharded": False,
-                    "chunks": [(f"count/{key}", location, length, None)],
+                    "chunks": [("count/c/0", location, length, None)],
                 }
             ],
         }
@@ -271,7 +274,10 @@ class TestDeclarePyramid:
             # An init ratchet lands right after this operation's commit.
             out = commit(session, message, **kw)
             _group, repo = _open(root)
-            icechunk_refs._update_block(repo, {"split_order": 1}, "ratchet", local=True, path="")
+            ratchet = repo.writable_session("main")
+            root_group = zarr.open_group(ratchet.store, mode="r+")
+            root_group.attrs[ICECHUNK_ATTR] = {**root_group.attrs[ICECHUNK_ATTR], "split_order": 1}
+            commit(ratchet, "ratchet", local=True)
             return out
 
         monkeypatch.setattr(icechunk_ops, "_commit", ratchet_lands_too)
@@ -295,7 +301,7 @@ class TestDeclarePyramid:
         group, _repo = _open(root)
         assert list(group.attrs[ICECHUNK_ATTR]["levels"]) == ["6"]
         assert MULTISCALES_ATTR not in group.attrs
-        assert {k for k, _ in group.members()} == {"1", "2", "3", "4", "5", "6"}  # kept
+        assert {k for k, _ in group.groups()} == {"1", "2", "3", "4", "5", "6"}  # kept
         cfg.output.pop("pyramid")
         _write_manifest(root, grid)
         r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
@@ -364,7 +370,7 @@ class TestDeclarePyramid:
         block["levels"] = {**block["levels"], "5": {**block["levels"]["5"], "chunk_order": 3}}
         root_group.attrs.put({**root_group.attrs.asdict(), ICECHUNK_ATTR: block})
         session.commit("tamper")
-        with pytest.raises(ValueError, match="/2 revision, not an operation"):
+        with pytest.raises(ValueError, match="a new revision, not an operation"):
             icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
         with pytest.raises(ValueError, match="no morton_hive.json"):
             icechunk_ops.declare_pyramid(str(tmp_path / "bare"), cfg, store_kwargs={})
