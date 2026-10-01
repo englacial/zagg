@@ -3018,7 +3018,7 @@ already carry:
 | tier | key | what | answers |
 |---|---|---|---|
 | 1 | `shards` | one toc word per populated shard — the join over that shard's sibling words | *which* shards hold data during a window |
-| 2 | `counts` | the store-wide counted cover — the observation count in every aligned time bucket the store's observations fall in, exact when every leaf carries its worker's record and a stated lower bound otherwise (§10.3) | *how much* data falls in a window |
+| 2 | `counts` | the store-wide counted cover — the observation count in every aligned time bucket the store's observations fall in, exact when the block's `uncounted_shards` is 0 and a stated lower bound otherwise (§10.3) | *how much* data falls in a window |
 
 Neither tier is new information and neither is truth: like the spatial ranges
 beside them they are a **regenerable accelerator** over the leaf arrays (§8.3,
@@ -3766,7 +3766,11 @@ which is that rule pinned as bytes.
   been dropped) and read the leaf over the manifest's declared set instead;
   zagg's sweep does, so that every contribution to one section is folded
   over one declared set. The record is left in place (above), and that
-  leaf contributes coverage only until it is rewritten.
+  leaf contributes coverage only until it is rewritten. The cost is the
+  leaf's counts, although they do not depend on `fields` (the worker folds
+  one shared clock column, `n_obs` below): declaring or dropping a field
+  turns every leaf written before the change uncounted (§10.3), and with
+  no backfill only rewriting the leaf restores its count.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
   MUST equal the counts block's `obs_total`: the number of clocked
   observations the leaf aggregated, **once each** (§10.3's count rule). The
