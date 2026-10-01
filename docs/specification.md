@@ -3952,11 +3952,12 @@ that would write nothing commits nothing. The operations of `/1`:
   reads nothing from the store and writes nothing — it may hold invoke
   rights and no write credentials (a store whose only writer is the worker
   role), and a retention pass run elsewhere would read the repo out of its
-  region. Only a local store root runs in-process. The function is
-  `--function-name`, else the `ZAGG_LAMBDA_FUNCTION_NAME` environment
-  variable, verbatim (the run config's `worker:` suffix is not applied: that
-  config is in the manifest, which the host does not read); with neither
-  the command refuses, and it never falls back to the host. Because the
+  region. Only a local store root runs in-process. The function must be
+  named: `--function-name`, else the `ZAGG_LAMBDA_FUNCTION_NAME`
+  environment variable, verbatim, with no `process-shard` default (the run
+  config's `worker:` suffix is not applied either: that config is in the
+  manifest, which the host does not read); with neither the command
+  refuses, and it never falls back to the host. Because the
   event carries no `config`, a deployed worker that predates
   `operator_checks` fails on the missing key before any write; had the
   config ridden along, it would have tagged `newest_only` with none of the

@@ -574,14 +574,15 @@ def finalize(
     role), and a retention pass from outside the store's region would read
     the repo out of it.
 
-    The function is ``function_name`` (``--function-name``), else the
-    ``ZAGG_LAMBDA_FUNCTION_NAME`` environment variable, verbatim — the first
-    two rules of :func:`zagg.runner._resolve_function_name`. Its third, the
-    run config's ``worker:`` suffix, is not applied: that config is in the
-    run's dispatch manifest, which this host does not read. With neither,
-    the operation refuses. The event carries no config, so a deployed worker
-    that predates ``operator_checks`` fails on the missing key before any
-    write instead of tagging without the checks.
+    The function must be named explicitly: ``function_name``
+    (``--function-name``), else the ``ZAGG_LAMBDA_FUNCTION_NAME``
+    environment variable, verbatim. Unlike
+    :func:`zagg.runner._resolve_function_name` there is no ``process-shard``
+    default, and the run config's ``worker:`` suffix is not applied: that
+    config is in the run's dispatch manifest, which this host does not read.
+    With neither, the operation refuses. The event carries no config, so a
+    deployed worker that predates ``operator_checks`` fails on the missing
+    key before any write instead of tagging without the checks.
 
     Raises :class:`FinalizeRefusedError` with the worker's reason when a
     precondition does not hold, ``RuntimeError`` when the invoke failed or
@@ -646,8 +647,8 @@ def main(argv=None) -> int:
     p.add_argument(
         "--function-name",
         default=None,
-        help="the Lambda worker that finalizes an s3:// store (default: env "
-        "ZAGG_LAMBDA_FUNCTION_NAME; a local store finalizes in-process)",
+        help="the Lambda worker that finalizes an s3:// store (else env "
+        "ZAGG_LAMBDA_FUNCTION_NAME, no default; a local store finalizes in-process)",
     )
     args = parser.parse_args(argv)
     store_kwargs = {"region": args.region}

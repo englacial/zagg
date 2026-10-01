@@ -1636,7 +1636,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   and writes nothing: it needs Lambda invoke rights only (on a Source
   Cooperative store the worker role is the only writer), and nothing leaves
   the region but the report. Name the function with `--function-name`, or
-  set `ZAGG_LAMBDA_FUNCTION_NAME` (used verbatim; the run config's
+  set `ZAGG_LAMBDA_FUNCTION_NAME` — there is no `process-shard` default
+  (the name is used verbatim; the run config's
   `worker:` suffix is not applied, since the only copy of that config the
   command could consult is the run's dispatch manifest, and it does not
   read the store). With neither it refuses rather than finalize from the
