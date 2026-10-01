@@ -885,6 +885,7 @@ class Run:
                     parent_order=self._parent_order,
                     run_id=run_id,
                     output_creds_event=output_creds_event,
+                    rows=runner._icechunk_rows(self.config),
                 )
         else:
             runner._invoke_lambda_setup(

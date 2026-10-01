@@ -21,7 +21,7 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
   and keeps its group and split (its refs stay readable on every snapshot
   that names them); a level whose
   geometry the manifest would change is refused — an array-model change is a
-  ``/2`` revision, never an operation. The retrofit tool calls this itself
+  new revision, never an operation. The retrofit tool calls this itself
   when the store has a repo, so one operator step declares both planes.
 
     python -m zagg.icechunk_ops <store> set-attrs <path> '<json>'
@@ -236,7 +236,8 @@ def declare_pyramid(
     want = {"shard_order": int(grid.parent_order), **level_geometry(grid)}
     repo, block = open_vetted(store_root, store_kwargs=store_kwargs, want=want)
     options = {k: block[k] for k in ("commit", "commit_order", "split_order")}
-    spec = repo_group_spec(grid, store_root, options, manifest)
+    # A newly declared level's arrays are built at the repo's rows (§11.2).
+    spec = repo_group_spec(grid, store_root, options, manifest, block["rows"])
     levels = spec.attributes[ICECHUNK_ATTR]["levels"]
     mirror = spec.attributes.get(MULTISCALES_ATTR)
     recorded = dict(block.get("levels") or {})
@@ -244,7 +245,7 @@ def declare_pyramid(
         if levels[order] != recorded[order]:
             raise ValueError(
                 f"level /{order} is recorded as {recorded[order]}, the manifest now declares "
-                f"{levels[order]}: an array-model change is a /2 revision, not an operation"
+                f"{levels[order]}: an array-model change is a new revision, not an operation"
             )
     added = sorted(levels.keys() - recorded.keys(), key=int)
     dropped = sorted(recorded.keys() - levels.keys(), key=int)
@@ -265,7 +266,7 @@ def declare_pyramid(
                 if not _group_matches(session, order, spec.members[order]):
                     raise ValueError(
                         f"level /{order} exists with another array model than the manifest "
-                        f"declares: an array-model change is a /2 revision, not an operation"
+                        f"declares: an array-model change is a new revision, not an operation"
                     )
                 continue
             with vlen_dtype_warning_suppressed():

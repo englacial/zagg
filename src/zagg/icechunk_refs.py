@@ -5,7 +5,9 @@ A morton hive is many leaf zarrs. The companion repository at
 a **group per level, named by CELL order** (``/19`` the base leaves,
 ``/13`` the §4.6 leaf columns' declared member, ``/12`` … ``/4`` the
 declared overview orders — exactly the manifest's ``multiscales`` datasets),
-each holding that level's arrays re-rooted on the whole sphere, plus the
+each holding that level's arrays re-rooted on the whole sphere under a
+leading **row** dimension (``zagg-icechunk/2``, :mod:`zagg.icechunk_rows`:
+one row per window, the single ``all`` row on an unwindowed store), plus the
 manifest's ``zagg-multiscales/1`` block mirrored into the root attrs as
 ``multiscales`` — by recording every object's inner chunks as Icechunk
 **virtual chunk references**: ``(location, offset, length)`` byte ranges
@@ -19,10 +21,11 @@ D8):
 - :func:`init_repo` — the once-per-run initialization (``mode="icechunk_init"``
   on Lambda, in-process on the local backend): create-or-open the repo,
   define every level's group and array nodes (§11.2), the per-level manifest
-  splits (§11.5) and the virtual chunk container (§11.3), commit
-  ``init {run_id}``. Idempotent: an initialized repo is reopened, never
-  re-templated; one built for another geometry or container is refused
-  (``split_order`` ratchets, ``commit`` / ``commit_order`` are per-run).
+  splits (§11.5) and the virtual chunk container (§11.3), allocate the run's
+  rows, commit ``init {run_id}``. Idempotent: an initialized repo is
+  reopened, never re-templated — it only gains rows; one built for another
+  geometry, container or spec revision is refused (``split_order``
+  ratchets, ``commit`` / ``commit_order`` are per-run).
 - :func:`leaf_ref_plan` / :func:`object_ref_plan` — size and index the
   objects a leaf (or an overview) wrote: one HEAD + one ranged GET of the
   shard-index suffix per sharded array, one HEAD per single-chunk array, one
@@ -50,14 +53,28 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Iterable
 
 import numpy as np
 
+from zagg.icechunk_rows import (
+    ALL_ROW,
+    cell_axis_split,
+    check_revision,
+    commit_rows,
+    coordinate_specs,
+    level_group_spec,
+    row_index,
+    row_key,
+    store_rows,
+    write_bounds,
+)
+
 logger = logging.getLogger(__name__)
 
-#: The ``zagg_icechunk`` root-attrs block's revision token (spec §11.1).
-ICECHUNK_SPEC = "zagg-icechunk/1"
+#: The ``zagg_icechunk`` root-attrs block's revision token (spec §11.1): ``/2``
+#: is the row model (§11.2, issue #584); a ``/1`` repo is refused, not upgraded.
+ICECHUNK_SPEC = "zagg-icechunk/2"
 #: Root-group attrs key carrying the block.
 ICECHUNK_ATTR = "zagg_icechunk"
 #: Root-group attrs key carrying the manifest's multiscales mirror (§11.1).
@@ -378,7 +395,7 @@ def _repo_config(store_root: str, splits: dict, store_kwargs: dict):
     container, _creds = _container(store_root, store_kwargs)
     config.set_virtual_chunk_container(container)
     sizes = {
-        C.path_matches(regex=rf"^/{int(order)}/.*"): {D.Axis(0): int(split["chunks"])}
+        C.path_matches(regex=rf"^/{int(order)}/.*"): cell_axis_split(split["chunks"])
         for order, split in sorted(splits.items(), key=lambda kv: -int(kv[0]))
     }
     sizes[C.AnyArray()] = {D.Axis(0): 1}
@@ -424,38 +441,6 @@ def _save_splits(repo, store_root: str, splits: dict, store_kwargs: dict):
 
 
 # ── the hierarchy ───────────────────────────────────────────────────────────
-
-
-def _reroot(spec, n_shards: int):
-    """One leaf array spec re-rooted on the whole order (§11.2).
-
-    Shape ``(n_shards · L₀, *L[1:])``; when the leaf array is sharded the chunk
-    grid becomes the INNER chunk shape and the codecs the INNER chain (the
-    ``sharding_indexed`` wrapper is gone); dtype, fill, dims and attrs pass
-    through verbatim.
-    """
-    data = spec.model_dump()
-    codecs = list(data["codecs"])
-    if codecs and codecs[0]["name"] == "sharding_indexed":
-        inner = codecs[0]["configuration"]
-        data["chunk_grid"] = {
-            "name": "regular",
-            "configuration": {"chunk_shape": list(inner["chunk_shape"])},
-        }
-        data["codecs"] = list(inner["codecs"])
-    shape = list(data["shape"])
-    shape[0] *= int(n_shards)
-    data["shape"] = tuple(shape)
-    return type(spec)(**data)
-
-
-def level_group_spec(grid):
-    """One order's group: the leaf's resolution-group attrs, every array re-rooted."""
-    from pydantic_zarr.experimental.v3 import GroupSpec
-
-    leaf = grid.shard_spec()
-    members = {name: _reroot(spec, grid.n_shards) for name, spec in leaf.members.items()}
-    return GroupSpec(members=members, attributes=leaf.attributes)
 
 
 def level_geometry(grid) -> dict:
@@ -518,10 +503,11 @@ def level_grids(manifest: dict, grid) -> dict:
     return levels
 
 
-def repo_group_spec(grid, store_root: str, options: dict, manifest: dict):
-    """The repo's hierarchy: ``zagg_icechunk`` + ``multiscales`` root attrs, a group per level."""
+def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(ALL_ROW,)):
+    """The repo's hierarchy: the root attrs, a group per level, the row coordinate (``rows``)."""
     from pydantic_zarr.experimental.v3 import GroupSpec
 
+    rows = list(rows)
     grids = level_grids(manifest, grid)
     levels = {
         str(cells): {
@@ -540,6 +526,9 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict):
         "chunk_order": int(grid.chunk_order),
         "cell_order": int(grid.child_order),
         "url_prefix": container_prefix(store_root),
+        # The row law (§11.2): row ``w`` of every level is ``rows[w]``, in
+        # order of first appearance — appended to, never reordered.
+        "rows": rows,
         "levels": levels,
         # The ladder's knobs (§11.4/§11.5), read back by every stage node.
         # ``split_order`` is the store's authoritative, ratcheting value;
@@ -553,10 +542,11 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict):
         # The §4.9 discovery mirror, verbatim: one repo, every level findable
         # from its root attrs (the icechunk-multiscales convention).
         attributes[MULTISCALES_ATTR] = mirror
-    return GroupSpec(
-        members={str(cells): level_group_spec(level["grid"]) for cells, level in grids.items()},
-        attributes=attributes,
-    )
+    members = {
+        str(cells): level_group_spec(level["grid"], len(rows)) for cells, level in grids.items()
+    }
+    members.update(coordinate_specs(len(rows), manifest.get("temporal")))
+    return GroupSpec(members=members, attributes=attributes)
 
 
 def _session_block(session) -> dict | None:
@@ -587,7 +577,11 @@ def _check_block(block: dict, want: dict, path: str) -> None:
     every key here and then raises ``NodeNotFound`` on every commit — an
     index that silently never fills. No published store carries that shape,
     so the fix is to clear the repo and re-init.
+
+    The block's ``spec`` is vetted on every call, whatever ``want`` names
+    (:func:`zagg.icechunk_rows.check_revision`: a ``/1`` repo is refused).
     """
+    check_revision(block.get("spec"), ICECHUNK_SPEC, path)
     have = {key: block.get(key) for key in want}
     if have != want:
         raise ValueError(f"icechunk repo {path} was built for {have}, this run is {want}")
@@ -616,26 +610,17 @@ def read_block(store_root: str, *, store_kwargs: dict) -> dict | None:
 _COMPAT_KEYS = ("shard_order", "chunk_order", "cell_order", "url_prefix")
 
 
-def _update_block(
-    repo, updates: dict, message: str, *, local: bool, path: str, run_id: str | None = None
-) -> str:
-    """Rewrite root-attrs keys of the repo in one commit; the snapshot id."""
-    import zarr
-
-    session = repo.writable_session(BRANCH)
-    root = zarr.open_group(session.store, mode="r+")
-    block = dict(cast("Mapping[str, Any]", root.attrs[ICECHUNK_ATTR]))
-    block.update(updates)
-    root.attrs[ICECHUNK_ATTR] = block
-    metadata = {"run_id": run_id} if run_id else None
-    snapshot, _rebases = _commit(session, message, local=local, path=path, metadata=metadata)
-    return snapshot
-
-
 def init_repo(
-    store_root: str, grid, config, *, run_id: str, store_kwargs: dict, manifest: dict | None = None
+    store_root: str,
+    grid,
+    config,
+    *,
+    run_id: str,
+    store_kwargs: dict,
+    manifest: dict | None = None,
+    rows=None,
 ) -> dict:
-    """Create-or-open the store's repo and define every level (§11.4 ``init``).
+    """Create-or-open the store's repo, define every level, allocate the run's rows (§11.4 ``init``).
 
     One repo per store, a group per LEVEL keyed by cell order — the base
     leaves, the §4.6 column's declared members and every declared overview
@@ -644,10 +629,16 @@ def init_repo(
     commit fan out. ``manifest`` is the store's (an append run indexes the
     declared ladder, not this config's); ``None`` reads it, then builds it
     from ``config``. Returns ``{"path", "snapshot", "created", "options",
-    "levels", "ladder", "split_ratchet"}``; ``levels`` is keyed by cell order
-    and ``ladder`` is those keys sorted. ``created`` is ``False`` when the
-    repo already carried a block for this array model and container
-    (reopened) — a block for another geometry raises.
+    "levels", "ladder", "split_ratchet", "rows"}``; ``levels`` is keyed by
+    cell order and ``ladder`` is those keys sorted. ``created`` is ``False``
+    when the repo already carried a block for this array model and container
+    (reopened) — a block for another geometry or spec revision raises.
+
+    **Rows (§11.2).** ``rows`` are the labels this run writes
+    (:func:`zagg.icechunk_rows.run_rows`): each is allocated ONCE, appended
+    in order of first appearance inside this init commit — every array grows,
+    no row moves, a label the repo has is a no-op. An unwindowed store always
+    has its one ``all`` row. The record's ``rows`` is the repo's full list.
 
     **The split ratchet (§11.5).** The store's recorded ``split_order`` is
     authoritative and moves one way, toward coarser: a config FINER than the
@@ -674,7 +665,9 @@ def init_repo(
         manifest = build_manifest(grid, windowing=get_windowing(config))
     path = repo_path(store_root)
     local = _is_local(store_root)
-    spec = repo_group_spec(grid, store_root, options, manifest)
+    temporal = manifest.get("temporal")
+    labels = store_rows(temporal, rows)
+    spec = repo_group_spec(grid, store_root, options, manifest, labels)
     block = spec.attributes[ICECHUNK_ATTR]
     splits = {order: level["split"] for order, level in block["levels"].items()}
     repo = open_repo(store_root, store_kwargs=store_kwargs, splits=splits)
@@ -684,6 +677,7 @@ def init_repo(
         session = repo.writable_session(BRANCH)
         with vlen_dtype_warning_suppressed():
             spec.to_zarr(session.store, "", overwrite=False)
+        write_bounds(session, labels, labels, temporal)
         snapshot, _rebases = _commit(
             session, f"init {run_id}", local=local, path=path, metadata={"run_id": run_id}
         )
@@ -695,6 +689,7 @@ def init_repo(
             "levels": block["levels"],
             "ladder": sorted(int(o) for o in block["levels"]),
             "split_ratchet": None,
+            "rows": labels,
         }
     _check_block(existing, {k: block[k] for k in _COMPAT_KEYS}, path)
     stored = int(existing.get("split_order", options["split_order"]))
@@ -715,8 +710,7 @@ def init_repo(
             )
     elif wanted < stored:
         ratchet = {"from": stored, "to": wanted}
-        spec = repo_group_spec(grid, store_root, options, manifest)
-        block = spec.attributes[ICECHUNK_ATTR]
+        block = repo_group_spec(grid, store_root, options, manifest).attributes[ICECHUNK_ATTR]
         retired = existing.get("retired") or {}
         splits = block_splits({**block, "retired": retired})
         repo = _save_splits(repo, store_root, splits, store_kwargs)
@@ -731,27 +725,24 @@ def init_repo(
     for key in ("commit", "commit_order"):
         if existing.get(key) != options[key]:
             updates[key] = options[key]
-    if updates:
-        label = (
-            f"split ratchet {ratchet['from']}->{ratchet['to']} {run_id}"
-            if ratchet
-            else f"init {run_id}"
-        )
-        snapshot = _update_block(repo, updates, label, local=local, path=path, run_id=run_id)
-    else:
-        # Every run opens with an ``init {run_id}`` commit (§11.4) — empty
-        # when the block is unchanged — so the ancestry brackets each run
-        # between its init and its finalize: the repo is its own run log,
-        # and finalize's newest-run check (a reattached client's guard) is
-        # exact rather than blind to a run that changed nothing at init.
-        snapshot, _rebases = _commit(
-            repo.writable_session(BRANCH),
-            f"init {run_id}",
-            local=local,
-            path=path,
-            metadata={"run_id": run_id},
-            allow_empty=True,
-        )
+    message = (
+        f"split ratchet {ratchet['from']}->{ratchet['to']} {run_id}"
+        if ratchet
+        else f"init {run_id}"
+    )
+    # Every run opens with an ``init {run_id}`` commit (§11.4) — empty when
+    # neither the block nor the rows change — so the ancestry brackets each
+    # run between its init and its finalize: the repo is its own run log, and
+    # finalize's newest-run check (a reattached client's guard) is exact.
+    snapshot, rows = commit_rows(
+        repo,
+        updates,
+        labels,
+        temporal,
+        lambda session: _commit(
+            session, message, local=local, path=path, metadata={"run_id": run_id}, allow_empty=True
+        )[0],
+    )
     return {
         "path": path,
         "snapshot": snapshot,
@@ -760,6 +751,7 @@ def init_repo(
         "levels": levels,
         "ladder": sorted(int(o) for o in levels),
         "split_ratchet": ratchet,
+        "rows": rows,
     }
 
 
@@ -973,8 +965,12 @@ def commit_units(
 ) -> dict:
     """Write ref-plan units for any set of orders into ONE session and commit once.
 
-    ``units`` is any ITERABLE of ``{"level", "entries"}``: each entry lands
-    under its level's group (``/{level}/{path}``, the level's CELL order). A
+    ``units`` is any ITERABLE of ``{"level", "row", "entries"}``: each entry
+    lands under its level's group (``/{level}/{path}``, the level's CELL
+    order) at the row the repo allocated the unit's LABEL (absent: ``all``;
+    §11.3 — the entries are the object's cell-axis plan, row-free). The label
+    is resolved against the block the committing session reads, the
+    authority, so a unit for a row the repo never allocated raises. A
     generator is the point — the ladder streams a committing node's subtree
     through here one child at a time, so the node's peak is one child's
     carriers rather than the whole subtree's (§11.4). Returns ``{"path",
@@ -985,10 +981,12 @@ def commit_units(
     if repo is None:
         repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
     session = repo.writable_session(BRANCH)
+    rows = (_session_block(session) or {}).get("rows") or []
     refs = 0
     orders: set = set()
     for unit in units:
         order = int(unit["level"])
+        row = row_index(rows, unit.get("row", ALL_ROW))
         for entry in unit["entries"]:
             if not entry["refs"]:
                 continue
@@ -996,11 +994,11 @@ def commit_units(
             if entry["sharded"]:
                 rejected = session.store.set_virtual_refs_arr(
                     array_path,
-                    tuple(entry["chunk_grid"]),
+                    (1, *entry["chunk_grid"]),
                     list(entry["locations"]),
                     np.asarray(entry["offsets"], dtype="<u8"),
                     np.asarray(entry["lengths"], dtype="<u8"),
-                    arr_offset=tuple(entry["arr_offset"]),
+                    arr_offset=(row, *entry["arr_offset"]),
                     checksum=entry["checksum"],
                 )
                 if rejected:
@@ -1008,7 +1006,7 @@ def commit_units(
             else:
                 for key, location, length, chunk_checksum in entry["chunks"]:
                     session.store.set_virtual_ref(
-                        f"{order}/{key}",
+                        f"{order}/{row_key(key, row)}",
                         location,
                         offset=0,
                         length=int(length),
@@ -1047,9 +1045,11 @@ def leaf_units(
     column: str | None,
     store_kwargs: dict,
     version: str | None = None,
+    row: str = ALL_ROW,
 ) -> list[dict]:
     """The units a committed leaf contributes (§11.4): its base arrays + its column's level.
 
+    Every unit names ``row``, the leaf's window label (``all`` when unwindowed).
     The base unit at the store's cell order from :func:`leaf_ref_plan`, plus
     — when the unit wrote its §4.6 column (``column`` is its basename) — one
     unit per column member that is a repo LEVEL: the declared leaf-node
@@ -1070,6 +1070,7 @@ def leaf_units(
     units = [
         {
             "level": int(grid.child_order),
+            "row": row,
             "entries": leaf_ref_plan(
                 grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
             ),
@@ -1088,7 +1089,7 @@ def leaf_units(
             column_grid, f"{node_rel}/{column}", rank, store_root, store_kwargs=store_kwargs
         )
         if entries:
-            units.append({"level": int(res), "entries": entries})
+            units.append({"level": int(res), "row": row, "entries": entries})
     return units
 
 
@@ -1149,7 +1150,7 @@ def record_leaf(
         plan = leaf_ref_plan(
             grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
         )
-        units = [{"level": int(grid.child_order), "entries": plan}]
+        units = [{"level": int(grid.child_order), "row": ALL_ROW, "entries": plan}]
     if not any(entry["refs"] for unit in units for entry in unit["entries"]):
         return {"skipped": "empty"}
     outcome = commit_units(
