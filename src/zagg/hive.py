@@ -2125,14 +2125,13 @@ def process_and_write_hive(
         # fail closed; nothing points at the record, and §10.6 reads its
         # absence as "read the leaf". So it is fail-OPEN like the D9
         # granule-id sibling below: a transient 5xx on a ~1 KB sidecar must
-        # not discard a finished shard's read and aggregate. What a failed PUT
-        # costs is this leaf's COUNTS — nothing else writes the record (§10.6),
-        # so the sweep reads the leaf's coverage only and reports the shard in
-        # the root block's ``uncounted_shards`` until the leaf is next
-        # replaced. Absent when the fold saw no clocked observation (an empty
-        # leaf publishes no temporal claim). It goes to ``data_path``, beside
-        # the bitmap: on a versioned leaf (spec §1.5) that is the version
-        # subgroup, written here BEFORE the version's stamp.
+        # not discard a finished shard's read and aggregate. A failed PUT costs
+        # this leaf's COUNTS — nothing else writes the record (§10.6), so the
+        # sweep reads its coverage only, the shard in the root block's
+        # ``uncounted_shards`` until the leaf is replaced. Absent when the
+        # fold saw no clocked observation (an empty leaf publishes no temporal
+        # claim). It goes to ``data_path``, beside the bitmap: on a versioned
+        # leaf (spec §1.5) the version subgroup, BEFORE the version's stamp.
         folded = temporal_acc.finish() if temporal_acc is not None else None
         if folded is not None:
             try:
