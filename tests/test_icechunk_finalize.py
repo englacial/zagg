@@ -443,6 +443,16 @@ class TestLambdaFinalizeInvoke:
             "operator_checks": True,
         }
 
+    def test_a_dispatcher_call_without_config_raises_before_any_invoke(self):
+        # Only the operator event omits the config; a dispatcher caller that
+        # forgot it would otherwise send ``"config": null`` and fail open.
+        from zagg import runner
+
+        client = _Client(_envelope({"ok": True, "tag": "run-r1"}))
+        with pytest.raises(TypeError, match="config_dict is required"):
+            runner._invoke_lambda_icechunk_finalize(client, "fn", "s3://b/p", run_id="r1")
+        assert client.events == []
+
     @pytest.mark.parametrize(
         "response, raise_exc, match",
         [

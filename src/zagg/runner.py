@@ -5902,6 +5902,8 @@ def _invoke_lambda_icechunk_finalize(
     event = {"mode": "icechunk_finalize", "store_path": store_path, "run_id": run_id}
     if operator_checks:
         newest_only = True
+    elif config_dict is None:
+        raise TypeError("config_dict is required unless operator_checks")
     else:
         event["config"] = config_dict
         # The init record rides so a split ratchet this run applied is
