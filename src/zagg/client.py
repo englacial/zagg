@@ -197,6 +197,18 @@ class RunHandle:
         #: dispatch failed (fail-open, D9 — ``icechunk_finalize`` then says
         #: ``{"skipped"}``).
         self.stage_sweep: dict | None = None
+        #: How the run's dispatch manifest went out (issue #588): ``"full"``;
+        #: ``"slim"`` — the block did not fit the hive setup Event, so it
+        #: rode without its shard list (the config is kept: :meth:`Run.attach`
+        #: and ``icechunk_ops finalize`` still work); or ``"dropped"`` — even
+        #: the slim block did not fit, so the run has no manifest and neither
+        #: works. What was SENT: the write is the worker's, best-effort. On a
+        #: reattached handle, the kind of manifest attach read.
+        self.dispatch_manifest: str | None = None
+        #: Reattached handles over a slim manifest only: how many of its
+        #: ``shards_omitted`` have no status object yet. Non-zero means this
+        #: handle is a snapshot of the reported shards and ran no tail.
+        self.unreported_shards: int = 0
 
     def __len__(self) -> int:
         return len(self.futures)
@@ -616,6 +628,12 @@ class Run:
         restart or a second machine can adopt a running fleet this way — the
         Event invokes are already in flight and owe the client nothing.
 
+        A large hive run's manifest is slim (issue #588 — no shard list, see
+        ``RunHandle.dispatch_manifest``): the config still comes from it and
+        the shard set is the shards that have reported a status. Until all of
+        them have, the handle covers only those (``unreported_shards`` counts
+        the rest) and runs no tail; attach again once the fleet has finished.
+
         Observe-only by design: the manifest carries no granule records, so a
         ``failed`` status resolves that shard's :class:`ShardError`
         immediately (no re-dispatch), and a shard with no status object by
@@ -888,7 +906,7 @@ class Run:
                 overwrite=self.overwrite,
                 output_creds_event=output_creds_event,
             )
-            runner._invoke_lambda_setup_async(
+            manifest_sent = runner._invoke_lambda_setup_async(
                 client,
                 self.function_name,
                 self.store,
@@ -926,6 +944,7 @@ class Run:
                 output_creds_event=output_creds_event,
                 run_manifest=run_manifest,
             )
+            manifest_sent = "full"  # the synchronous setup has no size gate
 
         aoi_by_shard = runner._aoi_payload_map(self.catalog_data)
         result_prefix = None
@@ -966,6 +985,7 @@ class Run:
             closer = pool
 
         handle = RunHandle(futures, store_path=self.store, memory_gb=memory_gb)
+        handle.dispatch_manifest = manifest_sent
         finisher = threading.Thread(
             target=self._post_run,
             args=(handle, client, closer, config_dict, dataset, output_creds_event, run_id),

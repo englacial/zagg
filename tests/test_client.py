@@ -790,7 +790,7 @@ class TestRunnerParity:
         # this run read-free rather than reaching for a bucket that isn't there.
         monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: None)
         agg_kwargs.setdefault("invocation", "sync")
-        runner.agg(
+        stub.summary = runner.agg(
             cfg if cfg is not None else default_config("atl06"),
             catalog=catalog_file,
             store=_STORE,
@@ -858,6 +858,41 @@ class TestRunnerParity:
 # -- dispatch manifest (issue #327 phase 2) ------------------------------------
 
 
+def _force_dispatch_manifest(monkeypatch, outcome):
+    """Make the hive setup invoke send its block ``outcome`` (issue #588).
+
+    Shrinks the async payload cap for that one invoke, to the exact boundary:
+    the full event's own size (``"full"``), one byte under it (``"slim"``), or
+    one byte under the slim event (``"dropped"``). Every other invoke of the
+    run keeps the real cap.
+    """
+    from zagg import runner
+
+    real = runner._invoke_lambda_setup_async
+
+    def gated_size(args, kwargs, cap=None):
+        # The event as the gate measures it: credentials ride after the gate.
+        probe = StubLambdaClient()
+        with monkeypatch.context() as m:
+            if cap is not None:
+                m.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
+            real(probe, *args[1:], **{**kwargs, "output_creds_event": None})
+        return len(json.dumps(probe.events[0][2]))
+
+    def gated(*args, **kwargs):
+        full = gated_size(args, kwargs)
+        cap = {
+            "full": lambda: full,
+            "slim": lambda: full - 1,
+            "dropped": lambda: gated_size(args, kwargs, full - 1) - 1,
+        }[outcome]()
+        with monkeypatch.context() as m:
+            m.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
+            return real(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_invoke_lambda_setup_async", gated)
+
+
 class TestDispatchManifestBlock:
     """The setup invoke carries the ``run_manifest`` block (issue #327): the
     worker records the run's shard set + identity at the status prefix, so
@@ -904,22 +939,151 @@ class TestDispatchManifestBlock:
         _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]]).wait(timeout=10)
         assert self._setup_block(stub)["shards"] == [str(_WORDS[1])]
 
-    def test_async_setup_size_gate_drops_the_block(self, monkeypatch):
-        # The hive setup invoke is a 256 KB-capped Event; an oversized shard
-        # list drops the block (never fatal) — attach degrades to statuses.
-        from zagg import runner
+    _SLIM_KEYS = ["run_id", "shards", "semantic_hash", "dispatched_at", "dataset", "shards_omitted"]
 
+    @staticmethod
+    def _setup_async(monkeypatch, cap, *, config_dict=None, shards=range(100), **kwargs):
+        """One direct hive setup invoke under ``cap``: ``(sent, event, block)``."""
+        from zagg import runner
+        from zagg.client_transport import build_run_manifest_block
+
+        block = build_run_manifest_block(
+            "r", shards, default_config("atl06"), dataset={"short_name": "ATL06", "version": "006"}
+        )
         stub = StubLambdaClient()
-        monkeypatch.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", 10)
-        runner._invoke_lambda_setup_async(
+        if cap is not None:
+            monkeypatch.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
+        sent = runner._invoke_lambda_setup_async(
             stub,
             "fn",
             _STORE,
-            config_dict={},
-            run_manifest={"run_id": "r", "shards": ["1"]},
+            config_dict={"a": 1} if config_dict is None else config_dict,
+            parent_order=6,
+            run_manifest=block,
+            **kwargs,
         )
-        (_, _, event) = stub.events[0]
-        assert "run_manifest" not in event
+        (_, kind, event) = stub.events[0]
+        assert kind == "Event"
+        return sent, event, block
+
+    def test_full_block_event_is_byte_identical(self):
+        # A block that fits rides exactly as before issue #588: the same keys
+        # in the same order, no ``shards_omitted``, credentials after it.
+        from zagg import runner
+        from zagg.client_transport import build_run_manifest_block
+
+        block = build_run_manifest_block("r", [1, 2], default_config("atl06"), dataset=None)
+        assert list(block) == ["run_id", "shards", "semantic_hash", "dispatched_at", "dataset"]
+        sent_payloads = []
+
+        class _Raw:
+            def invoke(self, **kwargs):
+                sent_payloads.append(kwargs["Payload"])
+
+        creds = {"accessKeyId": "AK", "secretAccessKey": "SK", "region": "us-west-2"}
+        sent = runner._invoke_lambda_setup_async(
+            _Raw(),
+            "fn",
+            _STORE,
+            config_dict={"a": 1},
+            dataset={"short_name": "ATL06", "version": "006"},
+            parent_order=6,
+            output_creds_event=creds,
+            run_manifest=block,
+        )
+        assert sent == "full"
+        assert sent_payloads == [
+            json.dumps(
+                {
+                    "mode": "setup",
+                    "store_path": _STORE,
+                    "parent_order": 6,
+                    "overwrite": False,
+                    "config": {"a": 1},
+                    "dataset": {"short_name": "ATL06", "version": "006"},
+                    "run_manifest": block,
+                    "output_credentials": creds,
+                }
+            )
+        ]
+
+    def test_a_block_just_over_the_cap_goes_slim(self, monkeypatch):
+        # The hive setup invoke is a 256 KB-capped Event and only the shard
+        # list scales with the run: one byte over, the block rides without
+        # it (issue #588) — the config and the run's identity still land.
+        sent, event, block = self._setup_async(monkeypatch, None)
+        assert sent == "full" and event["run_manifest"] == block
+        full = len(json.dumps(event))
+        sent, event, block = self._setup_async(monkeypatch, full)  # exactly at the cap
+        assert sent == "full" and event["run_manifest"] == block
+        sent, event, block = self._setup_async(monkeypatch, full - 1)
+        assert sent == "slim"
+        slim = event["run_manifest"]
+        assert list(slim) == self._SLIM_KEYS
+        assert slim["shards"] is None and slim["shards_omitted"] == 100
+        assert {k: v for k, v in slim.items() if k != "shards_omitted"} == {**block, "shards": None}
+        assert event["config"] == {"a": 1}  # what the worker folds into the manifest
+
+    def test_a_config_too_large_for_the_slim_block_drops_it(self, monkeypatch):
+        # Even slim does not fit when the config itself fills the event: the
+        # block is dropped (never fatal — the setup invoke still fires).
+        from zagg import runner
+
+        cap = runner._ASYNC_PAYLOAD_CAP_BYTES
+        sent, event, _block = self._setup_async(monkeypatch, None, config_dict={"blob": "x" * cap})
+        assert sent == "dropped"
+        assert "run_manifest" not in event and event["mode"] == "setup"
+
+    def test_a_one_byte_miss_of_the_slim_block_drops_it(self, monkeypatch):
+        sent, event, _block = self._setup_async(monkeypatch, None)
+        sent, event, _block = self._setup_async(monkeypatch, len(json.dumps(event)) - 1)
+        assert sent == "slim"
+        slim_size = len(json.dumps(event))
+        assert self._setup_async(monkeypatch, slim_size)[0] == "slim"
+        sent, event, _block = self._setup_async(monkeypatch, slim_size - 1)
+        assert sent == "dropped" and "run_manifest" not in event
+
+    def test_no_block_reports_nothing(self):
+        from zagg import runner
+
+        stub = StubLambdaClient()
+        assert runner._invoke_lambda_setup_async(stub, "fn", _STORE, config_dict={}) is None
+        assert "run_manifest" not in stub.events[0][2]
+
+    @pytest.mark.parametrize("outcome", ["full", "slim", "dropped"])
+    def test_the_handle_says_how_the_manifest_went_out(self, catalog, monkeypatch, outcome):
+        _force_dispatch_manifest(monkeypatch, outcome)
+        stub = StubLambdaClient()
+        handle = _run(catalog, client=stub).dispatch()
+        handle.wait(timeout=10)
+        assert handle.dispatch_manifest == outcome and handle.unreported_shards == 0
+        (setup,) = [e for _, _, e in stub.events if e.get("mode") == "setup"]
+        if outcome == "dropped":
+            assert "run_manifest" not in setup
+        else:
+            block = setup["run_manifest"]
+            assert (block["shards"] is None) == (outcome == "slim")
+            assert block.get("shards_omitted") == (3 if outcome == "slim" else None)
+
+    @pytest.mark.parametrize("outcome", ["full", "slim", "dropped"])
+    def test_the_cli_summary_says_how_the_manifest_went_out(
+        self, catalog_file, monkeypatch, outcome
+    ):
+        _force_dispatch_manifest(monkeypatch, outcome)
+        agg_stub = TestRunnerParity._agg_stub(catalog_file, monkeypatch)
+        assert agg_stub.summary["dispatch_manifest"] == outcome
+        (setup,) = [e for _, _, e in agg_stub.events if e.get("mode") == "setup"]
+        assert ("run_manifest" in setup) == (outcome != "dropped")
+
+    def test_a_flat_run_always_sends_it_full(self, catalog, catalog_file, monkeypatch):
+        # The flat setup is synchronous (no size gate) on both dispatchers.
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "flat"
+        handle = _run(catalog, client=StubLambdaClient(), config=cfg).dispatch()
+        handle.wait(timeout=10)
+        assert handle.dispatch_manifest == "full"
+        agg_stub = TestRunnerParity._agg_stub(catalog_file, monkeypatch, cfg=cfg)
+        assert agg_stub.summary["dispatch_manifest"] == "full"
 
     def test_sync_setup_has_no_size_gate(self):
         # The flat setup invoke is synchronous (6 MB cap): the block always rides.

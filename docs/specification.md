@@ -3942,10 +3942,11 @@ that would write nothing commits nothing. The operations of `/1`:
   (the state described under **Finalize** above). It reads the run's
   dispatch manifest (`<store>.status/run-<run_id>/manifest.json`) for the
   run's own config — its `retain_runs` and the D19 hash — refuses without
-  it (a Lambda-dispatched run normally has one, but the write is
-  best-effort: a large hive run's setup event drops it over the async
-  payload cap, and a lost setup invoke or failed write leaves none; such a
-  run is not finalizable here and the next run's tag covers it), refuses unless the newest `sweep_stats_*_stages.json` written since
+  it (a Lambda-dispatched run has one; a large hive run's is slim — the
+  shard list left out so the block fits the setup event — and carries the
+  config all the same. The write is best-effort: a lost setup invoke or
+  failed write leaves none, as does a block that does not fit even slim;
+  such a run is not finalizable here and the next run's tag covers it), refuses unless the newest `sweep_stats_*_stages.json` written since
   the run's init commit (its `written_at` on `main`, the repo's clock —
   a run with no init commit is refused) shows a completed sweep (the
   finisher wrote it, and no barrier expired), and then runs the **Finalize** above `newest_only`:

@@ -475,8 +475,12 @@ class TestFinalizeOperation:
 
     DISPATCHED = "2026-01-01T00:00:00+00:00"
 
-    def _manifest(self, root, run_id, cfg, *, dispatched_at=DISPATCHED):
-        """The run's dispatch manifest, as the setup worker writes it (issue #327)."""
+    def _manifest(self, root, run_id, cfg, *, dispatched_at=DISPATCHED, slim=False):
+        """The run's dispatch manifest, as the setup worker writes it (issue #327).
+
+        ``slim``: through the real halves — the dispatcher's slim block, the
+        worker's write — as a large hive run's setup event carries it.
+        """
         from dataclasses import asdict
 
         import obstore
@@ -485,6 +489,15 @@ class TestFinalizeOperation:
         from zagg.semantics import semantic_hash
         from zagg.store import open_object_store
 
+        if slim:
+            block = ct.build_run_manifest_block(run_id, [1, 2, 3], cfg)
+            event = {
+                "store_path": root,
+                "config": asdict(cfg),
+                "run_manifest": ct.slim_run_manifest_block(block),
+            }
+            ct.write_dispatch_manifest(event, {})
+            return
         manifest = {
             "schema_version": 1,
             "run_id": run_id,
@@ -565,6 +578,22 @@ class TestFinalizeOperation:
         assert again["tagged"] is False and again["skipped"] == f"run-{RUN} already exists"
         assert again["snapshot"] == out["snapshot"] and len(_messages(root)) == n
 
+    def test_tags_a_run_whose_manifest_is_slim(self, monkeypatch, cfg, tmp_path):
+        # A large hive run's manifest carries no shard list (issue #588); the
+        # config is all finalize reads, so the run is tagged all the same.
+        from zagg import client_transport as ct
+
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        cfg.output["icechunk"] = {"commit": "ladder", "retain_runs": 2}
+        self._manifest(root, RUN, cfg, slim=True)
+        manifest = ct.read_dispatch_manifest(ct.run_status_prefix(root, RUN), {})
+        assert manifest["shards"] is None and manifest["shards_omitted"] == 3
+        key = self._record(root)
+        out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert out["tagged"] is True and out["stage_record"] == key
+        assert out["retain_runs"] == 2
+        assert _open(root)[1].lookup_tag(f"run-{RUN}") == out["snapshot"]
+
     @pytest.mark.parametrize(
         "fields, reason",
         [
@@ -627,8 +656,10 @@ class TestFinalizeOperation:
         self._record(root)
         with pytest.raises(ValueError, match="no dispatch manifest") as err:
             icechunk_ops.finalize(root, RUN, store_kwargs={})
-        # The write is best-effort: the text says so and names the fallback.
-        assert "normally has one" in str(err.value)
+        # A large run has a slim manifest, so the text names only what is
+        # left: a lost write, or a block that did not fit even slim.
+        assert "slim (no shard list) when the run is large" in str(err.value)
+        assert 'dispatch_manifest: "dropped"' in str(err.value)
         assert "the next run's tag covers its commits" in str(err.value)
 
     def test_skips_a_run_that_is_no_longer_the_newest(self, monkeypatch, cfg, tmp_path):

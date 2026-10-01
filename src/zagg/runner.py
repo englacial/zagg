@@ -4013,7 +4013,7 @@ def _run_lambda(
             overwrite=overwrite,
             output_creds_event=output_creds_event,
         )
-        _invoke_lambda_setup_async(
+        manifest_sent = _invoke_lambda_setup_async(
             state["lambda_client"],
             function_name,
             store_path,
@@ -4067,6 +4067,7 @@ def _run_lambda(
             output_creds_event=output_creds_event,
             run_manifest=run_manifest,
         )
+        manifest_sent = "full"  # the synchronous setup has no size gate
     setup_s = time.time() - setup_start
 
     start_time = time.time()
@@ -4310,6 +4311,11 @@ def _run_lambda(
             "max_memory_mb": max_memory_mb,
             # Icechunk companion init record (issue #580): see _run_local.
             "icechunk": icechunk_init,
+            # How the dispatch manifest went out (issue #588): "full", "slim"
+            # (no shard list — the block did not fit the hive setup Event) or
+            # "dropped" (no manifest: no Run.attach, no operator finalize).
+            # What was SENT; the write is the worker's, best-effort.
+            "dispatch_manifest": manifest_sent,
             "store_path": store_path,
             "backend": "lambda",
             "function_name": function_name,
@@ -5287,6 +5293,11 @@ def _invoke_lambda_setup_async(
     idempotent ensure_manifest backstop — see ``_invoke_lambda_finalize``.
     ``run_manifest`` (issue #327) additionally has the worker record the
     run's dispatch manifest at the status prefix, size-gated below.
+
+    Returns how the block went out (issue #588): ``"full"``, ``"slim"`` (its
+    shard list left out), ``"dropped"`` (not sent at all), or ``None`` when
+    there was no block. It names what was SENT: the write is the worker's,
+    off a retries-0 Event invoke.
     """
     event = {
         "mode": "setup",
@@ -5298,19 +5309,37 @@ def _invoke_lambda_setup_async(
     if dataset is not None:
         event["dataset"] = dataset
     # Dispatch manifest (issue #327): attached only when it FITS the 256 KB
-    # Event cap — the shard list scales with the run, and this invoke
-    # dispatched fine before the block existed, so the block is dropped (never
-    # fatal) rather than failing the run; Run.attach then degrades to the
-    # status objects alone.
+    # Event cap. Only the shard list scales with the run, so a block that
+    # does not fit rides SLIM — without the list (issue #588): the worker
+    # still records the run's config and identity, which is all the operator
+    # ``finalize`` reads and what Run.attach rebuilds from (its shard set
+    # then comes from the status objects). Only when even the slim block
+    # does not fit (the config itself fills the event) is the block dropped —
+    # never fatal: this invoke dispatched fine before the block existed.
+    sent = None
     if run_manifest is not None:
-        with_block = {**event, "run_manifest": run_manifest}
-        if len(json.dumps(with_block)) <= _ASYNC_PAYLOAD_CAP_BYTES:
-            event = with_block
-        else:
+        from zagg.client_transport import slim_run_manifest_block
+
+        sent = "dropped"
+        for kind, block in (
+            ("full", run_manifest),
+            ("slim", slim_run_manifest_block(run_manifest)),
+        ):
+            with_block = {**event, "run_manifest": block}
+            if len(json.dumps(with_block)) <= _ASYNC_PAYLOAD_CAP_BYTES:
+                event, sent = with_block, kind
+                break
+        if sent != "full":
+            n_shards = len(run_manifest.get("shards") or [])
             logger.warning(
-                f"run_manifest block over the async setup budget "
-                f"({len(run_manifest.get('shards') or [])} shards); dropped — "
-                f"Run.attach for this run degrades to status objects only (issue #327)"
+                f"run_manifest block over the async setup budget ({n_shards} shards): "
+                + (
+                    "sent slim, without the shard list — Run.attach reads the shard set "
+                    "from the status objects (issue #588)"
+                    if sent == "slim"
+                    else "dropped, even without the shard list — this run has no dispatch "
+                    "manifest: no Run.attach, no operator finalize (issue #588)"
+                )
             )
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
@@ -5319,6 +5348,7 @@ def _invoke_lambda_setup_async(
         InvocationType="Event",
         Payload=json.dumps(event),
     )
+    return sent
 
 
 def _invoke_lambda_raster_setup(

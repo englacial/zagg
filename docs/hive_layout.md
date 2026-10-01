@@ -1609,10 +1609,14 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   sweep completed but before its finalize (`icechunk_finalize: {skipped}`
   on the CLI summary / `handle.icechunk_finalize` on the facade, or no
   record at all): it reads the run's dispatch manifest for its config
-  (`retain_runs`, the semantic hash — no `--retain-runs`; the manifest
-  write is best-effort, so a run whose manifest was dropped — a large hive
-  run over the async payload cap, a lost setup invoke — is refused and
-  left to the next run's tag), refuses unless
+  (`retain_runs`, the semantic hash — no `--retain-runs`; a large hive
+  run's manifest is **slim** — its block did not fit the setup event, so
+  it rode without the shard list, `shards: null` plus `shards_omitted` —
+  and still carries the config, so the run is finalizable; only a run
+  whose manifest write was lost, or whose block did not fit even slim, is
+  refused and left to the next run's tag — the run summary's
+  `dispatch_manifest` / `handle.dispatch_manifest` says which went out:
+  `full`, `slim` or `dropped`), refuses unless
   the newest `sweep_stats_*_stages.json` since the run's init commit
   (the repo's clock) shows a completed sweep, and tags `newest_only` — an
   older untagged run stays covered by the next run's tag. The record is
