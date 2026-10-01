@@ -52,6 +52,13 @@ ATL03_COLUMN_ARRAYS = {
     "h_tdigest_noise_locations",
     "composition",
 }
+#: The shipped strata template's column set: the exemplar arrays plus the
+#: per-centroid temporal companions the live store's build config declares
+#: (``temporal: per-centroid`` on both strata, issue #547).
+ATL03_TEMPLATE_COLUMN_ARRAYS = ATL03_COLUMN_ARRAYS | {
+    "h_tdigest_signal_times",
+    "h_tdigest_noise_times",
+}
 
 
 def _count_only(plan) -> dict:
@@ -135,7 +142,7 @@ class TestFourFieldSchema:
         )
         assert set(structure) == {"13", "12", "11", "10", "9"}
         for group in structure.values():
-            assert set(group) == ATL03_COLUMN_ARRAYS
+            assert set(group) == ATL03_TEMPLATE_COLUMN_ARRAYS
 
     def test_a_built_column_carries_the_four_field_set(self, tmp_path, monkeypatch):
         """The kitchen-sink fixture (the ATL03 shape at test scale), on disk."""

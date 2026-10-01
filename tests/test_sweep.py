@@ -1138,6 +1138,22 @@ class TestSweepHook:
         ]
         assert leaves_from_stats_records(records) == [(7, None), (7, "2019"), (8, None)]
 
+    def test_dirt_only_leaves(self):
+        # Issue #580 (PR #581 question (11)): only a CURRENT unit the worker
+        # marked ``icechunk_dirty`` (its ladder ref sidecar was rewritten after
+        # the lifecycle touch) rides the staged sweep as dirt-only.
+        from zagg.sweep import dirt_only_leaves
+
+        metas = [
+            {"shard_key": 7, "window": None, "current": True, "icechunk_dirty": True},
+            {"shard_key": 7, "window": "2019", "current": True, "icechunk_dirty": True},
+            {"shard_key": 8, "window": None, "current": True},  # untouched / no sidecar
+            {"shard_key": 9, "current": True, "icechunk": {"snapshot": "S"}},  # commit: leaf
+            {"shard_key": 10, "icechunk_dirty": True, "stats": {}},  # written: a real leaf
+            None,
+        ]
+        assert dirt_only_leaves(metas) == [(7, None), (7, "2019")]
+
     def test_local_run_folds_rollups(self, monkeypatch, tmp_path):
         # End-to-end through the local backend (fake hive write): the
         # in-process hook folds the stats family up the ancestor chain.

@@ -176,12 +176,14 @@ echo "Cleaning caches and test directories..."
 # bin/ from the deps install (zagg's was removed before it, see above).
 rm -rf "$BUILD_DIR/bin"
 find "$BUILD_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-# Strip dist-info except for packages whose code calls importlib.metadata.version()
-# at runtime. zarr / pydantic_zarr do this for in-package version checks; without
-# their dist-info, calls into ArraySpec.from_zarr fail with PackageNotFoundError.
-find "$BUILD_DIR" -type d -name "*.dist-info" \
-    ! -name "zarr-*" ! -name "pydantic_zarr-*" \
-    -exec rm -rf {} + 2>/dev/null || true
+# dist-info is KEPT for every package (espg ruling 2026-09-17). It used to be
+# stripped except for zarr / pydantic_zarr, which read their own version through
+# importlib.metadata; numcodecs 0.17.0 started doing the same in its __init__,
+# and the 0.54.0 function zip -- built with that strip and a floated numcodecs --
+# failed EVERY invocation at import ("No package metadata was found for
+# numcodecs"). The metadata is a few hundred KB against the 250 MB gate, and
+# any package may adopt the importlib.metadata pattern at any release, so the
+# allow-list is the trap, not the fix.
 find "$BUILD_DIR" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
 find "$BUILD_DIR" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
 find "$BUILD_DIR" -name "*.pyc" -delete 2>/dev/null || true

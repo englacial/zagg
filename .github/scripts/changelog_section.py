@@ -1,0 +1,208 @@
+"""Write the release section of CHANGELOG.md from merged pull-request titles.
+
+Called by the ``changelog`` job in ``.github/workflows/publish.yml`` on every
+``*.*.*`` tag (the repo's release trigger) so PRs never hand-edit CHANGELOG.md
+and never conflict on it. Given the tag, its bounds in time, and the merged PRs
+``gh pr list`` returned, it inserts
+
+    ## [TAG] - YYYY-MM-DD
+
+    ### Notes
+    <whatever ``## [Unreleased]`` held -- moved here verbatim, leaving it empty>
+
+    ### Merged pull requests
+    - <title> ([#N](url)) by @author      <- merge-time ascending
+
+right after ``## [Unreleased]``. A PR belongs to the release iff its merge
+commit is in ``--revs`` (``git rev-list PREV..TAG``) -- exact, and immune to
+GitHub stamping ``mergedAt`` a second after the merge commit's own time, which
+a time window would drop for the PR the tag sits on. Rows without a merge
+commit fall back to ``(prev-tag-time, tag-time]``; revs no returned row claims
+are counted into a ``::warning::``, since GitHub's search index lags a merge and
+an unindexed PR would otherwise vanish silently. Branch-sync merges
+(``merge main ...`` / ``Merge ...``) and duplicates are dropped; when no PR
+survives, ``--fallback`` (pre-rendered bullets, e.g. commit subjects) fills the
+list; a title merely *starting* with the word ("Merge the dense and sparse
+readers...") is kept. Re-running for a tag already in the file is a no-op (exit 0, nothing
+written), so a ``workflow_dispatch`` replay cannot duplicate a section. Stdlib
+only: the runner calls it with bare python3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+UNRELEASED = "## [Unreleased]"
+#: Branch-sync noise, not release notes. Matched against a PR *title*, so it
+#: pins the shapes git and GitHub actually generate rather than the bare word:
+#: "Merge the dense and sparse readers into one path" is a real release note.
+_SYNC_TITLE = re.compile(
+    r"^merge (main|origin/main|upstream)\b|^merge (branch|remote-tracking branch|pull request)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_time(value: str) -> datetime:
+    """An ISO-8601 timestamp (``git log --format=%cI`` or GitHub's ``...Z``)."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def pr_bullets(
+    prs: list[dict], prev_tag_time: str | None, tag_time: str, revs: set[str] | None = None
+) -> list[str]:
+    """One ``- title ([#N](url)) by @login`` per PR in the release.
+
+    Membership is the merge commit being in ``revs`` when both are known,
+    else ``mergedAt`` in ``(prev_tag_time, tag_time]``. Sync merges skipped,
+    de-duplicated by number, merge-time ascending.
+    """
+    lower = _parse_time(prev_tag_time) if prev_tag_time else None
+    upper = _parse_time(tag_time)
+    seen: set[int] = set()
+    kept: list[tuple[datetime, int, str]] = []
+    for pr in prs:
+        merged = pr.get("mergedAt")
+        if not merged:
+            continue
+        when = _parse_time(merged)
+        oid = (pr.get("mergeCommit") or {}).get("oid")
+        if revs is not None and oid:
+            if oid not in revs:
+                continue
+        elif when > upper or (lower is not None and when <= lower):
+            continue
+        number = int(pr["number"])
+        title = pr["title"].strip()
+        if number in seen or _SYNC_TITLE.match(title):
+            continue
+        seen.add(number)
+        author = (pr.get("author") or {}).get("login") or "unknown"
+        kept.append((when, number, f"- {title} ([#{number}]({pr['url']})) by @{author}"))
+    return [line for _, _, line in sorted(kept)]
+
+
+def unmatched_revs(prs: list[dict], revs: set[str]) -> set[str]:
+    """Commits in ``PREV..TAG`` that no returned PR row claims as its merge commit.
+
+    ``gh pr list --search`` reads GitHub's issue index, which lags a merge by
+    seconds to minutes -- and the PR the tag sits on is the likeliest to be
+    missing, because the tag is pushed right after it merges. Membership is only
+    ever evaluated over rows the search returned, so an unindexed PR is simply
+    absent from the section with no error. Most unmatched revs are ordinary
+    intermediate commits of a merge-commit merge, so the caller warns rather than
+    gates -- but a count that jumps on release day is the signal to look.
+    """
+    return revs - {(pr.get("mergeCommit") or {}).get("oid") for pr in prs}
+
+
+def _split_unreleased(text: str) -> tuple[list[str], list[str], list[str]]:
+    """(head incl. the Unreleased heading, its body, the rest) of a changelog."""
+    lines = text.splitlines()
+    try:
+        start = lines.index(UNRELEASED)
+    except ValueError as exc:
+        raise SystemExit(f"{UNRELEASED!r} heading not found") from exc
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return lines[: start + 1], lines[start + 1 : end], lines[end:]
+
+
+def _strip_blank(lines: list[str]) -> list[str]:
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    return lines
+
+
+_VERSION_HEADING = re.compile(r"^## \[(\d+)\.(\d+)\.(\d+)\]")
+
+
+def _version(line: str) -> tuple[int, ...] | None:
+    m = _VERSION_HEADING.match(line)
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def render(text: str, tag: str, date: str, bullets: list[str]) -> str | None:
+    """The changelog with ``## [tag]`` inserted, or None if it already has one.
+
+    The section goes above the first older release heading (a ``workflow_dispatch``
+    replay for a skipped tag lands in version order); the ``[Unreleased]`` body
+    drains into it only when it is the newest, so a backfill never steals the
+    notes waiting for the next release.
+    """
+    if re.search(rf"^## \[{re.escape(tag)}\]", text, re.MULTILINE):
+        return None
+    head, unreleased, rest = _split_unreleased(text)
+    mine = _version(f"## [{tag}]")
+    at = next(
+        (i for i, ln in enumerate(rest) if (v := _version(ln)) is not None and mine and v < mine),
+        len(rest) if mine else 0,
+    )
+    newest = at == 0
+    notes = _strip_blank(unreleased) if newest else []
+    section = [f"## [{tag}] - {date}", ""]
+    if notes and notes[0].startswith("### "):
+        # The drain is verbatim, so Keep-a-Changelog sub-headings (### Added,
+        # ### Fixed) would land as siblings UNDER an empty "### Notes". They are
+        # already their own headings: keep them and skip ours.
+        section += [*notes, ""]
+    elif notes:
+        section += ["### Notes", "", *notes, ""]
+    section += ["### Merged pull requests", "", *(bullets or ["- (none recorded)"]), ""]
+    above = [*head] if newest else [*head, *unreleased, *rest[:at]]
+    while above and not above[-1].strip():
+        above.pop()
+    return "\n".join([*above, "", *section, *rest[at:]]).rstrip("\n") + "\n"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--tag", required=True)
+    ap.add_argument("--tag-time", required=True, help="ISO-8601 commit time of --tag")
+    ap.add_argument("--prev-tag-time", help="ISO-8601 commit time of the previous tag (if any)")
+    ap.add_argument("--prs", required=True, type=Path, help="gh pr list --json output")
+    ap.add_argument("--revs", type=Path, help="git rev-list PREV..TAG output (exact membership)")
+    ap.add_argument("--fallback", type=Path, help="pre-rendered bullets used when no PR matches")
+    ap.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
+    args = ap.parse_args(argv)
+
+    # Ordering needs an N.N.N to place the section; anything else silently
+    # becomes "newest" and DRAINS [Unreleased] into it. The tag filter
+    # (`*.*.*`) is an unanchored glob and workflow_dispatch's input is free
+    # text, so 'v0.55.0' / '0.54.0.1' can reach here -- refuse rather than
+    # guess (the job's never-fail promise starts past generation).
+    if _version(f"## [{args.tag}]") is None:
+        raise SystemExit(f"--tag {args.tag!r} is not N.N.N; refusing to guess where it belongs")
+    revs = set(args.revs.read_text().split()) if args.revs else None
+    prs = json.loads(args.prs.read_text())
+    bullets = pr_bullets(prs, args.prev_tag_time, args.tag_time, revs)
+    if revs:
+        missing = unmatched_revs(prs, revs)
+        if missing:
+            print(
+                f"::warning::{len(missing)}/{len(revs)} commits in the tag range are claimed by "
+                "no merged-PR row; if the search index lagged a merge, that PR is missing from "
+                f"this section: {' '.join(sorted(missing)[:10])}"
+            )
+    # The fallback fires on the REV-LIST-filtered set being empty (bullets is
+    # already that set), not on the search returning zero rows: a search that
+    # returns only out-of-range PRs still gets commit subjects.
+    if not bullets and args.fallback and args.fallback.exists():
+        bullets = [ln for ln in args.fallback.read_text().splitlines() if ln.startswith("- ")]
+    date = _parse_time(args.tag_time).date().isoformat()
+    updated = render(args.changelog.read_text(), args.tag, date, bullets)
+    if updated is None:
+        print(f"{args.changelog}: [{args.tag}] already present, nothing to do")
+        return 0
+    args.changelog.write_text(updated)
+    print(f"{args.changelog}: wrote [{args.tag}] - {date} ({len(bullets)} bullets)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

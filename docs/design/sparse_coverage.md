@@ -817,6 +817,26 @@ neither gap and is safe now.
   on an existing store, where the as-spelled hash would have tripped the
   frozen-key refusal.
 
+  **Amended a third time — the index-exclusion epoch** (espg-ruled
+  2026-09-13; issue #499 phase 2, refs #547 / PR #565): the chunk-index
+  block `data_source.index` (`backend` inline/hierarchical/sidecar, the
+  sidecar `store` location, `on_miss`) is excluded as **read machinery**,
+  the same class as `reader`/`read_plan`: a sidecar miss processes the
+  file and a different sidecar location yields identical bytes, so the
+  block never decides what a leaf contains — and the #499 sidecar move to a
+  public bucket would otherwise have refused every append to the store the
+  sidecars index. Unlike the two amendments above this one moves digests
+  that outlive it: both deployed stores carry an index block, so their
+  frozen manifest hashes stop reproducing. The migration is
+  tool-driven and single-pointed — `zagg.semantics.semantic_hash_legacy`
+  reproduces the pre-epoch digest, `declare_pyramid` accepts a store
+  whose frozen hash is the supplied config's pre-epoch digest and rewrites
+  the key in the same write, and the append path (`_frozen_matches`)
+  refuses a not-yet-migrated store by name rather than accepting the old
+  digest. Operator consequences, the two live pairs, and the skip-gate
+  effect are in `docs/hive_layout.md`, "Migration: the index-exclusion
+  epoch".
+
   The hash is a
   **frozen manifest key** (reusing a name with different aggregation
   semantics refuses up front, like any frozen-key mismatch) and is

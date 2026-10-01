@@ -87,6 +87,7 @@ def run_target(
         config.output["store_layout"] = target["store_layout"]
         validate_config(config)
     grid = from_config(config)
+    parent_order, child_order = bench_metrics.shard_cell_orders(grid)
 
     cat = Catalog.from_geoparquet(str(_resolve(base, target["catalog"])))
     t0 = time.perf_counter()
@@ -113,8 +114,8 @@ def run_target(
         "collection": target.get("collection"),
         "grid_type": target.get("grid_type"),
         "grid_size": target.get("grid_size"),
-        "parent_order": int(grid.parent_order),
-        "child_order": int(grid.child_order),
+        "parent_order": parent_order,
+        "child_order": child_order,
         "n_shards": len(cells),
         # Forward-compatible layout axis (null-safe pre-hive: reads "flat");
         # distinguishes the hive rows the #237 flip will add to the series.

@@ -263,12 +263,16 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
         default_config,
         get_agg_fields,
         get_data_vars,
+        get_leaf_versions,
         get_output_signature,
     )
     from zagg.runner import agg
 
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
+    # The leaf-store object model is what stage 1 leaves unchanged (spec §11,
+    # "Not changed"), so the companion repo stays out of the count (issue #580).
+    cfg.output["icechunk"] = False
     # A ragged field so the leaf carries its whole-leaf vlen array (issue #209).
     cfg.aggregation["variables"]["h"] = {
         "function": "np.sort",
@@ -331,7 +335,11 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     measured = bench_objects.store_object_counts(
         root, grid=grid, shard_keys=[word], store_layout="hive"
     )
-    expected = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
+    # The runner writes VERSIONED leaves (issue #582): the pointer root is one
+    # more object per leaf, so the model takes the run's knob.
+    expected = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout="hive", leaf_versions=get_leaf_versions(cfg)
+    )
     # K == 1 leaf: every per-array count is deterministic, so the hive model
     # is exact here and the real store matches it object-for-object.
     assert expected["exact"] is True
@@ -792,7 +800,11 @@ def test_flat_model_requires_fullsphere(tmp_path):
             bench_objects.expected_object_counts(grid, n_shards=1)
         with pytest.raises(NotImplementedError, match="fullsphere"):
             bench_objects.store_object_counts(str(tmp_path), grid=grid, shard_keys=[])
-    # The hive path attributes by leaf prefix (layout-agnostic) -- unaffected.
+    # The hive path ATTRIBUTION is by leaf prefix (layout-agnostic), but its
+    # leaf model needs the shard/cell orders, so it fences on those instead --
+    # named via bench_metrics.shard_cell_orders, not a bare AttributeError.
+    with pytest.raises(TypeError, match="shard/cell orders"):
+        bench_objects.expected_object_counts(rect, n_shards=1, store_layout="hive")
     assert bench_objects.expected_object_counts(
         _grid(sharded=False), n_shards=1, store_layout="hive"
     )
@@ -874,12 +886,15 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
 
     import zagg.processing as processing
     from zagg import runner
-    from zagg.config import default_config
+    from zagg.config import default_config, get_leaf_versions
     from zagg.runner import agg
 
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
     cfg.output["grid"]["chunk_inner"] = 8  # K = 16; sharded defaults True (#236)
+    # The leaf-store object model is what stage 1 leaves unchanged (spec §11,
+    # "Not changed"), so the companion repo stays out of the count (issue #580).
+    cfg.output["icechunk"] = False
     if not pyramid:
         cfg.output["pyramid"] = False
     cfg.aggregation["variables"]["h"] = {
@@ -917,13 +932,14 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
 
     block = read_manifest(root)["pyramid"]
     expected = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout="hive", pyramid=block
+        grid, n_shards=1, store_layout="hive", pyramid=block, leaf_versions=get_leaf_versions(cfg)
     )
     measured = bench_objects.store_object_counts(
         root, grid=grid, shard_keys=[shard], store_layout="hive"
     )
-    # Exact: per leaf = root+group zarr.json (2) + one zarr.json AND one data
-    # object per array + the coverage sidecar + the stats.json sibling
+    # Exact: per leaf = pointer root + version root + group zarr.json (3, the
+    # runner writes versioned leaves — issue #582) + one zarr.json AND one
+    # data object per array + the coverage sidecar + the stats.json sibling
     # (issue #297); store root = manifest + aggregation.yaml (issue #299)
     # + MOC (the run parquet / sweep record are telemetry — issue #362).
     n_arrays = len(grid.shard_spec().members)
@@ -935,7 +951,8 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     assert column == (1 + 3 * (1 + 2 * (1 + 3)) + 1 if pyramid else 0)
     # ... + the stats.json, granules.json and shardmap.json siblings
     # (issues #297/#388/#300).
-    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 3 + column
+    assert get_leaf_versions(cfg) is True
+    assert expected["per_shard_max"] == 3 + 2 * n_arrays + 1 + 3 + column
     assert expected["metadata"] == 3
     # Sweep rollups (issue #300), overview zarrs (issue #201 — with the D20
     # `{window}.stats.json` sidecar each overview leaf carries since issue

@@ -13,6 +13,7 @@ behavior lives in ``tests/test_sweep_overview.py``; the spec fixture in
 import pytest
 
 from zagg.pyramid import (
+    column_tier_gaps,
     default_overviews,
     expand_overviews,
     normalize_overviews,
@@ -63,8 +64,76 @@ class TestNormalizeOverviews:
 class TestValidateOverviews:
     def test_single_and_multi_resolution_lists_are_valid(self):
         validate_overviews([13], **REF)
-        validate_overviews([16, 13], **REF)
-        validate_overviews([18, 15, 10], **REF)
+        validate_overviews([14, 13], **REF)
+        validate_overviews([18, 17, 16], **REF)
+
+    def test_dense_default_and_live_store_shapes_are_contiguous(self):
+        # The omitted-knob default (one resolution at the chunk order) and the
+        # two live stores (`--overviews 13` on 9/19, `--overviews 12` on 9/18)
+        # are one-member lists: the fixed ladder fills [max(shard, d), base)
+        # by itself — here [shard, base), since d == 4 is below the shard
+        # order — so the column tier steps by one down to the shard order.
+        default_overviews(9, 13, child_order=19)
+        validate_overviews([13], **REF)
+        validate_overviews([12], parent_order=9, child_order=18)
+        validate_overviews([13, 12, 11, 10], **REF)
+
+    @pytest.mark.parametrize(
+        "resolutions, tier, missing",
+        [
+            ([13, 12, 10], [13, 12, 10, 9], [11]),
+            ([12, 10], [12, 10, 9], [11]),
+            ([13, 11], [13, 11, 10, 9], [12]),
+            ([13, 10], [13, 10, 9], [12, 11]),
+            ([16, 13], [16, 13, 12, 11, 10, 9], [15, 14]),
+        ],
+    )
+    def test_gapped_column_tier_refused_by_name(self, resolutions, tier, missing):
+        # espg ruling (PR #567 thread, 2026-09-17): every ladder level whose
+        # cells are at or above the shard order IS the leaf column tier
+        # (§4.6), so it must be contiguous from the finest leaf resolution
+        # down to the shard order; the message names the tier and the gap —
+        # both finest-first, the direction the declaration is written in, so
+        # the missing orders splice straight into the list.
+        with pytest.raises(ValueError, match="column tier must be contiguous") as exc:
+            validate_overviews(resolutions, **REF)
+        assert f"cells at or above shard order 9 are {tier}, missing {missing}" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "resolutions, parent, missing",
+        [([18], 8, [9]), ([16], 7, [8]), ([10], 3, [6, 5, 4])],
+    )
+    def test_ladder_floor_gap_names_the_base_not_the_leaf_list(self, resolutions, parent, missing):
+        # The ladder's coarsest cell is node 0's, d == base - shard, so where
+        # d clears the shard order by more than one the tier gaps between the
+        # shard order and d — a hole NO leaf list can fill, since every
+        # declared resolution is at or above base. The refusal names that
+        # constraint (base <= 2 * shard + 1) instead of advising a
+        # finer-first ladder that cannot fix it.
+        with pytest.raises(ValueError, match="column tier must be contiguous") as exc:
+            validate_overviews(resolutions, parent_order=parent, child_order=19)
+        msg = str(exc.value)
+        assert f"missing {missing}" in msg
+        assert f"bottoms out at cells {resolutions[0] - parent} (node 0)" in msg
+        assert f"coarsest leaf resolution must be at most {2 * parent + 1}" in msg
+        assert "step by one down to the shard order" not in msg
+        # One order finer at the base clears the floor on the same geometry.
+        validate_overviews([2 * parent + 1], parent_order=parent, child_order=19)
+
+    def test_gaps_below_the_shard_order_are_not_the_tier(self):
+        # Cells below the shard order are outside the tier and never
+        # contribute. The `levels` list below — a ladder missing node 1 — is
+        # NOT a legal manifest (the §4.4 every-order law is enforced by
+        # byte-equality against `expand_overviews`); it is a helper-level
+        # unit, pinning that the scan looks only at the tier.
+        levels = [
+            {"node": 3, "cells": [6, 5, 4]},
+            {"node": 2, "cells": [3]},
+            {"node": 0, "cells": [1]},
+        ]
+        assert column_tier_gaps(levels, 3) == ([6, 5, 4, 3], [])
+        assert column_tier_gaps(expand_overviews([6, 4], parent_order=3), 3) == ([6, 4, 3], [5])
+        assert column_tier_gaps([{"node": 1, "cells": [2]}], 3) == ([], [])
 
     @pytest.mark.parametrize("resolutions", [[13, 16], [13, 13]])
     def test_not_strictly_descending_refused(self, resolutions):
@@ -103,8 +172,8 @@ class TestExpandOverviews:
     def test_multi_resolution_leaf_entry(self):
         # Every declared resolution materializes at the leaf; the ladder is
         # fixed by the COARSEST one (the base).
-        levels = expand_overviews([16, 13], parent_order=9)
-        assert levels[0] == {"node": 9, "cells": [16, 13]}
+        levels = expand_overviews([14, 13], parent_order=9)
+        assert levels[0] == {"node": 9, "cells": [14, 13]}
         assert levels[1:] == expand_overviews([13], parent_order=9)[1:]
 
     def test_every_order_no_parity_cases(self):
@@ -164,7 +233,7 @@ class TestConfigWiring:
         validate_config(self._cfg(store_layout="hive", pyramid=pyramid))
 
     def test_valid_overviews_knob(self):
-        self._validate({"overviews": [9, 7]})
+        self._validate({"overviews": [8, 7]})
         self._validate({"overviews": 8})  # scalar sugar
 
     def test_overviews_with_orders_or_spacing_refused(self):
@@ -183,6 +252,8 @@ class TestConfigWiring:
             self._validate({"overviews": [6]})  # == parent_order
         with pytest.raises(ValueError, match="not strictly between"):
             self._validate({"overviews": [12]})  # == child_order
+        with pytest.raises(ValueError, match=r"column tier must be contiguous.*missing \[8\]"):
+            self._validate({"overviews": [9, 7]})  # tier [9, 7, 6] skips 8
 
     def test_overviews_require_hive_layout(self):
         from zagg.config import validate_config

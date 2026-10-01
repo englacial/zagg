@@ -723,6 +723,57 @@ class TestBackfill:
         for reason, over in cases.items():
             assert _verdict(off, SHARDS[0], **over) == (reason == "current", reason), reason
 
+    def test_a_pre_538_column_is_declaration_drift(self, tmp_path, monkeypatch):
+        """The per-group ``merges_from_raw`` is a declaration term (issue #538).
+
+        A column the fleet wrote under the all-from-raw law records 1 at every
+        member; below the raw-fold boundary this run writes 2 (different
+        bytes), so the gate must rewrite it — the upgrade path is this pass,
+        never ``force=True`` over every leaf.
+        """
+        from zagg.column import COLUMN_ATTR, COLUMN_SPEC
+        from zagg.column_backfill import _column_state, column_is_current
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        # This store's 4/6 geometry has no boundary (every group is 1), so a
+        # recorded 2 is drift here ...
+        _stamp, attrs, _structure = _column_state(str(off), morton_word(SHARDS[0]), None, {})
+        block = json.loads(json.dumps(attrs[COLUMN_ATTR]))
+        block["groups"]["4"]["merges_from_raw"] = 2
+        assert _verdict(off, SHARDS[0], column_attrs=block) == (False, "declaration-drift")
+        # ... and at the reference geometry (node 9 / cells 19, boundary 11)
+        # the pre-#538 record — 1 at every member — is drift while the law's
+        # own record is current, with every other term held equal.
+        fields = {"count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0}}
+        resolutions = [13, 12, 11, 10, 9]
+        stamp = {"written_at": "2026-01-01T00:00:00+00:00", "granule_count": 1}
+
+        def verdict(merges):
+            return column_is_current(
+                stamp,
+                stamp,
+                {
+                    "spec": COLUMN_SPEC,
+                    "order": 9,
+                    "source_cell_order": 19,
+                    "groups": {
+                        str(r): {"regime": "leaf-column", "merges_from_raw": m, "n_cells": 1}
+                        for r, m in zip(resolutions, merges, strict=True)
+                    },
+                    "fields": {"count": {"class": "exact", "method": "sum", "nan_policy": "skip"}},
+                },
+                {},
+                node_order=9,
+                cell_order=19,
+                resolutions=resolutions,
+                fields=fields,
+                template={},
+            )
+
+        assert verdict([1, 1, 1, 1, 1]) == (False, "declaration-drift")
+        assert verdict([1, 1, 1, 2, 2]) == (True, "current")
+
     def test_a_re_run_leaf_is_not_current(self, tmp_path, monkeypatch):
         from zagg.hive import COMMIT_ATTR, shard_leaf_path
 

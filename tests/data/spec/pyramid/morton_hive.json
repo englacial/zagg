@@ -24,8 +24,8 @@
     ],
     "actuals": {
      "regime": "leaf-column",
-     "merges_from_raw": 1,
-     "generated_at": "2026-09-11T00:45:57+00:00"
+     "merges_from_raw": 2,
+     "generated_at": "2026-09-14T07:43:27+00:00"
     }
    },
    {
@@ -42,7 +42,7 @@
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-09-11T00:45:57+00:00"
+     "generated_at": "2026-09-14T07:43:27+00:00"
     }
    },
    {
@@ -59,7 +59,7 @@
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-09-11T00:45:57+00:00"
+     "generated_at": "2026-09-14T07:43:27+00:00"
     }
    },
    {
@@ -76,7 +76,7 @@
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-09-11T00:45:57+00:00"
+     "generated_at": "2026-09-14T07:43:27+00:00"
     }
    }
   ],
@@ -122,11 +122,11 @@
      "1": "leaves",
      "0": "cascade"
     },
-    "generated_at": "2026-09-11T00:45:57+00:00"
+    "generated_at": "2026-09-14T07:43:27+00:00"
    }
   }
  },
- "generated_at": "2026-09-11T00:45:57+00:00",
+ "generated_at": "2026-09-14T07:43:27+00:00",
  "multiscales": [
   {
    "spec": "zagg-multiscales/1",

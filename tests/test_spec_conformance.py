@@ -39,7 +39,7 @@ SPEC_DATA = Path(__file__).parent / "data" / "spec"
 #: same production path: the column writer must leave that leaf untouched
 #: (it holds the same payload ``bytes`` objects the leaf staged), and running
 #: the suite over both is what asserts it.
-FIXTURES = ("minimal", "kitchen_sink", "column")
+FIXTURES = ("minimal", "kitchen_sink", "column", "versioned")
 #: The manifest-only §4.5 declaration fixture (issue #382) — deliberately NOT
 #: in ``FIXTURES``: it has no leaf, so nothing leaf-shaped applies to it.
 PYRAMID = "pyramid"
@@ -48,6 +48,7 @@ PYRAMID = "pyramid"
 RAGGED_ARRAYS = [
     ("minimal", "h_tdigest", "float32", (2,)),
     ("column", "h_tdigest", "float32", (2,)),
+    ("versioned", "h_tdigest", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_signal", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_noise", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_signal_locations", "uint64", ()),
@@ -75,6 +76,10 @@ FROZEN_COMBINED = {
     # column/'s LEAF is minimal's, byte for byte — the same literal is the
     # cross-fixture pin that writing a column perturbs nothing.
     "column": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    # versioned/'s arrays are minimal's, byte for byte, behind a pointer root
+    # (§1.5, issue #582) — the same literal pins that versioning a leaf
+    # perturbs nothing the §5 recipe hashes.
+    "versioned": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
     # The §2.0 flux fixture (issue #424) — asserted by TestFluxDeclaration
     # (flux is not in FIXTURES: the leaf-shaped suite hardcodes h_tdigest).
     "flux": "910a9b12d34b4d072f454b2dd1cc232a6a9a92b536a8d26f5395154a1c02bc32",
@@ -1209,6 +1214,7 @@ class TestFixtureSemanticHash:
         "minimal",
         "kitchen_sink",
         "column",
+        "versioned",
         "flux",
         PYRAMID,
         MULTISCALES,
@@ -1223,6 +1229,9 @@ class TestFixtureSemanticHash:
             ("minimal", {"kitchen_sink": False}),
             ("kitchen_sink", {"kitchen_sink": True}),
             ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+            # versioned/ is minimal's config: leaf versioning is layout, not
+            # semantics (the run identity names the version, never the hash).
+            ("versioned", {"kitchen_sink": False}),
             # The §2.0 flux fixture (issue #424) landed after the epoch's
             # phase 3, so its committed digest was pre-epoch until now.
             ("flux", {"kitchen_sink": False, "flux": True}),
@@ -1329,10 +1338,12 @@ class TestFixtureGranuleIdentity:
         # a fixture with a leaf but no recorded id list ships a leaf the
         # contraction guard cannot protect. ``pyramid/`` is manifest-only (no
         # leaf, hence no sibling), which is why this keys on the leaf.
+        # The sibling sits beside the STABLE root (``pointer`` on a versioned
+        # fixture, §1.5), never inside a version subgroup.
         want = {
-            f"{name}/{Path(_expected(name)['leaf']).parent.as_posix()}/granules.json"
+            f"{name}/{Path(exp.get('pointer', exp['leaf'])).parent.as_posix()}/granules.json"
             for name in TestFixtureSemanticHash.COVERED
-            if _expected(name).get("leaf")
+            if (exp := _expected(name)).get("leaf")
         }
         assert set(self.SIBLINGS) == want
 
@@ -2242,3 +2253,52 @@ class TestDemotionAttrs:
         assert "h_tdigest_signal" not in dict(demoted.arrays())
         assert int(clean["composition"][:].astype("uint64").sum()) > 0
         assert int(demoted["composition"][:].astype("uint64").sum()) == 0
+
+
+class TestVersionedLeaf:
+    """§1.5 versioned leaves: the pointer root and the version subgroup, decoded
+    from the on-disk JSON alone (a spec-text reader never imports zagg)."""
+
+    NAME = "versioned"
+
+    def _root_stamp(self):
+        exp = _expected(self.NAME)
+        root = SPEC_DATA / self.NAME / exp["pointer"]
+        attrs = json.loads((root / "zarr.json").read_text())["attributes"]
+        return exp, root, attrs["morton_hive_commit"]
+
+    def test_the_root_is_a_pointer_stamp(self):
+        exp, root, stamp = self._root_stamp()
+        assert stamp["current"] == exp["version"]
+        assert exp["version"].startswith(f"run-{exp['run_id']}-")
+        assert exp["leaf"] == f"{exp['pointer']}/{exp['version']}"
+        # The stamp is otherwise a legacy stamp: no new spec token (the
+        # ``/3`` dialect is D23's), complete, hashes keyed as a legacy leaf's.
+        assert stamp["spec"] == "morton-hive/1" and stamp["complete"] is True
+        assert set(stamp["content_hashes"]["arrays"]) == set(exp["content_hashes"]["arrays"])
+        # Nothing but the pointer and its version live at the root.
+        assert sorted(p.name for p in root.iterdir()) == sorted(["zarr.json", exp["version"]])
+        assert not (root / exp["group"]).exists()
+
+    def test_the_version_carries_its_own_stamp(self):
+        exp, root, pointer = self._root_stamp()
+        version = json.loads((root / exp["version"] / "zarr.json").read_text())["attributes"][
+            "morton_hive_commit"
+        ]
+        assert "current" not in version
+        assert version == {k: v for k, v in pointer.items() if k != "current"}
+        # The arrays and the coverage sidecar are the version's.
+        assert (root / exp["version"] / exp["group"] / "count" / "zarr.json").exists()
+        assert (root / exp["version"] / "coverage.moc").exists()
+
+    def test_the_one_reader_rule(self):
+        # Open the root, follow ``current`` when named, else read the root:
+        # the same recipe resolves ``minimal/`` (legacy) and ``versioned/``.
+        for name in ("minimal", self.NAME):
+            exp = _expected(name)
+            root = SPEC_DATA / name / exp.get("pointer", exp["leaf"])
+            stamp = json.loads((root / "zarr.json").read_text())["attributes"]["morton_hive_commit"]
+            data = root / stamp["current"] if stamp.get("current") else root
+            assert data == SPEC_DATA / name / exp["leaf"]
+            count = zarr.open_array(LocalStore(str(data)), path=f"{exp['group']}/count", mode="r")
+            assert int(count[:].sum()) == sum(c["count"] for c in exp["cells"])

@@ -46,7 +46,7 @@ __all__ = [
     "waveform_weights",
 ]
 
-_DEFAULT_DELTA = 8192  # the ratified cross-sensor δ floor (issue #422, decision 7)
+_DEFAULT_DELTA = 4096  # the uniform packaged δ (espg ruling 2026-09-13, issue #547)
 
 
 def _probit(p: np.ndarray | float) -> np.ndarray | float:

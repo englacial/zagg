@@ -12,6 +12,128 @@ on:
         type: string
 
 jobs:
+  # Write the ## [TAG] section of CHANGELOG.md from the PR titles merged since
+  # the previous tag and push it to main (PRs never edit CHANGELOG.md -- the
+  # changelog-guard job in lint.yml refuses it). Runs BESIDE the build/publish
+  # chain, never in it: a changelog problem must not fail a release, so every
+  # failure past generation ends in a ::warning::, not an exit 1. The generator
+  # is .github/scripts/changelog_section.py (tests/test_changelog_section.py):
+  # it drains [Unreleased] into a ### Notes sub-heading, lists the PRs under
+  # ### Merged pull requests, and is a no-op when the tag's section exists, so
+  # a workflow_dispatch replay cannot duplicate it.
+  changelog:
+    name: Update CHANGELOG.md
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: main
+        fetch-depth: 0
+    - name: Get tag name
+      id: get_tag
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          TAG="${{ inputs.tag }}"
+        else
+          TAG="${GITHUB_REF#refs/tags/}"
+        fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+    - name: Generate the release section
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TAG: ${{ steps.get_tag.outputs.tag }}
+      run: |
+        set -euo pipefail
+        git fetch --tags --force origin
+        TAG_TIME="$(git log -1 --format=%cI "refs/tags/$TAG")"
+        PREV="$(git describe --tags --abbrev=0 --match '*.*.*' "$TAG^" 2>/dev/null || true)"
+        PREV_TIME=""; SEARCH="is:merged"
+        if [ -n "$PREV" ]; then
+          PREV_TIME="$(git log -1 --format=%cI "refs/tags/$PREV")"
+          SEARCH="merged:>=$PREV_TIME"
+        fi
+        echo "tag $TAG @ $TAG_TIME; previous ${PREV:-<none>} @ ${PREV_TIME:-<none>}"
+        # The search is only a prefilter (no upper bound: GitHub stamps mergedAt
+        # after the merge commit's own time, so the PR the tag sits on can
+        # postdate TAG_TIME). Membership is exact -- the PR's merge commit is in
+        # PREV..TAG -- with the time window only for rows lacking one. --limit
+        # 500 is per release, far above any tag-to-tag PR count here (no GraphQL
+        # first-100 cutoff).
+        gh pr list --repo "${{ github.repository }}" --state merged --base main \
+          --search "$SEARCH" --limit 500 \
+          --json number,title,url,author,mergedAt,mergeCommit > "$RUNNER_TEMP/prs.json"
+        git rev-list "${PREV:+$PREV..}$TAG" > "$RUNNER_TEMP/revs.txt"
+        git log --no-merges --pretty='- %s (%h)' "${PREV:+$PREV..}$TAG" \
+          > "$RUNNER_TEMP/commits.txt"
+        python3 .github/scripts/changelog_section.py \
+          --tag "$TAG" --tag-time "$TAG_TIME" \
+          ${PREV_TIME:+--prev-tag-time "$PREV_TIME"} \
+          --prs "$RUNNER_TEMP/prs.json" --revs "$RUNNER_TEMP/revs.txt" \
+          --fallback "$RUNNER_TEMP/commits.txt" --changelog CHANGELOG.md
+    - name: Commit to main (or open a PR if main refuses the push)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TAG: ${{ steps.get_tag.outputs.tag }}
+      run: |
+        set -uo pipefail
+        if git diff --quiet -- CHANGELOG.md; then
+          echo "CHANGELOG.md already carries [$TAG]; nothing to commit"
+          exit 0
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add CHANGELOG.md
+        git commit -q -m "changelog for $TAG"
+        # main may have moved since checkout: one rebase, never a force. A
+        # CONFLICTED rebase leaves HEAD at upstream WITHOUT our commit, so the
+        # push would be an up-to-date no-op that still exits 0 -- abort it and
+        # fall through to the PR path rather than reporting a success that
+        # recorded nothing.
+        if ! git pull --rebase -q origin main; then
+          git rebase --abort || true
+          echo "::warning::could not rebase the changelog commit for $TAG onto main; landing it as a PR instead"
+        # Success is the section being ON the commit we push, never the push's
+        # own exit code (an up-to-date no-op also exits 0): verify, then push.
+        # (git grep, not `show | grep`: under pipefail a grep -q that exits on
+        # the first match can SIGPIPE the producer once the file outgrows the
+        # pipe buffer, which would read as "section missing".)
+        elif git grep -q "^## \[$TAG\]" HEAD -- CHANGELOG.md && git push origin HEAD:main; then
+          echo "pushed changelog for $TAG to main"
+          exit 0
+        fi
+        # Branch protection (or a race) refused the bot: land it as a PR. A
+        # re-run rebuilds the commit on today's main, so it is NOT a descendant
+        # of an earlier attempt's branch tip: reuse that attempt's open PR when
+        # there is one, else give this run its own branch -- never a force-push
+        # over the old tip (CLAUDE.md section 1).
+        BRANCH="changelog/$TAG"
+        if [ -n "$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" \
+                     --state open --json number --jq '.[].number')" ]; then
+          echo "::warning::$BRANCH already has an open PR with the $TAG section; merge it to record the section"
+          exit 0
+        fi
+        if ! git push origin "HEAD:refs/heads/$BRANCH"; then
+          BRANCH="changelog/$TAG-$GITHUB_RUN_ID"
+          if ! git push origin "HEAD:refs/heads/$BRANCH"; then
+            echo "::warning::could not push $BRANCH either; the CHANGELOG.md section for $TAG was NOT recorded"
+            exit 0
+          fi
+        fi
+        # No --label: `implement` would put a bot PR into the routine's
+        # actionable set (CLAUDE.md section 5), and an agent could not push to a
+        # changelog/* branch anyway. The branch prefix alone is what exempts it
+        # from changelog-guard (lint.yml's `startsWith(github.head_ref,
+        # changelog/)`), so the label buys nothing and `gh pr create` aborts
+        # outright on a label name that has since been deleted.
+        gh pr create --repo "${{ github.repository }}" --base main --head "$BRANCH" \
+          --title "changelog for $TAG" \
+          --body "Generated by the changelog job of publish.yml for tag $TAG: main refused the direct push, so the section lands via this PR (changelog-guard exempts changelog/* head branches). NOTE: this PR was created with GITHUB_TOKEN, so GitHub fires no pull_request workflows for it -- it will show ZERO check runs, and under a required-status-check rule on main it needs an admin merge. The durable fix is to let the github-actions bot push to main directly." \
+          || echo "::warning::pushed $BRANCH but could not open its PR (it may already exist)"
+        echo "::warning::main rejected the changelog push for $TAG; opened a PR from $BRANCH instead"
+
   test:
     uses: ./.github/workflows/test.yml
 
@@ -96,6 +218,12 @@ jobs:
     outputs:
       tag: ${{ steps.get_tag.outputs.tag }}
       minor: ${{ steps.get_tag.outputs.minor }}
+      # LAMBDA_DIST_PREFIX is hand-typed, so a leading/trailing slash is a
+      # natural thing to type. Normalize it ONCE here and have both `distribute`
+      # and `deploy-prod` read this output, so the key one stages and the key
+      # the other reads back can never diverge (distribute_zips.sh trims its
+      # --prefix the same way).
+      prefix: ${{ steps.get_tag.outputs.prefix }}
 
     steps:
     - uses: actions/checkout@v5
@@ -104,6 +232,8 @@ jobs:
         fetch-depth: 0
     - name: Get tag name
       id: get_tag
+      env:
+        DIST_PREFIX: ${{ vars.LAMBDA_DIST_PREFIX }}
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           TAG="${{ inputs.tag }}"
@@ -112,6 +242,11 @@ jobs:
         fi
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
         echo "minor=$(echo "$TAG" | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
+        P="${DIST_PREFIX#/}"; P="${P%/}"
+        if [ "$P" != "$DIST_PREFIX" ]; then
+          echo "::warning::LAMBDA_DIST_PREFIX '$DIST_PREFIX' has stray slashes; using '$P'"
+        fi
+        echo "prefix=$P" >> "$GITHUB_OUTPUT"
     - name: Download Lambda zips
       uses: actions/download-artifact@v4
       with:
@@ -140,15 +275,22 @@ jobs:
           artifacts/lambda-function-arm64/lambda_function_arm64_*.zip \
           --repo "${{ github.repository }}" --clobber
 
-  # Publish the zips to the public distribution bucket (replaces source.coop;
-  # keyed by minor + a versions.json index). Skips until the bucket/role vars
-  # exist, so a release before the AWS-side setup still attaches zips (above).
+  # Publish the zips to Source Cooperative (issue #497: replaces the in-account
+  # sliderule-public-cors bucket, which cannot host public data and is being
+  # retired under issue #499) at LAMBDA_DIST_BUCKET/LAMBDA_DIST_PREFIX --
+  # us-west-2.opendata.source.coop / englacial/zagg/lambda -- keyed by minor +
+  # a versions.json index under the prefix. The prefix is GATED, not defaulted:
+  # unset, the release would aim at the mirror bucket's root, another
+  # organization's namespace (distribute_zips.sh refuses that too). Skips until
+  # every var exists, so a release before the AWS-side grant still attaches
+  # zips to the GitHub Release (above).
   distribute:
-    name: Distribute zips to public bucket
+    name: Distribute zips to Source Cooperative
     needs: github-release
     if: >-
       vars.LAMBDA_RELEASE_ROLE_ARN != '' &&
       vars.LAMBDA_DIST_BUCKET != '' &&
+      vars.LAMBDA_DIST_PREFIX != '' &&
       vars.LAMBDA_AWS_REGION != ''
     runs-on: ubuntu-latest
     permissions:
@@ -174,6 +316,7 @@ jobs:
           --minor "${{ needs.github-release.outputs.minor }}" \
           --tag "${{ needs.github-release.outputs.tag }}" \
           --bucket "${{ vars.LAMBDA_DIST_BUCKET }}" \
+          --prefix "${{ needs.github-release.outputs.prefix }}" \
           --region "${{ vars.LAMBDA_AWS_REGION }}" \
           --dir zips
 
@@ -194,6 +337,7 @@ jobs:
     if: >-
       vars.LAMBDA_RELEASE_ROLE_ARN != '' &&
       vars.LAMBDA_DIST_BUCKET != '' &&
+      vars.LAMBDA_DIST_PREFIX != '' &&
       vars.LAMBDA_AWS_REGION != '' &&
       vars.LAMBDA_PROD_FUNCTION_NAME != ''
     runs-on: ubuntu-latest
@@ -217,14 +361,21 @@ jobs:
       env:
         FUNCTION_NAME: ${{ vars.LAMBDA_PROD_FUNCTION_NAME }}
         DIST_BUCKET: ${{ vars.LAMBDA_DIST_BUCKET }}
+        # The SAME normalized prefix `distribute` passed to distribute_zips.sh
+        # (github-release trims it): a raw vars.LAMBDA_DIST_PREFIX here would
+        # build a different key from the one that was staged.
+        DIST_PREFIX: ${{ needs.github-release.outputs.prefix }}
         MINOR: ${{ needs.github-release.outputs.minor }}
         REGION: ${{ vars.LAMBDA_AWS_REGION }}
       run: |
         set -euo pipefail
-        # Layer was staged to the dist bucket by `distribute` (this job needs it).
+        # The layer was staged under the prefix by `distribute` (this job needs
+        # it): publish-layer-version reads it with the release role's own
+        # credentials, which hold s3:GetObject on that prefix (issue #497), from
+        # the same region as the function.
         .github/scripts/deploy_lambda.sh \
           --function "$FUNCTION_NAME" \
           --layer-bucket "$DIST_BUCKET" \
-          --layer-key "${MINOR}/lambda_layer_arm64.zip" \
+          --layer-key "${DIST_PREFIX:+$DIST_PREFIX/}${MINOR}/lambda_layer_arm64.zip" \
           --function-zip "$(ls fn/lambda_function_arm64_*.zip)" \
           --region "$REGION"

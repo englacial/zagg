@@ -732,8 +732,8 @@ class TestWaveformPyramidDeclaration:
     """Template-time classification for the waveform digest (issue #508).
 
     The SERC probe shape: ``gedi01b_waveform_healpix_hive`` + ``output.pyramid
-    = {}`` + ``rx_flux.overview_delta = 512`` under the probe's uniform-δ4096
-    override (the packaged template ships δ8192). Classification runs
+    = {}`` + ``rx_flux.overview_delta = 512`` at the packaged δ4096 (the live
+    store's value since issue #547). Classification runs
     worker-side at template time, so this IS the deployed surface the 0.50
     fleet re-runs the probe against.
     """
@@ -748,7 +748,7 @@ class TestWaveformPyramidDeclaration:
         # the OVERVIEW_DELTA_CAP fallback under δ4096 — so this value alone
         # cannot prove the declaration is read. The δ128 variant below does.
         rx["overview_delta"] = 512
-        rx["params"]["delta"] = 4096  # the probe's uniform-δ override
+        assert rx["params"]["delta"] == 4096  # the packaged value IS the probe's
         return cfg
 
     def test_probe_config_declares_the_ladder(self):
@@ -766,6 +766,10 @@ class TestWaveformPyramidDeclaration:
             "delta": 4096,
             "overview_delta": 512,
             "temporal": "per-centroid",
+            # The §2.0 flux declaration + gain provenance ride the manifest
+            # entry (PR #521, landed with issue #547).
+            "weights": "flux",
+            "gain": {"name": "unit", "version": "gedi01b-v002-placeholder", "value": 1.0},
         }
         assert "rx_flux" not in excluded
         # Non-vacuous pin on the SAME probe config: the capped fallback can
@@ -809,6 +813,8 @@ class TestWaveformPyramidDeclaration:
         assert rx["class"] == "approximate"
         assert rx["temporal"] == "per-centroid"
         assert rx["overview_delta"] == 512
+        # The §2.0 weights declaration rides every level too (PR #521).
+        assert rx["weights"] == "flux"
 
     def test_overview_template_emits_the_times_sibling(self, tmp_path):
         # The companion path at overview levels (issue #410, per-centroid at
@@ -897,9 +903,9 @@ class TestPyramidBlock:
         block = build_pyramid_block(cfg, shard_order=9)
         entry = block["overview"]["fields"]["h_tdigest"]
         assert entry["class"] == "approximate" and entry["method"] == "tdigest_kway"
-        # The packaged split budgets (issues #414/#424): leaf δ 8,192
-        # (loss-free bound), overview folds at 512 (accuracy bound).
-        assert entry["inner_shape"] == [2] and entry["delta"] == 8192
+        # The packaged split budgets (issues #414/#424/#547): leaf δ 4,096
+        # (the live stores' value), overview folds at 512 (accuracy bound).
+        assert entry["inner_shape"] == [2] and entry["delta"] == 4096
         assert entry["overview_delta"] == 512
 
     def test_explicit_orders_and_all_time(self):
@@ -934,14 +940,14 @@ class TestPyramidBlock:
         from zagg.pyramid import PYRAMID_SPEC_V2
         from zagg.sweep_overview import build_pyramid_block
 
-        cfg = self._cfg(pyramid={"overviews": [9, 7]})
+        cfg = self._cfg(pyramid={"overviews": [8, 7]})
         block = build_pyramid_block(cfg, shard_order=6)
         assert block["spec"] == PYRAMID_SPEC_V2
         overview = block["overview"]
         # The FULLY EXPANDED list at BLOCK level (the espg shape + collapse
         # rulings): the leaf entry carries every declared resolution, then
         # the fixed every-order ladder (d = 7 - 6 = 1) runs down to node 0.
-        assert block["overviews"] == [{"node": 6, "cells": [9, 7]}] + [
+        assert block["overviews"] == [{"node": 6, "cells": [8, 7]}] + [
             {"node": k, "cells": [k + 1]} for k in range(5, -1, -1)
         ]
         # The list REPLACES the /1 schedule keys wholesale — they must not
@@ -1012,12 +1018,12 @@ class TestPyramidBlock:
         with pytest.raises(ValueError, match="not strictly between"):
             build_pyramid_block(cfg, shard_order=6)
 
-    def test_levels_skip_validation_without_a_grid_block(self):
+    def test_levels_skip_range_validation_without_a_grid_block(self):
         """A grid-less retrofit config templates; ``declare_pyramid`` re-validates.
 
-        There is no child order to check against here, so the check is skipped
-        rather than guessed at — the store's own manifest orders win at
-        declare time (``TestDeclarePyramid``).
+        There is no child order to check the RANGE rule against here, so that
+        leg alone is skipped rather than guessed at — the store's own manifest
+        orders win at declare time (``TestDeclarePyramid``).
         """
         from zagg.pyramid import PYRAMID_SPEC_V2
         from zagg.sweep_overview import build_pyramid_block
@@ -1028,6 +1034,21 @@ class TestPyramidBlock:
         assert block["spec"] == PYRAMID_SPEC_V2
         assert block["overviews"][0] == {"node": 6, "cells": [8]}
         assert block["overviews"][-1] == {"node": 0, "cells": [2]}
+
+    def test_gapped_tier_refused_without_a_grid_block(self):
+        """The contiguity leg needs only the shard order, so it runs here too.
+
+        Review finding: with the check under the ``grid_child`` guard the
+        retrofit arm still templated a gapped ``/2`` block (``[13, 10]`` on
+        shard order 9 — tier ``[13, 10, 9]``, no group at the raw-fold
+        boundary 11), leaving ``declare_pyramid`` as the only gate.
+        """
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"overviews": [13, 10]})
+        cfg.output.pop("grid")
+        with pytest.raises(ValueError, match=r"column tier must be contiguous.*missing"):
+            build_pyramid_block(cfg, shard_order=9)
 
     def test_validate_rejects_bad_grammar(self):
         from zagg.config import validate_config
@@ -3294,6 +3315,127 @@ class TestDeclarePyramid:
         )
         assert "could NOT be verified" in caplog.text
 
+    #: The live ATL03 store's chunk-index block — read machinery (issue #499).
+    INDEX = {
+        "backend": "sidecar",
+        "store": "s3://sliderule-public-cors/zagg-index/ATL03/007",
+        "on_miss": "build",
+    }
+
+    def _pre_epoch_store(self, root):
+        """A store built before the issue #499 epoch: its manifest carries the
+        INDEX-IN-CORE digest of a config that declares an index block."""
+        from zagg.semantics import semantic_hash_legacy
+
+        cfg = _leaf_cfg()
+        cfg.data_source["index"] = dict(self.INDEX)
+        self._pre_declaration_store(root)
+        manifest = read_manifest(str(root))
+        manifest["semantic_hash"] = semantic_hash_legacy(cfg)
+        obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
+        return cfg
+
+    def test_pre_epoch_hash_migrates_in_the_same_write(self, tmp_path):
+        # The self-migrating guard (issue #499): the store's frozen hash is this
+        # config's PRE-epoch digest, so the declaration is accepted with a note
+        # and the same PUT rewrites the frozen key to the current digest.
+        from zagg.semantics import semantic_fingerprint, semantic_hash, semantic_hash_legacy
+
+        cfg = self._pre_epoch_store(tmp_path)
+        legacy, current = semantic_hash_legacy(cfg), semantic_hash(cfg)
+        assert legacy != current
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True
+        assert summary["semantic_hash_migration"] == {"from": legacy, "to": current}
+        assert f"pre-epoch semantic_hash {semantic_fingerprint(legacy)}" in summary["validated"]
+        assert summary["validated"].endswith(f"migrated to {semantic_fingerprint(current)}")
+        after = read_manifest(str(tmp_path))
+        assert after["semantic_hash"] == current and "pyramid" in after
+        # From here the store is a current-epoch store: the retrofit is
+        # idempotent again, and no second migration is reported.
+        again = declare_pyramid(str(tmp_path), cfg)
+        assert again["updated"] is False and again["semantic_hash_migration"] is None
+
+    def test_identical_declaration_still_puts_for_a_migration(self, tmp_path, monkeypatch):
+        # The "identical declaration -> no PUT" short-circuit must yield to a
+        # pending migration: the frozen key moves exactly here or never.
+        from zagg.hive import AGGREGATION_CORE_NAME
+        from zagg.semantics import semantic_hash, semantic_hash_legacy
+
+        cfg = self._pre_epoch_store(tmp_path)
+        declare_pyramid(str(tmp_path), cfg)  # installs the block AND migrates
+        manifest = read_manifest(str(tmp_path))
+        manifest["semantic_hash"] = semantic_hash_legacy(cfg)  # re-stamp the old digest
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        puts = []
+        real_put = obstore.put
+        monkeypatch.setattr(obstore, "put", lambda *a, **k: (puts.append(a), real_put(*a, **k))[1])
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "identical" and summary["updated"] is True
+        # The manifest exactly once, plus the core sidecar the migration
+        # re-renders beside it.
+        assert [a[1] for a in puts] == [MANIFEST_NAME, AGGREGATION_CORE_NAME]
+        assert read_manifest(str(tmp_path))["semantic_hash"] == semantic_hash(cfg)
+
+    def test_a_foreign_pre_epoch_hash_still_refuses(self, tmp_path):
+        # The legacy probe recognizes THIS config's old digest only: a store a
+        # different config built under the old rule is refused, not migrated.
+        cfg = self._pre_epoch_store(tmp_path)
+        cfg.aggregation["variables"]["h_min"]["function"] = "max"
+        with pytest.raises(ValueError, match="config semantics .* != the store's frozen"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
+    def test_migration_rewrites_the_core_sidecar(self, tmp_path):
+        # The D19 core sidecar is written only by ``ensure_manifest``'s PUT
+        # branch, so without this the migrated store would keep asserting the
+        # PRE-epoch core (index block and all) beside a post-epoch hash.
+        import yaml
+
+        from zagg.hive import AGGREGATION_CORE_NAME
+        from zagg.semantics import semantic_core
+
+        cfg = self._pre_epoch_store(tmp_path)
+        declare_pyramid(str(tmp_path), cfg)
+        sidecar = tmp_path / AGGREGATION_CORE_NAME
+        assert sidecar.read_text() == yaml.safe_dump(semantic_core(cfg), sort_keys=True)
+        assert "index" not in yaml.safe_load(sidecar.read_text())["data_source"]
+        # A non-migrating declaration does not write it, even when it PUTs the
+        # manifest: the store is already at the current epoch, and this is not
+        # a sidecar regenerator.
+        sidecar.unlink()
+        cfg.output["pyramid"] = False
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["semantic_hash_migration"] is None
+        assert not sidecar.exists()
+
+    def test_migration_refuses_a_hash_stripped_under_the_window(self, tmp_path, monkeypatch):
+        # ``_frozen_matches`` EXEMPTS ``semantic_hash`` when EITHER side lacks
+        # it (pre-#299 stores), so the RMW recheck alone would let a migration
+        # stamp the current digest onto a manifest whose own hash vanished
+        # inside the validation window — un-exempting a pre-#299 store on the
+        # strength of a different manifest's verification. The migration
+        # compares the exact digest the guard saw.
+        import zagg.sweep_overview as so
+
+        cfg = self._pre_epoch_store(tmp_path)
+        real = so._validate_block_against_store
+
+        def strip_the_hash(store_root, manifest, block, store_kwargs):
+            note = real(store_root, manifest, block, store_kwargs)
+            on_disk = read_manifest(str(tmp_path))
+            on_disk.pop("semantic_hash")
+            obstore.put(
+                open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(on_disk).encode()
+            )
+            return note
+
+        monkeypatch.setattr(so, "_validate_block_against_store", strip_the_hash)
+        with pytest.raises(ValueError, match="changed its semantic_hash under"):
+            declare_pyramid(str(tmp_path), cfg)
+        after = read_manifest(str(tmp_path))
+        assert "semantic_hash" not in after and "pyramid" not in after
+
     def test_declared_off_preserves_prior_materialized(self, tmp_path):
         # The intended shape (D24 option A): overviews already on disk are real
         # regenerable-cache debris, so a declared-OFF block still inventories
@@ -3476,6 +3618,49 @@ class TestDeclarePyramid:
         # artifacts already on disk (regenerable-cache debris, D24 option A).
         assert after["pyramid"]["spec"] == PYRAMID_SPEC_V2
         assert after["pyramid"]["overview"]["materialized"] == actuals
+
+    def test_declare_v2_replaces_v1_declared_but_never_materialized(self, tmp_path):
+        # The live atl03_tdigest_o9 shape (issue #520 audit): a /1 declaration
+        # retrofit-installed but NEVER swept — no ``materialized`` key at all.
+        # Replacing it with the /2 dense ladder must be a clean single-PUT
+        # replace that invents no actuals inventory out of nothing.
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        _write_manifest(tmp_path)  # /1 orders [1, 0], no materialized
+        _make_leaf(tmp_path, "-311", self.CELLS["-311"])
+        _run_record(tmp_path, ("-311",))
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"overviews": [3]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "replaced" and summary["updated"] is True
+        assert "orders" not in summary  # /2 summaries carry no /1 schedule key
+        after = read_manifest(str(tmp_path))["pyramid"]
+        assert after["spec"] == PYRAMID_SPEC_V2
+        # The dense every-order ladder: leaf entry + one member per order to 0.
+        assert after["overviews"] == [
+            {"node": 2, "cells": [3]},
+            {"node": 1, "cells": [2]},
+            {"node": 0, "cells": [1]},
+        ]
+        assert "materialized" not in after["overview"]
+        assert "orders" not in after["overview"] and "spacing" not in after["overview"]
+
+    def test_declare_v2_replaces_v1_declared_off(self, tmp_path):
+        # The live gedi_flux_o9 shape: pyramids declared OFF (``orders: []``,
+        # the /1 declared-off signal) — the /2 retrofit replaces it wholesale.
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        _write_manifest(tmp_path, orders=())
+        _make_leaf(tmp_path, "-311", self.CELLS["-311"])
+        _run_record(tmp_path, ("-311",))
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"overviews": [3]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "replaced" and summary["updated"] is True
+        after = read_manifest(str(tmp_path))["pyramid"]
+        assert after["spec"] == PYRAMID_SPEC_V2
+        assert [e["node"] for e in after["overviews"]] == [2, 1, 0]
+        assert "materialized" not in after["overview"]
 
     def test_declared_v2_store_sweeps_to_a_loud_noop(self, tmp_path, caplog):
         # End-to-end (#381 point (11)): declaring is free, sweeping is the

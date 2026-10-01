@@ -245,6 +245,7 @@ class TestTouchS3:
         assert {c.kwargs["Key"] for c in calls} == set(self.TREE_KEYS) | {
             "store/-5/1/stats.json",
             "store/-5/1/granules.json",
+            "store/-5/1/icechunk_refs.json",
             "store/-5/1/shardmap.json",
         }
         for c in calls:
@@ -254,7 +255,7 @@ class TestTouchS3:
             # LIST/HEAD omit the class for STANDARD; the copy must still name
             # one, or REPLACE resets whatever the object had.
             assert c.kwargs["StorageClass"] == "STANDARD"
-        assert counts == {"touched": 6, "failed": 0}
+        assert counts == {"touched": 7, "failed": 0}
 
     def test_the_storage_class_is_preserved_not_reset_to_standard(self, monkeypatch):
         # MetadataDirective=REPLACE covers SYSTEM metadata, so a copy with no
@@ -279,10 +280,11 @@ class TestTouchS3:
             # The siblings have no LIST entry: one HEAD each buys the class.
             "store/-5/1/stats.json": "STANDARD_IA",
             "store/-5/1/granules.json": "STANDARD_IA",
+            "store/-5/1/icechunk_refs.json": "STANDARD_IA",
             "store/-5/1/shardmap.json": "STANDARD_IA",
         }
-        assert client.head_object.call_count == 3  # named objects only
-        assert counts == {"touched": 5, "failed": 0}
+        assert client.head_object.call_count == 4  # named objects only
+        assert counts == {"touched": 6, "failed": 0}
 
     def test_external_target_copies_carry_the_bucket_owner_acl(self, monkeypatch):
         # CopyObject CREATES the object, so on a cross-account target a touch
@@ -326,9 +328,9 @@ class TestTouchS3:
         assert counts["touched"] == 0
         # PATHS, not objects (review finding on PR #496): the four inputs are
         # the leaf tree plus the three named siblings. A successful touch of
-        # the same footprint reports touched: 6, because the tree contributes
+        # the same footprint reports touched: 7, because the tree contributes
         # one per listed key -- the keys are not summable, hence the name.
-        assert counts["skipped_paths"] == 4
+        assert counts["skipped_paths"] == 5
 
     PUBLISHED = "us-west-2.opendata.source.coop"
 
@@ -513,7 +515,7 @@ class TestTouchS3:
             f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
             store_kwargs={"credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"}},
         )
-        assert counts == {"touched": 0, "failed": 6}
+        assert counts == {"touched": 0, "failed": 7}
 
     def test_absent_sibling_is_neither_touched_nor_failed(self, monkeypatch):
         # copy of a missing key (e.g. no sub-map was ever written) NoSuchKey-s;
@@ -527,7 +529,7 @@ class TestTouchS3:
         err = ClientError({"Error": {"Code": "AccessDenied"}}, "CopyObject")
         self._client(monkeypatch, copy_error=err)
         counts = lifecycle.touch_current_unit(f"s3://{self.BUCKET}/store/-5/1/{LEAF}")
-        assert counts == {"touched": 0, "failed": 6}
+        assert counts == {"touched": 0, "failed": 7}
 
     def test_a_list_fault_aborts_fail_open(self, monkeypatch):
         client = self._client(monkeypatch)

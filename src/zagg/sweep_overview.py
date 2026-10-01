@@ -527,6 +527,7 @@ def build_pyramid_block(config, shard_order: int, chunk_order: int | None = None
         expand_overviews,
         normalize_overviews,
         overview_block_v2,
+        validate_column_tier,
         validate_overviews,
         warn_excluded,
     )
@@ -557,15 +558,19 @@ def build_pyramid_block(config, shard_order: int, chunk_order: int | None = None
         # gets: the Lambda worker builds its config with ``load_config_from_dict``,
         # which never calls ``validate_config``, then goes straight to
         # ``build_manifest``. A grid-less retrofit config (no ``output.grid``,
-        # the ``declare_pyramid`` shape) is the one case skipped: there is no
-        # child order to check against here, and ``declare_pyramid``
-        # re-validates against the MANIFEST's own shard_order/cell_order before
-        # anything is written.
+        # the ``declare_pyramid`` shape) has no child order to check the RANGE
+        # rule against, so that leg alone is deferred to ``declare_pyramid``,
+        # which re-validates against the MANIFEST's own shard_order/cell_order
+        # before anything is written. The §4.6 column tier needs only the shard
+        # order, so its contiguity runs on both arms (review finding) — no arm
+        # templates a gapped ``/2`` block.
         grid_child = (config.output.get("grid") or {}).get("child_order")
         if grid_child is not None:
             validate_overviews(
                 resolutions, parent_order=int(shard_order), child_order=int(grid_child)
             )
+        else:
+            validate_column_tier(resolutions, parent_order=int(shard_order))
         # The manifest records the FULLY EXPANDED list — the leaf entry plus
         # the fixed every-order ladder to 0 (espg ruling; readers never
         # re-derive).
@@ -764,6 +769,17 @@ def declare_pyramid(
     block itself: ``orders`` under ``/1``, ``overviews`` (the normalized
     grouped form, issue #382) under ``/2``. An empty ``orders`` is ``/1``'s
     declared-off signal, so a ``/2`` summary must not carry the key at all.
+
+    **Hash-epoch migration** (issue #499): when the store's frozen
+    ``semantic_hash`` is this config's PRE-epoch digest (:func:`_semantic_guard`,
+    the self-migrating case), the same PUT rewrites it to the current digest —
+    even for an otherwise identical declaration, which is then NOT a no-op —
+    and the summary's ``semantic_hash_migration`` records ``{"from", "to"}``
+    (``None`` when no migration happened). The store's D19 core sidecar
+    (``aggregation.yaml``) is re-rendered from the same config right after, so
+    it does not go on asserting the pre-epoch core. This is the only path that
+    moves the frozen key; the append path refuses a pre-epoch store until it
+    has run.
     """
 
     from zagg.hive import MANIFEST_NAME, _frozen_matches, read_manifest
@@ -843,7 +859,7 @@ def declare_pyramid(
             f"declared orders {bad} are not ancestor orders of the manifest "
             f"shard_order {shard_order} — the config does not match this store"
         )
-    semantic = _semantic_guard(manifest, config)
+    semantic, migrate_to = _semantic_guard(manifest, config)
     validated = _validate_block_against_store(store_root, manifest, block, store_kwargs)
     # Re-read immediately before the RMW, the same discipline
     # :func:`_update_manifest_pyramid` uses: validation above is slow (run-record
@@ -857,6 +873,18 @@ def declare_pyramid(
             f"the {MANIFEST_NAME} at {store_root} changed under declare_pyramid's "
             f"validation window (frozen keys differ, or it vanished) — nothing was "
             f"written; re-run against the settled store"
+        )
+    if migrate_to is not None and fresh.get("semantic_hash") != manifest.get("semantic_hash"):
+        # ``_frozen_matches`` EXEMPTS ``semantic_hash`` when either side lacks
+        # it (pre-#299 stores), so the recheck above does not by itself prove
+        # ``fresh`` carries the digest :func:`_semantic_guard` verified — and a
+        # migration must never stamp the current hash onto a manifest whose own
+        # was stripped inside the window. Only the migration needs the stricter
+        # test; a non-migrating write leaves the key alone.
+        raise ValueError(
+            f"the {MANIFEST_NAME} at {store_root} changed its semantic_hash under "
+            f"declare_pyramid's validation window — nothing was written; re-run "
+            f"against the settled store"
         )
     prior = fresh.get("pyramid")
     # A non-dict prior (hand-edited ``"pyramid": "off"``) is not an error: it is
@@ -897,23 +925,97 @@ def declare_pyramid(
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
         "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
-        "updated": prior != block or not mirror_current,
+        "updated": prior != block or not mirror_current or migrate_to is not None,
         # Whether the written manifest carries the §4.9 mirror — /2 only.
         "multiscales": mirror is not None,
+        # The issue #499 hash-epoch migration, when this write performs one:
+        # ``{"from": <pre-epoch digest>, "to": <current digest>}``.
+        "semantic_hash_migration": (
+            {"from": fresh["semantic_hash"], "to": migrate_to} if migrate_to else None
+        ),
+        # The §11.4 ``declare-pyramid`` follow-through into the store's Icechunk
+        # repo (issue #582): ``None`` only when there is no repo, else
+        # :func:`zagg.icechunk_ops.declare_pyramid`'s report (``unchanged``
+        # when the repo already carries the declaration).
+        "icechunk": None,
     }
-    if prior == block and mirror_current:
+    if prior == block and mirror_current and migrate_to is None:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
+        # The repo may still lag the manifest (a failed follow-through, a repo
+        # built before the retrofit): the operation is idempotent, so re-run it.
+        summary["icechunk"] = _declare_into_repo(store_root, config, fresh, store_kwargs)
         return summary
     fresh["pyramid"] = block
+    if migrate_to is not None:
+        # The ONE place a frozen key moves (issue #499): the guard above proved
+        # this config built the store under the pre-epoch canonicalization, and
+        # the re-read re-checked ``fresh``'s frozen keys AND its semantic_hash
+        # against the manifest the guard saw, so the digest being replaced is
+        # the one that was verified.
+        fresh["semantic_hash"] = migrate_to
     store = open_object_store(store_root, **store_kwargs)
     if mirror is not None:
         fresh["multiscales"] = mirror
     else:
         fresh.pop("multiscales", None)
     put_object(store, MANIFEST_NAME, json.dumps(fresh, indent=1).encode())
+    if migrate_to is not None:
+        # The store's D19 core sidecar still renders the PRE-epoch core (it is
+        # written only by ``ensure_manifest``'s PUT branch and nothing else
+        # regenerates it), so a migrated store would assert two different cores
+        # — the frozen hash without ``data_source.index``, the sidecar beside it
+        # with. Rewriting it here is the same config the guard verified, and the
+        # call is fail-open by construction (D9 cache class: the hash is truth).
+        from zagg.hive import write_semantic_core
+
+        write_semantic_core(store_root, config, **store_kwargs)
     if mirror is None:
         _remove_multiscales_group(store, store_root)
+    summary["icechunk"] = _declare_into_repo(store_root, config, fresh, store_kwargs)
     return summary
+
+
+def _declare_into_repo(store_root: str, config, manifest: dict, store_kwargs: dict):
+    """Mirror the declaration just written into the store's repo, when it has one.
+
+    The metadata plane tracks the manifest (spec §11 head): the repo's level
+    groups and ``multiscales`` root attrs follow the ``/2`` block in one
+    ``declare-pyramid`` commit (:func:`zagg.icechunk_ops.declare_pyramid`).
+    Fail-open like every repo write (D9): ``None`` without a repo, the
+    report, or ``{"error": ...}`` — the manifest PUT above already landed and
+    ``python -m zagg.icechunk_ops <store> declare-pyramid`` re-runs the step.
+    """
+    from zagg.icechunk_refs import read_block
+
+    try:
+        block = read_block(store_root, store_kwargs=store_kwargs)
+        if block is None:
+            return None
+        from zagg.grids import from_config
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.icechunk_ops import declare_pyramid as declare_into_repo
+
+        # The retrofit vets the manifest, not the config's grid (the
+        # ``chunk_order=`` lever exists because that grid may not describe the
+        # store): a config grid the block disagrees with is rebuilt from the
+        # block, the store's truth, as the retrofit rebuilds from the manifest.
+        grid = from_config(config)
+        keys = ("shard_order", "cell_order", "chunk_order")
+        have = (grid.parent_order, grid.child_order, grid.chunk_order)
+        if tuple(int(v) for v in have) != tuple(block[k] for k in keys):
+            grid = HealpixGrid(
+                block["shard_order"],
+                block["cell_order"],
+                config=config,
+                chunk_inner=block["chunk_order"],
+                sharded=True,
+            )
+        return declare_into_repo(
+            store_root, config, store_kwargs=store_kwargs, manifest=manifest, grid=grid
+        )
+    except Exception as exc:
+        logger.warning(f"declare_pyramid: the icechunk repo was not updated ({exc!r})")
+        return {"error": repr(exc)}
 
 
 def _remove_multiscales_group(store, store_root: str) -> None:
@@ -950,7 +1052,7 @@ def _remove_multiscales_group(store, store_root: str) -> None:
         )
 
 
-def _semantic_guard(manifest: dict, config) -> str:
+def _semantic_guard(manifest: dict, config) -> tuple[str, str | None]:
     """Refuse a config whose semantics the store's frozen ``semantic_hash`` denies.
 
     The leaf probe (:func:`_field_drift`) can falsify TYPING only — no leaf
@@ -968,9 +1070,21 @@ def _semantic_guard(manifest: dict, config) -> str:
     false-refuse on the pyramid edit itself. It compares only when the manifest
     declares the key, the same both-sides-present exemption
     :func:`zagg.hive._frozen_matches` gives pre-#299 stores (a pre-#344 retrofit
-    target may well be one). Returns the note recorded in the summary.
+    target may well be one).
+
+    **The self-migrating case** (the issue #499 hash epoch): a store whose
+    frozen hash is this config's PRE-epoch digest
+    (:func:`zagg.semantics.semantic_hash_legacy` — the index-in-core
+    canonicalization) was built by this config, so it is ACCEPTED, and the
+    current digest is returned as the value :func:`declare_pyramid` rewrites
+    into the manifest in the same PUT. This is the one path that may move the
+    frozen key: the append path (:func:`zagg.hive._frozen_matches`) refuses a
+    pre-epoch store by name until this has run.
+
+    Returns ``(note, migrate_to)`` — the note recorded in the summary, and the
+    current digest when the manifest's must migrate (``None`` otherwise).
     """
-    from zagg.semantics import semantic_fingerprint, semantic_hash
+    from zagg.semantics import semantic_fingerprint, semantic_hash, semantic_hash_legacy
 
     stored = manifest.get("semantic_hash")
     if not stored:
@@ -979,8 +1093,19 @@ def _semantic_guard(manifest: dict, config) -> str:
             "the config's aggregation semantics could NOT be verified against the store; "
             "the declared fold methods are taken on trust"
         )
-        return "semantic_hash absent (pre-#299 store — fold methods unverified)"
+        return "semantic_hash absent (pre-#299 store — fold methods unverified)", None
     supplied = semantic_hash(config)
+    if supplied != stored and semantic_hash_legacy(config) == stored:
+        logger.info(
+            f"declare_pyramid: pre-epoch semantic_hash {semantic_fingerprint(stored)} — this "
+            f"config built the store under the index-in-core canonicalization (issue #499); "
+            f"the manifest migrates to {semantic_fingerprint(supplied)} in this write"
+        )
+        return (
+            f"pre-epoch semantic_hash {semantic_fingerprint(stored)} (this config built the "
+            f"store under the index-in-core canonicalization, issue #499) — migrated to "
+            f"{semantic_fingerprint(supplied)}"
+        ), supplied
     if supplied != stored:
         raise ValueError(
             f"config semantics {semantic_fingerprint(supplied)} != the store's frozen "
@@ -990,7 +1115,7 @@ def _semantic_guard(manifest: dict, config) -> str:
             f"Retrofit with the ORIGINAL config: output.* is not in the semantic core, so "
             f"adding output.pyramid to it hashes identically"
         )
-    return f"semantic_hash {semantic_fingerprint(stored)}"
+    return f"semantic_hash {semantic_fingerprint(stored)}", None
 
 
 def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> str:
@@ -1008,7 +1133,7 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
     """
     import zarr
 
-    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
     from zagg.store import open_store
     from zagg.sweep import discover_leaves
 
@@ -1032,8 +1157,16 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
     leaf = None
     for key, window in refs:
         path = shard_leaf_path(store_root, key, window=window)
-        if read_commit(open_store(path, read_only=True, **store_kwargs)) is not None:
-            leaf = path
+        stamp = read_commit(open_store(path, read_only=True, **store_kwargs))
+        if stamp is not None:
+            # A versioned leaf's arrays live under its current version
+            # (spec §1.5, issue #582); the stamp just read is the pointer. An
+            # invalid ``current`` is a corrupt leaf: probe the next one.
+            try:
+                leaf = leaf_data_path(path, stamp)
+            except ValueError as e:
+                logger.warning(f"declare_pyramid: skipping corrupt leaf {path} ({e})")
+                continue
             break
     if leaf is None:
         # Two very different stores that must not report the same thing: no run
@@ -1750,7 +1883,7 @@ def _fold_node(
     import zarr
 
     from zagg.grids.morton import morton_word
-    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
     from zagg.stats.composition import merge_composition_kway
     from zagg.store import open_store
     from zagg.windows import union_time_range
@@ -1814,6 +1947,11 @@ def _fold_node(
             # Fold the whole leaf's contribution BEFORE touching the slabs, so
             # a corrupt leaf skips cleanly instead of half-applying.
             try:
+                if stamp.get("current"):
+                    # Versioned leaf (spec §1.5): the arrays are the current
+                    # version's; the root stamp already read is its pointer.
+                    # Inside the try: an invalid ``current`` skips THIS leaf.
+                    leaf_store = open_store(leaf_data_path(leaf, stamp), **store_kwargs)
                 group = zarr.open_group(leaf_store, path=str(cell_order), mode="r", zarr_format=3)
                 morton = group["morton"]
                 if morton.shape != (leaf_cells,):
@@ -2502,6 +2640,7 @@ def _write_overview(
     from mortie import generate_morton_children
     from zarr import open_array
 
+    from zagg.content_hash import staged_record
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
@@ -2541,37 +2680,38 @@ def _write_overview(
         }
     )
     stamp_window = key if windowed else None
+    # O11 content hashes (issue #342 phase 4): an overview leaf gets the same
+    # §5 record as a source leaf, computed from the folded arrays already in
+    # memory (the ratified overview-scope decision (1)) — BEFORE the stamp so
+    # it rides the stamp (issue #580) and the D20 sidecar alike; the
+    # envelope's sweep-internal skip digest (``_content_hash`` above) is a
+    # DIFFERENT recipe with a different job and stays untouched (decision
+    # (2)). Fail-open (D9 telemetry posture; §5.3 reads absence as
+    # unverifiable, never tampered): a hashing failure stamps without the key.
+    staged = {f"{target_order}/morton": words}
+    staged.update({f"{target_order}/{name}": slab for name, slab in fold["slabs"].items()})
+    hashes = staged_record(store, staged, f"sweep[overview] at {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
         granule_count=int(fold["granule_count"]),
         window=stamp_window,
         time_range=fold["time_range"] if stamp_window is not None else None,
+        content_hashes=hashes,
     )
-    # O11 content hashes (issue #342 phase 4): an overview leaf gets the same
-    # §5 D20 sidecar record as a source leaf, computed from the folded arrays
-    # already in memory (the ratified overview-scope decision (1)); the
-    # envelope's sweep-internal skip digest (``_content_hash`` above) is a
-    # DIFFERENT recipe with a different job and stays untouched (decision
-    # (2)). Sidecar naming follows the leaf basename's D23 window-only
-    # grammar (``{stem}.stats.json``) regardless of the store's manifest
-    # spec: overview basenames are v3-named unconditionally, and the legacy
-    # grammar would key every window's sidecar to one ``stats.json`` at the
-    # node. Fail-open (D9 telemetry posture; §5.3 reads absence as
-    # unverifiable, never tampered).
+    # Sidecar naming follows the leaf basename's D23 window-only grammar
+    # (``{stem}.stats.json``) regardless of the store's manifest spec:
+    # overview basenames are v3-named unconditionally, and the legacy grammar
+    # would key every window's sidecar to one ``stats.json`` at the node.
     try:
-        from zagg.content_hash import content_hashes_record, hash_arrays
         from zagg.telemetry import SPEC_V3, build_record, write_sidecar
 
-        staged = {f"{target_order}/morton": words}
-        staged.update({f"{target_order}/{name}": slab for name, slab in fold["slabs"].items()})
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=morton_word(node),
             metadata={
                 "cells_with_data": int(populated.sum()),
                 "granule_count": int(fold["granule_count"]),
-                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+                "content_hashes": hashes,
             },
             window=stamp_window,
         )

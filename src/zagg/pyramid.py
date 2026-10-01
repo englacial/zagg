@@ -82,6 +82,22 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
     strictly between ``parent_order`` and ``child_order`` — a member at the
     shard's own order is the writer-side whole-footprint aggregate (never
     declared), and a member at the base data's own order IS the base data.
+    Then the contiguity rule (espg ruling on the PR #567 thread, 2026-09-17):
+    the §4.6 column tier — every ladder cell at or above the shard order —
+    MUST step by one from the finest leaf resolution down to the shard
+    order, or the raw-fold boundary member (``parent_order +
+    zagg.column.RAW_MEMBER_DEPTH``) can be absent while coarser members are
+    declared. The ladder's coarsest cell is node 0's, ``d = base -
+    parent_order``, so it fills ``[max(parent_order, d), base)`` — NOT
+    ``[parent_order, base)``. A gap therefore has two possible causes, and
+    the refusal names which: a gap in the leaf list when ``d <=
+    parent_order + 1``, else the ladder's own floor, which no leaf list can
+    fix (every declared resolution is at or above ``base``, the gap is
+    below it) — there the constraint is on ``base``, which must be at most
+    ``2 * parent_order + 1``. The rule scopes to the tier: levels whose
+    cells are BELOW the shard order are the ladder's own, DERIVED by the
+    every-order law of :func:`expand_overviews`, so no gap can arise there
+    and none is checked here.
     """
     parent_order, child_order = int(parent_order), int(child_order)
     if any(b >= a for a, b in zip(resolutions, resolutions[1:])):
@@ -98,6 +114,62 @@ def validate_overviews(resolutions: list, *, parent_order: int, child_order: int
                 f"(the base data itself is order {child_order}; the shard-order "
                 f"aggregate is writer-side, never declared)"
             )
+    validate_column_tier(resolutions, parent_order=parent_order)
+
+
+def validate_column_tier(resolutions: list, *, parent_order: int) -> None:
+    """Refuse a leaf list whose §4.6 column tier gaps — the contiguity half.
+
+    Split out of :func:`validate_overviews` because it needs no
+    ``child_order`` (review finding): the grid-less retrofit config has none
+    to check the range rule against, but its tier is still fully determined
+    by ``parent_order``, so ``build_pyramid_block`` runs this leg on that arm
+    rather than templating a gapped ``/2`` block for ``declare_pyramid`` to
+    refuse later.
+    """
+    parent_order = int(parent_order)
+    resolutions = [int(r) for r in resolutions]
+    tier, missing = column_tier_gaps(
+        expand_overviews(resolutions, parent_order=parent_order), parent_order
+    )
+    if missing:
+        d = resolutions[-1] - parent_order
+        why = (
+            f"the fixed ladder bottoms out at cells {d} (node 0), so the coarsest leaf "
+            f"resolution must be at most {2 * parent_order + 1} on this geometry"
+            if d > parent_order + 1
+            else "the leaf resolutions must step by one down to the shard order"
+        )
+        raise ValueError(
+            f"output.pyramid.overviews {resolutions}: column tier must be contiguous: "
+            f"cells at or above shard order {parent_order} are {tier}, missing {missing} "
+            f"(every such level is a leaf column member, spec §4.4/§4.6, so {why})"
+        )
+
+
+def column_tier_gaps(levels: list, shard_order: int) -> tuple[list[int], list[int]]:
+    """The §4.6 leaf column tier of an expanded list, and the orders it skips.
+
+    ``(tier, missing)``: the tier is :func:`zagg.column.column_resolutions`
+    — every cell at or above ``shard_order`` from any level plus the
+    node-order member, finest first — and ``missing`` every order between
+    the shard order and the tier's finest member that no level carries,
+    finest first as well (both halves of the refusal read in the same
+    direction the declaration is written in).
+    Empty ``missing`` is the contiguity the ruling requires. Cells below the
+    shard order never contribute, so a ``levels`` list that skips
+    stage-merge levels reports none — and no conformant manifest carries
+    such a skip anyway: those levels are DERIVED by the §4.4 every-order
+    law, which ``pyramid_check_v2`` enforces by byte-equality against
+    :func:`expand_overviews`.
+    """
+    from zagg.column import column_resolutions
+
+    tier = column_resolutions(levels, shard_order)
+    missing = (
+        sorted(set(range(int(shard_order), tier[0])) - set(tier), reverse=True) if tier else []
+    )
+    return tier, missing
 
 
 def expand_overviews(resolutions: list, *, parent_order: int) -> list[dict]:

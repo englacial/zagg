@@ -1809,6 +1809,10 @@ class TestSummaryKeysByteIdentical:
         # unless a unit refused. LOCAL-only — the fleet has no once-per-run
         # worker-side write seam (D8), so _LAMBDA_KEYS below does not carry it.
         "refusal_manifest_path",
+        # Icechunk companion init record (issue #580): always present, None
+        # off-hive / opted out, {"error"} on a fail-open init.
+        "icechunk",
+        "icechunk_finalize",
     } | _IDENTITY_KEYS
     _LAMBDA_KEYS = {
         "total_cells",
@@ -1832,6 +1836,9 @@ class TestSummaryKeysByteIdentical:
         "finalize_s",
         # Guarded finalize (issue #335); always present, None on success.
         "finalize_error",
+        # Icechunk companion init record (issue #580), as on the local backend.
+        "icechunk",
+        "icechunk_finalize",
         "function_timeout_s",
         "worker_max_s",
         "worker_median_s",
@@ -4542,6 +4549,195 @@ class TestManifestChecker:
         # root via the poller's output-store path (issue #274 Fix 2).
         assert captured["predicate"]() is True
         assert seen["root"] == "s3://out/x.zarr"
+
+
+class TestLambdaSkipAndDirtOnly:
+    """The fleet's leaf identity gate and the dirt-only work set (issues #388, #580).
+
+    ``_run_lambda`` arms the worker gate exactly where ``_run_local`` does (a
+    hive run without ``overwrite``), counts a current unit apart from
+    ``cells_with_data`` with no run-parquet row, and hands a unit the worker
+    marked ``icechunk_dirty`` to the staged sweep as dirt-only — the same
+    assembly as the local backend (PR #581 question (11)). The tail's
+    Icechunk finalize (issue #582) fires after the staged sweep, and only
+    when that sweep completed.
+    """
+
+    def _drive(self, monkeypatch, atl06_config, *, body, overwrite=False, init=None, staged=None):
+        """``init`` is the stubbed icechunk init record (``None``: no repo);
+        ``staged`` the stubbed staged sweep's summary. ``seen["order"]`` logs
+        the stage sweep and the icechunk finalize in call order (issue #582)."""
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        seen: dict = {"cells": [], "stage": [], "sweep": 0, "order": [], "finalize": []}
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_icechunk_init", lambda *a, **k: (seen.update(init=k), init)[1]
+        )
+
+        def finalize(*a, **k):
+            seen["order"].append("finalize")
+            seen["finalize"].append((a, k))
+            return {"tag": "run-x"}
+
+        monkeypatch.setattr(runner, "_invoke_lambda_icechunk_finalize", finalize)
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output["sweep"] = "stages"
+        atl06_config.output["coverage_moc"] = False
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_setup_async", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+
+        def cell(client, chunk_idx, shard_key, *a, **k):
+            seen["cells"].append(k)
+            return {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"shard_key": shard_key, "window": None, **body},
+                "error": None,
+                "timeout": False,
+            }
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", cell)
+        monkeypatch.setattr(
+            runner,
+            "_dispatch_run_stats",
+            lambda client, fn, store, rows, **k: seen.update(rows=rows),
+        )
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_sweep", lambda *a, **k: seen.update(sweep=seen["sweep"] + 1)
+        )
+
+        def stage(*a, **k):
+            seen["order"].append("stage")
+            seen["stage"].append((a, k))
+            return staged
+
+        monkeypatch.setattr(runner, "_invoke_lambda_stage_sweep", stage)
+        summary = runner._run_lambda(
+            atl06_config,
+            _run_catalog(),
+            "s3://out/x.zarr",
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=overwrite,
+            dry_run=False,
+            region="us-west-2",
+            function_name="fn",
+        )
+        return summary, seen
+
+    #: A touched current unit: it rides dirt-only, so the staged sweep is chained.
+    _DIRTY = {"current": True, "total_obs": 0, "icechunk_dirty": True}
+
+    def test_the_gate_is_armed_like_the_local_backend(self, monkeypatch, atl06_config):
+        from zagg.semantics import semantic_hash
+
+        _summary, seen = self._drive(monkeypatch, atl06_config, body={"total_obs": 1})
+        expected = semantic_hash(atl06_config)
+        assert [k["semantic_hash"] for k in seen["cells"]] == [expected] * 4
+
+    def test_overwrite_disarms_the_gate(self, monkeypatch, atl06_config):
+        _summary, seen = self._drive(
+            monkeypatch, atl06_config, body={"total_obs": 1}, overwrite=True
+        )
+        assert [k["semantic_hash"] for k in seen["cells"]] == [None] * 4
+
+    @pytest.mark.parametrize("dirty", [True, False])
+    def test_current_units_record_nothing_and_ride_dirt_only(
+        self, monkeypatch, atl06_config, dirty
+    ):
+        body = {"current": True, "total_obs": 0, **({"icechunk_dirty": True} if dirty else {})}
+        summary, seen = self._drive(monkeypatch, atl06_config, body=body)
+        assert summary["cells_current"] == 4 and summary["cells_with_data"] == 0
+        assert seen.get("rows", []) == []  # no run-parquet row for a current unit
+        assert seen["sweep"] == 0  # the families sweep sees real leaves only
+        if not dirty:
+            assert seen["stage"] == []  # an unmarked current unit enters no sweep
+            return
+        ((args, kwargs),) = seen["stage"]
+        assert args[3] == []  # no dirty leaf
+        assert kwargs["dirt_only"] == [(k, None) for k in (10, 11, 12, 13)]
+
+    def test_the_finalize_runs_once_after_the_stage_sweep(self, monkeypatch, atl06_config):
+        # _run_lambda's tail (issue #582): after the staged sweep returned,
+        # carrying the init record and the SAME pinned config the init got.
+        init = {"snapshot": "s0", "split_ratchet": None}
+        staged = {"barrier_timed_out": False, "finisher": {"fired": True, "landed": True}}
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, body=self._DIRTY, init=init, staged=staged
+        )
+        assert seen["order"] == ["stage", "finalize"]
+        ((args, kwargs),) = seen["finalize"]
+        assert args[1:] == ("fn", "s3://out/x.zarr") and kwargs["icechunk_init"] is init
+        assert kwargs["config_dict"] is seen["init"]["config_dict"]
+        assert kwargs["config_dict"]["output"]["icechunk"]["commit"] in ("ladder", "leaf")
+        assert isinstance(kwargs["run_id"], str) and kwargs["run_id"]
+        assert summary["icechunk"] is init and summary["icechunk_finalize"] == {"tag": "run-x"}
+
+    def test_no_init_record_no_finalize(self, monkeypatch, atl06_config):
+        summary, seen = self._drive(monkeypatch, atl06_config, body=self._DIRTY, init=None)
+        assert seen["order"] == ["stage"] and summary["icechunk_finalize"] is None
+
+    @pytest.mark.parametrize(
+        "staged, reason",
+        [
+            (None, "staged sweep dispatch failed"),
+            ({"barrier_timed_out": True, "finisher": {"fired": True, "landed": True}}, "barrier"),
+            ({"barrier_timed_out": False, "finisher": {"fired": True, "landed": False}}, "land"),
+        ],
+    )
+    def test_an_incomplete_staged_sweep_leaves_the_run_untagged(
+        self, monkeypatch, atl06_config, staged, reason
+    ):
+        # Stage nodes are Event invokes: a sweep that did not complete may
+        # still have node commits in flight, so no tag (issue #582).
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, body=self._DIRTY, init={"snapshot": "s0"}, staged=staged
+        )
+        assert seen["order"] == ["stage"] and seen["finalize"] == []
+        assert reason in summary["icechunk_finalize"]["skipped"]
+
+    def test_a_staged_sweep_that_fired_nothing_still_tags(self, monkeypatch, atl06_config):
+        staged = {
+            "skipped": "no dispatch nodes",
+            "barrier_timed_out": False,
+            "finisher": {"fired": False, "landed": False},
+        }
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, body=self._DIRTY, init={"snapshot": "s0"}, staged=staged
+        )
+        assert seen["order"] == ["stage", "finalize"]
+        assert summary["icechunk_finalize"] == {"tag": "run-x"}
 
 
 class TestFinalizeGuard:

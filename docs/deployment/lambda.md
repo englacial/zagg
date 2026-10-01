@@ -564,8 +564,9 @@ Every store write stays worker-side. The dispatcher only invokes and polls.
 `zagg.sweep_fleet.run_stage_sweep_fleet` mirrors the in-process driver's tuple
 ordering exactly:
 
-1. **fan out** one tuple's dispatch nodes, batched under the 250 KB async
-   payload cap, one `InvocationType="Event"` invoke per batch;
+1. **fan out** one tuple's dispatch nodes, batched under `max_nodes_per_invoke`
+   *and* the 250 KB async payload cap — whichever binds first closes a batch —
+   with one `InvocationType="Event"` invoke per batch;
 2. **soft-barrier** — poll the status prefix until every batch's stage record
    lands, or the barrier budget expires. Per #381 point (6) the barrier is a
    *scheduling* preference, not a correctness device: under-coverage is
@@ -580,6 +581,31 @@ ordering exactly:
    over zero stage records refuses by design, so firing it would buy one
    guaranteed 500 the Event invoke hides plus a full barrier on a record that
    can never land.
+
+#### How wide the fan-out is
+
+`max_nodes_per_invoke` caps how many dispatch nodes one invoke folds, and its
+**default is 1 — one dispatch node per invoke, at every tuple** (espg ruling,
+issue #547, 2026-09-11). That is the fan-out an `output.sweep: "stages"` run
+gets unless it says otherwise: the runner's tail passes no value and inherits
+it, and so does the ad-hoc driver below. The ruling was made on ATL03's T1 —
+the 110-node o6 tuple whose fattest node is already a full 4³ subtree of leaf
+columns against the 900 s wall — and applying it at every tuple is safe there
+because the coarser tuples are small (22 nodes, then 3).
+
+It is **orchestration only**: dispatch nodes own disjoint subtrees, so the
+grouping changes no store bytes (the byte-identity oracle re-runs at
+`max_nodes_per_invoke=1`). What it does change is the invoke count, and that
+scales with the store's order: the finest tuple of an o9 store is ~49,000
+dispatch nodes, so one node per invoke means ~49,000 `Event` invokes, ~49,000
+objects under the run's status prefix, and a barrier that re-LISTs a 49,000-name
+prefix every `poll_interval_s`. Sweeping a store that large, pass a cap sized to
+the per-invoke wall — or `max_nodes_per_invoke=None`, which restores
+payload-only packing (a whole tuple on one worker whenever it fits the 250 KB
+cap, which is what this transport did before the ruling).
+
+Both the ad-hoc driver and the runner's tail
+(`runner._invoke_lambda_stage_sweep`) take the knob by that name.
 
 One barrier is bounded by `barrier_timeout_s` (default 2,700 s — three times
 the 900 s function timeout: queue drain, one throttle redelivery, and the
@@ -641,12 +667,32 @@ summary = run_stage_sweep_fleet(
     leaves,                    # [(shard_key, window), ...]
     shard_order=6,
     store_kwargs={"region": "us-west-2"},
+    # Omitted here, so the ruled default rides: one dispatch node per invoke.
+    # max_nodes_per_invoke=None,   # payload-only packing instead
 )
 ```
 
 `shard_order` is passed in rather than read from the manifest on purpose: a
 dispatcher role may hold nothing but `lambda:InvokeFunction` against the
 store itself.
+
+**Computing the assignment from the store's coverage.** By default the
+dispatch nodes come from the work set alone. Hand in the store's coverage MOC
+and each tuple's node set becomes the ruled computation instead — the coverage
+resolved to that tuple's dispatch order, intersected with the shard set — so
+the worker count per tuple is *evaluated from the store*, never a number
+written down anywhere:
+
+```python
+from zagg.hive import read_root_coverage, root_coverage_words
+
+coverage = root_coverage_words(read_root_coverage("s3://bucket/prefix.zarr"))
+summary = run_stage_sweep_fleet(..., coverage=coverage)   # composes with scope=
+```
+
+The read happens **operator-side**, like `shard_order`: the dispatcher itself
+never touches the store (D8). The run summary records `coverage_computed` so
+the run says which derivation it used.
 
 **Permissions.** Nothing new on the worker side — the execution role already
 writes the store and the `<store>.status/` sibling (the issue #151 async result

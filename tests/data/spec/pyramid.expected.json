@@ -71,7 +71,7 @@
  "actuals": {
   "3": {
    "regime": "leaf-column",
-   "merges_from_raw": 1
+   "merges_from_raw": 2
   },
   "2": {
    "regime": "stage-gather",

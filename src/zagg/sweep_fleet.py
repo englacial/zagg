@@ -94,6 +94,62 @@ def dispatch_nodes(by_shard, dispatch: int, scope=None) -> list:
     return [n for n in nodes if scope_admits(n, scope)]
 
 
+def coverage_dispatch_nodes(by_shard, dispatch: int, coverage, scope=None) -> list:
+    """Dispatch nodes COMPUTED from the store's own coverage (issue #547 ruling).
+
+    THE ruled computation, and what ``run_stage_sweep_fleet(..., coverage=...)``
+    calls once per tuple — not a helper beside the dispatcher, but the
+    dispatcher's own node derivation when a coverage MOC is supplied.
+
+    Worker assignment is never a hardcoded count: coarsen the store's coverage
+    MOC to the ``dispatch`` order, intersect with the shard set, and assign
+    workers from the result — 110 is merely what ATL03's o6 coverage evaluates
+    to today (espg ruling, 2026-09-11). ``coverage`` is a MOC the caller
+    already HOLDS — the run record's shard set, or the root ``coverage.moc``'s
+    words (:func:`zagg.hive.root_coverage_words`) handed in by the operator —
+    never read from the store here (D8: the invoke-only dispatcher role
+    cannot). ``scope`` is the run's own scope MOC when it has one; the
+    assignment is then the intersection of all three
+    (:func:`zagg.sweep_stages.compose_scope`), since a scoped run must not
+    widen just because a coverage was supplied.
+
+    The argument order mirrors :func:`dispatch_nodes` exactly — same work set,
+    same ``dispatch``, then the MOC that filters — so the two spellings cannot
+    read as a swap of one another.
+
+    Spelled as :func:`dispatch_nodes` over the shard set with the coverage as
+    the scope MOC, because the two formulations name ONE set: a dispatch-order
+    ancestor of a committed shard lies in the coverage resolved to the dispatch
+    order exactly when its subtree intersects the coverage MOC (containment
+    resolves in either direction — :func:`zagg.sweep_stages.scope_admits`), so
+    nothing here depends on which of the two orders is finer.
+    At the default one node per invoke, ``len()`` of the result IS the tuple's
+    worker count.
+
+    A coverage MOC's empty/absent cases are the OPPOSITE of a hand-typed
+    ``--scope``'s, so they are handled here rather than inherited from
+    :func:`zagg.sweep_stages.normalize_scope` (review finding): an EMPTY
+    coverage is a real input — a store that covers nothing yet — and assigns
+    no workers, while ``None`` refuses by name rather than failing open to a
+    whole-store dispatch, which is what a caller whose coverage fetch came
+    back empty would otherwise get.
+    """
+    from zagg.sweep_stages import compose_scope, normalize_scope
+
+    if coverage is None:
+        raise ValueError(
+            "coverage_dispatch_nodes needs the store's coverage MOC — None is not "
+            "'whole store' here, because a coverage that failed to load must not "
+            "silently widen the dispatch; call dispatch_nodes(by_shard, dispatch) to "
+            "derive from the work set alone"
+        )
+    words = list(coverage.keys() if isinstance(coverage, dict) else coverage)
+    if not words:
+        return []
+    filter_moc = compose_scope(normalize_scope(scope), normalize_scope(words))
+    return dispatch_nodes(by_shard, int(dispatch), filter_moc)
+
+
 def _leaf_refs(by_shard, nodes=None) -> list:
     """``[[shard_key, window], ...]`` for the whole work set, or one node slice."""
     from zagg.grids.morton import morton_word
@@ -130,12 +186,24 @@ def _bucket_leaf_refs(by_shard, dispatch: int) -> dict:
     return buckets
 
 
-def _inline_event(store_path: str, block: dict, leaves, output_creds_event=None) -> dict:
+def _split_refs(refs, dirt_keys) -> tuple:
+    """``(leaves, dirt_only)`` — a batch's union refs split by the dirt-only keys."""
+    if not dirt_keys:
+        return list(refs), []
+    return [r for r in refs if tuple(r) not in dirt_keys], [
+        r for r in refs if tuple(r) in dirt_keys
+    ]
+
+
+def _inline_event(
+    store_path: str, block: dict, leaves, output_creds_event=None, dirt_only=None
+) -> dict:
     """The event build with NO cap fallback — the shape the packer measures.
 
     :func:`build_stage_event` is this plus the last-resort conversion to
     ``discover: true``; measuring through THAT would measure the stripped
-    event and call every overflow a fit.
+    event and call every overflow a fit. ``dirt_only`` (issue #580) rides
+    only when non-empty, so an event without it is byte-identical to before.
     """
     event: dict = {"mode": "sweep", "store_path": store_path, "stage": dict(block)}
     if output_creds_event is not None:
@@ -144,10 +212,14 @@ def _inline_event(store_path: str, block: dict, leaves, output_creds_event=None)
         event["discover"] = True
     else:
         event["leaves"] = list(leaves)
+    if dirt_only:
+        event["dirt_only"] = list(dirt_only)
     return event
 
 
-def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=None) -> dict:
+def build_stage_event(
+    store_path: str, block: dict, leaves, output_creds_event=None, dirt_only=None
+) -> dict:
     """One ``mode="sweep"`` + ``stage`` worker event; the single build site.
 
     Mirrors :func:`zagg.runner._build_sweep_event`: optional keys are added
@@ -169,7 +241,7 @@ def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=N
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
 
-    event = _inline_event(store_path, block, leaves, output_creds_event)
+    event = _inline_event(store_path, block, leaves, output_creds_event, dirt_only)
     if leaves is not None and len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
         logger.warning(
             f"stage fleet: run {block.get('run_id')!r} role {block.get('role', 'stage')} "
@@ -180,10 +252,16 @@ def build_stage_event(store_path: str, block: dict, leaves, output_creds_event=N
         )
         del event["leaves"]
         event["discover"] = True
+        # Dirt-only refs (issue #580) are in no run record, so discovery cannot
+        # recover them: they drop, loudly, and heal on a manual staged sweep.
+        if event.pop("dirt_only", None):
+            logger.warning(f"stage fleet: dropped {len(dirt_only)} dirt-only ref(s) with it")
     return event
 
 
-def _fit_batch(nodes, buckets, *, block: dict, store_path: str, output_creds_event, cap) -> list:
+def _fit_batch(
+    nodes, buckets, *, block: dict, store_path: str, output_creds_event, cap, dirt_keys=()
+) -> list:
     """Split one greedily-packed batch until its REAL event fits under the cap.
 
     The incremental accounting in :func:`pack_batches` is an estimate; this is
@@ -195,16 +273,56 @@ def _fit_batch(nodes, buckets, *, block: dict, store_path: str, output_creds_eve
     """
     leaves = [ref for node in nodes for ref in buckets.get(node, [])]
     probe = {**block, "nodes": list(nodes), "batch": _BATCH_INDEX_PROBE}
-    if len(json.dumps(_inline_event(store_path, probe, leaves, output_creds_event))) <= cap:
+    real, dirt = _split_refs(leaves, dirt_keys)
+    if len(json.dumps(_inline_event(store_path, probe, real, output_creds_event, dirt))) <= cap:
         return [(list(nodes), leaves)]
     if len(nodes) == 1:
         return [(list(nodes), None)]  # its own leaves overflow: discover
     mid = len(nodes) // 2
-    kw = dict(block=block, store_path=store_path, output_creds_event=output_creds_event, cap=cap)
+    kw = dict(
+        block=block,
+        store_path=store_path,
+        output_creds_event=output_creds_event,
+        cap=cap,
+        dirt_keys=dirt_keys,
+    )
     return _fit_batch(nodes[:mid], buckets, **kw) + _fit_batch(nodes[mid:], buckets, **kw)
 
 
-def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_event=None) -> list:
+def normalize_max_nodes(max_nodes):
+    """``max_nodes`` as an int >= 1, or ``None`` — refused by name, once.
+
+    Validated where the value ENTERS rather than where it is used, so a run
+    whose tuples all filter out still records a value it could have honored.
+    ``int()`` on its own is not validation: it truncates ``2.9`` to 2 and reads
+    ``True`` as 1 (both silently, so the summary's record would disagree with
+    what shipped), and it raises ``invalid literal for int()`` on a string —
+    not a message naming this knob (review finding).
+    """
+    if max_nodes is None:
+        return None
+    try:
+        value = int(max_nodes)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or isinstance(max_nodes, bool) or value != max_nodes or value < 1:
+        raise ValueError(
+            f"max_nodes must be a whole number >= 1, got {max_nodes!r} — "
+            "pass None for payload-only packing"
+        )
+    return value
+
+
+def pack_batches(
+    nodes,
+    by_shard,
+    *,
+    block: dict,
+    store_path: str,
+    output_creds_event=None,
+    max_nodes=None,
+    dirt_only=None,
+) -> list:
     """Split one tuple's dispatch nodes into invoke-sized batches.
 
     Returns ``[(nodes, leaves), ...]``, every node in exactly one batch and in
@@ -217,13 +335,30 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     the ``discover: true`` form rather than truncating a work set, which would
     silently under-fold.
 
+    ``max_nodes`` caps how many dispatch nodes ride one batch; ``None`` packs
+    by payload alone. The two caps COMPOSE — whichever binds first closes the
+    batch, and the post-measure split below can only make batches smaller — so
+    every batch holds at most ``max_nodes`` nodes AND fits the payload cap.
+    Orchestration only, like ``tuple_width``: dispatch nodes own disjoint
+    subtrees, so batch membership changes no store bytes (the byte-identity
+    oracle re-runs at ``max_nodes=1``). Without it the payload cap alone put
+    an entire tuple on ONE worker — the whole 110-node ATL03 T1 fan-out is
+    ~90 KB (issue #547).
+
     The estimate is deliberately CONSERVATIVE (it charges the real ``", "``
     separators and a fixed envelope margin), and every batch it produces is
     then measured with one real ``json.dumps`` and split if it still exceeds
     the cap — so a batch this function calls inline ships inline, instead of
     being silently converted to ``discover: true`` at build time.
+
+    ``dirt_only`` (issue #580, the ``by_shard`` shape) packs with the work set:
+    each batch's leaf refs are the union, which the caller splits back with
+    :func:`_split_refs` into the event's ``leaves`` and ``dirt_only`` lists —
+    the split this function measures.
     """
     from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES
+
+    max_nodes = normalize_max_nodes(max_nodes)
 
     # The fixed cost of the event minus its two variable-length lists, plus a
     # margin for the JSON punctuation the incremental accounting approximates.
@@ -231,14 +366,16 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
     envelope["nodes"] = []
     base = len(json.dumps(build_stage_event(store_path, envelope, [], output_creds_event))) + 64
     budget = _ASYNC_PAYLOAD_CAP_BYTES - base
-    buckets = _bucket_leaf_refs(by_shard, int(block["dispatch"]))
+    buckets = _bucket_leaf_refs({**(dirt_only or {}), **by_shard}, int(block["dispatch"]))
+    dirt_keys = {tuple(r) for r in _leaf_refs(dirt_only or {})}
     grouped: list = []
     cur_nodes: list = []
     cur_bytes = 0
     for node in nodes:
         # `", "` between elements, both lists: json.dumps' default separators.
         cost = len(node) + 4 + sum(len(json.dumps(r)) + 2 for r in buckets.get(node, []))
-        if cur_nodes and cur_bytes + cost > budget:
+        full = cur_bytes + cost > budget or (max_nodes is not None and len(cur_nodes) >= max_nodes)
+        if cur_nodes and full:
             grouped.append(cur_nodes)
             cur_nodes, cur_bytes = [], 0
         if not cur_nodes and cost > budget:
@@ -258,6 +395,7 @@ def pack_batches(nodes, by_shard, *, block: dict, store_path: str, output_creds_
                 store_path=store_path,
                 output_creds_event=output_creds_event,
                 cap=_ASYNC_PAYLOAD_CAP_BYTES,
+                dirt_keys=dirt_keys,
             )
         )
     return batches
@@ -383,7 +521,9 @@ def run_stage_sweep_fleet(
     *,
     shard_order: int,
     scope=None,
+    coverage=None,
     tuple_width: int | None = None,
+    max_nodes_per_invoke: int | None = 1,
     run_id: str | None = None,
     output_creds_event=None,
     store_kwargs: dict | None = None,
@@ -392,6 +532,7 @@ def run_stage_sweep_fleet(
     barrier_timeout_s: float = DEFAULT_BARRIER_TIMEOUT_S,
     total_barrier_budget_s: float = DEFAULT_TOTAL_BARRIER_BUDGET_S,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    dirt_only=(),
 ) -> dict:
     """One staged sweep run over the fleet: tuples, barriers, finisher last.
 
@@ -405,6 +546,42 @@ def run_stage_sweep_fleet(
     manifest for the same reason: a dispatcher role may hold nothing but
     ``lambda:InvokeFunction``. The runner has it from the config.
 
+    ``coverage`` is the store's own coverage MOC, and supplying it makes every
+    tuple's node set THE ruled computation (:func:`coverage_dispatch_nodes`,
+    issue #547): coverage resolved to the tuple's dispatch order ∩ the shard
+    set, so the worker count per tuple is evaluated from the store rather than
+    pinned anywhere — 110 is only what ATL03's o6 coverage evaluates to today.
+    It composes with ``scope`` (intersection, so a scoped run cannot widen),
+    and it is handed IN, the way ``shard_order`` is — the operator reads it
+    with :func:`zagg.hive.read_root_coverage` /
+    :func:`zagg.hive.root_coverage_words`, and the dispatcher never reads the
+    store (D8). Omitted, the nodes come from the work set alone, which is what
+    the runner's auto-scoped tail passes and what this transport has always
+    done.
+
+    ``max_nodes_per_invoke`` caps how many dispatch nodes one invoke folds
+    (:func:`pack_batches`, where it composes with the async payload cap). The
+    default is 1 — one dispatch node per invoke. Orchestration only, like
+    ``tuple_width`` — no store byte moves with it — and the resulting worker
+    count is COMPUTED per tuple (:func:`dispatch_nodes`, or
+    :func:`coverage_dispatch_nodes` from a coverage MOC), never hardcoded.
+    ``None`` restores payload-only packing, which puts a whole tuple on one
+    worker whenever it fits the 250 KB async cap.
+
+    **What the ruling covers, and what this default extends.** The espg ruling
+    (issue #547, 2026-09-11) named T1 — ATL03's 110-node o6 tuple, whose
+    fattest node is already a full ``4^width`` subtree of leaf columns against
+    the 900 s wall, so one node per invoke is what keeps it inside the wall.
+    Making it the default at EVERY tuple is this dispatcher's extension, and
+    it is safe on that store only because the coarser tuples are small (22,
+    then 3). It is not free in the store's order: at ``max_nodes=1`` the
+    ~49k-node finest tuple of an o9 store is ~49k ``Event`` invokes, ~49k
+    objects under the run's status prefix, and an ``expected`` set of ~49k
+    names that every barrier poll re-LISTs — a dispatcher-side cost the
+    payload cap used to bound. Sweeping such a store, pass a cap sized to the
+    per-invoke wall (or ``None``); the knob is reachable from the runner's
+    seam too (:func:`zagg.runner._invoke_lambda_stage_sweep`).
+
     ``run_id`` names the lease, the skip-key/foreign-stamp namespace AND the
     status prefix the stage records land under, so it is generated here (or
     supplied) and threaded verbatim into every invoke. ``run_started`` is
@@ -416,6 +593,13 @@ def run_stage_sweep_fleet(
     function of the store's order (there is one barrier per tuple plus the
     finisher's). Once the total is spent each remaining barrier degrades to a
     single check — fail-open, exactly as a timeout is.
+
+    ``dirt_only`` (issue #580) is the run's ref-only work set — the touched
+    current units :func:`zagg.sweep.dirt_only_leaves` collects. Its ancestors
+    join each tuple's dispatch nodes, and each stage event carries its node
+    slice as ``dirt_only`` (absent when empty); the worker re-gathers those
+    nodes' refs without a fold (:func:`zagg.sweep_stages.sweep_stage_pass`).
+    The finisher never sees it.
 
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
@@ -433,6 +617,12 @@ def run_stage_sweep_fleet(
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
     tuple_width = int(DEFAULT_TUPLE_WIDTH if tuple_width is None else tuple_width)
+    # Normalized HERE, not on first use inside the tuple loop: a run whose
+    # tuples all filter out never reaches `pack_batches`, and would otherwise
+    # report a value it never validated (review finding). The summary below
+    # records the EFFECTIVE value, so the run's own record cannot disagree
+    # with what shipped.
+    max_nodes_per_invoke = normalize_max_nodes(max_nodes_per_invoke)
     shard_order = int(shard_order)
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
@@ -440,6 +630,10 @@ def run_stage_sweep_fleet(
     # this transport mirrors, passes decimal strings.
     scope = normalize_scope(scope)
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
+    regather, _ = _normalize_leaves(dirt_only, shard_order)
+    regather = {d: w for d, w in regather.items() if d not in by_shard}
+    dirt_keys = {tuple(r) for r in _leaf_refs(regather)}
+    work = {**regather, **by_shard}
     run_id = run_id or (
         f"stage-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
     )
@@ -451,10 +645,17 @@ def run_stage_sweep_fleet(
         "store_root": store_path,
         "shard_order": shard_order,
         "tuple_width": tuple_width,
+        "max_nodes_per_invoke": max_nodes_per_invoke,
         "scope": None if scope is None else [str(int(w)) for w in scope],
+        # Whether the per-tuple node sets were computed from the store's own
+        # coverage (issue #547) or from the work set alone. The words
+        # themselves are not recorded: a shard-order coverage MOC is thousands
+        # of them, and the run record is read by operators.
+        "coverage_computed": coverage is not None,
         "transport": "lambda",
         "records_from": records_from,
         "n_leaves": sum(len(w) for w in by_shard.values()),
+        "n_dirt_only": sum(len(w) for w in regather.values()),
         "skipped_leaves": skipped,
         # Why the run did nothing, or None. Always present: a caller reading
         # the summary should never have to know which branch produced it.
@@ -510,7 +711,14 @@ def run_stage_sweep_fleet(
 
     for stage in stage_tuples(shard_order, tuple_width=tuple_width):
         dispatch = int(stage["dispatch"])
-        nodes = dispatch_nodes(by_shard, dispatch, scope)
+        # The ruled computation when a coverage MOC was handed in, the work set
+        # alone otherwise. Both derive the nodes dispatcher-side, per tuple —
+        # neither reads the store (D8).
+        nodes = (
+            dispatch_nodes(work, dispatch, scope)
+            if coverage is None
+            else coverage_dispatch_nodes(work, dispatch, coverage, scope)
+        )
         if not nodes:
             continue
         block = {
@@ -529,16 +737,28 @@ def run_stage_sweep_fleet(
             block=block,
             store_path=store_path,
             output_creds_event=output_creds_event,
+            max_nodes=max_nodes_per_invoke,
+            dirt_only=regather,
         )
         expected = set()
         for batch, (batch_nodes, batch_leaves) in enumerate(batches):
             expected.add(stage_record_name(dispatch, batch))
+            real, dirt = (
+                (None, []) if batch_leaves is None else _split_refs(batch_leaves, dirt_keys)
+            )
+            if batch_leaves is None and any(d.startswith(tuple(batch_nodes)) for d in regather):
+                logger.warning(
+                    f"stage fleet: node(s) {batch_nodes} overflow the payload cap and fall "
+                    "back to discover — their dirt-only refs (issue #580) are in no run "
+                    "record, so they re-gather on the next manual staged sweep"
+                )
             _fire(
                 build_stage_event(
                     store_path,
                     {**block, "nodes": batch_nodes, "batch": batch},
-                    batch_leaves,
+                    real,
                     output_creds_event,
+                    dirt,
                 )
             )
         t_stage = time.perf_counter()

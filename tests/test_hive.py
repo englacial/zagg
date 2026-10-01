@@ -342,6 +342,90 @@ class TestSemanticManifest:
         with pytest.raises(ValueError, match="does not match this run"):
             hive.validate_manifest(root, other)
 
+    def _pre_epoch_store(self, cfg, root):
+        """A store built before the issue #499 epoch: its manifest carries the
+        INDEX-IN-CORE digest of a config that declares a chunk-index block.
+        Returns ``(indexed config, grid, the stored manifest)``."""
+        import copy
+
+        from zagg.semantics import semantic_hash, semantic_hash_legacy
+
+        indexed = copy.deepcopy(cfg)
+        indexed.data_source["index"] = {"backend": "sidecar", "store": "s3://public/zagg-index"}
+        grid = self._grid(indexed)
+        old = hive.build_manifest(grid)
+        old["semantic_hash"] = semantic_hash_legacy(indexed)
+        assert old["semantic_hash"] != semantic_hash(indexed)
+        hive.ensure_manifest(root, old)
+        return indexed, grid, old
+
+    def test_pre_epoch_store_refuses_append_by_name(self, cfg, tmp_path):
+        # Issue #499: the append path compares CURRENT-epoch digests only. A
+        # store whose manifest carries this config's pre-epoch digest refuses
+        # — never silently migrates — and the refusal names the one migration
+        # point, the redeclare tool.
+        import copy
+
+        root = str(tmp_path / "store")
+        indexed, grid, old = self._pre_epoch_store(cfg, root)
+        fresh = hive.build_manifest(grid)
+        with pytest.raises(ValueError, match="PRE-EPOCH digest.*redeclare_dense_ladder"):
+            hive.validate_manifest(root, fresh, config=indexed)
+        # For a caller that does not forward the config (today the Lambda ping
+        # precheck) the hint is conditional, and still names the tool.
+        with pytest.raises(ValueError, match="if this config built the store.*issue #499"):
+            hive.validate_manifest(root, fresh)
+        with pytest.raises(ValueError, match="never migrates on its own"):
+            hive.ensure_manifest(root, fresh, config=indexed)
+        assert hive.read_manifest(root) == old  # nothing moved
+        # A DIFFERENT config's pre-epoch digest earns no hint: the probe
+        # recognizes this config's own old digest only.
+        other = copy.deepcopy(indexed)
+        other.aggregation["variables"]["count"]["dtype"] = "int64"
+        with pytest.raises(ValueError) as exc:
+            hive.validate_manifest(root, hive.build_manifest(self._grid(other)), config=other)
+        assert "issue #499" not in str(exc.value)
+        # Nor does a mismatch that is not the hash alone (orders moved too).
+        moved = HealpixGrid(parent_order=5, child_order=8, layout="fullsphere", config=indexed)
+        with pytest.raises(ValueError) as exc:
+            hive.validate_manifest(root, hive.build_manifest(moved), config=indexed)
+        assert "issue #499" not in str(exc.value)
+
+    def test_hint_never_masks_the_refusal(self, cfg, tmp_path, monkeypatch):
+        # The hint is interpolated INTO the refusal message, so a raise from
+        # ``semantic_hash_legacy`` would replace the clear frozen-key refusal
+        # with an unrelated traceback. It is advisory: it fails open to the
+        # config-less wording and the refusal still fires.
+        import zagg.semantics
+
+        root = str(tmp_path / "store")
+        indexed, grid, _ = self._pre_epoch_store(cfg, root)
+
+        def boom(*a, **k):
+            raise TypeError("a fault inside a normalizer")
+
+        monkeypatch.setattr(zagg.semantics, "semantic_hash_legacy", boom)
+        with pytest.raises(ValueError, match="does not match this run"):
+            hive.validate_manifest(root, hive.build_manifest(grid), config=indexed)
+
+    def test_migration_through_declare_pyramid_unblocks_the_append(self, cfg, tmp_path):
+        # The tool's path end to end: declare_pyramid migrates the frozen key,
+        # after which the same run's manifest is accepted without a PUT.
+        from zagg.semantics import semantic_hash
+        from zagg.sweep_overview import declare_pyramid
+
+        root = str(tmp_path / "store")
+        indexed, grid, old = self._pre_epoch_store(cfg, root)
+        summary = declare_pyramid(root, indexed)
+        assert summary["semantic_hash_migration"] == {
+            "from": old["semantic_hash"],
+            "to": semantic_hash(indexed),
+        }
+        fresh = hive.build_manifest(grid)
+        accepted = hive.ensure_manifest(root, fresh, config=indexed)
+        assert accepted["semantic_hash"] == semantic_hash(indexed) == fresh["semantic_hash"]
+        assert accepted["pyramid"] == hive.read_manifest(root)["pyramid"]
+
     def test_overwrite_semantic_mismatch_refuses_over_existing_shards(self, cfg, tmp_path):
         # Issue #341 hash-guard ruling: overwrite does NOT bypass the
         # semantic-hash refusal — the hash is a frozen key, so a changed
@@ -490,6 +574,16 @@ class TestProductRoots:
                 hive.validate_product_name(bad)
         # Digit-LEADING names longer than a base component are fine.
         assert hive.validate_product_name("2019_run") == "2019_run"
+
+    def test_reserved_store_root_children(self):
+        # Store-root children the D19 grammar excludes so a multi-product
+        # walker can never classify them as products: the §4.10 multiscales
+        # companion group (#394) and the §11.1 Icechunk companion repos (#580).
+        with pytest.raises(ValueError, match="multiscales"):
+            hive.validate_product_name(hive.MULTISCALES_GROUP_NAME)
+        with pytest.raises(ValueError, match="Icechunk"):
+            hive.validate_product_name("icechunk")
+        assert hive.ICECHUNK_DIR_NAME == "icechunk"
 
     def test_product_root_join(self):
         assert hive.product_root("s3://b/root/", "atl06") == "s3://b/root/atl06"
@@ -1908,7 +2002,7 @@ class TestHiveProfileWritePhase:
         _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
         timings = meta["phase_timings"]
         # Additive: the process_shard phases keep their names and values.
-        assert set(timings) == {"read", "index", "aggregate", "write", "hash"}
+        assert set(timings) == {"read", "index", "aggregate", "write", "hash", "icechunk"}
         assert {k: timings[k] for k in self._SHARD_PHASES} == self._SHARD_PHASES
         assert timings["write"] >= 0.0
 
@@ -1947,6 +2041,7 @@ class TestHiveProfileWritePhase:
             "write",
             "hash",
             "column",
+            "icechunk",
         }
 
     def test_errored_shard_omits_write(self, monkeypatch, cfg, tmp_path):
@@ -1962,7 +2057,14 @@ class TestHiveProfileWritePhase:
         # without any profile flag — the sidecar record is complete by default.
         fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
         _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
-        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write", "hash"}
+        assert set(meta["phase_timings"]) == {
+            "read",
+            "index",
+            "aggregate",
+            "write",
+            "hash",
+            "icechunk",
+        }
         # The leaf still landed, fully stamped.
         from zagg.store import open_store
 
@@ -2132,6 +2234,10 @@ class TestRunnerWiring:
             node,
             hive.AGGREGATION_CORE_NAME,
             hive.ROOT_COVERAGE_NAME,
+            # The Icechunk companion repo dir (issue #580, spec §11.1): the
+            # local backend's in-process init lands it at the root, before
+            # any cell — the reserved fourth root-only child.
+            hive.ICECHUNK_DIR_NAME,
             hive.MANIFEST_NAME,
             parquets[0],
             records[0],
@@ -2252,8 +2358,11 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         leaf = hive.shard_leaf_path(root, shard)
+        # The runner writes VERSIONED leaves (issue #582): the objects sit
+        # under the current version; the stamp stays at the root.
+        data_path, _stamp = hive.resolve_leaf(leaf)
         for name in ("morton", "h"):
-            chunk_dir = os.path.join(leaf, grid.group_path, name, "c")
+            chunk_dir = os.path.join(data_path, grid.group_path, name, "c")
             n_objects = sum(len(files) for _d, _s, files in os.walk(chunk_dir))
             assert n_objects == 1, name
         assert hive.read_commit(open_store(leaf))["complete"] is True

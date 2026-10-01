@@ -6,6 +6,8 @@ machinery, carrier) never change it; any semantic edit does.
 """
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -705,3 +707,111 @@ class TestTimeSourceHashing:
         for name in ("atl03_tdigest_located_healpix", "gedi01b_waveform_healpix_hive"):
             clock = semantic_core(default_config(name))["output"]["time_source"]
             assert clock["field"] == "delta_time" and clock["scale"] == "gps"
+
+
+#: The two live stores' build configs, vendored from their run records
+#: (``config`` key, recovered 2026-09-13) exactly as the CA manifest fixture
+#: is: the historical record the issue #499 epoch moves, never edited.
+LIVE_CONFIGS = Path(__file__).parent / "data"
+
+#: ``{store: (pre-epoch frozen manifest hash, epoch-2 hash)}``. The first
+#: column is what ``morton_hive.json`` carries on disk today; the second is
+#: what ``declare_pyramid`` migrates it to.
+LIVE_HASHES = {
+    "atl03_tdigest_o9": (
+        "b9b15fdde78f147c15c929da8ca93de21930ad5c552ae082c5d8998fb83ada21",
+        "aacfe1e387d2289276572ac941449d4042a174ccc9976528af530d2993b2258a",
+    ),
+    "gedi_flux_o9": (
+        "4f8287947a83abd38519372c047e7f4c62c0479d64bc72f6d512eda413d88f63",
+        "337b2c3acac928c4b1b708e5895081b407d03001325ca756eb6c600c02b11e96",
+    ),
+}
+
+
+def _live_config(name) -> PipelineConfig:
+    return PipelineConfig(**json.loads((LIVE_CONFIGS / f"{name}.config.json").read_text()))
+
+
+class TestIndexExclusionEpoch:
+    """Issue #499 (espg-ruled 2026-09-13): ``data_source.index`` is read machinery.
+
+    A sidecar miss processes the file and a different sidecar location yields
+    identical bytes, so the chunk-index block leaves the core — and every
+    pre-epoch hash of a store whose config carried one stops reproducing.
+    ``semantic_hash_legacy`` is the self-migrating guard's probe.
+    """
+
+    SIDECAR = {
+        "backend": "sidecar",
+        "store": "s3://sliderule-public-cors/zagg-index/ATL03/007",
+        "on_miss": "build",
+    }
+
+    def test_index_is_packaging(self):
+        from zagg.semantics import DATA_SOURCE_PACKAGING_KEYS
+
+        assert "index" in DATA_SOURCE_PACKAGING_KEYS
+        base = semantic_hash(_cfg())
+        for block in (
+            self.SIDECAR,
+            {**self.SIDECAR, "store": "s3://public-bucket/zagg-index/ATL03/007"},
+            {**self.SIDECAR, "on_miss": "skip"},
+            {"backend": "hierarchical"},
+            {"backend": "inline"},
+        ):
+            assert semantic_hash(_cfg(data_source__index=block)) == base
+        assert "index" not in semantic_core(_cfg(data_source__index=self.SIDECAR))["data_source"]
+
+    def test_legacy_reinserts_the_index_block(self):
+        from zagg.semantics import semantic_hash_legacy
+
+        with_index = _cfg(data_source__index=self.SIDECAR)
+        # A config with no index block hashed the same under both epochs.
+        assert semantic_hash_legacy(_cfg()) == semantic_hash(_cfg())
+        # With one, the legacy digest is a different value that the block's
+        # contents move — the pre-epoch behavior the guard has to recognize.
+        legacy = semantic_hash_legacy(with_index)
+        assert legacy != semantic_hash(with_index)
+        assert legacy != semantic_hash_legacy(_cfg(data_source__index={"backend": "hierarchical"}))
+        # Canonicalized the same way: an explicit null inside the block prunes.
+        assert legacy == semantic_hash_legacy(
+            _cfg(data_source__index={**self.SIDECAR, "prefix": None})
+        )
+        assert semantic_hash_legacy(_cfg(data_source__index=None)) == semantic_hash(_cfg())
+
+    def test_the_two_atl03_templates_collapse(self):
+        # The packaged surface the epoch also moves: `index: {backend: inline}`
+        # (the absent-key default since #170) was the ONLY core-visible
+        # difference between these two templates, so post-epoch they name one
+        # D19 product identity — intended, and recorded in `hive_layout.md`.
+        from zagg.semantics import semantic_hash_legacy
+
+        flat, hive = (
+            default_config("atl03_tdigest_healpix"),
+            default_config("atl03_tdigest_healpix_hive"),
+        )
+        assert semantic_hash(flat) == semantic_hash(hive)
+        assert semantic_hash_legacy(flat) != semantic_hash_legacy(hive)
+
+    def test_unknown_epoch_refuses(self):
+        from zagg.semantics import LEGACY_EPOCHS, semantic_hash_legacy
+
+        assert LEGACY_EPOCHS == (1,)
+        with pytest.raises(ValueError, match="unknown semantic-hash epoch"):
+            semantic_hash_legacy(_cfg(), epoch=0)
+
+    @pytest.mark.parametrize("name", sorted(LIVE_HASHES))
+    def test_the_live_stores_migrate(self, name):
+        # The known-answer pair for each deployed store: the legacy digest
+        # reproduces the frozen manifest hash the store carries today, and the
+        # current digest is the value the migration rewrites it to. Both
+        # literals are pinned so a canonicalization drift on either side fails
+        # here by name rather than at the operator's --execute.
+        from zagg.semantics import semantic_hash_legacy
+
+        cfg = _live_config(name)
+        assert cfg.data_source["index"]  # the records really carry the block
+        stored, migrated = LIVE_HASHES[name]
+        assert semantic_hash_legacy(cfg) == stored
+        assert semantic_hash(cfg) == migrated

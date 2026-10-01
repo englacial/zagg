@@ -1,0 +1,202 @@
+{
+ "data_source": {
+  "reader": "h5coro",
+  "driver": "s3",
+  "groups": [
+   "gt1l",
+   "gt1r",
+   "gt2l",
+   "gt2r",
+   "gt3l",
+   "gt3r"
+  ],
+  "coordinates": {
+   "latitude": "/{group}/heights/lat_ph",
+   "longitude": "/{group}/heights/lon_ph"
+  },
+  "variables": {
+   "h_ph": "/{group}/heights/h_ph",
+   "signal_conf_land": {
+    "path": "/{group}/heights/signal_conf_ph",
+    "column": 0
+   },
+   "signal_conf_ocean": {
+    "path": "/{group}/heights/signal_conf_ph",
+    "column": 1
+   },
+   "signal_conf_sea_ice": {
+    "path": "/{group}/heights/signal_conf_ph",
+    "column": 2
+   },
+   "signal_conf_land_ice": {
+    "path": "/{group}/heights/signal_conf_ph",
+    "column": 3
+   },
+   "signal_conf_inland_water": {
+    "path": "/{group}/heights/signal_conf_ph",
+    "column": 4
+   },
+   "delta_time": "/{group}/heights/delta_time"
+  },
+  "filters": [
+   {
+    "dataset": "/{group}/heights/signal_conf_ph",
+    "column": 0,
+    "op": "ne",
+    "value": -2
+   }
+  ],
+  "base_level": "photons",
+  "levels": {
+   "photons": {
+    "path": "/{group}/heights",
+    "coordinates": {
+     "latitude": "lat_ph",
+     "longitude": "lon_ph"
+    },
+    "link": null
+   },
+   "segments": {
+    "path": "/{group}/geolocation",
+    "coordinates": {
+     "latitude": "reference_photon_lat",
+     "longitude": "reference_photon_lon"
+    },
+    "link": {
+     "to": "photons",
+     "index_beg": "/{group}/geolocation/ph_index_beg",
+     "count": "/{group}/geolocation/segment_ph_cnt",
+     "index_base": 1
+    }
+   }
+  },
+  "read_plan": {
+   "spatial_index": "segments",
+   "pad": 1
+  },
+  "index": {
+   "backend": "sidecar",
+   "on_miss": "build",
+   "store": "s3://sliderule-public-cors/zagg-index/ATL03/007"
+  }
+ },
+ "aggregation": {
+  "coordinates": {
+   "morton": {
+    "dtype": "uint64",
+    "fill_value": 0
+   }
+  },
+  "variables": {
+   "count": {
+    "function": "len",
+    "source": "h_ph",
+    "dtype": "int32",
+    "fill_value": 0
+   },
+   "h_tdigest_signal": {
+    "kind": "ragged",
+    "function": "zagg.stats.tdigest.build_tdigest_where",
+    "source": "h_ph",
+    "location": "leaf_id",
+    "inner_shape": [
+     2
+    ],
+    "params": {
+     "delta": 4096,
+     "where": "(signal_conf_land >= 2) | (signal_conf_ocean >= 2) | (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) | (signal_conf_inland_water >= 2)"
+    },
+    "overview_delta": 512,
+    "dtype": "float32",
+    "fill_value": 0,
+    "attrs": {
+     "stratum": "signal",
+     "signal_threshold": 2
+    },
+    "temporal": "per-centroid"
+   },
+   "h_tdigest_noise": {
+    "kind": "ragged",
+    "function": "zagg.stats.tdigest.build_tdigest_where",
+    "source": "h_ph",
+    "location": "leaf_id",
+    "inner_shape": [
+     2
+    ],
+    "params": {
+     "delta": 4096,
+     "where": "~((signal_conf_land >= 2) | (signal_conf_ocean >= 2) | (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) | (signal_conf_inland_water >= 2))"
+    },
+    "overview_delta": 512,
+    "dtype": "float32",
+    "fill_value": 0,
+    "attrs": {
+     "stratum": "noise",
+     "signal_threshold": 2
+    },
+    "temporal": "per-centroid"
+   },
+   "composition": {
+    "function": "zagg.stats.composition.pack_composition",
+    "source": "h_ph",
+    "dtype": "uint64",
+    "fill_value": 0,
+    "params": {
+     "conf_land": "signal_conf_land",
+     "conf_ocean": "signal_conf_ocean",
+     "conf_sea_ice": "signal_conf_sea_ice",
+     "conf_land_ice": "signal_conf_land_ice",
+     "conf_inland_water": "signal_conf_inland_water",
+     "threshold": 2
+    },
+    "attrs": {
+     "composition": {
+      "spec": "zagg-composition/1",
+      "lanes": [
+       "land",
+       "ocean",
+       "sea_ice",
+       "land_ice",
+       "inland_water",
+       "low",
+       "med",
+       "high"
+      ],
+      "of": "h_tdigest_signal",
+      "threshold": 2
+     }
+    }
+   }
+  },
+  "streaming": {
+   "mode": "spill"
+  }
+ },
+ "output": {
+  "grid": {
+   "type": "healpix",
+   "indexing_scheme": "nested",
+   "parent_order": 9,
+   "chunk_inner": 13,
+   "sharded": true,
+   "child_order": 19
+  },
+  "store_layout": "hive",
+  "pyramid": {},
+  "time_source": {
+   "field": "delta_time",
+   "epoch": "2018-01-01T00:00:00",
+   "scale": "gps",
+   "units": "seconds"
+  }
+ },
+ "catalog": null,
+ "bounds": null,
+ "pipeline": {
+  "type": "spatial"
+ },
+ "worker": {
+  "memory": 4096,
+  "extra_disk": true
+ }
+}

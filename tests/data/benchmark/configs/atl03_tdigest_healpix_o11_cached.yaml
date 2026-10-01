@@ -2,7 +2,7 @@
 #
 # Identical grid/aggregation/shardmap to the uncached baseline; the ONLY
 # difference is the read backend: `sidecar` consumes the granule-keyed chunk
-# manifests under zagg-index/ATL03/007 (shared with the sponsor example and
+# manifests under demo/sidecar/ATL03/007 (shared with the sponsor example and
 # populated on first run via `on_miss: build`, which delegates to
 # inline+write_back). Column semantics: baseline = pure-h5coro uncached read,
 # this = compiled (hidefix) read against the manifest cache.
@@ -12,7 +12,7 @@ data_source:
   index:
     backend: sidecar
     on_miss: build
-    store: s3://sliderule-public-cors/zagg-index/ATL03/007
+    store: s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007
   reader: h5coro
   driver: s3
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]

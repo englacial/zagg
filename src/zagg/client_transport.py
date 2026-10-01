@@ -397,6 +397,7 @@ def dispatch_event_shards(
         max_in_flight=workers,
         on_failed=on_failed,
     )
+    skip_hash = runner._fleet_skip_hash(run.config, run.overwrite)
     futures: dict[int, Future] = {}
     for key, records in cells:
         key = int(key)
@@ -419,6 +420,7 @@ def dispatch_event_shards(
             aoi_payload=aoi_by_shard.get(key),
             invoked_by=invoked_by,
             run_id=run_id,
+            semantic_hash=skip_hash,
         )
         submap = {
             "grid_signature": run.catalog_data["grid_signature"],
@@ -515,6 +517,7 @@ def attach_run(
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url or get_output_endpoint_url(config),
     )
+    run._attached = True  # the tail finalizes the repo off the knob (issue #582)
     client = lambda_client
     if client is None:
         import boto3

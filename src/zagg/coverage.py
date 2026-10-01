@@ -31,6 +31,7 @@ from zagg.hive import (
     _decimal_rank,
     _is_base_component,
     build_root_coverage,
+    leaf_data_path,
     read_commit,
     read_coverage_bitmap,
     read_manifest,
@@ -386,8 +387,13 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 decimals.append(decimal)
                 if toc_fields and decimal not in toc_failed:
                     try:
+                        # A versioned leaf's arrays sit under the version
+                        # its stamp names (spec §1.5).
                         got = read_leaf_temporal(
-                            f"{root}/{rel}", cell_order, toc_fields, **store_kwargs
+                            leaf_data_path(f"{root}/{rel}", stamp),
+                            cell_order,
+                            toc_fields,
+                            **store_kwargs,
                         )
                     except Exception as e:  # fail-open: the section is a cache
                         # Shard-scoped, not leaf-scoped: §10.2's word must

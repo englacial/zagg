@@ -5,7 +5,140 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Release sections are generated at tag time from merged pull-request titles
+(`.github/workflows/publish.yml` → `.github/scripts/changelog_section.py`); do not
+edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-labelled PR.
+
 ## [Unreleased]
+
+## [0.55.0] - 2026-09-17
+
+### Merged pull requests
+
+- Publish Lambda zips to Source Cooperative (issue #497 phases 1-2) ([#504](https://github.com/englacial/zagg/pull/504)) by @espg
+- small fix: keep every package's dist-info in the function zip (0.54.0 fleet import failure) ([#572](https://github.com/englacial/zagg/pull/572)) by @espg
+- small fix: point the sidecar index at source.coop; declare GEDI's overview budget (issues #499, #547) ([#571](https://github.com/englacial/zagg/pull/571)) by @espg
+- changelog cicd: release-time CHANGELOG generation, PR guard, and Source Cooperative publication ([#570](https://github.com/englacial/zagg/pull/570)) by @espg
+
+## [0.54.0] - 2026-09-17
+
+### Notes
+
+- **A gapped column tier above the shard order is refused at declaration**
+  (refs #538, PR #567; espg ruling 2026-09-17). `output.pyramid.overviews`
+  must now be consecutive: every `/2` ladder level whose cells are at or
+  above the shard order IS the leaf column tier (spec §4.6), so it must be
+  contiguous from the finest leaf resolution down to the shard order —
+  `[13, 12, 11, 10, 9]` on an o9/o19 store, never `[13, 12, 10, 9]` or
+  `[12, 10]`. `validate_overviews` refuses by name, listing the tier and the
+  gap (`column tier must be contiguous: cells at or above shard order 9 are
+  [13, 12, 10, 9], missing [11]`), through `validate_config`,
+  `build_pyramid_block` (both arms — the contiguity leg needs no child
+  order, so the grid-less retrofit config is checked too),
+  `declare_pyramid` and the `/2` pyramid check's declaration leg;
+  `zagg.pyramid.column_tier_gaps` is the one definition, reporting the tier
+  and the gap finest-first. Where the coarsest leaf resolution clears twice
+  the shard order the ladder's own floor gaps the tier instead (node 0
+  carries cells `base - shard_order`), and the refusal names that
+  constraint. Levels below the shard order are the ladder's own, derived by
+  the §4.4 every-order law, so no gap can arise there. Writer-side only:
+  the `/2` marker does not bump and a reader still decodes a stored gapped
+  declaration by its recorded `overviews` list. The default
+  dense declaration and both live stores (`--overviews 13` on 9/19,
+  `--overviews 12` on 9/18) are one-member lists and pass unchanged.
+  Contiguity guarantees the raw-fold boundary member (`shard_order + 2`,
+  `zagg.column.RAW_MEMBER_DEPTH`) exists whenever anything coarser is
+  declared, so `relay_resolution`'s node-member fallback is reachable for a
+  validated store only at a finest resolution of `shard_order + 1`; a
+  hand-built manifest can still gap and keeps the backstop. Spec §4.4/§4.5/§4.6
+  updated; no fixture declared a gapped tier.
+- **the packaged templates are the live stores' build configs** (#547)
+  ([#565](https://github.com/englacial/zagg/pull/565)): a default build from
+  `atl03_tdigest_strata_healpix` or `gedi01b_waveform_healpix_hive` now
+  APPENDS to `atl03_tdigest_o9.zarr` / `gedi_flux_o9.zarr` instead of being
+  refused on the frozen `semantic_hash` — the two templates carry, key for key,
+  what those stores' run records hold, pinned in
+  `tests/test_live_store_templates.py` against the store manifests. Ordering
+  with the index epoch below: the templates reproduce those manifests at their
+  *pre-epoch* digest, so each store takes the append once `declare_pyramid`
+  has migrated its frozen key — the pins carry both columns.
+  - **δ = 4,096 is uniform across every packaged digest template**, retiring
+    the 8,192 raise (espg ruling 2026-09-13): the CA tail scan puts 1e-5 of
+    cells above 4,096, all atmospheric storm artifacts, and the GEDI read
+    (`gedi_flux_o9`, 8 leaves incl. the 3 densest, 243,202 occupied cells) tops
+    out at 1,146 centroids. `zagg.stats.waveform._DEFAULT_DELTA` follows.
+  - **`gedi01b_waveform_healpix_hive`'s identity moves**: the template now
+    declares `weights: flux` plus the `gain` provenance
+    ([#521](https://github.com/englacial/zagg/pull/521)), so its semantic hash
+    changes. Stores built from the PRIOR packaged form keep their own frozen
+    hash — appends to them need that form, not this one.
+  - **`atl03_tdigest_strata_healpix`** additionally carries the section-8.3
+    temporal companion (`temporal: per-centroid` on both strata) with its
+    `delta_time` column and `output.time_source`, the write-through sidecar
+    `data_source.index` block, and `parent_order: 9`. The index bucket is
+    account-private (#499): build your own store by deleting or overriding
+    `data_source.index` — which, since the epoch below took that block out of
+    the core, leaves the hash untouched.
+
+- **BREAKING — hash epoch: `data_source.index` leaves the semantic core**
+  (#499 phase 2, refs #547, [#565](https://github.com/englacial/zagg/pull/565);
+  espg-ruled 2026-09-13). The chunk-index block (`backend`
+  inline/hierarchical/sidecar, the sidecar `store` location, `on_miss`) is
+  read machinery: a sidecar miss processes the file and a different sidecar
+  location yields identical bytes, so it joins `DATA_SOURCE_PACKAGING_KEYS`
+  beside `reader`/`read_plan`. **Every pre-epoch `semantic_hash` of a store
+  whose config carried an `index` block stops reproducing** — both live
+  stores do (`atl03_tdigest_o9` `b9b15fdd…` → `aacfe1e3…`, `gedi_flux_o9`
+  `4f828794…` → `337b2c3a…`; pairs pinned in `tests/test_semantics.py`).
+  - **Migration is the redeclare tool, and only it.**
+    `zagg.semantics.semantic_hash_legacy` recomputes a config's pre-epoch
+    digest; `declare_pyramid` (behind `tools/redeclare_dense_ladder.py` and
+    `--declare-pyramid`) accepts a store whose frozen hash is the supplied
+    config's pre-epoch digest and rewrites `semantic_hash` to the current
+    value in the same manifest write — the one place a frozen key moves. The
+    tool's dry run prints `semantic guard: legacy MATCH (b9b15f…) → will
+    rewrite to aacfe1…` before `--execute`; an identical declaration is no
+    longer a no-op while a migration is pending. The same write re-renders the
+    store's D19 core sidecar (`aggregation.yaml`), which nothing else
+    regenerates, so it does not keep asserting the pre-epoch core.
+  - **The append path does not migrate.** `hive._frozen_matches` compares
+    current-epoch digests only; a not-yet-migrated store refuses an
+    aggregation run up front with a message naming the tool.
+  - **Skip-gate consequence (deliberate):** `dedup` compares stamped hash
+    strings, so pre-epoch stamps on the two live stores read as stale — a
+    same-shard re-dispatch **rewrites** instead of skipping. New-AOI appends
+    and the column backfill are unaffected. Migration note:
+    `docs/hive_layout.md`, "Migration: the index-exclusion epoch".
+
+- **The leaf column's coarse members fold flat from the res-(s+2) member**
+  (#538): the leaf-time column fold merged every resident photon of the shard
+  in one k-way call at the node-order member, at ~95–100 B of peak memory per
+  centroid row — 2.2 GB at the CA ATL03 store's p90 and 6.8 GB at its largest
+  shard, the 0.52 fleet's 47/251 OOMs at 4 GB. Members at `cells >=
+  shard_order + 2` (13/12/11 on an o9/o19 store) keep the from-raw fold; the
+  two coarser members now fold in one flat k-way call per output cell over the
+  res-(s+2) member's already-quantized cells (never chained) and record
+  `merges_from_raw: 2`, so the largest single merge is one boundary cell — a
+  sixteenth of the shard only under uniform occupancy; measured across the 39
+  fattest CA ATL03 shards the largest res-(s+2) cell holds 6.04 M rows, 9.8% of
+  its 61.7 M-row shard (p50 9.6%, max 14.0%), i.e. ~0.6 GB at ~100 B/row
+  against the 4 GB tier. The boundary is the constant
+  `zagg.column.RAW_MEMBER_DEPTH = 2`, not a knob. The `/2` ladder's stage-merge
+  relay member moves from the node-order partial to the res-(s+2) partial
+  (`zagg.column.relay_resolution`), so every stage-merge level stays exactly 2
+  merges from raw; stage columns relay that member. That trades the leaf-side
+  win for a ~16× ladder tier: a relay member carries 16 δ-bounded digests where
+  the node member carried 1, so a stage merge k-ways 64 sources per output cell
+  where it k-wayed 4, and one T1 stage node over 64 leaves relays ~16 × 64 × 512
+  centroids (~524k rows, tens of MB) — δ-bounded and tiny next to the leaf tier,
+  with no invoke-payload impact (payloads carry node decimals and leaf refs,
+  never partials). Exact-class values are unchanged; digest and composition
+  bytes at cells `s`/`s+1` and at every stage-merge level change, the `/2`
+  byte-identity oracle (CLI fold ≡ fleet fold) holds on the boundary-relay
+  geometry as well as the node-relay one, and the manifest leaf-entry `actuals`
+  record the worst of the entry's declared cells. Spec §4.4/§4.5/§4.6 and the
+  `pyramid/` fixture's actuals updated. The worker also releases the aggregate
+  it no longer needs before the fold.
 
 - **mortie 1.0 is now the floor** (#559): mortie 1.0.0 retired its plural batch
   names with no aliases (espg/mortie#187), so a fresh install against unpinned
@@ -133,6 +266,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - docs: mark SSO execution-role path out of date ([#35](https://github.com/englacial/zagg/pull/35)) by @espg
 - sort/hash grouping refactor (#30) ([#33](https://github.com/englacial/zagg/pull/33)) by @espg
 - Rectilinear grid: chunk-driven auto-padding + run enablement ([#32](https://github.com/englacial/zagg/pull/32)) by @espg
+
+### Merged pull requests
+
+- choropleth: rollup->GeoJSON exporter for gridlook vectorChoropleth (issue #301) ([#554](https://github.com/englacial/zagg/pull/554)) by @espg
+- record composition demotion in the store: zagg_overview demotions attrs when the packed rail fires (issue #518) ([#557](https://github.com/englacial/zagg/pull/557)) by @espg
+- multiscales convention metadata: the manifest discovery mirror of the /2 ladder (issue #392) ([#555](https://github.com/englacial/zagg/pull/555)) by @espg
+- multiscales companion group: stock-tool-legible zarr tree of the coarse ladder (issue #394) ([#558](https://github.com/englacial/zagg/pull/558)) by @espg
+- pyramid sweep runbook prep: dense-ladder re-declaration tool + partitioning proposal ([#551](https://github.com/englacial/zagg/pull/551)) by @espg
+- 0.44.0 overview pipeline E2E validation harness (issue #434) ([#556](https://github.com/englacial/zagg/pull/556)) by @espg
+- Fold the coarse column members flat from the res-(s+2) member (issue #538) ([#567](https://github.com/englacial/zagg/pull/567)) by @espg
+- index leaves the semantic core: the issue #499 hash epoch ([#566](https://github.com/englacial/zagg/pull/566)) by @espg
+- small fixes 2026-09-13: packaged templates match the live stores (δ 4096 uniform, issue #547) ([#565](https://github.com/englacial/zagg/pull/565)) by @espg
+- small fix: refuse a gapped column tier above the shard order (issue #538) ([#569](https://github.com/englacial/zagg/pull/569)) by @espg
 
 ## [0.46.0] - 2026-08-17
 

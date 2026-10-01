@@ -69,6 +69,15 @@ HIVE_SPEC = "morton-hive/1"
 #: manifest carries a temporal block; a ``/1`` store *is* a ``/2`` store with
 #: ``schedule: none``, so ``/1`` stays the spec written for unwindowed stores.
 HIVE_SPEC_V2 = "morton-hive/2"
+#: Versioned leaves (issue #582, spec §1.5): the stable leaf root is a
+#: POINTER STAMP naming ``current``, and the arrays live in a version
+#: subgroup ``run-{run_id}-{attempt}`` that is never rewritten once stamped.
+#: Marked by the ``current`` key alone — the stamp's ``spec`` stays ``/1`` or
+#: ``/2`` as windowing assigns it (``/3`` is the D23 window-only dialect,
+#: :data:`zagg.telemetry.SPEC_V3`); a stamp without ``current`` is a legacy
+#: leaf. Version names begin with this prefix, so a leaf-root member is never
+#: mistaken for a cell-order digit group (§4.2).
+VERSION_PREFIX = "run-"
 #: Root manifest object name (the root-only exception to the node invariant).
 MANIFEST_NAME = "morton_hive.json"
 #: Root-group attrs key carrying the commit stamp (D4).
@@ -122,6 +131,13 @@ PRODUCT_NAME_MAX = 192
 #: cycle for a string literal.
 MULTISCALES_GROUP_NAME = "multiscales"
 
+#: The store-root child reserved for the §11 Icechunk companion repos
+#: (issue #580): one repository per pyramid order at
+#: ``{store_root}/icechunk/`` (one repo, a group per order). Reserved on the same footing as
+#: :data:`MULTISCALES_GROUP_NAME` — the D19 product-name grammar excludes it
+#: so a multi-product root walker can never classify it as a product.
+ICECHUNK_DIR_NAME = "icechunk"
+
 
 def validate_product_name(name: str) -> str:
     """Validate a D19 product name; returns it.
@@ -161,6 +177,16 @@ def validate_product_name(name: str) -> str:
         raise ValueError(
             f"product name {MULTISCALES_GROUP_NAME!r} is reserved for the multiscales "
             f"companion group at the store root (spec §4.10, issue #394)"
+        )
+    if name == ICECHUNK_DIR_NAME:
+        # The issue #580 companion repos own this store-root child (spec
+        # §11.1): a product by the same name would collide with them at every
+        # multi-product root. No legacy warning pairs with this one — the
+        # reservation lands with the section, so no store predating it can
+        # hold a product by this name.
+        raise ValueError(
+            f"product name {ICECHUNK_DIR_NAME!r} is reserved for the Icechunk "
+            f"companion repos at the store root (spec §11.1, issue #580)"
         )
     return name
 
@@ -412,8 +438,58 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     return manifest
 
 
+def _pre_epoch_hint(existing: dict, manifest: dict, config) -> str:
+    """Name the issue #499 migration when a frozen-key mismatch is the hash alone.
+
+    The append path compares CURRENT-epoch digests only — accepting a legacy
+    hash here would make every append a silent migration point, and the hash
+    would then never move in the manifest. So a pre-epoch store refuses, but
+    by name: with ``config`` in hand the legacy digest is recomputed and the
+    verdict is definite; for a caller that does not forward the config (today
+    the Lambda ping precheck, which holds one but does not pass it) the hint
+    is conditional — it fires on ANY hash-only frozen-key mismatch, including
+    the ordinary D19 case of a genuinely different aggregation config. Empty
+    when some other frozen key differs.
+    """
+    fa, fb = _frozen(existing), _frozen(manifest)
+    if fa["semantic_hash"] is None or fb["semantic_hash"] is None:
+        return ""
+    fa.pop("semantic_hash")
+    fb.pop("semantic_hash")
+    if fa != fb:
+        return ""
+    tool = "tools/redeclare_dense_ladder.py (dry-run prints the migration; --execute writes it)"
+    if config is not None:
+        from zagg.semantics import semantic_hash_legacy
+
+        try:
+            legacy = semantic_hash_legacy(config)
+        except Exception:
+            # This runs WHILE the refusal message is being built, and
+            # ``semantic_core`` is total only for the fault classes it
+            # enumerates (a fault inside a normalizer propagates by design).
+            # An error-message helper must never mask the error it decorates,
+            # so fall through to the conditional wording.
+            legacy = None
+        if legacy is not None and legacy != existing["semantic_hash"]:
+            return ""
+        if legacy is not None:
+            return (
+                f"; the only frozen key that differs is semantic_hash, and the store's is "
+                f"this config's PRE-EPOCH digest (issue #499: data_source.index left the "
+                f"semantic core) — migrate the manifest with {tool}, then rerun; the append "
+                f"path never migrates on its own"
+            )
+    return (
+        f"; the only frozen key that differs is semantic_hash — if this config built the "
+        f"store before the issue #499 epoch (data_source.index left the semantic core), "
+        f"migrate the manifest with {tool}, then rerun; the append path never migrates on "
+        f"its own"
+    )
+
+
 def validate_manifest(
-    store_root: str, manifest: dict, *, overwrite: bool = False, **store_kwargs
+    store_root: str, manifest: dict, *, overwrite: bool = False, config=None, **store_kwargs
 ) -> dict | None:
     """Read-only frozen-key precheck — the fail-fast half of the manifest guard.
 
@@ -447,6 +523,7 @@ def validate_manifest(
                 f"(existing {existing!r} vs {manifest!r}); this store was templated "
                 f"for different orders/identity — clear the store root (or pick a "
                 f"new one) before writing with this configuration"
+                f"{_pre_epoch_hint(existing, manifest, config)}"
             )
         return existing
     if overwrite and existing is not None and not frozen_matches:
@@ -553,7 +630,9 @@ def ensure_manifest(
     """
 
     store = open_object_store(store_root, **store_kwargs)
-    existing = validate_manifest(store_root, manifest, overwrite=overwrite, **store_kwargs)
+    existing = validate_manifest(
+        store_root, manifest, overwrite=overwrite, config=config, **store_kwargs
+    )
     if existing is not None and not overwrite:
         return existing
     put_object(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
@@ -624,7 +703,10 @@ def _frozen_matches(existing: dict | None, manifest: dict) -> bool:
     pre-#299 manifest lacks the key, and refusing every append to an
     existing store on its absence would brick resumes — the orders/schedule
     keys still guard those stores. Two hash-carrying manifests must match
-    exactly (D19: the hash is a frozen key).
+    exactly (D19: the hash is a frozen key) — at the CURRENT epoch: a
+    pre-epoch digest (issue #499) is never matched here, so a not-yet-migrated
+    store refuses until :func:`zagg.sweep_overview.declare_pyramid` has
+    rewritten its manifest (see :func:`_pre_epoch_hint`).
     """
     if existing is None:
         return False
@@ -854,14 +936,20 @@ def read_coverage_bitmap(
     from zagg.grids.morton import morton_word
     from zagg.store import open_store
 
+    stamp = read_commit(open_store(leaf_root, **store_kwargs)) if coverage is None else None
     if coverage is None:
-        coverage = read_coverage(open_store(leaf_root, **store_kwargs))
+        coverage = (stamp or {}).get("coverage")
     if not coverage or coverage.get("encoding") != "bitmap" or not coverage.get("sidecar"):
         return None
     # Windowed leaves (issue #246) carry `{full_id}_{window}.zarr` basenames;
     # the shard id is the part before the first `_` (the frozen parse rule).
     shard = morton_word(split_leaf_name(leaf_root.rstrip("/").rsplit("/", 1)[-1])[0])
-    store = open_object_store(leaf_root, **store_kwargs)
+    # The sidecar lives beside the arrays, so a versioned leaf's (spec §1.5,
+    # issue #582) is in the current version: resolve through the root stamp
+    # — read here only when the caller passed the envelope without it.
+    if stamp is None:
+        stamp = read_commit(open_store(leaf_root, **store_kwargs))
+    store = open_object_store(leaf_data_path(leaf_root, stamp), **store_kwargs)
     try:
         data = obstore.get(store, str(coverage["sidecar"])).bytes()
     except (FileNotFoundError, NotFoundError):
@@ -878,8 +966,9 @@ def stamp_commit(
     window: str | None = None,
     time_range: tuple | list | None = None,
     run_id: str | None = None,
-) -> None:
-    """Stamp a shard leaf complete — the shard's FINAL write (D4).
+    content_hashes: dict | None = None,
+) -> dict:
+    """Stamp a shard leaf complete — the shard's FINAL write (D4); the stamp written.
 
     One small PUT rewriting the leaf's root ``zarr.json`` (which the template
     already created), not consolidation. Until this lands, the leaf prefix is
@@ -900,6 +989,19 @@ def stamp_commit(
     requires — a skip-if-current read that sees a foreign FRESH stamp aborts
     loudly. Fleet-written leaves and columns never carry it; readers treat
     absence as "not a stage artifact", never as an error.
+
+    ``content_hashes`` (issue #580, additive): the spec §5.3 O11 record —
+    ``{"arrays": {path: sha256}, "combined": sha256}`` — computed by the
+    writer from the arrays it just wrote, BEFORE the stamp lands, so the stamp
+    itself certifies the bytes it seals (the D20 sidecar carries the same
+    record as telemetry). ``None`` (a writer that could not stand behind a
+    digest — the §5.2 raise gate) writes no key: absence reads as
+    unverifiable, never tampered.
+
+    On a versioned leaf (issue #582, spec §1.5) ``leaf_store`` is the VERSION
+    subgroup; the returned dict is what the caller mirrors onto the stable
+    root with :func:`write_pointer_stamp` once the version's refs are
+    recorded. The stamp itself is identical in form to a legacy leaf's.
     """
     if window is None and time_range is not None:
         raise ValueError(
@@ -943,7 +1045,62 @@ def stamp_commit(
         stamp["coverage"] = coverage
     if run_id is not None:
         stamp["run_id"] = str(run_id)
+    if content_hashes is not None:
+        stamp["content_hashes"] = content_hashes
     group.attrs[COMMIT_ATTR] = stamp
+    return stamp
+
+
+def leaf_version_name(run_id, attempt: str | None = None) -> str:
+    """A version subgroup name under the stable leaf root: ``run-{run_id}-{attempt}`` (§1.5).
+
+    ``attempt`` is a per-invocation nonce (a fresh one is drawn when omitted)
+    so two writers of one unit in one run — a duplicate-invoke retry, a
+    redundant fleet worker — never share a prefix; the run tag ``run-{run_id}``
+    still groups a run's versions by prefix.
+    """
+    import uuid
+
+    return f"{VERSION_PREFIX}{run_id}-{attempt or uuid.uuid4().hex[:8]}"
+
+
+def leaf_data_path(leaf_path: str, stamp: dict | None) -> str:
+    """Where a leaf's arrays live given its ROOT stamp (§1.5): the version, or the root itself.
+
+    A stamp naming ``current`` is a versioned leaf's pointer; absent (or a
+    legacy stamp) the root prefix IS the leaf. The one reader rule.
+    """
+    current = (stamp or {}).get("current")
+    if not current:
+        return leaf_path
+    if not str(current).startswith(VERSION_PREFIX) or "/" in str(current):
+        raise ValueError(f"leaf {leaf_path} names an invalid version {current!r} (spec §4.2)")
+    return f"{leaf_path.rstrip('/')}/{current}"
+
+
+def resolve_leaf(leaf_path: str, **store_kwargs) -> tuple[str, dict | None]:
+    """``(data_path, stamp)`` for a leaf root: one GET, the pointer stamp read anyway.
+
+    ``stamp`` is ``None`` for absent/unstamped debris (then ``data_path`` is
+    the root, which holds nothing a reader may trust).
+    """
+    from zagg.store import open_store
+
+    stamp = read_commit(open_store(leaf_path, read_only=True, **store_kwargs))
+    return leaf_data_path(leaf_path, stamp), stamp
+
+
+def write_pointer_stamp(leaf_store, stamp: dict, current: str) -> dict:
+    """The stable root's pointer stamp: the version's stamp plus ``current`` (§1.5 step 4).
+
+    One PUT of the root ``zarr.json`` — the swap that makes a new version
+    live. Creates the root group when this is the leaf's first versioned
+    write (a legacy leaf's root group already exists and keeps its members).
+    """
+    group = zarr.open_group(leaf_store, path="", mode="a", zarr_format=3)
+    pointer = {**stamp, "current": current}
+    group.attrs[COMMIT_ATTR] = pointer
+    return pointer
 
 
 def read_commit(leaf_store) -> dict | None:
@@ -1206,8 +1363,8 @@ def leaf_block_index(grid, block_index, shard_key) -> tuple:
     return tuple(int(s.start) // int(c) for s, c in zip(region, grid.chunk_shape))
 
 
-def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> bool:
-    """Is a STAMPED leaf present at ``leaf_path``? (issue #388 skip precondition)
+def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> dict | None:
+    """The root stamp of a COMMITTED leaf at ``leaf_path``, else ``None`` (issue #388).
 
     The D20 stats sidecar is a SIBLING of the leaf ``.zarr``
     (:func:`zagg.telemetry.sidecar_path`), so the two diverge, and the
@@ -1223,17 +1380,27 @@ def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> bool:
     miss``); the gate follows it. ``leaf_path`` is the per-``(shard, window)``
     leaf on both seams, so the windowed stamp is the one checked. Fail-open
     toward RECOMPUTE: an unreadable store reads as uncommitted.
+
+    A root stamp naming ``current`` (a versioned leaf, issue #582) is
+    committed only when the named version is stamped too: a pointer to a
+    missing or unstamped version is debris (spec §1.5), so the gate rewrites
+    it instead of certifying it forever — one more GET, versioned leaves only.
     """
     from zagg.store import open_store
 
     try:
-        return read_commit(open_store(leaf_path, **store_kwargs)) is not None
+        stamp = read_commit(open_store(leaf_path, **store_kwargs))
+        if stamp is not None and stamp.get("current"):
+            version = leaf_data_path(leaf_path, stamp)
+            if read_commit(open_store(version, **store_kwargs)) is None:
+                return None
+        return stamp
     except Exception as e:
         logger.warning(
             f"skip-if-current: leaf stamp unreadable for shard {shard_key} "
             f"(rewriting, issue #388): {e}"
         )
-        return False
+        return None
 
 
 def leaf_column_expectation(store_root, shard_key, grid, config, window):
@@ -1300,7 +1467,8 @@ def leaf_identity_gate(
       metadata as ``metadata["identity"]`` so run stats can count
       ``unrecorded-ids`` rewrites apart from ordinary ones.
     - ``meta`` — an early-return unit metadata dict when the unit must NOT
-      fold: ``{"current": True}`` on an identity match, ``{"refused": True,
+      fold: ``{"current": True}`` on an identity match (plus ``leaf_version``,
+      the live version, on a versioned leaf — spec §1.5), ``{"refused": True,
       "missing_granules": [...]}`` on a contraction without
       ``allow_contraction``. ``None`` means proceed with the wholesale D4
       rewrite exactly as today — including a contraction explicitly allowed
@@ -1364,12 +1532,14 @@ def leaf_identity_gate(
             leaf_path, recorded, spec=sidecar_spec, store_kwargs=store_kwargs
         ),
     )
+    leaf_stamp = None
     if identity["action"] == "skip":
         drift = None
-        if not _leaf_is_committed(leaf_path, store_kwargs, shard_key):
+        leaf_stamp = _leaf_is_committed(leaf_path, store_kwargs, shard_key)
+        if leaf_stamp is None:
             drift = "unstamped-leaf"
-        elif column_path is not None and column_declared is not _leaf_is_committed(
-            column_path, store_kwargs, shard_key
+        elif column_path is not None and column_declared is not (
+            _leaf_is_committed(column_path, store_kwargs, shard_key) is not None
         ):
             drift = "column-drift"
         if drift is not None:
@@ -1394,7 +1564,12 @@ def leaf_identity_gate(
     }
     if identity["action"] == "skip":
         logger.info(f"shard {shard_key}: current (identity match, issue #388) — fold skipped")
-        return identity, {**base, "current": True}
+        meta = {**base, "current": True}
+        if leaf_stamp.get("current"):
+            # The versioned leaf's live version (spec §1.5), from the stamp the
+            # gate already read: the caller's touch/refs use it, never a re-read.
+            meta["leaf_version"] = leaf_stamp["current"]
+        return identity, meta
     if identity["action"] == "refuse":
         missing = identity["missing"]
         if allow_contraction:
@@ -1410,6 +1585,74 @@ def leaf_identity_gate(
         )
         return identity, {**base, "refused": True, "missing_granules": missing}
     return identity, None
+
+
+def _leaf_icechunk_refs(
+    store_root,
+    grid,
+    config,
+    shard_key,
+    leaf_path,
+    *,
+    column,
+    window,
+    sidecar_spec,
+    store_kwargs,
+    version=None,
+) -> dict:
+    """The unit's Icechunk record (issue #580, spec §11.4) — fail-open, never raises.
+
+    Plans the leaf's units from fresh HEADs (:func:`zagg.icechunk_refs.leaf_units`:
+    its base arrays plus ``column``'s declared level) and, per the resolved
+    ``commit`` mode, commits them (``"leaf"``, after vetting the repo BEFORE
+    the plan — a missing or mismatched repo refuses for one read, not the
+    plan's ~20 requests) or writes them as the ladder's sidecar beside the
+    leaf (``"ladder"`` — no icechunk session on the leaf path; the staged
+    sweep gathers and commits them). Both the write path and the
+    skip-if-current touch call it. A failure logs and returns ``{"error"}``:
+    the leaf is normative, the repo a regenerable index (D9). ``version`` is
+    the versioned leaf's version subgroup the refs point into (spec §1.5,
+    issue #582) — the one being written, or the current one on the touch
+    path; ``None`` for a legacy leaf.
+    """
+    try:
+        from zagg.icechunk_refs import leaf_units, record_leaf, resolve_options, vet_leaf_repo
+
+        if window and window.get("label") is not None:
+            return {"skipped": "windowed"}
+        commit_leaf = resolve_options(config, grid.parent_order, grid=grid)["commit"] == "leaf"
+        repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs) if commit_leaf else None
+        units = leaf_units(
+            grid,
+            config,
+            shard_key,
+            store_root,
+            column=column,
+            store_kwargs=store_kwargs,
+            version=version,
+        )
+        if commit_leaf:
+            return record_leaf(
+                store_root,
+                grid,
+                shard_key,
+                store_kwargs=store_kwargs,
+                units=units,
+                repo=repo,
+                version=version,
+            )
+        if not any(e["refs"] for u in units for e in u["entries"]):
+            return {"skipped": "empty"}
+        from zagg.icechunk_ladder import write_leaf_refs
+
+        record = write_leaf_refs(
+            store_root, leaf_path, grid, units, spec=sidecar_spec, store_kwargs=store_kwargs
+        )
+        checksum = "etag" if store_root.startswith("s3://") else "last_modified"
+        return {**record, "checksum": checksum}
+    except Exception as e:
+        logger.warning(f"icechunk refs failed for shard {shard_key} (fail-open, issue #580): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def process_and_write_hive(
@@ -1430,6 +1673,7 @@ def process_and_write_hive(
     allow_contraction=False,
     semantic_hash=None,
     sidecar_spec=None,
+    run_id=None,
 ):
     """Process one shard into its own hive leaf store (issue #199 phase 2).
 
@@ -1449,6 +1693,14 @@ def process_and_write_hive(
     the K carriers accumulate and the whole leaf is written once
     (``write_leaf_to_zarr`` — one ShardingCodec object per array), mirroring
     the flat sharded switch in ``runner._process_and_write``.
+
+    ``run_id`` (issue #582, spec §1.5) makes the leaf VERSIONED: the arrays
+    go to a fresh version subgroup ``run-{run_id}-{attempt}`` under the
+    stable leaf root, the version is stamped, its refs are recorded against
+    the version's objects, and the root's pointer stamp is swapped LAST — so a
+    replacement never rewrites bytes an earlier run tag references. Without a
+    run identity the writer emits a legacy in-place leaf (and refuses to do
+    so over a root that already names ``current``).
     Phase timings are always collected (issue #297; formerly the opt-in
     ``profile`` gate of issues #100/#249): ``process_shard`` fills
     ``metadata["phase_timings"]`` with read/index/aggregate, and the leaf
@@ -1531,6 +1783,13 @@ def process_and_write_hive(
         time_range_of = windowing["time_field"]
 
     leaf_path = shard_leaf_path(store_root, shard_key, window=window["label"] if window else None)
+    # Versioned leaf (issue #582, spec §1.5): a run identity names the fresh
+    # version subgroup this attempt writes; ``data_path`` is where the arrays
+    # (and the coverage sidecar) go. Legacy writers keep the root.
+    from zagg.config import get_leaf_versions
+
+    version = leaf_version_name(run_id) if run_id and get_leaf_versions(config) else None
+    data_path = f"{leaf_path}/{version}" if version else leaf_path
 
     # Leaf identity gate (issue #388): per (shard, window) unit, before any
     # read or fold. A skipped/refused unit returns here having written NOTHING.
@@ -1561,6 +1820,12 @@ def process_and_write_hive(
         )
         if unit_meta is not None:
             if unit_meta.get("current"):
+                # A versioned leaf's current version (spec §1.5): the touch
+                # refreshes the pointer root and the siblings only — never a
+                # version's objects, whose checksums the run tags depend on —
+                # and the refs re-plan points into it. The gate verified the
+                # version is stamped and hands its name over (no re-read).
+                current = unit_meta.get("leaf_version")
                 # Lifecycle touch (issue #388 phase 3): a skip must still
                 # reset the purge clock on the unit's whole footprint — leaf
                 # tree, sidecar/sub-map siblings, and the declared column
@@ -1578,6 +1843,7 @@ def process_and_write_hive(
                         sidecar_spec=sidecar_spec,
                         store_kwargs=store_kwargs,
                         policy=get_touch_policy(config),
+                        current=current,
                     )
                 except Exception as e:
                     logger.warning(
@@ -1593,6 +1859,34 @@ def process_and_write_hive(
                 # when zero, so every non-published record stays as it was.
                 if counts.get("skipped_paths"):
                     unit_meta["touch_skipped_paths"] = counts["skipped_paths"]
+                # The touch moved the checksum every ref into this leaf
+                # carries (§11.3: the ``file://`` mtime; a multipart ETag on
+                # S3), so the refs are re-planned from fresh HEADs: a per-leaf
+                # commit lands them now; in ladder mode the sidecar is
+                # rewritten and the unit is marked ``icechunk_dirty``, so this
+                # run's staged sweep re-gathers its node as dirt-only (issue
+                # #580, PR #581 question (11) ruled (a)).
+                from zagg.config import get_icechunk
+
+                # A versioned leaf's objects were not touched, so its refs
+                # are untouched too: the re-plan is the LEGACY leaf's (§11.6).
+                if counts["touched"] and get_icechunk(config) and not current:
+                    unit_meta["icechunk"] = _leaf_icechunk_refs(
+                        store_root,
+                        grid,
+                        config,
+                        shard_key,
+                        leaf_path,
+                        column=str(column_path).rstrip("/").rpartition("/")[2]
+                        if column_declared and column_path
+                        else None,
+                        window=window,
+                        sidecar_spec=sidecar_spec,
+                        store_kwargs=store_kwargs,
+                        version=current,
+                    )
+                    if unit_meta["icechunk"].get("sidecar"):
+                        unit_meta["icechunk_dirty"] = True
             return unit_meta
 
     box: dict = {}
@@ -1600,7 +1894,16 @@ def process_and_write_hive(
 
     def _leaf():
         if "store" not in box:
-            store = open_store(leaf_path, **store_kwargs)
+            if version is None:
+                # A legacy (in-place) write over a versioned root would clear
+                # every version behind the pointer: refuse (spec §1.5).
+                pointer = read_commit(open_store(leaf_path, read_only=True, **store_kwargs))
+                if pointer and pointer.get("current"):
+                    raise ValueError(
+                        f"leaf {leaf_path} is versioned (current {pointer['current']!r}); "
+                        f"a writer without a run_id cannot replace it in place (spec §1.5)"
+                    )
+            store = open_store(data_path, **store_kwargs)
             # overwrite=True: any existing prefix here is either debris from a
             # torn run (D4) or a prior committed write being redone — both are
             # replaced wholesale; per-leaf state never blocks a retry. Since
@@ -1673,9 +1976,9 @@ def process_and_write_hive(
     # vlen array (the unsharded flat layout) — named here, not built.
     # Sibling envelope (issue #383): when the /2 declaration carries leaf-node
     # levels, the column fold at the TAIL of this function k-way merges this
-    # same resident digest load once more — measured ~+2.0 GB transient at the
-    # o8 scale above, on top of this accumulation, since nothing here is
-    # released before that call (``column.write_leaf_column``'s memory note).
+    # same resident digest load once more — bounded to one raw-fold-boundary
+    # cell per call since issue #538 (``column.write_leaf_column``'s memory
+    # note), and this accumulation is released before that call.
     ragged_chunks: list = []
 
     def _write_chunk(block_index, carrier, ragged):
@@ -1742,12 +2045,46 @@ def process_and_write_hive(
     # sidecar is PUT just before it (issue #200 phase 2), and both inherit
     # its debris semantics: a torn worker's coverage never becomes visible.
     # The leaf write order is pinned: dense (streamed, or one object each when
-    # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp
-    # -> granule-id sibling (issue #388; after the stamp, inside the bracket).
+    # sharded) -> ragged (one object, issue #209) -> O11 hashes (in memory,
+    # issue #580) -> coverage sidecar -> stamp -> granule-id sibling (issue
+    # #388; after the stamp, inside the bracket) -> leaf pyramid column (issue
+    # #383) -> Icechunk refs commit (issue #580; last, after the one
+    # post-stamp phase that can still fail the unit).
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
             write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid, staged_out=staged)
+        _write_elapsed += time.time() - _t0
+        # O11 content hashes (issue #342, spec §5): computed in-worker at
+        # write, from the STAGED arrays (the ratified source — the write path
+        # already holds every slab, so this is a memory-bandwidth pass).
+        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
+        # one-object-per-array pass and the per-chunk streaming path
+        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
+        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
+        # are the one read-back fallback inside ``hash_arrays``: they are
+        # written per chunk-block, never as a leaf slab. Computed BEFORE the
+        # stamp (issue #580) so the record rides the stamp itself — the D4
+        # seal then certifies the digest of the bytes it seals — and the
+        # caller's D20 sidecar (``telemetry.build_record``) carries the same
+        # record off ``metadata``. Hive-only by ratified decision (3): flat
+        # layouts have no leaf sidecar or stamp to record into, and no flat
+        # writer computes hashes — those stores stay verifiable by running
+        # the §5 recipe manually. Fail-open: the record is telemetry-class
+        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
+        # dropped record is strictly safer than a wrong one (the §5.2 raise
+        # gate lands here as a warning + a stamp without the key).
+        _t0 = time.time()
+        from zagg.content_hash import staged_record
+
+        record = staged_record(box["store"], staged, f"leaf {leaf_path}")
+        if record is not None:
+            metadata["content_hashes"] = record
+            # Same "populated phase_timings" gate as the write stamp below:
+            # the timing rides an existing dict, never seeds one.
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["hash"] = time.time() - _t0
+        _t0 = time.time()
         words = np.concatenate(occupied) if occupied else None
         if words is not None and words.size == 0:
             words = None
@@ -1765,14 +2102,15 @@ def process_and_write_hive(
         # PR #208 round 2). The envelope simply omits the pointer — box only.
         if words is not None and not full and depth > 0:
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
-            write_coverage_sidecar(leaf_path, bitmap, **store_kwargs)
-        stamp_commit(
+            write_coverage_sidecar(data_path, bitmap, **store_kwargs)
+        stamp = stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),
             granule_count=metadata.get("granule_count", 0),
             coverage=build_coverage(shard_key, words, grid.child_order, bitmap=bitmap, full=full),
             window=window["label"] if window else None,
             time_range=time_range,
+            content_hashes=metadata.get("content_hashes"),
         )
         # The recorded granule-id list, as this leaf's own sibling object
         # (issue #388): AFTER the stamp, so it never certifies a leaf that
@@ -1802,46 +2140,19 @@ def process_and_write_hive(
     # and a no-data shard (no leaf) stays write-less.
     if not metadata.get("error") and "phase_timings" in metadata and "store" in box:
         metadata["phase_timings"]["write"] = _write_elapsed
-    if not metadata.get("error") and "store" in box:
-        # O11 content hashes (issue #342, spec §5): computed in-worker at
-        # write, from the STAGED arrays (the ratified source — the write path
-        # already holds every slab, so this is a memory-bandwidth pass).
-        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
-        # one-object-per-array pass and the per-chunk streaming path
-        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
-        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
-        # are the one read-back fallback inside ``hash_arrays``: they are
-        # written per chunk-block, never as a leaf slab.
-        # Recorded on ``metadata`` for the caller's D20
-        # sidecar (``telemetry.build_record``). Hive-only by ratified decision
-        # (3): flat layouts have no leaf sidecar to record into, and no flat
-        # writer computes hashes — those stores stay verifiable by running
-        # the §5 recipe manually. Fail-open: the record is telemetry-class
-        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
-        # dropped record is strictly safer than a wrong one (the §5.2 raise
-        # gate lands here as a warning + no record).
-        _t0 = time.time()
-        try:
-            import warnings
-
-            from zagg.content_hash import content_hashes_record, hash_arrays
-
-            group = zarr.open_group(box["store"], path="", mode="r", zarr_format=3)
-            with warnings.catch_warnings():
-                # The leaf's own coverage sidecar is the one known non-zarr
-                # object under the prefix; ``members()`` warn-skips it (the
-                # ``process_and_write_raster_hive`` suppression precedent).
-                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
-                metadata["content_hashes"] = content_hashes_record(
-                    hash_arrays(group, staged=staged)
-                )
-        except Exception as e:
-            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
-        else:
-            # Same "populated phase_timings" gate as the write stamp above:
-            # the timing rides an existing dict, never seeds one.
-            if "phase_timings" in metadata:
-                metadata["phase_timings"]["hash"] = time.time() - _t0
+    # Release the aggregate the column fold does not need (issue #538): the
+    # K sharded carriers and the streamed ragged blocks are written and dead
+    # from here — nothing below reads them — so the fold's transient rides
+    # beside ``staged`` alone, not on top of a second copy of the leaf. The
+    # per-cell payload ``bytes`` ``staged`` shares with them survive by
+    # reference; only the containers go. Exactly one clear does work per
+    # path: ``chunk_results`` is the sharded sink, ``ragged_chunks`` the
+    # streaming one, and the two are exclusive. (``_df_out`` needs no
+    # release — ``process_shard`` returns an empty frame whenever either
+    # sink is in play, which here is always; review finding.)
+    if chunk_results is not None:
+        chunk_results.clear()
+    ragged_chunks.clear()
     # Leaf pyramid column (issue #383): written AFTER the leaf's own commit,
     # from the same resident staged slabs — the fleet side of #381 points
     # (1)-(3). Gated inside on the /2 declaration carrying leaf-node levels
@@ -1882,6 +2193,57 @@ def process_and_write_hive(
                 metadata["leaf_column"] = column
                 if "phase_timings" in metadata:
                     metadata["phase_timings"]["column"] = time.time() - _t0
+    # Icechunk companion refs (issue #580, spec §11.4): AFTER the stamp — the
+    # refs point at objects the stamp has just certified — and after the #383
+    # column fold, which is the LAST post-stamp phase that can still fail the
+    # unit. That ordering is load-bearing: a failed unit is retried, the retry
+    # rewrites leaf + column wholesale (same keys, new bytes, new inner-chunk
+    # offsets), and refs committed before the fold would leave the branch tip
+    # — not merely a superseded snapshot — indexing the discarded attempt's
+    # offsets (review finding). Gated on the same clean-unit condition, so the
+    # block only ever indexes a unit that actually succeeded. Fail-open itself
+    # (D9): the leaf is normative, the repo a regenerable index, so a refs
+    # failure logs and rides the stats sidecar (``icechunk.error``) but never
+    # fails the unit. Its own phase, not ``write``: the HEADs, the index GETs
+    # and the commit are index cost, not leaf cost. Gated also on the knob the
+    # init step read (``output.icechunk``); a run whose init failed lands here
+    # too and records the open error.
+    if not metadata.get("error") and "store" in box:
+        from zagg.config import get_icechunk
+
+        if get_icechunk(config):
+            _t0 = time.time()
+            metadata["icechunk"] = _leaf_icechunk_refs(
+                store_root,
+                grid,
+                config,
+                shard_key,
+                leaf_path,
+                column=metadata.get("leaf_column"),
+                window=window,
+                sidecar_spec=sidecar_spec,
+                store_kwargs=store_kwargs,
+                version=version,
+            )
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["icechunk"] = time.time() - _t0
+    # Pointer swap (issue #582, spec §1.5 step 4): the stable root's stamp now
+    # names this attempt's version — one PUT, after the refs, so for a single
+    # writer the repo and the pointer agree on the version. Two racing
+    # attempts under ``commit: "leaf"`` (refs A, refs B, swap B, swap A) can
+    # leave ``main`` and the pointer naming DIFFERENT complete versions; both
+    # are retained (one referenced, one current) and the collector reclaims
+    # neither, until the next run converges them. Only a clean unit swaps: a
+    # failed column leaves the previous version live and the retry writes a
+    # new one.
+    if version and "store" in box and not metadata.get("error"):
+        _t0 = time.time()
+        write_pointer_stamp(open_store(leaf_path, **store_kwargs), stamp, version)
+        metadata["leaf_version"] = version
+        if "phase_timings" in metadata:
+            metadata["phase_timings"]["write"] = (
+                metadata["phase_timings"].get("write", 0.0) + time.time() - _t0
+            )
     return metadata
 
 
@@ -1921,7 +2283,10 @@ __all__ = [
     "leaf_column_expectation",
     "leaf_identity_gate",
     "process_and_write_hive",
+    "leaf_data_path",
+    "leaf_version_name",
     "read_commit",
+    "resolve_leaf",
     "read_coverage",
     "read_coverage_bitmap",
     "read_manifest",
@@ -1930,5 +2295,6 @@ __all__ = [
     "shard_leaf_path",
     "stamp_commit",
     "write_coverage_sidecar",
+    "write_pointer_stamp",
     "write_root_coverage",
 ]
