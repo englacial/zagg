@@ -207,7 +207,8 @@ class RunHandle:
         self.dispatch_manifest: str | None = None
         #: Reattached handles over a slim manifest only: how many of its
         #: ``shards_omitted`` have no status object yet. Non-zero means this
-        #: handle is a snapshot of the reported shards and ran no tail.
+        #: handle is a snapshot of the reported shards and ran no tail
+        #: (past the drop deadline, for good: see :meth:`Run.attach`).
         self.unreported_shards: int = 0
 
     def __len__(self) -> int:
@@ -633,6 +634,8 @@ class Run:
         the shard set is the shards that have reported a status. Until all of
         them have, the handle covers only those (``unreported_shards`` counts
         the rest) and runs no tail; attach again once the fleet has finished.
+        Shards still unreported past the drop deadline never report, so
+        attach cannot run such a run's tail (the warning says so).
 
         Observe-only by design: the manifest carries no granule records, so a
         ``failed`` status resolves that shard's :class:`ShardError`

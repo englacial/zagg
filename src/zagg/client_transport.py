@@ -513,7 +513,10 @@ def attach_run(
     than ``shards_omitted`` the handle is a snapshot of the reported shards
     (``handle.unreported_shards`` counts the rest) and runs NO tail: the
     tail's run record and its marker stand for the whole run, and the shards
-    this handle cannot name would be missing from them.
+    this handle cannot name would be missing from them. Past the drop
+    deadline the rest never report (a worker killed at the timeout, a lost
+    invoke, a dispatcher that died mid-fan-out), so attach can never run that
+    run's tail; the warning says so and points at a re-dispatch.
     """
     import threading
     from dataclasses import asdict
@@ -609,10 +612,10 @@ def attach_run(
         dispatched_at = datetime.fromisoformat(manifest["dispatched_at"]).timestamp()
     except (KeyError, TypeError, ValueError):
         pass
-    timeout_s = runner._get_function_timeout_s(client, run.function_name)
+    drop_s = drop_timeout_s(runner._get_function_timeout_s(client, run.function_name))
     poller = StatusPoller(
         lambda: open_status_store(prefix, store_kwargs),
-        drop_timeout_s=drop_timeout_s(timeout_s),
+        drop_timeout_s=drop_s,
         on_failed=_fail_with_shard_error,
     )
     futures: dict[int, Future] = {}
@@ -625,10 +628,16 @@ def attach_run(
     handle.dispatch_manifest = "full" if omitted is None else "slim"
     handle.unreported_shards = unreported
     if unreported:
+        late = dispatched_at is not None and time.time() >= dispatched_at + drop_s
+        then = (
+            f"the drop deadline has passed, so the other {unreported} never reported and attach "
+            f"cannot run this run's tail: re-dispatch the run to cover them"
+            if late
+            else "attach again once the rest have"
+        )
         logger.warning(
             f"run {run_id}: slim dispatch manifest, {len(shards)} of {omitted} shards have "
-            f"reported — this handle covers those and runs no tail; attach again once "
-            f"the rest have (issue #588)"
+            f"reported — this handle covers those and runs no tail; {then} (issue #588)"
         )
 
         def _settle():  # no tail: its record would stand for a partial shard set

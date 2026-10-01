@@ -1036,7 +1036,7 @@ class TestAttach:
         assert fresh.modes() == ["icechunk_finalize"]
         assert fresh.events[0][2]["config"] == manifest["config"]
 
-    def test_attach_on_a_slim_manifest_mid_run_runs_no_tail(self, status_store):
+    def test_attach_on_a_slim_manifest_mid_run_runs_no_tail(self, status_store, caplog):
         # Two of three shards have reported: the handle covers those, says
         # one is unaccounted for, and runs NO tail — its run record and
         # marker would stand for the whole run with that shard missing.
@@ -1046,7 +1046,9 @@ class TestAttach:
         _put_status(status_store, _WORDS[1], status="failed", error="boom", status_code=500)
 
         stub = EventStubLambdaClient(status_store)
-        handle = Run.attach(_STORE, "slimrun", lambda_client=stub)
+        with caplog.at_level("WARNING"):
+            handle = Run.attach(_STORE, "slimrun", lambda_client=stub)
+        assert "attach again once the rest have" in caplog.text
         assert handle.dispatch_manifest == "slim" and handle.unreported_shards == 1
         assert set(handle.futures) == {_WORDS[0], _WORDS[1]}
         results = handle.results(return_exceptions=True)
@@ -1067,6 +1069,27 @@ class TestAttach:
         modes = [m for m in again.modes() if m]
         assert "finalize" in modes and "stats" in modes
         assert modes[-1] == "icechunk_finalize" and again.cell_events() == []
+
+    def test_attach_on_a_slim_manifest_past_the_deadline_says_the_tail_is_lost(
+        self, status_store, caplog
+    ):
+        # A shard with no status by the drop deadline (killed at the timeout,
+        # a lost invoke) never reports, and a slim manifest cannot name it:
+        # still no tail, and the warning says attach cannot recover it.
+        _put_manifest(
+            status_store, "slimold", _WORDS, dispatched_at="2020-01-01T00:00:00+00:00", slim=True
+        )
+        for word in _WORDS[:2]:
+            _put_status(status_store, word, body={"total_obs": 7})
+        stub = EventStubLambdaClient(status_store)
+        with caplog.at_level("WARNING"):
+            handle = Run.attach(_STORE, "slimold", lambda_client=stub)
+        assert handle.unreported_shards == 1 and set(handle.futures) == set(_WORDS[:2])
+        assert "the other 1 never reported and attach cannot run this run's tail" in caplog.text
+        assert "attach again once the rest have" not in caplog.text
+        handle.results()
+        handle.wait(timeout=10)
+        assert stub.events == [] and ct.tail_recorded("ignored", {}) is False
 
     def test_attach_on_a_slim_manifest_before_any_status_refuses(self, status_store):
         _put_manifest(status_store, "early", _WORDS, slim=True)
