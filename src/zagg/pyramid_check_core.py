@@ -300,6 +300,7 @@ class _Harness:
             for _kwarg, sibling in _field_companions(name, meta)
         }
         self._groups: dict = {}
+        self._leaf_rels: dict = {}
         self.warnings: list = []
 
     def warn(self, message: str) -> None:
@@ -331,11 +332,21 @@ class _Harness:
         return self._open(_column_object_rel(decimal), r)
 
     def leaf_group(self, decimal: str):
-        from zagg.grids.morton import morton_word
-        from zagg.hive import shard_leaf_path
+        """A leaf's cell-order group, resolved through its root stamp (spec §1.5).
 
-        rel = shard_leaf_path("", morton_word(decimal)).lstrip("/")
-        return self._open(rel, self.cell_order)
+        A versioned leaf's arrays live under ``{root}/{current}/``; the one
+        stamp GET per leaf is cached with the group.
+        """
+        if decimal not in self._leaf_rels:
+            from zagg.grids.morton import morton_word
+            from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
+            from zagg.store import open_store
+
+            rel = shard_leaf_path("", morton_word(decimal)).lstrip("/")
+            root = f"{self.store_root}/{rel}"
+            stamp = read_commit(open_store(root, read_only=True, **self.store_kwargs))
+            self._leaf_rels[decimal] = leaf_data_path(rel, stamp)
+        return self._open(self._leaf_rels[decimal], self.cell_order)
 
     def containers(self, cell_dec: str, src_order: int, roster: list[str]) -> list[str]:
         """Roster members contributing to the cell at ``cell_dec``."""

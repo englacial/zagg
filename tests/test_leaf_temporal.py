@@ -806,3 +806,118 @@ class TestSweepRoute:
         # Nothing composed, so no section and no shard count — the route block
         # is the only thing separating this from the non-temporal store above.
         assert "temporal_shards" not in moc
+
+
+# ── versioned leaves (spec §1.5): the record lives in the version, sealed ──
+
+
+def _versioned_copy(tmp_path) -> tuple[str, str, str]:
+    """The ``temporal/`` fixture with its leaf re-homed as a VERSIONED leaf.
+
+    The legacy leaf's whole tree — arrays, bitmap, record, stamp — becomes the
+    version subgroup, and the stable root gets the pointer stamp naming it:
+    the state a versioned worker write leaves (issue #582), with real
+    companions under it. Returns ``(store_root, leaf_root, version_path)``.
+    """
+    from zagg.hive import leaf_version_name, read_commit, write_pointer_stamp
+    from zagg.store import open_store
+
+    root = _fixture_copy(tmp_path)
+    leaf = Path(_leaf_of(root))
+    version = leaf_version_name("f" * 32, "0badc0de")
+    parked = leaf.with_name(leaf.name + ".parked")
+    leaf.rename(parked)
+    leaf.mkdir()
+    parked.rename(leaf / version)
+    write_pointer_stamp(open_store(str(leaf)), read_commit(str(leaf / version)), version)
+    return root, str(leaf), str(leaf / version)
+
+
+def _tree(path: str) -> dict:
+    return {
+        str(p.relative_to(path)): (p.stat().st_mtime_ns, p.read_bytes())
+        for p in sorted(Path(path).rglob("*"))
+        if p.is_file()
+    }
+
+
+class TestVersionedLeaf:
+    """§10.6 on a versioned leaf: read through ``current``, never written into."""
+
+    def test_the_record_is_read_from_the_current_version(self, tmp_path, monkeypatch):
+        import zagg.coverage_toc as toc
+        from zagg.hive import read_commit
+
+        root, leaf, version = _versioned_copy(tmp_path)
+        cell_order, fields = _declared(root)
+        assert not (Path(leaf) / LEAF_TEMPORAL_NAME).exists()  # never the pointer root
+        expected = leaf_temporal_contribution(read_leaf_temporal_record(version))
+        monkeypatch.setattr(toc, "read_leaf_temporal", _boom)
+        # Stamp handed over by the walk, or resolved here: the same answer.
+        for stamp in (read_commit(leaf), None):
+            got, route = leaf_contribution(leaf, cell_order, fields, stamp=stamp)
+            assert route == "record" and got[0] == expected[0]
+            _same(got[1], expected[1])
+
+    def test_a_missing_record_is_never_materialized_into_a_version(self, tmp_path):
+        """The conservative reading of §1.5: a stamped version gains no object."""
+        import zagg.coverage_toc as toc
+
+        root, leaf, version = _versioned_copy(tmp_path)
+        cell_order, fields = _declared(root)
+        (Path(version) / LEAF_TEMPORAL_NAME).unlink()
+        before = _tree(leaf)
+        raw = toc.read_leaf_temporal(version, cell_order, fields)
+        for _pass in range(2):  # it does not converge, by rule: raw every pass
+            got, route = leaf_contribution(leaf, cell_order, fields)
+            assert route == "raw" and got[0] == raw[0]
+            _same(got[1], raw[1])
+        assert _tree(leaf) == before
+
+    @pytest.mark.parametrize("damage", ["not json {", "n_obs", "fields", "unmarked"])
+    def test_a_debris_or_stale_record_in_a_version_is_left_standing(self, tmp_path, damage):
+        """On a legacy leaf these are replaced; in a version nothing is rewritten."""
+        root, leaf, version = _versioned_copy(tmp_path)
+        cell_order, fields = _declared(root)
+        path = Path(version) / LEAF_TEMPORAL_NAME
+        if damage == "not json {":
+            path.write_bytes(damage.encode())
+        else:
+            record = json.loads(path.read_text())
+            if damage == "n_obs":
+                record["n_obs"] += 1
+            elif damage == "fields":
+                record["fields"] = []
+            else:
+                record.pop("spec")
+            path.write_text(json.dumps(record))
+        before = _tree(leaf)
+        got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "raw" and got is not None
+        assert _tree(leaf) == before
+
+    def test_the_sweep_and_the_refresh_compose_without_writing_the_version(self, tmp_path):
+        from zagg.coverage import refresh_root_coverage
+        from zagg.coverage_toc import coverage_toc_counts
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        root, leaf, version = _versioned_copy(tmp_path)
+        expected = json.loads((SPEC_DATA / "temporal.expected.json").read_text())
+        (Path(version) / LEAF_TEMPORAL_NAME).unlink()
+        (Path(root) / "coverage.moc").unlink()
+        (Path(root) / "coverage.toc").unlink()
+        before = _tree(leaf)
+        summary = run_sweep(root, [(int(morton_word(SHARD)), None)], families=["moc"], record=False)
+        moc = summary["families"]["moc"]
+        assert moc["temporal_routes"] == {"records": 0, "materialized": 0, "raw": 1}
+        envelope = read_root_coverage(root)
+        assert set(envelope["temporal"]["shards"]) == {SHARD}
+        assert (
+            int(coverage_toc_counts(envelope).obs.sum()) == expected["root_coverage"]["obs_total"]
+        )
+        # The refresh walk defaults to materializing; a version still gains nothing.
+        refreshed = refresh_root_coverage(root)
+        assert set(refreshed["temporal"]["shards"]) == {SHARD}
+        assert _tree(leaf) == before

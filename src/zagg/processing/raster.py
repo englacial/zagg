@@ -1303,6 +1303,7 @@ def process_and_write_raster_hive(
         build_coverage,
         encode_coverage_bitmap,
         leaf_identity_gate,
+        read_commit,
         shard_leaf_path,
         stamp_commit,
         write_coverage_sidecar,
@@ -1390,6 +1391,15 @@ def process_and_write_raster_hive(
 
     def _leaf():
         if "store" not in box:
+            # The raster writer is legacy (in place); clearing a VERSIONED
+            # root would delete every version behind its pointer: refuse
+            # (spec §1.5, issue #582).
+            pointer = read_commit(open_store(leaf_path, read_only=True, **store_kwargs))
+            if pointer and pointer.get("current"):
+                raise ValueError(
+                    f"leaf {leaf_path} is versioned (current {pointer['current']!r}); "
+                    f"the raster writer cannot replace it in place (spec §1.5)"
+                )
             store = open_store(leaf_path, **store_kwargs)
             # overwrite=True: an existing prefix is debris from a torn run
             # (D4) or a prior committed leaf being redone (D13 re-run) — both

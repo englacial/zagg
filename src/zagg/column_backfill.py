@@ -484,8 +484,14 @@ def stored_leaf_slabs(
     )
 
     cell_order, n_cells = int(cell_order), int(n_cells)
+    # A versioned leaf's arrays live under its current version (spec §1.5,
+    # issue #582): resolve through the root stamp, which is the same GET the
+    # COMMITTED-leaf precondition above already pays.
+    from zagg.hive import resolve_leaf
+
+    data_path, _stamp = resolve_leaf(leaf_path, **dict(store_kwargs or {}))
     group = zarr.open_group(
-        open_store(leaf_path, read_only=True, **dict(store_kwargs or {})),
+        open_store(data_path, read_only=True, **dict(store_kwargs or {})),
         path=str(cell_order),
         mode="r",
         zarr_format=3,

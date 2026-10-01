@@ -395,10 +395,15 @@ def refresh_root_coverage(
                 decimals.append(decimal)
                 if toc_fields and decimal not in toc_failed:
                     try:
+                        # The leaf's ROOT stamp rides along: a versioned
+                        # leaf's record and arrays sit under the version it
+                        # names (spec §1.5), and no record is ever
+                        # materialized into one (§10.6).
                         got, _route = leaf_contribution(
                             f"{root}/{rel}",
                             cell_order,
                             toc_fields,
+                            stamp=stamp,
                             materialize=materialize,
                             # This walk's own provenance (§10.6): a record
                             # the refresh backfilled must not claim the

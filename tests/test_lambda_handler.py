@@ -1253,12 +1253,15 @@ class TestProcessHive:
 
         monkeypatch.setattr(hive, "process_and_write_hive", seam)
         event = self._event(tmp_path)
+        event.pop("run_id", None)
         if armed:
             event.update(skip_if_current=True, semantic_hash="abc", allow_contraction=True)
+            event["run_id"] = "r1"  # names the versioned leaf (issue #582, spec §1.5)
         body = json.loads(handler_mod._handle_process(event, _context())["body"])
         assert (seen["skip_if_current"], seen["allow_contraction"], seen["semantic_hash"]) == (
             (True, True, "abc") if armed else (False, False, None)
         )
+        assert seen["run_id"] == ("r1" if armed else None)
         assert body["icechunk_dirty"] is True and "stats" not in body
         assert read_sidecar(hive.shard_leaf_path(event["store_path"], self._WORD)) is None
 

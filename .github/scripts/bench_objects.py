@@ -237,6 +237,7 @@ def expected_object_counts(
     n_shards: int,
     store_layout: str = "flat",
     pyramid: dict | None = None,
+    leaf_versions: bool = False,
 ) -> dict:
     """Expected store object counts for ``n_shards`` populated shards.
 
@@ -250,6 +251,10 @@ def expected_object_counts(
     declaration that decides whether each leaf also writes a column
     (:func:`_column_objects`). :func:`measure_objects` reads it off the store
     it is measuring; ``None`` models the pre-#384 shape, i.e. no column.
+    ``leaf_versions`` (hive only) models the versioned leaf (issue #582,
+    spec §1.5): one more object per populated leaf, the pointer root's
+    ``zarr.json``, since the version subgroup carries its own stamped root
+    beside the group and array metadata the legacy leaf has.
     """
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -322,7 +327,8 @@ def expected_object_counts(
         # ... plus the leaf's own pyramid column and its sidecar (issue #418),
         # exact per populated leaf and zero when none is declared.
         sidecar = 1 if child_order > parent_order else 0
-        lo = hi = 5 + len(members) + sidecar + _column_objects(pyramid, parent_order)
+        pointer = 1 if leaf_versions else 0
+        lo = hi = 5 + pointer + len(members) + sidecar + _column_objects(pyramid, parent_order)
         for m in members:
             blocks = m["blocks_per_shard"]
             hi += blocks
@@ -636,12 +642,20 @@ def measure_objects(
     raises here rather than quietly modelling the pre-#384 shape.
     """
     pyramid = None
+    leaf_versions = False
     if store_layout == "hive":
+        from zagg.config import get_leaf_versions
         from zagg.hive import read_manifest
 
         pyramid = (read_manifest(store_path, **store_kwargs) or {}).get("pyramid")
+        # The run's knob (issue #582): the harness runs the config it audits.
+        leaf_versions = get_leaf_versions(grid.config)
     expected = expected_object_counts(
-        grid, n_shards=n_shards, store_layout=store_layout, pyramid=pyramid
+        grid,
+        n_shards=n_shards,
+        store_layout=store_layout,
+        pyramid=pyramid,
+        leaf_versions=leaf_versions,
     )
     measured = store_object_counts(
         store_path,

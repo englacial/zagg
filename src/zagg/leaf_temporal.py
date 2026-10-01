@@ -460,6 +460,7 @@ def leaf_contribution(
     cell_order: int,
     fields: dict,
     *,
+    stamp: dict | None = None,
     materialize: bool = True,
     source: str = "sweep",
     **store_kwargs,
@@ -479,6 +480,17 @@ def leaf_contribution(
     ``"refresh"`` from :func:`zagg.coverage.refresh_root_coverage`.
     ``contribution`` is ``None`` for a leaf holding no temporal row.
 
+    ``leaf_root`` is the STABLE leaf root and ``stamp`` its root stamp, as the
+    walk already read it (omitted: resolved here, one GET —
+    :func:`zagg.hive.resolve_leaf`). The record and the arrays are read from
+    where the stamp says the leaf's data lives (spec §1.5): the root of a
+    legacy leaf, the ``current`` version of a versioned one, beside its
+    ``coverage.moc``. A VERSIONED leaf is never materialized into, whatever
+    ``materialize`` says: a version's objects are fixed once it is stamped
+    (§1.5), so its record is the worker's or none, and a version lacking a
+    usable one is read raw on every pass until the leaf's next replacement
+    writes a fresh version (§10.6).
+
     Succession and debris follow §10.4/§10.6: a record at a FOREIGN revision
     is preserved (raw route, never overwritten); an unparsable or
     inconsistent one is debris the materialized record replaces; one whose
@@ -492,19 +504,25 @@ def leaf_contribution(
     write that fails is logged and the contribution still returns.
     """
     from zagg.coverage_toc import read_leaf_temporal
+    from zagg.hive import leaf_data_path, resolve_leaf
 
+    if stamp is None:
+        data_path, stamp = resolve_leaf(leaf_root, **store_kwargs)
+    else:
+        data_path = leaf_data_path(leaf_root, stamp)
+    versioned = bool((stamp or {}).get("current"))
     foreign = False
     try:
-        raw = read_leaf_temporal_record(leaf_root, **store_kwargs)
+        raw = read_leaf_temporal_record(data_path, **store_kwargs)
     except ValueError as e:
-        logger.warning(f"leaf temporal: {leaf_root} record is not JSON ({e}) — re-deriving")
+        logger.warning(f"leaf temporal: {data_path} record is not JSON ({e}) — re-deriving")
         raw = None
     except Exception as e:
         # The GET itself failed (a 403 on the key, a 5xx, a timeout): the
         # accelerator is not the truth, so read the leaf rather than costing
         # the shard — and never overwrite a body that could not be read (it
         # may be a foreign revision, which §10.4 says to preserve).
-        logger.warning(f"leaf temporal: {leaf_root} record did not read ({e}) — re-deriving")
+        logger.warning(f"leaf temporal: {data_path} record did not read ({e}) — re-deriving")
         raw, foreign = None, True
     record = load_leaf_temporal(raw)
     if record is not None:
@@ -512,23 +530,23 @@ def leaf_contribution(
             try:
                 return leaf_temporal_contribution(record), "record"
             except (KeyError, TypeError, ValueError) as e:
-                logger.warning(f"leaf temporal: {leaf_root} record is debris ({e}) — re-deriving")
+                logger.warning(f"leaf temporal: {data_path} record is debris ({e}) — re-deriving")
         else:
             logger.info(
-                f"leaf temporal: {leaf_root} record's fields are not the declared set — re-deriving"
+                f"leaf temporal: {data_path} record's fields are not the declared set — re-deriving"
             )
     elif isinstance(raw, dict) and isinstance(raw.get("spec"), str) and raw["spec"]:
         # An unknown revision: read the leaf, and leave the object alone.
         foreign = True
-    got = read_leaf_temporal(leaf_root, cell_order, fields, **store_kwargs)
-    if got is None or not materialize or foreign:
+    got = read_leaf_temporal(data_path, cell_order, fields, **store_kwargs)
+    if got is None or not materialize or foreign or versioned:
         return got, "raw"
     try:
         write_leaf_temporal(
-            leaf_root, build_leaf_temporal(*got, fields, source=source), **store_kwargs
+            data_path, build_leaf_temporal(*got, fields, source=source), **store_kwargs
         )
     except Exception as e:
-        logger.warning(f"leaf temporal: could not materialize {leaf_root} (fail-open, D9): {e}")
+        logger.warning(f"leaf temporal: could not materialize {data_path} (fail-open, D9): {e}")
         return got, "raw"
     return got, "materialized"
 

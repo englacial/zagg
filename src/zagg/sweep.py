@@ -223,8 +223,14 @@ class MocFamily(SweepFamily):
         self._temporal_fields: dict | None = None
         self._cell_order = 0
 
-    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs) -> None:
+    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs, stamp=None) -> None:
         """Read one leaf's §10 temporal contribution; fail-open per SHARD (D9).
+
+        ``stamp`` is the leaf's root stamp: a versioned leaf's record and
+        arrays are read from the version it names (spec §1.5), resolved inside
+        the fail-open — and never written into it (§10.6: a versioned leaf
+        without a usable record stays on the raw route, uncounted as
+        ``materialized``).
 
         A store declaring no temporal field short-circuits after one manifest
         read. An unreadable companion is logged and skipped rather than
@@ -260,7 +266,7 @@ class MocFamily(SweepFamily):
             return
         try:
             got, route = leaf_contribution(
-                leaf, self._cell_order, self._temporal_fields, **store_kwargs
+                leaf, self._cell_order, self._temporal_fields, stamp=stamp, **store_kwargs
             )
         except Exception as e:
             logger.warning(
@@ -309,7 +315,7 @@ class MocFamily(SweepFamily):
         stamp = read_commit(open_store(leaf, **store_kwargs))
         if stamp is None:
             return None  # absent leaf or unstamped debris (D4)
-        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs)
+        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs, stamp)
         payload = _moc_payload([morton_word(decimal)], stamp.get("time_range"))
         return payload, stamp.get("written_at")
 

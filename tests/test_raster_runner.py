@@ -106,7 +106,7 @@ class TestRasterAgg:
         assert summary["total_obs"] == 2
         # Shared across strategies (issue #580): always present, always None
         # here — raster is outside the stage-1 writer's scope (spec §11.6).
-        assert summary["icechunk"] is None
+        assert summary["icechunk"] is None and summary["icechunk_finalize"] is None
 
         grid = from_config(cfg)
         store_path = cfg.output["store"]
@@ -422,7 +422,7 @@ class TestRasterLambdaBackend:
         assert "run_stats_path" in summary and summary["run_stats_path"] is None
         # Icechunk init record (issue #580): present and None, as on the local
         # raster path — spec §11.6 puts raster outside stage 1's writer.
-        assert summary["icechunk"] is None
+        assert summary["icechunk"] is None and summary["icechunk_finalize"] is None
         assert not any(e["mode"] == "stats" for e in fake.events)
         # Cost block (issue #298, rolled into the raster path here): the
         # pre-invoke ceiling, the deferred estimate stub, and the billed

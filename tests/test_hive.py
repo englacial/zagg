@@ -1243,6 +1243,73 @@ class TestProcessAndWriteHive:
 
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
+    def test_a_versioned_leaf_carries_the_record_in_its_version(self, monkeypatch, cfg, tmp_path):
+        """Issue #575 under versioned leaves (issue #582, spec §1.5/§10.6): the
+        record goes where the arrays and the bitmap go — the version subgroup —
+        before the VERSION's stamp, the only moment a version may gain one.
+        The pointer root holds the pointer stamp and the version, nothing else.
+        """
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(5)],
+            dtype=np.uint64,
+        )
+        ops: list = []
+
+        def rec(name, fn):
+            def wrapped(*a, **k):
+                ops.append((name, str(a[0]) if name in ("sidecar", "temporal") else None))
+                return fn(*a, **k)
+
+            return wrapped
+
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 5.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(
+            hive, "write_coverage_sidecar", rec("sidecar", hive.write_coverage_sidecar)
+        )
+        monkeypatch.setattr(
+            leaf_temporal, "write_leaf_temporal", rec("temporal", leaf_temporal.write_leaf_temporal)
+        )
+        monkeypatch.setattr(hive, "stamp_commit", rec("stamp", hive.stamp_commit))
+        monkeypatch.setattr(hive, "write_pointer_stamp", rec("pointer", hive.write_pointer_stamp))
+        root = str(tmp_path / "store")
+        meta = hive.process_and_write_hive(
+            shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}, run_id="a" * 32
+        )
+        leaf = hive.shard_leaf_path(root, shard)
+        version = f"{leaf}/{meta['leaf_version']}"
+        # Bitmap, record, the version's stamp, then the pointer swap — both
+        # sidecars addressed at the version, never at the pointer root.
+        assert ops == [
+            ("sidecar", version),
+            ("temporal", version),
+            ("stamp", None),
+            ("pointer", None),
+        ]
+        assert sorted(os.listdir(leaf)) == sorted(["zarr.json", meta["leaf_version"]])
+        assert os.path.exists(f"{version}/{leaf_temporal.LEAF_TEMPORAL_NAME}")
+        assert os.path.exists(f"{version}/{hive.COVERAGE_SIDECAR}")
+        record = leaf_temporal.read_leaf_temporal_record(version)
+        assert record["source"] == "worker" and record["n_obs"] == 5
+        # The sweep's seam resolves the pointer and reads it there.
+        got, route = leaf_temporal.leaf_contribution(leaf, grid.child_order, {"h": {}})
+        assert route == "record" and int(got[1].obs.sum()) == 5
+
     def test_a_failed_record_write_still_stamps_the_leaf(self, monkeypatch, cfg, tmp_path, caplog):
         """Issue #575: the record PUT is fail-OPEN, unlike the bitmap's.
 
@@ -2614,8 +2681,11 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
 
         leaf = hive.shard_leaf_path(root, shard)
+        # The runner writes VERSIONED leaves (issue #582): the objects sit
+        # under the current version; the stamp stays at the root.
+        data_path, _stamp = hive.resolve_leaf(leaf)
         for name in ("morton", "h"):
-            chunk_dir = os.path.join(leaf, grid.group_path, name, "c")
+            chunk_dir = os.path.join(data_path, grid.group_path, name, "c")
             n_objects = sum(len(files) for _d, _s, files in os.walk(chunk_dir))
             assert n_objects == 1, name
         assert hive.read_commit(open_store(leaf))["complete"] is True
