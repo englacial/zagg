@@ -946,9 +946,14 @@ def _leaf_coordinates(
                     errors.append(f"{label}: {name} declares locations {sibling!r}, absent")
                     continue
                 raw = _payload_bytes(arrays[sibling][j : j + 1][0])
-                locs = np.frombuffer(raw, dtype="<u8")
+                try:  # a torn payload or a word mortie refuses fails the cell, never the report
+                    locs = np.frombuffer(raw, dtype="<u8")
+                    within = words_in_cell(locs, word)
+                except ValueError as exc:
+                    errors.append(f"{label}[{j}]/{sibling}: undecodable location word(s) ({exc})")
+                    continue
                 n_located += len(locs)
-                outside = locs[~words_in_cell(locs, word)]
+                outside = locs[~within]
                 if len(outside):
                     errors.append(
                         f"{label}[{j}]/{sibling}: {len(outside)} of {len(locs)} location "

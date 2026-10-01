@@ -545,6 +545,23 @@ class TestPyramidCheck:
         assert str(int(donor[0])) in entry["mismatches"][0]
         assert "[FAIL] coordinates" in format_report(report)
 
+    @pytest.mark.parametrize("torn", [False, True], ids=["invalid-word", "torn-payload"])
+    def test_an_undecodable_location_payload_fails_not_raises(self, tmp_path, torn):
+        from zagg.pyramid_check import validate_pyramid
+
+        root, exp = self._located(tmp_path)
+        store = open_store(str(root / exp["leaf"]))
+        arr = zarr.open_array(store, path=f"{exp['group']}/h_tdigest_locations", mode="r+")
+        slab = arr[:]
+        a = exp["cells"][0]["index"]
+        victim = np.frombuffer(bytes(slab[a]), dtype="<u8").copy()
+        victim[0] = np.uint64(2**64 - 1)  # mortie refuses it
+        slab[a] = victim.tobytes()[:-3] if torn else victim.tobytes()
+        arr[:] = slab
+        entry = validate_pyramid(str(root), full=True)["checks"]["coordinates"]
+        assert entry["status"] == "fail", entry
+        assert f"[{a}]/h_tdigest_locations: undecodable location word(s)" in entry["mismatches"][0]
+
     def test_an_unlocated_windowed_store_reports_derivation_only(self, monkeypatch, tmp_path):
         from zagg.pyramid_check import format_report, validate_pyramid
 

@@ -277,7 +277,9 @@ def words_in_cell(words, cell_word) -> np.ndarray:
     order is decoded from the word, never assumed. A word COARSER than the
     cell (only §9 area-word ingest of inputs resolved above the cell order
     produces one) passes when the cell lies inside it. The empty word ``0``
-    locates nothing and fails.
+    locates nothing and fails; any other word mortie cannot decode raises its
+    ``ValueError`` (a checker over untrusted bytes catches it and fails the
+    cell).
     """
     from mortie import clip2order, orders_of
 
