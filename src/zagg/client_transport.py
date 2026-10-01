@@ -108,7 +108,11 @@ def drop_timeout_s(function_timeout_s: float) -> float:
 
 #: Version stamped into every status object; bump on any key change. Read back
 #: in :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump
-#: is loud rather than subtly wrong (review finding, PR #343).
+#: is loud rather than subtly wrong (review finding, PR #343). The manifest and
+#: tail marker carry it too, but the slim manifest (issue #588) did not bump it:
+#: the worker stamps it while the dispatcher picks slim-or-full, so only the
+#: ``shards: null`` + ``shards_omitted`` shape can say which; status objects
+#: are unchanged; the manifest's keys are not normative in the spec.
 STATUS_SCHEMA_VERSION = 1
 
 #: Dispatch-manifest object name under the run prefix (issue #327 phase 2).
@@ -239,12 +243,12 @@ def slim_run_manifest_block(block: dict) -> dict:
     :func:`attach_run` takes the shard set from the status objects instead.
 
     ``shards`` stays in the key set as ``null`` and ``shards_omitted`` counts
-    the keys left out. ``null`` rather than ``[]`` or a missing key: an empty
-    list would read as a run that dispatched nothing, while ``null`` fails
-    loudly in a reader that iterates it and reads as "no list" in one that
-    does ``manifest.get("shards") or []`` — a pre-#588 ``Run.attach`` then
-    refuses with "lists no shards" instead of attaching to an empty set. The
-    full block carries no ``shards_omitted``, so its bytes are unchanged.
+    the keys left out (the full block has none, so its bytes are unchanged).
+    ``null`` rather than ``[]`` or a missing key: an empty list would read as
+    a run that dispatched nothing, while ``null`` fails loudly in a reader
+    that iterates it and reads as "no list" in one that does
+    ``manifest.get("shards") or []`` — a pre-#588 ``Run.attach`` then refuses
+    with "lists no shards". :data:`STATUS_SCHEMA_VERSION` is not bumped.
     """
     return {**block, "shards": None, "shards_omitted": len(block.get("shards") or [])}
 
