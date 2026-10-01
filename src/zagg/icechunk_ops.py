@@ -435,9 +435,10 @@ def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
         raise ValueError(
             f"no dispatch manifest with a config at {prefix}/{MANIFEST_NAME}: finalize reads "
             f"the run's retain_runs and semantic hash from it. A Lambda-dispatched run "
-            f"has one, slim (no shard list) when the run is large; it is missing only when "
-            f"the setup invoke or its write was lost, or the block did not fit the setup "
-            f'event even slim (the run summary then says dispatch_manifest: "dropped"). '
+            f"has one, slim (no shard list) when the run is large; it is missing for a "
+            f"wrong store/run_id, a dispatcher predating issue #327, a lost setup invoke "
+            f"or write, or a block that did not fit the setup event even slim (the run "
+            f'summary then says dispatch_manifest: "dropped"). '
             f"This operation cannot finalize such a run, and the next run's tag covers its "
             f"commits. A local-backend run finalizes in-process"
         )

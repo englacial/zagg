@@ -657,8 +657,10 @@ class TestFinalizeOperation:
         with pytest.raises(ValueError, match="no dispatch manifest") as err:
             icechunk_ops.finalize(root, RUN, store_kwargs={})
         # A large run has a slim manifest, so the text names only what is
-        # left: a lost write, or a block that did not fit even slim.
+        # left: a wrong store/run_id or a pre-#327 dispatcher first, then a
+        # lost write, or a block that did not fit even slim.
         assert "slim (no shard list) when the run is large" in str(err.value)
+        assert "wrong store/run_id, a dispatcher predating issue #327" in str(err.value)
         assert 'dispatch_manifest: "dropped"' in str(err.value)
         assert "the next run's tag covers its commits" in str(err.value)
 
