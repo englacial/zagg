@@ -780,6 +780,68 @@ class TestSweepRoute:
         assert moc["temporal_shards"] == 1 and moc["uncounted_shards"] == 0
         assert coverage_toc_uncounted(read_root_coverage(root)) == 1
 
+    @staticmethod
+    def _windowed(tmp_path, monkeypatch, routes: dict) -> tuple[str, list]:
+        """``SHARD`` split into window leaves whose seam routes are ``routes``.
+
+        Each label's leaf is a copy of the fixture leaf; its route is
+        ``routes[label]`` (``"record"``/``"raw"``) or, for ``"fail"``, the
+        read raises. A bare, recorded ``11214`` keeps the section non-empty,
+        so a marker of 0 is a written block rather than an absent one.
+        """
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path
+
+        root = _fixture_copy(tmp_path)
+        word = int(morton_word(SHARD))
+        for label in routes:
+            shutil.copytree(_leaf_of(root), shard_leaf_path(root, word, window=label))
+        shutil.copytree(_leaf_of(root), _leaf_of(root, "11214"))
+        shutil.rmtree(_leaf_of(root))
+        (Path(root) / "coverage.moc").unlink()
+        (Path(root) / "coverage.toc").unlink()
+        real = leaf_temporal.leaf_contribution
+
+        def seam(leaf, *args, **kwargs):
+            got, route = real(leaf, *args, **kwargs)
+            label = Path(leaf).name.removesuffix(".zarr").rpartition("_")[2]
+            if routes.get(label) == "fail":
+                raise OSError("truncated companion")
+            return got, routes.get(label, route)
+
+        monkeypatch.setattr(leaf_temporal, "leaf_contribution", seam)
+        leaves = [(word, label) for label in routes] + [(int(morton_word("11214")), None)]
+        return root, leaves
+
+    @pytest.mark.parametrize("producer", ["sweep", "refresh"])
+    @pytest.mark.parametrize(
+        "routes, listed, marker",
+        [
+            # A mixed shard is uncounted once, whichever window came last.
+            ({"2019": "raw", "2020": "record"}, {SHARD, "11214"}, 1),
+            # A raw window whose shard a later window drops leaves no mark.
+            ({"2019": "raw", "2020": "fail"}, {"11214"}, 0),
+        ],
+    )
+    def test_the_marker_is_per_shard_over_its_windows(
+        self, tmp_path, monkeypatch, producer, routes, listed, marker
+    ):
+        """§10.3: a shard is uncounted iff a LISTED shard holds a raw leaf."""
+        from zagg.coverage import refresh_root_coverage
+        from zagg.coverage_toc import coverage_toc_uncounted
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        root, leaves = self._windowed(tmp_path, monkeypatch, routes)
+        if producer == "sweep":
+            moc = run_sweep(root, leaves, families=["moc"], record=False)["families"]["moc"]
+            assert moc["uncounted_shards"] == marker
+            envelope = read_root_coverage(root)
+        else:
+            envelope = refresh_root_coverage(root)
+        assert set(envelope["temporal"]["shards"]) == listed
+        assert coverage_toc_uncounted(envelope) == marker
+
     def test_an_empty_leaf_counts_no_route(self, tmp_path, monkeypatch):
         """The route tally is per CONTRIBUTING leaf (issue #575).
 
