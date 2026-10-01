@@ -880,7 +880,8 @@ def _leaf_coordinates(
     sampled occupied cell: every location word of every located field (bound
     by the payload's §1.2 ``ragged.locations`` attrs) must lie inside the
     cell (:func:`zagg.grids.morton.words_in_cell` — per-word order decode, a
-    coarser §9 area word passing on the ancestor line), and where the leaf
+    coarser §9 area word passing on the ancestor line, and counted in the
+    ``pass`` detail), and where the leaf
     still STORES a ``morton`` array (every unwindowed leaf; a windowed leaf
     written before issue #586 phase 3) the stored word must equal the
     derived one.
@@ -890,6 +891,7 @@ def _leaf_coordinates(
     reported as exactly that — ``skip``, "derivation only" — never as a pass.
     """
     import zarr
+    from mortie import orders_of
 
     from zagg.grids.morton import cell_words, morton_word, words_in_cell
     from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
@@ -901,7 +903,7 @@ def _leaf_coordinates(
         leaves = [leaves[i] for i in picks]
     errors: list = []
     warnings: list = []
-    n_leaves = n_cells = n_stored = n_located = 0
+    n_leaves = n_cells = n_stored = n_located = n_coarse = 0
     for dec, window in leaves:
         label = f"{dec}[{window or 'all'}]"
         root = shard_leaf_path(store_root, morton_word(dec), window=window)
@@ -949,6 +951,9 @@ def _leaf_coordinates(
                 try:  # a torn payload or a word mortie refuses fails the cell, never the report
                     locs = np.frombuffer(raw, dtype="<u8")
                     within = words_in_cell(locs, word)
+                    # Passed only on the ancestor line: legal for §9 coarse ingest alone,
+                    # so it is counted, never hidden (a point-ingest writer makes none).
+                    n_coarse += int(np.count_nonzero(orders_of(locs[within]) < cell_order))
                 except ValueError as exc:
                     errors.append(f"{label}[{j}]/{sibling}: undecodable location word(s) ({exc})")
                     continue
@@ -967,7 +972,13 @@ def _leaf_coordinates(
         entry = _entry(
             "pass",
             f"{n_located} location word(s) in {n_cells} cell(s) of {n_leaves} leaf(s) lie inside "
-            f"their derived cells; {n_stored} stored coordinate(s) agree",
+            f"their derived cells; {n_stored} stored coordinate(s) agree"
+            + (
+                f"; {n_coarse} word(s) coarser than their cell, accepted under §9.1 coarse "
+                f"ingest only"
+                if n_coarse
+                else ""
+            ),
         )
     elif n_stored:
         entry = _entry(

@@ -545,6 +545,26 @@ class TestPyramidCheck:
         assert str(int(donor[0])) in entry["mismatches"][0]
         assert "[FAIL] coordinates" in format_report(report)
 
+    def test_a_word_coarser_than_its_cell_passes_but_is_counted(self, tmp_path):
+        from zagg.pyramid_check import validate_pyramid
+
+        root, exp = self._located(tmp_path)
+        entry = validate_pyramid(str(root), full=True)["checks"]["coordinates"]
+        assert "coarser than their cell" not in entry["detail"]  # a point-ingest store makes none
+        store = open_store(str(root / exp["leaf"]))
+        arr = zarr.open_array(store, path=f"{exp['group']}/h_tdigest_locations", mode="r+")
+        slab = arr[:]
+        a = exp["cells"][0]["index"]
+        victim = np.frombuffer(bytes(slab[a]), dtype="<u8").copy()
+        victim[0] = np.uint64(int(exp["shard_word"]))  # on the ancestor line of every cell
+        slab[a] = victim.tobytes()
+        arr[:] = slab
+        entry = validate_pyramid(str(root), full=True)["checks"]["coordinates"]
+        assert entry["status"] == "pass", entry
+        assert entry["detail"].endswith(
+            "; 1 word(s) coarser than their cell, accepted under §9.1 coarse ingest only"
+        )
+
     @pytest.mark.parametrize("torn", [False, True], ids=["invalid-word", "torn-payload"])
     def test_an_undecodable_location_payload_fails_not_raises(self, tmp_path, torn):
         from zagg.pyramid_check import validate_pyramid
