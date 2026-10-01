@@ -571,7 +571,7 @@ def _containing_shard(parent_grid, shard_key: int) -> int:
     """
     from mortie import mort2geo
 
-    # mort2geo's scalar form is length-1 arrays (mortie >=1.0), hence the [0].
+    # assign/shards_of return length-1 arrays for a scalar word, hence the [0].
     lat, lon = mort2geo(shard_key)
     leaf = parent_grid.assign(lat, lon)
     return int(parent_grid.shards_of(leaf)[0])
