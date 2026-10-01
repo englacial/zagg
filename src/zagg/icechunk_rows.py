@@ -91,9 +91,16 @@ def store_rows(temporal: dict | None, rows: Iterable[str] | None) -> list[str]:
 
     An unwindowed store always has its one ``all`` row, whatever the run
     names (and may name no other); a windowed store gets exactly the run's
-    labels. Order of first appearance, duplicates dropped.
+    labels — its ``all`` row only when the run names it — and an init naming
+    none is refused (it would make a zero-row repo, §11.2). Order of first
+    appearance, duplicates dropped.
     """
     labels = list(dict.fromkeys([*([] if temporal else [ALL_ROW]), *(rows or ())]))
+    if not labels:
+        raise ValueError(
+            "a windowed store's init names no row label: the run's windows (and 'all' for "
+            "its all-time fold) are the dispatcher's to name (spec §11.2)"
+        )
     for label in labels:
         row_bounds(label, temporal)
     return labels
