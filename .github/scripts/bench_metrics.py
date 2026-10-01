@@ -569,11 +569,11 @@ def _containing_shard(parent_grid, shard_key: int) -> int:
     containing coarser cell; routing through ``assign``/``shards_of`` keeps this
     on the same mortie machinery the shard maps themselves are built with.
     """
-    import numpy as np
     from mortie import mort2geo
 
-    lat, lon = mort2geo(np.array([shard_key], dtype=np.uint64))
-    leaf = parent_grid.assign(np.atleast_1d(lat), np.atleast_1d(lon))
+    # assign/shards_of return length-1 arrays for a scalar word, hence the [0].
+    lat, lon = mort2geo(shard_key)
+    leaf = parent_grid.assign(lat, lon)
     return int(parent_grid.shards_of(leaf)[0])
 
 

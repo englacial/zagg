@@ -43,8 +43,9 @@ from typing import Any, Callable, Protocol, runtime_checkable
 class CellCost:
     """Measured cost of a single work unit.
 
-    ``compute_time_s`` is the backend-reported execution time (Lambda
-    ``duration_s``; 0 for the local backend, which carries no metered cost).
+    ``compute_time_s`` is the backend-reported billed wall (Lambda
+    ``duration_total_s`` when the worker stamped it, else ``duration_s``, via
+    ``lambda_duration``; 0 for the local backend, which carries no metered cost).
     ``gb_seconds`` and ``cost_usd`` are derived by the executor's pricing model
     (``compute_time_s * memory_gb`` and ``gb_seconds * price_per_gb_sec`` for
     Lambda; both 0 locally).

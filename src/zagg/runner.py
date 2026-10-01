@@ -77,6 +77,7 @@ from zagg.processing import (
 )
 from zagg.semantics import semantic_hash as _semantic_hash
 from zagg.store import open_object_store, open_store
+from zagg.telemetry import billed_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -1031,6 +1032,7 @@ class RasterStrategy:
             # writes no leaf, so ``timesteps`` alone would orphan a sidecar.
             # Fail-open on the sidecar PUT.
             meta.setdefault("duration_s", time.time() - unit_t0)
+            meta["duration_total_s"] = time.time() - unit_t0  # issue #589
             # A raster unit's obs tally is its timestep count (the raster
             # obs-count convention). Mirror the Lambda handler, which injects
             # ``total_obs`` before ``build_record``, so the same shard yields an
@@ -3266,6 +3268,9 @@ def _run_local(
         return record
 
     def _cell_work(payload):
+        # Unit wall clock (issue #589): the same entry -> record span the
+        # Lambda handler stamps, so ``duration_total_s`` is one column.
+        unit_t0 = time.time()
         # (shard, records) pairs, (shard, records, window) triples when a
         # window schedule fanned the dispatch per window (issue #246), or
         # (shard, records, windows) shard units emitting every window from
@@ -3330,6 +3335,12 @@ def _run_local(
                     # metadata and granule subset; skipped windows record
                     # nothing, as above. The shard meta rides the list.
                     subsets = {payload["label"]: subset for payload, subset in windows}
+                    # The unit's wall (issue #589) is the INVOKE's: it repeats
+                    # on every leaf's record beside ``duration_s``, and a sum
+                    # de-duplicates on ``unit_windows`` (``telemetry.merge``).
+                    meta["duration_total_s"] = time.time() - unit_t0
+                    for m in meta["windows"]:
+                        m["duration_total_s"] = meta["duration_total_s"]
                     meta["stats"] = [
                         _record_unit(m, subsets[m["window"]], m["window"])
                         for m in meta["windows"]
@@ -3350,6 +3361,7 @@ def _run_local(
                     **extra,
                 )
             meta.setdefault("shard_key", int(shard_key))
+            meta["duration_total_s"] = time.time() - unit_t0
             _record_unit(meta, records, window["label"] if window else None)
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
@@ -4909,7 +4921,7 @@ def _invoke_lambda_event(
                 "status_code": result.get("statusCode"),
                 "body": body,
                 "wall_time": time.time() - wall_start,
-                "lambda_duration": body.get("duration_s", 0),
+                "lambda_duration": billed_seconds(body),
                 "error": last_error if function_error else body.get("error"),
                 "retries": attempt,
                 "timeout": is_timeout,
@@ -4987,7 +4999,7 @@ def _poll_lambda_result(
                 "status_code": result.get("statusCode"),
                 "body": body,
                 "wall_time": wall_time,
-                "lambda_duration": body.get("duration_s", 0),
+                "lambda_duration": billed_seconds(body),
                 "error": body.get("error"),
                 "retries": retries,
                 "timeout": False,
@@ -6427,7 +6439,7 @@ def _invoke_lambda_cell(
                 "status_code": result.get("statusCode"),
                 "body": body,
                 "wall_time": time.time() - wall_start,
-                "lambda_duration": body.get("duration_s", 0),
+                "lambda_duration": billed_seconds(body),
                 "error": last_error if function_error else body.get("error"),
                 "retries": attempt,
                 "timeout": is_timeout,
