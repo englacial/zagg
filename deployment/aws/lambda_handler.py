@@ -99,8 +99,10 @@ writes the raster (time, cells) template instead, from a synchronous invoke):
         owns the global timestep index and threads it here so the template
         write needs no S3 access from the dispatcher.
     "run_manifest": dict (optional, issue #327) -- {"run_id", "shards"
-        (decimal shard-key strings), "semantic_hash", "dispatched_at",
-        "dataset"} dispatch identity: on a successful setup the worker writes
+        (decimal shard-key strings; null, with a "shards_omitted" count, on
+        a large run's slim block -- issue #588), "semantic_hash",
+        "dispatched_at", "dataset"} dispatch identity: on a successful setup
+        the worker writes
         it (plus this event's "config") as
         "<store>.status/run-<run_id>/manifest.json" -- what Run.attach
         rebuilds a handle from (D8: the dispatcher never writes). Fail-open;
