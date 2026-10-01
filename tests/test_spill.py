@@ -1440,6 +1440,55 @@ class TestLeafTemporalFold:
         assert signal_alone and all(by_word[w] == 0 for w in signal_alone)
         assert by_word == {**dict.fromkeys(signal_alone, 0), **noise_counts}
 
+    def test_a_flux_counting_field_counts_rounded_flux(self, monkeypatch, tmp_path):
+        """The raw route counts the counting field's WEIGHT, whatever it means.
+
+        Under ``weights: "flux"`` (spec §2.0, GEDI's ``rx_flux``) the weight
+        column is calibrated flux, not observations. The raw route reads no
+        ``weights`` declaration: its ``obs`` is that column summed per bucket
+        and rounded, so it is not the worker's count, and a bucket whose flux
+        sums below 0.5 is occupied at ``obs: 0``. Pins the present behaviour
+        (spec §10.3); it is not an observation count.
+        """
+        import zarr
+
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.hive import read_manifest
+        from zagg.leaf_temporal import (
+            count_words,
+            leaf_temporal_contribution,
+            read_leaf_temporal_record,
+        )
+        from zagg.sweep_overview import decode_digest, encode_digest
+
+        root, leaf, dfs, meta = self._two_field_leaf(monkeypatch, tmp_path, step=60.0)
+        manifest = read_manifest(root)
+        fields, order = temporal_fields(manifest), temporal_cell_order(manifest)
+        fields["g_tdigest"]["weights"] = "flux"
+        # Rewrite the counting field's weights as flux: 0.3 per unit of count.
+        group = zarr.open_group(leaf, path=str(order), mode="a", zarr_format=3)
+        payload, sibling = group["g_tdigest"], group["g_tdigest_times"]
+        flux = np.empty(payload.shape[0], dtype=object)
+        words, weights = [], []
+        for i, (raw, times) in enumerate(zip(payload[:], sibling[:], strict=True)):
+            cell = decode_digest(raw if raw is not None else b"", "float32", (2,)).copy()
+            cell[:, 1] *= np.float32(0.3)
+            flux[i] = encode_digest(cell, "float32")
+            if times is not None and len(times):
+                words.append(decode_digest(times, "uint64", ()))
+                weights.append(cell[:, 1])
+        payload[:] = flux
+        expected = count_words(np.concatenate(words), np.concatenate(weights))
+        worker = leaf_temporal_contribution(read_leaf_temporal_record(leaf))
+        assert int(worker[1].obs.sum()) == meta["total_obs"]  # the clock: observations
+        raw = read_leaf_temporal(leaf, order, fields)
+        assert raw[0] == worker[0]
+        by_word = dict(zip(raw[1].words.tolist(), raw[1].obs.tolist(), strict=True))
+        flux_obs = dict(zip(expected.words.tolist(), expected.obs.tolist(), strict=True))
+        assert {w: by_word[w] for w in flux_obs} == flux_obs  # rounded flux per bucket
+        assert int(raw[1].obs.sum()) == sum(flux_obs.values()) < meta["total_obs"]
+        assert any(v == 0 for v in flux_obs.values())  # counted, yet rounds to 0
+
     def test_a_part_backfilled_store_totals_under_one_rule(self, monkeypatch, tmp_path):
         """A root total summed over a worker record and a backfilled leaf.
 

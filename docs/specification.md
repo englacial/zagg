@@ -3224,6 +3224,18 @@ worker counts (every clocked observation of those leaves) and one-field
 counts (each backfilled leaf's counting-field observations) — a lower bound
 on the store's clocked observations, not that count.
 
+**A flux counting field.** The raw route counts the counting field's
+payload **weight**, which is an observation count only where that field's
+weights are counts (§2.0's `"counts"`, the default). The raw route reads no
+`weights` declaration, and name order alone picks the counting field, so it
+can be a `weights: "flux"` field (§2.0 — e.g. GEDI's `rx_flux`) even beside a
+counts field. A raw-route `obs` over a flux counting field is that weight
+column summed per bucket and rounded to an integer — calibrated flux, not
+observations: it is not comparable with a worker record's count for the
+same leaf, a bucket whose flux sums below 0.5 is occupied at `obs: 0`, and a
+root `obs_total` over a part-backfilled flux store adds the two units
+together.
+
 **How an observation lands in a bucket.** Its instant is its §8.3 word's
 *representative instant*: the instant itself for a timestamp word, the
 envelope's midpoint for a range word. Under the worker-written leaf record
@@ -3709,8 +3721,12 @@ which is that rule pinned as bytes.
   so a raw-route `n_obs` is ONE field's observation count: a lower bound on
   the worker's for the same leaf, equal only when the counting field
   aggregated every clocked observation, and far below it on a store whose
-  temporal fields partition the observations (§10.3's strata example). The
-  number of declared fields does not enter either.
+  temporal fields partition the observations (§10.3's strata example). It
+  is the counting field's payload WEIGHT, an observation count only under
+  `weights: "counts"` (§2.0): for a `weights: "flux"` counting field it is
+  the flux summed and rounded per bucket — not observations, not
+  comparable with a worker record's `n_obs` (§10.3). The number of declared
+  fields does not enter either.
 - **`word`** (required) — the §10.2 envelope word for THIS leaf, as a
   decimal string: the grammar's join (`toc_reduce`) over every observation
   word the leaf holds. Because the join is a semilattice, it is identical

@@ -173,7 +173,10 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     every clocked observation, and far below it on a store whose temporal
     fields partition the observations (the ATL03 signal/noise strata, where
     ``h_tdigest_noise`` counts and every signal photon is occupancy only;
-    spec §10.3). Every other field
+    spec §10.3). The count is the field's payload WEIGHT, an observation
+    count only under ``weights: "counts"``: a ``"flux"`` counting field's
+    total is its flux rounded per bucket, not observations (spec §10.3).
+    Every other field
     contributes OCCUPANCY only: its words join the envelope and mark their
     buckets with a zero count, so the key set (and the §10.5 cover derived
     from it) stays the union across fields while nothing is counted twice;
