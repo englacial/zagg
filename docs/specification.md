@@ -3501,6 +3501,9 @@ no published store carries a `/1` repo. The remedy is to clear
 `{store_root}/icechunk/`: the next run's init re-creates the repo as `/2`
 and a staged sweep over the store re-gathers its refs (§11.4; a leaf's ref
 carrier written before `/2` names no row and is read as the `all` row).
+That re-gather reads the ladder's carriers, so it covers leaves written
+under `commit: "ladder"`; a leaf committed per leaf (`commit: "leaf"`)
+wrote no carrier, and is indexed again only when a run rewrites it.
 
 A morton hive is many leaf zarrs. The companion presents every leaf of one
 order as **one zarr hierarchy** by recording each leaf's inner chunks as
