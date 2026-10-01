@@ -3595,8 +3595,10 @@ keeps what that worker knew: **one small JSON object per shard leaf,
 counted cover, and the §10.5 cover derived from it. `{leaf}` is where the
 leaf's arrays live under §1.5's one reader rule: the stable root
 `{id}.zarr/` of a legacy leaf, the **version subgroup**
-`{id}.zarr/{current}/` of a versioned one — never the pointer root, which
-holds the pointer stamp and its versions and nothing else. A reader of the
+`{id}.zarr/{current}/` of a versioned one — never the pointer root (which
+holds the pointer stamp and its versions, plus, on a converted legacy leaf,
+the last legacy write's arrays and sidecars, which a versioned reader
+ignores). A reader of the
 record resolves `current` first, exactly as a reader of the arrays or the
 bitmap does.
 

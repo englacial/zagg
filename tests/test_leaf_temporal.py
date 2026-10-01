@@ -896,6 +896,31 @@ class TestVersionedLeaf:
             assert route == "record" and got[0] == expected[0]
             _same(got[1], expected[1])
 
+    def test_a_stale_root_record_of_a_converted_legacy_leaf_is_ignored(self, tmp_path):
+        """§1.5's converted legacy leaf: the root keeps the last legacy write.
+
+        Its arrays, bitmap and a (here stale, but valid) ``temporal.toc`` stay
+        at the pointer root beside the stamp naming ``current``. A versioned
+        reader takes the version's record and never touches the root's.
+        """
+        root, leaf, version = _versioned_copy(tmp_path)
+        cell_order, fields = _declared(root)
+        shutil.copytree(Path(version) / str(cell_order), Path(leaf) / str(cell_order))
+        shutil.copy(Path(version) / "coverage.moc", Path(leaf) / "coverage.moc")
+        expected = leaf_temporal_contribution(read_leaf_temporal_record(version))
+        word, counts = expected
+        assert len(counts.words) > 1
+        stale_counts = CountedCover(counts.words[:1], counts.obs[:1], counts.order)
+        stale = build_leaf_temporal(word, stale_counts, sorted(fields), source="sweep")
+        write_leaf_temporal(leaf, stale)
+        stale_total = int(leaf_temporal_contribution(stale)[1].obs.sum())
+        assert stale_total < int(counts.obs.sum())  # a valid record, and a different one
+        before = _tree(leaf)
+        got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "record" and got[0] == expected[0]
+        _same(got[1], counts)
+        assert _tree(leaf) == before  # the root object is untouched
+
     def test_a_missing_record_is_never_materialized_into_a_version(self, tmp_path):
         """The conservative reading of §1.5: a stamped version gains no object."""
         import zagg.coverage_toc as toc
