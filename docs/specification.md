@@ -3012,19 +3012,24 @@ grammars are mortie's; this page owns exactly one addition to it — a
 **`temporal` key** — so that a spatiotemporal candidate query resolves from
 metadata alone, before any leaf is opened.
 
-Two tiers, both derived from the §8.3 `"per-centroid"` companions the leaves
-already carry:
+Two tiers. Tier 1, and the buckets tier 2 keys, are derived from the §8.3
+`"per-centroid"` companions the leaves already carry; tier 2's counts are
+summed from the leaves' §10.6 worker records and come from nowhere else:
 
 | tier | key | what | answers |
 |---|---|---|---|
 | 1 | `shards` | one toc word per populated shard — the join over that shard's sibling words | *which* shards hold data during a window |
 | 2 | `counts` | the store-wide counted cover — the observation count in every aligned time bucket the store's observations fall in, exact when the block's `uncounted_shards` is 0 and a stated lower bound otherwise (§10.3) | *how much* data falls in a window |
 
-Neither tier is new information and neither is truth: like the spatial ranges
-beside them they are a **regenerable accelerator** over the leaf arrays (§8.3,
-D9), written at end of walk while leaves stamp continuously, so a reader MUST
-treat them under the same staleness posture as the `ranges` — a shard the
-section does not list is not proof the shard has no data in the window.
+Tier 1 and tier 2's occupied buckets are not new information: like the
+spatial ranges beside them they are a **regenerable accelerator** over the
+leaf arrays (§8.3, D9). Tier 2's counts are not regenerable — they are
+leaf-written data that exist only in the §10.6 records, so a lost record
+lowers the bound (§10.3 `uncounted_shards`) and no refresh rebuilds it.
+Neither tier is truth: both are written at end of walk while leaves stamp
+continuously, so a reader MUST treat them under the same staleness posture
+as the `ranges` — a shard the section does not list is not proof the shard
+has no data in the window.
 
 **Absence is the whole-section rule.** A store with no temporal channel
 carries no `temporal` key, and its root object is byte-identical to one
