@@ -3889,7 +3889,7 @@ An unwindowed store's one row `all` is allocated at creation whatever the
 event names, and a window label on an unwindowed store — or one its
 schedule does not declare — is refused. Two runs allocating at once both
 resize every array, which Icechunk's rebase does not reconcile: the loser's
-init retries in a fresh session (up to 5), re-reads the rows the winner
+init retries in a fresh session (5 attempts in all), re-reads the rows the winner
 recorded and appends after them. A retry re-applies the loser's own block
 changes (a ratchet, the per-run knobs) only when the winner changed nothing
 else, or made the same changes: a block the winner moved otherwise — a
