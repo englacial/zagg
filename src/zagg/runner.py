@@ -5934,7 +5934,8 @@ def _invoke_lambda_icechunk_finalize(
         if not body.get("ok") or not body.get("tag"):
             raise RuntimeError(f"unexpected icechunk_finalize body: {body!r}")
     except Exception as e:
-        logger.warning(f"icechunk finalize invoke failed (fail-open, issue #582): {e}")
+        how = "raised to the operator, issue #588" if operator_checks else "fail-open, issue #582"
+        logger.warning(f"icechunk finalize invoke failed ({how}): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
     record = {k: v for k, v in body.items() if k not in ("ok", "mode")}
     record["invoke_s"] = time.perf_counter() - t0

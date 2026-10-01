@@ -607,15 +607,20 @@ def finalize(
     if "refused" in out:
         raise FinalizeRefusedError(out["refused"])
     if "error" in out:
-        stale = (
+        # Only a stale worker is known not to have finalized; a transport
+        # failure after delivery leaves the worker's outcome unknown.
+        stale = "'config'" in out["error"]
+        hint = (
             "; a missing 'config' is a worker that predates the operator finalize, which "
             "fails on that key before any write: deploy a current worker"
-            if "'config'" in out["error"]
-            else ""
+            if stale
+            else f"; if the request reached it the worker may have tagged: re-run finalize, "
+            f"which reports an existing run-{run_id} tag and rewrites nothing"
         )
+        outcome = "did not finalize" if stale else "may not have finalized"
         raise RuntimeError(
-            f"the worker {function_name} did not finalize run {run_id}: {out['error']} "
-            f"(nothing was written from this host{stale})"
+            f"the worker {function_name} {outcome} run {run_id}: {out['error']} "
+            f"(nothing was written from this host{hint})"
         )
     return out
 

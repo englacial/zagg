@@ -895,7 +895,31 @@ class TestFinalizeInvoke:
             )
         assert "nothing was written from this host" in str(err.value)
         # Only the missing-config failure is read as a worker older than the operation.
-        assert ("predates the operator finalize" in str(err.value)) == (status == 500)
+        stale = status == 500
+        assert ("predates the operator finalize" in str(err.value)) == stale
+        assert ("did not finalize" in str(err.value)) == stale
+        assert ("may not have finalized" in str(err.value)) != stale
+        assert len(worker.events) == 1
+
+    def test_a_lost_response_is_an_unknown_outcome_with_a_rerun_hint(self, on_host, caplog):
+        # The request may have reached the worker: the host cannot say it did not tag.
+        class _Dropped(_Worker):
+            def invoke(self, **kwargs):
+                super().invoke(**kwargs)
+                raise ConnectionError("connection dropped")
+
+        worker = _Dropped(_REPORT)
+        with (
+            caplog.at_level("WARNING", logger="zagg.runner"),
+            on_host(),
+            pytest.raises(RuntimeError, match="may not have finalized") as err,
+        ):
+            icechunk_ops.finalize(
+                REMOTE, RUN, store_kwargs={}, lambda_client=worker, function_name="fn"
+            )
+        assert f"re-run finalize, which reports an existing run-{RUN} tag" in str(err.value)
+        assert "fail-open" not in caplog.text
+        assert "raised to the operator, issue #588" in caplog.text
         assert len(worker.events) == 1
 
 
