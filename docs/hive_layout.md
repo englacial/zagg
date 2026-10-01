@@ -856,7 +856,10 @@ nobody mistakes the result for a total, the root `counts` block carries
 `obs_total` is exact at 0 and a lower bound otherwise. The sweep record
 shows the same thing per pass: `temporal_routes: {records, raw}` (how each
 contributing leaf was read; `raw` leaves gave no counts) and, on a pass
-that wrote the section, `uncounted_shards` beside `temporal_shards`.
+that wrote the section, `uncounted_shards` beside `temporal_shards` — both
+this pass's tally, not the root's: a pass over part of the store keeps the
+standing counts block and its marker (§10.4), so whether the published
+totals are exact is read from the root block's own `uncounted_shards`.
 
 There is no backfill for a store written before the record existed (espg
 ruling of 2026-10-01 on [issue #575](https://github.com/englacial/zagg/issues/575)):

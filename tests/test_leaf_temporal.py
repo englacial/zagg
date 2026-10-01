@@ -749,6 +749,37 @@ class TestSweepRoute:
         expected = json.loads((SPEC_DATA / "temporal.expected.json").read_text())
         assert envelope["temporal"]["counts"]["obs_total"] == expected["root_coverage"]["obs_total"]
 
+    def test_a_partial_pass_reports_its_own_tally_not_the_root_marker(self, tmp_path):
+        """The summary's ``uncounted_shards`` is THIS pass's (issue #575 review).
+
+        A full pass over a counted and a record-less shard leaves a
+        lower-bound root block. A pass over the counted shard alone reports
+        0 for itself, while the root keeps the standing block and its marker
+        of 1 (§10.4): the published totals are still a lower bound.
+        """
+        from zagg.coverage_toc import coverage_toc_uncounted
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        root = _fixture_copy(tmp_path)
+        other = "11214"
+        shutil.copytree(_leaf_of(root), _leaf_of(root, other))
+        (Path(_leaf_of(root, other)) / LEAF_TEMPORAL_NAME).unlink()
+        (Path(root) / "coverage.moc").unlink()
+        (Path(root) / "coverage.toc").unlink()
+        counted = (int(morton_word(SHARD)), None)
+        full = run_sweep(
+            root, [counted, (int(morton_word(other)), None)], families=["moc"], record=False
+        )
+        assert full["families"]["moc"]["uncounted_shards"] == 1
+        assert coverage_toc_uncounted(read_root_coverage(root)) == 1
+        (Path(root) / "coverage.toc").unlink()  # so the partial pass writes
+        moc = run_sweep(root, [counted], families=["moc"], record=False)["families"]["moc"]
+        assert moc["root_moc_written"] is True
+        assert moc["temporal_shards"] == 1 and moc["uncounted_shards"] == 0
+        assert coverage_toc_uncounted(read_root_coverage(root)) == 1
+
     def test_an_empty_leaf_counts_no_route(self, tmp_path, monkeypatch):
         """The route tally is per CONTRIBUTING leaf (issue #575).
 

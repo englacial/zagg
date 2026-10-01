@@ -430,8 +430,8 @@ class MocFamily(SweepFamily):
             # that landed lists at least these shards and usually more; the
             # run summary reports what the run did.
             out["temporal_shards"] = len(section["shards"])
-            # ... of which this many came in with no counts (§10.3): the
-            # operator's read of whether the root totals are exact.
+            # ... of which this many came in uncounted (§10.3) — also per pass: a
+            # partial pass keeps the root's standing marker (§10.4), so read that.
             out["uncounted_shards"] = len(self._temporal_uncounted & set(section["shards"]))
         if cover is not None:
             out["cover_shards"] = len(cover["shards"])

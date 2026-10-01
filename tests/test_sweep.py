@@ -1297,9 +1297,10 @@ class TestHandlerSweepResponse:
 
         One shard with its worker's record and one without. The response (and
         the durable store-root record it names) reports how each leaf was
-        read and how many shards came in uncounted, and the root object the
-        invoke wrote carries the same marker — the only place a reader sees
-        that its totals are a lower bound.
+        read and how many of THIS pass's shards came in uncounted; on a full
+        pass the root object the invoke wrote carries the same marker — the
+        only place a reader sees that its totals are a lower bound (a partial
+        pass's tally can differ from it: ``test_leaf_temporal.py``).
         """
         import shutil
 
