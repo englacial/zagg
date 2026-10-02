@@ -293,6 +293,32 @@ class TestDamage:
             for m in entry["mismatches"]
         )
 
+    def test_every_all_time_fold_must_say_it_is_one_sampled_or_not(self, store):
+        nodes = sorted({d[:6] for d in SHARDS})  # order 4: two nodes, one sampled
+        assert len(nodes) == 2
+        for node in nodes:
+            _set_attrs(
+                store / _rel(node, "all.zarr"),
+                lambda a: a["zagg_overview"].update(window="2019"),
+            )
+        report = validate_pyramid(str(store), sample_windows=1, sample_nodes=1, sample_cells=1)
+        found = report["checks"]["all_time"]["mismatches"]
+        for node in nodes:
+            assert any(m.startswith(f"{node}[all]: attrs spec/window") for m in found)
+
+    def test_a_window_overview_carrying_source_windows_fails_read_back(self, store):
+        _set_attrs(
+            store / _rel("-51", "2018.zarr"),
+            lambda a: a["zagg_overview"].update(
+                source_windows={"folded": 1, "missing": 0, "unreadable": 0}
+            ),
+        )
+        report = validate_pyramid(str(store), sample_windows=1, sample_nodes=1, sample_cells=1)
+        assert any(
+            m.startswith("-51[2018]: 'zagg_overview' carries source_windows")
+            for m in report["checks"]["readback"]["mismatches"]
+        )
+
     def test_a_missing_window_column_fails_by_leaf_and_window(self, store):
         leaf = SHARDS[0]
         shutil.rmtree(store / _rel(leaf[:-1], f"{leaf[-1]}/2019.pyramid.zarr"))

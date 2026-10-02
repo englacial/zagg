@@ -509,11 +509,18 @@ def _window_checks(
         for attr, artifacts in ((OVERVIEW_ATTR, probes[window]), (COLUMN_ATTR, col_probes[window])):
             for name, attrs in sorted(artifacts.items()):
                 block = (attrs or {}).get(attr)
-                if isinstance(block, dict) and block.get("window") != window:
-                    counted["readback"] += 1
+                if not isinstance(block, dict):
+                    continue
+                counted["readback"] += 1
+                if block.get("window") != window:
                     errors["readback"].append(
                         f"{name}[{window}]: {attr!r} records window {block.get('window')!r} — "
                         f"the artifact is another window's, misfiled under this name"
+                    )
+                if "source_windows" in block:
+                    errors["readback"].append(
+                        f"{name}[{window}]: {attr!r} carries source_windows, which §4.4 puts "
+                        f"on the all-time fold only"
                     )
 
     windows = sorted(by_window)
@@ -658,6 +665,9 @@ def _all_time_check(
     *not applicable*, after the same probe, naming any committed fold found.
     """
     from zagg.store import open_object_store
+    from zagg.sweep_overview import OVERVIEW_ATTR
+    from zagg.sweep_stage import OVERVIEW_SPEC_V2
+    from zagg.windows import SCHEDULE_NONE_TOKEN
 
     orders = {k: sorted({n for w in declared for n in declared[w][k]}) for k, _ in ladder}
     probed, errored = _probe_nodes(
@@ -713,6 +723,18 @@ def _all_time_check(
     store = open_object_store(harness.store_root, **harness.store_kwargs)
     errors: dict = {name: [] for name in _VALUE_CHECKS}
     counted = dict.fromkeys(_VALUE_CHECKS, 0)
+    # The artifact's identity, on EVERY node (the attrs are in hand): an
+    # all.zarr that records a window, or another spec, is not this fold.
+    for node, attrs in sorted(committed.items()):
+        prov = attrs.get(OVERVIEW_ATTR)
+        if isinstance(prov, dict) and (prov.get("spec"), prov.get("window")) != (
+            OVERVIEW_SPEC_V2,
+            SCHEDULE_NONE_TOKEN,
+        ):
+            errors["readback"].append(
+                f"{node}[all]: attrs spec/window ({prov.get('spec')!r}, {prov.get('window')!r}) "
+                f"!= ({OVERVIEW_SPEC_V2!r}, {SCHEDULE_NONE_TOKEN!r}) — not the all-time fold"
+            )
     checked = 0
     for k, r in ladder:
         nodes = [n for n in orders[k] if n in committed]
@@ -828,24 +850,19 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
     """
     from zagg.pyramid_check_v2 import _as_int
     from zagg.sweep_overview import OVERVIEW_ATTR
-    from zagg.sweep_stage import OVERVIEW_SPEC_V2, STAGE_GATHER, STAGE_MERGE, classify_level
-    from zagg.windows import SCHEDULE_NONE_TOKEN
+    from zagg.sweep_stage import STAGE_GATHER, STAGE_MERGE, classify_level
 
     name = f"{node}[all]"
     if not isinstance(prov, dict):
         if prov is not None:
             errors["readback"].append(f"{name}: {OVERVIEW_ATTR!r} attrs are not a mapping")
         return False  # absent: _check_node's read-back leg names it
-    out = errors["readback"]
-    if prov.get("spec") != OVERVIEW_SPEC_V2:
-        out.append(f"{name}: attrs spec {prov.get('spec')!r} != {OVERVIEW_SPEC_V2!r}")
+    out = errors["readback"]  # spec and window: checked on every node by the caller
     if _as_int(prov.get("order")) != int(k) or _as_int(prov.get("cell_order")) != int(r):
         out.append(
             f"{name}: attrs order/cell_order ({prov.get('order')}, {prov.get('cell_order')}) "
             f"!= level entry ({k}, {r})"
         )
-    if prov.get("window") != SCHEDULE_NONE_TOKEN:
-        out.append(f"{name}: attrs window {prov.get('window')!r} != {SCHEDULE_NONE_TOKEN!r}")
     if prov.get("regime") != STAGE_MERGE:
         out.append(
             f"{name}: regime {prov.get('regime')!r} != {STAGE_MERGE!r} — the all-time fold is a "

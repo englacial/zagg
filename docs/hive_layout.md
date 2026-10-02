@@ -799,8 +799,10 @@ window's objects, and every finding names the node and the window
   name — rerun with `--roster list`. A recorded shard missing from the MOC is
   the MOC lagging (its write is fail-open) and is only named.
 - `readback` — each artifact's `window` key must be the window it is filed
-  under (checked on every artifact, not a sample), plus the per-window
-  regime, `merges_from_raw` and `source_children` of §4.4.
+  under, and only the all-time fold may carry `source_windows` (both checked
+  on every artifact, not a sample — the all-time folds' `window: all` too,
+  reported under `all_time`), plus the per-window regime, `merges_from_raw`
+  and `source_children` of §4.4 on the sampled nodes.
 - `counts` / `digests` / `composition` — a window's overview re-folded from
   **that window's** leaf columns, and its columns from **that window's**
   leaves, for `--sample-windows` windows (default 3). An overview built
