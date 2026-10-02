@@ -438,11 +438,15 @@ def _records_check(
     Per sampled ``(shard, window)`` leaf of a store declaring a per-centroid
     temporal field, the leaf is read as the families sweep reads it
     (:func:`zagg.leaf_temporal.leaf_contribution` — record first): a usable
-    record passes, a leaf holding no clocked observation needs none, and a
-    leaf whose observations are clocked but that has no usable record — the
-    sweep would count it as coverage only (``uncounted_shards``) — fails by
+    record passes when its envelope word lies inside the window (§10.6 —
+    one accumulator per window), a leaf holding no clocked observation needs
+    none, and a leaf whose observations are clocked but that has no usable
+    record — the sweep would count it as coverage only
+    (``uncounted_shards``) — or whose record spans past its window fails by
     leaf and window. Its own generator (same ``seed``), as ``coordinates``.
     """
+    from mortie import toc2time
+
     from zagg.coverage_toc import temporal_cell_order, temporal_fields
     from zagg.grids.morton import morton_word
     from zagg.hive import read_commit, shard_leaf_path
@@ -454,6 +458,7 @@ def _records_check(
     if not fields or cell_order is None:
         checks["records"] = _entry("skip", "no per-centroid temporal field declared (§10)")
         return
+    bounds = partial(_window_envelope, manifest.get("temporal") or {})
     leaves = list(refs)
     if not full and len(leaves) > sample_nodes:
         picks = np.random.default_rng(seed).choice(len(leaves), sample_nodes, replace=False)
@@ -477,14 +482,19 @@ def _records_check(
         if got is None:
             n_empty += 1
         elif route == "record":
-            n_record += 1
+            lo, hi = (int(x) for x in toc2time(got[0]))
+            w_lo, w_hi = bounds(window)
+            if lo < w_lo or hi > w_hi:
+                errors.append(f"{label}: record's envelope spans past window {window!r}")
+            else:
+                n_record += 1
         else:
             errors.append(f"{label}: clocked observations but no usable temporal.toc record")
     if errors:
         checks["records"] = _entry(
             "fail",
-            f"{len(errors)} window leaf/leaves would be counted as coverage only "
-            f"(§10.3 uncounted): {errors[:8]}",
+            f"{len(errors)} window leaf/leaves lack a usable record of their own window "
+            f"(§10.6): {errors[:8]}",
         )
         return
     checks["records"] = _entry(
@@ -492,6 +502,27 @@ def _records_check(
         f"{n_record} window leaf/leaves carry their record; {n_empty} hold no clocked "
         f"observation (none needed) — of {len(leaves)} sampled",
     )
+
+
+def _window_envelope(temporal: dict, label: str) -> tuple[int, int]:
+    """The widest ``toc2time`` envelope a record of window ``label`` can hold.
+
+    The join of the window's first and last instants, decoded as a record's
+    word is: its bounds are conservative (snapped outward to the word grid),
+    so an honest record's envelope — the join of instants inside ``[start,
+    end)`` — lies within them, and a record carrying another window's
+    observations does not.
+    """
+    from mortie import time2toc, toc2time, toc_reduce
+
+    from zagg.time_axis import _internal_ns
+    from zagg.windows import window_range
+
+    start, end = window_range(label, temporal.get("schedule"), temporal.get("windows"))
+    ns = _internal_ns(np.array([t.replace(tzinfo=None) for t in (start, end)], "datetime64[us]"))
+    words = np.asarray(time2toc(np.array([ns[0], ns[1] - 1], dtype=np.uint64)), dtype=np.uint64)
+    lo, hi = toc2time(int(toc_reduce(words)))
+    return int(lo), int(hi)
 
 
 def _artifact_probes(

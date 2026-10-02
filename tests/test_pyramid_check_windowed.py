@@ -593,6 +593,43 @@ class TestATemporalStore:
         detail = report["checks"]["records"]["detail"]
         assert f"{SHARDS[1]}[2019]: clocked observations but no usable temporal.toc" in detail
 
+    def test_a_record_of_another_windows_observations_fails_by_leaf_and_window(
+        self, clocked, tmp_path
+    ):
+        # A shared accumulator, or a per-window regression, on disk: the
+        # 2018 and 2020 leaves carry 2019's record, which loads and matches
+        # the declaration but counts the wrong window.
+        from zagg.leaf_temporal import LEAF_TEMPORAL_NAME
+
+        store = tmp_path / "store"
+        shutil.copytree(clocked, store)
+        paths = {w: next(store.rglob(f"{SHARDS[0]}_{w}.zarr")) for w in WINDOWS}
+        paths = {w: next(leaf.rglob(LEAF_TEMPORAL_NAME)) for w, leaf in paths.items()}
+        for w in ("2018", "2020"):
+            paths[w].write_text(paths["2019"].read_text())
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["records"]
+        detail = report["checks"]["records"]["detail"]
+        assert detail.startswith("2 window leaf/leaves lack a usable record of their own window")
+        for w in ("2018", "2020"):
+            assert f"{SHARDS[0]}[{w}]: record's envelope spans past window '{w}'" in detail
+
+    def test_a_record_reaching_its_windows_edges_is_inside_it(self):
+        # The envelope's bounds snap outward to the word grid; observations at
+        # the window's first and last microsecond must still pass.
+        from mortie import time2toc, toc2time
+
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+        from zagg.pyramid_check_windowed import _window_envelope
+        from zagg.time_axis import _internal_ns
+
+        edges = np.array(["2019-01-01", "2019-12-31T23:59:59.999999"], dtype="datetime64[us]")
+        acc = LeafTemporalAccumulator()
+        acc.add_words(np.asarray(time2toc(_internal_ns(edges)), dtype=np.uint64))
+        lo, hi = (int(x) for x in toc2time(acc.finish()[0]))
+        w_lo, w_hi = _window_envelope({"schedule": "yearly"}, "2019")
+        assert w_lo <= lo and hi <= w_hi
+
 
 def _drop_records(store: Path, keep) -> None:
     """Rewrite the run records without the rows ``keep`` rejects."""

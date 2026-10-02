@@ -3939,8 +3939,9 @@ record and stamps: that is the absence rule below, not a failure.
 
 **One record per window leaf.** On a windowed store (§4.2) every
 `{id}_{window}.zarr` is a leaf, so each carries its own record, folded from
-that window's observations alone: its envelope word lies inside the window,
-and the shard's contribution to the root section is the composition of its
+that window's observations alone: its envelope word lies inside the window
+(its decoded bounds may pass the window's ends only by the word grid's outward
+snap, §8), and the shard's contribution to the root section is the composition of its
 window leaves' records (§10.2, §10.3). The rule does not depend on which
 unit wrote the leaf. A writer that emits several windows of a shard from one
 read (zagg's bulk per-shard unit,
