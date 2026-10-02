@@ -775,7 +775,12 @@ def write_stage_column(
     (:func:`column_members`). Returns ``{"object", "source_children"}`` — the
     basename and the relay member's coverage counters — or ``None`` when the
     relay member folds nothing, in which case NOTHING is written and an
-    existing column is left as it was.
+    existing column is left as it was. Otherwise the committed column is
+    cleared BEFORE the streamed reads that feed it, so a read that fails
+    mid-stream leaves it cleared and unstamped: the next tuple reads the child
+    as missing (under-coverage, recorded) until a later pass rewrites it — the
+    column is a regenerable cache (spec §4.1). :func:`stage_node` therefore
+    retries a failed column once, from fresh readers, before counting it.
 
     The §4.6 column artifact shape (``zagg-column/1``) with the stage
     regime: every group is a PURE GATHER of the child columns' members at
@@ -1230,15 +1235,16 @@ def stage_node(
     ):
         counts["columns_current"] += 1
         return
-    granules, ranges = 0, []
-    for row in readers.values():
-        for reader in row:
-            if _is_reader(reader) and reader.stamp:
-                granules += int(reader.stamp.get("granule_count") or 0)
-                if reader.stamp.get("time_range") is not None:
-                    ranges.append(reader.stamp["time_range"])
-    try:
-        written = write_stage_column(
+
+    def _write_column():
+        granules, ranges = 0, []
+        for row in readers.values():
+            for reader in row:
+                if _is_reader(reader) and reader.stamp:
+                    granules += int(reader.stamp.get("granule_count") or 0)
+                    if reader.stamp.get("time_range") is not None:
+                        ranges.append(reader.stamp["time_range"])
+        return write_stage_column(
             store_root,
             node,
             _dense_rows(readers, node, depth=child_order - dispatch),
@@ -1248,13 +1254,24 @@ def stage_node(
             node_order=dispatch,
             relay=relay,
             cell_order=cell_order,
-            generation=fresh_gen,
+            generation=_summed_generation(list(readers.values())),
             window=window,
             time_range=union_time_range(*ranges) if ranges else None,
             granule_count=granules,
             run_id=run_id,
             store_kwargs=store_kwargs,
             meter=meter,
+        )
+
+    try:
+        # The column is cleared before its streamed reads, so a read failing
+        # mid-stream would leave the node with none: ANY failure is retried
+        # once, from fresh readers, before it is counted.
+        written = refold_on_move(
+            _write_column,
+            _fresh_readers,
+            f"the stage column at node {node} window {key!r}",
+            retry_on=(Exception,),
         )
     except ForeignSweepError:
         raise

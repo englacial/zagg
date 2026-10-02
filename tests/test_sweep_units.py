@@ -726,6 +726,49 @@ class TestStreamedFold:
         assert not set(map(id, closes[0])) & set(map(id, closes[1]))  # fresh readers
         assert len(_overviews(root, "all.zarr")) == 7
 
+    @pytest.mark.parametrize("failures", (1, 2))
+    def test_a_read_failure_mid_column_is_retried_once(self, tmp_path, monkeypatch, failures):
+        # The column is cleared before its streamed reads: one failed read
+        # costs a retry from fresh readers, not the node's column. Two in a
+        # row are counted, and leave the column cleared until a later pass.
+        import zagg.sweep_stage as stage_mod
+
+        self._swept_column(tmp_path, monkeypatch)
+        root = tmp_path / "s"
+        manifest = json.loads((root / MANIFEST_NAME).read_text())
+        column = root / "-2" / "1" / "1" / "all.pyramid.zarr"  # node -211's, the first written
+        assert dict(_artifact(root, "-2/1/1/all.pyramid.zarr").attrs)["morton_hive_commit"]
+        monkeypatch.setattr(stage_mod, "_stage_column_current", lambda *a, **k: False)
+        real_write, real_fetch = stage_mod.write_stage_column, fold_mod._fetch
+        state = {"in": False, "n": 0, "failed": 0}
+
+        def write(*args, **kwargs):
+            state["in"], state["n"] = True, 0
+            try:
+                return real_write(*args, **kwargs)
+            finally:
+                state["in"] = False
+
+        def fetch(*args, **kwargs):
+            if state["in"] and state["failed"] < failures:
+                state["n"] += 1
+                if state["n"] == 2:
+                    state["failed"] += 1
+                    raise OSError("simulated transient read failure")
+            return real_fetch(*args, **kwargs)
+
+        monkeypatch.setattr(stage_mod, "write_stage_column", write)
+        monkeypatch.setattr(fold_mod, "_fetch", fetch)
+        summary = sweep_stage_pass(
+            str(root), manifest, {d: {None} for d in LEAVES}, run_id="B", tuple_width=1
+        )
+        assert state["failed"] == failures
+        assert sum(row["failed"] for row in summary["stages"]) == failures - 1
+        stamp = dict(zarr.open_group(open_store(str(column)), mode="r").attrs).get(
+            "morton_hive_commit"
+        )
+        assert (stamp is not None) is (failures == 1)
+
     def test_a_foreign_sweep_is_never_refolded(self):
         calls = []
 
