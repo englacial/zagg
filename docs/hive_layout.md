@@ -242,12 +242,15 @@ output:
   its leaves stands (written by this run, or found current or refused by the
   gate), and the root time-range union takes those leaves' ranges alone. The
   failed window is in none of them. This is one rule on every dispatch path
-  — the local backend, `agg` on Lambda over the sync, async and Event
-  transports, and the `zagg.client` tail that `Run.attach` re-runs
-  (`runner._landed_coverage`, `sweep.leaves_from_stats_records`) — so a
-  backend never sweeps or covers what another would not. The run parquet
-  already carried one row per leaf, the failed window's unsuccessful, so
-  `python -m zagg.sweep`'s run-record discovery sees the same set. Only a
+  that runs a windowed config — the local backend and `agg` on Lambda over
+  the sync, async and Event transports (`runner._landed_coverage`,
+  `sweep.leaves_from_stats_records`) — so a backend never sweeps or covers
+  what another would not. The `zagg.client` tail reads results through the
+  same two readers, but today `zagg.client` and `Run.attach` refuse a
+  windowed config, so a partly failed windowed run's tail is recovered with
+  `python -m zagg.sweep`, not by attaching: the run parquet already carried
+  one row per leaf, the failed window's unsuccessful, so its run-record
+  discovery sees the same set. Only a
   worker that RETURNED reports its landed windows: an invoke killed outright
   (timeout, OOM) leaves no body, and on the fleet no D20 sidecar either, so
   the re-run rewrites those windows rather than skipping them.
