@@ -1635,13 +1635,14 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   in the store's region. The operator's host reads nothing from the store
   and writes nothing: it needs Lambda invoke rights only (on a Source
   Cooperative store the worker role is the only writer), and nothing leaves
-  the region but the report. Name the function with `--function-name`, or
-  set `ZAGG_LAMBDA_FUNCTION_NAME` — there is no `process-shard` default
-  (the name is used verbatim; the run config's
-  `worker:` suffix is not applied, since the only copy of that config the
-  command could consult is the run's dispatch manifest, and it does not
-  read the store). With neither it refuses rather than finalize from the
-  host. A check that does not hold comes back as a refusal with its reason;
+  the region but the report. The function is `--function-name`, else
+  `ZAGG_LAMBDA_FUNCTION_NAME`, else `process-shard` — the dispatchers' own
+  default for a config with no `worker:` block (the run config's `worker:`
+  suffix is never applied, since the only copy of that config the command
+  could consult is the run's dispatch manifest, and it does not read the
+  store). The report names the function invoked as `function_name`; the
+  command never finalizes from the host. A check that does not hold comes
+  back as a refusal with its reason;
   a deployed worker older than this operation fails on the missing `config`
   before any write — deploy a current worker. A local store root finalizes
   in-process.

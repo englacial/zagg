@@ -44,8 +44,9 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
   worker's report — the checks, the commit, the tag and the retention are
   the worker's, and the operator's host reads nothing from the store and
   writes nothing (an operator holds invoke rights, not the bucket's; and
-  the repo is not read out of its region). Only a local store finalizes
-  in-process.
+  the repo is not read out of its region). The worker is
+  ``--function-name``, else ``ZAGG_LAMBDA_FUNCTION_NAME``, else
+  ``process-shard``. Only a local store finalizes in-process.
 
     python -m zagg.icechunk_ops <store> set-attrs <path> '<json>'
     python -m zagg.icechunk_ops <store> declare-pyramid <config.yaml>
@@ -574,15 +575,16 @@ def finalize(
     role), and a retention pass from outside the store's region would read
     the repo out of it.
 
-    The function must be named explicitly: ``function_name``
-    (``--function-name``), else the ``ZAGG_LAMBDA_FUNCTION_NAME``
-    environment variable, verbatim. Unlike
-    :func:`zagg.runner._resolve_function_name` there is no ``process-shard``
-    default, and the run config's ``worker:`` suffix is not applied: that
-    config is in the run's dispatch manifest, which this host does not read.
-    With neither, the operation refuses. The event carries no config, so a
-    deployed worker that predates ``operator_checks`` fails on the missing
-    key before any write instead of tagging without the checks.
+    The function is ``function_name`` (``--function-name``), else the
+    ``ZAGG_LAMBDA_FUNCTION_NAME`` environment variable, else
+    :data:`zagg.runner.DEFAULT_FUNCTION_NAME` (``process-shard``) — what
+    :func:`zagg.runner._resolve_function_name` gives a config with no
+    ``worker:`` block. The run config's ``worker:`` suffix is never applied:
+    that config is in the run's dispatch manifest, which this host does not
+    read. The report names the function under ``function_name``. The event
+    carries no config, so a deployed worker that predates ``operator_checks``
+    fails on the missing key before any write instead of tagging without the
+    checks.
 
     Raises :class:`FinalizeRefusedError` with the worker's reason when a
     precondition does not hold, ``RuntimeError`` when the invoke failed or
@@ -590,16 +592,11 @@ def finalize(
     """
     if _is_local(store_root):
         return finalize_run(store_root, run_id, store_kwargs=store_kwargs)
-    function_name = function_name or os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME")
-    if not function_name:
-        raise FinalizeRefusedError(
-            f"finalize on {store_root} runs in a Lambda worker (the operator's host does not "
-            f"write the store), and no function is named: pass --function-name <name> "
-            f"(function_name=) or set ZAGG_LAMBDA_FUNCTION_NAME to the deployed worker "
-            f"function, e.g. process-shard"
-        )
-    from zagg.runner import _invoke_lambda_icechunk_finalize
+    from zagg.runner import DEFAULT_FUNCTION_NAME, _invoke_lambda_icechunk_finalize
 
+    function_name = (
+        function_name or os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME") or DEFAULT_FUNCTION_NAME
+    )
     if lambda_client is None:
         lambda_client = _lambda_client(store_kwargs.get("region"))
     out = _invoke_lambda_icechunk_finalize(
@@ -623,7 +620,7 @@ def finalize(
             f"the worker {function_name} {outcome} run {run_id}: {out['error']} "
             f"(nothing was written from this host{hint})"
         )
-    return out
+    return {**out, "function_name": function_name}
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -648,7 +645,7 @@ def main(argv=None) -> int:
         "--function-name",
         default=None,
         help="the Lambda worker that finalizes an s3:// store (else env "
-        "ZAGG_LAMBDA_FUNCTION_NAME, no default; a local store finalizes in-process)",
+        "ZAGG_LAMBDA_FUNCTION_NAME, else process-shard; a local store finalizes in-process)",
     )
     args = parser.parse_args(argv)
     store_kwargs = {"region": args.region}

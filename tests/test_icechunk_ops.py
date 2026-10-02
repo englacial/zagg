@@ -848,28 +848,51 @@ class TestFinalizeInvoke:
         assert regions == ["us-east-9"]
         out = json.loads(capsys.readouterr().out)
         assert out.pop("invoke_s") >= 0.0
+        assert out.pop("function_name") == "fn"  # the report names the function invoked
         assert out == {k: v for k, v in _REPORT.items() if k not in ("ok", "mode")}
 
     def test_function_name_is_the_flag_then_the_environment(self, monkeypatch):
         monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard-test")
         worker = _Worker(_REPORT)
-        icechunk_ops.finalize(REMOTE, RUN, store_kwargs={}, lambda_client=worker)
-        icechunk_ops.finalize(
+        by_env = icechunk_ops.finalize(REMOTE, RUN, store_kwargs={}, lambda_client=worker)
+        by_flag = icechunk_ops.finalize(
             REMOTE, RUN, store_kwargs={}, lambda_client=worker, function_name="fn"
         )
         assert [name for name, _kind, _event in worker.events] == ["process-shard-test", "fn"]
+        assert [by_env["function_name"], by_flag["function_name"]] == ["process-shard-test", "fn"]
         assert all(event == OPERATOR_EVENT for _name, _kind, event in worker.events)
 
-    def test_refuses_without_a_function_and_never_runs_on_the_host(self, monkeypatch, on_host):
-        # No fallback to an in-process finalize: no invoke, no store access.
+    @pytest.mark.parametrize("env", [None, ""])
+    def test_defaults_to_the_runners_function_and_never_runs_on_the_host(
+        self, monkeypatch, on_host, capsys, env
+    ):
+        # Neither the flag nor the environment (unset, or set empty) names a
+        # function: one invoke at the runner's own default, still no
+        # in-process finalize and no store access from the host.
+        from zagg import runner
+
+        if env is None:
+            monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
+        else:
+            monkeypatch.setenv("ZAGG_LAMBDA_FUNCTION_NAME", env)
+        worker = _Worker(_REPORT)
+        self._client(monkeypatch, worker)
+        with on_host():
+            assert icechunk_ops.main([REMOTE, "finalize", RUN]) == 0
+        assert worker.events == [("process-shard", "RequestResponse", OPERATOR_EVENT)]
+        assert runner.DEFAULT_FUNCTION_NAME == "process-shard"
+        assert json.loads(capsys.readouterr().out)["function_name"] == "process-shard"
+
+    def test_the_default_is_the_runners_rule_without_a_worker_block(self, monkeypatch, cfg):
+        # One default, not two: what the dispatchers resolve for a config with
+        # no ``worker:`` block is what the operator finalize invokes.
+        from zagg import runner
+
         monkeypatch.delenv("ZAGG_LAMBDA_FUNCTION_NAME", raising=False)
-        monkeypatch.setattr(icechunk_ops, "_lambda_client", _fail("built a Lambda client"))
-        with (
-            on_host(),
-            pytest.raises(icechunk_ops.FinalizeRefusedError, match="--function-name") as e,
-        ):
-            icechunk_ops.main([REMOTE, "finalize", RUN])
-        assert "ZAGG_LAMBDA_FUNCTION_NAME" in str(e.value)
+        assert not cfg.worker
+        worker = _Worker(_REPORT)
+        icechunk_ops.finalize(REMOTE, RUN, store_kwargs={}, lambda_client=worker)
+        assert worker.events[0][0] == runner._resolve_function_name(cfg, None)
 
     def test_a_worker_refusal_is_raised_with_its_reason(self, on_host):
         worker = _Worker({"ok": False, "mode": "icechunk_finalize", "refused": "no record"})

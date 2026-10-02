@@ -80,6 +80,9 @@ from zagg.telemetry import billed_seconds
 
 logger = logging.getLogger(__name__)
 
+#: The worker function when nothing names one: the stack's unsuffixed function.
+DEFAULT_FUNCTION_NAME = "process-shard"
+
 
 def _resolve_function_name(config: PipelineConfig, function_name: str | None) -> str:
     """Resolve the Lambda function to invoke (issue #235).
@@ -95,7 +98,7 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
     """
     if function_name is not None:
         return function_name
-    base = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+    base = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", DEFAULT_FUNCTION_NAME)
     worker = config.worker
     if not worker:
         return base
