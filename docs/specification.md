@@ -3246,13 +3246,12 @@ have for the cover sibling:
   zagg's sweep names them in its own per-pass run record
   (`sweep_stats_*.json`, telemetry outside this specification) as
   `pass_uncounted: {count, shards, truncated}` — the decimal ids of the
-  shards **that pass** read coverage-only, capped at 1,024 with the exact
-  `count` beside them
+  shards **that pass** read coverage-only, capped, with the exact `count`
+  and a `truncated` flag beside them
   ([issue #598](https://github.com/englacial/zagg/issues/598)). That list
   is a pass's tally, scoped to the shards the pass visited (one partition's,
   on a partitioned pass); it is not this marker, which is the standing
-  figure for the shards `shards` lists, and a reader MUST NOT substitute
-  one for the other.
+  figure for the shards `shards` lists. The two are not interchangeable.
 
 **What is counted (normative).** Counts have **one source**: the leaf's own
 worker, which folds the ONE clock column every declared field shares and
