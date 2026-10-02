@@ -728,13 +728,14 @@ def _all_time_node(
 
 
 def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) -> bool:
-    """The all-time artifact's ``zagg-overview/2`` attrs vs §4.4; True when stale.
+    """The all-time artifact's ``zagg-overview/2`` attrs vs §4.4; True when not comparable.
 
     ``held`` maps each window committed at the node to its overview's attrs —
     the fold's sources as they are on disk now — and ``n_expected`` counts
     the windows the node is known to have, committed or not. Appends
     read-back findings; returns whether the fold's recorded sources are NOT
-    the ones on disk (so its values are not comparable to them).
+    the ones on disk — stale, or honestly short of committed windows it could
+    not read — so its values are not comparable to them.
     """
     from zagg.pyramid_check_v2 import _as_int
     from zagg.sweep_overview import OVERVIEW_ATTR
@@ -779,25 +780,36 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
     if None in (folded, missing, unreadable):
         out.append(f"{name}: source_windows {sw!r} carries a non-integer counter (§4.4)")
         return True
-    if folded != len(held):
+    # The writer counts a committed window it could not fold (the packed-field
+    # rail fired, §4.3) as ``unreadable``, so the committed windows it SAW are
+    # ``folded + unreadable``; ``short`` of them are in neither the values nor
+    # ``source_children``, and which ones is not recorded.
+    short = len(held) - folded
+    if folded > len(held) or short > unreadable:
         out.append(
-            f"{name}: STALE all-time fold — it folded {sw.get('folded')} window overview(s) and "
-            f"the node now holds {len(held)} committed {sorted(held)}; re-sweep"
+            f"{name}: STALE all-time fold — it folded {folded} window overview(s) "
+            f"({unreadable} unreadable) and the node now holds {len(held)} committed "
+            f"{sorted(held)}; re-sweep"
+        )
+        return True
+    if missing > n_expected - len(held):
+        out.append(
+            f"{name}: STALE all-time fold — it records {missing} missing window(s) and only "
+            f"{n_expected - len(held)} of the node's {n_expected} are uncommitted now; re-sweep"
         )
         return True
     if missing or unreadable:
-        if len(held) == n_expected:
-            out.append(
-                f"{name}: STALE all-time fold — it records source_windows {sw} while all "
-                f"{n_expected} of the node's window overviews are committed; re-sweep"
+        # Honestly short: an absent window already failed ``materialization``.
+        sources.warn(
+            f"{name}: the all-time fold under-covers ({sw}; {n_expected - len(held)} of the "
+            f"node's {n_expected} window(s) uncommitted) — "
+            + (
+                f"its values are not compared: {short} committed window(s) it could not read "
+                f"are not named, and a re-sweep does not clear them (§4.3 rail)"
+                if short
+                else f"compared against the {len(held)} it folded; the next sweep heals it"
             )
-        else:
-            # Honestly short: the absent window already failed ``materialization``.
-            sources.warn(
-                f"{name}: the all-time fold under-covers ({sw}; {n_expected - len(held)} of the "
-                f"node's {n_expected} window(s) uncommitted) — compared against the "
-                f"{len(held)} it folded; the next sweep heals it"
-            )
+        )
     parsed = {window: _source_block(a) for window, a in held.items()}
     bad = sorted(window for window, p in parsed.items() if p is None)
     if bad:
@@ -806,16 +818,24 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
             f"the all-time fold's sources cannot be summed (§4.4)"
             for window in bad
         )
-        return False
+        return bool(short)
+    # Summed over the folded windows only: with ``short`` committed windows
+    # unfolded, the sum over all of them bounds it from above.
     children = {c: sum(p[0][c] for p in parsed.values()) for c in _COUNTERS}
     recorded = prov.get("source_children")
-    if (
-        not isinstance(recorded, dict)
-        or {c: _as_int(recorded.get(c)) for c in children} != children
+    claimed = {c: _as_int(recorded.get(c)) for c in children} if isinstance(recorded, dict) else {}
+    if not (
+        claimed == children
+        or (
+            short
+            and all(
+                isinstance(claimed.get(c), int) and 0 <= claimed[c] <= children[c] for c in children
+            )
+        )
     ):
         out.append(
             f"{name}: source_children {recorded!r} != the folded windows' own counters summed "
-            f"{children} (§4.4)"
+            f"{children}{' (at most)' if short else ''} (§4.4)"
         )
     # §4.5's skip key over the consumed overviews: their blocks' leaf counts
     # summed, the newest leaf stamp among them, and every run id they relay
@@ -840,7 +860,7 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
             f"window overviews' blocks summed {summed} (§4.4/§4.5); re-sweep"
         )
         return True
-    return False
+    return bool(short)
 
 
 def _str_list(value) -> bool:

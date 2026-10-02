@@ -318,6 +318,78 @@ class TestDamage:
             for m in report["checks"]["all_time"]["mismatches"]
         )
 
+    def test_an_honestly_unreadable_window_passes_with_a_warning(self, store):
+        # The packed-field rail fired on one committed window (§4.3): the
+        # writer counts it unreadable, folds the other two, and sums
+        # source_children over those; a re-sweep cannot clear it, so it is
+        # not stale. Its values are not compared, and the report says so.
+        def edit(a):
+            sc = a["zagg_overview"]["source_children"]
+            a["zagg_overview"]["source_windows"] = {"folded": 2, "missing": 0, "unreadable": 1}
+            a["zagg_overview"]["source_children"] = {**sc, "folded": sc["folded"] - 1}
+
+        _set_attrs(store / _rel("-5", "all.zarr"), edit)
+        report = validate_pyramid(str(store), full=True)
+        assert report["passed"], format_report(report)
+        assert any(
+            w.startswith("-5[all]: the all-time fold under-covers") and "not compared" in w
+            for w in report["warnings"]
+        )
+
+    def test_an_unreadable_count_that_cannot_cover_the_node_is_stale(self, store):
+        _set_attrs(
+            store / _rel("-5", "all.zarr"),
+            lambda a: a["zagg_overview"].update(
+                source_windows={"folded": 1, "missing": 0, "unreadable": 1}
+            ),
+        )
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        (finding,) = report["checks"]["all_time"]["mismatches"]
+        assert finding.startswith("-5[all]: STALE all-time fold — it folded 1 window overview(s)")
+
+    @pytest.mark.parametrize("torn", [True, False])
+    def test_a_missing_window_is_honest_only_while_it_is_uncommitted(self, store, torn):
+        from zagg.hive import COMMIT_ATTR
+
+        folded = ["2018", "2020"] if torn else list(WINDOWS)
+        if torn:  # the 2019 unit died before its stamp: the close counts it missing
+            _set_attrs(store / _rel("-511", "2019.zarr"), lambda a: a.pop(COMMIT_ATTR))
+        # The provenance the close records over the windows it folded (§4.4).
+        attrs = [_attrs(store / _rel("-511", f"{w}.zarr")) for w in folded]
+        blocks = [a["zagg_overview"] for a in attrs]
+        generation = {
+            "n_leaves": sum(b["generation"]["n_leaves"] for b in blocks),
+            "max_leaf_timestamp": max(b["generation"]["max_leaf_timestamp"] for b in blocks),
+            "run_ids": sorted(
+                {r for b in blocks for r in b["generation"].get("run_ids") or []}
+                | {a[COMMIT_ATTR]["run_id"] for a in attrs}
+            ),
+        }
+        _set_attrs(
+            store / _rel("-511", "all.zarr"),
+            lambda a: a["zagg_overview"].update(
+                source_windows={"folded": len(folded), "missing": 1, "unreadable": 0},
+                generation=generation,
+            ),
+        )
+        report = validate_pyramid(str(store), full=True)
+        stale = [
+            m
+            for m in report["checks"]["all_time"].get("mismatches", [])
+            if m.startswith("-511[all]: STALE")
+        ]
+        under = [w for w in report.get("warnings", []) if w.startswith("-511[all]: the all-time")]
+        if torn:
+            # Its absence fails materialization; the fold itself is honest.
+            assert report["materialization"]["partial"] == ["-511[2019]"]
+            assert not stale and under
+        else:
+            assert stale == [
+                "-511[all]: STALE all-time fold — it records 1 missing window(s) and only 0 of "
+                "the node's 3 are uncommitted now; re-sweep"
+            ]
+
     @pytest.mark.parametrize(
         ("key", "value"),
         [("generation", "bogus"), ("generation", {"n_leaves": "x"}), ("source_children", [1])],
