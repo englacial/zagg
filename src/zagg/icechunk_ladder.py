@@ -353,13 +353,15 @@ def _overview_units(
     """Ref entries of every overview object under ``node`` at the tuple's orders.
 
     One unit per (level, ROW): a windowed store's node carries one overview
-    object per window (``{node}_{window}.zarr``, D23) plus ``all.zarr`` for
-    the cross-window fold, and each lands at its own row (§11.2, issue #584
-    phase 2). ``rows`` is the repo's row list, so an unwindowed store asks
-    for ``all.zarr`` alone and plans exactly what it did before. A row whose
-    object this node has not written contributes no entry
-    (:func:`~zagg.icechunk_refs.object_ref_plan` skips a missing object) and
-    so no unit.
+    object per window (``{window}.zarr``, D23) plus ``all.zarr`` for the
+    cross-window fold, and each lands at its own row (§11.2, issue #584
+    phase 2). ``rows`` are the rows THIS RUN writes under the node
+    (:func:`zagg.sweep_units.node_rows`), never the repo's whole list: an
+    unwindowed store asks for ``all.zarr`` alone and plans exactly what it
+    did before, and an append plans its new window rather than every window
+    the store ever allocated. A row whose object this node has not written
+    contributes no entry (:func:`~zagg.icechunk_refs.object_ref_plan` skips
+    a missing object) and so no unit.
     """
     from zagg.grids.morton import morton_word
     from zagg.sweep_overview import _node_at, _overview_basename
@@ -525,8 +527,13 @@ def stage_node_refs(
         store_root, node, orders, level_by_order, fields, candidates, store_kwargs, rows=rows
     )
     # The leaf tuple reads one carrier per (leaf, WINDOW); the ``all`` row
-    # has no base leaf of its own (§11.2), so it names no leaf read.
-    windows = [None] if rows == [ALL_ROW] else [row for row in rows if row != ALL_ROW]
+    # has no base leaf of its own (§11.2), so it names no leaf read. A
+    # windowed node with nothing but the fold to write therefore reads no
+    # leaf at all, where an UNWINDOWED store's one ``all`` row IS its leaf
+    # (``{id}.zarr``) — the store is unwindowed exactly when its repo holds
+    # that row and no other (``icechunk_rows.store_rows``).
+    unwindowed = list(block.get("rows") or [ALL_ROW]) == [ALL_ROW]
+    windows = [row for row in rows if row != ALL_ROW] or ([None] if unwindowed else [])
     # Which of the three roles this tuple plays (module docstring, §11.4).
     commits_all = dispatch <= commit_order < child_order and not per_leaf
     column_only = dispatch > commit_order and not per_leaf
