@@ -1292,6 +1292,49 @@ class TestHandlerSweepResponse:
         # The leaves rode inline: no work set was derived to charge for.
         assert body["discover_s"] is None
 
+    def test_response_surfaces_the_temporal_routes_and_the_root_marker(self, tmp_path):
+        """The fleet path of issue #575: the worker-side sweep IS the production sweep.
+
+        One shard with its worker's record and one without. The response (and
+        the durable store-root record it names) reports how each leaf was
+        read and how many of THIS pass's shards came in uncounted; on a full
+        pass the root object the invoke wrote carries the same marker — the
+        only place a reader sees that its totals are a lower bound (a partial
+        pass's tally can differ from it: ``test_leaf_temporal.py``).
+        """
+        import shutil
+
+        from zagg.hive import read_root_coverage, shard_leaf_path
+
+        mod = _handler_module()
+        root = tmp_path / "temporal"
+        shutil.copytree(Path(__file__).parent / "data" / "spec" / "temporal", root)
+        words = [int(morton_word(d)) for d in ("11213", "11214")]
+        recordless = Path(shard_leaf_path(str(root), words[1]))
+        shutil.copytree(shard_leaf_path(str(root), words[0]), recordless)
+        (recordless / "temporal.toc").unlink()
+        for name in ("coverage.moc", "coverage.toc"):
+            (root / name).unlink()
+        response = mod._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(root),
+                "leaves": [[w, None] for w in words],
+                "families": ["moc"],
+            }
+        )
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        moc = body["families"]["moc"]
+        assert moc["temporal_routes"] == {"records": 1, "raw": 1}
+        assert moc["temporal_shards"] == 2 and moc["uncounted_shards"] == 1
+        durable = json.loads((root / body["record"]).read_text())
+        assert durable["families"]["moc"]["temporal_routes"] == moc["temporal_routes"]
+        block = read_root_coverage(str(root))["temporal"]["counts"]
+        assert block["uncounted_shards"] == 1
+        # Read-only on the leaves: the invoke wrote no record back.
+        assert not (recordless / "temporal.toc").exists()
+
     def test_discovery_path_reports_its_own_span(self, tmp_path):
         # discover_leaves is a LIST + a parquet read per run record; it is not
         # inside run_sweep's span, so it gets its own field rather than being

@@ -207,6 +207,7 @@ def process_shard(
     windows: list[dict] | None = None,
     time_field: str | None = None,
     emit_window: Callable | None = None,
+    temporal_out=None,
 ) -> Tuple[pd.DataFrame, ProcessingMetadata]:
     """Process one shard: read granules, filter to this shard, aggregate, return df.
 
@@ -298,6 +299,12 @@ def process_shard(
         appended after the shard's reads are grouped. The hive write path uses
         it to derive the commit stamp's coverage payload; ``None`` (default)
         records nothing — byte-for-byte unchanged.
+    temporal_out : LeafTemporalAccumulator, optional
+        The leaf's temporal-record accumulator (issue #575). When given, every
+        chunk's toc words are folded into it as they are encoded — on the
+        pooled path and both spill regimes — so the hive write path can
+        write the leaf's ``temporal.toc`` record with no second pass;
+        ``None`` (default) folds nothing.
     time_range_of : str, optional
         Column name whose observed ``[min, max]`` is reported as
         ``metadata["time_range"]`` (issue #246): the ACTUAL dataset-unit time
@@ -508,7 +515,7 @@ def process_shard(
     streaming_cfg = get_streaming(config)
     spill_mode = streaming_cfg is not None and streaming_cfg["mode"] == "spill"
 
-    def _make_buffered():
+    def _make_buffered(temporal=None):
         if spill_mode:
             return SpillAggregator(
                 config,
@@ -516,6 +523,7 @@ def process_shard(
                 handoff,
                 streaming_cfg["buffer_granules"],
                 block_bytes=streaming_cfg["block_bytes"],
+                temporal_out=temporal,
             )
         return StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
 
@@ -531,7 +539,7 @@ def process_shard(
         bins = WindowBins(windows, time_field, _make_buffered if streaming_cfg else None)
         buffered = None
     else:
-        buffered = None if streaming_cfg is None else _make_buffered()
+        buffered = None if streaming_cfg is None else _make_buffered(temporal_out)
 
     # Per-phase timing (issue #100; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default, and the cost is a
@@ -792,6 +800,7 @@ def process_shard(
         write_chunk=None,
         ragged_out=None,
         occupied_out=None,
+        temporal_out=None,
     ):
         if buffered.empty if buffered is not None else not all_reads:
             # Distinguish a genuinely-empty read from one where a group read raised
@@ -1001,6 +1010,7 @@ def process_shard(
                     # Already gathered for the precompute above — the toc hoist reuses
                     # it instead of rebuilding the same index (review finding, PR #478).
                     chunk_pooled=chunk_pooled,
+                    temporal_out=temporal_out,
                 )
             cells_with_data += cwd
             # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
@@ -1118,6 +1128,7 @@ def process_shard(
             write_chunk=write_chunk,
             ragged_out=ragged_out,
             occupied_out=occupied_out,
+            temporal_out=temporal_out,
         )
 
     # Bulk multi-window emit (issue #586 phase 2): one aggregate pass per

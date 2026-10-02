@@ -83,11 +83,20 @@ class TestCollect:
         _grid_, root, versioned, legacy, (va, vb, vc) = _store(monkeypatch, cfg, tmp_path)
         leaf = hive.shard_leaf_path(root, versioned)
         legacy_leaf = hive.shard_leaf_path(root, legacy)
+        # The §10.6 temporal record (issue #575) lives in the version and has
+        # no reference of its own: it goes with a collected version, whole,
+        # and stays with a kept one.
+        for version in (va, vc):
+            (Path(leaf) / version / "temporal.toc").write_text("{}")
+        objects = tool.collect(root, store_kwargs={})["targets"][0]["objects"]
         before = {p for p in Path(legacy_leaf).rglob("*")}
         report = tool.collect(root, store_kwargs={}, execute=True)
         assert report["deleted"] == 1
+        assert report["targets"][0]["objects"] == objects
+        assert objects == sum(1 for p in (Path(leaf) / vb).rglob("*") if p.is_file()) + 1
         assert _versions(leaf) == sorted([vb, vc])
         assert not (Path(leaf) / va).exists()
+        assert (Path(leaf) / vc / "temporal.toc").exists()
         assert {p for p in Path(legacy_leaf).rglob("*")} == before
         # Idempotent: a second pass finds nothing.
         assert tool.collect(root, store_kwargs={})["targets"] == []

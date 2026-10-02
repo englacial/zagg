@@ -297,6 +297,9 @@ class TestLifecycle:
         (shard,) = _shards(grid, 1)
         v = _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id=RUN_A)["leaf_version"]
         leaf = hive.shard_leaf_path(root, shard)
+        # The §10.6 temporal record (issue #575) is a version object like the
+        # arrays beside it: the touch must not reach it.
+        Path(f"{leaf}/{v}/temporal.toc").write_text("{}")
         aged = 1_000_000_000
         for dirpath, _dirs, files in os.walk(os.path.dirname(leaf)):
             for name in files:
@@ -304,6 +307,7 @@ class TestLifecycle:
         counts = lifecycle.touch_current_unit(leaf, current=v)
         assert counts["failed"] == 0 and counts["touched"] >= 2
         version_tree = _mtimes(f"{leaf}/{v}")
+        assert "temporal.toc" in version_tree
         assert all(m == aged for m, _size in version_tree.values())  # never a version object
         assert os.stat(f"{leaf}/zarr.json").st_mtime_ns > aged  # the pointer root
         from zagg.telemetry import granule_ids_path
@@ -342,7 +346,7 @@ class TestLifecycle:
             (rank,) = grid.block_index(shard)
             leaf = zarr.open_group(hive.resolve_leaf(hive.shard_leaf_path(root, shard))[0])["6"]
             np.testing.assert_array_equal(
-                group["6"]["count"][rank * 16 : (rank + 1) * 16], leaf["count"][:]
+                group["6"]["count"][0, rank * 16 : (rank + 1) * 16], leaf["count"][:]
             )
 
 

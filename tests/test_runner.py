@@ -1852,6 +1852,9 @@ class TestSummaryKeysByteIdentical:
         # Icechunk companion init record (issue #580), as on the local backend.
         "icechunk",
         "icechunk_finalize",
+        # How the dispatch manifest went out (issue #588): full / slim /
+        # dropped. LAMBDA-only — a local run records no dispatch manifest.
+        "dispatch_manifest",
         "function_timeout_s",
         "worker_max_s",
         "worker_median_s",

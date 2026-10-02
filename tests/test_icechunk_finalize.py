@@ -179,6 +179,25 @@ class TestNewestOnly:
         assert out["tagged"] is True and "skipped" not in out
         assert _messages(_open(root))[:3] == ["finalize r1", "leaf 123", "init r1"]
 
+    def test_a_run_opened_by_a_split_ratchet_is_the_newest(self, cfg, tmp_path):
+        # A run whose init re-cuts ``split_order`` (§11.5) opens with the
+        # ``split ratchet … r1`` commit, not ``init r1``: it still marks r1 as
+        # the newest run, so the reattached finalize tags it.
+        from zagg.grids import from_config
+
+        root = str(tmp_path / "store")
+        grid = from_config(cfg, parent_order=4)
+        cfg.output["icechunk"] = {"split_order": 3}
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r0", store_kwargs={})
+        _finalize(root, "r0")
+        cfg.output["icechunk"] = {"split_order": 2, "commit_order": 2}
+        out = icechunk_refs.init_repo(root, grid, cfg, run_id="r1", store_kwargs={})
+        assert out["split_ratchet"] == {"from": 3, "to": 2}
+        _empty_commit(root, "leaf 123")
+        assert _messages(_open(root))[1] == "split ratchet 3->2 r1"
+        out = _finalize(root, "r1", newest_only=True)
+        assert out["tagged"] is True and "skipped" not in out
+
     def test_existing_tag_is_a_no_op(self, repo):
         root, _grid = repo
         first = _finalize(root, "r0")
@@ -394,6 +413,45 @@ class TestLambdaFinalizeInvoke:
         assert out["skipped"] == "later"
         ((_kind, event),) = client.events
         assert event["newest_only"] is True
+
+    def test_operator_checks_event_carries_no_config(self):
+        # The operator finalize (issue #588): the worker reads the run's
+        # manifest for the config, so a worker predating the flag fails on the
+        # missing key instead of tagging without the checks. A refusal is a
+        # 200 the dispatcher hands back as such, not a fail-open error.
+        from zagg import runner
+
+        refused = {"ok": False, "mode": "icechunk_finalize", "refused": "no staged-sweep record"}
+        client = _Client(_envelope(refused))
+        out = runner._invoke_lambda_icechunk_finalize(
+            client,
+            "fn",
+            "s3://b/p",
+            run_id="r1",
+            operator_checks=True,
+            output_creds_event={"accessKeyId": "a", "secretAccessKey": "s"},
+        )
+        assert out == {"refused": "no staged-sweep record"}
+        ((kind, event),) = client.events
+        assert kind == "RequestResponse"
+        assert event == {
+            "mode": "icechunk_finalize",
+            "store_path": "s3://b/p",
+            "run_id": "r1",
+            "output_credentials": {"accessKeyId": "a", "secretAccessKey": "s"},
+            "newest_only": True,
+            "operator_checks": True,
+        }
+
+    def test_a_dispatcher_call_without_config_raises_before_any_invoke(self):
+        # Only the operator event omits the config; a dispatcher caller that
+        # forgot it would otherwise send ``"config": null`` and fail open.
+        from zagg import runner
+
+        client = _Client(_envelope({"ok": True, "tag": "run-r1"}))
+        with pytest.raises(TypeError, match="config_dict is required"):
+            runner._invoke_lambda_icechunk_finalize(client, "fn", "s3://b/p", run_id="r1")
+        assert client.events == []
 
     @pytest.mark.parametrize(
         "response, raise_exc, match",

@@ -110,6 +110,14 @@ conformance tests assert decoded values, never object bytes.
   leaving them without either root object IS §10's absence rule, and keeps
   those trees byte-identical.
 
+- ``uncounted/`` — the §10.3 COVERAGE-ONLY surface (issue #575): METADATA
+  ONLY — the manifest and the two root objects the production sweep writes
+  over ``temporal/``'s leaf when that leaf carries NO §10.6 record. Its
+  counted-cover block is the only committed one whose ``obs`` are 0
+  (occupied buckets, nothing counted) under ``uncounted_shards: 1``, the
+  marker that makes ``obs_total`` a lower bound. The leaf is not committed
+  twice: its arrays are ``temporal/``'s, pinned by their §5 combined digest.
+
 - ``windowed/`` — the §1.5 DERIVED-COORDINATE surface (issue #586 phase 3):
   ``minimal/``'s geometry and cell plan with a located digest field, written
   as one WINDOWED leaf (``{id}_{window}.zarr``, ``morton-hive/2``). It stores
@@ -1383,6 +1391,13 @@ def _fake_temporal_shard(grid, by_chunk):
             }
             kwargs["chunk_results"].append((block, df, ragged))
             occupied.extend(int(children[i]) for i in sorted(cells))
+            # The §10.6 leaf record's feed (issue #575): the chunk's
+            # per-OBSERVATION words, exactly as the worker hands them over
+            # (`_aggregate_chunk_cells`, one array per chunk).
+            if kwargs.get("temporal_out") is not None:
+                kwargs["temporal_out"].add_words(
+                    np.concatenate([cells[i]["obs_words"] for i in ids])
+                )
         kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
         return pd.DataFrame(), {
             "shard_key": int(shard_key),
@@ -1456,6 +1471,9 @@ def build_temporal(out: Path) -> None:
             "count": n,
             "observed": per_cell,
             "h_tdigest": (digest, locs, per_centroid),
+            # One exact timestamp word per observation — the §10.6 record's
+            # worker feed (the words `_chunk_toc_words` would encode).
+            "obs_words": _toc_words(times_ns, times_ns),
         }
         expected_cells.append(
             {
@@ -1513,7 +1531,6 @@ def build_temporal(out: Path) -> None:
         TEMPORAL_COVER_ORDER,
         cover_words,
         coverage_toc,
-        coverage_toc_digest,
         quantize_words,
         read_cover,
     )
@@ -1523,14 +1540,13 @@ def build_temporal(out: Path) -> None:
     contribution, _written_at = family.read_leaf(root, SHARD_KEY, None, "morton-hive/1", {})
     family.finish(root, [{"payload": contribution}], 4, {})
     envelope = hive.read_root_coverage(root)
-    root_digest, root_words = coverage_toc_digest(envelope)
     # The shard envelope word is DERIVED from the generator's inputs — the
     # join over every per-centroid word it handed the writer — so a writer
     # that folds the wrong thing fails here instead of certifying itself. The
-    # digest rows are the writer's committed output read back (pinned the way
-    # column/'s group values are); the claims that matter over them — weight
-    # conservation and per-centroid containment — are derived, from the cell
-    # plan's own observation counts and the instants recorded per cell.
+    # §10.3 counted cover is the writer's committed output read back (pinned
+    # the way column/'s group values are); the claims that matter over it —
+    # count conservation and per-centroid bucketing — are derived, from the
+    # cell plan's own observation counts and the instants recorded per cell.
     shard_word = int(
         toc_reduce(
             np.concatenate(
@@ -1567,6 +1583,61 @@ def build_temporal(out: Path) -> None:
     assert not bool(np.any(np.atleast_1d(toc_overlaps(expect_cover, gap_start, gap_end))))
 
     leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
+
+    # The §10.6 leaf temporal record (issue #575), written by the PRODUCTION
+    # worker write path from the per-observation words the fake handed it.
+    # Pinned against the generator's inputs: its word is the join over the
+    # observation instants (and so equals the root section's shard word —
+    # the join is a semilattice), its cover the quantized normalize over
+    # those same instants, its count the cell plan's observation total.
+    from mortie import toc2time
+
+    from zagg.leaf_temporal import (
+        LEAF_TEMPORAL_NAME,
+        LEAF_TEMPORAL_SPEC,
+        count_words,
+        cover_from_counts,
+        leaf_temporal_contribution,
+        read_leaf_temporal_record,
+    )
+
+    every_instant = np.concatenate(
+        [cell["obs_words"] for cells in by_chunk.values() for cell in cells.values()]
+    ).astype(np.uint64)
+    record = read_leaf_temporal_record(str(out / leaf_rel))
+    assert record is not None and record["spec"] == LEAF_TEMPORAL_SPEC, record
+    assert record["source"] == "worker" and record["fields"] == ["h_tdigest"]
+    leaf_word, leaf_counts = leaf_temporal_contribution(record)
+    assert leaf_word == int(toc_reduce(every_instant)) == shard_word
+    # The §10.3 counted cover, DERIVED from the per-observation instants: one
+    # exact bucket per instant, counts by bucket, un-coalesced.
+    expect_counts = count_words(every_instant)
+    assert leaf_counts.order == expect_counts.order == TEMPORAL_COVER_ORDER
+    assert np.array_equal(leaf_counts.words, expect_counts.words), leaf_counts
+    assert np.array_equal(leaf_counts.obs, expect_counts.obs), leaf_counts
+    assert int(leaf_counts.obs.sum()) == record["n_obs"] == sum(c["count"] for c in expected_cells)
+    # ... and the §10.5 cover it derives is the quantization of those instants.
+    leaf_cover, _leaf_cover_order = cover_from_counts(leaf_counts)
+    expect_leaf_cover = quantize_words(every_instant)
+    assert np.array_equal(leaf_cover, expect_leaf_cover), leaf_cover
+    # The worker's cover is contained in the companion-derived one (§10.6):
+    # every one of its words overlaps the root sibling's word set.
+    for lo, hi in zip(*(np.atleast_1d(x) for x in toc2time(leaf_cover)), strict=True):
+        assert bool(np.any(np.atleast_1d(toc_overlaps(expect_cover, int(lo), int(hi)))))
+    # The §10.3 root tier composes from the leaf record (the sweep's
+    # record-first route, issue #575), so on this one-leaf store it IS the
+    # record's counted cover — derived from the instants above, never read
+    # back — and its total is the cell plan's.
+    from zagg.coverage_toc import coverage_toc_counts, coverage_toc_uncounted
+
+    root_counts = coverage_toc_counts(envelope)
+    assert root_counts is not None and root_counts.order == TEMPORAL_COVER_ORDER
+    # Every leaf came in with its worker's record, so the block is exact.
+    assert coverage_toc_uncounted(envelope) == 0
+    assert np.array_equal(root_counts.words, expect_counts.words), root_counts
+    assert np.array_equal(root_counts.obs, expect_counts.obs), root_counts
+    assert int(root_counts.obs.sum()) == sum(c["count"] for c in expected_cells)
+
     expected = {
         "shard": SHARD_KEY,
         "leaf": leaf_rel,
@@ -1579,18 +1650,20 @@ def build_temporal(out: Path) -> None:
         "empty_chunk": EMPTY_CHUNK,
         "delta": DELTA,
         # The §10 root coverage temporal section: the tier-1 word (derived),
-        # the tier-2 digest (the writer's, read back) and the weight total the
-        # cell plan says it must carry.
+        # the tier-2 counted cover (the writer's, read back) and the
+        # observation total the cell plan says it must carry.
         "root_coverage": {
             "object": "coverage.moc",
             "spec": "zagg-coverage-toc/1",
             "fields": ["h_tdigest"],
             "shards": {SHARD_KEY: str(shard_word)},
+            # §10.3's exactness marker: 0, so `obs_total` IS the count.
+            "uncounted_shards": 0,
             "obs_total": sum(c["count"] for c in expected_cells),
-            "digest": {
-                "delta": envelope["temporal"]["digest"]["delta"],
-                "centroids": [[float(m), float(w)] for m, w in root_digest],
-                "times": [str(int(w)) for w in root_words],
+            "counts": {
+                "temporal_order": TEMPORAL_COVER_ORDER,
+                "words": [str(int(w)) for w in expect_counts.words],
+                "obs": [int(n) for n in expect_counts.obs],
             },
         },
         # The §10.5 sibling: the object name, its markers, and the DERIVED
@@ -1613,6 +1686,29 @@ def build_temporal(out: Path) -> None:
             # discriminating: a cover that bridges the fixture's two clusters
             # over-claims here (§10.5's never-bridge law).
             "gap_ns": [str(int(gap_start)), str(int(gap_end))],
+        },
+        # The §10.6 leaf record (issue #575): the object name under the leaf,
+        # its markers, and the DERIVED word and cover — from the generator's
+        # per-observation instants, never read back — so the committed
+        # record is pinned against the inputs, not against itself.
+        "leaf_temporal": {
+            "object": LEAF_TEMPORAL_NAME,
+            "spec": LEAF_TEMPORAL_SPEC,
+            "source": "worker",
+            "fields": ["h_tdigest"],
+            "n_obs": sum(c["count"] for c in expected_cells),
+            "word": str(shard_word),
+            "temporal_order": TEMPORAL_COVER_ORDER,
+            "cap": COVER_CAP,
+            "counts": {
+                "count": len(expect_counts.words),
+                "words": [str(int(w)) for w in expect_counts.words],
+                "obs": [int(n) for n in expect_counts.obs],
+            },
+            "cover": {
+                "count": len(expect_leaf_cover),
+                "words": [str(int(w)) for w in expect_leaf_cover],
+            },
         },
         # The declarations the conformance tests assert against the committed
         # attrs — each on the array that HOLDS the words (§8/§9), and the
@@ -1637,7 +1733,119 @@ def build_temporal(out: Path) -> None:
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     print(
         f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells, both toc "
-        f"variants, root coverage.moc with {len(root_digest)} digest centroids"
+        f"variants, root coverage.moc with {len(root_counts.words)} counted buckets"
+    )
+
+
+def build_uncounted(out: Path) -> None:
+    """The §10.3 ``uncounted/`` fixture: the root objects over a record-less leaf.
+
+    METADATA ONLY, like ``multiscales/``: the manifest and the two root
+    objects the production sweep writes over ``temporal/``'s leaf when that
+    leaf carries NO §10.6 record. The ``temporal/`` store is built into a
+    scratch directory, the worker's ``temporal.toc`` is deleted — the bytes
+    of a leaf written before the record existed, or of one whose record was
+    lost after its stamp — and the sweep's own leaf read and finisher run over
+    it. Nothing writes the record back (§10.6), so the leaf contributes its
+    coverage and no count: every ``obs`` is 0 under ``uncounted_shards: 1``.
+
+    The expectations are derived from the generator's per-centroid words
+    (``temporal/``'s recorded ``h_tdigest_times``), each keyed at the bucket
+    of its representative instant — never read back from the object.
+    """
+    import tempfile
+
+    from mortie import toc_reduce
+
+    from zagg import hive
+    from zagg.coverage_toc import (
+        COVER_NAME,
+        COVER_SPEC,
+        TEMPORAL_COVER_ORDER,
+        cover_words,
+        coverage_toc,
+        coverage_toc_counts,
+        coverage_toc_uncounted,
+        read_cover,
+    )
+    from zagg.leaf_temporal import LEAF_TEMPORAL_NAME, count_words, cover_from_counts
+    from zagg.sweep import MocFamily
+
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = Path(tmp) / "temporal"
+        build_temporal(scratch)
+        source = json.loads((Path(tmp) / "temporal.expected.json").read_text())
+        leaf = scratch / source["leaf"]
+        (leaf / LEAF_TEMPORAL_NAME).unlink()
+        for name in (hive.ROOT_COVERAGE_NAME, COVER_NAME):
+            (scratch / name).unlink()
+        family = MocFamily()
+        contribution, _written_at = family.read_leaf(
+            str(scratch), SHARD_KEY, None, "morton-hive/1", {}
+        )
+        family.finish(str(scratch), [{"payload": contribution}], 4, {})
+        assert family.summary() == {"temporal_routes": {"records": 0, "raw": 1}}
+        assert not (leaf / LEAF_TEMPORAL_NAME).exists()  # the sweep writes no record
+        envelope = hive.read_root_coverage(str(scratch))
+        cover_obj = read_cover(str(scratch))
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir(parents=True)
+        for name in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME, COVER_NAME):
+            shutil.copy(scratch / name, out / name)
+
+    words = np.array(
+        [int(w) for cell in source["cells"] for w in cell["h_tdigest_times"]], dtype=np.uint64
+    )
+    shard_word = int(toc_reduce(words))
+    assert coverage_toc(envelope) == {SHARD_KEY: shard_word}
+    # Occupied buckets, nothing counted: one key per representative instant.
+    expect = count_words(words, np.zeros(len(words)))
+    counts = coverage_toc_counts(envelope)
+    assert coverage_toc_uncounted(envelope) == 1
+    assert counts.order == TEMPORAL_COVER_ORDER
+    assert np.array_equal(counts.words, expect.words) and not counts.obs.any(), counts
+    expect_cover, _order = cover_from_counts(expect)
+    assert cover_obj["spec"] == COVER_SPEC
+    assert np.array_equal(cover_words(cover_obj)[SHARD_KEY], expect_cover), cover_obj
+    clocked = sum(cell["count"] for cell in source["cells"])
+    assert clocked > 0
+
+    expected = {
+        "shard": SHARD_KEY,
+        "shard_order": 4,
+        # The leaf these root objects describe: `temporal/`'s, without its
+        # `temporal.toc`. Pinned by the §5 combined digest of its arrays, so
+        # the two fixtures are provably two readings of ONE leaf.
+        "source_fixture": "temporal",
+        "leaf_content_hash": source["content_hashes"]["combined"],
+        "root_coverage": {
+            "object": "coverage.moc",
+            "spec": "zagg-coverage-toc/1",
+            "fields": ["h_tdigest"],
+            "shards": {SHARD_KEY: str(shard_word)},
+            # §10.3's exactness marker: the one shard came in uncounted, so
+            # `obs_total` is a lower bound — on `clocked_obs`, the leaf's
+            # real observation count, which no object in this store carries.
+            "uncounted_shards": 1,
+            "obs_total": 0,
+            "clocked_obs": clocked,
+            "counts": {
+                "temporal_order": TEMPORAL_COVER_ORDER,
+                "words": [str(int(w)) for w in expect.words],
+                "obs": [0] * len(expect.words),
+            },
+        },
+        "cover": {
+            "object": "coverage.toc",
+            "spec": COVER_SPEC,
+            "count": len(expect_cover),
+            "words": [str(int(w)) for w in expect_cover],
+        },
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(
+        f"{out.name}: root objects over a record-less leaf, {len(expect.words)} zero-count buckets"
     )
 
 
@@ -1923,6 +2131,7 @@ def main() -> None:
         ),
         "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
         "temporal": lambda: build_temporal(args.out / "temporal"),
+        "uncounted": lambda: build_uncounted(args.out / "uncounted"),
         "windowed": lambda: build_windowed(args.out / "windowed"),
     }
     unknown = set(args.only or ()) - set(builders)

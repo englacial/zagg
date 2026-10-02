@@ -1153,3 +1153,461 @@ class TestTmpGuard:
         monkeypatch.setattr(_os, "statvfs", fake)
         check_tmp_headroom(1, tmp_dir="/somewhere")
         assert seen["path"] == "/somewhere"
+
+
+class TestLeafTemporalFold:
+    """Issue #575: the leaf temporal accumulator is fed from every worker regime.
+
+    The record's word and counted cover must equal the whole-shard fold over
+    the observation clock whichever route the worker takes — pooled, spill
+    single-block (the pooled machinery over read-back columns) and spill
+    multi-block (per cell, in ``_fold_block``) — and the fold must never be
+    handed the whole shard at once.
+    """
+
+    def _expected(self, dfs):
+        from mortie import toc_reduce
+
+        from zagg.leaf_temporal import count_words
+        from zagg.time_axis import observation_words
+
+        src = _TIME_SOURCE["time_source"]
+        words = np.concatenate(
+            [
+                observation_words(
+                    df["delta_time"].to_numpy(),
+                    epoch=src["epoch"],
+                    scale=src["scale"],
+                    units=src["units"],
+                )
+                for df in dfs
+            ]
+        )
+        return int(toc_reduce(words)), count_words(words), len(words)
+
+    def _dfs(self, grid, key, seed=7, **kw):
+        return _with_clock(_granule_dfs(grid, key, _CELL_LISTS, seed=seed, **kw))
+
+    @staticmethod
+    def _assert_fold(got, dfs, expected, total):
+        word, counts = got
+        e_word, e_counts, e_n = expected
+        assert word == e_word
+        assert counts.order == e_counts.order
+        np.testing.assert_array_equal(counts.words, e_counts.words)
+        np.testing.assert_array_equal(counts.obs, e_counts.obs)
+        assert int(counts.obs.sum()) == e_n == total
+
+    @pytest.mark.parametrize("regime", ["pooled", "spill-single", "spill-multi"])
+    def test_every_regime_folds_the_whole_shard_exactly(self, monkeypatch, regime):
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        if regime == "spill-multi":
+            monkeypatch.setattr(
+                "zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1
+            )
+        streaming = None if regime == "pooled" else {"buffer_granules": 2, "mode": "spill"}
+        cfg = _config(streaming=streaming, variables=_companion_variables(), output=_TIME_SOURCE)
+        grid = _grid(cfg)
+        key = _shard_key()
+        # A NaN-valued cell still carries a clock: the record counts every
+        # clocked observation, the payload digest drops the NaN rows.
+        dfs = self._dfs(grid, key, nan_cells={4})
+        acc = LeafTemporalAccumulator()
+        _, _, meta = _run(monkeypatch, cfg, grid, key, list(dfs), temporal_out=acc, profile=True)
+        if regime == "spill-multi":
+            assert meta["phase_timings"]["spill_blocks_closed"] > 0
+        elif regime == "spill-single":
+            assert meta["phase_timings"]["spill_blocks_closed"] == 0
+        self._assert_fold(acc.finish(), dfs, self._expected(dfs), meta["total_obs"])
+
+    @pytest.mark.parametrize("regime", ["pooled", "spill-single", "spill-multi"])
+    def test_a_failed_record_write_fails_the_unit_in_every_regime(
+        self, monkeypatch, tmp_path, regime
+    ):
+        """The record write fails CLOSED whichever regime folded it (#575).
+
+        Pooled, spill single-block and spill multi-block all drain into the
+        one write site in ``hive.process_and_write_hive``, through the real
+        worker: a record PUT that fails raises before the stamp and leaves the
+        leaf unstamped, and the retry lands the leaf with the exact record.
+        """
+        import os
+
+        from zagg import hive, leaf_temporal
+        from zagg.store import open_store
+
+        if regime == "spill-multi":
+            monkeypatch.setattr(
+                "zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1
+            )
+        streaming = None if regime == "pooled" else {"buffer_granules": 2, "mode": "spill"}
+        cfg = _config(
+            streaming=streaming,
+            variables=_companion_variables(),
+            output={**_TIME_SOURCE, "store_layout": "hive"},
+        )
+        cfg.aggregation["coordinates"] = {"morton": {"dtype": "uint64", "fill_value": 0}}
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = self._dfs(grid, key)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, key)
+
+        def write():
+            reads = iter(dfs)
+            monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
+            return hive.process_and_write_hive(
+                key,
+                [f"s3://b/g{i}.h5" for i in range(len(dfs))],
+                grid,
+                _CREDS,
+                root,
+                cfg,
+                store_kwargs={},
+                handoff="pandas",  # the fake reads are DataFrames
+                profile=True,
+            )
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        with monkeypatch.context() as failing:
+            failing.setattr(leaf_temporal, "write_leaf_temporal", boom)
+            with pytest.raises(RuntimeError, match="leaf temporal record .* failed to write"):
+                write()
+        assert os.path.exists(leaf) and hive.read_commit(open_store(leaf)) is None
+        meta = write()
+        assert meta.get("error") is None
+        if regime != "pooled":
+            assert (meta["phase_timings"]["spill_blocks_closed"] > 0) == (regime == "spill-multi")
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        record = leaf_temporal.read_leaf_temporal_record(leaf)
+        got = leaf_temporal.leaf_temporal_contribution(record)
+        self._assert_fold(got, dfs, self._expected(dfs), meta["total_obs"])
+
+    def test_the_fold_never_sees_the_whole_shard(self, monkeypatch):
+        # Multi-block spill feeds per cell; with a small row budget the largest
+        # array any fold sees is bounded by that budget plus one feed — never
+        # the shard (the #574 regime the record exists to respect).
+        from zagg import leaf_temporal
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        monkeypatch.setattr(leaf_temporal, "FOLD_ROWS", 64)
+        monkeypatch.setattr("zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1)
+        sizes: list[int] = []
+        fold = LeafTemporalAccumulator._fold
+
+        def spy(self, words, weights):
+            sizes.append(len(words))
+            return fold(self, words, weights)
+
+        monkeypatch.setattr(LeafTemporalAccumulator, "_fold", spy)
+        cfg = _config(
+            streaming={"buffer_granules": 2, "mode": "spill"},
+            variables=_companion_variables(),
+            output=_TIME_SOURCE,
+        )
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = self._dfs(grid, key)
+        acc = LeafTemporalAccumulator()
+        _, _, meta = _run(monkeypatch, cfg, grid, key, list(dfs), temporal_out=acc)
+        assert int(acc.finish()[1].obs.sum()) == meta["total_obs"] == 750
+        assert len(sizes) > 1 and max(sizes) <= 64 + 50 < meta["total_obs"]
+
+    def test_k_gt_1_pooled_feeds_are_bounded_by_the_chunk(self, monkeypatch):
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        cfg = _config(variables=_companion_variables(), output=_TIME_SOURCE)
+        grid = _grid(cfg, parent=2, child=5, chunk_inner=3)
+        assert grid.chunks_per_shard == 4
+        key = _shard_key(order=2)
+        dfs = _with_clock(_granule_dfs(grid, key, [[0, 20, 40], [5, 20, 60], [0, 40, 63]], seed=3))
+        fed: list[int] = []
+        acc = LeafTemporalAccumulator()
+        add = acc.add_words
+        monkeypatch.setattr(acc, "add_words", lambda w: (fed.append(len(w)), add(w)))
+        sink: list = []
+        _run(monkeypatch, cfg, grid, key, list(dfs), chunk_results=sink, temporal_out=acc)
+        expected = self._expected(dfs)
+        self._assert_fold(acc.finish(), dfs, expected, expected[2])
+        # The feeds are the per-cell VIEWS of each chunk's one flat encode (no
+        # concatenated copy of the chunk), so there is one per populated cell:
+        # cells 0 and 5 in chunk 0, 20 in chunk 1, 40 in chunk 2, 60 and 63 in
+        # chunk 3, at 50 rows per cell per granule. Every feed is bounded by
+        # its own chunk's rows — the fattest chunk is 0's 150 — and none is the
+        # shard; what the accumulator actually folds is bounded separately, by
+        # ``FOLD_ROWS`` (``test_the_fold_never_sees_the_whole_shard``).
+        assert len(fed) == 6 and sum(fed) == expected[2]
+        assert max(fed) <= 150 < expected[2]
+
+    def _two_field_leaf(
+        self, monkeypatch, tmp_path, key=None, *, nan_cells=(), step=3.0, strata=False
+    ):
+        """One leaf through the PRODUCTION writer under two temporal fields.
+
+        ``g_tdigest`` and ``h_tdigest`` both declare a per-centroid companion
+        over the one shared clock; ``g`` digests ``g_ph``, which is ``h_ph``
+        with ``nan_cells``' rows blanked, so the two payloads' NaN masks
+        differ. ``step`` is the clock spacing in seconds: at 60 s a cell's 50
+        observations span their own order-24 buckets (2^39 ns ≈ 550 s).
+        ``strata`` instead declares the shipped ATL03 strata shape
+        (``atl03_tdigest_strata_healpix.yaml``): ``h_tdigest_signal`` and
+        ``h_tdigest_noise``, complementary ``build_tdigest_where`` predicates
+        over ``h_ph``, so the two fields partition the observations.
+        Returns ``(root, leaf_data_path, dfs, meta)``.
+        """
+        from zagg import hive
+
+        variables = _companion_variables()
+        if strata:
+            base = variables.pop("h_tdigest")
+            where = "h_ph > 0"
+            for name, pred in (("h_tdigest_signal", where), ("h_tdigest_noise", f"~({where})")):
+                variables[name] = {
+                    **base,
+                    "function": "zagg.stats.tdigest.build_tdigest_where",
+                    "params": {**base["params"], "where": pred},
+                }
+        else:
+            variables["g_tdigest"] = {**variables["h_tdigest"], "source": "g_ph"}
+        cfg = _config(variables=variables, output={**_TIME_SOURCE, "store_layout": "hive"})
+        # The leaf template carries only DECLARED coordinates (the bare
+        # ``process_shard`` tests above never emit one).
+        cfg.aggregation["coordinates"] = {"morton": {"dtype": "uint64", "fill_value": 0}}
+        grid = _grid(cfg)
+        key = _shard_key() if key is None else key
+        dfs = _with_clock(_granule_dfs(grid, key, _CELL_LISTS, seed=7), step=step)
+        blank = {int(grid.children(key)[ci]) for ci in nan_cells}
+        for df in dfs:
+            if not strata:
+                df["g_ph"] = df["h_ph"].where(~df["leaf_id"].isin(blank), np.nan)
+        reads = iter(dfs)
+        monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        root = str(tmp_path / "store")
+        hive.ensure_manifest(root, hive.build_manifest(grid, dataset={"short_name": "X"}))
+        meta = hive.process_and_write_hive(
+            key,
+            [f"s3://b/g{i}.h5" for i in range(len(dfs))],
+            grid,
+            _CREDS,
+            root,
+            cfg,
+            store_kwargs={},
+            handoff="pandas",  # the fake reads are DataFrames
+        )
+        assert meta.get("error") is None
+        return root, hive.resolve_leaf(hive.shard_leaf_path(root, key))[0], dfs, meta
+
+    @staticmethod
+    def _raw(root, leaf, names=None):
+        """The raw route's ``(word, counts)`` over the declared fields (or ``names``)."""
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.hive import read_manifest
+
+        manifest = read_manifest(root)
+        fields = temporal_fields(manifest)
+        if names is not None:
+            fields = {name: fields[name] for name in names}
+        return read_leaf_temporal(leaf, temporal_cell_order(manifest), fields)
+
+    def test_the_worker_counts_once_and_the_raw_route_counts_nothing(self, monkeypatch, tmp_path):
+        """The two §10 feeds on one MULTI-field leaf (espg ruling 2026-10-01, #575).
+
+        The worker folds the one shared clock column: once per observation,
+        whatever the declared field count. The sweep's raw route contributes
+        COVERAGE ONLY — the same envelope word, the union of every field's
+        occupied buckets, and no count at all.
+        """
+        from zagg.coverage_toc import temporal_fields
+        from zagg.hive import read_manifest
+        from zagg.leaf_temporal import leaf_temporal_contribution, read_leaf_temporal_record
+
+        root, leaf, dfs, meta = self._two_field_leaf(monkeypatch, tmp_path)
+        fields = temporal_fields(read_manifest(root))
+        assert sorted(fields) == ["g_tdigest", "h_tdigest"]
+        record = read_leaf_temporal_record(leaf)
+        assert record["source"] == "worker" and record["fields"] == sorted(fields)
+        worker = leaf_temporal_contribution(record)
+        self._assert_fold(worker, dfs, self._expected(dfs), meta["total_obs"])
+        raw = self._raw(root, leaf)
+        assert raw[0] == worker[0]
+        assert int(raw[1].obs.sum()) == 0 and len(raw[1].words)
+        g_only, h_only = self._raw(root, leaf, ["g_tdigest"]), self._raw(root, leaf, ["h_tdigest"])
+        assert set(raw[1].words) == set(g_only[1].words) | set(h_only[1].words)
+
+    def test_a_nan_valued_observation_is_counted_by_the_worker_and_covered_raw(
+        self, monkeypatch, tmp_path
+    ):
+        """Fields whose NaN masks differ: the clock counts, the cover unions.
+
+        A payload digest drops non-finite rows and the clock does not, so the
+        worker's count includes an observation that is NaN in ``g``. The raw
+        route counts nothing; its buckets are the union across fields, so an
+        observation finite only in ``h`` is still covered.
+        """
+        from zagg.leaf_temporal import leaf_temporal_contribution, read_leaf_temporal_record
+
+        root, leaf, dfs, meta = self._two_field_leaf(
+            monkeypatch, tmp_path, nan_cells={4}, step=60.0
+        )
+        worker = leaf_temporal_contribution(read_leaf_temporal_record(leaf))
+        n_finite_g = int(sum(df["g_ph"].notna().sum() for df in dfs))
+        assert n_finite_g < meta["total_obs"] == int(worker[1].obs.sum())
+        raw = self._raw(root, leaf)
+        assert raw[0] == worker[0] and int(raw[1].obs.sum()) == 0
+        g_only, h_only = self._raw(root, leaf, ["g_tdigest"]), self._raw(root, leaf, ["h_tdigest"])
+        h_alone = set(h_only[1].words.tolist()) - set(g_only[1].words.tolist())
+        assert h_alone and h_alone <= set(raw[1].words.tolist())
+        # The worker's exact buckets are the same key set: every clocked
+        # observation, finite in ``g`` or not.
+        np.testing.assert_array_equal(raw[1].words, worker[1].words)
+
+    def test_complementary_strata_are_covered_whole_and_counted_only_by_the_worker(
+        self, monkeypatch, tmp_path
+    ):
+        """A store whose temporal fields PARTITION the observations.
+
+        The shipped ATL03 strata shape: ``h_tdigest_signal`` and
+        ``h_tdigest_noise`` are complementary ``where`` strata over one
+        source, so no single field's weights are the leaf's observations.
+        The worker counts every clocked one; the raw route counts none and
+        covers both strata — no field is chosen to count over.
+        """
+        from zagg.coverage_toc import temporal_fields
+        from zagg.hive import read_manifest
+        from zagg.leaf_temporal import leaf_temporal_contribution, read_leaf_temporal_record
+
+        # At 300 s a bucket (~550 s) holds one or two observations, so some
+        # buckets hold signal only, and the worker's stay under the §10.5 cap.
+        root, leaf, dfs, meta = self._two_field_leaf(monkeypatch, tmp_path, strata=True, step=300.0)
+        assert sorted(temporal_fields(read_manifest(root))) == [
+            "h_tdigest_noise",
+            "h_tdigest_signal",
+        ]
+        n_signal = int(sum((df["h_ph"] > 0).sum() for df in dfs))
+        assert 0 < n_signal < meta["total_obs"]
+        worker = leaf_temporal_contribution(read_leaf_temporal_record(leaf))
+        assert int(worker[1].obs.sum()) == meta["total_obs"]  # every clocked observation
+        raw = self._raw(root, leaf)
+        assert raw[0] == worker[0] and int(raw[1].obs.sum()) == 0
+        noise = self._raw(root, leaf, ["h_tdigest_noise"])
+        signal = self._raw(root, leaf, ["h_tdigest_signal"])
+        signal_alone = set(signal[1].words.tolist()) - set(noise[1].words.tolist())
+        assert signal_alone  # buckets only the signal stratum occupies ...
+        assert set(raw[1].words.tolist()) == set(signal[1].words.tolist()) | set(
+            noise[1].words.tolist()
+        )  # ... are covered all the same
+
+    def test_a_flux_field_is_covered_and_its_weights_are_never_read_as_counts(
+        self, monkeypatch, tmp_path
+    ):
+        """``weights: "flux"`` (spec §2.0, GEDI's ``rx_flux``) on the raw route.
+
+        A flux payload's weight column is calibrated flux, not observations.
+        The raw route derives no count from any payload, so rewriting the
+        weights changes nothing it publishes.
+        """
+        import zarr
+
+        from zagg.coverage_toc import temporal_cell_order
+        from zagg.hive import read_manifest
+        from zagg.sweep_overview import decode_digest, encode_digest
+
+        root, leaf, _dfs, _meta = self._two_field_leaf(monkeypatch, tmp_path, step=60.0)
+        before = self._raw(root, leaf)
+        order = temporal_cell_order(read_manifest(root))
+        payload = zarr.open_group(leaf, path=str(order), mode="a", zarr_format=3)["g_tdigest"]
+        flux = np.empty(payload.shape[0], dtype=object)
+        for i, raw in enumerate(payload[:]):
+            cell = decode_digest(raw if raw is not None else b"", "float32", (2,)).copy()
+            cell[:, 1] *= np.float32(0.3)
+            flux[i] = encode_digest(cell, "float32")
+        payload[:] = flux
+        after = self._raw(root, leaf)
+        assert after[0] == before[0] and int(after[1].obs.sum()) == 0
+        np.testing.assert_array_equal(after[1].words, before[1].words)
+
+    @staticmethod
+    def _drop_field(leaf, order, name):
+        """Remove a field's payload and companion from a written leaf (schema evolution)."""
+        import shutil
+
+        for array in (name, f"{name}_times"):
+            shutil.rmtree(f"{leaf}/{order}/{array}")
+
+    @pytest.mark.parametrize("gap", ["no-word", "no-arrays"])
+    def test_a_field_the_leaf_holds_no_word_for_contributes_nothing(
+        self, monkeypatch, tmp_path, gap
+    ):
+        """A declared field with no word in the leaf is absence, not failure.
+
+        This leaf either holds no ``g`` word anywhere (every ``g_ph`` row NaN)
+        or lacks ``g``'s arrays entirely (a field declared after the leaf was
+        written). Either way the coverage is ``h``'s alone.
+        """
+        from zagg.coverage_toc import temporal_cell_order
+        from zagg.hive import read_manifest
+
+        every_cell = {ci for cells in _CELL_LISTS for ci in cells}
+        nan_cells = every_cell if gap == "no-word" else ()
+        root, leaf, _dfs, _meta = self._two_field_leaf(monkeypatch, tmp_path, nan_cells=nan_cells)
+        if gap == "no-arrays":
+            self._drop_field(leaf, temporal_cell_order(read_manifest(root)), "g_tdigest")
+        else:
+            assert self._raw(root, leaf, ["g_tdigest"]) is None
+        h_only, raw = self._raw(root, leaf, ["h_tdigest"]), self._raw(root, leaf)
+        assert raw[0] == h_only[0]
+        np.testing.assert_array_equal(raw[1].words, h_only[1].words)
+
+    def test_a_record_less_shard_makes_the_root_total_a_lower_bound(self, monkeypatch, tmp_path):
+        """A root block over a worker-recorded shard and a record-less one.
+
+        Two shards of one two-field store through the production writer; one
+        lost its record after its stamp (the write itself fails closed, so
+        only a later loss leaves a stamped leaf without one). The sweep writes
+        none back: the root ``obs_total`` is the recorded shard's count alone,
+        and ``uncounted_shards`` says the other is missing from it.
+        """
+        import os
+
+        from mortie import geo2mort
+
+        from zagg.coverage_toc import coverage_toc_counts, coverage_toc_uncounted
+        from zagg.grids.morton import morton_decimal
+        from zagg.hive import read_root_coverage
+        from zagg.leaf_temporal import LEAF_TEMPORAL_NAME
+        from zagg.sweep import run_sweep
+
+        key_a, key_b = _shard_key(), int(geo2mort(-60.0, 40.0, order=6)[0])
+        root, _leaf_a, _dfs_a, meta_a = self._two_field_leaf(monkeypatch, tmp_path, key_a)
+        _root, leaf_b, _dfs_b, meta_b = self._two_field_leaf(monkeypatch, tmp_path, key_b)
+        os.remove(f"{leaf_b}/{LEAF_TEMPORAL_NAME}")
+        summary = run_sweep(root, [(key_a, None), (key_b, None)], families=["moc"], record=False)
+        moc = summary["families"]["moc"]
+        assert moc["temporal_routes"] == {"records": 1, "raw": 1}
+        assert moc["temporal_shards"] == 2 and moc["uncounted_shards"] == 1
+        assert not os.path.exists(f"{leaf_b}/{LEAF_TEMPORAL_NAME}")
+        envelope = read_root_coverage(root)
+        assert set(envelope["temporal"]["shards"]) == {
+            str(morton_decimal(key_a)),
+            str(morton_decimal(key_b)),
+        }
+        assert coverage_toc_uncounted(envelope) == 1
+        assert int(coverage_toc_counts(envelope).obs.sum()) == meta_a["total_obs"]
+        assert meta_b["total_obs"] > 0  # ... which the total does not include
+
+    def test_a_config_without_a_temporal_field_feeds_nothing(self, monkeypatch):
+        from zagg.leaf_temporal import LeafTemporalAccumulator
+
+        cfg = _config(variables=_base_variables())
+        grid = _grid(cfg)
+        key = _shard_key()
+        acc = LeafTemporalAccumulator()
+        _run(monkeypatch, cfg, grid, key, _granule_dfs(grid, key, _CELL_LISTS), temporal_out=acc)
+        assert acc.finish() is None

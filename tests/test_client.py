@@ -96,7 +96,17 @@ def _envelope(body: dict, status=200):
 class StubLambdaClient:
     """boto3-Lambda-shaped stub: records invokes, answers canned envelopes."""
 
-    def __init__(self, *, fail=(), benign=(), timeout=(), delays=None, mode_delay=0):
+    def __init__(
+        self,
+        *,
+        fail=(),
+        benign=(),
+        timeout=(),
+        delays=None,
+        mode_delay=0,
+        record=False,
+        current=False,
+    ):
         self.events: list[tuple[str, str, dict]] = []
         self._lock = threading.Lock()
         self._fail = set(fail)
@@ -104,6 +114,8 @@ class StubLambdaClient:
         self._timeout = set(timeout)
         self._delays = delays or {}
         self._mode_delay = mode_delay
+        self._record = record  # deployed workers ride a stats record; stale ones don't
+        self._current = current  # every unit is a touched current one (issue #580)
         self.gate: threading.Event | None = None  # holds cell invokes open
 
     def invoke(self, **kwargs):
@@ -129,7 +141,18 @@ class StubLambdaClient:
             return _envelope({"error": "boom"}, status=500)
         if key in self._benign:
             return _envelope({"error": "No granules found"})
-        return _envelope({"total_obs": 7, "duration_s": 1.5})
+        if self._current:
+            # A skip-if-current unit whose lifecycle touch moved its refs: no
+            # stats record, marked dirt-only for the staged sweep (issue #580).
+            return _envelope(
+                {"shard_key": key, "window": None, "current": True, "icechunk_dirty": True}
+            )
+        body = {"total_obs": 7, "duration_s": 1.5}
+        if self._record:
+            from zagg.telemetry import build_record
+
+            body["stats"] = build_record(shard_key=int(key), metadata=dict(body))
+        return _envelope(body)
 
     def cell_events(self):
         return [(n, t, e) for n, t, e in self.events if e.get("mode") is None]
@@ -354,19 +377,31 @@ class TestDispatch:
         (_, _, event) = stub.cell_events()[0]
         assert "skip_if_current" not in event and "semantic_hash" not in event
 
-    def test_icechunk_commit_ships_pinned_per_leaf(self, catalog):
-        # The facade chains no staged sweep, so the ref ladder never runs:
-        # even under ``sweep: "stages"`` an unset commit must reach the init
-        # and every worker as the per-leaf commit, never the ladder whose
-        # sidecars nothing would gather (issue #580 review finding).
+    def test_icechunk_commit_ships_pinned_like_the_cli(self, catalog, monkeypatch):
+        # The facade chains the staged sweep under ``sweep: "stages"`` (issue
+        # #588), so an unset commit reaches the init and every worker pinned
+        # exactly as ``runner._run_lambda`` pins it: the ladder when the run
+        # walks one, the per-leaf commit otherwise (issue #580).
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_invoke_lambda_stage_sweep", lambda *a, **k: None)
+
+        def pinned(cfg):
+            stub = StubLambdaClient()
+            run = _run(catalog, client=stub, config=cfg)
+            run.dispatch(shard_keys=[_WORDS[1]]).wait(timeout=10)
+            events = [e for _, _, e in stub.events if e.get("mode") in (None, "icechunk_init")]
+            assert {e.get("mode") for e in events} == {None, "icechunk_init"}
+            (mode,) = {e["config"]["output"]["icechunk"]["commit"] for e in events}
+            return mode
+
         cfg = default_config("atl06")
         cfg.output["sweep"] = "stages"
-        stub = StubLambdaClient()
-        _run(catalog, client=stub, config=cfg).dispatch(shard_keys=[_WORDS[1]]).results()
-        events = [e for _, _, e in stub.events if e.get("mode") in (None, "icechunk_init")]
-        assert {e.get("mode") for e in events} == {None, "icechunk_init"}
-        for event in events:
-            assert event["config"]["output"]["icechunk"] == {"commit": "leaf"}
+        assert pinned(cfg) == "leaf"  # no /2 ladder declared: nothing walks it
+        cfg.output["grid"] = {**cfg.output["grid"], "chunk_inner": 9}  # a /2 column at o9
+        assert pinned(cfg) == "ladder"
+        cfg.output["sweep"] = True
+        assert pinned(cfg) == "leaf"  # the families sweep alone walks no ladder
         assert "icechunk" not in cfg.output  # the caller's config is untouched
 
     def test_icechunk_knob_off_stands_up_and_finalizes_nothing(self, catalog):
@@ -436,6 +471,9 @@ class TestDispatch:
         # ... with the very config dispatch() pinned and sent to the init.
         (init_event,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_init"]
         assert fin_event["config"] == init_event["config"]
+        # The run's row labels ride the init (issue #584, spec §11.4): an
+        # unwindowed run's one ``all`` row.
+        assert init_event["rows"] == ["all"]
         # The finalize outcome is surfaced on the handle, not write-only: the
         # stub's bare envelope is a fail-open error the caller can read.
         assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
@@ -755,7 +793,7 @@ class TestRunnerParity:
         # this run read-free rather than reaching for a bucket that isn't there.
         monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: None)
         agg_kwargs.setdefault("invocation", "sync")
-        runner.agg(
+        stub.summary = runner.agg(
             cfg if cfg is not None else default_config("atl06"),
             catalog=catalog_file,
             store=_STORE,
@@ -823,6 +861,41 @@ class TestRunnerParity:
 # -- dispatch manifest (issue #327 phase 2) ------------------------------------
 
 
+def _force_dispatch_manifest(monkeypatch, outcome):
+    """Make the hive setup invoke send its block ``outcome`` (issue #588).
+
+    Shrinks the async payload cap for that one invoke, to the exact boundary:
+    the full event's own size (``"full"``), one byte under it (``"slim"``), or
+    one byte under the slim event (``"dropped"``). Every other invoke of the
+    run keeps the real cap.
+    """
+    from zagg import runner
+
+    real = runner._invoke_lambda_setup_async
+
+    def gated_size(args, kwargs, cap=None):
+        # The event as the gate measures it: credentials ride after the gate.
+        probe = StubLambdaClient()
+        with monkeypatch.context() as m:
+            if cap is not None:
+                m.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
+            real(probe, *args[1:], **{**kwargs, "output_creds_event": None})
+        return len(json.dumps(probe.events[0][2]))
+
+    def gated(*args, **kwargs):
+        full = gated_size(args, kwargs)
+        cap = {
+            "full": lambda: full,
+            "slim": lambda: full - 1,
+            "dropped": lambda: gated_size(args, kwargs, full - 1) - 1,
+        }[outcome]()
+        with monkeypatch.context() as m:
+            m.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
+            return real(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_invoke_lambda_setup_async", gated)
+
+
 class TestDispatchManifestBlock:
     """The setup invoke carries the ``run_manifest`` block (issue #327): the
     worker records the run's shard set + identity at the status prefix, so
@@ -869,22 +942,151 @@ class TestDispatchManifestBlock:
         _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]]).wait(timeout=10)
         assert self._setup_block(stub)["shards"] == [str(_WORDS[1])]
 
-    def test_async_setup_size_gate_drops_the_block(self, monkeypatch):
-        # The hive setup invoke is a 256 KB-capped Event; an oversized shard
-        # list drops the block (never fatal) — attach degrades to statuses.
-        from zagg import runner
+    _SLIM_KEYS = ["run_id", "shards", "semantic_hash", "dispatched_at", "dataset", "shards_omitted"]
 
+    @staticmethod
+    def _setup_async(monkeypatch, cap, *, config_dict=None, shards=range(100), **kwargs):
+        """One direct hive setup invoke under ``cap``: ``(sent, event, block)``."""
+        from zagg import runner
+        from zagg.client_transport import build_run_manifest_block
+
+        block = build_run_manifest_block(
+            "r", shards, default_config("atl06"), dataset={"short_name": "ATL06", "version": "006"}
+        )
         stub = StubLambdaClient()
-        monkeypatch.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", 10)
-        runner._invoke_lambda_setup_async(
+        if cap is not None:
+            monkeypatch.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", cap)
+        sent = runner._invoke_lambda_setup_async(
             stub,
             "fn",
             _STORE,
-            config_dict={},
-            run_manifest={"run_id": "r", "shards": ["1"]},
+            config_dict={"a": 1} if config_dict is None else config_dict,
+            parent_order=6,
+            run_manifest=block,
+            **kwargs,
         )
-        (_, _, event) = stub.events[0]
-        assert "run_manifest" not in event
+        (_, kind, event) = stub.events[0]
+        assert kind == "Event"
+        return sent, event, block
+
+    def test_full_block_event_is_byte_identical(self):
+        # A block that fits rides exactly as before issue #588: the same keys
+        # in the same order, no ``shards_omitted``, credentials after it.
+        from zagg import runner
+        from zagg.client_transport import build_run_manifest_block
+
+        block = build_run_manifest_block("r", [1, 2], default_config("atl06"), dataset=None)
+        assert list(block) == ["run_id", "shards", "semantic_hash", "dispatched_at", "dataset"]
+        sent_payloads = []
+
+        class _Raw:
+            def invoke(self, **kwargs):
+                sent_payloads.append(kwargs["Payload"])
+
+        creds = {"accessKeyId": "AK", "secretAccessKey": "SK", "region": "us-west-2"}
+        sent = runner._invoke_lambda_setup_async(
+            _Raw(),
+            "fn",
+            _STORE,
+            config_dict={"a": 1},
+            dataset={"short_name": "ATL06", "version": "006"},
+            parent_order=6,
+            output_creds_event=creds,
+            run_manifest=block,
+        )
+        assert sent == "full"
+        assert sent_payloads == [
+            json.dumps(
+                {
+                    "mode": "setup",
+                    "store_path": _STORE,
+                    "parent_order": 6,
+                    "overwrite": False,
+                    "config": {"a": 1},
+                    "dataset": {"short_name": "ATL06", "version": "006"},
+                    "run_manifest": block,
+                    "output_credentials": creds,
+                }
+            )
+        ]
+
+    def test_a_block_just_over_the_cap_goes_slim(self, monkeypatch):
+        # The hive setup invoke is a 256 KB-capped Event and only the shard
+        # list scales with the run: one byte over, the block rides without
+        # it (issue #588) — the config and the run's identity still land.
+        sent, event, block = self._setup_async(monkeypatch, None)
+        assert sent == "full" and event["run_manifest"] == block
+        full = len(json.dumps(event))
+        sent, event, block = self._setup_async(monkeypatch, full)  # exactly at the cap
+        assert sent == "full" and event["run_manifest"] == block
+        sent, event, block = self._setup_async(monkeypatch, full - 1)
+        assert sent == "slim"
+        slim = event["run_manifest"]
+        assert list(slim) == self._SLIM_KEYS
+        assert slim["shards"] is None and slim["shards_omitted"] == 100
+        assert {k: v for k, v in slim.items() if k != "shards_omitted"} == {**block, "shards": None}
+        assert event["config"] == {"a": 1}  # what the worker folds into the manifest
+
+    def test_a_config_too_large_for_the_slim_block_drops_it(self, monkeypatch):
+        # Even slim does not fit when the config itself fills the event: the
+        # block is dropped (never fatal — the setup invoke still fires).
+        from zagg import runner
+
+        cap = runner._ASYNC_PAYLOAD_CAP_BYTES
+        sent, event, _block = self._setup_async(monkeypatch, None, config_dict={"blob": "x" * cap})
+        assert sent == "dropped"
+        assert "run_manifest" not in event and event["mode"] == "setup"
+
+    def test_a_one_byte_miss_of_the_slim_block_drops_it(self, monkeypatch):
+        sent, event, _block = self._setup_async(monkeypatch, None)
+        sent, event, _block = self._setup_async(monkeypatch, len(json.dumps(event)) - 1)
+        assert sent == "slim"
+        slim_size = len(json.dumps(event))
+        assert self._setup_async(monkeypatch, slim_size)[0] == "slim"
+        sent, event, _block = self._setup_async(monkeypatch, slim_size - 1)
+        assert sent == "dropped" and "run_manifest" not in event
+
+    def test_no_block_reports_nothing(self):
+        from zagg import runner
+
+        stub = StubLambdaClient()
+        assert runner._invoke_lambda_setup_async(stub, "fn", _STORE, config_dict={}) is None
+        assert "run_manifest" not in stub.events[0][2]
+
+    @pytest.mark.parametrize("outcome", ["full", "slim", "dropped"])
+    def test_the_handle_says_how_the_manifest_went_out(self, catalog, monkeypatch, outcome):
+        _force_dispatch_manifest(monkeypatch, outcome)
+        stub = StubLambdaClient()
+        handle = _run(catalog, client=stub).dispatch()
+        handle.wait(timeout=10)
+        assert handle.dispatch_manifest == outcome and handle.unreported_shards == 0
+        (setup,) = [e for _, _, e in stub.events if e.get("mode") == "setup"]
+        if outcome == "dropped":
+            assert "run_manifest" not in setup
+        else:
+            block = setup["run_manifest"]
+            assert (block["shards"] is None) == (outcome == "slim")
+            assert block.get("shards_omitted") == (3 if outcome == "slim" else None)
+
+    @pytest.mark.parametrize("outcome", ["full", "slim", "dropped"])
+    def test_the_cli_summary_says_how_the_manifest_went_out(
+        self, catalog_file, monkeypatch, outcome
+    ):
+        _force_dispatch_manifest(monkeypatch, outcome)
+        agg_stub = TestRunnerParity._agg_stub(catalog_file, monkeypatch)
+        assert agg_stub.summary["dispatch_manifest"] == outcome
+        (setup,) = [e for _, _, e in agg_stub.events if e.get("mode") == "setup"]
+        assert ("run_manifest" in setup) == (outcome != "dropped")
+
+    def test_a_flat_run_always_sends_it_full(self, catalog, catalog_file, monkeypatch):
+        # The flat setup is synchronous (no size gate) on both dispatchers.
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "flat"
+        handle = _run(catalog, client=StubLambdaClient(), config=cfg).dispatch()
+        handle.wait(timeout=10)
+        assert handle.dispatch_manifest == "full"
+        agg_stub = TestRunnerParity._agg_stub(catalog_file, monkeypatch, cfg=cfg)
+        assert agg_stub.summary["dispatch_manifest"] == "full"
 
     def test_sync_setup_has_no_size_gate(self):
         # The flat setup invoke is synchronous (6 MB cap): the block always rides.
@@ -1238,3 +1440,173 @@ class TestTqdmOptional:
         handle = _run(catalog, client=StubLambdaClient()).dispatch()
         seen = [fut.result()["shard_key"] for fut in handle.progress(leave=False)]
         assert sorted(seen) == sorted(_WORDS)
+
+
+# -- the staged sweep chained by the tail (issue #588) ----------------------------
+
+
+class TestStagedSweepTail:
+    """``output.sweep: "stages"`` on the facade: the tail chains the staged
+    sweep through the runner's seam and finalizes only after a completed one,
+    exactly as ``runner._run_lambda``'s tail does."""
+
+    _COMPLETE = {"barrier_timed_out": False, "finisher": {"fired": True, "landed": True}}
+
+    def _drive(self, catalog, monkeypatch, *, staged, record=True, current=False, ladder=True):
+        from zagg import runner
+
+        seen: dict = {"stage": [], "order": [], "modes_at_stage": None}
+
+        def stage(*a, **k):
+            # The seam is stubbed, so it never reaches ``stub.invoke``:
+            # snapshot the invokes that preceded it (review, PR #591).
+            seen["modes_at_stage"] = [m for m in a[0].modes() if m]
+            seen["order"].append("stage")
+            seen["stage"].append((a, k))
+            return staged
+
+        real_finalize = runner._invoke_lambda_icechunk_finalize
+
+        def finalize(*a, **k):
+            seen["order"].append("finalize")
+            return real_finalize(*a, **k)
+
+        monkeypatch.setattr(runner, "_invoke_lambda_stage_sweep", stage)
+        monkeypatch.setattr(runner, "_invoke_lambda_icechunk_finalize", finalize)
+        cfg = default_config("atl06")
+        cfg.output["sweep"] = "stages"
+        if ladder:
+            cfg.output["grid"] = {**cfg.output["grid"], "chunk_inner": 9}
+        stub = StubLambdaClient(record=record, current=current)
+        run = _run(catalog, client=stub, config=cfg)
+        handle = run.dispatch()
+        handle.wait(timeout=10)
+        assert handle._tail_error is None
+        return run, handle, stub, seen
+
+    def test_the_stage_sweep_follows_the_record_and_precedes_the_finalize(
+        self, catalog, monkeypatch
+    ):
+        from zagg.config import get_touch_policy
+
+        run, handle, stub, seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
+        modes = stub.modes()
+        # CLI parity (issue #588 question (1), ruled): the rollup trigger still
+        # fires, then the staged sweep, then the finalize — all after the stats
+        # invoke wrote the tail marker, exactly as ``_run_lambda``'s tail.
+        assert modes.index("stats") < modes.index("sweep")
+        before = seen["modes_at_stage"]
+        assert "stats" in before and "sweep" in before  # the tail marker and rollup precede
+        assert "icechunk_finalize" not in before  # ...and the finalize follows
+        assert seen["order"] == ["stage", "finalize"] and modes[-1] == "icechunk_finalize"
+        ((args, kwargs),) = seen["stage"]
+        # The staged tail runs on the 8,192 MB tier of the run's own function
+        # family, as on ``_run_lambda`` (issue #586).
+        assert args[0] is stub and args[1:3] == ("process-shard-test-8192-disk", _STORE)
+        assert args[3] == [(w, None) for w in sorted(_WORDS)]  # every ok leaf
+        assert kwargs["shard_order"] == 6 and kwargs["dirt_only"] == []
+        # The stage records name the run this sweep completes (issue #593): it
+        # is what the operator ``finalize`` matches. The facade is unwindowed.
+        (cell,) = {e["run_id"] for _, _, e in stub.cell_events()}
+        assert kwargs["pipeline_run_id"] == cell
+        assert (kwargs["windowed"], kwargs["all_time"]) == (False, False)
+        assert kwargs["touch_policy"] == get_touch_policy(run.config)
+        assert kwargs["output_creds_event"] is None and "store_kwargs" in kwargs
+        assert handle.stage_sweep is self._COMPLETE
+        # The finalize carries the init record and the pinned ladder config.
+        assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
+        (fin,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
+        assert fin["icechunk_init"] == run._icechunk_init and "newest_only" not in fin
+        assert fin["config"]["output"]["icechunk"]["commit"] == "ladder"
+
+    @pytest.mark.parametrize(
+        "staged, reason",
+        [
+            (None, "staged sweep dispatch failed"),
+            (
+                {"barrier_timed_out": True, "finisher": {"fired": True, "landed": True}},
+                "staged sweep barrier timed out",
+            ),
+            (
+                {"barrier_timed_out": False, "finisher": {"fired": True, "landed": False}},
+                "staged sweep finisher did not land",
+            ),
+        ],
+    )
+    def test_an_incomplete_stage_sweep_leaves_the_run_untagged(
+        self, catalog, monkeypatch, staged, reason
+    ):
+        # Stage nodes are Event invokes: a sweep that did not complete may
+        # still have node commits in flight, so no tag — the CLI's gate
+        # (issue #582), shared through ``runner._staged_sweep_incomplete``.
+        _run_, handle, stub, seen = self._drive(catalog, monkeypatch, staged=staged)
+        assert seen["order"] == ["stage"] and "icechunk_finalize" not in stub.modes()
+        assert handle.stage_sweep is staged
+        assert handle.icechunk_finalize == {"skipped": reason}
+
+    def test_a_stage_sweep_that_fired_nothing_still_tags(self, catalog, monkeypatch):
+        staged = {
+            "skipped": "no dispatch nodes",
+            "barrier_timed_out": False,
+            "finisher": {"fired": False, "landed": False},
+        }
+        _run_, _handle, stub, seen = self._drive(catalog, monkeypatch, staged=staged)
+        assert seen["order"] == ["stage", "finalize"] and stub.modes()[-1] == "icechunk_finalize"
+
+    def test_dirt_only_units_chain_the_sweep_without_leaves(self, catalog, monkeypatch):
+        # A touched current unit writes no stats record — no rollup sweep, no
+        # run-parquet row — but re-gathers its node's refs (issue #580), so
+        # the staged sweep is chained on dirt-only units alone.
+        _run_, _handle, stub, seen = self._drive(
+            catalog, monkeypatch, staged=self._COMPLETE, record=False, current=True
+        )
+        assert "sweep" not in stub.modes()
+        ((args, kwargs),) = seen["stage"]
+        assert args[3] == [] and kwargs["dirt_only"] == [(w, None) for w in sorted(_WORDS)]
+        assert seen["order"] == ["stage", "finalize"]
+
+    def test_no_work_chains_nothing_and_still_tags(self, catalog, monkeypatch):
+        # No leaf and no dirt-only unit: nothing to sweep, and the finalize is
+        # ungated — every commit of the run has landed with the fan-out.
+        _run_, handle, stub, seen = self._drive(
+            catalog, monkeypatch, staged=self._COMPLETE, record=False
+        )
+        assert seen["order"] == ["finalize"] and handle.stage_sweep is None
+        assert "sweep" not in stub.modes()
+
+    def test_a_block_failure_before_the_chain_still_gates(self, catalog, monkeypatch):
+        # A raise anywhere in the sweep block (here a malformed stats record)
+        # must not fire the finalize ungated: the gate is decided from the
+        # config before the try, so the tag is withheld (review, PR #591).
+        import zagg.sweep
+
+        def boom(records):
+            raise ValueError("malformed stats record")
+
+        monkeypatch.setattr(zagg.sweep, "leaves_from_stats_records", boom)
+        _run_, handle, stub, seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
+        assert seen["order"] == [] and "icechunk_finalize" not in stub.modes()
+        assert handle.stage_sweep is None
+        assert handle.icechunk_finalize == {"skipped": "staged sweep dispatch failed"}
+
+    def test_a_leaf_pinned_run_still_chains_and_gates(self, catalog, monkeypatch):
+        # No ``/2`` ladder declared, so the dispatch pins ``commit: "leaf"``,
+        # yet ``stages`` still chains the sweep and the finalize gate follows
+        # the sweep's summary regardless of the pinned mode: the gate is on
+        # the sweep, not the commit mode.
+        _run_, handle, stub, seen = self._drive(catalog, monkeypatch, staged=None, ladder=False)
+        (init,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_init"]
+        assert init["config"]["output"]["icechunk"]["commit"] == "leaf"
+        assert seen["order"] == ["stage"]
+        assert handle.icechunk_finalize == {"skipped": "staged sweep dispatch failed"}
+
+    def test_the_seam_and_the_gate_are_the_runners(self):
+        # Shared, not copied (issue #588): the facade owns no staged-sweep
+        # dispatcher or completion gate of its own.
+        import inspect
+
+        src = inspect.getsource(zagg.client)
+        assert "def _invoke_lambda_stage_sweep" not in src
+        assert "def _staged_sweep_incomplete" not in src
+        assert "runner._invoke_lambda_stage_sweep(" in src
+        assert "runner._staged_sweep_incomplete(" in src
