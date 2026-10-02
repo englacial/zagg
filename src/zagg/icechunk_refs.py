@@ -60,11 +60,12 @@ import numpy as np
 from zagg.icechunk_rows import (
     ALL_ROW,
     DEFAULT_ROWS_PER_MANIFEST,
-    LEGACY_ROW_SPLIT,
+    adopt_row_cut,
     check_revision,
     commit_rows,
     coordinate_specs,
     level_group_spec,
+    resolve_rows_per_manifest,
     row_index,
     row_key,
     splits_follow_block,
@@ -296,20 +297,11 @@ def resolve_options(config, shard_order: int, *, tuple_width: int | None = None,
             f"output.icechunk.split_order {split_order} must lie in [commit_order {commit_order}, "
             f"shard_order {shard_order}] — a commit must write whole manifests (spec §11.5)"
         )
-    rows_per_manifest = raw.get("rows_per_manifest")
-    rows_per_manifest = (
-        DEFAULT_ROWS_PER_MANIFEST if rows_per_manifest is None else int(rows_per_manifest)
-    )
-    if rows_per_manifest < 1:
-        raise ValueError(
-            f"output.icechunk.rows_per_manifest {rows_per_manifest} must be at least 1 — "
-            f"a manifest spans whole rows (spec §11.5)"
-        )
     return {
         "commit": commit,
         "commit_order": commit_order,
         "split_order": split_order,
-        "rows_per_manifest": rows_per_manifest,
+        "rows_per_manifest": resolve_rows_per_manifest(raw),
     }
 
 
@@ -747,20 +739,7 @@ def init_repo(
                 f"output.icechunk.commit_order {options['commit_order']} exceeds the store's "
                 f"recorded split_order {stored}: a commit must write whole manifests (§11.5)"
             )
-    # The row cut is fixed at the repo's creation (§11.5): it is baked into
-    # every manifest already written, so a later config value is
-    # adopted-with-a-warning the way a finer ``split_order`` is, and moving it
-    # on an existing repo is an operator ``rewrite_manifests`` concern.
-    # Unlike ``split_order`` it does NOT ratchet here. An absent key is a
-    # repo written before the ruling: it keeps its every-row-in-one cut.
-    rows_stored = int(existing.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
-    if int(options["rows_per_manifest"]) != rows_stored:
-        logger.warning(
-            f"output.icechunk.rows_per_manifest {options['rows_per_manifest']} differs from the "
-            f"store's recorded {rows_stored} at {path}; the row cut is fixed at creation — "
-            f"using {rows_stored} (spec §11.5)"
-        )
-        options = {**options, "rows_per_manifest": rows_stored}
+    options = adopt_row_cut(existing, options, path)
     if wanted < stored:
         ratchet = {"from": stored, "to": wanted}
         block = repo_group_spec(grid, store_root, options, manifest).attributes[ICECHUNK_ATTR]

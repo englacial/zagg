@@ -80,6 +80,43 @@ def level_split(chunks: int, rows: int = DEFAULT_ROWS_PER_MANIFEST) -> dict:
     return {D.Axis(0): int(rows), D.Axis(1): int(chunks)}
 
 
+def resolve_rows_per_manifest(raw: Mapping) -> int:
+    """``output.icechunk.rows_per_manifest``, defaulted and vetted (§11.5).
+
+    One manifest per row unless the store asks for blocks; at least 1, a
+    manifest spanning whole rows.
+    """
+    value = raw.get("rows_per_manifest")
+    value = DEFAULT_ROWS_PER_MANIFEST if value is None else int(value)
+    if value < 1:
+        raise ValueError(
+            f"output.icechunk.rows_per_manifest {value} must be at least 1 — "
+            f"a manifest spans whole rows (spec §11.5)"
+        )
+    return value
+
+
+def adopt_row_cut(existing: Mapping, options: dict, path: str) -> dict:
+    """``options`` with the STORE's row cut, warning when the config's differs (§11.5).
+
+    The cut is fixed at the repo's creation: it is baked into every manifest
+    already written, so a later config value is adopted the way a finer
+    ``split_order`` is, and moving it on an existing repo is an operator
+    ``rewrite_manifests`` pass. Unlike ``split_order`` it does NOT ratchet.
+    An absent key is a repo written before the row split: it keeps its
+    every-row-in-one cut (:data:`LEGACY_ROW_SPLIT`).
+    """
+    stored = int(existing.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
+    if int(options["rows_per_manifest"]) == stored:
+        return options
+    logger.warning(
+        f"output.icechunk.rows_per_manifest {options['rows_per_manifest']} differs from the "
+        f"store's recorded {stored} at {path}; the row cut is fixed at creation — "
+        f"using {stored} (spec §11.5)"
+    )
+    return {**options, "rows_per_manifest": stored}
+
+
 def check_revision(have, want: str, path: str) -> None:
     """Refuse a repo whose ``zagg_icechunk.spec`` is not this writer's (§11.2).
 
@@ -442,6 +479,8 @@ __all__ = [
     "ROW_START",
     "array_model",
     "level_split",
+    "resolve_rows_per_manifest",
+    "adopt_row_cut",
     "check_array_model",
     "check_revision",
     "commit_rows",
