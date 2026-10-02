@@ -652,8 +652,8 @@ def init_repo(
     writes is already at the new cut) and flagged as ``split_ratchet:
     {from, to}`` for a later ``rewrite_manifests`` of the old manifests (not
     run here — mixed cuts are valid, each manifest carries its own extents).
-    An init that fails after that save re-saves the block's own splits before
-    raising (:func:`zagg.icechunk_rows.splits_follow_block`, issue #597).
+    An init that RAISES after that save re-saves the block's own splits first
+    (:func:`zagg.icechunk_rows.splits_follow_block`, issue #597); a killed one cannot.
     ``commit_order`` is per-run: it is written to the block for this run's
     stage nodes whenever it differs, never compared.
     """

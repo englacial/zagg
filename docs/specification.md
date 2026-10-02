@@ -4325,9 +4325,13 @@ changes (a ratchet, the per-run knobs) only when the winner changed nothing
 else, or made the same changes: a block the winner moved otherwise — a
 different ratchet, other knobs — is not overwritten with changes computed
 from the block before it, and the loser's init raises (and fails open). An
-init that fails after saving a ratcheted splitting config (§11.5: the save
+init that raises after saving a ratcheted splitting config (§11.5: the save
 precedes the commit and is not part of it) first re-saves the splits of the
-block as it stands, so the saved config does not stay ahead of the block.
+block as it stands. That covers an error the init can catch, not an init
+killed between the save and the commit (a timeout, an out-of-memory kill):
+it re-saves nothing, and the saved config stays ahead of the block until
+the splits are saved again (a further ratchet, or `declare-pyramid` adding
+a level).
 
 **Finalize.** `finalize {run_id}` — the once-per-run close
 (`mode="icechunk_finalize"` on Lambda, in-process on the local backend),
