@@ -1415,7 +1415,10 @@ def _validate_windowing(config: PipelineConfig) -> None:
     is decided per observation. On the RASTER path (issue #247) membership is
     the acquisition's STAC ``datetime`` instead: ``time_field`` is optional
     (fixed to ``datetime``) and the ``epoch``/``scale``/``units`` conversion
-    knobs are rejected.
+    knobs are rejected. ``unit`` (issue #586 phase 2) picks the dispatch
+    unit — ``shard`` (default: one invoke per shard emits every window its
+    granules span) or ``window`` (one invoke per ``(shard, window)``); the
+    raster path always dispatches per window and rejects the key.
     """
     from zagg import windows as _windows
 
@@ -1454,8 +1457,21 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "output.windowing requires output.store_layout: hive (window leaves "
             "are hive leaf zarrs; the flat shared store has no leaves to window)"
         )
+    unit = block.get("unit")
+    if unit is not None and unit not in WINDOWING_UNITS:
+        raise ValueError(
+            f"output.windowing.unit must be one of {WINDOWING_UNITS} (got {unit!r}): "
+            f"'shard' emits every window from one invoke per shard, 'window' "
+            f"dispatches one invoke per (shard, window)"
+        )
     time_field = block.get("time_field")
     if (config.data_source or {}).get("reader") == "raster":
+        if unit is not None:
+            raise ValueError(
+                "output.windowing.unit does not apply to raster pipelines: window "
+                "membership is decided per acquisition at dispatch, one unit per "
+                "(shard, window) (drop the key)"
+            )
         # Raster window membership is the acquisition's STAC ``datetime``,
         # decided at dispatch (issue #247, ratified): there is no
         # per-observation timestamp column, so ``time_field`` is optional and
@@ -3768,6 +3784,28 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         "units": block.get("units") or "seconds",
         "windows": declared,
     }
+
+
+#: ``output.windowing.unit`` values (issue #586 phase 2): ``shard`` is one
+#: invoke per shard emitting every window its granules span (the default);
+#: ``window`` keeps the per-``(shard, window)`` fan-out.
+WINDOWING_UNITS = ("shard", "window")
+
+
+def get_windowing_unit(config: PipelineConfig) -> str:
+    """The windowed dispatch unit, ``"shard"`` (default) or ``"window"`` (issue #586).
+
+    Read apart from :func:`get_windowing` on purpose: the unit is how a run
+    is DISPATCHED, not what the store holds — the leaves, the manifest's
+    temporal block and the D19 semantic hash (which folds the normalized
+    windowing declaration, :mod:`zagg.semantics`) are byte-identical either
+    way, so the knob must move none of them. Raster configs always read
+    ``"window"`` (membership is per acquisition at dispatch).
+    """
+    if (config.data_source or {}).get("reader") == "raster":
+        return "window"
+    block = config.output.get("windowing") or {}
+    return block.get("unit") or "shard"
 
 
 def window_time_filters(config: PipelineConfig, start: float, end: float) -> list[dict]:

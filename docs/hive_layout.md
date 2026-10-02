@@ -110,6 +110,7 @@ output:
   store_layout: hive
   windowing:                        # absent = schedule none = morton-hive/1
     schedule: yearly                # none | yearly | monthly | daily | explicit
+    unit: shard                     # shard (default) | window — the dispatch unit
     time_field: delta_time          # per-observation timestamp column
                                     #   (a declared data_source column)
     epoch: "2018-01-01T00:00:00Z"   # dataset zero as an ISO-8601 UTC instant
@@ -162,14 +163,97 @@ output:
   `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
   `TAI−UTC = 37 s`; stdlib `datetime` has no leap-second table) — boundaries
   are accurate to ≤ 1 leap second, none declared since 2017.
-- **Dispatch fans one work unit per (shard, window).** The ShardMap's
-  per-granule `time_start`/`time_end` subset granules per window; inside the
-  worker an observation-level filter on `time_field` (a pair of structured
-  `ge`/`lt` predicates riding the ordinary filter machinery) splits
-  boundary-straddling granules exactly — an observation on a boundary instant
-  belongs to the *later* window. Legacy shardmaps without granule times
-  dispatch every granule to every window (the filter keeps it correct) and
-  need `bounds.temporal` to enumerate generative windows.
+- **Dispatch is one work unit per shard, emitting every window its granules
+  span** (`unit: shard`, the default —
+  [issue #586](https://github.com/englacial/zagg/issues/586) phase 2). The
+  ShardMap's per-granule `time_start`/`time_end` decide which granules belong
+  to which window, and the worker reads the shard's granules ONCE, bins each
+  read on `time_field` into the windows (the same half-open `[start, end)`
+  predicate, applied to the read chunk instead of inside the read — an
+  observation on a boundary instant belongs to the *later* window), then
+  aggregates and finishes one window at a time — leaf, stamp, granule-id
+  sibling, leaf column, refs, pointer — releasing each window's reads before
+  the next one pools, so peak memory holds one window's slab beside the
+  shard's reads rather than N. Under `aggregation.streaming` each window
+  gets its own aggregator at the fan-out unit's own threshold, flushed on
+  its own granule cadence and drained as soon as the read passes its last
+  member granule (so the resident tail buffers are the open windows', not
+  all N; under `mode: merge` every window's running state stays resident
+  until its leaf is written), plus one shared cap on the open spill blocks
+  together (`SPILL_TMP_FRACTION` of free `/tmp`), with every block close
+  first joining all the windows' in-flight reduces so one block reduces at a
+  time. A cap close is the one bulk-only fold, and on a config with no
+  cross-block fold law it fails the shard (`SpillOverflowError`) where every
+  fan-out unit would have stayed single-block: dispatch `unit: window` there. The leaves are
+  byte-identical to the per-window fan-out's. `unit: window` keeps that
+  fan-out — one invoke per (shard, window), the window's granule subset,
+  an observation-level `ge`/`lt` filter pair injected into the read — for
+  runs that want the smaller per-invoke footprint at the cost of reading
+  each shard once per window. The shard event carries the shard's whole
+  granule list plus each window's index list, so it is about N× a
+  per-window event: at ~100 B per ATL03 s3 href the 250 KiB async (Event)
+  budget holds ~2,400 granules, and a 4,600-granule pole shard × 7 windows
+  is ~478 KB (every per-window event ~68 KB). Such a shard fails at
+  dispatch on an async run (`invocation="sync"`, or `unit: window`, is the
+  remedy), and the per-leaf `submap` block is dropped — sub-maps deferred
+  to the sweep CLI — at a correspondingly lower granule count. The unit is a dispatch choice: the leaves,
+  the manifest's temporal block and the D19 semantic hash are the same
+  either way. The raster path always dispatches per window (membership is
+  per acquisition at dispatch) and rejects the key. Legacy shardmaps
+  without granule times dispatch every granule to every window (the
+  per-observation split keeps it correct) and need `bounds.temporal` to
+  enumerate generative windows.
+- **Run records stay one row per leaf.** A shard unit that emits N leaves
+  writes N D20 records — each leaf's own sidecar, sub-map (its granule
+  subset) and run-parquet row, with `window` naming the leaf, so the
+  sweep's run-record discovery and `Run.attach` read them as before. The
+  invoke-level telemetry (`duration_s`, `duration_total_s` — the billed
+  wall, [issue #589](https://github.com/englacial/zagg/issues/589) —
+  `max_memory_mb`, `gb_seconds` / `est_cost_usd`, the
+  `read` phase, and `n_obs_read` — the shard's decoded rows, so the #374
+  read-vs-keep ratio is per invoke: `n_obs_read` over the rows' summed
+  `n_obs`) repeats across the invoke's N rows and each carries
+  `unit_windows: N` — the leaves the invoke emitted, windows the gate
+  skipped not counted (null on a per-window unit) — so per-invoke quantiles stay
+  the fleet-safety numbers and a per-invoke sum de-duplicates on
+  `(run_id, shard_key)` where `unit_windows` is set. The stats rollup does
+  exactly that (`telemetry.merge`: a shard node's rollup carries the bill of
+  the one invoke that wrote its N leaves, and everything coarser sums shard
+  rollups), as does `tools/windowed_emit_measure.py`; the dispatcher's own
+  cost block and `worker_pct_timeout` read the invoke's result body, one per
+  invoke. A window whose inputs
+  are current under the skip-if-current gate is skipped inside the shard
+  invoke (no record, as for a skipped unit); a window that kept no data
+  reports the fan-out's benign no-data error and fails nothing. A window
+  that fails costs only its own leaf — the others still land and keep their
+  records and sidecars — but marks the invoke failed
+  (`error: "window {label}: ..."`). Nothing re-fires it automatically (a
+  body-level error is not retried and a `failed` status object is
+  terminal): a re-run of the shard rewrites the failed window while the
+  gate skips the windows that landed.
+- **The post-run tail reads leaves, not invokes.** The shard above is a
+  failed cell on every backend — its 500 and its `failed` status object on
+  the fleet, `cells_error` on both — but the
+  leaves that landed are in the store, and the run's tail treats them as the
+  per-window fan-out would have: the **sweep work set** (the families sweep,
+  the staged sweep's `(node, window)` units and the node close) is every
+  result's stats **records**, each on its own `success`, never the invoke's
+  status; a shard enters the root **`coverage.moc`** when at least one of
+  its leaves stands (written by this run, or found current or refused by the
+  gate), and the root time-range union takes those leaves' ranges alone. The
+  failed window is in none of them. This is one rule on every dispatch path
+  that runs a windowed config — the local backend and `agg` on Lambda over
+  the sync, async and Event transports (`runner._landed_coverage`,
+  `sweep.leaves_from_stats_records`) — so a backend never sweeps or covers
+  what another would not. The `zagg.client` tail reads results through the
+  same two readers, but today `zagg.client` and `Run.attach` refuse a
+  windowed config, so a partly failed windowed run's tail is recovered with
+  `python -m zagg.sweep`, not by attaching: the run parquet already carried
+  one row per leaf, the failed window's unsuccessful, so its run-record
+  discovery sees the same set. Only a
+  worker that RETURNED reports its landed windows: an invoke killed outright
+  (timeout, OOM) leaves no body, and on the fleet no D20 sidecar either, so
+  the re-run rewrites those windows rather than skipping them.
 - **Stamps carry the truth, the manifest the schema** (D15): each windowed
   leaf's commit stamp records its `window` label and the ACTUAL written
   `time_range` as ISO-8601 UTC strings (both ends at whole-second
@@ -180,6 +264,27 @@ output:
   to a `yearly` store adds leaves the schedule already describes — no
   manifest touch; the explicit list is the noted exception (appending outside
   it re-templates).
+- **No per-cell `morton` array** ([issue #586](https://github.com/englacial/zagg/issues/586)
+  phase 3, [specification §1.5](specification.md#15-storage-geometries) "The
+  cell coordinate"): every window of a shard shares the shard's cells axis,
+  so a windowed leaf does not store the coordinate — cell `j` carries the
+  word of the shard's `j`-th child at the cell order
+  (`zagg.grids.morton.cell_words`; one stride of 4,194,304 across an order-9
+  shard at cell order 19), derived from the leaf id and the rank. That is
+  32 KiB per occupied inner chunk and two objects per leaf not written —
+  8.4 MB per full order-9 shard, per window. Every write path drops it (the
+  shard unit, `unit: window`, the streaming and spill modes, the raster
+  writer, versioned leaves), on the local backend and the Lambda handler
+  alike; unwindowed leaves keep their stored array unchanged. zagg's readers
+  derive it when it is absent — the sweep fold and the column backfill pin
+  the leaf's extent on a declared field instead, the tensor readers derive
+  the words from the leaf's own stamp — and windowed leaves written before
+  this change, which do store it, read as before. The leaf columns and
+  overviews still store `morton` in every group. `python -m
+  zagg.pyramid_check` holds the derivation against the data: its
+  `coordinates` check requires every location word of a sampled cell to lie
+  inside the derived cell, and reports a store with no located field as
+  *derivation only* rather than as a pass.
 - **Coverage gains `encoding: "full"`** (D14): a popcount at stamp time marks
   a fully-occupied subtree — no bitmap sidecar object is written, and readers
   short-circuit the exact intersection through the shard's own MOC
@@ -529,6 +634,7 @@ workers over the leaf columns** — a raw leaf is never read above the shard:
 ```
 python -m zagg.sweep s3://bucket/store --stages            # CLI backstop
 python -m zagg.sweep s3://bucket/store --stages --partitions 16
+python -m zagg.sweep s3://bucket/store --stages --pipeline-run-id <run id>
 ```
 
 or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
@@ -564,6 +670,49 @@ tier (the espg merge-source ruling), so **the cadence changes no bytes**:
 every upfront merge level is uniformly 2 merges from raw (gathers are 1;
 gen 3 is append-later cascade territory only).
 
+**Units.** The unit of stage work is the dispatch node on an unwindowed
+store and the **`(node, window)` pair** on a windowed one
+([issue #586](https://github.com/englacial/zagg/issues/586)): each window's
+overviews and stage column come from that window's leaf columns alone, so a
+node's windows are independent. The fleet runs them concurrently, one invoke
+per window per node; the CLI and the local backend run the same units
+serially. A node's window units share no object — each writes only its own
+`{window}.zarr` / `{window}.pyramid.zarr` and reads its skip key off the
+artifact itself — so one that fails costs its own window and nothing else,
+and is named in the stage record (`unit_errors`). Where the store declares
+`output.pyramid.all_time`, each node then gets one **close**: the all-time
+fold, a k-way merge of the node's per-window overviews into `all.zarr`
+(overview-sized objects at the same node, never leaves — its cost follows
+the window count, not the subtree). It covers every window the node has,
+not only the ones the run touched, records the windows it folded
+(`source_windows`), and is one more merge from raw than its sources — 2 at a
+gather level, 3 at a merge level
+([specification §4.4](specification.md)). A store without the declaration
+has no close and pays no unit for it. The declaration is the store's: the
+fleet dispatcher reads it back from the first window unit's stage record
+(`closes`, taken from the manifest the worker ran against), so a run whose
+config omits or contradicts `all_time` still closes exactly the nodes the
+CLI would.
+
+**Memory.** A stage worker folds a level **one block of output cells at a
+time** — read the child members covering the block, fold, write, drop — and
+never holds a level whole (`zagg.sweep_fold`). A block is `4^5` cells; a
+stage-column group wider than that is laid on inner chunks of exactly one
+block, so the block written and the block a parent reads back are single
+chunk objects. Nothing is spilled to `/tmp`: the inputs already live in the
+store. The stage rows report `fold_blocks`, `fold_cells_read` and
+`fold_peak_cells` (the most source cells any one block held).
+
+**Which run a sweep completes.** A sweep has its own `run_id`. When it is
+chained after an aggregation run, that run's id rides along as
+**`pipeline_run_id`** and is written into the sweep's run record
+(`sweep_stats_{ts}_stages.json`) and every stage record
+([issue #593](https://github.com/englacial/zagg/issues/593)), so the record
+names the run it vouches for instead of being linked to it by time. A
+standalone `--stages` pass names the run it is completing with
+`--pipeline-run-id`; without it the key is `null` and the pass vouches for
+no run.
+
 **Scope.** The only argument a sweep takes about *where* is an optional
 node-prefix set — a MOC; a shardmap is accepted as sugar (its keys are the
 prefixes). Scope selects which dispatch nodes are invoked; a dispatched
@@ -577,7 +726,7 @@ swept under one admission.
 | regime | allowed? | governed by |
 |---|---|---|
 | fleet ∥ fleet | yes, iff their (window, shard) write sets are disjoint | the existing leaf single-writer law |
-| fleet ∥ sweep | yes | disjoint object sets; the stage worker validates every column stamp before and after reading its groups and re-reads on movement, so a mid-read leaf rewrite never feeds a torn column into a merge; a mid-sweep append is recorded-and-healed under-coverage |
+| fleet ∥ sweep | yes | disjoint object sets; the stage worker validates every column stamp before and after reading its groups and re-reads on movement; once a column has served a block, a rewrite under it fails the artifact being folded, which is folded once more from fresh reads, so a mid-read leaf rewrite never feeds a torn column into a merge; a mid-sweep append is recorded-and-healed under-coverage |
 | sweep ∥ sweep | **no — serialized per store** | the admission lease |
 
 Only pyramid sweeps serialize. Admission is one conditional PUT of the
@@ -616,6 +765,93 @@ overviews out under a bucket lifecycle rule: the per-unit lifecycle touch
 covers leaf footprints, not ancestor artifacts (the PR #397 finding — this
 is the recorded posture, not an oversight; re-sweeping is the refresh).
 
+### Checking a swept store (`python -m zagg.pyramid_check`)
+
+The acceptance check for a swept pyramid
+([issue #434](https://github.com/englacial/zagg/issues/434)) is read-only and
+runs from any machine that can read the store:
+
+```bash
+python -m zagg.pyramid_check s3://bucket/product.zarr            # your credentials
+python -m zagg.pyramid_check s3://public-bucket/product.zarr --anon
+```
+
+It prints one line per check and exits nonzero on any `FAIL`. It derives
+what it expects from the leaves, the artifacts' own recorded attrs and the
+geometry — never by calling the fold it is checking — and it samples: the
+value checks read `--sample-nodes` nodes per ladder order and
+`--sample-cells` cells per node (`--full`, for a local fixture-scale store
+only, reads everything and can re-run the sweep to prove it a no-op).
+
+On an **unwindowed** store the checks are `declaration` (the manifest
+grammar), `coordinates` (leaf cell words against the located fields),
+`materialization` (a committed `all.zarr` at every declared ladder node),
+`columns` (a committed leaf column per leaf), `readback` (the attrs each
+artifact records, held to specification §4.4/§4.6), and `counts` / `digests`
+/ `composition` (each sampled cell re-folded from the leaf columns, and each
+column from its leaf).
+
+A **windowed** store ([issue #586](https://github.com/englacial/zagg/issues/586))
+is one ladder per window, so the same checks run per window over that
+window's objects, and every finding names the node and the window
+(`-511[2019]`, `window 2019: …`):
+
+- `records` — where the manifest declares a `per-centroid` temporal field
+  (§8.3): each sampled `(leaf, window)` is read as the families sweep reads
+  it, record first. A leaf with a usable `temporal.toc` passes, a leaf
+  holding no clocked observation needs none, and a stamped leaf with clocked
+  observations but no usable record — which the sweep would count as
+  coverage only, under `uncounted_shards` — fails by leaf and window. With
+  no temporal field declared the check is `SKIP`.
+- `materialization` — a committed `{window}.zarr` at every ladder node that
+  has a leaf of that window beneath it; `columns` — a committed
+  `{window}.pyramid.zarr` beside every `(leaf, window)`. Every check derives
+  from the leaf roster, so the roster is cross-checked against the store:
+  a window with an overview at an order-0 node the roster does not reach
+  (every window's ladder runs to order 0), and, under the run-record roster,
+  a shard the root `coverage.moc` covers and the records lack, both FAIL by
+  name — rerun with `--roster list`. A recorded shard missing from the MOC is
+  the MOC lagging (its write is fail-open) and is only named.
+- `readback` — each artifact's `window` key must be the window it is filed
+  under, and only the all-time fold may carry `source_windows` (both checked
+  on every artifact, not a sample — the all-time folds' `window: all` too,
+  reported under `all_time`), plus the per-window regime, `merges_from_raw`
+  and `source_children` of §4.4 on the sampled nodes.
+- `counts` / `digests` / `composition` — a window's overview re-folded from
+  **that window's** leaf columns, and its columns from **that window's**
+  leaves, for `--sample-windows` windows (default 3). An overview built
+  from another window's leaves fails here.
+- `all_time` — where the manifest declares `pyramid.overview.all_time`: a
+  committed `all.zarr` at every ladder node, and for the sampled nodes its
+  values against the k-way fold of the node's own `{window}.zarr` overviews,
+  `regime: stage-merge`, `merges_from_raw` 2 at a gather level and 3 at a
+  merge level, `source_windows` equal to the windows the node holds, and
+  `source_children` / `generation` equal to those overviews' blocks summed.
+  A fold that consumed fewer windows than the node now holds is reported
+  `STALE`. Where the store declares no all-time fold the check is reported
+  `SKIP — not applicable`, never left out; the same nodes are still probed,
+  and a committed `all.zarr` found anyway (debris of an earlier declaration —
+  the `pyramid` block is not frozen) is named under "NOT validated".
+
+**What it reads on a windowed store.** The leaf roster from the run records
+(one LIST of the root and its `stats_*.parquet` objects; `--roster list`
+walks the store instead, `--roster moc` takes the shards from the root
+`coverage.moc` and one LIST per shard for its windows); for the roster's
+cross-check one LIST of the root, one per order-0 node (at most 12) and, under
+the run records, one GET of `coverage.moc`; one `zarr.json` GET
+per declared `(node, window)` overview, per `(leaf, window)` column and per
+ladder node for its `all.zarr` (declared or not) — the unwindowed bound times
+the window count; then array
+reads for the sampled windows × nodes × cells, and, per sampled all-time
+node, one LIST of the node's prefix and the sampled cells of each of its
+windows' overviews. Nothing is written.
+
+**Not checked, and said so.** The staged sweep's stage columns above the
+shard (orchestration, not contract — specification §4.6) on either kind of
+store; a windowed `zagg-pyramid/1` store (a legacy `orders` schedule, or a
+raster store), whose `declaration` fails naming that; and whatever the
+report lists under "check(s) declined — NOT validated".
+
 ## The commit stamp
 
 S3 has no empty directories and LIST is strongly consistent, so **absence is
@@ -641,7 +877,9 @@ per-array sha256 over decoded values plus the combined digest — computed
 from the arrays the worker just wrote, before the stamp lands, so the stamp
 certifies the digest of what it seals. The D20 stats sidecar carries the
 same record; a leaf stamped before the key existed is unverifiable from the
-stamp alone, never tampered.
+stamp alone, never tampered. A **windowed** leaf's record has no
+`{cell_order}/morton` key: that leaf stores no coordinate array (see
+[Time windows](#time-windows-morton-hive2)).
 
 The sidecar (and the run parquet row flattened from it) carries two clocks
 ([issue #589](https://github.com/englacial/zagg/issues/589)): `duration_s`
@@ -757,7 +995,7 @@ shard plus two store-root objects:
 |---|---|---|---|
 | 0 — morton box | canonical ≤ 4-member cover of the occupied cells (DCA children, each tightened) | `coverage` payload on the commit stamp | free — rides the stamp GET readers already make |
 | 1 — exact bitmap | zstd-compressed bit field over the shard subtree at `cell_order` | `{full_id}.zarr/coverage.moc` sidecar | one opt-in GET |
-| 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
+| 2 — exact truth | the leaf's `morton` coordinate (a stored array; derived from the leaf id on a windowed leaf) and its data arrays | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
 | root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
 | root sibling | [§10.5](specification.md) word-set cover: a per-shard toc word SET (temporal stores only) | `{store_root}/coverage.toc` | one opt-in GET, temporal consumers only, on demand |
 | leaf record | [§10.6](specification.md) temporal record: the leaf's envelope word + counted cover (temporal stores only; written by the leaf's worker, never by a sweep) | `{full_id}.zarr/temporal.toc` sidecar (a versioned leaf's: in its `current` version, beside the bitmap) | one small GET — the sweep's per-leaf read; readers never need it |
@@ -849,7 +1087,17 @@ back (a million-row ragged array per field per leaf at California scale,
 which no single invoke could finish). On a **versioned** leaf the record
 (like the bitmap) lives in the version subgroup —
 `{full_id}.zarr/run-{run_id}-{attempt}/temporal.toc` — and every walk
-resolves `current` before reading it.
+resolves `current` before reading it. On a **windowed** store every window
+leaf (`{full_id}_{window}.zarr`) carries its own record, counted from that
+window's observations alone, whichever unit wrote it: the bulk per-shard
+invoke ([issue #586](https://github.com/englacial/zagg/issues/586)) folds
+one accumulator per window — fed that window's binned observations on the
+pooled path and in both spill regimes — and writes each leaf's record before
+that leaf's stamp, so the record is the one `unit: window` writes, byte for
+byte. A record that cannot be built or written is its own window's failure:
+that leaf stays unstamped, the shard's other windows land with theirs, and
+the run's tail sweeps and covers the windows that landed (the "post-run tail
+reads leaves" rule above).
 
 **The record is the worker's, or there is none.** It is the only source of
 observation counts: the leaf stores no per-observation clock, so nothing
@@ -1766,12 +2014,16 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   refused and left to the next run's tag — the run summary's
   `dispatch_manifest` / `handle.dispatch_manifest` says which went out:
   `full`, `slim` or `dropped`), refuses unless
-  the newest `sweep_stats_*_stages.json` since the run's init commit
-  (the repo's clock) shows a completed sweep, and tags `newest_only` — an
-  older untagged run stays covered by the next run's tag. The record is
-  tied to the run by time only, so with overlapping runs on one store a
-  sibling run's sweep record can vouch for it. No `--force`: an incomplete sweep is
-  completed with `python -m zagg.sweep <store> --stages` first.
+  the newest `sweep_stats_*_stages.json` that names the run
+  (`pipeline_run_id == <run_id>`,
+  [issue #593](https://github.com/englacial/zagg/issues/593)) since the
+  run's init commit (the repo's clock) shows a completed sweep, and tags
+  `newest_only` — an older untagged run stays covered by the next run's
+  tag. A record naming another run, or none, vouches for nothing: a sibling
+  run's sweep or an unnamed `--stages` pass landing after this run opened
+  cannot tag it, and a later unnamed pass does not block the run's own
+  record either. No `--force`: an incomplete sweep is completed with
+  `python -m zagg.sweep <store> --stages --pipeline-run-id <run_id>` first.
   **Where it runs.** On an `s3://` store all of that is the worker's: the
   command fires one synchronous `mode: "icechunk_finalize"` invoke —
   `{mode, store_path, run_id, newest_only: true, operator_checks: true}`,
@@ -1917,7 +2169,9 @@ carrying the spec §8.1 `temporal` declaration at `shape: "coordinate"`
 and no CF attrs under
 `output.time_encoding: toc` — which the shipped Sentinel-2 config sets, issue
 #443) and `morton` (packed u64 words) as the sole cell
-coordinate — `cell_ids` (NESTED) rides only the `emit_cell_ids` transition hatch
+coordinate — stored on an unwindowed leaf, derived on a windowed one, which
+stores no such array ([Time windows](#time-windows-morton-hive2));
+`cell_ids` (NESTED) rides only the `emit_cell_ids` transition hatch
 (issue #304) — plus one
 `(T_leaf, cells_per_shard)` array per configured band, chunked
 `(1, cells_per_chunk)`. The leaf's time axis is the unit's **own acquisition
@@ -1984,6 +2238,10 @@ be added later by the sweep as a derived artifact). Readers:
    for a reader that already GETs the root stamp and then addresses chunks by
    key (moczarr's 2-GET path, zagg's readers). A zarr-python reader that
    opens the version **group** pays one GET for its `{current}/zarr.json`.
+   A **windowed** leaf has no `{cell_order}/morton` array to open: the cell
+   words are the shard's children at the cell order
+   (`zagg.grids.morton.cell_words(shard, cell_order)`), the shard being the
+   leaf id the path was computed from.
 4. Discovery without a root MOC falls back to the delimiter-LIST walk:
    recurse on `[1-4]/` children; a `*.zarr` entry is data at that node; no
    digit children ⇒ nothing finer. Never LIST per observation in a join

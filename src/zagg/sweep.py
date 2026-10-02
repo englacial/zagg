@@ -1085,7 +1085,10 @@ def _rollup_interior(store, fam, node, computed, counts) -> dict | None:
     A child freshly computed this pass is used in memory; any other candidate
     is probed on the store (<= 4 GETs, no LIST) so prior runs' siblings keep
     contributing. Generation is the children's sum/max — fold-of-folds equals
-    the direct leaf fold because every family's merge is associative (§8.3).
+    the direct leaf fold because every family's merge is associative (§8.3)
+    over shard rollups: the stats fold is, once each bulk invoke's rows have
+    met in one call, which :func:`_rollup_shard_node` guarantees
+    (:func:`zagg.telemetry.merge`).
 
     The store is append-only at the leaf level (leaf deletion/GC is the
     registered debris family, deliberately stubbed), so a child that emptied
@@ -1248,12 +1251,17 @@ def leaves_from_stats_records(records) -> list:
     ``shard_key`` + the issue #300 ``window`` field. Records without a window
     key (older workers) map to the unwindowed leaf name — on a windowed store
     that read simply misses (fail-open; the CLI backstops). Failure and
-    ``None`` records are skipped; pairs are deduplicated and sorted.
+    ``None`` records are skipped; pairs are deduplicated and sorted. A bulk
+    multi-window unit's ``stats`` is a LIST of records, one per emitted leaf
+    (issue #586 phase 2, :func:`zagg.telemetry.stats_records`).
     """
+    from zagg.telemetry import stats_records
+
     refs = {
         (int(r["shard_key"]), r.get("window"))
-        for r in records
-        if r and r.get("success") and r.get("shard_key") is not None
+        for stats in records
+        for r in stats_records(stats)
+        if r.get("success") and r.get("shard_key") is not None
     }
     return sorted(refs, key=lambda p: (p[0], p[1] is not None, p[1] or ""))
 
@@ -1266,12 +1274,17 @@ def dirt_only_leaves(metas) -> list:
     unit enters no sweep": its lifecycle touch moved the checksums its Icechunk
     refs carry and it rewrote its ladder sidecar, which the worker marks
     ``icechunk_dirty``. Those units re-gather their node's refs in the staged
-    sweep without re-folding it (PR #581 question (11), ruled (a)).
+    sweep without re-folding it (PR #581 question (11), ruled (a)). A bulk
+    multi-window unit stands for its per-window metas
+    (:func:`zagg.telemetry.window_metas`).
     """
+    from zagg.telemetry import window_metas
+
     refs = {
         (int(m["shard_key"]), m.get("window"))
-        for m in metas
-        if m and m.get("current") and m.get("icechunk_dirty")
+        for meta in metas
+        for m in window_metas(meta)
+        if m.get("current") and m.get("icechunk_dirty")
     }
     return sorted(refs, key=lambda p: (p[0], p[1] is not None, p[1] or ""))
 
@@ -1431,6 +1444,16 @@ def main(argv=None) -> int:
         "The families sweep does not run in this mode.",
     )
     parser.add_argument(
+        "--pipeline-run-id",
+        default=None,
+        metavar="RUN_ID",
+        help="With --stages: the PIPELINE run this pass completes (issue #593) — the "
+        "run id of an aggregation run whose dispatcher died before its staged sweep "
+        "finished. Recorded in the sweep's run record (pipeline_run_id) beside the "
+        "sweep's own id, so the record vouches for that run by name. Omitted, the "
+        "record carries null and vouches for no run",
+    )
+    parser.add_argument(
         "--tuple-width",
         type=int,
         default=3,
@@ -1479,6 +1502,10 @@ def main(argv=None) -> int:
         "to /2 must not get. Validated against the manifest's own shard/cell orders",
     )
     args = parser.parse_args(argv)
+    if args.pipeline_run_id is not None and not args.stages:
+        # The key lives in the STAGED run record; a families pass has nowhere
+        # to put it, and dropping it silently would look like it was recorded.
+        parser.error("--pipeline-run-id only applies to --stages")
     if args.overviews is not None and args.declare_pyramid is None:
         # --overviews rides the declaration, and a sweep pass would silently
         # ignore it — refuse rather than run something the operator did not ask
@@ -1538,6 +1565,7 @@ def main(argv=None) -> int:
             tuple_width=args.tuple_width,
             partitions=args.partitions if args.partitions != 1 else None,
             store_kwargs=store_kwargs,
+            pipeline_run_id=args.pipeline_run_id,
         )
         print(json.dumps(summary, indent=2))
         return 0

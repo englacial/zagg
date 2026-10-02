@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import re
 import statistics
 import threading
 import time
@@ -44,11 +45,13 @@ from zagg.config import (
     get_output_region,
     get_parent_order,
     get_pipeline_type,
+    get_pyramid,
     get_store_layout,
     get_store_path,
     get_sweep,
     get_touch_policy,
     get_windowing,
+    get_windowing_unit,
     validate_config,
 )
 from zagg.dispatch import (
@@ -104,6 +107,41 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
         return base
     suffix = f"-{worker['memory']}"
     if worker.get("extra_disk"):
+        suffix += "-disk"
+    return base + suffix
+
+
+#: The worker-size variant a staged sweep's invokes run on (issue #586): the
+#: 8,192 MB tier with the 10 GB ``/tmp``. The interim ruled on the issue's
+#: 2026-09-26 amendment — the 0.55 fleet's order-6 stage died at the 4 GB cap
+#: on 64 unwindowed leaves — and it stays until the chunk-streamed fold
+#: (:mod:`zagg.sweep_fold`) has been measured on the fleet. Stage nodes sit at
+#: order 6 and coarser, 1/64th of the shards and fewer, so the tier costs
+#: little. A dispatch default, not a deployment change: the variant is one
+#: the stack already stamps (``deployment/aws/template.yaml``).
+STAGE_SWEEP_WORKER = {"memory": 8192, "extra_disk": True}
+
+_WORKER_SUFFIX_RE = re.compile(r"-(?:2048|4096|8192)(?:-disk)?$")
+
+
+def _resolve_stage_function_name(function_name: str) -> str:
+    """The function a staged sweep's invokes go to (issue #586 phase 4).
+
+    Precedence: env ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME`` wins verbatim (a
+    deployment whose family has no such variant, or an operator pinning the
+    tier down again); otherwise the :data:`STAGE_SWEEP_WORKER` variant of the
+    RUN's own function family — ``function_name`` (already resolved,
+    :func:`_resolve_function_name`) with its ``-<memory>[-disk]`` suffix, if
+    any, replaced. So ``process-shard`` and ``process-shard-4096-disk`` both
+    stage on ``process-shard-8192-disk``, and a ``-test`` family on its own
+    twin. The leaf fan-out is unaffected; only the staged tail moves.
+    """
+    override = os.environ.get("ZAGG_LAMBDA_STAGE_FUNCTION_NAME")
+    if override:
+        return override
+    base = _WORKER_SUFFIX_RE.sub("", function_name)
+    suffix = f"-{STAGE_SWEEP_WORKER['memory']}"
+    if STAGE_SWEEP_WORKER.get("extra_disk"):
         suffix += "-disk"
     return base + suffix
 
@@ -2356,6 +2394,57 @@ def _windowed_units(cells: list[tuple], windowing: dict, bounds_temporal: dict |
     return units
 
 
+def _shard_window_units(cells: list[tuple], windowing: dict, bounds_temporal: dict | None) -> list:
+    """Regroup :func:`_windowed_units` per SHARD: ``(shard, records, windows)`` units.
+
+    The ``output.windowing.unit: shard`` dispatch (issue #586 phase 2, the
+    default): one unit per shard whose ``windows`` are the ``(payload,
+    subset)`` pairs of every window its granules span, in window order, and
+    whose ``records`` are the shard's records that belong to at least one of
+    them, in their incoming order — so the worker reads the same granules the
+    per-window fan-out would, once, and bins them. A shard with no window is
+    dropped, as the fan-out drops it.
+    """
+    by_shard: dict = {}
+    for shard_key, subset, payload in _windowed_units(cells, windowing, bounds_temporal):
+        by_shard.setdefault(shard_key, []).append((payload, subset))
+    units = []
+    for shard_key, records in cells:
+        windows = by_shard.get(shard_key)
+        if not windows:
+            continue
+        member = {id(r) for _payload, subset in windows for r in subset}
+        units.append((shard_key, [r for r in records if id(r) in member], windows))
+    return units
+
+
+def _shard_window_payloads(records: list, windows: list, driver: str | None) -> list[dict]:
+    """The event's ``windows`` list for one shard unit: payloads plus ``granules``.
+
+    ``granules`` are indices into the unit's RESOLVED granule list
+    (:func:`_resolve_granule_entries` over ``records`` — same order, same
+    href-less drop), naming the window's own granule subset: what the
+    fan-out unit would have been dispatched with, so the worker's identity
+    gate and granule-id sibling see the same planned set either way.
+    """
+    key = "https" if driver == "https" else "s3"
+    position = {id(r): i for i, r in enumerate(r for r in records if r.get(key))}
+    return [
+        {**payload, "granules": [position[id(r)] for r in subset if id(r) in position]}
+        for payload, subset in windows
+    ]
+
+
+def _unit_windows(payload) -> tuple:
+    """``(window, windows)`` of one dispatch unit: a ``(shard, records)`` pair,
+    a ``(shard, records, window)`` fan-out triple, or a ``(shard, records,
+    windows)`` shard unit (issue #586) whose third element is the list."""
+    third = payload[2] if len(payload) > 2 else None
+    if isinstance(third, list):
+        return None, third
+    return third, None
+
+
 def _raster_windowed_units(cells: list[tuple], windowing: dict) -> list:
     """Expand raster ``(shard, records)`` pairs into ``(shard, records, window)`` units.
 
@@ -2671,7 +2760,7 @@ def _lambda_result_rows(results, *, run_id=None) -> tuple[list, list]:
     stale-worker fallback-success rows built here) would be dropped worker-side
     and has to be sent inline alongside the pointer.
     """
-    from zagg.telemetry import build_record, failure_record, flatten_record
+    from zagg.telemetry import build_record, failure_record, flatten_record, stats_records
 
     rows = []
     inline_rows = []
@@ -2679,30 +2768,37 @@ def _lambda_result_rows(results, *, run_id=None) -> tuple[list, list]:
         body = r.get("body") or {}
         if r.get("status_code") == 200 and _wrote_nothing(body):
             continue  # a current/refused unit records nothing, as on _run_local
-        record = body.get("stats")
-        # Envelope-backed rows are re-derivable worker-side (rows_from_status);
-        # everything else the pointer path can't rebuild, so it rides inline.
-        rideable = record is not None
-        if record is None:
+        # One record, or one per emitted leaf on a bulk multi-window unit
+        # (issue #586). Envelope-backed rows are re-derivable worker-side
+        # (rows_from_status); everything else the pointer path can't
+        # rebuild, so it rides inline.
+        records = stats_records(body.get("stats"))
+        rideable = bool(records)
+        if not records:
             if r.get("status_code") == 200 and not r.get("error"):
                 # Stale deployed worker (no record in the envelope): derive one
                 # from the body's counters so the row is not a false failure.
-                record = build_record(
-                    shard_key=r.get("shard_key") if r.get("shard_key") is not None else -1,
-                    metadata=body,
-                    run_id=run_id,
-                )
+                records = [
+                    build_record(
+                        shard_key=r.get("shard_key") if r.get("shard_key") is not None else -1,
+                        metadata=body,
+                        run_id=run_id,
+                    )
+                ]
             else:
-                record = failure_record(
-                    shard_key=r.get("shard_key"),
-                    error=r.get("error") or f"status {r.get('status_code')}",
-                    duration_s=r.get("lambda_duration") or r.get("wall_time"),
-                    run_id=run_id,
-                )
-        row = flatten_record(record, retries=r.get("retries"))
-        rows.append(row)
-        if not rideable:
-            inline_rows.append(row)
+                records = [
+                    failure_record(
+                        shard_key=r.get("shard_key"),
+                        error=r.get("error") or f"status {r.get('status_code')}",
+                        duration_s=r.get("lambda_duration") or r.get("wall_time"),
+                        run_id=run_id,
+                    )
+                ]
+        for record in records:
+            row = flatten_record(record, retries=r.get("retries"))
+            rows.append(row)
+            if not rideable:
+                inline_rows.append(row)
     return rows, inline_rows
 
 
@@ -2937,8 +3033,13 @@ def _identity_counts(metas) -> dict:
       key set it did before. Without it a published run records
       ``objects_touched: 0, touch_failures: 0`` — byte-identical to a touch
       that never ran, which is the ambiguity the skip must not inherit.
+
+    A bulk multi-window unit (issue #586) counts per window: its shard
+    metadata stands for its ``windows`` (:func:`zagg.telemetry.window_metas`).
     """
-    metas = [m for m in metas if isinstance(m, dict)]
+    from zagg.telemetry import window_metas
+
+    metas = [m for meta in metas for m in window_metas(meta)]
     counts = {
         "cells_current": sum(1 for m in metas if m.get("current")),
         "cells_refused": sum(1 for m in metas if m.get("refused")),
@@ -2964,6 +3065,51 @@ def _add_skipped_paths(identity: dict, touch: dict) -> None:
         identity["touch_skipped_paths"] = (
             identity.get("touch_skipped_paths", 0) + touch["skipped_paths"]
         )
+
+
+def _reported_units(results) -> list:
+    """``(shard_key, body)`` of the Lambda results whose body reports its leaves.
+
+    A clean 200, as ever — and a bulk multi-window unit (issue #586) whatever
+    its status: one failed window fails the shard (its 500, its ``failed``
+    status object, its error naming the window), but the body still carries
+    every window's own metadata, and those say which leaves landed (review
+    finding (8), ruled option (1)). A failure with no such body — a timeout,
+    an OOM, a dropped invoke, a raise before any window emitted — reports no
+    leaf.
+    """
+    units = []
+    for r in results:
+        body = r.get("body") or {}
+        if isinstance(body.get("windows"), list) or (
+            r.get("status_code") == 200 and not r.get("error")
+        ):
+            units.append((r.get("shard_key"), body))
+    return units
+
+
+def _landed_coverage(units) -> tuple[list, list | None]:
+    """Root-coverage inputs from ``(shard_key, metadata)`` unit outcomes.
+
+    Returns the shards to cover and the D15 time-range union. A shard is
+    covered when at least one of its leaves stands — one this run wrote, or
+    one the gate found current or refused — and the union takes those leaves'
+    ranges alone. A bulk multi-window unit stands for its windows
+    (:func:`zagg.telemetry.window_metas`), so a shard with a failed window is
+    covered through the ones that landed: what its ``(shard, window)`` fan-out
+    units would have reported, and the same on both backends (issue #586
+    review finding (8)).
+    """
+    from zagg.telemetry import window_metas
+    from zagg.windows import union_time_range
+
+    done, ranges = [], []
+    for key, meta in units:
+        standing = [m for m in window_metas(meta) if not m.get("error")]
+        if standing:
+            done.append(key)
+            ranges.extend(m.get("time_range") for m in standing)
+    return done, union_time_range(*ranges)
 
 
 def _warn_partial_auth_denials(metas) -> int:
@@ -3013,11 +3159,11 @@ def _write_refusals(store_path, metas, identity, run_id, semantic_hash, store_kw
     """
     if not identity["cells_refused"]:
         return None
-    from zagg.telemetry import write_refusal_manifest
+    from zagg.telemetry import window_metas, write_refusal_manifest
 
     return write_refusal_manifest(
         store_path,
-        [m for m in metas if isinstance(m, dict) and m.get("refused")],
+        [m for meta in metas for m in window_metas(meta) if m.get("refused")],
         run_id=run_id,
         semantic_hash=semantic_hash,
         store_kwargs=store_kwargs,
@@ -3133,11 +3279,14 @@ def _run_local(
         # fields is declared (``icechunk_refs.ladder_walks``) — else to the
         # per-leaf commit. Explicit settings are honored.
         icechunk_init = _init_icechunk_local(config, grid, store_path, run_id, store_kwargs)
-        # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
-        # window). None (schedule none/absent) keeps the (shard, records)
-        # pairs — dispatch byte-identical to pre-windowing runs.
+        # Temporal fan-out (issue #246 phase 5): one work unit per shard
+        # emitting every window its granules span (issue #586, the default),
+        # or per (shard, window) under ``windowing.unit: window``. None
+        # (schedule none/absent) keeps the (shard, records) pairs — dispatch
+        # byte-identical to pre-windowing runs.
         if windowing is not None:
-            cells = _windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
+            fan = _windowed_units if get_windowing_unit(config) == "window" else _shard_window_units
+            cells = fan(cells, windowing, (config.bounds or {}).get("temporal"))
     else:
         icechunk_init = None
         zarr_store = open_store(store_path, **store_kwargs)
@@ -3147,14 +3296,72 @@ def _run_local(
     # error and the run continues (the old loop's ``except`` branch). The
     # outcome is tagged in a private envelope the accumulator unpacks; on the
     # error path nothing is appended to ``results``, matching the old behavior.
+    def _record_unit(meta, unit_records, label):
+        # Per-shard stats record (issue #297): same schema as the Lambda
+        # worker's (no lambda config / caller identity on the local
+        # backend). Hive leaves get the stats.json sidecar SIBLING on
+        # success; the record rides ``meta`` for the run parquet either
+        # way. Fail-open on the sidecar PUT. One call per emitted LEAF: a
+        # bulk multi-window unit (issue #586) records each window's leaf
+        # from its own metadata and granule subset.
+        record = build_record(
+            shard_key=int(meta["shard_key"]),
+            metadata=meta,
+            granule_ids=_resolve_urls(unit_records, driver),
+            run_id=run_id,
+            window=label,
+            semantic_hash=run_semantic_hash,
+        )
+        meta["stats"] = record
+        if store_layout == "hive" and not meta.get("error"):
+            from zagg.hive import shard_leaf_path
+
+            try:
+                leaf = shard_leaf_path(store_path, int(meta["shard_key"]), window=label)
+                # Sidecar naming keys on the manifest spec IN EFFECT
+                # (issue #299 spec-compat; the #307 seam).
+                write_sidecar(leaf, record, spec=manifest["spec"], **store_kwargs)
+            except Exception as e:
+                logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+            # Leaf sub-map (issue #300, D22): the unit's ShardMap entries as
+            # full ShardMap JSON, sibling to the stats sidecar. The local
+            # "worker" is in-process, so the catalog fields are in scope
+            # (the Lambda path threads them via the event's submap block).
+            # Fail-open, like the sidecar.
+            try:
+                from zagg.sweep import submap_emittable, write_leaf_submap
+
+                sig = catalog_data["grid_signature"]
+                if submap_emittable(sig, unit_records):
+                    write_leaf_submap(
+                        store_path,
+                        int(meta["shard_key"]),
+                        unit_records,
+                        grid_signature=sig,
+                        metadata=catalog_data.get("metadata"),
+                        window=label,
+                        spec=manifest["spec"],
+                        store_kwargs=store_kwargs,
+                    )
+                else:
+                    logger.debug(
+                        f"leaf sub-map skipped for shard {meta['shard_key']}: non-HEALPix "
+                        f"grid or id-less entries (unmergeable, issue #300)"
+                    )
+            except Exception as e:
+                logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
+        return record
+
     def _cell_work(payload):
         # Unit wall clock (issue #589): the same entry -> record span the
         # Lambda handler stamps, so ``duration_total_s`` is one column.
         unit_t0 = time.time()
-        # (shard, records) pairs, or (shard, records, window) triples when a
-        # window schedule fanned the dispatch (issue #246).
+        # (shard, records) pairs, (shard, records, window) triples when a
+        # window schedule fanned the dispatch per window (issue #246), or
+        # (shard, records, windows) shard units emitting every window from
+        # one read (issue #586).
         shard_key, records = payload[0], payload[1]
-        window = payload[2] if len(payload) > 2 else None
+        window, windows = _unit_windows(payload)
         # Only thread aoi_payload when the manifest actually carries a mask (flag
         # on); otherwise omit the kwarg entirely so the flag-off call is identical
         # to the pre-feature signature. Same posture for the window unit.
@@ -3163,6 +3370,8 @@ def _run_local(
             extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
         if window is not None:
             extra["window"] = window
+        if windows is not None:
+            extra["windows"] = _shard_window_payloads(records, windows, driver)
         # Per-cell granule_workers clamp (issue #184): min(K, n_granules), so
         # a small cell doesn't spin idle reader threads; unclamped cells pass
         # the shared config through untouched. Count the RESOLVED urls — what
@@ -3206,6 +3415,23 @@ def _run_local(
                 # row and no sweep work either.
                 if meta.get("current") or meta.get("refused"):
                     return {"shard_key": shard_key, "ok": True, "meta": meta}
+                if windows is not None:
+                    # One record per emitted leaf, from the window's own
+                    # metadata and granule subset; skipped windows record
+                    # nothing, as above. The shard meta rides the list.
+                    subsets = {payload["label"]: subset for payload, subset in windows}
+                    # The unit's wall (issue #589) is the INVOKE's: it repeats
+                    # on every leaf's record beside ``duration_s``, and a sum
+                    # de-duplicates on ``unit_windows`` (``telemetry.merge``).
+                    meta["duration_total_s"] = time.time() - unit_t0
+                    for m in meta["windows"]:
+                        m["duration_total_s"] = meta["duration_total_s"]
+                    meta["stats"] = [
+                        _record_unit(m, subsets[m["window"]], m["window"])
+                        for m in meta["windows"]
+                        if not (m.get("current") or m.get("refused"))
+                    ]
+                    return {"shard_key": shard_key, "ok": True, "meta": meta}
             else:
                 meta = _process_and_write(
                     shard_key,
@@ -3219,60 +3445,9 @@ def _run_local(
                     handoff=handoff,
                     **extra,
                 )
-            # Per-shard stats record (issue #297): same schema as the Lambda
-            # worker's (no lambda config / caller identity on the local
-            # backend). Hive leaves get the stats.json sidecar SIBLING on
-            # success; the record rides ``meta`` for the run parquet either
-            # way. Fail-open on the sidecar PUT.
+            meta.setdefault("shard_key", int(shard_key))
             meta["duration_total_s"] = time.time() - unit_t0
-            record = build_record(
-                shard_key=int(shard_key),
-                metadata=meta,
-                granule_ids=_resolve_urls(records, driver),
-                run_id=run_id,
-                window=window["label"] if window else None,
-                semantic_hash=run_semantic_hash,
-            )
-            meta["stats"] = record
-            if store_layout == "hive" and not meta.get("error"):
-                from zagg.hive import shard_leaf_path
-
-                try:
-                    leaf = shard_leaf_path(
-                        store_path, int(shard_key), window=window["label"] if window else None
-                    )
-                    # Sidecar naming keys on the manifest spec IN EFFECT
-                    # (issue #299 spec-compat; the #307 seam).
-                    write_sidecar(leaf, record, spec=manifest["spec"], **store_kwargs)
-                except Exception as e:
-                    logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
-                # Leaf sub-map (issue #300, D22): the unit's ShardMap entries as
-                # full ShardMap JSON, sibling to the stats sidecar. The local
-                # "worker" is in-process, so the catalog fields are in scope
-                # (the Lambda path threads them via the event's submap block).
-                # Fail-open, like the sidecar.
-                try:
-                    from zagg.sweep import submap_emittable, write_leaf_submap
-
-                    sig = catalog_data["grid_signature"]
-                    if submap_emittable(sig, records):
-                        write_leaf_submap(
-                            store_path,
-                            int(shard_key),
-                            records,
-                            grid_signature=sig,
-                            metadata=catalog_data.get("metadata"),
-                            window=window["label"] if window else None,
-                            spec=manifest["spec"],
-                            store_kwargs=store_kwargs,
-                        )
-                    else:
-                        logger.debug(
-                            f"leaf sub-map skipped for shard {shard_key}: non-HEALPix grid "
-                            f"or id-less entries (unmergeable, issue #300)"
-                        )
-                except Exception as e:
-                    logger.warning(f"leaf sub-map write failed (fail-open, issue #300): {e}")
+            _record_unit(meta, records, window["label"] if window else None)
             return {"shard_key": shard_key, "ok": True, "meta": meta}
         except Exception as e:
             return {"shard_key": shard_key, "ok": False, "error": e}
@@ -3298,7 +3473,16 @@ def _run_local(
             return
         meta = outcome["meta"]
         report.results.append(meta)
-        if meta.get("error"):
+        if (
+            meta.get("error")
+            and isinstance(meta.get("windows"), list)
+            and meta["error"] not in BENIGN_ERRORS
+        ):
+            # A bulk unit catches its failed window and returns it (issue
+            # #586): a failed cell, as the fleet counts its 500.
+            report.cells_error += 1
+            logger.warning(f"  [{i}/{n}] {label}: ERROR {meta['error']}")
+        elif meta.get("error"):
             logger.info(f"  [{i}/{n}] {label}: {meta['error']}")
         elif meta.get("current"):
             # Skip-if-current (issue #388): counted apart in the summary
@@ -3359,22 +3543,18 @@ def _run_local(
     # failed write costs readers one walk, never a wrong answer.
     if store_layout == "hive" and get_coverage_moc(config):
         from zagg.hive import build_root_coverage, write_root_coverage
-        from zagg.windows import union_time_range
 
         try:
             # Inside the try so the fail-open claim survives result-envelope
-            # refactors (review finding, PR #208 round 3).
-            ok_results = [m for m in report.results if not m.get("error")]
-            done = [m["shard_key"] for m in ok_results]
+            # refactors (review finding, PR #208 round 3). Per leaf, not per
+            # unit: a bulk shard with a failed window is covered through the
+            # windows that landed (issue #586) — see _landed_coverage.
+            done, time_range = _landed_coverage((m["shard_key"], m) for m in report.results)
             if done:
                 # D15: windowed runs union the leaf stamps' ISO time ranges
                 # into the root summary; unwindowed metas carry no time_range,
                 # the union is None, and the envelope stays byte-identical.
-                envelope = build_root_coverage(
-                    done,
-                    int(grid.parent_order),
-                    time_range=union_time_range(*(m.get("time_range") for m in ok_results)),
-                )
+                envelope = build_root_coverage(done, int(grid.parent_order), time_range=time_range)
                 write_root_coverage(store_path, envelope, **store_kwargs)
                 logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
         except Exception as e:
@@ -3423,9 +3603,9 @@ def _run_local(
     }
     # Run-level stats parquet (issue #297 phase 3): one row per shard from the
     # metas' envelope records, failure rows from the raised-cell captures.
-    from zagg.telemetry import failure_record, flatten_record
+    from zagg.telemetry import failure_record, flatten_record, stats_records
 
-    rows = [flatten_record(m["stats"]) for m in report.results if m.get("stats")]
+    rows = [flatten_record(r) for m in report.results for r in stats_records(m.get("stats"))]
     rows += [
         flatten_record(
             failure_record(shard_key=int(key), error=str(exc), run_id=run_id),
@@ -3461,6 +3641,8 @@ def _run_local(
                 dirt_only=dirt_only,
                 store_kwargs=store_kwargs,
                 touch_policy=get_touch_policy(config),
+                # The run this sweep completes (issue #593).
+                pipeline_run_id=run_id,
             )
     # Icechunk run finalize (issue #582, spec §11.4): AFTER every commit of
     # the run — the staged sweep's ladder commits included — tag the tip
@@ -3623,12 +3805,15 @@ def _run_lambda(
         # ceiling; this path stays a pure shard/granule preview until then.
         return _dry_run_summary(cells, store_path)
 
-    # Temporal fan-out (issue #246 phase 5): one work unit per (shard,
-    # window); the biggest-first bucket order above survives (shard-major
-    # expansion). None keeps the pairs — dispatch byte-identical.
+    # Temporal fan-out (issue #246 phase 5): one work unit per shard emitting
+    # every window its granules span (issue #586, the default), or per
+    # (shard, window) under ``windowing.unit: window``; the biggest-first
+    # bucket order above survives (shard-major expansion). None keeps the
+    # pairs — dispatch byte-identical.
     windowing = get_windowing(config)
     if windowing is not None:
-        cells = _windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
+        fan = _windowed_units if get_windowing_unit(config) == "window" else _shard_window_units
+        cells = fan(cells, windowing, (config.bounds or {}).get("temporal"))
 
     # Pre-invoke cost ceiling (issue #298): every unit is one invoke billed at
     # the worker's memory for at most the function timeout, so the bill is
@@ -3765,10 +3950,12 @@ def _run_lambda(
     # the executor submits one payload per cell. Mirrors the kwargs the old
     # inline ``executor.submit(_invoke_lambda_cell, ...)`` passed.
     def _cell_work(payload):
-        # (shard, records) pairs, or (shard, records, window) triples when a
-        # window schedule fanned the dispatch (issue #246).
+        # (shard, records) pairs, (shard, records, window) triples when a
+        # window schedule fanned the dispatch per window (issue #246), or
+        # (shard, records, windows) shard units emitting every window from
+        # one read (issue #586; the status object is then the shard's).
         shard_key, records = payload[0], payload[1]
-        window = payload[2] if len(payload) > 2 else None
+        window, windows = _unit_windows(payload)
         # Rendered once per cell: the status-object name (below) and the
         # payload-cap error message in _invoke_lambda_cell both carry it
         # (issue #199). On ASYNC runs the label becomes a path component (the
@@ -3788,6 +3975,8 @@ def _run_lambda(
             extra["aoi_payload"] = aoi_by_shard.get(int(shard_key))
         if window is not None:
             extra["window"] = window
+        if windows is not None:
+            extra["windows"] = _shard_window_payloads(records, windows, driver)
         # Async dispatch (issue #151): where the worker writes this shard's
         # result, how to poll for it, and how long before giving up (function
         # timeout + queue/write margin). Sync runs pass none of these, keeping
@@ -3853,6 +4042,7 @@ def _run_lambda(
                 profile=profile,
                 aoi_payload=extra.get("aoi_payload"),
                 window=window,
+                windows=extra.get("windows"),
                 invoked_by=invoked_by,
                 run_id=run_id,
                 allow_contraction=allow_contraction,
@@ -4165,25 +4355,17 @@ def _run_lambda(
         if get_store_layout(config) == "hive" and get_coverage_moc(config):
             try:
                 from zagg.hive import build_root_coverage
-                from zagg.windows import union_time_range
 
                 # Inside the try so the fail-open claim survives result-envelope
-                # refactors (review finding, PR #208 round 3).
-                ok_results = [
-                    r for r in report.results if r.get("status_code") == 200 and not r.get("error")
-                ]
-                done = [r["shard_key"] for r in ok_results]
+                # refactors (review finding, PR #208 round 3). Per leaf, as on
+                # _run_local: a bulk shard whose invoke failed on one window is
+                # covered through the windows that landed (issue #586).
+                done, time_range = _landed_coverage(_reported_units(report.results))
                 if done:
                     # D15: union the windowed workers' stamped time ranges (each
                     # body mirrors its leaf stamp's ISO strings); unwindowed
                     # bodies carry none and the envelope stays byte-identical.
-                    envelope = build_root_coverage(
-                        done,
-                        int(parent_order),
-                        time_range=union_time_range(
-                            *(r.get("body", {}).get("time_range") for r in ok_results)
-                        ),
-                    )
+                    envelope = build_root_coverage(done, int(parent_order), time_range=time_range)
                     # An OLD deployment has no coverage mode: the event falls
                     # through to its process handler, which returns a LOGGED 400
                     # (missing shard_key/granule_urls...) — no writes, no result
@@ -4364,18 +4546,19 @@ def _run_lambda(
         # worker Event invoke — async, retries-0, fail-open (D9: rollups are
         # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
         # come from the envelope stats records; a stale deployed worker's
-        # record-less envelope simply contributes no leaf.
+        # record-less envelope simply contributes no leaf. The RECORDS drive
+        # the work set, each on its own ``success``, not the invoke's status
+        # (issue #586 review finding (8), ruled option (1)): a bulk shard that
+        # 500s on one window still sweeps the windows that landed, exactly as
+        # _run_local's sweep does — and a failed leaf's record is unsuccessful
+        # on every unit shape, so nothing that did not land gets in.
         stage_chained, staged = False, None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
-                ok_bodies = [
-                    r.get("body") or {}
-                    for r in report.results
-                    if r.get("status_code") == 200 and not r.get("error")
-                ]
-                leaves = leaves_from_stats_records([b.get("stats") for b in ok_bodies])
+                bodies = [r.get("body") or {} for r in report.results]
+                leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
                 if leaves:
                     _invoke_lambda_sweep(
                         state["lambda_client"],
@@ -4397,12 +4580,13 @@ def _run_lambda(
                 # `python -m zagg.sweep --stages` is the backstop). Touched
                 # current units ride as dirt-only (issue #580), as on
                 # _run_local: their nodes re-gather refs, nothing is re-folded.
-                dirt_only = dirt_only_leaves(ok_bodies)
+                dirt_only = dirt_only_leaves(bodies)
                 if (leaves or dirt_only) and config.output.get("sweep") == "stages":
                     stage_chained = True
                     staged = _invoke_lambda_stage_sweep(
                         state["lambda_client"],
-                        function_name,
+                        # The staged tail runs on its own tier (issue #586).
+                        _resolve_stage_function_name(function_name),
                         store_path,
                         leaves,
                         shard_order=int(parent_order),
@@ -4410,6 +4594,14 @@ def _run_lambda(
                         store_kwargs=_output_store_kwargs(output_creds_event, region),
                         touch_policy=get_touch_policy(config),
                         dirt_only=dirt_only,
+                        # The (node, window) units and the per-node close.
+                        # ``all_time`` is only a first guess: the fleet
+                        # follows the store's declaration once a window
+                        # unit's stage record names it (``closes``).
+                        windowed=get_windowing(config) is not None,
+                        all_time=bool((get_pyramid(config) or {}).get("all_time")),
+                        # The run this sweep completes (issue #593).
+                        pipeline_run_id=run_id,
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
@@ -6050,6 +6242,9 @@ def _invoke_lambda_stage_sweep(
     barrier_timeout_s=None,
     total_barrier_budget_s=None,
     dirt_only=(),
+    windowed=False,
+    all_time=False,
+    pipeline_run_id=None,
 ) -> dict | None:
     """End-of-run STAGED sweep over the fleet (issue #519); its summary.
 
@@ -6098,6 +6293,18 @@ def _invoke_lambda_stage_sweep(
 
     ``dirt_only`` (issue #580) is the run's touched current units, forwarded
     to the workers as the stage event's ``dirt_only`` refs.
+
+    ``windowed`` / ``all_time`` are the store's declaration — a window
+    schedule, and the all-time fold — which select the ``(node, window)``
+    stage units and the per-node close (issue #586 phase 4,
+    :func:`zagg.sweep_units.stage_units`). ``pipeline_run_id`` (issue #593)
+    is the run this sweep completes; the workers record it in the stage
+    records beside the sweep's own id. It is optional so a caller that holds
+    no run id (a standalone staged pass) records ``null``.
+
+    ``function_name`` is the function the STAGE invokes go to — the caller
+    resolves it (:func:`_resolve_stage_function_name`: the 8,192 MB variant
+    of the run's family, the issue #586 interim).
     """
     from zagg.sweep_fleet import run_stage_sweep_fleet
 
@@ -6121,6 +6328,9 @@ def _invoke_lambda_stage_sweep(
             store_kwargs=store_kwargs,
             touch_policy=touch_policy,
             dirt_only=dirt_only,
+            windowed=bool(windowed),
+            all_time=bool(all_time),
+            pipeline_run_id=pipeline_run_id,
             **knobs,
         )
     except Exception as e:
@@ -6155,6 +6365,7 @@ def _build_cell_event(
     profile=False,
     aoi_payload=None,
     window=None,
+    windows=None,
     invoked_by=None,
     run_id=None,
     result_url=None,
@@ -6202,6 +6413,11 @@ def _build_cell_event(
     # (schedule none) keeps the event byte-identical to pre-windowing runs.
     if window is not None:
         event["window"] = window
+    # Bulk multi-window shard unit (issue #586 phase 2): the shard's windows,
+    # each with its ``granules`` membership; absent on fan-out and unwindowed
+    # events, so those stay byte-identical.
+    if windows is not None:
+        event["windows"] = windows
     # Add the key for the arrow carrier (the default); an explicit pandas run omits
     # it, staying byte-identical to the pre-handoff path (#130).
     if handoff and handoff != "pandas":
@@ -6282,6 +6498,7 @@ def _invoke_lambda_cell(
     profile=False,
     aoi_payload=None,
     window=None,
+    windows=None,
     result_url=None,
     result_fetch=None,
     poll_timeout_s=None,
@@ -6344,6 +6561,7 @@ def _invoke_lambda_cell(
         profile=profile,
         aoi_payload=aoi_payload,
         window=window,
+        windows=windows,
         invoked_by=invoked_by,
         run_id=run_id,
         result_url=result_url,

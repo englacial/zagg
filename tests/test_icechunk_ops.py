@@ -5,10 +5,11 @@ from __future__ import annotations
 import copy
 import io
 import json
+import time
 
 import pytest
 import zarr
-from test_icechunk_refs import _grid, _open, _shards, _write_leaf
+from test_icechunk_refs import _grid, _ladder_run, _open, _shards, _write_leaf
 
 from zagg import hive, icechunk_ops, icechunk_refs
 from zagg.config import default_config
@@ -705,6 +706,8 @@ class _FinalizeFixtures:
             "spec": SWEEP_SPEC,
             "mode": "stages",
             "run_id": "sweep-0001",
+            # The run the sweep completes (issue #593): what finalize matches.
+            "pipeline_run_id": RUN,
             "store_root": root,
             "shard_order": 4,
             "transport": "lambda",
@@ -804,6 +807,102 @@ class TestFinalizeOperation(_FinalizeFixtures):
             with pytest.raises(ValueError, match=f"{newer} does not show a completed sweep"):
                 icechunk_ops.finalize(root, RUN, store_kwargs={})
             assert not _open(root)[1].list_tags()
+
+    @pytest.mark.parametrize("named", ["another-run", None, "absent"])
+    def test_refuses_a_record_that_names_another_run_or_none(
+        self, monkeypatch, cfg, tmp_path, named
+    ):
+        # Issue #593: the only completed record since the run opened is a
+        # sibling run's sweep, an unnamed ``--stages`` pass, or one written
+        # before the key existed. Time alone no longer vouches.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        key = self._record(root, pipeline_run_id=named)
+        if named == "absent":
+            store_path = f"{root}/{key}"
+            record = json.loads(open(store_path).read())
+            del record["pipeline_run_id"]
+            open(store_path, "w").write(json.dumps(record))
+        n = len(_messages(root))
+        recorded = None if named == "absent" else named
+        with pytest.raises(icechunk_ops.FinalizeRefusedError) as refused:
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+        message = str(refused.value)
+        assert f"names this run: the newest, {key}, records pipeline_run_id {recorded!r}" in message
+        assert f"--stages --pipeline-run-id {RUN}" in message  # the remedy, runnable as written
+        assert not _open(root)[1].list_tags() and len(_messages(root)) == n
+
+    def test_the_runs_own_record_tags_whatever_landed_after_it(self, monkeypatch, cfg, tmp_path):
+        # The newest record NAMING the run decides: a later unnamed pass and a
+        # sibling run's sweep neither vouch nor un-vouch.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        own = self._record(root, ts=self._stamp(60))
+        self._record(root, ts=self._stamp(120), pipeline_run_id=None)
+        self._record(root, ts=self._stamp(180), pipeline_run_id="another-run", error="boom")
+        out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert out["tagged"] is True and out["stage_record"] == own
+
+    def test_an_unreadable_record_names_no_run(self, monkeypatch, cfg, tmp_path, caplog):
+        # A torn or non-object record names no run: passed over with a warning,
+        # never a bare JSONDecodeError (a fleet 500) — alone, it is a refusal.
+        from zagg.store import open_object_store, put_object
+
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        store = open_object_store(root)
+        put_object(store, f"sweep_stats_{self._stamp(180)}_stages.json", b"{torn")
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no staged-sweep record"):
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+        own = self._record(root, ts=self._stamp(60))
+        put_object(store, f"sweep_stats_{self._stamp(120)}_stages.json", b"[1]")
+        out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert out["tagged"] is True and out["stage_record"] == own
+        assert "is not a JSON object" in caplog.text
+
+    def test_the_runs_own_record_must_postdate_its_init_commit(self, monkeypatch, cfg, tmp_path):
+        # The time anchor stands as the second condition: a record naming the
+        # run but older than its init commit is a previous run's of that name.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        self._record(root, ts=self._stamp(-3600))
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no staged-sweep record"):
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+
+    def test_a_named_stages_pass_completes_a_run_whose_dispatcher_died(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # Issue #593's third acceptance: the dispatcher dies after the fan-out
+        # — no staged sweep, no finalize. A ``--stages`` pass that names no
+        # run builds the ladder but vouches for none; the same pass naming
+        # the run writes the record ``finalize`` accepts. Real records, from
+        # the real CLI, over a real ladder run.
+        import zagg.sweep_stages as stages_mod
+        from zagg import runner
+        from zagg.sweep import main as sweep_main
+
+        monkeypatch.setattr(stages_mod, "stage_sweep_after_run", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_finalize_icechunk_local", lambda *a, **k: None)
+        shards = _shards(_grid(cfg), 3)
+        _grid_, root, summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards
+        )
+        run_id = summary["results"][0]["stats"]["run_id"]
+        assert summary["icechunk_finalize"] is None and not _open(root)[1].list_tags()
+        # A Lambda dispatcher's setup invoke writes the manifest finalize reads.
+        self._manifest(root, run_id, runner._pin_icechunk_commit(cfg, _grid_, stages=True))
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no staged-sweep record"):
+            icechunk_ops.finalize(root, run_id, store_kwargs={})
+        assert sweep_main([root, "--stages"]) == 0
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="pipeline_run_id None"):
+            icechunk_ops.finalize(root, run_id, store_kwargs={})
+        assert not _open(root)[1].list_tags()
+        time.sleep(1.1)  # record keys resolve to one second
+        assert sweep_main([root, "--stages", "--pipeline-run-id", run_id]) == 0
+        out = icechunk_ops.finalize(root, run_id, store_kwargs={})
+        assert out["tagged"] is True and out["tag"] == f"run-{run_id}"
+        record = json.loads(open(f"{root}/{out['stage_record']}").read())
+        assert record["pipeline_run_id"] == run_id and record["lease"]["released"]
 
     def test_refuses_without_a_record_since_the_init_commit(self, monkeypatch, cfg, tmp_path):
         # No record at all, then one older than the run's init commit — though

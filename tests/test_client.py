@@ -1500,9 +1500,16 @@ class TestStagedSweepTail:
         assert "icechunk_finalize" not in before  # ...and the finalize follows
         assert seen["order"] == ["stage", "finalize"] and modes[-1] == "icechunk_finalize"
         ((args, kwargs),) = seen["stage"]
-        assert args[0] is stub and args[1:3] == ("process-shard-test", _STORE)
+        # The staged tail runs on the 8,192 MB tier of the run's own function
+        # family, as on ``_run_lambda`` (issue #586).
+        assert args[0] is stub and args[1:3] == ("process-shard-test-8192-disk", _STORE)
         assert args[3] == [(w, None) for w in sorted(_WORDS)]  # every ok leaf
         assert kwargs["shard_order"] == 6 and kwargs["dirt_only"] == []
+        # The stage records name the run this sweep completes (issue #593): it
+        # is what the operator ``finalize`` matches. The facade is unwindowed.
+        (cell,) = {e["run_id"] for _, _, e in stub.cell_events()}
+        assert kwargs["pipeline_run_id"] == cell
+        assert (kwargs["windowed"], kwargs["all_time"]) == (False, False)
         assert kwargs["touch_policy"] == get_touch_policy(run.config)
         assert kwargs["output_creds_event"] is None and "store_kwargs" in kwargs
         assert handle.stage_sweep is self._COMPLETE

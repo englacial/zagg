@@ -1,0 +1,70 @@
+{
+  "attributes": {
+    "role": "column",
+    "zagg_column": {
+      "spec": "zagg-column/1",
+      "node": "11213",
+      "order": 4,
+      "source_cell_order": 6,
+      "window": "2019",
+      "fields": {
+        "count": {
+          "class": "exact",
+          "method": "sum",
+          "nan_policy": "skip"
+        },
+        "h_tdigest": {
+          "class": "approximate",
+          "method": "tdigest_kway",
+          "delta": 16,
+          "overview_delta": 16,
+          "dtype": "float32",
+          "inner_shape": [
+            2
+          ]
+        }
+      },
+      "groups": {
+        "5": {
+          "regime": "leaf-column",
+          "merges_from_raw": 1,
+          "n_cells": 4
+        },
+        "4": {
+          "regime": "leaf-column",
+          "merges_from_raw": 1,
+          "n_cells": 1
+        }
+      },
+      "cells_with_data_order": 5,
+      "generated_at": "2026-10-01T22:01:45+00:00"
+    },
+    "morton_hive_commit": {
+      "spec": "morton-hive/2",
+      "complete": true,
+      "cells_with_data": 3,
+      "granule_count": 1,
+      "written_at": "2026-10-01T22:01:45+00:00",
+      "window": "2019",
+      "time_range": [
+        "2019-03-01T00:00:00+00:00",
+        "2019-09-01T00:00:00+00:00"
+      ],
+      "content_hashes": {
+        "arrays": {
+          "4/count": "71f269d578d413efdf624d699f2d8430be995bd75dba859bd9a782e7c89c3118",
+          "4/h_tdigest": "c074d2090ede770ce7fd312a2d98abf2ffe1032866028866bd5024422d813484",
+          "4/h_tdigest_locations": "464700b72f5e0e618b26d0890a1dd2e8a1a7255091e4cbdb7e3417303ce7930c",
+          "4/morton": "92cedd52796c6c0844af1ce3e7e7636ed28804f6bf8f9d10ceab93edf1a29805",
+          "5/count": "6380596d3ca826d3ccda1b07f368ca3b43b486b7aaa0ca17e055ac8bf0b2c064",
+          "5/h_tdigest": "61e2dde0a3b263a7b4daf463d32b3686b8be9759c652e1800b1e8e800196b733",
+          "5/h_tdigest_locations": "13c93fd6f975f697e38a37d6bc0d19770d238f1b869059828805b6ce51680d99",
+          "5/morton": "2d7a07b3e2db265b2050fedfd968fb6763f5b012c87033526852bffc90b059d2"
+        },
+        "combined": "0e2ac82f1c29c9ab624a20f9a85211f8df7a230b0ce8193773b95d42a24666f4"
+      }
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

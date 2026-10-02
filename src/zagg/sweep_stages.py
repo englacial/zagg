@@ -29,7 +29,6 @@ import numpy as np
 
 from zagg.sweep_stage import (
     DEFAULT_TUPLE_WIDTH,
-    _node_at,
     aggregate_actuals,
     ladder_entries,
     stage_node,
@@ -137,6 +136,8 @@ def sweep_stage_pass(
     level_actuals: dict | None = None,
     only_dispatch: int | None = None,
     dirt_only: dict | None = None,
+    only_unit: str | None = None,
+    only_window: str | None = None,
 ) -> dict:
     """One staged pass over the dirty set: every tuple, finest first.
 
@@ -165,11 +166,22 @@ def sweep_stage_pass(
     ``dirt_only`` (``by_shard`` shape, issue #580): leaves with unchanged data
     but a rewritten Icechunk ref sidecar. A node with dirt-only leaves and no
     dirty one is not folded; only its ref hook runs (``icechunk_regathered``).
+
+    **Units** (issue #586 phase 4). Each tuple's work is
+    :func:`zagg.sweep_units.stage_units`, run by
+    :func:`zagg.sweep_units.run_tuple`: per dispatch node, its window units,
+    then its close, serially. ``only_unit`` restricts the pass to ONE kind —
+    ``"window"`` (with ``only_window`` naming the window) or ``"close"`` —
+    which is what a fleet stage invoke runs, so the fleet differs from this
+    driver in concurrency alone.
     """
     from zagg.hive import _utcnow
     from zagg.store import open_object_store
-    from zagg.sweep_overview import _candidate_decimals, _window_work
+    from zagg.sweep_overview import _candidate_decimals
+    from zagg.sweep_units import UNIT_KINDS, run_tuple
 
+    if only_unit is not None and only_unit not in UNIT_KINDS:
+        raise ValueError(f"unknown stage unit {only_unit!r} (expected one of {UNIT_KINDS})")
     store_kwargs = dict(store_kwargs or {})
     run_started = run_started or _utcnow()
     pyramid = manifest.get("pyramid") or {}
@@ -230,92 +242,46 @@ def sweep_stage_pass(
     # The Icechunk ref ladder (issue #580 phase 6, spec §11.4): one vetted
     # read of the base repo's block per pass; ``None`` when the store has no
     # companion, and every node's hook is then a no-op. Fail-open (D9).
-    from zagg.icechunk_ladder import STAGE_COUNTS, ladder_context, node_row, stage_hook
-    from zagg.windows import SCHEDULE_NONE_TOKEN
+    from zagg.icechunk_ladder import ladder_context
 
     try:
         ladder = ladder_context(store_root, manifest, store_kwargs=store_kwargs)
     except Exception as e:
         logger.warning(f"icechunk ladder disabled for this pass (fail-open, issue #580): {e}")
         ladder = None
+    if only_unit is not None and not windowed:
+        raise ValueError(
+            f"stage unit {only_unit!r} was named against an unwindowed store — its nodes "
+            "have one unit each, which closes inline; send the node without a unit"
+        )
+    context = {
+        "store": store,
+        "store_root": store_root,
+        "manifest": manifest,
+        "levels": levels,
+        "fields": fields,
+        "relay": relay,
+        "scope": scope,
+        "candidates": candidates,
+        "by_shard": by_shard,
+        "dirt_only": dirt_only,
+        "ladder": ladder,
+        "run_id": run_id,
+        "run_started": run_started,
+        "store_kwargs": store_kwargs,
+        "level_actuals": level_actuals,
+    }
     for stage in schedule:
-        t0 = time.perf_counter()
-        counts = {
-            "written": 0,
-            "current": 0,
-            "empty": 0,
-            "failed": 0,
-            "under_covered": 0,
-            "columns_written": 0,
-            "columns_current": 0,
-            "revalidated": 0,
-            **({name: 0 for name in STAGE_COUNTS} if ladder is not None else {}),
-        }
-        nodes = sorted({_node_at(d, stage["dispatch"]) for d in candidates})
-        nodes = [n for n in nodes if scope_admits(n, scope)]
-        icechunk_nodes: list = []
-        for node in nodes:
-            dirty = any(d.startswith(node) for d in by_shard)
-            regather = not dirty and any(d.startswith(node) for d in dirt_only)
-            dirty_windows: set = set()
-            for d in by_shard:
-                if d.startswith(node):
-                    dirty_windows |= by_shard[d]
-            from zagg.sweep_overview import _read_envelope
-
-            envelope = None if regather else _read_envelope(store, node)
-            entries = dict((envelope or {}).get("windows") or {})
-            work = [] if regather else _window_work(decl, windowed, dirty_windows, entries)
-            for key, fold_windows in work:
-                stage_node(
-                    store,
-                    store_root,
-                    node,
-                    stage,
-                    levels,
-                    fields,
-                    key=key,
-                    fold_windows=fold_windows,
-                    all_time=bool(windowed and key == SCHEDULE_NONE_TOKEN),
-                    windowed=windowed,
-                    shard_order=shard_order,
-                    cell_order=cell_order,
-                    relay=relay,
-                    candidates=candidates,
-                    run_id=run_id,
-                    run_started=run_started,
-                    counts=counts,
-                    store_kwargs=store_kwargs,
-                    level_actuals=level_actuals,
-                )
-            hooked = stage_hook(
-                store_root,
-                node,
-                stage,
-                dirty=dirty or regather,
-                manifest=manifest,
-                levels=levels,
-                fields=fields,
-                candidates=candidates,
-                block=ladder,
-                store_kwargs=store_kwargs,
-                counts=counts,
-            )
-            if hooked is not None:
-                icechunk_nodes.append(node_row(hooked))
-                if regather and "error" not in hooked:
-                    counts["icechunk_regathered"] += 1
-            if on_node is not None:
-                on_node(node)
-        row = {
-            "dispatch_order": stage["dispatch"],
-            "orders": list(stage["orders"]),
-            "nodes": len(nodes),
-            **counts,
-            "duration_s": time.perf_counter() - t0,
-        }
-        if ladder is not None:
-            row["icechunk_nodes"] = icechunk_nodes
+        row = run_tuple(
+            stage,
+            context,
+            # Passed, not imported there: this module's ``stage_node`` is the
+            # one seam a caller (and the #380 spy) replaces.
+            window_unit=stage_node,
+            only_unit=only_unit,
+            only_window=only_window,
+            on_node=on_node,
+        )
         summary["stages"].append(row)
         if on_stage is not None:
             on_stage(row)
@@ -503,6 +469,7 @@ def run_stage_sweep(
     lease_ttl_s: int | None = None,
     touch_policy: str = "auto",
     dirt_only=None,
+    pipeline_run_id: str | None = None,
 ) -> dict:
     """One admitted staged sweep, end to end: lease -> stages -> finisher.
 
@@ -539,6 +506,11 @@ def run_stage_sweep(
     staged sweep refreshes. ``auto`` (the default) is the issue #495 phase 4
     inference, so the CLI entry point, which has no config to read it from, is
     unchanged.
+
+    ``pipeline_run_id`` (issue #593) names the PIPELINE run this sweep
+    completes — distinct from ``run_id``, the sweep's own — and is recorded
+    under its own key, so the record vouches for that run by name rather than
+    by time. A standalone pass that names none records ``null``: no run.
     """
     import uuid
     from datetime import datetime, timezone
@@ -588,6 +560,7 @@ def run_stage_sweep(
 
     summary: dict = {
         "run_id": run_id,
+        "pipeline_run_id": pipeline_run_id,
         "store_root": store_root,
         "shard_order": shard_order,
         "tuple_width": int(tuple_width),
@@ -702,6 +675,7 @@ def stage_sweep_after_run(
     store_kwargs: dict | None = None,
     touch_policy: str = "auto",
     dirt_only=(),
+    pipeline_run_id: str | None = None,
 ):
     """Post-fleet chaining: the ``output.sweep: "stages"`` opt-in, fail-open.
 
@@ -721,7 +695,8 @@ def stage_sweep_after_run(
     reads the config to decide to chain at all, so it also passes the policy
     that governs the finisher's touch — an operator who declared ``never`` on an
     archival destination must not get one new root-core version per staged sweep.
-    ``dirt_only`` (issue #580) joins the scope and rides to :func:`run_stage_sweep`.
+    ``dirt_only`` (issue #580) joins the scope and rides to :func:`run_stage_sweep`,
+    as does ``pipeline_run_id`` (issue #593): the run this sweep completes.
     """
     from zagg.grids.morton import morton_decimal
 
@@ -737,6 +712,7 @@ def stage_sweep_after_run(
             store_kwargs=store_kwargs,
             touch_policy=touch_policy,
             dirt_only=dirt_only,
+            pipeline_run_id=pipeline_run_id,
         )
         logger.info(
             f"Post-run staged sweep: {[(s['dispatch_order'], s['written']) for s in summary['stages']]}"
@@ -909,6 +885,9 @@ def run_stage_worker(
     lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
     dirt_only=(),
+    unit: str | None = None,
+    window: str | None = None,
+    pipeline_run_id: str | None = None,
 ) -> dict:
     """One fleet stage worker: this invoke's dispatch nodes, one tuple.
 
@@ -958,10 +937,19 @@ def run_stage_worker(
     so an absent prefix refuses BY NAME before anything is read or written
     (review finding). ``dirt_only`` is the event's ref-only slice
     (:func:`sweep_stage_pass`). Returns the record.
+
+    ``unit`` (issue #586 phase 4) is which of the nodes' stage units this
+    invoke runs (:mod:`zagg.sweep_units`): ``"window"`` — the ONE window
+    named by ``window`` — or ``"close"``, the per-node close after a node's
+    window units. ``None`` runs the nodes whole, every window then the
+    close: an unwindowed store's one unit per node, and what a dispatcher
+    predating the units sends. ``pipeline_run_id`` (issue #593) is the
+    pipeline run this sweep completes, recorded beside its own ``run_id``.
     """
     from zagg.hive import MANIFEST_NAME, _decimal_order, read_manifest
     from zagg.sweep import _normalize_leaves
     from zagg.sweep_lease import DEFAULT_TTL_S, acquire_lease, heartbeat_lease
+    from zagg.sweep_units import check_unit, manifest_closes
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
@@ -972,6 +960,7 @@ def run_stage_worker(
             "the dispatcher exactly like a lost invoke, and its coverage never reaches "
             "the manifest; refusing rather than folding invisibly"
         )
+    check_unit(unit, window, f"run {run_id!r}, dispatch order {dispatch}, batch {batch}")
     nodes = [str(n) for n in nodes]
     if not nodes:
         raise ValueError(
@@ -1022,6 +1011,8 @@ def run_stage_worker(
         level_actuals=level_actuals,
         only_dispatch=int(dispatch),
         dirt_only=regather,
+        only_unit=unit,
+        only_window=window,
     )
     rows = summary["stages"]
     if partition is not None:
@@ -1031,9 +1022,13 @@ def run_stage_worker(
         "spec": STAGE_RECORD_SPEC,
         "role": "stage",
         "run_id": run_id,
+        "pipeline_run_id": pipeline_run_id,
         "run_started": run_started,
         "dispatch": int(dispatch),
         "batch": int(batch),
+        "unit": unit,  # which of the nodes' units ran; null = the nodes whole
+        "window": window,
+        "closes": manifest_closes(manifest),  # what the store declares (the dispatcher reads it)
         "tuple_width": int(tuple_width),
         "n_nodes": len(nodes),
         "n_leaves": sum(len(w) for w in by_shard.values()),
@@ -1063,6 +1058,7 @@ def run_stage_finisher(
     lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
     record: bool = True,
+    pipeline_run_id: str | None = None,
 ) -> dict:
     """The fleet's finisher invoke: aggregate the run's records, then finish.
 
@@ -1078,7 +1074,9 @@ def run_stage_finisher(
 
     ``barrier_timed_out`` is the dispatcher's verdict on its own soft barrier,
     threaded in so the RUN RECORD says the per-level actuals may be short — see
-    where it is recorded below.
+    where it is recorded below. ``pipeline_run_id`` (issue #593) is the
+    pipeline run this sweep completes, recorded in the run record and the
+    finisher record under its own key (``null`` when the dispatcher named none).
 
     ``records_from`` is REQUIRED and the prefix must list at least one stage
     record; both refuse by name. A finisher only ever fires after a fan-out,
@@ -1150,6 +1148,7 @@ def run_stage_finisher(
     aggregated = aggregate_actuals(merged)
     summary: dict = {
         "run_id": run_id,
+        "pipeline_run_id": pipeline_run_id,
         "store_root": store_root,
         "shard_order": shard_order,
         "transport": "lambda",

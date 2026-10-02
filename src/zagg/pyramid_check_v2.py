@@ -67,6 +67,7 @@ from zagg.pyramid_check_core import (
     _check_node,
     _column_object_rel,
     _committed,
+    _coordinates_check,
     _entry,
     _field_groups,
     _finish,
@@ -148,6 +149,18 @@ def validate_v2(
         checks["materialization"] = _entry("fail", f"empty leaf roster (source {roster_source})")
         skip_rest("empty roster", after="materialization")
         return _finish(report, CHECKS_V2)
+    _coordinates_check(
+        store_root,
+        manifest,
+        [(dec, None) for dec in leaves],
+        store_kwargs,
+        checks,
+        report,
+        seed=seed,
+        sample_nodes=sample_nodes,
+        sample_cells=sample_cells,
+        full=full,
+    )
 
     # -- [2] materialization: the above-shard ladder (shared leg).
     probes, declared, state = _ladder_materialization(
@@ -206,7 +219,9 @@ def validate_v2(
 
     # -- [8] idempotency (fixture mode): an immediate staged re-pass is a no-op.
     if resweep:
-        checks["idempotency"] = _restage_check(store_root, manifest, leaves, store_kwargs)
+        checks["idempotency"] = _restage_check(
+            store_root, manifest, {d: {None} for d in leaves}, store_kwargs
+        )
     return _finish(report, CHECKS_V2)
 
 
@@ -304,7 +319,51 @@ def _columns_check(store_root, leaves, store_kwargs, checks, report) -> tuple[di
 def _value_checks_v2(
     harness, ladder, declared, probes, col_probes, leaves, entries, checks, report, *, full
 ):
-    """Read-back + counts + digests + composition, both /2 tiers.
+    """Read-back + counts + digests + composition, both /2 tiers, settled."""
+    errors: dict = {"readback": [], "counts": [], "digests": [], "composition": []}
+    counted = {"readback": 0, "counts": 0, "digests": 0, "composition": 0}
+    groups = _field_groups(harness, report)
+    _tier_checks(
+        harness,
+        ladder,
+        declared,
+        probes,
+        col_probes,
+        leaves,
+        entries,
+        groups,
+        errors,
+        counted,
+        full=full,
+    )
+    # -- the finisher's manifest actuals (#381 point (7)), when recorded.
+    # Read from the RAW manifest entries: the grammar-normalized ``entries``
+    # deliberately strip additive keys, ``actuals`` included.
+    raw_entries = (harness.manifest.get("pyramid") or {}).get("overviews") or []
+    _actuals_errors(raw_entries, harness.shard_order, harness, errors, counted, probes, declared)
+    count_meta, _exact_fields, digest_fields, wide_fields, packed_fields = groups
+    _settle_value_checks(
+        checks,
+        report,
+        harness,
+        errors,
+        counted,
+        count_meta=count_meta,
+        digest_fields=digest_fields,
+        wide_fields=wide_fields,
+        packed_fields=packed_fields,
+    )
+
+
+def _tier_checks(
+    harness, ladder, declared, probes, col_probes, leaves, entries, groups, errors, counted, *, full
+):
+    """The value laws over both /2 tiers of ONE ladder, accumulated into ``errors``.
+
+    One ladder is an unwindowed store's, or one window's of a windowed store
+    (``harness.window``, :mod:`zagg.pyramid_check_windowed`): the legs are the
+    same, over that window's objects. ``groups`` is :func:`_field_groups`'s
+    tuple.
 
     Ladder levels re-fold from the LEAF COLUMNS (the gen-1 tier the staged
     sweep itself consumes); the column tier re-folds from the leaf's own cell
@@ -328,11 +387,7 @@ def _value_checks_v2(
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import STAGE_GATHER, classify_level
 
-    errors: dict = {"readback": [], "counts": [], "digests": [], "composition": []}
-    counted = {"readback": 0, "counts": 0, "digests": 0, "composition": 0}
-    count_meta, exact_fields, digest_fields, wide_fields, packed_fields = _field_groups(
-        harness, report
-    )
+    count_meta, exact_fields, digest_fields, _wide_fields, packed_fields = groups
     s = harness.shard_order
     relay = relay_resolution(entries, s, harness.cell_order)
 
@@ -423,24 +478,6 @@ def _value_checks_v2(
                 group_getter=harness.column_group,
                 refold_payloads=refold,
             )
-
-    # -- the finisher's manifest actuals (#381 point (7)), when recorded.
-    # Read from the RAW manifest entries: the grammar-normalized ``entries``
-    # deliberately strip additive keys, ``actuals`` included.
-    raw_entries = (harness.manifest.get("pyramid") or {}).get("overviews") or []
-    _actuals_errors(raw_entries, s, harness, errors, counted, probes, declared)
-
-    _settle_value_checks(
-        checks,
-        report,
-        harness,
-        errors,
-        counted,
-        count_meta=count_meta,
-        digest_fields=digest_fields,
-        wide_fields=wide_fields,
-        packed_fields=packed_fields,
-    )
 
 
 def _as_int(value) -> int | None:
@@ -674,8 +711,12 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
             )
 
 
-def _restage_check(store_root, manifest, leaves, store_kwargs) -> dict:
-    """Fixture-mode skip gate (issue #417 ratchet): a staged re-pass is a no-op."""
+def _restage_check(store_root, manifest, by_shard, store_kwargs) -> dict:
+    """Fixture-mode skip gate (issue #417 ratchet): a staged re-pass is a no-op.
+
+    ``by_shard`` is the sweep's work set, ``{shard decimal: {window, ...}}``
+    (``{None}`` on an unwindowed store).
+    """
     import uuid
 
     from zagg.hive import _utcnow
@@ -686,7 +727,7 @@ def _restage_check(store_root, manifest, leaves, store_kwargs) -> dict:
     summary = sweep_stage_pass(
         store_root,
         manifest,
-        {d: {None} for d in leaves},
+        by_shard,
         run_id=f"pyramid-check-{uuid.uuid4().hex[:6]}",
         run_started=_utcnow(),
         store_kwargs=store_kwargs,

@@ -1062,6 +1062,22 @@ class TestSpillOverlap:
             for x, y in zip(pay_a[name], pay_b[name], strict=True):
                 np.testing.assert_array_equal(x, y)
 
+    def test_before_close_runs_ahead_of_every_block_close(self):
+        # The bulk bins' hook (issue #586 review finding (5)): called before
+        # each close hands a block on, with this aggregator's reducer joinable.
+        cfg = _config(streaming={"buffer_granules": 1, "mode": "spill"})
+        grid = _grid(cfg)
+        agg = SpillAggregator(cfg, grid, "pandas", 1, block_bytes=1)
+        calls = []
+        agg.before_close = lambda: (calls.append(agg._closed_blocks), agg.join_reducer())
+        for df in _granule_dfs(grid, _shard_key(), _CELL_LISTS, seed=3):
+            agg.add_read(df)
+            agg.granule_done()
+        assert calls == list(range(len(_CELL_LISTS)))
+        agg.join_reducer()
+        assert agg._reducer is None
+        agg.close()
+
     def test_reduce_error_propagates_at_next_join(self, monkeypatch):
         cfg = _config(streaming={"buffer_granules": 1, "mode": "spill"})
         key = _shard_key()

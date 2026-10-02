@@ -396,7 +396,11 @@ def _stage_record_incomplete(record: dict) -> str | None:
 
 
 def newest_stage_record(
-    store_root: str, *, store_kwargs: dict, since: datetime | None = None
+    store_root: str,
+    *,
+    store_kwargs: dict,
+    since: datetime | None = None,
+    pipeline_run_id: str | None = None,
 ) -> tuple[str, dict] | None:
     """``(key, record)`` of the newest ``sweep_stats_*_stages.json`` at the root, or ``None``.
 
@@ -405,24 +409,47 @@ def newest_stage_record(
     ``written_at`` of a run's init commit — so a record from before the run
     can never stand for its ladder. The key's stamp is whole seconds, so
     ``since`` is floored to the second before the comparison.
+
+    ``pipeline_run_id`` (issue #593) narrows it to the newest record that
+    NAMES that run — the ``pipeline_run_id`` the dispatcher (or
+    ``python -m zagg.sweep --stages --pipeline-run-id``) stamped into the
+    sweep it chained, spec §4.7. Records are read newest first until one
+    matches; a record naming another run, or none (``null``: the pass
+    vouches for no run), is passed over, and so is one that is not a JSON
+    object (it names no run either), with a warning. The newest match is
+    returned even when an older one is complete: the caller refuses on it.
+    Keys resolve to one second, so two passes finishing in the same second
+    write one key and the later overwrites the earlier.
     """
     import obstore
 
     from zagg.store import open_object_store
 
     store = open_object_store(store_root, **store_kwargs)
-    records = sorted(
-        (m[1], m[0])
-        for o in obstore.list_with_delimiter(store)["objects"]
-        if (m := _STAGE_RECORD_RE.fullmatch(o["path"].rsplit("/", 1)[-1]))
+    floor = since.replace(microsecond=0) if since is not None else None
+    names = sorted(
+        (
+            name
+            for o in obstore.list_with_delimiter(store)["objects"]
+            if (m := _STAGE_RECORD_RE.fullmatch(name := o["path"].rsplit("/", 1)[-1]))
+            and (
+                floor is None
+                or datetime.strptime(m[1], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc) >= floor
+            )
+        ),
+        reverse=True,
     )
-    if not records:
-        return None
-    ts, name = records[-1]
-    written = datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-    if since is not None and written < since.replace(microsecond=0):
-        return None
-    return name, json.loads(bytes(obstore.get(store, name).bytes()))
+    for name in names:
+        try:
+            record = json.loads(bytes(obstore.get(store, name).bytes()))
+        except ValueError as e:
+            record = e
+        if not isinstance(record, dict):
+            logger.warning(f"stage record {name} is not a JSON object ({record}) — passed over")
+            continue
+        if pipeline_run_id is None or record.get("pipeline_run_id") == pipeline_run_id:
+            return name, record
+    return None
 
 
 def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
@@ -487,39 +514,61 @@ def finalize_run(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     ``mode="icechunk_finalize"`` under ``operator_checks``, or
     :func:`finalize` on a local store. Refuses (:class:`FinalizeRefusedError`)
     without the run's dispatch manifest, without the run's
-    init commit on the repo, without a staged-sweep record written since
-    that commit (:func:`_run_opened_at` — the manifest supplies the config
-    only), or when that record does not show a completed sweep. Otherwise
+    init commit on the repo, without a staged-sweep record that NAMES this
+    run written since that commit (:func:`_run_opened_at` — the manifest
+    supplies the config only), or when that record does not show a completed
+    sweep. Otherwise
     :func:`zagg.icechunk_finalize.finalize_repo` with ``newest_only``: the
     report carries the finalize record plus ``operation``, ``run_id`` and
     ``stage_record`` (the record that vouched for the ladder); ``skipped``
     when the run is no longer the repo's newest or its tag already exists
     (nothing written either way).
 
-    Residual: the record names the sweep's own run id, not this run's, so it
-    is tied to the run by time alone. With overlapping runs on one store (the
-    §11.4 casualty case) a sibling run's completed sweep, landing after this
-    run's init, can vouch for this run's ladder; a stronger link needs the
-    dispatcher to stamp the pipeline run id into the stage event.
+    Two conditions tie the record to the run (issue #593). It must carry
+    ``pipeline_run_id == run_id`` — stamped by the dispatcher that chained
+    the sweep, or by ``python -m zagg.sweep --stages --pipeline-run-id`` for
+    a pass completing a run whose dispatcher died — and it must be written
+    since the run opened. Time alone let a sibling run's sweep, or an
+    unrelated ``--stages`` pass, vouch for a ladder this run never built;
+    a record naming another run, or none, now vouches for nothing here. The
+    newest record naming the run decides: a later pass that names no run
+    (or an unreadable record) neither vouches nor un-vouches, and a failed
+    named retry refuses even over an earlier complete one — re-run the
+    ``--pipeline-run-id`` pass to completion.
     """
     from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
     from zagg.semantics import semantic_hash
 
     config = _run_dispatch_config(store_root, run_id, store_kwargs)
     opened = _run_opened_at(store_root, run_id, store_kwargs)
-    found = newest_stage_record(store_root, store_kwargs=store_kwargs, since=opened)
+    found = newest_stage_record(
+        store_root, store_kwargs=store_kwargs, since=opened, pipeline_run_id=run_id
+    )
     if found is None:
+        remedy = (
+            f"complete this run's ladder with `python -m zagg.sweep {store_root} --stages "
+            f"--pipeline-run-id {run_id}`, then finalize"
+        )
+        other = newest_stage_record(store_root, store_kwargs=store_kwargs, since=opened)
+        if other is None:
+            raise FinalizeRefusedError(
+                f"no staged-sweep record at {store_root} since run {run_id}'s init commit "
+                f"({opened.isoformat(timespec='seconds')}): {remedy}"
+            )
         raise FinalizeRefusedError(
             f"no staged-sweep record at {store_root} since run {run_id}'s init commit "
-            f"({opened.isoformat(timespec='seconds')}): complete the ladder first with "
-            f"`python -m zagg.sweep {store_root} --stages`, then finalize"
+            f"({opened.isoformat(timespec='seconds')}) names this run: the newest, {other[0]}, "
+            f"records pipeline_run_id {other[1].get('pipeline_run_id')!r} (null: the pass named "
+            f"no run and vouches for none — issue #593), so it does not show this run's "
+            f"ladder was built; {remedy}"
         )
     name, record = found
     reason = _stage_record_incomplete(record)
     if reason is not None:
         raise FinalizeRefusedError(
             f"staged-sweep record {name} does not show a completed sweep ({reason}); "
-            f"re-run `python -m zagg.sweep {store_root} --stages`, then finalize"
+            f"re-run `python -m zagg.sweep {store_root} --stages --pipeline-run-id {run_id}`, "
+            f"then finalize"
         )
     out = finalize_repo(
         store_root,

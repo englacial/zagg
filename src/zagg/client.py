@@ -74,6 +74,7 @@ from zagg.config import (
     get_output_region,
     get_parent_order,
     get_pipeline_type,
+    get_pyramid,
     get_store_layout,
     get_store_path,
     get_sweep,
@@ -1288,21 +1289,17 @@ class Run:
                 handle._finalize_error = error
                 logger.warning(f"finalize invoke failed (surfaced via handle.wait()): {error}")
 
-        ok_results = [r for r in results if r.get("status_code") == 200 and not r.get("error")]
         if layout == "hive" and get_coverage_moc(self.config):
             try:
                 from zagg.hive import build_root_coverage
-                from zagg.windows import union_time_range
 
-                done = [r["shard_key"] for r in ok_results]
+                # Per leaf, the one rule every dispatch path shares (issue
+                # #586): see runner._landed_coverage.
+                done, time_range = runner._landed_coverage(runner._reported_units(results))
                 # hive is HEALPix-only (validated), so parent_order is set here.
                 if done and self._parent_order is not None:
                     envelope = build_root_coverage(
-                        done,
-                        int(self._parent_order),
-                        time_range=union_time_range(
-                            *(r.get("body", {}).get("time_range") for r in ok_results)
-                        ),
+                        done, int(self._parent_order), time_range=time_range
                     )
                     runner._invoke_lambda_coverage(
                         client,
@@ -1361,8 +1358,10 @@ class Run:
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
-                ok_bodies = [r.get("body") or {} for r in ok_results]
-                leaves = leaves_from_stats_records([b.get("stats") for b in ok_bodies])
+                # The records drive the work set, each on its own ``success``
+                # (issue #586), as on runner._run_lambda and _run_local.
+                bodies = [r.get("body") or {} for r in results]
+                leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
                 if leaves:
                     runner._invoke_lambda_sweep(
                         client,
@@ -1381,7 +1380,7 @@ class Run:
                 # HEALPix-only (validated), so parent_order is set here; were
                 # it not, ``int(None)`` raises into the fail-open gate, as on
                 # the CLI.
-                dirt_only = dirt_only_leaves(ok_bodies)
+                dirt_only = dirt_only_leaves(bodies)
                 if stage_chained and not (leaves or dirt_only):
                     stage_chained = False
                 if stage_chained:
@@ -1391,7 +1390,8 @@ class Run:
                     )
                     handle.stage_sweep = runner._invoke_lambda_stage_sweep(
                         client,
-                        self.function_name,
+                        # The staged tail runs on its own tier (issue #586).
+                        runner._resolve_stage_function_name(self.function_name),
                         self.store,
                         leaves,
                         shard_order=int(self._parent_order),
@@ -1399,6 +1399,15 @@ class Run:
                         store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
                         touch_policy=get_touch_policy(self.config),
                         dirt_only=dirt_only,
+                        # The (node, window) units and the per-node close; the
+                        # fleet follows the store's own declaration once a
+                        # stage record names it (as on ``_run_lambda``).
+                        windowed=get_windowing(self.config) is not None,
+                        all_time=bool((get_pyramid(self.config) or {}).get("all_time")),
+                        # The run this sweep completes (issue #593): what
+                        # ``icechunk_ops.finalize_run`` matches the stage
+                        # record against.
+                        pipeline_run_id=run_id,
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")

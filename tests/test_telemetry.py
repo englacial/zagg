@@ -572,6 +572,120 @@ class TestMerge:
         grouped = merge([merge(records[:2]), merge(records[2:5]), merge(records[5:])])
         _assert_records_close(grouped, direct)
 
+    def _bulk(self, window, *, run_id="rid", shard=7, n=3, n_obs=10, write=4.0):
+        # One leaf record of a bulk multi-window invoke (issue #586): the
+        # invoke's clocks, price and decoded rows repeat; the leaf's own
+        # counts and write-side phases do not.
+        return build_record(
+            shard_key=shard,
+            metadata={
+                "duration_s": 50.0,
+                "duration_total_s": 80.0,
+                "total_obs": n_obs,
+                "total_obs_read": 1000,
+                "unit_windows": n,
+                "phase_timings": {"read": 20.0, "write": write},
+            },
+            run_id=run_id,
+            window=window,
+            lambda_config={"memory_mb": 2048, "arch": "arm64"},
+        )
+
+    def test_a_bulk_invokes_rows_count_its_billed_wall_once(self):
+        # PR #587 question (15), option (a): ``duration_total_s`` (issue
+        # #589) is invoke-level on a bulk unit and repeats across its N
+        # rows with ``duration_s`` / ``gb_seconds`` / ``est_cost_usd`` /
+        # ``n_obs_read`` and the ``read`` phase; a roll-up counts the
+        # invoke once, never N times its bill.
+        rows = [self._bulk(w) for w in ("2019", "2020", "2021")]
+        one = rows[0]
+        assert one["gb_seconds"] == pytest.approx(160.0)  # 80 s x 2 GB: the total, not 50 s
+        m = merge(rows)
+        for key in ("duration_s", "duration_total_s", "gb_seconds", "est_cost_usd", "n_obs_read"):
+            assert m[key] == pytest.approx(one[key]), key
+        assert m["phase_timings"] == {"read": 20.0, "write": 12.0}
+        # The leaves' own counts still sum, and the invoke width survives.
+        assert (m["n_obs"], m["n_shards"], m["unit_windows"]) == (30, 3, 3)
+
+    def test_bulk_dedup_is_per_invoke_not_per_shard_or_run(self):
+        rows = [self._bulk(w) for w in ("2019", "2020")]
+        # Another shard's invoke, a later run's invoke of the same shard, and
+        # a per-window fan-out unit (``unit_windows`` null) are each their own bill.
+        other_shard = self._bulk("2019", shard=8, n=1)
+        rerun = self._bulk("2021", run_id="rid2", n=1)
+        fan_out = build_record(
+            shard_key=7,
+            metadata={"duration_s": 5.0, "duration_total_s": 9.0},
+            run_id="rid",
+            window="2022",
+        )
+        m = merge([*rows, other_shard, rerun, fan_out])
+        assert m["duration_total_s"] == pytest.approx(80.0 * 3 + 9.0)
+        assert m["duration_s"] == pytest.approx(50.0 * 3 + 5.0)
+        assert m["gb_seconds"] == pytest.approx(160.0 * 3)
+        assert m["n_obs_read"] == 3000
+        # An unidentified run (no ``run_id``) cannot be told apart, so it is
+        # never collapsed.
+        anon = [self._bulk(w, run_id=None) for w in ("2019", "2020")]
+        assert merge(anon)["duration_total_s"] == pytest.approx(160.0)
+
+    def test_a_bulk_invoke_split_across_partial_folds_counts_twice(self):
+        # The limit of associativity: the de-dup needs one invoke's rows in ONE
+        # call. A partial fold mixing shards collapses ``shard_key`` to None,
+        # so the invoke's other row is no longer recognized and bills again.
+        a, b = self._bulk("2019"), self._bulk("2020")
+        y = self._bulk("2019", shard=8, n=1)
+        assert merge([a, b, y])["duration_total_s"] == pytest.approx(160.0)
+        assert merge([merge([a, y]), b])["duration_total_s"] == pytest.approx(240.0)
+        # Grouped by shard first, as the sweep does, the fold is associative.
+        assert merge([merge([a, b]), y])["duration_total_s"] == pytest.approx(160.0)
+
+    def test_the_sweep_folds_a_shards_window_rows_in_one_call(self, tmp_path):
+        # The call graph the precondition rests on: the shard node merges ALL
+        # its windows' records at once, so a bulk invoke's rows always meet.
+        from obstore.store import LocalStore
+
+        from zagg.sweep import _rollup_shard_node
+
+        rows = {w: self._bulk(w) for w in ("2019", "2020", "2021")}
+        calls = []
+
+        class Family:
+            name, rollup_name = "stats", "stats.rollup.json"
+
+            def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+                return rows[window], "2026-10-01T00:00:00+00:00"
+
+            def merge(self, payloads, node, order):
+                calls.append(len(payloads))
+                return merge(payloads)
+
+        counts = dict.fromkeys(("written", "current", "empty", "failed"), 0)
+        envelope = _rollup_shard_node(
+            str(tmp_path),
+            LocalStore(str(tmp_path)),
+            Family(),
+            "1111",
+            set(rows),
+            3,
+            None,
+            {},
+            counts,
+        )
+        assert calls == [3]
+        assert envelope["payload"]["duration_total_s"] == pytest.approx(80.0)
+
+    def test_bulk_shard_rollups_fold_up_tree_unchanged(self):
+        # The shard node folds its windows in one call; everything coarser
+        # sums shard rollups, each already one invoke.
+        a = merge([self._bulk(w, shard=7) for w in ("2019", "2020", "2021")])
+        b = merge([self._bulk(w, shard=8) for w in ("2019", "2020", "2021")])
+        top = merge([a, b])
+        assert top["duration_total_s"] == pytest.approx(160.0)
+        assert top["gb_seconds"] == pytest.approx(320.0)
+        assert top["phase_timings"]["read"] == pytest.approx(40.0)
+        _assert_records_close(merge([a]), a)
+
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="at least one"):
             merge([])

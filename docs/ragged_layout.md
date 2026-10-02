@@ -122,7 +122,10 @@ located field, `{field}_times` for one carrying the per-centroid temporal
 companion ([spec §8.3](specification.md#83-shape-per-centroid)) — all
 sharded as one whole-leaf `ShardingCodec` object (one stored span). So a hive
 product is **read one leaf at a time**: open the leaf store
-(`hive.shard_leaf_path`) and pass the same `field` path to the readers. The
+(`hive.shard_leaf_path`) and pass the same `field` path to the readers. A
+**windowed** leaf stores no `morton` array (spec §1.5, issue #586): there the
+readers derive the words from the leaf's own stamp, and take occupancy from
+the payload array rather than from the coordinate's `0` fill. The
 readers are store-scoped and never traverse the hive digit tree — leaf
 discovery is the coverage MOC's / walker's job
 ([issue #200](https://github.com/englacial/zagg/issues/200)). The flat-sharded
@@ -242,7 +245,8 @@ for morton, (row, col), values in read_raw_values(store, field):
 
 It resolves the offset from the sibling `morton` coordinate, searching only
 the array's stored spans (the populated chunks the sweep readers yield from)
-and no digest bytes. `morton_index` must be a read-chunk id — a coarser
+and no digest bytes (on a windowed leaf, whose coordinate is derived, it
+reads the one matching inner chunk's payload to confirm the chunk is stored). `morton_index` must be a read-chunk id — a coarser
 `block_order` block id names no single chunk and raises.
 
 ## Issue #210 typed-dtype migration

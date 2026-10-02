@@ -245,6 +245,61 @@ def morton_box(values) -> np.ndarray:
     return np.sort(np.asarray(box, dtype=np.uint64))
 
 
+def cell_words(shard_key, cell_order: int) -> np.ndarray:
+    """The per-cell ``morton`` coordinate of a shard's cells axis, derived.
+
+    The derivation law (spec §1.5 "The cell coordinate", issue #586): a
+    leaf's cells axis is the shard's children at ``cell_order`` in canonical
+    nested order, and cell ``j`` carries the ``j``-th child's packed word —
+    mortie's ``generate_morton_children``. At ``cell_order <= 27`` that is the
+    arithmetic progression ``word[0] + j * 2**(60 - 2 * cell_order)`` (one
+    stride across the shard, both hemispheres; 4,194,304 at order 19), but the
+    law is mortie's children, never the stride.
+
+    A WINDOWED leaf stores no ``morton`` array, so this is where its cell
+    words come from — the one function every reader and check derives
+    through. An unwindowed leaf's stored array equals it on every written
+    chunk (and holds the ``0`` fill on unwritten ones).
+    """
+    from mortie import generate_morton_children
+
+    return np.asarray(generate_morton_children(int(shard_key), int(cell_order)), dtype=np.uint64)
+
+
+def words_in_cell(words, cell_word) -> np.ndarray:
+    """Per word: does it lie on ``cell_word``'s ancestor line? (spec §1.5).
+
+    The containment a located field's words owe the cell they are stored in
+    (§2.2/§9.1): a word at or below the cell's order lies inside the cell —
+    its ancestor at the cell's order IS the cell word. Orders are
+    heterogeneous within one cell (point words are order 29, a merged
+    centroid carries its members' deepest common ancestor), so each word's
+    order is decoded from the word, never assumed. A word COARSER than the
+    cell (only §9 area-word ingest of inputs resolved above the cell order
+    produces one) passes when the cell lies inside it. The empty word ``0``
+    locates nothing and fails; any other word mortie cannot decode raises its
+    ``ValueError`` (a checker over untrusted bytes catches it and fails the
+    cell).
+    """
+    from mortie import clip2order, orders_of
+
+    words = np.asarray(words, dtype=np.uint64).ravel()
+    cell = np.asarray([cell_word], dtype=np.uint64)
+    cell_order = int(orders_of(cell)[0])
+    within = np.zeros(words.shape, dtype=bool)
+    valid = words != 0
+    if not valid.any():
+        return within
+    orders = np.asarray(orders_of(words), dtype=np.int64)
+    finer = valid & (orders >= cell_order)
+    if finer.any():
+        within[finer] = clip2order(cell_order, words[finer]) == cell[0]
+    for order in np.unique(orders[valid & ~finer]):
+        coarse = valid & (orders == order)
+        within[coarse] = words[coarse] == clip2order(int(order), cell)[0]
+    return within
+
+
 def morton_to_arrow(values):
     """Export ``values`` as a typed ``arro3.core.Array`` (issue #135).
 
@@ -294,6 +349,7 @@ __all__ = [
     "LATITUDE_CONVENTION",
     "MORTON_CONVENTION",
     "MORTON_EXTENSION_NAME",
+    "cell_words",
     "is_morton_array",
     "is_morton_arrow",
     "morton_box",
@@ -304,4 +360,5 @@ __all__ = [
     "morton_word",
     "morton_words",
     "to_morton_array",
+    "words_in_cell",
 ]

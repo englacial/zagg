@@ -934,6 +934,9 @@ class TestLeafTemplate:
         assert red.attributes["scale_factor"] == 0.0001
         assert tuple(inner.members["time"].shape) == (3,)
         assert tuple(inner.members["morton"].shape) == (grid.cells_per_shard,)
+        # The windowed leaf's template (issue #586 phase 3) drops only that.
+        windowed = raster_leaf_spec(grid, cfg, 3, cell_coordinate=False).members[grid.group_path]
+        assert set(inner.members) - set(windowed.members) == {"morton"}
 
     def test_leaf_spec_sharded_rejected(self, tmp_path):
         from zagg.processing.raster import raster_leaf_spec
@@ -1259,6 +1262,21 @@ class TestRasterHiveWorker:
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (1, grid.cells_per_shard)
         assert (red[0, :][valid] == 555).all()
+        # A windowed leaf stores no per-cell coordinate (issue #586 phase 3):
+        # for raster the derived word simply IS the coordinate — cell j of
+        # the band axis is the shard's j-th child.
+        import zarr
+
+        from zagg.grids.morton import cell_words
+        from zagg.store import open_store
+
+        group = zarr.open_group(open_store(leaf), path=grid.group_path, mode="r", zarr_format=3)
+        assert set(group.array_keys()) == {"time", "red"}
+        assert set(stamp["content_hashes"]["arrays"]) == {
+            f"{grid.group_path}/time",
+            f"{grid.group_path}/red",
+        }
+        np.testing.assert_array_equal(cell_words(shard, grid.child_order), cells)
 
     def test_refuses_a_versioned_root(self, tmp_path):
         # The raster writer stays legacy; its clear-and-template must not

@@ -4006,8 +4006,9 @@ class TestDispatchRunStats:
         from zagg import runner
         from zagg.telemetry import build_record, flatten_record
 
-        # Six rows (~6 KB) overflow; the two inline rows (~2.1 KB, a row is
-        # ~1 KB wide since the issue #589 column) still fit.
+        # Six rows (~6.4 KB) overflow; the two inline rows (~2.1 KB, a row is
+        # ~1.1 KB wide with the issue #586 ``unit_windows`` and issue #589
+        # ``duration_total_s`` columns) still fit.
         monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 4096)
         client = self._Client()
         rows = self._rows(n_ok=5, n_fail=1)

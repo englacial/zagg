@@ -32,6 +32,7 @@ from zagg.grids.base import (
 from zagg.grids.morton import (
     LATITUDE_CONVENTION,
     MORTON_CONVENTION,
+    cell_words,
     morton_decimal,
     to_morton_array,
 )
@@ -456,10 +457,14 @@ class HealpixGrid:
         return Polygon(zip(lons, lats))
 
     def children(self, shard_key) -> np.ndarray:
-        """Child morton IDs under a parent, in canonical order."""
-        from mortie import generate_morton_children
+        """Child morton IDs under a parent, in canonical order.
 
-        return generate_morton_children(int(shard_key), self.child_order)
+        The cells axis itself: cell ``j`` of the shard's leaf carries
+        ``children(shard_key)[j]`` (:func:`zagg.grids.morton.cell_words`, the
+        spec §1.5 derivation law) — stored as the leaf's ``morton`` array on
+        an unwindowed leaf, derived by readers on a windowed one.
+        """
+        return cell_words(shard_key, self.child_order)
 
     def encode_cell_ids(self, leaf_ids) -> np.ndarray:
         """Convert morton IDs to HEALPix nested cell IDs."""
@@ -554,8 +559,13 @@ class HealpixGrid:
             spec.to_zarr(store, self.group_path, overwrite=overwrite)
         return store
 
-    def emit_shard_template(self, store: Store, *, overwrite: bool = False) -> Store:
+    def emit_shard_template(
+        self, store: Store, *, overwrite: bool = False, cell_coordinate: bool = True
+    ) -> Store:
         """Write ONE shard's leaf-zarr template to ``store`` (issue #199 phase 2).
+
+        ``cell_coordinate=False`` (issue #586 phase 3) is the WINDOWED leaf's
+        template: no per-cell ``morton`` member — see :meth:`shard_spec`.
 
         The hive layout (D3 in ``docs/design/sparse_coverage.md``) gives every
         shard its own self-describing leaf zarr: the same group structure as
@@ -605,7 +615,10 @@ class HealpixGrid:
         prefix_store``), which is what makes a name-prefix twin like
         ``<leaf>.status`` safe rather than merely unlikely.
         """
-        spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
+        spec = GroupSpec(
+            members={self.group_path: self.shard_spec(cell_coordinate=cell_coordinate)},
+            attributes={},
+        )
         # Ragged vlen-array creation warns about the dtype NAME only
         # (zarr-python#3517); message-scoped suppression, see grids.base.
         with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
@@ -620,7 +633,7 @@ class HealpixGrid:
         """Return the pydantic-zarr GroupSpec for this grid's template."""
         return self._spec()
 
-    def shard_spec(self) -> GroupSpec:
+    def shard_spec(self, *, cell_coordinate: bool = True) -> GroupSpec:
         """GroupSpec for ONE shard's hive leaf (issue #199 phase 2).
 
         Identical member set to :meth:`spec` — same dtypes, fills, chunking —
@@ -630,8 +643,36 @@ class HealpixGrid:
         leaf — a ragged field's vlen array always (issue #209), the dense
         per-cell arrays when ``sharded`` (issue #236) — so each is ONE object
         per leaf.
+
+        ``cell_coordinate=False`` drops the per-cell ``morton`` member: a
+        WINDOWED leaf stores none (issue #586 phase 3, spec §1.5 "The cell
+        coordinate") — the word is a pure function of the leaf id and the
+        rank (:func:`zagg.grids.morton.cell_words`), and N windows of one
+        shard would each store the same 8 B per cell. The ``dggs`` attrs still
+        name ``morton`` as the coordinate; readers derive it. The legacy
+        ``cell_ids`` member rides its ``emit_cell_ids`` hatch either way (an
+        explicit opt-in for readers that need the array on disk).
         """
-        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,), leaf=True)
+        return self._group_spec(
+            self.cells_per_shard,
+            (self.chunks_per_shard,),
+            leaf=True,
+            cell_coordinate=cell_coordinate,
+        )
+
+    def chunked_spec(self) -> GroupSpec:
+        """GroupSpec for ONE shard on plain inner chunks — no whole-leaf shard.
+
+        :meth:`shard_spec`'s member set with every per-cell array, ragged
+        ones included, left on its ``cells_per_chunk`` chunk grid (one object
+        per chunk). For an artifact written one chunk at a time and never
+        held whole — the streamed stage column (issue #586 phase 4) — where a
+        ShardingCodec array would be re-read and re-PUT whole on every chunk.
+        Requires an unsharded grid.
+        """
+        if self.sharded:
+            raise ValueError("chunked_spec is the unsharded layout; build the grid sharded=False")
+        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,))
 
     # ── internals ────────────────────────────────────────────────────────
 
@@ -640,7 +681,12 @@ class HealpixGrid:
         return self._group_spec(n_pixels, self.chunk_grid_shape)
 
     def _group_spec(
-        self, n_pixels: int, chunk_grid_shape: tuple[int, ...], *, leaf: bool = False
+        self,
+        n_pixels: int,
+        chunk_grid_shape: tuple[int, ...],
+        *,
+        leaf: bool = False,
+        cell_coordinate: bool = True,
     ) -> GroupSpec:
         base = ArraySpec(
             attributes={},
@@ -683,6 +729,10 @@ class HealpixGrid:
             # carries an array the writer will not fill. Keyed off the same
             # flag as coords_of, so template and writes cannot disagree.
             if name == "cell_ids" and not self.emit_cell_ids:
+                continue
+            # A windowed leaf stores no per-cell coordinate (issue #586 phase
+            # 3): its writer drops the ``morton`` column to match.
+            if name == "morton" and not cell_coordinate:
                 continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")

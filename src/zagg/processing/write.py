@@ -134,6 +134,7 @@ def write_dataframe_to_zarr(
     grid,
     chunk_idx: tuple,
     staged_out: dict | None = None,
+    omit: tuple = (),
 ) -> Store:
     """Write a per-shard output carrier to an existing Zarr template.
 
@@ -164,6 +165,11 @@ def write_dataframe_to_zarr(
         them). **Flat-path callers must not pass it**: the region math assumes
         the leaf-local chunk grid (one array per leaf, block ``chunk_idx``
         indexing that leaf's own arrays), which only holds on the hive layout.
+    omit : tuple of str, optional
+        Carrier columns NOT written — the template declares no array for
+        them. A windowed hive leaf passes ``("morton",)`` (issue #586 phase
+        3): its template carries no per-cell coordinate, the word being
+        derived (:func:`zagg.grids.morton.cell_words`).
 
     Returns
     -------
@@ -187,6 +193,8 @@ def write_dataframe_to_zarr(
 
     chunk_idx = tuple(int(i) for i in chunk_idx)
     for name, values in _iter_carrier_columns(df_out):
+        if name in omit:
+            continue
         if name in chunk_res_fields:
             # resolution: chunk — the column must be chunk-uniform (every populated
             # cell carries the same chunk value), so collapse the CELL axis to the
@@ -534,6 +542,7 @@ def write_leaf_to_zarr(
     grid,
     shard_key: int,
     staged_out: dict | None = None,
+    omit: tuple = (),
 ) -> Store:
     """Write a SHARDED hive leaf in ONE block selection per array (issue #236).
 
@@ -564,6 +573,11 @@ def write_leaf_to_zarr(
     — refs to the exact arrays written, the ratified O11 hash source (staged,
     not read back). Companions are per-chunk-block writes and are not staged;
     the hasher's read-back fallback covers them.
+
+    ``omit`` names carrier columns the template declares no array for — a
+    windowed leaf's ``("morton",)`` (issue #586 phase 3; see
+    :func:`write_dataframe_to_zarr`). An omitted column is neither written
+    nor staged.
     """
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
     inner_shape = tuple(int(s) for s in grid.chunk_shape)
@@ -582,8 +596,8 @@ def write_leaf_to_zarr(
         if _carrier_empty(carrier) and not ragged:
             continue
         for name, values in _iter_carrier_columns(carrier):
-            if name in chunk_res_fields:
-                continue  # companion (resolution: chunk) — handled per chunk above
+            if name in chunk_res_fields or name in omit:
+                continue  # companion (resolution: chunk, per chunk above) / no array
             values = np.asarray(values)
             trailing = values.shape[1:]
             if name not in slabs:
