@@ -571,9 +571,10 @@ def finalize(
 
     The function is ``function_name`` (``--function-name``), else the
     ``ZAGG_LAMBDA_FUNCTION_NAME`` environment variable, else
-    :data:`zagg.runner.DEFAULT_FUNCTION_NAME` (``process-shard``) — what
-    :func:`zagg.runner._resolve_function_name` gives a config with no
-    ``worker:`` block. The run config's ``worker:`` suffix is never applied:
+    :data:`zagg.runner.DEFAULT_FUNCTION_NAME` (``process-shard``), an empty
+    value counting as unset — what :func:`zagg.runner._resolve_function_name`
+    gives a config with no ``worker:`` block, except that the dispatchers
+    take an empty value verbatim. The run config's ``worker:`` suffix is never applied:
     that config is in the run's dispatch manifest, which this host does not
     read. The report names the function under ``function_name``. The event
     carries no config, so a deployed worker that predates ``operator_checks``

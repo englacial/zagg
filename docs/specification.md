@@ -4076,8 +4076,9 @@ that would write nothing commits nothing. The operations:
   role), and a retention pass run elsewhere would read the repo out of its
   region. Only a local store root runs in-process. The function is
   `--function-name`, else the `ZAGG_LAMBDA_FUNCTION_NAME` environment
-  variable, else `process-shard` — the dispatchers' own default for a
-  config with no `worker:` block (the run config's `worker:` suffix is
+  variable, else `process-shard`, an empty value counting as unset — the
+  dispatchers' own default for a config with no `worker:` block, though they
+  take an empty value verbatim (the run config's `worker:` suffix is
   never applied: that config is in the manifest, which the host does not
   read); the report names the function invoked as `function_name`, and the
   command never falls back to the host. Because the
