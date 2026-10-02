@@ -16,7 +16,16 @@ import asyncio
 import numpy as np
 import pytest
 import zarr
-from test_icechunk_refs import RUN_ID, _grid, _leaf_arrays, _open, _shards, _write_leaf
+from test_icechunk_refs import (
+    RUN_ID,
+    _block_splits,
+    _grid,
+    _leaf_arrays,
+    _open,
+    _saved_splits,
+    _shards,
+    _write_leaf,
+)
 
 from zagg import hive, icechunk_refs, icechunk_rows
 from zagg.config import default_config
@@ -259,6 +268,8 @@ class TestAllocation:
         block = icechunk_refs.read_block(root, store_kwargs={})
         assert block["split_order"] == block["commit_order"] == b_split
         assert block["levels"]["6"]["split"]["order"] == b_split
+        # Either way the saved splitting config is the committed block's (issue #597).
+        assert _saved_splits(root) == _block_splits(root)
 
 
 class TestRefsLandAtTheirRow:

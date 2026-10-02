@@ -4327,7 +4327,10 @@ recorded and appends after them. A retry re-applies the loser's own block
 changes (a ratchet, the per-run knobs) only when the winner changed nothing
 else, or made the same changes: a block the winner moved otherwise — a
 different ratchet, other knobs — is not overwritten with changes computed
-from the block before it, and the loser's init raises (and fails open).
+from the block before it, and the loser's init raises (and fails open). An
+init that fails after saving a ratcheted splitting config (§11.5: the save
+precedes the commit and is not part of it) first re-saves the splits of the
+block as it stands, so the saved config does not stay ahead of the block.
 
 **Finalize.** `finalize {run_id}` — the once-per-run close
 (`mode="icechunk_finalize"` on Lambda, in-process on the local backend),

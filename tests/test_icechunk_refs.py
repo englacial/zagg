@@ -1143,6 +1143,163 @@ class TestHandlerMode:
         assert icechunk_refs.read_block(root, store_kwargs={}) is None
 
 
+def _saved_splits(root):
+    """``{cell order: chunks per manifest}`` of the repo's SAVED splitting config (a plain open)."""
+    sizes = icechunk_refs.open_repo(root, store_kwargs={}).config.manifest.splitting.split_sizes
+    return {c.regex[2:-3]: {axis._0: n for axis, n in dims}[1] for c, dims in sizes[:-1]}
+
+
+def _block_splits(root):
+    """The same map, cut from the committed block (``block_splits``)."""
+    block = icechunk_refs.read_block(root, store_kwargs={})
+    return {order: s["chunks"] for order, s in icechunk_refs.block_splits(block).items()}
+
+
+def _spy_saves(monkeypatch, before_first=lambda: None):
+    """Record every ``_save_splits`` as the base level's split order, in landing order.
+
+    ``before_first`` runs ahead of the first save — issue #597's interleaving:
+    a competing run's whole init between this init's block read and its save.
+    """
+    real, saves, started = icechunk_refs._save_splits, [], []
+
+    def spy(repo, store_root, splits, store_kwargs):
+        if not started:
+            started.append(True)  # the competing init's own save comes through here too
+            before_first()
+        saves.append(splits["6"]["order"])
+        return real(repo, store_root, splits, store_kwargs)
+
+    monkeypatch.setattr(icechunk_refs, "_save_splits", spy)
+    return saves
+
+
+class TestLostRatchet:
+    """Issue #597: the repo's saved splitting config follows the committed block.
+
+    A ratcheting init saves its config BEFORE its commit (§11.5); an init
+    that then fails re-saves the splits of the block as it stands.
+    """
+
+    @staticmethod
+    def _init(cfg, root, split, run_id):
+        cfg.output["icechunk"] = {"split_order": split, "commit_order": split}
+        return icechunk_refs.init_repo(root, _grid(cfg), cfg, run_id=run_id, store_kwargs={})
+
+    def test_the_losing_init_resaves_the_blocks_splits(self, cfg, tmp_path, monkeypatch):
+        # Run A (3 -> 2) read the order-3 block; run B's whole 3 -> 1 init
+        # lands; A's save then overwrites B's, and A's commit finds B's block
+        # and raises. Without the re-save the repo keeps cutting manifests at
+        # A's order-2 run while its block records order 1.
+        root = str(tmp_path / "store")
+        self._init(cfg, root, 3, "run-0")
+        b: list = []
+        saves = _spy_saves(monkeypatch, lambda: b.append(self._init(cfg, root, 1, "run-B")))
+        with pytest.raises(ValueError, match=r"block changed under this init \(.*split_order"):
+            self._init(cfg, root, 2, "run-A")
+        # B's save, A's over it, then A's re-save from the block B committed.
+        assert saves == [1, 2, 1]
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        assert block["split_order"] == 1
+        assert _saved_splits(root) == _block_splits(root)
+        assert _saved_splits(root)["6"] == 4**4  # one order-1 cell of the base, not A's 4**3
+        # The winner recorded what a lone ratchet records; A committed nothing.
+        assert b[0]["split_ratchet"] == {"from": 3, "to": 1} and b[0]["created"] is False
+        assert block["levels"] == b[0]["levels"] and block["commit_order"] == 1
+        _group, repo = _open(root)
+        history = list(repo.ancestry(branch="main"))
+        assert [s.message for s in history][:2] == ["split ratchet 3->1 run-B", "init run-0"]
+        assert history[0].id == b[0]["snapshot"]
+        # A ratchet that lands saves once, ahead of its commit, as before.
+        assert self._init(cfg, root, 0, "run-C")["split_ratchet"] == {"from": 1, "to": 0}
+        assert saves == [1, 2, 1, 0]
+        assert _saved_splits(root) == _block_splits(root)
+
+    def test_any_failure_after_the_save_returns_the_config_to_the_block(
+        self, cfg, tmp_path, monkeypatch
+    ):
+        root = str(tmp_path / "store")
+        self._init(cfg, root, 3, "run-0")
+        saves = _spy_saves(monkeypatch)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(icechunk_refs, "_commit", boom)
+        # An init that saved nothing re-saves nothing.
+        with pytest.raises(RuntimeError, match="boom"):
+            self._init(cfg, root, 3, "run-A")
+        assert saves == []
+        # A ratchet whose commit fails with no competing run: back to the block's cut.
+        with pytest.raises(RuntimeError, match="boom"):
+            self._init(cfg, root, 2, "run-A")
+        assert saves == [2, 3]
+        assert icechunk_refs.read_block(root, store_kwargs={})["split_order"] == 3
+        assert _saved_splits(root) == _block_splits(root)
+
+    def test_a_failed_resave_is_logged_and_the_inits_error_still_raises(
+        self, cfg, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        root = str(tmp_path / "store")
+        self._init(cfg, root, 3, "run-0")
+        real, calls = icechunk_refs._save_splits, []
+
+        def save_once(*args):
+            calls.append(None)
+            if len(calls) > 1:
+                raise OSError("config store down")
+            return real(*args)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(icechunk_refs, "_save_splits", save_once)
+        monkeypatch.setattr(icechunk_refs, "_commit", boom)
+        with caplog.at_level(logging.WARNING, logger="zagg.icechunk_rows"):
+            with pytest.raises(RuntimeError, match="boom"):
+                self._init(cfg, root, 2, "run-A")
+        assert len(calls) == 2
+        assert "re-saving the block's splits failed too (OSError: config store down)" in caplog.text
+
+    @pytest.mark.parametrize("via", ["local", "lambda"])
+    def test_the_losing_init_fails_open_at_the_dispatcher(
+        self, via, handler_mod, cfg, tmp_path, monkeypatch, caplog
+    ):
+        import copy
+        import logging
+
+        from zagg import runner
+
+        root = str(tmp_path / "store")
+        cfg.output["store_layout"] = "hive"
+        self._init(cfg, root, 3, "run-0")
+        _spy_saves(monkeypatch, lambda: self._init(copy.deepcopy(cfg), root, 1, "run-B"))
+        cfg.output["icechunk"] = {"split_order": 2, "commit_order": 2}
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            if via == "local":
+                out = runner._init_icechunk_local(cfg, _grid(cfg), root, "run-A", {})
+            else:
+                # The fleet path: the handler 500s, the dispatcher records it.
+                event = {**TestHandlerMode()._event(root, cfg), "run_id": "run-A"}
+                resp = handler_mod.lambda_handler(event, None)
+                assert resp["statusCode"] == 500
+                out = runner._invoke_lambda_icechunk_init(
+                    _Client({"Payload": _Payload(json.dumps(resp).encode())}),
+                    "fn",
+                    root,
+                    config_dict=event["config"],
+                    parent_order=4,
+                    run_id="run-A",
+                    rows=["all"],
+                )
+        assert set(out) == {"error"} and "block changed under this init" in out["error"]
+        assert "fail-open, issue #580" in caplog.text
+        assert icechunk_refs.read_block(root, store_kwargs={})["split_order"] == 1
+        assert _saved_splits(root) == _block_splits(root)
+
+
 class TestWorkerWiring:
     """Phase 4: ``process_and_write_hive`` records refs after the stamp, fail-open."""
 
