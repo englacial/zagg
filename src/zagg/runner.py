@@ -3470,7 +3470,16 @@ def _run_local(
             return
         meta = outcome["meta"]
         report.results.append(meta)
-        if meta.get("error"):
+        if (
+            meta.get("error")
+            and isinstance(meta.get("windows"), list)
+            and meta["error"] not in BENIGN_ERRORS
+        ):
+            # A bulk unit catches its failed window and returns it (issue
+            # #586): a failed cell, as the fleet counts its 500.
+            report.cells_error += 1
+            logger.warning(f"  [{i}/{n}] {label}: ERROR {meta['error']}")
+        elif meta.get("error"):
             logger.info(f"  [{i}/{n}] {label}: {meta['error']}")
         elif meta.get("current"):
             # Skip-if-current (issue #388): counted apart in the summary

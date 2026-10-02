@@ -232,7 +232,8 @@ output:
   terminal): a re-run of the shard rewrites the failed window while the
   gate skips the windows that landed.
 - **The post-run tail reads leaves, not invokes.** The shard above is a
-  failed cell — its 500, its `failed` status object, `cells_error` — but the
+  failed cell on every backend — its 500 and its `failed` status object on
+  the fleet, `cells_error` on both — but the
   leaves that landed are in the store, and the run's tail treats them as the
   per-window fan-out would have: the **sweep work set** (the families sweep,
   the staged sweep's `(node, window)` units and the node close) is every

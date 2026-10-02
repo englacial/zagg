@@ -254,10 +254,12 @@ class TestBackendsAgree:
         )
         landed = [(shard, w) for w in LANDED]
 
-        # The shard is a failed cell on the fleet: its 500, its error naming
-        # the window, its records — the failed window's unsuccessful.
+        # The shard is a failed cell on both backends; on the fleet its 500,
+        # its error naming the window, its records — the failed window's
+        # unsuccessful.
         (result,) = fleet["results"]
-        assert fleet["cells_error"] == 1 and fleet["cells_with_data"] == 0
+        assert local["cells_error"] == fleet["cells_error"] == 1
+        assert local["cells_with_data"] == fleet["cells_with_data"] == 0
         assert result["status_code"] == 500 and result["error"] == ERROR
         assert [(r["window"], r["success"]) for r in result["body"]["stats"]] == [
             ("2018", True),
