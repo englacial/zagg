@@ -1735,8 +1735,8 @@ def build_uncounted(out: Path) -> None:
     objects the production sweep writes over ``temporal/``'s leaf when that
     leaf carries NO §10.6 record. The ``temporal/`` store is built into a
     scratch directory, the worker's ``temporal.toc`` is deleted — the bytes
-    of a leaf written before the record existed, or of one whose fail-open
-    record PUT failed — and the sweep's own leaf read and finisher run over
+    of a leaf written before the record existed, or of one whose record was
+    lost after its stamp — and the sweep's own leaf read and finisher run over
     it. Nothing writes the record back (§10.6), so the leaf contributes its
     coverage and no count: every ``obs`` is 0 under ``uncounted_shards: 1``.
 

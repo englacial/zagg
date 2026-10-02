@@ -1205,6 +1205,73 @@ class TestLeafTemporalFold:
             assert meta["phase_timings"]["spill_blocks_closed"] == 0
         self._assert_fold(acc.finish(), dfs, self._expected(dfs), meta["total_obs"])
 
+    @pytest.mark.parametrize("regime", ["pooled", "spill-single", "spill-multi"])
+    def test_a_failed_record_write_fails_the_unit_in_every_regime(
+        self, monkeypatch, tmp_path, regime
+    ):
+        """The record write fails CLOSED whichever regime folded it (#575).
+
+        Pooled, spill single-block and spill multi-block all drain into the
+        one write site in ``hive.process_and_write_hive``, through the real
+        worker: a record PUT that fails raises before the stamp and leaves the
+        leaf unstamped, and the retry lands the leaf with the exact record.
+        """
+        import os
+
+        from zagg import hive, leaf_temporal
+        from zagg.store import open_store
+
+        if regime == "spill-multi":
+            monkeypatch.setattr(
+                "zagg.processing.spill._default_block_bytes", lambda k, tmp_dir=None: 1
+            )
+        streaming = None if regime == "pooled" else {"buffer_granules": 2, "mode": "spill"}
+        cfg = _config(
+            streaming=streaming,
+            variables=_companion_variables(),
+            output={**_TIME_SOURCE, "store_layout": "hive"},
+        )
+        cfg.aggregation["coordinates"] = {"morton": {"dtype": "uint64", "fill_value": 0}}
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = self._dfs(grid, key)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, key)
+
+        def write():
+            reads = iter(dfs)
+            monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: next(reads))
+            return hive.process_and_write_hive(
+                key,
+                [f"s3://b/g{i}.h5" for i in range(len(dfs))],
+                grid,
+                _CREDS,
+                root,
+                cfg,
+                store_kwargs={},
+                handoff="pandas",  # the fake reads are DataFrames
+                profile=True,
+            )
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        with monkeypatch.context() as failing:
+            failing.setattr(leaf_temporal, "write_leaf_temporal", boom)
+            with pytest.raises(RuntimeError, match="leaf temporal record .* failed to write"):
+                write()
+        assert os.path.exists(leaf) and hive.read_commit(open_store(leaf)) is None
+        meta = write()
+        assert meta.get("error") is None
+        if regime != "pooled":
+            assert (meta["phase_timings"]["spill_blocks_closed"] > 0) == (regime == "spill-multi")
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        record = leaf_temporal.read_leaf_temporal_record(leaf)
+        got = leaf_temporal.leaf_temporal_contribution(record)
+        self._assert_fold(got, dfs, self._expected(dfs), meta["total_obs"])
+
     def test_the_fold_never_sees_the_whole_shard(self, monkeypatch):
         # Multi-block spill feeds per cell; with a small row budget the largest
         # array any fold sees is bounded by that budget plus one feed — never
@@ -1486,9 +1553,10 @@ class TestLeafTemporalFold:
         """A root block over a worker-recorded shard and a record-less one.
 
         Two shards of one two-field store through the production writer; one
-        lost its record (the worker's fail-open PUT). The sweep writes none
-        back: the root ``obs_total`` is the recorded shard's count alone, and
-        ``uncounted_shards`` says the other is missing from it.
+        lost its record after its stamp (the write itself fails closed, so
+        only a later loss leaves a stamped leaf without one). The sweep writes
+        none back: the root ``obs_total`` is the recorded shard's count alone,
+        and ``uncounted_shards`` says the other is missing from it.
         """
         import os
 

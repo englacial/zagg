@@ -2056,7 +2056,7 @@ def process_and_write_hive(
     # The leaf write order is pinned: dense (streamed, or one object each when
     # sharded) -> ragged (one object, issue #209) -> O11 hashes (in memory,
     # issue #580) -> coverage sidecar -> temporal record (issue #575,
-    # fail-open) -> stamp -> granule-id sibling (issue #388; after the stamp,
+    # fail-closed) -> stamp -> granule-id sibling (issue #388; after the stamp,
     # inside the bracket) -> leaf pyramid column (issue #383) -> Icechunk refs
     # commit (issue #580; last, after the one post-stamp phase that can still
     # fail the unit) -> pointer swap (issue #582; versioned leaves only). The
@@ -2117,21 +2117,21 @@ def process_and_write_hive(
         if words is not None and not full and depth > 0:
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
             write_coverage_sidecar(data_path, bitmap, **store_kwargs)
-        # The leaf temporal record (issue #575): the bitmap's SLOT — a
-        # per-leaf sidecar PUT before the stamp, so an unstamped prefix's
-        # record is debris with everything else — but not the bitmap's
-        # posture. The stamp points AT the bitmap (``build_coverage(...,
-        # bitmap=...)``), so a stamp without it is a lie and the PUT must
-        # fail closed; nothing points at the record, and §10.6 reads its
-        # absence as "read the leaf". So it is fail-OPEN like the D9
-        # granule-id sibling below: a transient 5xx on a ~1 KB sidecar must
-        # not discard a finished shard's read and aggregate. A failed PUT costs
-        # this leaf's COUNTS — nothing else writes the record (§10.6), so the
-        # sweep reads its coverage only, the shard in the root block's
-        # ``uncounted_shards`` until the leaf is replaced. Absent when the
-        # fold saw no clocked observation (an empty leaf publishes no temporal
-        # claim). It goes to ``data_path``, beside the bitmap: on a versioned
-        # leaf (spec §1.5) the version subgroup, BEFORE the version's stamp.
+        # The leaf temporal record (issue #575): the bitmap's SLOT and its
+        # posture — a per-leaf sidecar PUT before the stamp that FAILS CLOSED
+        # (espg ruling of 2026-10-01, §10.6). Nothing points at the record,
+        # but it is the only source of this leaf's counts, no later walk
+        # writes one, and the skip-if-current gate above never looks for it:
+        # a leaf stamped without it reads as current on every re-run and
+        # stays uncounted for good. So a failed write raises HERE, before
+        # the stamp — the prefix is unstamped debris (a versioned leaf's
+        # pointer does not move; the previous ``current`` keeps serving), the
+        # caller writes no stats sidecar, and the next attempt rewrites the
+        # unit like any failed shard. No retry loop of its own: the store
+        # client's policy (``store._S3_RETRY_CONFIG``) already ran. Absent,
+        # and NOT a failure, when the fold saw no clocked observation. It
+        # goes to ``data_path``, beside the bitmap: on a versioned leaf (spec
+        # §1.5) the version subgroup, BEFORE the version's stamp.
         folded = temporal_acc.finish() if temporal_acc is not None else None
         if folded is not None:
             try:
@@ -2142,11 +2142,11 @@ def process_and_write_hive(
                     ),
                     **store_kwargs,
                 )
-            except Exception as exc:  # fail-open: the leaf lands, uncounted
-                logger.warning(
-                    f"leaf temporal record for {data_path} failed to write ({exc}); continuing "
-                    f"to the stamp — the sweep reads this leaf's coverage only (issue #575)"
-                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"leaf temporal record for {data_path} failed to write ({exc}); the leaf "
+                    f"is left unstamped and the unit fails (issue #575)"
+                ) from exc
         stamp = stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),

@@ -1323,6 +1323,139 @@ class TestProcessHive:
         assert body["icechunk_dirty"] is True and "stats" not in body
         assert read_sidecar(hive.shard_leaf_path(event["store_path"], self._WORD)) is None
 
+    def test_a_failed_temporal_record_write_is_a_terminal_failed_shard(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        """Issue #575 on the fleet: the leaf temporal record write fails CLOSED.
+
+        What a record-write failure looks like end to end, dispatcher included
+        (the real ``StatusPoller`` drives the invoke and reads the status
+        object the worker wrote):
+
+        - the worker raises before the stamp, so the handler returns its
+          caught-exception 500 envelope naming the record and the leaf, with
+          no stats record, and writes a ``failed`` status object;
+        - a ``failed`` status is TERMINAL for the run (fault class (a)): the
+          invoke is not re-fired, and the shard resolves as failed;
+        - nothing certifies the attempt — no pointer, no stamped version, no
+          stats sidecar — so a LATER run's unit, gate armed, is not skipped as
+          current: it folds, and lands a fresh version with its record.
+        """
+        import os
+
+        import numpy as np
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import client_transport as ct
+        from zagg import hive, leaf_temporal
+        from zagg.config import load_config_from_dict
+        from zagg.semantics import semantic_hash
+        from zagg.store import open_object_store, open_store
+        from zagg.telemetry import read_sidecar
+
+        config = self._hive_config_dict()
+        config["aggregation"]["variables"]["h"] = {
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [2],
+            "dtype": "float32",
+            "fill_value": 0,
+            "temporal": "per-centroid",
+        }
+        config["output"]["time_source"] = {
+            "field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        cfg = load_config_from_dict(config)
+        grid = from_config(cfg, parent_order=6)
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+        folds: list = []
+
+        def fake(g, shard_key, urls, **kwargs):
+            folds.append(int(shard_key))
+            kwargs["temporal_out"].add_words(words)
+            carrier = self._carrier(grid, shard_key)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 5,
+                "total_obs": 4,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "phase_timings": {"read": 0.0, "index": 0.0, "aggregate": 0.0},
+                "error": None,
+            }
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        event = {
+            **self._event(tmp_path),
+            "config": config,
+            "run_id": "first",
+            # Armed exactly as the dispatcher arms it (issue #388).
+            "skip_if_current": True,
+            "semantic_hash": semantic_hash(cfg),
+        }
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+
+        # The dispatcher half: one Event invoke per fire (its return value is
+        # discarded), resolved from the run's status objects.
+        fired: list = []
+
+        def dispatch():
+            fired.append(event["run_id"])
+            handler_mod.lambda_handler(event, _context())
+
+        prefix = ct.run_status_prefix(event["store_path"], "first")
+        poller = ct.StatusPoller(
+            lambda: open_object_store(prefix), drop_timeout_s=60.0, max_retries=3
+        )
+        future = poller.register(self._WORD, "shard", dispatch=dispatch, granule_count=1)
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        with monkeypatch.context() as failing:
+            failing.setattr(leaf_temporal, "write_leaf_temporal", boom)
+            for _ in range(3):  # fire, resolve, and one more tick that must not re-fire
+                poller._tick()
+        result = future.result(timeout=0)
+        assert fired == ["first"] and result["retries"] == 0
+        assert result["status_code"] == 500
+        assert result["error"].startswith("Unhandled exception: leaf temporal record for ")
+        assert leaf in result["error"] and "503 SlowDown" in result["error"]
+        assert result["body"]["shard_key"] == self._WORD and "stats" not in result["body"]
+        status_path = tmp_path / "hive-out.status" / "run-first" / f"shard-{self._WORD}.json"
+        status = json.loads(status_path.read_text())
+        assert (status["status"], status["status_code"]) == ("failed", 500)
+        # Nothing certifies the attempt: an unstamped version, no pointer, no
+        # stats sidecar beside the leaf.
+        (debris,) = os.listdir(leaf)
+        assert debris.startswith("run-first-")
+        assert hive.read_commit(open_store(leaf)) is None
+        assert hive.read_commit(open_store(f"{leaf}/{debris}")) is None
+        assert read_sidecar(leaf) is None
+
+        # A later run over the store: the unit is processed, not skipped.
+        resp = handler_mod.lambda_handler({**event, "run_id": "second"}, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert "current" not in body and body["identity"] == "no-sidecar"
+        assert folds == [self._WORD, self._WORD]
+        assert body["leaf_version"].startswith("run-second-")
+        data_path, stamp = hive.resolve_leaf(leaf)
+        assert stamp["current"] == body["leaf_version"]
+        assert leaf_temporal.read_leaf_temporal_record(data_path)["n_obs"] == 4
+        assert read_sidecar(leaf)["run_id"] == "second"
+
 
 class TestProcessHiveWindowed:
     """Issue #246: a windowed hive event threads ``window`` through the shared

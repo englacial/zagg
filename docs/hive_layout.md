@@ -834,7 +834,8 @@ store every leaf the worker writes also carries a small JSON record — its
 §10.2 envelope word, its §10.3 counted cover (observation counts per
 aligned time bucket) and the §10.5 cover derived from it — computed per
 chunk from the toc words the aggregation already encodes, and PUT in the
-bitmap's slot: after the arrays, before the stamp, fail-open. It exists so
+bitmap's slot: after the arrays, before the stamp, **fail-closed** — a
+record that does not land fails the unit before the stamp (below). It exists so
 the families sweep composes the root section and the cover sibling from
 one small GET per leaf instead of reading every leaf's raw `_times` column
 back (a million-row ragged array per field per leaf at California scale,
@@ -869,9 +870,41 @@ cover, and a counts block of zero-count buckets with every shard uncounted
 — and pays the raw column read per leaf on every pass, since nothing
 converges, which at California scale no single invoke can finish
 (`_handle_sweep` in `deployment/aws/lambda_handler.py` works that
-arithmetic). A leaf whose
-worker failed its (fail-open) record PUT is the other way to get a raw
-leaf; it stays raw until that leaf is next rewritten. Grammar:
+arithmetic).
+
+**A record that fails to write fails the unit** (espg ruling of 2026-10-01
+on [PR #578](https://github.com/englacial/zagg/pull/578)). The skip-if-current
+gate compares the semantic hash and the granule-id set and verifies the
+leaf column, but never looks for the record, so a leaf stamped without one
+would be skipped as current on every re-run and stay uncounted for good.
+The worker therefore raises before the stamp, after the object-store
+client's own retries (up to 12, backed off 1–30 s inside a 180 s budget —
+`zagg.store._S3_RETRY_CONFIG`; there is no second loop on top):
+
+- a **legacy** leaf is left an unstamped prefix (arrays and bitmap, no
+  record, no stamp) — debris, cleared wholesale by the next attempt's
+  template. As with any failed legacy write, the previous committed leaf is
+  already gone: the template cleared it before the first chunk;
+- a **versioned** leaf's attempt is left an unstamped version subgroup; the
+  pointer is not swapped, so the previous `current` (if any) keeps serving,
+  and the retry draws a fresh version;
+- no stats sidecar, granule-id sibling, sub-map or leaf column is written
+  for the attempt, so a later run's gate sees nothing of it and does not
+  skip the unit on its account: a legacy leaf is unstamped and rewritten; a
+  versioned leaf is judged on its previous `current` alone (rewritten
+  unless that version already holds the planned identity), and a unit with
+  no previous version has no sidecar and is processed;
+- on the fleet the invoke returns the handler's 500 envelope
+  (`{"error": "Unhandled exception: leaf temporal record for … failed to
+  write …", "shard_key", "request_id"}`) and its `.status` object is
+  `failed`. A `failed` status is terminal for that run — the poller never
+  re-fires a worker-reported error, and the fleet's async retry count is 0
+  — so the shard is counted in the run's errors and re-done by the next run.
+
+A leaf whose fold saw no clocked observation writes no record and stamps;
+that is not a failure. A raw leaf now means one written before the record
+existed, one whose record was lost or damaged after the stamp, a revision
+or field-set mismatch, or a record read that failed on that pass. Grammar:
 [`specification.md`](specification.md) §10.6.
 
 **Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`

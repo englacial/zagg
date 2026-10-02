@@ -3251,8 +3251,9 @@ and however many fields are declared. A producer composing the root block
 sums those records (the merge law below) and derives no count of its own.
 
 **Coverage only (normative).** A leaf with no usable record (§10.6 — written
-before the record existed, or whose worker failed to write it, or whose
-record a reader bypasses) is read from its committed §8.3 companions
+before the record existed, or whose record was lost or damaged after the
+stamp, or is bypassed or unreadable on this pass; a writer never stamps a
+leaf whose record write failed) is read from its committed §8.3 companions
 instead, and contributes **its coverage and no count** (espg ruling of
 2026-10-01 on [issue #575](https://github.com/englacial/zagg/issues/575),
 retiring the weight-derived count this section carried for such leaves):
@@ -3634,7 +3635,7 @@ pinned.
 
 **Status: contract** ([issue #575](https://github.com/englacial/zagg/issues/575);
 espg rulings of 2026-09-17 on the record's channels and of 2026-10-01 on its
-one producer).
+one producer and its fail-closed write).
 
 §10.2, §10.3 and §10.5 describe the root section's *outputs*; this section
 describes where their per-leaf *inputs* are kept. All three were originally
@@ -3656,7 +3657,7 @@ ignores). A reader of the
 record resolves `current` first, exactly as a reader of the arrays or the
 bitmap does.
 
-It has the bitmap's placement and most of its posture. It is never truth;
+It has the bitmap's placement and its posture. It is never truth;
 it is written **before** the commit stamp, so an unstamped prefix's record
 is debris with everything else (D4) and the stamp stays the leaf's final
 write; and it is **additive** — a leaf written before this revision simply
@@ -3677,7 +3678,8 @@ a legacy root.
 
 **Written by the leaf's worker, and by nothing else.** The record is written
 once, by the worker that wrote the leaf, before that leaf's stamp (a
-versioned leaf's: before the **version** stamp) — or not at all. No other
+versioned leaf's: before the **version** stamp) — or, for a leaf holding
+no clocked observation, not at all. No other
 producer creates one or replaces one: a sweep or refresh that had to read a
 leaf raw MUST NOT write a record for it, and MUST NOT replace a record it
 finds — not a missing one, not a stale one (the `fields` gate below), not
@@ -3703,15 +3705,34 @@ never reaches the record of a versioned leaf (it touches no version object,
 §1.5; on a legacy leaf the record rides the leaf tree like the bitmap), and
 the §11.4 collector reclaims it with its version, which it deletes whole.
 
-It takes the bitmap's *slot* but not its failure posture. The commit stamp
-points AT the bitmap (§ the stamp's `coverage`), so a stamp published
-without one is a false claim and that write must fail the leaf. Nothing
-points at this record: absence is a defined reading, so a producer that
-fails to write it SHOULD log and **stamp the leaf anyway**, leaving the
-record absent, rather than discard a leaf whose arrays all landed. What
-that costs is the leaf's counts, not correctness: its coverage is still
-read from its arrays, and the root block reports the shard in
-`uncounted_shards` instead of publishing a total that silently omits it.
+**The write fails closed.** The record takes the bitmap's *slot* and its
+failure posture, for its own reason. The commit stamp points AT the bitmap
+(§ the stamp's `coverage`), so a stamp published without one is a false
+claim. Nothing points at this record — but its counts exist nowhere else,
+no later producer writes it (above), and a leaf stamped without it is, to
+every later run, a finished leaf: zagg's rerun identity compares the
+configuration and the input set, not the record, so the leaf would be
+skipped as current and stay uncounted until something else forced its
+rewrite. A writer under this revision therefore **MUST NOT stamp a leaf
+whose record write failed**, when the leaf's fold saw at least one clocked
+observation (espg ruling of 2026-10-01 on
+[PR #578](https://github.com/englacial/zagg/pull/578)). The failed write
+fails the unit before the stamp: the prefix is unstamped debris (D4); on a
+versioned leaf the pointer is not swapped, so the previous `current`, if
+any, keeps serving and the attempt's version is reclaimed as any dead
+attempt's is (§1.5, §11.4); and the unit is retried as any failed leaf
+write is — a legacy leaf cleared and rewritten in place, a versioned one
+under a fresh version. A fold that saw no clocked observation writes no
+record and stamps: that is the absence rule below, not a failure.
+
+**A reader's rule is unchanged**: an absent or unusable record is coverage
+only (§10.3), never a refusal of the leaf. With the writer failing closed,
+the cases that still reach it are a leaf written before the record
+existed; a record damaged or lost after its leaf was stamped; a record at
+another revision, or whose `fields` are not the declared set (below); and
+a record whose read failed on this pass. Each is reported the same way —
+the shard in the root block's `uncounted_shards` — instead of a total that
+silently omits it.
 
 **Absence is the rule for non-temporal stores.** A leaf is written with a
 record **iff** its config declares a §8.3 `"per-centroid"` field and the
