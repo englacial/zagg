@@ -35,7 +35,9 @@ Nothing here calls the fold it checks: expectations come from the leaves
 attrs, and from the geometry.
 
 **What it reads.** The leaf roster — the run records at the store root
-(one LIST, the ``stats_*.parquet`` objects), or ``--roster list`` / ``moc``;
+(one LIST, the ``stats_*.parquet`` objects), or ``--roster list`` / ``moc``
+— and its cross-check (:func:`_roster_gaps`: one LIST of the root, one per
+order-0 node, and under the run records one GET of ``coverage.moc``);
 one ``zarr.json`` GET per declared ``(node, window)`` overview, per ``(leaf,
 window)`` column and per ladder node's ``all.zarr``, declared or not (the
 same per-artifact bound as the unwindowed arm, times the window count);
@@ -163,6 +165,66 @@ def _listed_refs(store_root, shards, store_kwargs, shard_order=None) -> list:
         return sorted(r for refs in pool.map(windows_of, shards) for r in refs)
 
 
+def _roster_gaps(store_root, manifest, store_kwargs, declared, refs, source) -> tuple:
+    """``(findings, warnings)``: what the store holds that the roster does not name.
+
+    A window with an overview anywhere has one at its ladder's order-0 node
+    (§4.2, the ``/2`` ladder runs to 0), so one delimiter LIST of the root and
+    one of each order-0 node (at most 12) name every ``(base, window)`` the
+    ladder holds — exhaustive, unsampled, and independent of the roster. One
+    the roster does not reach is a finding: the harness cannot vouch for a
+    ladder it did not check. Under the run-record roster, the root
+    ``coverage.moc`` (one GET) is a second, independently written shard set:
+    a shard it covers and the records lack is a finding too; the reverse is
+    the MOC lagging (its write is fail-open), named as a warning.
+    """
+    import re
+
+    import obstore
+
+    from zagg.grids.morton import morton_decimal
+    from zagg.hive import read_root_coverage, root_coverage_words
+    from zagg.store import open_object_store
+
+    store = open_object_store(store_root, **store_kwargs)
+    findings, notes = [], []
+    if not all(0 in by_order for by_order in declared.values()):
+        notes.append("the roster's windows were not cross-checked: the ladder stops above order 0")
+    else:
+        try:
+            listing = obstore.list_with_delimiter(store)["common_prefixes"]
+            names = [str(p).rstrip("/") for p in listing]
+            for base in sorted(n for n in names if re.fullmatch(r"-?[1-6]", n)):
+                for window in sorted(_node_window_labels(store, base)):
+                    if base not in declared.get(window, {}).get(0, ()):
+                        findings.append(f"{base}[{window}]")
+        except Exception as exc:
+            findings.append(f"the store's order-0 windows (cannot list them: {exc})")
+    if source != "run records":
+        return findings, notes
+    try:
+        envelope = read_root_coverage(store_root, **store_kwargs)
+    except Exception as exc:
+        envelope, why = None, f"unreadable ({exc})"
+    else:
+        why = "absent"
+    if envelope is None or int(envelope.get("order", -1)) != int(manifest["shard_order"]):
+        notes.append(
+            f"the run-record roster's shard set was not cross-checked: the root coverage.moc "
+            f"is {why if envelope is None else 'at another order'}"
+        )
+        return findings, notes
+    covered = {morton_decimal(int(w)) for w in root_coverage_words(envelope)}
+    recorded = {dec for dec, _ in refs}
+    findings.extend(f"shard {d} (in coverage.moc)" for d in sorted(covered - recorded))
+    if recorded - covered:
+        notes.append(
+            f"{len(recorded - covered)} recorded shard(s) are not in the root coverage.moc "
+            f"(a lagging cache — its write is fail-open): {sorted(recorded - covered)[:8]}"
+        )
+    return findings, notes
+
+
 def validate_windowed(
     store_root: str,
     manifest: dict,
@@ -256,6 +318,19 @@ def validate_windowed(
     if state == "errors":
         skip_rest("node probes failed", after="materialization")
         return _finish(report, CHECKS_WINDOWED)
+    # A roster that understates the store shrinks every check above to what
+    # it names, so the store's own ladder tops are its cross-check (§4.2).
+    gaps, notes = _roster_gaps(store_root, manifest, store_kwargs, declared, refs, roster_source)
+    if notes:
+        report.setdefault("warnings", []).extend(notes)
+    if gaps:
+        report["materialization"]["unaccounted"] = gaps[:50]
+        checks["materialization"] = _entry(
+            "fail",
+            f"{checks['materialization']['detail']}; the leaf roster ({roster_source}) does not "
+            f"account for {len(gaps)}: {gaps[:8]} — their ladders were NOT validated; rerun "
+            f"with --roster list",
+        )
 
     # -- [3] the §4.6 leaf-column tier: one column per (leaf, window).
     from zagg.column import COLUMN_ROLE
@@ -705,9 +780,10 @@ def _all_time_node(
     for window in sorted(expected):
         known = probes.get(window, {})
         if node not in known:
-            sources.warn(
+            errors["readback"].append(
                 f"{node}[{window}]: an overview the leaf roster does not account for — the "
-                f"roster understates this window; its ladder was not validated"
+                f"roster understates this window and its ladder was NOT validated; rerun with "
+                f"--roster list"
             )
             known, errored = _probe_nodes(
                 sources.store_root,

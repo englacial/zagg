@@ -791,7 +791,13 @@ window's objects, and every finding names the node and the window
 
 - `materialization` — a committed `{window}.zarr` at every ladder node that
   has a leaf of that window beneath it; `columns` — a committed
-  `{window}.pyramid.zarr` beside every `(leaf, window)`.
+  `{window}.pyramid.zarr` beside every `(leaf, window)`. Every check derives
+  from the leaf roster, so the roster is cross-checked against the store:
+  a window with an overview at an order-0 node the roster does not reach
+  (every window's ladder runs to order 0), and, under the run-record roster,
+  a shard the root `coverage.moc` covers and the records lack, both FAIL by
+  name — rerun with `--roster list`. A recorded shard missing from the MOC is
+  the MOC lagging (its write is fail-open) and is only named.
 - `readback` — each artifact's `window` key must be the window it is filed
   under (checked on every artifact, not a sample), plus the per-window
   regime, `merges_from_raw` and `source_children` of §4.4.
@@ -814,7 +820,9 @@ window's objects, and every finding names the node and the window
 **What it reads on a windowed store.** The leaf roster from the run records
 (one LIST of the root and its `stats_*.parquet` objects; `--roster list`
 walks the store instead, `--roster moc` takes the shards from the root
-`coverage.moc` and one LIST per shard for its windows); one `zarr.json` GET
+`coverage.moc` and one LIST per shard for its windows); for the roster's
+cross-check one LIST of the root, one per order-0 node (at most 12) and, under
+the run records, one GET of `coverage.moc`; one `zarr.json` GET
 per declared `(node, window)` overview, per `(leaf, window)` column and per
 ladder node for its `all.zarr` (declared or not) — the unwindowed bound times
 the window count; then array

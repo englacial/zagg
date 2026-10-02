@@ -424,6 +424,53 @@ class TestDamage:
         assert "['-511']" in report["checks"]["all_time"]["mismatches"][0]
 
 
+def _drop_records(store: Path, keep) -> None:
+    """Rewrite the run records without the rows ``keep`` rejects."""
+    import pandas as pd
+
+    for path in store.glob("stats_*.parquet"):
+        records = pd.read_parquet(path)
+        records[records.apply(keep, axis=1)].to_parquet(path, index=False)
+
+
+class TestARosterThatUnderstatesTheStore:
+    def test_a_window_the_run_records_lost_fails_by_name(self, store):
+        # The sweep's own discovery source lost 2020: no check below would see
+        # that window's ladder, so the verdict cannot be PASS.
+        _drop_records(store, lambda row: row["window"] != "2020")
+        report = validate_pyramid(str(store), full=True)
+        assert report["windows"] == ["2018", "2019"] and not report["passed"]
+        entry = report["checks"]["materialization"]
+        assert (
+            entry["status"] == "fail" and "does not account for 1: ['-5[2020]']" in entry["detail"]
+        )
+        assert "--roster list" in entry["detail"]
+        assert report["materialization"]["unaccounted"] == ["-5[2020]"]
+        # The all-time leg names the same gap at every node it samples.
+        assert any(
+            m.startswith("-5[2020]: an overview the leaf roster does not account for")
+            for m in report["checks"]["all_time"]["mismatches"]
+        )
+        assert validate_pyramid(str(store), full=True, roster="list")["passed"]
+
+    def test_a_shard_the_run_records_lost_fails_against_the_coverage_moc(self, store):
+        key = _shard(SITES[2])
+        _drop_records(store, lambda row: int(row["shard_key"]) != key)
+        report = validate_pyramid(str(store), full=True)
+        entry = report["checks"]["materialization"]
+        assert entry["status"] == "fail"
+        assert report["materialization"]["unaccounted"] == [f"shard {SHARDS[2]} (in coverage.moc)"]
+
+    def test_an_absent_coverage_moc_is_named_not_failed(self, store):
+        (store / "coverage.moc").unlink()
+        report = validate_pyramid(str(store), full=True)
+        assert report["passed"], format_report(report)
+        assert any(
+            "shard set was not cross-checked: the root coverage.moc is absent" in w
+            for w in report["warnings"]
+        )
+
+
 class TestNotModelled:
     def test_a_windowed_v1_declaration_is_refused_by_name(self, store):
         manifest = json.loads((store / MANIFEST_NAME).read_text())
