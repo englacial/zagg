@@ -893,8 +893,11 @@ It is the pass's own tally, like `temporal_routes`: a **partitioned** pass
 writes no root object and names only the shards of its partition (its
 `sweep_stats_{ts}_p{index}of{of}.json` is one of `of` such lists), and a
 pass over part of the store names only what it read. It is not the standing
-list behind the root marker — no object holds that; a full partition-less
-pass is what names every uncounted shard, up to the cap. Each named shard
+list behind the root marker — no object holds that. Only the sweep names:
+`zagg.coverage.refresh_root_coverage` rebuilds the section and sets the
+marker but writes no run record, so after a refresh the names take a
+partition-less sweep over the store's leaves, which names every shard it
+reads raw, up to the cap. Each named shard
 has at least one leaf to rewrite (a forced rewrite of that unit, whose
 worker writes the record).
 
