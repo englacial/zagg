@@ -176,7 +176,8 @@ class TestValidation:
         # The identity check's one allowance (§11.4): labels appended to the
         # block's ``rows`` with EVERY array holding that many rows. Anything
         # short of that — a shrink, a cell-extent change, arrays and block out
-        # of step, a reordered list — is refused and nothing lands.
+        # of step, a reordered list, a label allocated twice — is refused and
+        # nothing lands.
         _grid_, root = _store(monkeypatch, cfg, tmp_path)
         n = len(_messages(root))
         grow = self._grow
@@ -205,22 +206,41 @@ class TestValidation:
             (lambda s, _b: grow(s, ["2019"], arrays=False) or {}, "off the block's 2 rows"),
             (lambda s, _b: grow(s, ["2019"], skip=("6/count",)) or {}, r"\['6/count'\] off"),
             (reorder, "would reorder or drop rows"),
+            (lambda s, _b: grow(s, ["all"]) or {}, "would allocate a row twice"),
+            (lambda s, _b: grow(s, ["2019", "2019"]) or {}, "would allocate a row twice"),
         ):
             with pytest.raises(ValueError, match=msg):
                 icechunk_ops._operation(root, "probe", mutate, store_kwargs={})
         assert len(_messages(root)) == n  # nothing landed
-        # Rows appended to the block and to every array at once: allowed.
-        out = icechunk_ops._operation(
-            root, "probe", lambda s, _b: grow(s, ["2019", "2020"]) or {}, store_kwargs={}
+
+    def test_an_allocation_passes_the_check(self, cfg, tmp_path):
+        # The init's own allocation (``grow_rows`` plus the block's ``rows``,
+        # §11.4) on a windowed store is exactly the growth the check allows.
+        from test_icechunk_rows import _Y, _YEARLY
+
+        from zagg import icechunk_rows
+
+        cfg.output["pyramid"] = False
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        manifest = hive.build_manifest(grid, windowing=_YEARLY)
+        icechunk_refs.init_repo(
+            root, grid, cfg, run_id=RUN, store_kwargs={}, manifest=manifest, rows=["2019"]
         )
+
+        def allocate(session, block):
+            rows = icechunk_rows.grow_rows(session, block["rows"], ["2020", "2021"], _YEARLY)
+            root_group = zarr.open_group(session.store, mode="r+")
+            root_group.attrs[ICECHUNK_ATTR] = {**root_group.attrs[ICECHUNK_ATTR], "rows": rows}
+            return {}
+
+        out = icechunk_ops._operation(root, "probe", allocate, store_kwargs={})
         assert out["snapshot"] and _messages(root)[0] == "probe"
         group, _repo = _open(root)
-        assert group.attrs[ICECHUNK_ATTR]["rows"] == ["all", "2019", "2020"]
+        assert group.attrs[ICECHUNK_ATTR]["rows"] == ["2019", "2020", "2021"]
         assert group["6"]["count"].shape == (3, 12 * 4**6)
-        assert group["window_start"].shape == (3,)
-        # The committed leaf's refs are untouched in row 0; the new rows read fill.
-        assert int(group["6"]["count"][0, :].sum()) > 0
-        assert int(group["6"]["count"][1:, :].sum()) == 0
+        assert group["window_start"][:].tolist() == [_Y[2019], _Y[2020], _Y[2021]]
+        assert int(group["6"]["count"][1:, :].sum()) == 0  # the new rows read fill
 
 
 class TestDeclarePyramid:

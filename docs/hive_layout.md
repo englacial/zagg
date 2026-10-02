@@ -1610,7 +1610,7 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   ```
 
   Before the commit the array model of every array must be unchanged — but
-  for row growth: labels appended to `rows`, every array holding that many
+  for row growth: new labels appended to `rows`, every array holding that many
   rows — and
   the block's compatibility keys must hold, else the session is discarded.
   `set-attrs` refuses the root's `zagg_icechunk` and `multiscales` keys;

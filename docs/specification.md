@@ -4011,7 +4011,7 @@ reads as a log — and it touches no leaf. Before the commit the session is
 **validated**: the array model of every array (shape, dtype, chunk grid,
 codecs, fill value — everything but attrs) MUST be identical before and
 after **except for row growth** — the block's `rows` may gain labels at its
-end (never lose or reorder one, §11.2), and then every array with the
+end (never lose or reorder one, nor hold one twice, §11.2), and then every array with the
 `window` dimension MUST hold exactly that many rows, its cell extent and
 everything else unchanged; rows grow for the whole repo or not at all —
 the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
