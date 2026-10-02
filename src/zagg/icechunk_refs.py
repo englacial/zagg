@@ -66,6 +66,7 @@ from zagg.icechunk_rows import (
     level_group_spec,
     row_index,
     row_key,
+    splits_follow_block,
     store_rows,
     write_bounds,
 )
@@ -651,6 +652,8 @@ def init_repo(
     writes is already at the new cut) and flagged as ``split_ratchet:
     {from, to}`` for a later ``rewrite_manifests`` of the old manifests (not
     run here — mixed cuts are valid, each manifest carries its own extents).
+    An init that fails after that save re-saves the block's own splits before
+    raising (:func:`zagg.icechunk_rows.splits_follow_block`, issue #597).
     ``commit_order`` is per-run: it is written to the block for this run's
     stage nodes whenever it differs, never compared.
     """
@@ -726,25 +729,22 @@ def init_repo(
     for key in ("commit", "commit_order"):
         if existing.get(key) != options[key]:
             updates[key] = options[key]
-    message = (
-        f"split ratchet {ratchet['from']}->{ratchet['to']} {run_id}"
-        if ratchet
-        else f"init {run_id}"
-    )
+    message = f"split ratchet {stored}->{wanted} {run_id}" if ratchet else f"init {run_id}"
     # Every run opens with an ``init {run_id}`` commit (§11.4) — empty when
     # neither the block nor the rows change — so the ancestry brackets each
     # run between its init and its finalize: the repo is its own run log, and
     # finalize's newest-run check (a reattached client's guard) is exact.
-    snapshot, rows = commit_rows(
-        repo,
-        existing,
-        updates,
-        labels,
-        temporal,
-        lambda session: _commit(
-            session, message, local=local, path=path, metadata={"run_id": run_id}, allow_empty=True
-        )[0],
-    )
+    with splits_follow_block(repo, store_root, store_kwargs, saved=ratchet is not None):
+        snapshot, rows = commit_rows(
+            repo,
+            existing,
+            updates,
+            labels,
+            temporal,
+            lambda s: _commit(
+                s, message, local=local, path=path, metadata={"run_id": run_id}, allow_empty=True
+            )[0],
+        )
     return {
         "path": path,
         "snapshot": snapshot,

@@ -27,11 +27,15 @@ by LABEL and the committing session resolves it (``icechunk_refs.commit_units``)
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from typing import Any, Iterable, Mapping, cast
 
 import numpy as np
 
 from zagg.windows import SCHEDULE_NONE_TOKEN
+
+logger = logging.getLogger(__name__)
 
 #: The reserved row label: an unwindowed store's one row, and a windowed
 #: store's all-time fold (never both in one store, issue #584).
@@ -307,6 +311,40 @@ def commit_rows(
                 raise
 
 
+@contextlib.contextmanager
+def splits_follow_block(repo, store_root: str, store_kwargs: dict, saved: bool):
+    """Around a reopened repo's init commit: a failed init leaves no saved split ahead of the block.
+
+    A ratcheting init saves its splitting config BEFORE its commit (§11.5),
+    and the save is not part of the commit. ``saved`` says this init made
+    one: if the commit then raises — the lost race :func:`commit_rows`
+    refuses, an exhausted rebase, anything — the repo's saved config would
+    stay at a cut the block never recorded, and every later commit would cut
+    its manifests there (issue #597). So before the error propagates the
+    splits are re-saved from main's block as it stands NOW
+    (``icechunk_refs.block_splits``): the winner's ratchet, or the block this
+    init found. The init's own error always raises; a re-save that fails is
+    logged. Residual, as in ``declare-pyramid``: a ratchet saving between this
+    read and this save is lost (last writer wins).
+    """
+    from zagg.icechunk_refs import BRANCH, _save_splits, _session_block, block_splits
+
+    try:
+        yield
+    except Exception:
+        if saved:
+            try:
+                block = _session_block(repo.readonly_session(BRANCH))
+                _save_splits(repo, store_root, block_splits(block), store_kwargs)
+            except Exception as exc:
+                logger.warning(
+                    f"icechunk init failed after saving a split ratchet, and re-saving the "
+                    f"block's splits failed too ({type(exc).__name__}: {exc}): the repo's saved "
+                    f"splitting config may be ahead of its block (spec §11.5, issue #597)"
+                )
+        raise
+
+
 # ── the array-model identity check ──────────────────────────────────────────
 
 
@@ -395,6 +433,7 @@ __all__ = [
     "row_index",
     "row_key",
     "run_rows",
+    "splits_follow_block",
     "store_rows",
     "write_bounds",
 ]
