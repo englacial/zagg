@@ -935,6 +935,14 @@ class Run:
                     parent_order=self._parent_order,
                     run_id=run_id,
                     output_creds_event=output_creds_event,
+                    # No ``cells``: this facade dispatches one future per
+                    # shard and never fans out, so it has no expanded units
+                    # to read rows off. It only ever reaches here on an
+                    # UNWINDOWED config (windowed ones are refused above),
+                    # whose single ``all`` row needs none; should that
+                    # refusal be lifted without threading the units through,
+                    # ``_icechunk_rows`` raises here rather than allocating a
+                    # repo with no row for any window (issue #584).
                     rows=runner._icechunk_rows(self.config),
                 )
         else:

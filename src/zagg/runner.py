@@ -3278,15 +3278,19 @@ def _run_local(
         # chains the staged sweep here AND a ``/2`` ladder with composable
         # fields is declared (``icechunk_refs.ladder_walks``) — else to the
         # per-leaf commit. Explicit settings are honored.
-        icechunk_init = _init_icechunk_local(config, grid, store_path, run_id, store_kwargs)
         # Temporal fan-out (issue #246 phase 5): one work unit per shard
         # emitting every window its granules span (issue #586, the default),
         # or per (shard, window) under ``windowing.unit: window``. None
         # (schedule none/absent) keeps the (shard, records) pairs — dispatch
-        # byte-identical to pre-windowing runs.
+        # byte-identical to pre-windowing runs. It runs BEFORE the init
+        # because the init allocates the run's rows from the units' window
+        # labels (issue #584 §11.2).
         if windowing is not None:
             fan = _windowed_units if get_windowing_unit(config) == "window" else _shard_window_units
             cells = fan(cells, windowing, (config.bounds or {}).get("temporal"))
+        icechunk_init = _init_icechunk_local(
+            config, grid, store_path, run_id, store_kwargs, cells=cells
+        )
     else:
         icechunk_init = None
         zarr_store = open_store(store_path, **store_kwargs)
@@ -4233,7 +4237,7 @@ def _run_lambda(
                 parent_order=parent_order,
                 run_id=run_id,
                 output_creds_event=output_creds_event,
-                rows=_icechunk_rows(config),
+                rows=_icechunk_rows(config, cells),
             )
             if get_icechunk(config)
             else None
@@ -5916,18 +5920,91 @@ def _pin_icechunk_commit(config, grid, *, stages: bool):
     return replace(config, output={**config.output, "icechunk": block})
 
 
-def _icechunk_rows(config) -> list:
+def _unit_window_labels(cells: list[tuple], unit_mode: str) -> list[str]:
+    """The window labels a windowed run's DISPATCH UNITS carry, first-appearance order.
+
+    Read off the expanded units rather than re-derived from the schedule, so
+    the init allocates exactly the rows the run can write: a declared window
+    no granule falls in produces no unit, writes no leaf, and gets no row.
+    ``unit: "window"`` units are ``(shard, subset, payload)``;
+    ``unit: "shard"`` units are ``(shard, records, [(payload, subset), …])``
+    (:func:`_windowed_units`, :func:`_shard_window_units`).
+
+    Every shape is checked rather than unpacked on faith: an un-fanned
+    ``(shard, records)`` pair, a unit read under the WRONG ``unit_mode``, or
+    a payload that lost its label would otherwise raise a bare
+    ``ValueError``/``TypeError``/``KeyError`` from deep inside the
+    comprehension, or quietly yield no label at all — and a row the init
+    never allocates fails every leaf under it much later (issue #584 review).
+    """
+    labels: list[str] = []
+    for unit in cells:
+        if not isinstance(unit, (tuple, list)) or len(unit) != 3:
+            raise ValueError(
+                f"icechunk rows: {unit!r} is not an expanded (shard, records, windows) "
+                f"dispatch unit — a windowed run's rows are read off its fanned-out units, "
+                f"so the temporal fan-out runs BEFORE the init (spec §11.2, issue #584)"
+            )
+        if unit_mode == "window":
+            payloads = [unit[2]]
+        else:
+            pairs = unit[2]
+            if not isinstance(pairs, (tuple, list)) or any(
+                not isinstance(pair, (tuple, list)) or len(pair) != 2 for pair in pairs
+            ):
+                raise ValueError(
+                    f"icechunk rows: shard unit {unit[0]!r} carries {unit[2]!r}, not the "
+                    f"(payload, subset) pairs of output.windowing.unit: 'shard' "
+                    f"(spec §11.2, issue #584)"
+                )
+            payloads = [payload for payload, _subset in pairs]
+        for payload in payloads:
+            if not isinstance(payload, dict) or not payload.get("label"):
+                raise ValueError(
+                    f"icechunk rows: dispatch payload {payload!r} names no window label "
+                    f"under output.windowing.unit: {unit_mode!r} — the init allocates one "
+                    f"row per label (spec §11.2, issue #584)"
+                )
+            labels.append(str(payload["label"]))
+    return list(dict.fromkeys(labels))
+
+
+def _icechunk_rows(config, cells: list[tuple] | None = None) -> list:
     """The row labels this run writes in the companion repo (issue #584, spec §11.2).
 
     What every dispatcher hands the once-per-run init, which allocates them:
-    an unwindowed run writes the single ``all`` row.
+    an unwindowed run writes the single ``all`` row; a windowed run the
+    labels of its dispatch units (``cells``, already expanded), plus the
+    reserved ``all`` row when the store maintains the cross-window fold
+    (``pyramid.overview.all_time``) — that row is populated at the overview
+    levels only, there being no all-time leaf at the base.
+
+    ``cells`` is REQUIRED for a windowed config and is the run's expanded
+    units; a caller that has not fanned out is refused here rather than
+    handed an empty row list, which would make a repo with no row for any
+    window and fail every leaf's refs behind it (issue #584 review). An
+    empty list is legitimate — a run whose fan-out produced no unit.
     """
-    from zagg.icechunk_rows import run_rows
+    from zagg.icechunk_rows import ALL_ROW, run_rows
 
-    return run_rows(get_windowing(config))
+    windowing = get_windowing(config)
+    if windowing is None:
+        return run_rows(None)
+    if cells is None:
+        raise ValueError(
+            "a windowed run's init rows are read off its expanded dispatch units, so "
+            "_icechunk_rows needs the run's cells; fan the units out before the init "
+            "(spec §11.2, issue #584)"
+        )
+    labels = _unit_window_labels(cells, get_windowing_unit(config))
+    if (get_pyramid(config) or {}).get("all_time"):
+        labels = [*labels, ALL_ROW]
+    return run_rows(windowing, labels)
 
 
-def _init_icechunk_local(config, grid, store_path, run_id, store_kwargs) -> dict | None:
+def _init_icechunk_local(
+    config, grid, store_path, run_id, store_kwargs, cells: list[tuple] | None = None
+) -> dict | None:
     """The local backend's in-process Icechunk init (issue #580); its record.
 
     ``None`` when ``output.icechunk`` is off; ``{"error": ...}`` on a failed
@@ -5946,7 +6023,7 @@ def _init_icechunk_local(config, grid, store_path, run_id, store_kwargs) -> dict
             config,
             run_id=run_id,
             store_kwargs=store_kwargs,
-            rows=_icechunk_rows(config),
+            rows=_icechunk_rows(config, cells),
         )
     except Exception as e:
         logger.warning(f"icechunk init failed (fail-open, issue #580): {e}")

@@ -95,6 +95,7 @@ def _write_leaf(
     skip_chunks=(),
     refs=False,
     run_id=None,
+    window=None,
 ):
     """One leaf through the production writer; returns the worker metadata.
 
@@ -145,7 +146,15 @@ def _write_leaf(
     # ``run_id`` makes the leaf VERSIONED (issue #582); ``None`` writes the
     # legacy in-place leaf these refs tests were written against.
     return hive.process_and_write_hive(
-        shard, ["s3://bucket/g.h5"], grid, {}, root, grid.config, store_kwargs={}, run_id=run_id
+        shard,
+        ["s3://bucket/g.h5"],
+        grid,
+        {},
+        root,
+        grid.config,
+        store_kwargs={},
+        run_id=run_id,
+        window=window,
     )
 
 
@@ -191,15 +200,17 @@ class TestSplit:
 
     def test_block_per_level_at_the_production_split(self, cfg):
         base = HealpixGrid(9, 19, config=cfg, chunk_inner=13)
-        assert icechunk_refs.split_block(base, 6) == {"chunks": 4**7, "order": 6}
-        assert icechunk_refs.split_block(base, 4) == {"chunks": 4**9, "order": 4}
+        assert icechunk_refs.split_block(base, 6) == {"chunks": 4**7, "order": 6, "rows": 1}
+        assert icechunk_refs.split_block(base, 4) == {"chunks": 4**9, "order": 4, "rows": 1}
+        # The row block is store-wide, so it is the same on every level.
+        assert icechunk_refs.split_block(base, 6, rows=4)["rows"] == 4
         # The column and overview levels, at the grids their writers use
         # (one chunk per node): the same 16,384 chunks, a coarser cell each.
         want = {13: (4**7, 2), 12: (4**7, 1), 11: (4**7, 0), 10: (4**6, 0), 4: (1, 0)}
         for cells, (chunks, order) in want.items():
             level = HealpixGrid(cells - 4, cells, config=cfg, sharded=True)
             block = icechunk_refs.split_block(level, 6, base_chunk_order=base.chunk_order)
-            assert block == {"chunks": chunks, "order": order}, cells
+            assert block == {"chunks": chunks, "order": order, "rows": 1}, cells
 
     def test_the_default_split_clears_the_dictionary_gate(self):
         # §11.5 (informative): the default split is one manifest per order-6
@@ -224,6 +235,7 @@ class TestOptions:
             "commit": "leaf",  # no grid: nothing says a ladder will run
             "commit_order": 6,
             "split_order": 6,
+            "rows_per_manifest": 1,
         }
         assert icechunk_refs.resolve_options(self._cfg(cfg), 4)["commit_order"] == 3
 
@@ -281,7 +293,12 @@ class TestOptions:
         opts = icechunk_refs.resolve_options(
             self._cfg(cfg, commit="ladder", split_order=4, commit_order=3), 9
         )
-        assert opts == {"commit": "ladder", "commit_order": 3, "split_order": 4}
+        assert opts == {
+            "commit": "ladder",
+            "commit_order": 3,
+            "split_order": 4,
+            "rows_per_manifest": 1,
+        }
 
     def test_split_finer_than_commit_is_refused(self, cfg):
         with pytest.raises(ValueError, match="whole manifests"):
@@ -291,6 +308,14 @@ class TestOptions:
 
         with pytest.raises(ValueError, match="finer than commit_order"):
             validate_config(self._cfg(cfg, split_order=2, commit_order=3))
+
+    def test_rows_per_manifest_defaults_to_one_and_must_be_positive(self, cfg):
+        # The §11.5 row cut: one manifest per row unless a store sets blocks.
+        assert icechunk_refs.resolve_options(self._cfg(cfg), 9)["rows_per_manifest"] == 1
+        opts = icechunk_refs.resolve_options(self._cfg(cfg, rows_per_manifest=4), 9)
+        assert opts["rows_per_manifest"] == 4
+        with pytest.raises(ValueError, match="must be at least 1"):
+            icechunk_refs.resolve_options(self._cfg(cfg, rows_per_manifest=0), 9)
 
     def test_orders_above_the_shard_order_are_refused(self, cfg):
         with pytest.raises(ValueError, match="shard_order"):
@@ -312,6 +337,7 @@ class TestOptions:
             "commit": "leaf",
             "commit_order": 4,
             "split_order": 4,
+            "rows_per_manifest": 1,
         }
 
     def test_block_shape_is_validated(self, cfg):
@@ -360,19 +386,19 @@ class TestInit:
             "cell_order": 6,
             "node_order": 4,
             "artifact": "leaf",
-            "split": {"chunks": 16, "order": 3},
+            "split": {"chunks": 16, "order": 3, "rows": 1},
         }
         assert out["levels"] == block["levels"] and out["options"]["commit_order"] == 3
         # Every level holds the base's 16 chunks per manifest, capped at its
         # own chunk axis: the column (5) spans an order-2 cell, the overviews
         # a coarser one each, down to one base cell (§11.5).
         assert {k: v["split"] for k, v in block["levels"].items()} == {
-            "6": {"chunks": 16, "order": 3},
-            "5": {"chunks": 16, "order": 2},
-            "4": {"chunks": 16, "order": 1},
-            "3": {"chunks": 16, "order": 0},
-            "2": {"chunks": 4, "order": 0},
-            "1": {"chunks": 1, "order": 0},
+            "6": {"chunks": 16, "order": 3, "rows": 1},
+            "5": {"chunks": 16, "order": 2, "rows": 1},
+            "4": {"chunks": 16, "order": 1, "rows": 1},
+            "3": {"chunks": 16, "order": 0, "rows": 1},
+            "2": {"chunks": 4, "order": 0, "rows": 1},
+            "1": {"chunks": 1, "order": 0, "rows": 1},
         }
         # The manifest's §4.9 multiscales mirror rides the root attrs.
         assert group.attrs["multiscales"] == hive.build_manifest(grid)["multiscales"]
@@ -462,11 +488,15 @@ class TestInit:
         (condition, dims) = sizes[0]
         assert isinstance(condition, icechunk.ManifestSplitCondition.PathMatches)
         # The split names BOTH axes (§11.5): the cell axis at the level's run,
-        # the row axis at a length no row count reaches — an axis left
-        # unnamed would split at one chunk, a manifest per row.
+        # the row axis at ``rows_per_manifest`` — one row per manifest by
+        # default, so an append adds manifests and rewrites no earlier row.
         by_axis = {axis._0: size for axis, size in dims}
         assert all(isinstance(a, icechunk.ManifestSplitDimCondition.Axis) for a, _ in dims)
-        assert by_axis == {0: icechunk_rows.ROW_SPLIT, 1: out["levels"]["6"]["split"]["chunks"]}
+        assert by_axis == {
+            0: icechunk_rows.DEFAULT_ROWS_PER_MANIFEST,
+            1: out["levels"]["6"]["split"]["chunks"],
+        }
+        assert out["levels"]["6"]["split"]["rows"] == 1
         assert isinstance(sizes[-1][0], icechunk.ManifestSplitCondition.AnyArray)
 
     def test_rerun_reopens_with_an_empty_init_commit(self, cfg, tmp_path):
@@ -543,7 +573,7 @@ class TestInit:
 
         root = str(tmp_path / "store")
         first = self._init(cfg, root, split_order=2, commit_order=2)
-        assert first["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2}
+        assert first["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2, "rows": 1}
         with caplog.at_level(logging.WARNING, logger="zagg.icechunk_refs"):
             again = self._init(cfg, root, split_order=3, commit_order=2)  # finer than the store
         assert "finer than the store's recorded 2" in caplog.text
@@ -571,7 +601,7 @@ class TestInit:
         assert "ratchets 3 -> 2" in caplog.text
         assert again["split_ratchet"] == {"from": 3, "to": 2}
         assert again["snapshot"] != first["snapshot"]  # the block rewrite is a commit
-        assert again["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2}
+        assert again["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2, "rows": 1}
         block = icechunk_refs.read_block(root, store_kwargs={})
         assert block["split_order"] == 2 and block["levels"] == again["levels"]
         _group, repo = _open(root)
@@ -781,13 +811,16 @@ class TestLeafRefs:
         with pytest.raises(icechunk.StorageError, match="checksum"):
             group["6"]["count"][span]
 
-    def test_windowed_and_empty_units_are_skipped(self, monkeypatch, cfg, tmp_path):
+    def test_a_leaf_with_no_objects_is_skipped(self, monkeypatch, cfg, tmp_path):
+        # A windowed leaf is no longer skipped (issue #584 phase 2) — it is
+        # indexed at its window's row; only an objectless leaf skips. Here
+        # neither the unwindowed nor the ``2019`` leaf was ever written.
         grid = _grid(cfg)
         root = str(tmp_path / "store")
         icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
         shard = _shards(grid, 1)[0]
         assert icechunk_refs.record_leaf(root, grid, shard, store_kwargs={}, window="2019") == {
-            "skipped": "windowed"
+            "skipped": "empty"
         }
         assert icechunk_refs.record_leaf(root, grid, shard, store_kwargs={}) == {"skipped": "empty"}
 
@@ -894,7 +927,7 @@ class TestLeafRefs:
         grid = _grid(cfg)
         root = str(tmp_path / "store")
         out = icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
-        assert out["levels"]["3"]["split"] == {"chunks": 16, "order": 0}
+        assert out["levels"]["3"]["split"] == {"chunks": 16, "order": 0, "rows": 1}
         repo = icechunk_refs.open_repo(root, store_kwargs={})
         prefix = icechunk_refs.container_prefix(root)
         first, second = repo.writable_session("main"), repo.writable_session("main")
@@ -973,7 +1006,12 @@ class TestLambdaInitInvoke:
             "path": "s3://b/p/icechunk",
             "snapshot": "SNAP",
             "created": True,
-            "options": {"commit": "ladder", "commit_order": 6, "split_order": 6},
+            "options": {
+                "commit": "ladder",
+                "commit_order": 6,
+                "split_order": 6,
+                "rows_per_manifest": 1,
+            },
             "levels": {
                 "9": {"chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}}
             },
@@ -1147,6 +1185,12 @@ def _saved_splits(root):
     """``{cell order: chunks per manifest}`` of the repo's SAVED splitting config (a plain open)."""
     sizes = icechunk_refs.open_repo(root, store_kwargs={}).config.manifest.splitting.split_sizes
     return {c.regex[2:-3]: {axis._0: n for axis, n in dims}[1] for c, dims in sizes[:-1]}
+
+
+def _saved_row_splits(root):
+    """``{cell order: rows per manifest}`` of the repo's SAVED splitting config."""
+    sizes = icechunk_refs.open_repo(root, store_kwargs={}).config.manifest.splitting.split_sizes
+    return {c.regex[2:-3]: {axis._0: n for axis, n in dims}[0] for c, dims in sizes[:-1]}
 
 
 def _block_splits(root):
@@ -1749,8 +1793,25 @@ class TestCarrier:
         assert units == [{"level": 6, "row": "all", "entries": []}]
 
 
-def _ladder_run(monkeypatch, cfg, tmp_path, *, icechunk_block, shards, workers=1):
-    """A local run with the staged sweep chained: leaves, columns, ladder, refs."""
+def _ladder_run(
+    monkeypatch,
+    cfg,
+    tmp_path,
+    *,
+    icechunk_block,
+    shards,
+    workers=1,
+    windowing=None,
+    windows=(),
+    root=None,
+):
+    """A local run with the staged sweep chained: leaves, columns, ladder, refs.
+
+    ``windowing`` declares a schedule (issue #584 phase 2): the run then
+    dispatches ``(shard, window)`` units and writes one leaf per window.
+    ``windows`` are ``(label, time_start, time_end)`` triples, one granule
+    per shard per window. ``root`` reuses an existing store (an append).
+    """
     import pandas as pd
 
     import zagg.processing as processing
@@ -1767,6 +1828,8 @@ def _ladder_run(monkeypatch, cfg, tmp_path, *, icechunk_block, shards, workers=1
     }
     cfg.output["sweep"] = "stages"
     cfg.output["icechunk"] = icechunk_block
+    if windowing is not None:
+        cfg.output["windowing"] = windowing
     monkeypatch.setattr(
         runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a", "secretAccessKey": "s"}
     )
@@ -1801,9 +1864,22 @@ def _ladder_run(monkeypatch, cfg, tmp_path, *, icechunk_block, shards, workers=1
             "layout": "fullsphere",
         },
         "shard_keys": shards,
-        "granules": [[{"id": f"g{i}", "s3": f"s3://b/g{i}.h5"}] for i in range(len(shards))],
+        "granules": [
+            [
+                {
+                    "id": f"g{i}{label}",
+                    "s3": f"s3://b/g{i}{label}.h5",
+                    "time_start": start,
+                    "time_end": end,
+                }
+                for label, start, end in windows
+            ]
+            if windows
+            else [{"id": f"g{i}", "s3": f"s3://b/g{i}.h5"}]
+            for i in range(len(shards))
+        ],
     }
-    root = str(tmp_path / "store")
+    root = root or str(tmp_path / "store")
     summary = runner._run_local(
         cfg,
         catalog,
@@ -1840,17 +1916,30 @@ class TestLadder:
         )
         assert summary["cells_error"] == 0
         init = summary["icechunk"]
-        assert init["options"] == {"commit": "ladder", "commit_order": 3, "split_order": 3}
+        assert init["options"] == {
+            "commit": "ladder",
+            "commit_order": 3,
+            "split_order": 3,
+            "rows_per_manifest": 1,
+        }
         assert init["ladder"] == [1, 2, 3, 4, 5, 6]  # cell orders: o0..o3 overviews, column, base
-        assert init["levels"]["6"]["split"] == {"chunks": 4**2, "order": 3}  # base: chunk order 5
+        assert init["levels"]["6"]["split"] == {
+            "chunks": 4**2,
+            "order": 3,
+            "rows": 1,
+        }  # base: chunk order 5
         assert init["levels"]["5"] == {
             "node_order": 4,
             "artifact": "column",
             "chunk_order": 4,
             "cell_order": 5,
-            "split": {"chunks": 16, "order": 2},  # the base's 16 chunks: one o2 cell
+            "split": {"chunks": 16, "order": 2, "rows": 1},  # the base's 16 chunks: one o2 cell
         }
-        assert init["levels"]["4"]["split"] == {"chunks": 16, "order": 1}  # one chunk per o3 node
+        assert init["levels"]["4"]["split"] == {
+            "chunks": 16,
+            "order": 1,
+            "rows": 1,
+        }  # one chunk / o3 node
         for meta in summary["results"]:
             assert "sidecar" in meta["icechunk"] and "snapshot" not in meta["icechunk"]
         rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
@@ -1943,6 +2032,7 @@ class TestLadder:
             "commit": "ladder",
             "commit_order": 0,
             "split_order": 0,
+            "rows_per_manifest": 1,
         }
         from zagg.icechunk_ladder import read_node_refs
 
@@ -2033,7 +2123,7 @@ class TestLadder:
         block = ladder_context(root, manifest, store_kwargs={})
         candidates = [morton_decimal(s) for s in shards]
         yielded = list(
-            _child_units(root, "1111", 4, 4, candidates, block, manifest.get("spec"), {})
+            _child_units(root, "1111", 4, 4, candidates, block, manifest.get("spec"), {}, [None])
         )
         assert len(yielded) == len(shards) and [miss for _u, miss in yielded] == [0, 0]
         # ... and the commit takes that stream in its generator form.
@@ -2383,16 +2473,17 @@ class TestKnob:
         assert get_icechunk(cfg) is False
 
     def test_default_follows_the_writer_scope_not_the_layout(self, cfg):
-        # Spec §11.6: a windowed store's leaves share a shard rank and a
-        # raster product is never sharded, so stage 1 records no refs for
-        # either — the default resolves OFF rather than standing up a repo no
-        # leaf can ever fill.
+        # Spec §11.6: a raster product is never sharded, so the writer
+        # records no refs for it — the default resolves OFF rather than
+        # standing up a repo no leaf can ever fill. A WINDOWED hive store is
+        # in scope as of issue #584 phase 2: the repo's row dimension is
+        # what separates the leaves that share a shard rank.
         from zagg.config import get_icechunk, get_store_layout
 
         cfg.output["store_layout"] = "hive"
         assert get_icechunk(cfg) is True
         cfg.output["windowing"] = _WINDOWING
-        assert get_icechunk(cfg) is False
+        assert get_icechunk(cfg) is True
         cfg.output.pop("windowing")
         raster = default_config("sentinel2_l2a")
         assert get_store_layout(raster) == "hive" and get_icechunk(raster) is False
@@ -2410,8 +2501,8 @@ class TestKnob:
             validate_config(cfg)
         cfg.output["store_layout"] = "hive"
         cfg.output["windowing"] = _WINDOWING
-        with pytest.raises(ValueError, match=r"windowed stores \(spec §11.6\)"):
-            validate_config(cfg)
+        validate_config(cfg)  # windowed hive stores are in scope (issue #584)
+        cfg.output.pop("windowing")
         raster = default_config("sentinel2_l2a")
         raster.output["icechunk"] = True
         with pytest.raises(ValueError, match=r"raster products \(spec §11.6\)"):
@@ -2430,8 +2521,8 @@ class TestKnob:
             validate_config(cfg)
         cfg.output["store_layout"] = "hive"
         cfg.output["windowing"] = _WINDOWING
-        with pytest.raises(ValueError, match=r"windowed stores \(spec §11.6\)"):
-            validate_config(cfg)
+        validate_config(cfg)  # windowed hive stores are in scope (issue #584)
+        cfg.output.pop("windowing")
         raster = default_config("sentinel2_l2a")
         raster.output["icechunk"] = {}
         with pytest.raises(ValueError, match=r"raster products \(spec §11.6\)"):
