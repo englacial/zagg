@@ -4958,17 +4958,22 @@ having precisely because all refs of one leaf array carry the **same**
 Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
 across windows, which is what the `/2` row dimension is for: each window is
 a row (§11.2), so the array model holds them — and the writer now indexes
-them (issue #584 phase 2). A windowed hive store is **in** scope: the
-run's init allocates one row per window label its dispatch units carry
-(plus the reserved `all` row when the store maintains the cross-window
-fold, `pyramid.overview.all_time`), each window leaf's refs land at its
-window's row, the ladder's node units plan one overview object per row
-**this run writes** (`{window}.zarr` per window unit beneath the node, and
-`all.zarr` when the node closes) — never per row the repo holds, which
-would re-plan and re-commit every window ever allocated and so rewrite
-those rows' manifests on every append — and
+them (issue #584 phase 2). A windowed hive store is **in** scope, and
 `output.icechunk` defaults ON there as it does for an unwindowed hive
-store.
+store:
+
+- the run's init allocates one row per window label its dispatch units
+  carry, plus the reserved `all` row when the store maintains the
+  cross-window fold (`pyramid.overview.all_time`);
+- each window leaf's refs land at its window's row. A leaf unit that names
+  **no** window label is refused: `all` is the fold's own row, it IS
+  allocated whenever the fold is maintained, so nothing downstream would
+  catch a base ref written over it;
+- the ladder's node units plan one overview object per row **this run
+  writes** (`{window}.zarr` per window unit beneath the node, and
+  `all.zarr` when the node closes), never per row the repo holds — which
+  would re-plan and re-commit every window ever allocated, rewriting those
+  rows' manifests on every append.
 
 Raster hive products (`(time, cells)` arrays, never sharded — one row per
 acquisition, in append order) remain out of the writer's scope: the knob

@@ -72,6 +72,7 @@ from zagg.icechunk_rows import (
     splits_follow_block,
     store_rows,
     stored_rows_per_manifest,
+    unit_row,
     write_bounds,
 )
 
@@ -1218,9 +1219,12 @@ def record_leaf(
     reason}`` for a leaf with no chunk objects. Raises on failure — the
     caller is fail-open. ``repo`` is a handle :func:`vet_leaf_repo` already
     returned (the worker seam vets before it plans); ``None`` opens and vets
-    here, still BEFORE the plan. ``window`` is the leaf's window label, used
-    only when ``units`` is ``None`` (the caller's units already name their
-    row); a windowed leaf is indexed as of issue #584 phase 2.
+    here, still BEFORE the plan. ``window`` is the leaf's window label (or
+    the dispatcher's unit dict), used only when ``units`` is ``None`` (the
+    caller's units already name their row); a windowed leaf is indexed as of
+    issue #584 phase 2, and on a windowed store a unit naming no label is
+    refused rather than written to the reserved ``all`` row
+    (:func:`~zagg.icechunk_rows.unit_row`).
     """
     from zagg.grids.morton import morton_decimal
 
@@ -1228,18 +1232,20 @@ def record_leaf(
     if repo is None:
         repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs)
     if units is None:
-        # ``window`` is the dispatcher's unit dict, or just its label.
-        label = window if isinstance(window, str) else (window or {}).get("label")
-        label = str(label) if label else None
+        # ``window`` is the dispatcher's unit dict, or just its label. The
+        # store is windowed when its repo holds a row other than ``all``:
+        # an unwindowed store's init allocates that one row and no other
+        # (:func:`~zagg.icechunk_rows.store_rows`).
+        rows = (_session_block(repo.readonly_session(BRANCH)) or {}).get("rows") or [ALL_ROW]
+        row = unit_row(window, windowed=list(rows) != [ALL_ROW])
         plan = leaf_ref_plan(
             grid,
             shard_key,
             store_root,
             store_kwargs=store_kwargs,
             version=version,
-            window=label,
+            window=None if row == ALL_ROW else row,
         )
-        row = ALL_ROW if label is None else label
         units = [{"level": int(grid.child_order), "row": row, "entries": plan}]
     if not any(entry["refs"] for unit in units for entry in unit["entries"]):
         return {"skipped": "empty"}

@@ -624,6 +624,69 @@ _WINDOW_GRANULES = (
 )
 
 
+class TestAMissingWindowLabelIsRefused:
+    """Issue #584 review: ``all`` is the fold's row, never a default."""
+
+    def test_unit_row_reads_a_label_a_unit_dict_or_nothing(self):
+        for window in ("2019", {"label": "2019"}, {"label": "2019", "start": 0, "end": 1}):
+            assert icechunk_rows.unit_row(window, windowed=True) == "2019"
+        # An unwindowed leaf names no window and takes the one ``all`` row.
+        assert icechunk_rows.unit_row(None, windowed=False) == "all"
+        assert icechunk_rows.unit_row({}, windowed=False) == "all"
+
+    def test_a_windowed_unit_that_lost_its_label_raises(self):
+        for window in (None, {}, {"label": None}, {"label": ""}, ""):
+            with pytest.raises(ValueError, match="names no window label"):
+                icechunk_rows.unit_row(window, windowed=True)
+
+    def test_a_payload_of_another_shape_raises_rather_than_falling_through(self):
+        for window in (2019, ["2019"], object()):
+            for windowed in (True, False):
+                with pytest.raises(ValueError, match="is not a window label"):
+                    icechunk_rows.unit_row(window, windowed=windowed)
+
+    def test_record_leaf_refuses_it_against_a_windowed_repo(self, monkeypatch, cfg, tmp_path):
+        # The row is read off the repo: an unwindowed store's init allocates
+        # ``all`` and no other row, so a repo holding more is windowed.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        _init(root, grid, cfg, manifest, ["2019", "all"])
+        cfg.output["windowing"] = _YEARLY
+        window = {"label": "2019", "start": _Y[2019], "end": _Y[2020]}
+        meta = _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id="2019", window=window)
+        out = icechunk_refs.record_leaf(
+            root, grid, shard, store_kwargs={}, window=window, version=meta["leaf_version"]
+        )
+        assert out["refs"] > 0
+        with pytest.raises(ValueError, match="names no window label"):
+            icechunk_refs.record_leaf(root, grid, shard, store_kwargs={}, window={"label": None})
+
+    def test_the_worker_seam_fails_open_with_the_reserved_row_named(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        _init(root, grid, cfg, manifest, ["2019", "all"])
+        cfg.output["windowing"] = _YEARLY
+        cfg.output["icechunk"] = {"commit": "leaf"}
+        window = {"label": "2019", "start": _Y[2019], "end": _Y[2020]}
+        _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id="2019", window=window)
+        leaf = hive.shard_leaf_path(root, shard, window="2019")
+        out = hive._leaf_icechunk_refs(
+            root,
+            grid,
+            cfg,
+            shard,
+            leaf,
+            column=None,
+            window={"label": None},
+            sidecar_spec=manifest["spec"],
+            store_kwargs={},
+        )
+        # Fail-open at the leaf (D9), but named — not a silent write to ``all``.
+        assert "names no window label" in out["error"]
+
+
 class TestTheLadderWalksAWindowedStore:
     """Issue #584 phase 2: a windowed store's nodes gather and commit per row."""
 

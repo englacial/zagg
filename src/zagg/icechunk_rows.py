@@ -178,6 +178,42 @@ def store_rows(temporal: dict | None, rows: Iterable[str] | None) -> list[str]:
     return labels
 
 
+def unit_row(window, *, windowed: bool) -> str:
+    """The repo row one LEAF unit's refs land in (§11.2): its window label, or ``all``.
+
+    ``window`` is the dispatcher's unit payload — the unit dict
+    (``{"label", …}``), its label alone, or ``None`` for an unwindowed
+    leaf. The derivation lives here and not in each caller so the worker
+    seam and the per-leaf commit cannot drift.
+
+    On a WINDOWED store ``all`` is not a neutral default: §11.2 reserves it
+    for the cross-window fold maintained at the overview levels, so a unit
+    that names no label is REFUSED rather than written over it. Nothing
+    downstream would catch that — ``all`` IS an allocated row whenever
+    ``pyramid.overview.all_time`` is on — and it would surface much later
+    as an all-time overview disagreeing with the k-way merge of its
+    windows. A payload of some other shape is refused here too, instead of
+    raising ``AttributeError`` inside a ``.get`` (issue #584 review).
+    """
+    if window is None or isinstance(window, str):
+        label = window
+    elif isinstance(window, Mapping):
+        label = window.get("label")
+    else:
+        raise ValueError(
+            f"window {window!r} ({type(window).__name__}) is not a window label, a "
+            f"dispatcher unit dict or None (spec §11.2)"
+        )
+    label = str(label) if label else None
+    if label is None and windowed:
+        raise ValueError(
+            f"a leaf unit of a windowed store names no window label (window={window!r}): "
+            f"its refs would land on the reserved {ALL_ROW!r} row, which is the "
+            f"cross-window fold's own (spec §11.2, issue #584)"
+        )
+    return ALL_ROW if label is None else label
+
+
 def row_bounds(label: str, temporal: dict | None) -> tuple[int, int] | None:
     """One row's ``[start, end)`` in the manifest's epoch/scale/units, or ``None``.
 
@@ -509,5 +545,6 @@ __all__ = [
     "splits_follow_block",
     "store_rows",
     "stored_rows_per_manifest",
+    "unit_row",
     "write_bounds",
 ]
