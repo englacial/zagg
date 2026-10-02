@@ -84,21 +84,26 @@ def _composable_fields(manifest: dict) -> dict:
     }
 
 
-def _node_object_rel(node: str) -> str:
-    """An above-shard ladder artifact's relative zarr root (``all.zarr``)."""
+def _node_object_rel(node: str, window: str | None = None) -> str:
+    """An above-shard ladder artifact's relative zarr root (§4.2).
+
+    ``all.zarr`` — an unwindowed store's one overview, and a windowed store's
+    all-time fold — or ``{window}.zarr`` for one window's.
+    """
     from zagg.sweep import _node_rel
+    from zagg.windows import leaf_name_v3
 
-    return f"{_node_rel(node)}/all.zarr"
+    return f"{_node_rel(node)}/{leaf_name_v3(window)}"
 
 
-def _column_object_rel(decimal: str) -> str:
-    """A leaf's column artifact root (§4.6): ``{node prefix}/all.pyramid.zarr``."""
+def _column_object_rel(decimal: str, window: str | None = None) -> str:
+    """A leaf's column artifact root (§4.6): ``{node prefix}/{window or all}.pyramid.zarr``."""
     from zagg.column import column_name
     from zagg.grids.morton import morton_word
     from zagg.hive import shard_leaf_path
 
     leaf_rel = shard_leaf_path("", morton_word(decimal)).lstrip("/")
-    return f"{leaf_rel.rsplit('/', 1)[0]}/{column_name(None)}"
+    return f"{leaf_rel.rsplit('/', 1)[0]}/{column_name(window)}"
 
 
 def _leaf_roster(store_root, manifest, store_kwargs, mode) -> tuple[list[str], str]:
@@ -275,9 +280,16 @@ def _digest_mismatch(stored: np.ndarray, ref: np.ndarray) -> str | None:
 
 
 class _Harness:
-    """One validation pass's shared context: store handles + group cache."""
+    """One validation pass's shared context: store handles + group cache.
 
-    def __init__(self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells):
+    ``window`` binds the pass to one window of a windowed store (issue #586):
+    every leaf, column and overview it opens is then that window's.
+    """
+
+    def __init__(
+        self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells, window=None
+    ):
+        self.window = window
         self.store_root = str(store_root).rstrip("/")
         self.manifest = manifest
         self.store_kwargs = dict(store_kwargs)
@@ -325,11 +337,11 @@ class _Harness:
         return self._groups[key]
 
     def node_group(self, node: str, t: int):
-        return self._open(_node_object_rel(node), t)
+        return self._open(_node_object_rel(node, self.window), t)
 
     def column_group(self, decimal: str, r: int):
         """A leaf column's resolution group (§4.6) — the ``/2`` gen-1 tier."""
-        return self._open(_column_object_rel(decimal), r)
+        return self._open(_column_object_rel(decimal, self.window), r)
 
     def leaf_group(self, decimal: str):
         """A leaf's cell-order group, resolved through its root stamp (spec §1.5).
@@ -342,7 +354,7 @@ class _Harness:
             from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
             from zagg.store import open_store
 
-            rel = shard_leaf_path("", morton_word(decimal)).lstrip("/")
+            rel = shard_leaf_path("", morton_word(decimal), window=self.window).lstrip("/")
             root = f"{self.store_root}/{rel}"
             stamp = read_commit(open_store(root, read_only=True, **self.store_kwargs))
             self._leaf_rels[decimal] = leaf_data_path(rel, stamp)

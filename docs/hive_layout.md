@@ -754,6 +754,73 @@ overviews out under a bucket lifecycle rule: the per-unit lifecycle touch
 covers leaf footprints, not ancestor artifacts (the PR #397 finding — this
 is the recorded posture, not an oversight; re-sweeping is the refresh).
 
+### Checking a swept store (`python -m zagg.pyramid_check`)
+
+The acceptance check for a swept pyramid
+([issue #434](https://github.com/englacial/zagg/issues/434)) is read-only and
+runs from any machine that can read the store:
+
+```bash
+python -m zagg.pyramid_check s3://bucket/product.zarr            # your credentials
+python -m zagg.pyramid_check s3://public-bucket/product.zarr --anon
+```
+
+It prints one line per check and exits nonzero on any `FAIL`. It derives
+what it expects from the leaves, the artifacts' own recorded attrs and the
+geometry — never by calling the fold it is checking — and it samples: the
+value checks read `--sample-nodes` nodes per ladder order and
+`--sample-cells` cells per node (`--full`, for a local fixture-scale store
+only, reads everything and can re-run the sweep to prove it a no-op).
+
+On an **unwindowed** store the checks are `declaration` (the manifest
+grammar), `coordinates` (leaf cell words against the located fields),
+`materialization` (a committed `all.zarr` at every declared ladder node),
+`columns` (a committed leaf column per leaf), `readback` (the attrs each
+artifact records, held to specification §4.4/§4.6), and `counts` / `digests`
+/ `composition` (each sampled cell re-folded from the leaf columns, and each
+column from its leaf).
+
+A **windowed** store ([issue #586](https://github.com/englacial/zagg/issues/586))
+is one ladder per window, so the same checks run per window over that
+window's objects, and every finding names the node and the window
+(`-511[2019]`, `window 2019: …`):
+
+- `materialization` — a committed `{window}.zarr` at every ladder node that
+  has a leaf of that window beneath it; `columns` — a committed
+  `{window}.pyramid.zarr` beside every `(leaf, window)`.
+- `readback` — each artifact's `window` key must be the window it is filed
+  under (checked on every artifact, not a sample), plus the per-window
+  regime, `merges_from_raw` and `source_children` of §4.4.
+- `counts` / `digests` / `composition` — a window's overview re-folded from
+  **that window's** leaf columns, and its columns from **that window's**
+  leaves, for `--sample-windows` windows (default 3). An overview built
+  from another window's leaves fails here.
+- `all_time` — where the manifest declares `pyramid.overview.all_time`: a
+  committed `all.zarr` at every ladder node, and for the sampled nodes its
+  values against the k-way fold of the node's own `{window}.zarr` overviews,
+  `regime: stage-merge`, `merges_from_raw` 2 at a gather level and 3 at a
+  merge level, `source_windows` equal to the windows the node holds, and
+  `source_children` / `generation` equal to those overviews' blocks summed.
+  A fold that consumed fewer windows than the node now holds is reported
+  `STALE`. Where the store declares no all-time fold the check is reported
+  `SKIP — not applicable`, never left out.
+
+**What it reads on a windowed store.** The leaf roster from the run records
+(one LIST of the root and its `stats_*.parquet` objects; `--roster list`
+walks the store instead, `--roster moc` takes the shards from the root
+`coverage.moc` and one LIST per shard for its windows); one `zarr.json` GET
+per declared `(node, window)` overview, per `(leaf, window)` column and per
+all-time node — the unwindowed bound times the window count; then array
+reads for the sampled windows × nodes × cells, and, per sampled all-time
+node, one LIST of the node's prefix and the sampled cells of each of its
+windows' overviews. Nothing is written.
+
+**Not checked, and said so.** The staged sweep's stage columns above the
+shard (orchestration, not contract — specification §4.6) on either kind of
+store; a windowed `zagg-pyramid/1` store (a legacy `orders` schedule, or a
+raster store), whose `declaration` fails naming that; and whatever the
+report lists under "check(s) declined — NOT validated".
+
 ## The commit stamp
 
 S3 has no empty directories and LIST is strongly consistent, so **absence is

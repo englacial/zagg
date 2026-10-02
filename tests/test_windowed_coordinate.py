@@ -517,10 +517,13 @@ class TestPyramidCheck:
         assert entry["status"] == "pass", entry
         assert entry["detail"].startswith(f"{n_words} location word(s) in 4 cell(s) of 1 leaf(s)")
         assert "0 stored coordinate(s) agree" in entry["detail"]
-        assert report["roster"] == {"source": "run records", "leaves": 1}
-        # The rest of the harness is unwindowed-only, as before.
-        assert report["checks"]["declaration"]["status"] == "fail"
-        assert report["checks"]["materialization"]["detail"] == "windowed store"
+        assert report["roster"] == {"source": "run records", "leaves": 1, "windows": 1}
+        # The fixture is one committed leaf and its column, never swept: the
+        # windowed arm (tests/test_pyramid_check_windowed.py) reads it as the
+        # pre-sweep baseline, exactly as it reads an unwindowed unswept store.
+        checks = report["checks"]
+        assert (checks["declaration"]["status"], checks["columns"]["status"]) == ("pass", "pass")
+        assert "pre-sweep baseline" in checks["materialization"]["detail"]
 
     def test_a_misplaced_location_word_fails_by_name(self, tmp_path):
         from zagg.pyramid_check import format_report, validate_pyramid
