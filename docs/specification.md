@@ -4019,7 +4019,9 @@ the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
 group; a session that fails is discarded and nothing lands. (Neither
 operation below allocates a row — the init does, §11.4 **Row allocation** —
 so for them the allowance is the invariant: a group `declare-pyramid` adds
-is built at the repo's rows.) moczarr's
+is built at the repo's rows — those the operation's own session reads, so an
+init allocating rows after the operation first read the block does not
+refuse it.) moczarr's
 validator (issue #582 phase 6) runs in addition when it lands; the check
 above is zagg's own. An operation
 that would write nothing commits nothing. The two operations:

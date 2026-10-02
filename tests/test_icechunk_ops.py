@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 
 import pytest
@@ -418,6 +419,46 @@ class TestDeclarePyramid:
         relisted = declare()
         assert relisted["added"] == ["1", "2", "3", "4", "5"] and relisted["snapshot"]
         assert all(rows_of(order) == {3} for order in ("1", "2", "3", "4", "5", "6"))
+
+    @pytest.mark.parametrize("relist", [False, True])
+    def test_an_init_landing_after_the_vet_is_built_at_its_rows(
+        self, monkeypatch, cfg, tmp_path, relist
+    ):
+        # An init that allocates rows between the vet and the operation's
+        # session: the new (or relisted) groups are built and checked at the
+        # rows the session reads, so the declaration lands (§11.2, §11.4).
+        from test_icechunk_rows import _YEARLY
+
+        cfg.output["pyramid"] = False
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        bare = hive.build_manifest(grid, windowing=_YEARLY)
+        icechunk_refs.init_repo(
+            root, grid, cfg, run_id=RUN, store_kwargs={}, manifest=bare, rows=["2019"]
+        )
+        cfg.output.pop("pyramid")
+        full = hive.build_manifest(grid, windowing=_YEARLY)
+        if relist:
+            icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=full, grid=grid)
+            icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=bare, grid=grid)
+        vet = icechunk_ops.open_vetted
+        run2 = copy.deepcopy(cfg)
+        run2.output["pyramid"] = False
+
+        def init_lands(*a, **k):
+            out = vet(*a, **k)
+            icechunk_refs.init_repo(
+                root, grid, run2, run_id="r2", store_kwargs={}, manifest=bare, rows=["2020"]
+            )
+            return out
+
+        monkeypatch.setattr(icechunk_ops, "open_vetted", init_lands)
+        r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=full, grid=grid)
+        assert r["added"] == ["1", "2", "3", "4", "5"] and r["snapshot"]
+        group, _repo = _open(root)
+        assert group.attrs[ICECHUNK_ATTR]["rows"] == ["2019", "2020"]
+        for order in ("1", "2", "3", "4", "5", "6"):
+            assert {arr.shape[0] for _name, arr in group[order].arrays()} == {2}
 
     def test_a_delisted_level_keeps_its_split_through_a_ratchet_and_relisting(
         self, monkeypatch, cfg, tmp_path

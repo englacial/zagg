@@ -130,6 +130,9 @@ def _operation(
         repo, block = open_vetted(store_root, store_kwargs=store_kwargs)
     path = repo_path(store_root)
     session = repo.writable_session(BRANCH)
+    # An init may have allocated rows since the vet: ``mutate`` and the check
+    # work from the rows this session reads (§11.2).
+    block = {**block, "rows": list(_session_block(session)["rows"])}
     before = _array_model(session)
     details = mutate(session, block)
     report = {"operation": name, "path": path, "snapshot": None, "message": None, **details}
@@ -239,23 +242,28 @@ def declare_pyramid(
     retired = {**(block.get("retired") or {}), **{o: recorded[o] for o in dropped}}
     retired = {o: lvl for o, lvl in retired.items() if o not in levels}
 
-    def mutate(session, _block):
+    def mutate(session, session_block):
         import zarr
 
+        # Built at the rows the session reads: an init may have grown them since the vet.
+        members = spec.members
+        if session_block["rows"] != block["rows"]:
+            rows = session_block["rows"]
+            members = repo_group_spec(grid, store_root, options, manifest, rows).members
         root = zarr.open_group(session.store, mode="r+")
         present = {name for name, _ in root.members()}
         for order in added:
             if order in present:
                 # Delisted earlier and declared again: its group is still there,
                 # and must still carry the declared model.
-                if not _group_matches(session, order, spec.members[order]):
+                if not _group_matches(session, order, members[order]):
                     raise ValueError(
                         f"level /{order} exists with another array model than the manifest "
                         f"declares: an array-model change is a new revision, not an operation"
                     )
                 continue
             with vlen_dtype_warning_suppressed():
-                spec.members[order].to_zarr(session.store, order, overwrite=False)
+                members[order].to_zarr(session.store, order, overwrite=False)
         attrs = root.attrs.asdict()
         new_block = {**attrs[ICECHUNK_ATTR], "levels": levels, "retired": retired}
         if not retired:
