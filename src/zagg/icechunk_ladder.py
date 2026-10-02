@@ -452,6 +452,26 @@ def _child_units(
         yield child_units, 0
 
 
+def node_rows(block: dict, rows) -> list[str]:
+    """The rows a node may write this run: ``rows``, less any the repo lacks (§11.2).
+
+    The run's own rows, never the block's whole list: an unwindowed store
+    has the one ``all`` row, a windowed node the labels of its window units
+    plus ``all`` when it closes (:func:`zagg.sweep_units.node_rows`). A row
+    the init did not allocate is dropped with a warning rather than taken to
+    ``commit_units``, which raises and would cost the node its whole gather.
+    """
+    have = list(block.get("rows") or [ALL_ROW])
+    wanted = list(dict.fromkeys(rows or [ALL_ROW]))
+    unknown = [row for row in wanted if row not in have]
+    if unknown:
+        logger.warning(
+            f"icechunk: rows {unknown} are not allocated in the repo (rows {have}) — "
+            f"this run's init did not name them; their refs are skipped (spec §11.2)"
+        )
+    return [row for row in wanted if row in have]
+
+
 def stage_node_refs(
     store_root: str,
     node: str,
@@ -465,16 +485,23 @@ def stage_node_refs(
     spec: str | None,
     store_kwargs: dict,
     counts: dict,
+    rows=None,
 ) -> dict:
     """One stage node's share of the ladder; the counters it adds to ``counts``.
 
     ``stage`` is the tuple (``dispatch``, ``orders``, ``child_order``) the
     node was dispatched under; ``block`` the repo's vetted block
-    (:func:`ladder_context`). Fail-open at the call site: raises propagate to
-    the hook, which counts ``icechunk_failed`` and moves on (D9).
+    (:func:`ladder_context`). ``rows`` are the row labels THIS RUN writes
+    under the node (:func:`zagg.sweep_units.node_rows`); ``None`` is the
+    unwindowed single ``all`` row. The repo's own ``rows`` list is the whole
+    store's history, so planning against it would HEAD every window ever
+    allocated and re-commit the untouched ones at their rows — the append
+    cost the row cut exists to remove (review finding). Fail-open at the
+    call site: raises propagate to the hook, which counts
+    ``icechunk_failed`` and moves on (D9).
     """
     dispatch, child_order = int(stage["dispatch"]), int(stage["child_order"])
-    rows = list(block.get("rows") or [ALL_ROW])
+    rows = node_rows(block, rows)
     commit_order, split_order = int(block["commit_order"]), int(block["split_order"])
     level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
     # Against the REPO'S groups, not the manifest's declaration alone: the
@@ -573,11 +600,13 @@ def stage_hook(
     store_kwargs,
     counts,
     dirty=True,
+    rows=None,
 ):
     """The few-line seam ``sweep_stages.sweep_stage_pass`` calls per node — fail-open.
 
-    ``dirty`` is whether any leaf under ``node`` was written this run. A
-    clean node is skipped whole: its refs were committed by the run that
+    ``rows`` are the row labels this node writes this run (§11.2,
+    :func:`zagg.sweep_units.node_rows`). ``dirty`` is whether any leaf under
+    ``node`` was written this run. A clean node is skipped whole: its refs were committed by the run that
     dirtied it, and the gather is O(subtree) — running it for every node on
     every pass makes an append cost O(store), which is the amplification the
     ladder exists to avoid (review finding). The ladder therefore runs over
@@ -602,6 +631,7 @@ def stage_hook(
             spec=manifest.get("spec"),
             store_kwargs=store_kwargs,
             counts=counts,
+            rows=rows,
         )
     except Exception as e:
         logger.warning(f"icechunk ladder failed at node {node} (fail-open, issue #580): {e}")
@@ -643,6 +673,7 @@ __all__ = [
     "ladder_context",
     "leaf_refs_key",
     "node_row",
+    "node_rows",
     "pack_units",
     "read_leaf_refs",
     "read_node_refs",

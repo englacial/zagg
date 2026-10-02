@@ -4460,7 +4460,10 @@ columns do:
    children's **node ref columns** (the same carrier at
    `{node}/icechunk_refs.json`) above — and adds the refs of the overview
    objects at every order of its tuple beneath it (read the same way a
-   leaf's are). A missing carrier is counted (`icechunk_missing`) and
+   leaf's are). What it reads and plans is scoped to the rows THIS RUN
+   writes under the node — the window labels dirty beneath it plus `all`
+   when it closes — so an append costs the new rows, not the store's
+   history. A missing carrier is counted (`icechunk_missing`) and
    tolerated — under-coverage, never a failure — and a carrier whose
    recorded geometry disagrees with the repo's block is refused.
 3. **One tuple commits.** Let `c` be `commit_order`, `d` a tuple's dispatch
@@ -4960,7 +4963,10 @@ run's init allocates one row per window label its dispatch units carry
 (plus the reserved `all` row when the store maintains the cross-window
 fold, `pyramid.overview.all_time`), each window leaf's refs land at its
 window's row, the ladder's node units plan one overview object per row
-(`{node}_{window}.zarr`, and `all.zarr` for the fold), and
+**this run writes** (`{window}.zarr` per window unit beneath the node, and
+`all.zarr` when the node closes) — never per row the repo holds, which
+would re-plan and re-commit every window ever allocated and so rewrite
+those rows' manifests on every append — and
 `output.icechunk` defaults ON there as it does for an unwindowed hive
 store.
 

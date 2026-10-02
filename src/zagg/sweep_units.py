@@ -77,6 +77,35 @@ def closes_nodes(*, windowed: bool, all_time: bool) -> bool:
     return bool(windowed and all_time)
 
 
+def node_rows(node: str, by_shard: dict, dirt_only: dict | None, *, windowed: bool, close: bool):
+    """The companion repo's rows one stage node writes THIS RUN (spec §11.2).
+
+    The ladder plans and commits per row, so it must be told the run's rows
+    and not read the repo's whole list: an append would otherwise re-plan
+    and re-commit every window the store ever allocated (issue #584 review).
+    An unwindowed store has the one ``all`` row. A windowed node's rows are
+    the window labels dirty beneath it — the written set (``by_shard``) and
+    the refs-only set (``dirt_only``, issue #580) alike, since the hook runs
+    for a regathered node too — plus ``all`` when the node closes, which is
+    the cross-window fold's own row at the overview levels.
+    """
+    from zagg.icechunk_rows import ALL_ROW
+
+    if not windowed:
+        return [ALL_ROW]
+    labels = sorted(
+        {
+            window
+            for source in (by_shard, dirt_only or {})
+            for decimal, windows in source.items()
+            if decimal.startswith(node)
+            for window in windows
+            if window is not None and window != ALL_ROW
+        }
+    )
+    return [*labels, *([ALL_ROW] if close else [])]
+
+
 def manifest_closes(manifest: dict) -> bool:
     """:func:`closes_nodes` as the store's manifest declares it — the source of truth.
 
@@ -577,6 +606,9 @@ def run_tuple(
                 node,
                 stage,
                 dirty=dirty or regather,
+                rows=node_rows(
+                    node, by_shard, dirt_only, windowed=windowed, close=bool(unit["close"])
+                ),
                 manifest=manifest,
                 levels=context["levels"],
                 fields=context["fields"],

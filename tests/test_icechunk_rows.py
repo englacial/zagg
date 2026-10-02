@@ -660,9 +660,7 @@ class TestTheLadderWalksAWindowedStore:
             (rank,) = grid.block_index(shard)
             span = slice(rank * 16, (rank + 1) * 16)
             for row, label in enumerate(("2019", "2020")):
-                path, _stamp = hive.resolve_leaf(
-                    hive.shard_leaf_path(root, shard, window=label)
-                )
+                path, _stamp = hive.resolve_leaf(hive.shard_leaf_path(root, shard, window=label))
                 leaf = zarr.open_group(path, mode="r")["6"]
                 assert leaf["count"][:].any(), "the window leaf wrote nothing to index"
                 np.testing.assert_array_equal(group["6"]["count"][row, span], leaf["count"][:])
@@ -676,6 +674,66 @@ class TestTheLadderWalksAWindowedStore:
             leaf = next(part for part in location.split("/") if part.endswith(".zarr"))
             by_row.setdefault(row, set()).add(leaf.rpartition("_")[2])
         assert by_row == {0: {"2019.zarr"}, 1: {"2020.zarr"}}
+
+    def test_a_node_plans_the_rows_the_run_writes_not_the_repos_whole_list(self):
+        from zagg import sweep_units
+
+        by_shard = {"11111": {"2021"}, "11112": {"2021", "2022"}}
+        dirt = {"11113": {"2019"}}  # refs-only: its row still has to be planned
+        # An unwindowed store is the one ``all`` row whatever the units say.
+        assert sweep_units.node_rows("1111", by_shard, dirt, windowed=False, close=False) == ["all"]
+        assert sweep_units.node_rows("1111", by_shard, dirt, windowed=True, close=False) == [
+            "2019",
+            "2021",
+            "2022",
+        ]
+        # The close is the cross-window fold, written at the ``all`` row.
+        assert sweep_units.node_rows("1111", by_shard, None, windowed=True, close=True) == [
+            "2021",
+            "2022",
+            "all",
+        ]
+        # A node with no dirty leaf beneath it plans only what it closes.
+        assert sweep_units.node_rows("1112", by_shard, None, windowed=True, close=True) == ["all"]
+        assert sweep_units.node_rows("1112", by_shard, None, windowed=True, close=False) == []
+
+    def test_an_appended_window_replans_no_earlier_rows_objects(self, monkeypatch, cfg, tmp_path):
+        # The harm the run's rows avoid: planning the repo's whole row list
+        # HEADs every window the store ever allocated, per node per level,
+        # and re-commits the untouched ones at their rows — rewriting those
+        # rows' manifests, the opposite of the cut's point (issue #584 review).
+        from test_icechunk_refs import _ladder_run
+
+        from zagg import icechunk_ladder
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        run = dict(
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+        )
+        _grid_, root, _summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, windows=_WINDOW_GRANULES[:1], **run
+        )
+        planned: list = []
+        real = icechunk_ladder.object_ref_plan
+
+        def spy(grid, object_rel, rank, store_root, **kw):
+            planned.append(object_rel)
+            return real(grid, object_rel, rank, store_root, **kw)
+
+        monkeypatch.setattr(icechunk_ladder, "object_ref_plan", spy)
+        append = (("2020", "2020-03-01T00:00:00Z", "2020-03-02T00:00:00Z"),)
+        _grid_, _root, summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, windows=append, root=root, **run
+        )
+        assert summary["cells_error"] == 0
+        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == ["2019", "all", "2020"]
+        # The append planned its own window's overviews and the all-time
+        # fold it rewrote — never 2019's, whose refs stand as committed.
+        assert planned, "the ladder planned nothing"
+        assert not [rel for rel in planned if rel.endswith("/2019.zarr")], sorted(set(planned))
 
 
 class TestRevisionOneIsRefused:
