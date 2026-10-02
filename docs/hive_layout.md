@@ -807,14 +807,17 @@ window's objects, and every finding names the node and the window
   `source_children` / `generation` equal to those overviews' blocks summed.
   A fold that consumed fewer windows than the node now holds is reported
   `STALE`. Where the store declares no all-time fold the check is reported
-  `SKIP — not applicable`, never left out.
+  `SKIP — not applicable`, never left out; the same nodes are still probed,
+  and a committed `all.zarr` found anyway (debris of an earlier declaration —
+  the `pyramid` block is not frozen) is named under "NOT validated".
 
 **What it reads on a windowed store.** The leaf roster from the run records
 (one LIST of the root and its `stats_*.parquet` objects; `--roster list`
 walks the store instead, `--roster moc` takes the shards from the root
 `coverage.moc` and one LIST per shard for its windows); one `zarr.json` GET
 per declared `(node, window)` overview, per `(leaf, window)` column and per
-all-time node — the unwindowed bound times the window count; then array
+ladder node for its `all.zarr` (declared or not) — the unwindowed bound times
+the window count; then array
 reads for the sampled windows × nodes × cells, and, per sampled all-time
 node, one LIST of the node's prefix and the sampled cells of each of its
 windows' overviews. Nothing is written.

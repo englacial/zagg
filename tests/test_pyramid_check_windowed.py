@@ -198,7 +198,7 @@ class TestACorrectStore:
         assert report["windows"] == ["2018", "2019"]
 
     def test_without_the_declaration_the_all_time_check_is_not_applicable(
-        self, tmp_path, monkeypatch
+        self, built, tmp_path, monkeypatch
     ):
         root = tmp_path / "store"
         _run(monkeypatch, tmp_path, root, first_run=False, all_time=False)
@@ -206,8 +206,20 @@ class TestACorrectStore:
         assert report["passed"], format_report(report)
         entry = report["checks"]["all_time"]
         assert entry["status"] == "skip" and entry["detail"].startswith("not applicable")
+        assert entry["detail"].endswith("9 ladder node(s) probed for all.zarr, none found")
         assert "[SKIP] all_time" in format_report(report)
         assert "all-time fold not declared" in report["checks"]["declaration"]["detail"]
+        # An all-time fold the manifest does not declare (an earlier
+        # declaration's debris) is probed for and named, not vouched for.
+        shutil.copytree(built[0] / _rel("-5", "all.zarr"), root / _rel("-5", "all.zarr"))
+        report = validate_pyramid(str(root), full=True)
+        assert report["passed"], format_report(report)
+        entry = report["checks"]["all_time"]
+        assert entry["status"] == "skip" and "1 carry an undeclared one" in entry["detail"]
+        assert any(
+            "carry a committed all.zarr the manifest does not declare: ['-5']" in w
+            for w in report["warnings"]
+        )
 
 
 class TestDamage:

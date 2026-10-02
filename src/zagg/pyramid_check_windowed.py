@@ -26,7 +26,9 @@ unwindowed counterpart, and the harness holds it to what spec §4.2–§4.6 stat
   windows actually there; ``source_children`` and ``generation`` equal to
   the consumed overviews' own blocks, summed. A fold that consumed fewer
   windows than the node now holds is STALE and fails by name. Undeclared, the
-  check is reported ``skip`` — *not applicable* — never left out.
+  check is reported ``skip`` — *not applicable* — never left out, and a
+  committed ``all.zarr`` found at a ladder node anyway is named as not
+  validated (debris of an earlier declaration: the block is not frozen).
 
 Nothing here calls the fold it checks: expectations come from the leaves
 (the roster, the columns), from the per-window artifacts' own recorded
@@ -35,12 +37,12 @@ attrs, and from the geometry.
 **What it reads.** The leaf roster — the run records at the store root
 (one LIST, the ``stats_*.parquet`` objects), or ``--roster list`` / ``moc``;
 one ``zarr.json`` GET per declared ``(node, window)`` overview, per ``(leaf,
-window)`` column and per all-time node (the same per-artifact bound as the
-unwindowed arm, times the window count); then array reads for
-``sample_windows`` windows × ``sample_nodes`` nodes per order ×
-``sample_cells`` cells, and for ``sample_nodes`` all-time nodes per order one
-delimiter LIST of the node's prefix plus the same cells of each of its
-windows' overviews. Read-only throughout.
+window)`` column and per ladder node's ``all.zarr``, declared or not (the
+same per-artifact bound as the unwindowed arm, times the window count);
+then array reads for ``sample_windows`` windows × ``sample_nodes`` nodes
+per order × ``sample_cells`` cells, and for ``sample_nodes`` all-time nodes
+per order one delimiter LIST of the node's prefix plus the same cells of
+each of its windows' overviews. Read-only throughout.
 
 **Not applicable, and said so.** The staged sweep's stage columns
 (``{window}.pyramid.zarr`` above the shard) are orchestration, never contract
@@ -578,17 +580,10 @@ def _all_time_check(
     carry a committed ``all.zarr`` (one GET each); ``sample_nodes`` of them
     per order (all in full mode) are then held to the fold's contract — see
     :func:`_all_time_node`. Undeclared, there is nothing to hold: reported
-    *not applicable*.
+    *not applicable*, after the same probe, naming any committed fold found.
     """
     from zagg.store import open_object_store
 
-    if not all_time:
-        checks["all_time"] = _entry(
-            "skip",
-            "not applicable — the manifest declares no pyramid.overview.all_time, so no node "
-            "carries an all-time fold (§4.5); nothing was probed",
-        )
-        return
     orders = {k: sorted({n for w in declared for n in declared[w][k]}) for k, _ in ladder}
     probed, errored = _probe_nodes(
         harness.store_root, [n for k in orders for n in orders[k]], harness.store_kwargs
@@ -601,6 +596,24 @@ def _all_time_check(
         )
         return
     committed = {n: attrs for n, attrs in probed.items() if _committed(attrs)}
+    if not all_time:
+        # The pyramid block is not frozen (§4.5): a store re-declared without
+        # the fold keeps the old all.zarr objects as regenerable-cache debris
+        # (§4.1) — legal, and not validated, so named rather than failed.
+        stray = sorted(committed)
+        if stray:
+            harness.warn(
+                f"{len(stray)} ladder node(s) carry a committed all.zarr the manifest does not "
+                f"declare: {stray[:8]} — undeclared, NOT validated (debris of an earlier "
+                f"declaration, §4.1/§4.5)"
+            )
+        checks["all_time"] = _entry(
+            "skip",
+            f"not applicable — the manifest declares no pyramid.overview.all_time (§4.5); "
+            f"{len(probed)} ladder node(s) probed for all.zarr, "
+            + (f"{len(stray)} carry an undeclared one (see warnings)" if stray else "none found"),
+        )
+        return
     missing = sorted(set(probed) - set(committed))
     report["all_time_nodes"] = {
         "declared": len(probed),
