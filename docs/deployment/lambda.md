@@ -887,7 +887,11 @@ shards that reported and runs **no tail**; past the drop deadline the rest
 never report, attach cannot finish that run, and its warning says to
 re-dispatch.
 
-**3. Finish a `sweep: "stages"` run by hand, in this order.**
+**3. Finish a `sweep: "stages"` run by hand, in this order** — only once the
+run's own `stats_<ts>_<run_id>.parquet` is at the store root (the tail writes
+it, step 2). Without it the sweep cannot find the run's leaves, yet still
+succeeds over other runs' leaves, and `finalize` accepts any completed sweep
+since the run's init: it would tag a ladder without them. Re-dispatch instead.
 
 ```
 python -m zagg.sweep s3://bucket/store.zarr --stages
@@ -903,8 +907,8 @@ this run's. On success it prints its summary: a `finisher` block with
 `lease_released: true` and `record`, the `sweep_stats_<ts>_stages.json` it
 wrote.
 
-- `No completed leaves found in the store's run records` — no run record
-  names a completed leaf: do step 2 first.
+- `No completed leaves found in the store's run records` — no run record,
+  this run's included, names a completed leaf: there is nothing to fold.
 - `SweepRefusedError: a sweep already holds this store: run '…'` — the dead
   launcher's sweep (or a live one) holds the lease. Wait out the `ttl` the
   message quotes and run it again; the new sweep claims the expired lease.
