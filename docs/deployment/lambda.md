@@ -837,14 +837,15 @@ prefix is a staged sweep's own). In it:
 
 At the store root, a `sweep_stats_<ts>_stages.json` newer than the run with a
 `finisher` block and neither `error` nor `barrier_timed_out` is a completed
-staged sweep. In the repo (`<store>/icechunk`), `init <run_id>` opens each run
-on `main`, and a finished run has its tag:
+staged sweep. In the repo (`<store>/icechunk`), `init <run_id>` (or `split
+ratchet … <run_id>`, when its init re-cuts the split) opens each run on
+`main`, and a finished run has its tag:
 
 ```python
 from zagg.icechunk_refs import open_repo
 
 repo = open_repo("s3://bucket/store.zarr", store_kwargs={"region": "us-west-2"})
-sorted(repo.list_tags())                                  # run-<run_id>, one per finalized run
+sorted(repo.list_tags())       # run-<run_id>; retain_runs > 0 deletes the older ones
 [s.message for s in repo.ancestry(branch="main")][:10]    # newest first
 ```
 
