@@ -1609,7 +1609,9 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   python -m zagg.icechunk_ops <store_root> declare-pyramid config.yaml     # levels + multiscales follow the manifest's declaration
   ```
 
-  Before the commit the array model of every array must be unchanged and
+  Before the commit the array model of every array must be unchanged — but
+  for row growth: labels appended to `rows`, every array holding that many
+  rows — and
   the block's compatibility keys must hold, else the session is discarded.
   `set-attrs` refuses the root's `zagg_icechunk` and `multiscales` keys;
   `declare-pyramid` adds a newly declared level's group (and its manifest

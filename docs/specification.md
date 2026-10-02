@@ -4010,9 +4010,16 @@ An operation's commit message names it, its commit metadata carries
 reads as a log — and it touches no leaf. Before the commit the session is
 **validated**: the array model of every array (shape, dtype, chunk grid,
 codecs, fill value — everything but attrs) MUST be identical before and
-after, the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
+after **except for row growth** — the block's `rows` may gain labels at its
+end (never lose or reorder one, §11.2), and then every array with the
+`window` dimension MUST hold exactly that many rows, its cell extent and
+everything else unchanged; rows grow for the whole repo or not at all —
+the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
 `url_prefix` MUST hold, and every level the block lists MUST have its
-group; a session that fails is discarded and nothing lands. moczarr's
+group; a session that fails is discarded and nothing lands. (Neither
+operation below allocates a row — the init does, §11.4 **Row allocation** —
+so for them the allowance is the invariant: a group `declare-pyramid` adds
+is built at the repo's rows.) moczarr's
 validator (issue #582 phase 6) runs in addition when it lands; the check
 above is zagg's own. An operation
 that would write nothing commits nothing. The two operations:

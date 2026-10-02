@@ -7,7 +7,8 @@ repo**, never by rewriting leaves. Each operation here is one such commit:
 a message naming the operation, commit metadata ``{"operation",
 "zagg_version", …}`` so history reads as a log, a **validation pass before
 the commit** (the array model — shape, dtype, chunks, codecs, fill of every
-array — must be byte-identical before and after, the ``zagg_icechunk``
+array — must be identical before and after but for row growth: rows
+appended, to every array at once; the ``zagg_icechunk``
 compatibility keys must hold, every listed level must have its group; a
 mutation that fails is discarded, nothing lands), and no leaf touched.
 
@@ -55,6 +56,8 @@ from zagg.icechunk_refs import (
     repo_group_spec,
     repo_path,
 )
+from zagg.icechunk_rows import array_model as _array_model
+from zagg.icechunk_rows import check_array_model
 
 logger = logging.getLogger(__name__)
 
@@ -69,24 +72,14 @@ def _node_path(path: str) -> str:
     return path.strip().strip("/")
 
 
-def _array_model(session) -> dict[str, dict]:
-    """``{array path: metadata minus attrs}`` for every array in the session."""
-    import zarr
-
-    root = zarr.open_group(session.store, mode="r")
-    model = {}
-    for path, node in root.members(max_depth=None):
-        if isinstance(node, zarr.Array):
-            meta = node.metadata.to_dict()
-            meta.pop("attributes", None)
-            model[path] = meta
-    return model
-
-
 def _validate(
     session, before: dict[str, dict], allow_new: tuple[str, ...], block: dict, path: str
 ) -> None:
     """The pre-commit check; raises ``ValueError`` and the caller discards the session.
+
+    The array model may move by ROW GROWTH and nothing else
+    (:func:`zagg.icechunk_rows.check_array_model`): labels appended to the
+    block's ``rows``, every array holding exactly that many rows.
 
     It runs on the session as mutated, not after a rebase: ``_commit`` rebases
     with ``ConflictDetector``, which refuses any conflicting change, so a
@@ -94,19 +87,11 @@ def _validate(
     """
     import zarr
 
-    after = _array_model(session)
-    for array, meta in before.items():
-        if array not in after:
-            raise ValueError(f"operation would remove array {array!r}")
-        if after[array] != meta:
-            raise ValueError(f"operation would change the array model of {array!r} (spec §11.2)")
-    for array in after:
-        if array not in before and not array.startswith(allow_new):
-            raise ValueError(f"operation would add array {array!r}")
     root = zarr.open_group(session.store, mode="r")
     got = root.attrs.get(ICECHUNK_ATTR)
     if not isinstance(got, dict):
         raise ValueError(f"operation would remove the root {ICECHUNK_ATTR!r} block")
+    check_array_model(before, _array_model(session), block["rows"], got.get("rows"), allow_new)
     # ``cell_order`` apart: in ``_check_block`` it would also vet the level
     # keying and blame the repo for what is this operation's refusal.
     _check_block(got, {k: block.get(k) for k in _FIXED_BLOCK_KEYS if k != "cell_order"}, path)

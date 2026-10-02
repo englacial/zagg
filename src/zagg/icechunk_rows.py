@@ -17,7 +17,9 @@ what is the same for every level:
 - **the re-rooted array** (:func:`reroot`) — a leaf array's spec on the whole
   sphere under the row dimension;
 - **allocation** (:func:`grow_rows`) — the once-per-run init grows every
-  array by the run's new labels inside its ``init {run_id}`` commit.
+  array by the run's new labels inside its ``init {run_id}`` commit;
+- **the array-model identity check** (:func:`check_array_model`) — what a
+  §11.4 operation may move of the model: rows, appended, and nothing else.
 
 Workers never open the repo to learn a row index: a ref unit names its row
 by LABEL and the committing session resolves it (``icechunk_refs.commit_units``).
@@ -25,7 +27,7 @@ by LABEL and the committing session resolves it (``icechunk_refs.commit_units``)
 
 from __future__ import annotations
 
-from typing import Any, Iterable, cast
+from typing import Any, Iterable, Mapping, cast
 
 import numpy as np
 
@@ -305,6 +307,69 @@ def commit_rows(
                 raise
 
 
+# ── the array-model identity check ──────────────────────────────────────────
+
+
+def array_model(session) -> dict[str, dict]:
+    """``{array path: metadata minus attrs}`` for every array in the session."""
+    import zarr
+
+    root = zarr.open_group(session.store, mode="r")
+    model = {}
+    for path, node in root.members(max_depth=None):
+        if isinstance(node, zarr.Array):
+            meta = node.metadata.to_dict()
+            meta.pop("attributes", None)
+            model[path] = meta
+    return model
+
+
+def _has_rows(meta: Mapping) -> bool:
+    return (meta.get("dimension_names") or (None,))[0] == ROW_DIM
+
+
+def _rows_grew(before: Mapping, after: Mapping) -> bool:
+    """Whether ``after`` is ``before`` with a longer row extent and nothing else moved."""
+    old, new = tuple(before["shape"]), tuple(after["shape"])
+    if not _has_rows(before) or new[0] < old[0] or new[1:] != old[1:]:
+        return False
+    return {**after, "shape": None} == {**before, "shape": None}
+
+
+def check_array_model(
+    before: dict[str, dict],
+    after: dict[str, dict],
+    rows_before: Iterable[str],
+    rows_after: Iterable[str] | None,
+    allow_new: tuple[str, ...] = (),
+) -> None:
+    """Raise unless the array model moved by row growth and nothing else (spec §11.4).
+
+    The one thing an existing array's model may do is gain rows: its leading
+    ``window`` extent may grow — never shrink — and nothing else of its
+    metadata (the cell extent, dtype, chunk grid, codecs, fill value,
+    dimension names) may differ. Rows grow for the whole repo or not at all:
+    the block's ``rows`` may only gain labels at its END (the row law,
+    §11.2), and every array with the row dimension must hold exactly that
+    many rows. No array may disappear; a new one must sit under an
+    ``allow_new`` path prefix.
+    """
+    for array, meta in before.items():
+        if array not in after:
+            raise ValueError(f"operation would remove array {array!r}")
+        if after[array] != meta and not _rows_grew(meta, after[array]):
+            raise ValueError(f"operation would change the array model of {array!r} (spec §11.2)")
+    for array in after:
+        if array not in before and not array.startswith(allow_new):
+            raise ValueError(f"operation would add array {array!r}")
+    old, new = list(rows_before), list(rows_after or [])
+    if new[: len(old)] != old:
+        raise ValueError(f"operation would reorder or drop rows: {old} -> {new} (spec §11.2)")
+    off = sorted(a for a, m in after.items() if _has_rows(m) and m["shape"][0] != len(new))
+    if off:
+        raise ValueError(f"operation would leave {off} off the block's {len(new)} rows (§11.2)")
+
+
 __all__ = [
     "ALL_ROW",
     "ROW_ALLOC_TRIES",
@@ -315,7 +380,9 @@ __all__ = [
     "ROW_FILL",
     "ROW_SPLIT",
     "ROW_START",
+    "array_model",
     "cell_axis_split",
+    "check_array_model",
     "check_revision",
     "commit_rows",
     "coordinate_specs",
