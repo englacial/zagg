@@ -134,9 +134,19 @@ def _run_local(monkeypatch, tmp_path, cfg, root=None):
         seen["stage"] = list(leaves)
         return real_stage(store, leaves, **kw)
 
+    real_cover = hive.write_root_coverage
+
+    def cover(store, envelope, **kw):
+        # The dispatcher's own write: the families sweep rewrites the root
+        # after it (``source: "sweep"``), so the final object cannot tell.
+        if envelope.get("source") == "dispatcher":
+            seen.setdefault("coverage", []).append(_cover(envelope))
+        return real_cover(store, envelope, **kw)
+
     with monkeypatch.context() as patch:
         patch.setattr(sweep_mod, "sweep_after_run", sweep)
         patch.setattr(stages_mod, "stage_sweep_after_run", stage)
+        patch.setattr(hive, "write_root_coverage", cover)
         summary = runner.agg(cfg, catalog=catalog_path, store=str(root), backend="local")
     return root, shard, summary, seen
 
@@ -193,6 +203,7 @@ def _run_fleet(monkeypatch, tmp_path, cfg, invocation, root=None):
         )
     families = [e for e in stub.modes("sweep") if "stage" not in e]
     seen["sweep"] = [tuple(leaf) for e in families for leaf in e["leaves"]]
+    seen["coverage"] = [_cover(e["coverage"]) for e in stub.modes("coverage")]
     return root, shard, summary, seen, stub
 
 
@@ -206,9 +217,13 @@ def _artifacts(root):
     return sorted(out)
 
 
+def _cover(env):
+    return {k: env.get(k) for k in ("order", "ranges", "time_range")}
+
+
 def _coverage(root):
     env = hive.read_root_coverage(str(root))
-    return None if env is None else {k: env.get(k) for k in ("order", "ranges", "time_range")}
+    return None if env is None else _cover(env)
 
 
 def _rows(summary):
@@ -260,18 +275,22 @@ class TestBackendsAgree:
                 500,
             )
 
-        # The sweep work set: the landed windows, on both backends, in the
-        # families sweep and the staged one alike; the failed window in none.
-        assert local_seen == fleet_seen == {"sweep": landed, "stage": landed}
-
         # Root coverage: the shard is covered through its landed windows, and
-        # the union stops where they do.
+        # the union stops where they do — in the dispatcher's own write (the
+        # local PUT, the fleet's ``mode: "coverage"`` event) and on disk.
         expected = {
             "order": 6,
             "ranges": [[morton_decimal(shard)] * 2],
             "time_range": LANDED_RANGE,
         }
         assert _coverage(local_root) == _coverage(fleet_root) == expected
+
+        # The tail's inputs on both backends: the landed windows, in the
+        # families sweep and the staged one alike, and the dispatcher's
+        # coverage above; the failed window in none.
+        assert (
+            local_seen == fleet_seen == {"sweep": landed, "stage": landed, "coverage": [expected]}
+        )
 
         # The run parquet: one row per leaf on both, the failed one unsuccessful.
         assert _rows(local) == _rows(fleet) == [("2018", True), ("2019", True), ("2020", False)]
@@ -324,7 +343,12 @@ class TestBackendsAgree:
         # The gate skipped the landed windows; only the failed one is redone,
         # swept, and unioned into the root summary.
         assert (second["cells_current"], second["cells_error"]) == (2, 0)
-        assert seen == {"sweep": [(shard, FAILED)], "stage": [(shard, FAILED)]}
+        assert (seen["sweep"], seen["stage"]) == ([(shard, FAILED)], [(shard, FAILED)])
+        # The dispatcher covers the shard through the redone window alone (a
+        # current window carries no range); the root union keeps the rest.
+        (cover,) = seen["coverage"]
+        assert cover["ranges"] == [[morton_decimal(shard)] * 2]
+        assert cover["time_range"] == ["2020-01-01T00:00:00+00:00", FULL_RANGE[1]]
         assert _coverage(root)["time_range"] == FULL_RANGE
         assert [len(_overviews(root, w)) for w in ("2018", "2019", "2020", "all")] == [6, 6, 6, 6]
         block = dict(_artifact(root, "-5/all.zarr").attrs)["zagg_overview"]
