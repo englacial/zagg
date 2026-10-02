@@ -548,7 +548,10 @@ stage workers with the dispatcher invoking and polling and never writing
 (issue #519) — which is the only way to build the ladder on a store whose
 bucket policy names the fleet execution role as the write identity. The wire
 grammar, the sequencing and the permissions are in
-[`docs/deployment/lambda.md`](deployment/lambda.md#staged-sweep).
+[`docs/deployment/lambda.md`](deployment/lambda.md#staged-sweep). When the
+process that launched a run dies before or during its chained sweep, the
+operator's steps are in
+[Recovering a run whose launcher died](deployment/lambda.md#recovering-a-run).
 
 **Cadence.** Ladder orders are grouped into dispatch tuples of
 `tuple_width` consecutive orders (default 3: `[8,7,6] → [5,4,3] → [2,1,0]`
@@ -1645,7 +1648,9 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   back as a refusal with its reason;
   a deployed worker older than this operation fails on the missing `config`
   before any write — deploy a current worker. A local store root finalizes
-  in-process.
+  in-process. The step-by-step recovery around this command — finding the
+  run, `Run.attach`, the hand sweep, then `finalize` — is the operator
+  runbook, [Recovering a run whose launcher died](deployment/lambda.md#recovering-a-run).
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M

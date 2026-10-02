@@ -630,15 +630,16 @@ intent, not an open store.
 ### Running it
 
 Opt in with `output.sweep: "stages"` — the same knob the spatial local
-dispatcher reads — and the **spatial** Lambda tail (`runner._run_lambda`)
-chains the fleet sweep after the rollup-families leg, auto-scoped to the run's
-own footprint.
+dispatcher reads — and both **spatial** Lambda tails chain the fleet sweep
+after the rollup-families leg, auto-scoped to the run's own footprint:
+`runner._run_lambda` (`python -m zagg` / `agg`) and the `client` facade's
+`Run.dispatch` (issue #588, either transport), through the one seam
+`runner._invoke_lambda_stage_sweep`.
 
-!!! warning "Only the spatial Lambda tail chains it"
+!!! warning "Only the spatial Lambda tails chain it"
     `output.sweep: "stages"` validates on any hive config, and every tail
     reads it as truthy and runs the rollup-families sweep — but only the
-    spatial Lambda tail goes on to dispatch the staged one. The other two
-    unwired tails are not the same case:
+    spatial Lambda tails go on to dispatch the staged one. Two tails do not:
 
     * **raster** (`data_source.reader: raster`) does not chain, and is right
       not to. A raster store is column-less by construction — there are no
@@ -646,12 +647,11 @@ own footprint.
       `zagg-pyramid/2` ladder at all, and a stage worker handed one would
       refuse it at the `/2` declaration gate (`zagg.sweep_stage.ladder_entries`)
       rather than build anything. Nothing is missing from such a store.
-    * the v2 **`Run.dispatch`** tail is the real gap: a column-bearing `/2`
-      store dispatched through it accepts the knob, runs the families sweep
-      and silently builds no ladder, with no warning at the seam. The
-      operator's evidence is an absent ladder hours later. Follow such a run
-      with an explicit `run_stage_sweep_fleet` call (below) or a
-      `python -m zagg.sweep <root> --stages` pass.
+    * a session **reattached** with `Run.attach` runs the families sweep when
+      it runs the tail, and never the staged one: attach is observe-only, and
+      the staged sweep (with its lease) is the launching dispatcher's. A run
+      whose launcher died before or during the staged sweep is finished by
+      hand — see [Recovering a run whose launcher died](#recovering-a-run).
 
 Ad hoc, drive `zagg.sweep_fleet.run_stage_sweep_fleet` with a boto3 Lambda
 client:
@@ -802,6 +802,143 @@ prior ladder and heals on the next pass that does include it.
     implementing branch. The `stage` arm ships in the function zip like any
     other handler change — there is no template, layer, or IAM change to
     stage first.
+
+## Recovering a run whose launcher died {#recovering-a-run}
+
+The process that launches a run — `python -m zagg`, or a notebook's
+`Run.dispatch` — also finishes it. Workers write every byte, but the launcher
+holds the order: it fans the shards out and, once the last one settles (after
+the idempotent store-manifest backstop and the root `coverage.moc`), fires:
+
+| End-of-run step | What lands | If the launcher dies before it |
+|---|---|---|
+| 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
+| 2. rollup sweep | the rollup families (one fire-and-forget invoke) | nothing lost: `python -m zagg.sweep <store>` regenerates them |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits; last, the finisher writes `sweep_stats_<ts>_stages.json` at the store root and releases the lease | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
+
+Shards the launcher had not dispatched yet never run. Work through the steps
+below from a host in the store's region: they read status objects and, for the
+hand sweep, the leaf columns.
+
+**1. Find the run and where it stopped.** A Lambda-dispatched run has a
+prefix *beside* the store, `<store>.status/run-<run_id>/` (a `run-stage-…`
+prefix is a staged sweep's own). In it:
+
+- `manifest.json` — the dispatch manifest: `run_id`, `dispatched_at`, the
+  config the run shipped, and its shard list (`shards: null` plus
+  `shards_omitted` on a large run: a *slim* manifest). Pick the run by
+  `dispatched_at`. No manifest at all means the setup write was lost or the
+  block did not fit its event (the launcher's summary said
+  `dispatch_manifest: "dropped"`): neither `Run.attach` nor `finalize` can
+  serve that run — go to step 4.
+- `shard-<key>.json` — one per shard that reported (`status`: `ok`,
+  `no_data` or `failed`); `tail.json` — the run-record step completed.
+
+At the store root, a `sweep_stats_<ts>_stages.json` newer than the run with a
+`finisher` block and neither `error` nor `barrier_timed_out` is a completed
+staged sweep. In the repo (`<store>/icechunk`), `init <run_id>` opens each run
+on `main`, and a finished run has its tag:
+
+```python
+from zagg.icechunk_refs import open_repo
+
+repo = open_repo("s3://bucket/store.zarr", store_kwargs={"region": "us-west-2"})
+sorted(repo.list_tags())                                  # run-<run_id>, one per finalized run
+[s.message for s in repo.ancestry(branch="main")][:10]    # newest first
+```
+
+**2. Reattach.**
+
+```python
+from zagg.client import Run
+
+handle = Run.attach("s3://bucket/store.zarr", "<run_id>")  # the store root as dispatched
+handle.wait()                    # every shard settled, plus whatever tail attach ran
+handle.status()                  # {"pending": 0, "ok": n, "failed": n}
+handle.icechunk_finalize         # the tag record, {"skipped": ...}, {"error": ...} or None
+handle.dispatch_manifest, handle.unreported_shards        # "full" | "slim", and a count
+```
+
+Attach rebuilds the handle from the manifest and the status objects, for
+unwindowed spatial runs (a windowed run raises). It only observes shards: it
+never re-dispatches one. A `failed` status, or no status by the drop deadline
+— the function timeout plus 150 s after the manifest's `dispatched_at` —
+resolves as a failure, so wait one function timeout after the launcher died
+before attaching, or a shard still running can be recorded as failed. Shards
+that failed or never ran need a new dispatch (`Run.dispatch(shard_keys=…)`).
+
+With no `tail.json`, the attached session runs the tail itself, through worker
+invokes: the store-manifest backstop, the root `coverage.moc`, the run record
+and the rollup sweep. It **never** runs the staged sweep, and for a `sweep:
+"stages"` run it never tags (`handle.icechunk_finalize` is `{"skipped": …}`);
+only a run pinned `commit: "leaf"` with no staged sweep is tagged by attach,
+and only while it is the repo's newest run. With `tail.json` present, attach
+does that finalize and nothing else.
+
+A slim manifest names no shards, so attach takes them from the status objects.
+While `handle.unreported_shards` is non-zero the handle is a snapshot of the
+shards that reported and runs **no tail**; past the drop deadline the rest
+never report, attach cannot finish that run, and its warning says to
+re-dispatch.
+
+**3. Finish a `sweep: "stages"` run by hand, in this order.**
+
+```
+python -m zagg.sweep s3://bucket/store.zarr --stages
+python -m zagg.icechunk_ops s3://bucket/store.zarr finalize <run_id>
+```
+
+*The sweep* runs in the calling process and writes the store from it, so it
+needs the store's write credentials and a host in the store's region. Where
+the operator cannot write the store (a Source Cooperative–published one),
+drive the fleet form instead — `run_stage_sweep_fleet`, under
+[Running it](#running-it). It covers every leaf the run records name, not only
+this run's. On success it prints its summary: a `finisher` block with
+`lease_released: true` and `record`, the `sweep_stats_<ts>_stages.json` it
+wrote.
+
+- `No completed leaves found in the store's run records` — no run record
+  names a completed leaf: do step 2 first.
+- `SweepRefusedError: a sweep already holds this store: run '…'` — the dead
+  launcher's sweep (or a live one) holds the lease. Wait out the `ttl` the
+  message quotes and run it again; the new sweep claims the expired lease.
+- A sweep that fails midway leaves a record carrying `error` and the lease
+  held: wait out the TTL and run it again.
+
+*The finalize* on an `s3://` store is one synchronous Lambda invoke; this host
+reads nothing from the store and writes nothing, and needs only invoke rights.
+The function is `--function-name`, else `ZAGG_LAMBDA_FUNCTION_NAME`, else
+`process-shard`, and the deployed worker must be at least as new as this
+operation: an older one fails on the event's missing `config` before any
+write, and the command reports a worker that `predates the operator
+finalize` — deploy a current worker. On success it prints the worker's
+report: `tagged: true`, the `tag`, its `snapshot`, the `stage_record` that
+vouched for the ladder and the `function_name` invoked.
+`tagged: false` comes with `skipped`: either the tag `already exists`, or `a
+later run has committed since` — it only ever tags the repo's **newest** run.
+A refusal raises and writes nothing:
+
+- `no staged-sweep record … since run …'s init commit`, or `… does not show a
+  completed sweep` — run the sweep above (again), then finalize.
+- `no dispatch manifest with a config` — wrong store or run id, or the
+  manifest was lost or dropped: this run cannot be tagged here (step 4).
+- `no init commit for run …` — the run never initialized this repo, or a
+  later run's retention squashed its commits: nothing to tag.
+- `may not have finalized` (a `RuntimeError`) — the invoke failed or its
+  response was lost, so the outcome is unknown: run it again, an existing tag
+  is reported and nothing is rewritten.
+
+**4. Or do nothing.** An untagged run's commits stay on `main`, and the next
+run's tag covers them; no step above is needed for the repo to stay correct.
+What waits is the ladder — and, for a ladder-committed run, the repo's refs —
+over leaves no sweep has reached: a later run's chained sweep is scoped to its
+own footprint, so those leaves are folded by the next sweep that includes
+them. The unscoped `--stages` pass above does.
+
+The reference for each piece: the [staged sweep](../hive_layout.md#the-staged-sweep-issue-384),
+the [Icechunk repo and `finalize`](../hive_layout.md#the-icechunk-companion-repo),
+and specification §11.4.
 
 ## Cost Estimate
 
