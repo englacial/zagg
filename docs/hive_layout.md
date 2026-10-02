@@ -533,7 +533,11 @@ python -m zagg.sweep s3://bucket/store --stages --partitions 16
 
 or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
 chained immediately after a fleet run with the opt-in `output.sweep:
-"stages"` (auto-scoped to the run's own footprint). Work is discovered from
+"stages"` (auto-scoped to the run's own footprint) — from `python -m zagg`
+and from the `client` facade's `Run.dispatch` alike ([issue
+#588](https://github.com/englacial/zagg/issues/588); the facade's post-run
+tail chains it after the run record and the rollup sweep, and the summary
+rides the handle as `handle.stage_sweep`). Work is discovered from
 the **run records** (listing-based; the root `coverage.moc` is an
 accelerator for sibling candidates, never the source of truth — a fleet
 append with no subsequent sweep leaves it stale, and discovery still finds
@@ -544,7 +548,10 @@ stage workers with the dispatcher invoking and polling and never writing
 (issue #519) — which is the only way to build the ladder on a store whose
 bucket policy names the fleet execution role as the write identity. The wire
 grammar, the sequencing and the permissions are in
-[`docs/deployment/lambda.md`](deployment/lambda.md#staged-sweep).
+[`docs/deployment/lambda.md`](deployment/lambda.md#staged-sweep). When the
+process that launched a run dies before or during its chained sweep, the
+operator's steps are in
+[Recovering a run whose launcher died](deployment/lambda.md#recovering-a-run).
 
 **Cadence.** Ladder orders are grouped into dispatch tuples of
 `tuple_width` consecutive orders (default 3: `[8,7,6] → [5,4,3] → [2,1,0]`
@@ -1654,7 +1661,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   virtual chunk container and the `multiscales` mirror, **allocates the
   run's rows** (the event's `rows`, `["all"]` for an unwindowed run: each new
   label grows every array by one row, in order of first appearance) and commits
-  `init {run_id}` (every run — empty when neither the block nor the rows change, so the
+  `init {run_id}` (every run — empty when neither the block nor the rows change,
+  labelled `split ratchet {from}->{to} {run_id}` when it re-cuts, so the
   ancestry brackets each run). Idempotent — a rerun reopens; a repo built for another
   geometry, container or spec revision is refused, while `split_order` follows the ratchet
   below and `commit` / `commit_order` are per-run, never compared. The record (`path`, `snapshot`, `created`, `options`,
@@ -1698,8 +1706,10 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   `icechunk_rebases` off the stage records.
 - **`mode: "icechunk_finalize"`** ([issue #582](https://github.com/englacial/zagg/issues/582),
   spec §11.4), one synchronous invoke AFTER every commit of the run landed —
-  after the staged sweep returned under the ladder, after the fan-out under
-  `commit: "leaf"` (the local backend calls
+  after the staged sweep returned under the ladder (on both Lambda
+  dispatchers, the CLI and the `client` facade: a sweep that did not
+  complete leaves the run untagged, `icechunk_finalize: {skipped}`), after
+  the fan-out under `commit: "leaf"` (the local backend calls
   `zagg.icechunk_finalize.finalize_repo` in-process at the same point): applies
   the `retain_runs` retention below, makes one content-free `finalize
   {run_id}` commit whose metadata names the run (`run_id`, `semantic_hash`,
@@ -1710,10 +1720,15 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   here. The record rides the run summary under `icechunk_finalize`; the tag
   is the durable outcome (`repo.lookup_tag("run-…")`, `ancestry(tag=…)`).
   `Run.attach` fires it too, off the config's knob and only for a pinned
-  `commit: "leaf"` run (a ladder run's is its dispatcher's), with
+  `commit: "leaf"` run with no `sweep: "stages"` (a `sweep: "stages"`
+  run's is its dispatcher's, after the staged sweep), with
   `newest_only: true` (written only while the run is the newest on the repo,
   else `{skipped}`) and `icechunk_init: null`, so `rewrite_pending` is
-  always null there.
+  always null there. The operator's `finalize` (below) fires it with
+  `operator_checks: true` and **no `config`**: the worker reads the run's
+  dispatch manifest for the config and runs the operator's checks before a
+  `newest_only` finalize, answering a failed check with `{ok: false,
+  refused: <reason>}`.
 - **Operations** (spec §11.4 **Operations**, issue #582) — the operator's
   way to change what the repo is authoritative for, one validated commit
   each, no leaf touched, the commit metadata naming the operation:
@@ -1721,6 +1736,7 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   ```
   python -m zagg.icechunk_ops <store_root> set-attrs /19 '{"dggs": {...}}'   # root "/", a level "/{cells}", an array "/{cells}/{array}"; null deletes a key
   python -m zagg.icechunk_ops <store_root> declare-pyramid config.yaml     # levels + multiscales follow the manifest's declaration
+  python -m zagg.icechunk_ops <store_root> finalize <run_id> [--function-name <fn>]   # tag a completed-but-untagged ladder run (the repo's newest run only); an s3:// store is finalized by the worker
   ```
 
   Before the commit the array model of every array must be unchanged — but
@@ -1732,6 +1748,47 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   split), delists a no-longer-declared one without deleting its group, and
   refuses a geometry change (that is a new spec revision). The manifest
   retrofit runs `declare-pyramid` itself ([above](#retrofitting-the-pyramid-declaration)).
+  `finalize` ([issue #588](https://github.com/englacial/zagg/issues/588))
+  is the repair for a ladder run whose dispatcher died after the staged
+  sweep completed but before its finalize (`icechunk_finalize: {skipped}`
+  on the CLI summary / `handle.icechunk_finalize` on the facade, or no
+  record at all): it reads the run's dispatch manifest for its config
+  (`retain_runs`, the semantic hash — no `--retain-runs`; a large hive
+  run's manifest is **slim** — its block did not fit the setup event, so
+  it rode without the shard list, `shards: null` plus `shards_omitted` —
+  and still carries the config, so the run is finalizable; only a run
+  whose manifest write was lost, or whose block did not fit even slim, is
+  refused and left to the next run's tag — the run summary's
+  `dispatch_manifest` / `handle.dispatch_manifest` says which went out:
+  `full`, `slim` or `dropped`), refuses unless
+  the newest `sweep_stats_*_stages.json` since the run's init commit
+  (the repo's clock) shows a completed sweep, and tags `newest_only` — an
+  older untagged run stays covered by the next run's tag. The record is
+  tied to the run by time only, so with overlapping runs on one store a
+  sibling run's sweep record can vouch for it. No `--force`: an incomplete sweep is
+  completed with `python -m zagg.sweep <store> --stages` first.
+  **Where it runs.** On an `s3://` store all of that is the worker's: the
+  command fires one synchronous `mode: "icechunk_finalize"` invoke —
+  `{mode, store_path, run_id, newest_only: true, operator_checks: true}`,
+  no config — and prints the worker's report, so the manifest and record
+  reads, the commit, the tag and the retention run under the execution role
+  in the store's region. The operator's host reads nothing from the store
+  and writes nothing: it needs Lambda invoke rights only (on a Source
+  Cooperative store the worker role is the only writer), and nothing leaves
+  the region but the report. The function is `--function-name`, else
+  `ZAGG_LAMBDA_FUNCTION_NAME`, else `process-shard`, an empty value counting
+  as unset — the dispatchers' own default for a config with no `worker:`
+  block, though they take an empty value verbatim (the run config's `worker:`
+  suffix is never applied, since the only copy of that config the command
+  could consult is the run's dispatch manifest, and it does not read the
+  store). The report names the function invoked as `function_name`; the
+  command never finalizes from the host. A check that does not hold comes
+  back as a refusal with its reason;
+  a deployed worker older than this operation fails on the missing `config`
+  before any write — deploy a current worker. A local store root finalizes
+  in-process. The step-by-step recovery around this command — finding the
+  run, `Run.attach`, the hand sweep, then `finalize` — is the operator
+  runbook, [Recovering a run whose launcher died](deployment/lambda.md#recovering-a-run).
 
 **Why the ladder, and the scale settings.** Per-leaf commits do not scale:
 at the full-globe worst case (3,145,728 order-9 leaves) they are 3.1M
@@ -1763,7 +1820,8 @@ warning; a coarser value re-cuts new manifests from this run on and flags
 the run parquet's `icechunk_split_ratchet` for a later `rewrite_manifests`
 pass over the old ones. `tuple_width` is unchanged (3). An unset `commit`
 resolves to `ladder` only when the run walks it — the dispatcher chains the
-staged sweep (`output.sweep: "stages"`; the `client` facade never does) and
+staged sweep (`output.sweep: "stages"`, on every dispatcher: the CLI, the
+local backend and the `client` facade, issue #588) and
 the store declares a `/2` ladder with at least one composable field
 (`zagg.icechunk_refs.ladder_walks`) — and to `leaf` otherwise, so no run
 writes sidecars nothing gathers. The Lambda dispatchers ship the resolved
