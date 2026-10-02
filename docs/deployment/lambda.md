@@ -867,7 +867,11 @@ never re-dispatches one. A `failed` status, or no status by the drop deadline
 — the function timeout plus 150 s after the manifest's `dispatched_at` —
 resolves as a failure, so wait that long after the launcher died before
 attaching, or a shard still running can be recorded as failed. Shards
-that failed or never ran need a new dispatch (`Run.dispatch(shard_keys=…)`).
+that failed or never ran need a new dispatch: `Run.dispatch(shard_keys=…)` on
+a `Run.from_config(...)` built from the run's config and shard map (the
+handle carries no granules). That is a new run with its own `init` commit,
+after which `finalize` of the old run is always skipped (the new run's tag
+covers it), so finalize the old run first if you want it tagged.
 
 With no `tail.json`, the attached session runs the tail itself, through worker
 invokes: the store-manifest backstop, the root `coverage.moc`, the run record
