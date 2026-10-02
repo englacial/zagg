@@ -335,31 +335,43 @@ def _overview_grid(k: int, r: int, fields: dict):
     return HealpixGrid(int(k), int(r), config=_overview_config(fields), sharded=True)
 
 
-def _overview_units(store_root, node, orders, level_by_order, fields, candidates, store_kwargs):
-    """Ref entries of every overview object under ``node`` at the tuple's orders."""
+def _overview_units(
+    store_root, node, orders, level_by_order, fields, candidates, store_kwargs, rows=(ALL_ROW,)
+):
+    """Ref entries of every overview object under ``node`` at the tuple's orders.
+
+    One unit per (level, ROW): a windowed store's node carries one overview
+    object per window (``{node}_{window}.zarr``, D23) plus ``all.zarr`` for
+    the cross-window fold, and each lands at its own row (§11.2, issue #584
+    phase 2). ``rows`` is the repo's row list, so an unwindowed store asks
+    for ``all.zarr`` alone and plans exactly what it did before. A row whose
+    object this node has not written contributes no entry
+    (:func:`~zagg.icechunk_refs.object_ref_plan` skips a missing object) and
+    so no unit.
+    """
     from zagg.grids.morton import morton_word
     from zagg.sweep_overview import _node_at, _overview_basename
-    from zagg.windows import SCHEDULE_NONE_TOKEN
 
-    basename = _overview_basename(SCHEDULE_NONE_TOKEN)
     units = []
     for k in orders:
         grid = _overview_grid(k, level_by_order[k], fields)
-        entries: list = []
-        for target in sorted({_node_at(d, k) for d in candidates if d.startswith(node)}):
-            (rank,) = grid.block_index(morton_word(target))
-            entries.extend(
-                object_ref_plan(
-                    grid,
-                    f"{_node_rel(target)}/{basename}",
-                    rank,
-                    store_root,
-                    store_kwargs=store_kwargs,
+        targets = sorted({_node_at(d, k) for d in candidates if d.startswith(node)})
+        ranks = {target: grid.block_index(morton_word(target))[0] for target in targets}
+        for row in rows:
+            basename = _overview_basename(row)
+            entries: list = []
+            for target in targets:
+                entries.extend(
+                    object_ref_plan(
+                        grid,
+                        f"{_node_rel(target)}/{basename}",
+                        ranks[target],
+                        store_root,
+                        store_kwargs=store_kwargs,
+                    )
                 )
-            )
-        if entries:
-            # ``all.zarr`` is the all-time fold: the ``all`` row (§11.2).
-            units.append({"level": int(level_by_order[k]), "row": ALL_ROW, "entries": entries})
+            if entries:
+                units.append({"level": int(level_by_order[k]), "row": row, "entries": entries})
     return units
 
 
@@ -457,7 +469,14 @@ def stage_node_refs(
         orders = [k for k in orders if level_by_order[k] in have]
     per_leaf = block.get("commit") == "leaf"
     own = _overview_units(
-        store_root, node, orders, level_by_order, fields, candidates, store_kwargs
+        store_root,
+        node,
+        orders,
+        level_by_order,
+        fields,
+        candidates,
+        store_kwargs,
+        rows=block.get("rows") or (ALL_ROW,),
     )
     # Which of the three roles this tuple plays (module docstring, §11.4).
     commits_all = dispatch <= commit_order < child_order and not per_leaf

@@ -4947,14 +4947,20 @@ having precisely because all refs of one leaf array carry the **same**
 
 Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
 across windows, which is what the `/2` row dimension is for: each window is
-a row (§11.2), so the array model holds them. The **writer** does not index
-them yet: it records no refs for a windowed leaf (the sidecar says
-`skipped: windowed`), the ladder does not run on a windowed store, and
-`output.icechunk` resolves off there (an explicit `true` is refused), so no
-windowed store has a repo. Raster hive products (`(time, cells)` arrays,
-never sharded — one row per acquisition, in append order) are likewise out
-of the writer's scope. Both are tracked on issue
-[#584](https://github.com/englacial/zagg/issues/584) (its phases 2 and 4);
+a row (§11.2), so the array model holds them — and the writer now indexes
+them (issue #584 phase 2). A windowed hive store is **in** scope: the
+run's init allocates one row per window label its dispatch units carry
+(plus the reserved `all` row when the store maintains the cross-window
+fold, `pyramid.overview.all_time`), each window leaf's refs land at its
+window's row, the ladder's node units plan one overview object per row
+(`{node}_{window}.zarr`, and `all.zarr` for the fold), and
+`output.icechunk` defaults ON there as it does for an unwindowed hive
+store.
+
+Raster hive products (`(time, cells)` arrays, never sharded — one row per
+acquisition, in append order) remain out of the writer's scope: the knob
+resolves off there and an explicit `true` is refused. They are tracked on
+issue [#584](https://github.com/englacial/zagg/issues/584) (its phase 4);
 the finalize and tags of §11.4 apply to them unchanged once they have a
 repo. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview

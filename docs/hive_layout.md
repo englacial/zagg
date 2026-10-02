@@ -1932,8 +1932,9 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   single-chunk column array, whose ref is the whole object) and writes the plan as a JSON sibling beside the leaf's stats
   sidecar (`icechunk_refs.json`, ≈40 KB at production geometry). No
   Icechunk session on the leaf path. The outcome rides the leaf's stats sidecar as `icechunk` —
-  `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "windowed" |
-  "empty"}`, or `{error}` — and the run parquet as `icechunk_*` columns. Its
+  `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "empty"}`, or
+  `{error}` — and the run parquet as `icechunk_*` columns. A windowed leaf
+  is indexed like any other, at its window's row (spec §11.2). Its
   cost is its own `phase_timings["icechunk"]`, not `write`.
 - **The ladder commits** (`zagg.icechunk_ladder`, hooked into every node of
   the [staged sweep](#the-staged-sweep-issue-384)): a stage node gathers its

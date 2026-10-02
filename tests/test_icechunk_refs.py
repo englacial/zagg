@@ -95,6 +95,7 @@ def _write_leaf(
     skip_chunks=(),
     refs=False,
     run_id=None,
+    window=None,
 ):
     """One leaf through the production writer; returns the worker metadata.
 
@@ -145,7 +146,15 @@ def _write_leaf(
     # ``run_id`` makes the leaf VERSIONED (issue #582); ``None`` writes the
     # legacy in-place leaf these refs tests were written against.
     return hive.process_and_write_hive(
-        shard, ["s3://bucket/g.h5"], grid, {}, root, grid.config, store_kwargs={}, run_id=run_id
+        shard,
+        ["s3://bucket/g.h5"],
+        grid,
+        {},
+        root,
+        grid.config,
+        store_kwargs={},
+        run_id=run_id,
+        window=window,
     )
 
 
@@ -802,13 +811,16 @@ class TestLeafRefs:
         with pytest.raises(icechunk.StorageError, match="checksum"):
             group["6"]["count"][span]
 
-    def test_windowed_and_empty_units_are_skipped(self, monkeypatch, cfg, tmp_path):
+    def test_a_leaf_with_no_objects_is_skipped(self, monkeypatch, cfg, tmp_path):
+        # A windowed leaf is no longer skipped (issue #584 phase 2) — it is
+        # indexed at its window's row; only an objectless leaf skips. Here
+        # neither the unwindowed nor the ``2019`` leaf was ever written.
         grid = _grid(cfg)
         root = str(tmp_path / "store")
         icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
         shard = _shards(grid, 1)[0]
         assert icechunk_refs.record_leaf(root, grid, shard, store_kwargs={}, window="2019") == {
-            "skipped": "windowed"
+            "skipped": "empty"
         }
         assert icechunk_refs.record_leaf(root, grid, shard, store_kwargs={}) == {"skipped": "empty"}
 
@@ -2429,16 +2441,17 @@ class TestKnob:
         assert get_icechunk(cfg) is False
 
     def test_default_follows_the_writer_scope_not_the_layout(self, cfg):
-        # Spec §11.6: a windowed store's leaves share a shard rank and a
-        # raster product is never sharded, so stage 1 records no refs for
-        # either — the default resolves OFF rather than standing up a repo no
-        # leaf can ever fill.
+        # Spec §11.6: a raster product is never sharded, so the writer
+        # records no refs for it — the default resolves OFF rather than
+        # standing up a repo no leaf can ever fill. A WINDOWED hive store is
+        # in scope as of issue #584 phase 2: the repo's row dimension is
+        # what separates the leaves that share a shard rank.
         from zagg.config import get_icechunk, get_store_layout
 
         cfg.output["store_layout"] = "hive"
         assert get_icechunk(cfg) is True
         cfg.output["windowing"] = _WINDOWING
-        assert get_icechunk(cfg) is False
+        assert get_icechunk(cfg) is True
         cfg.output.pop("windowing")
         raster = default_config("sentinel2_l2a")
         assert get_store_layout(raster) == "hive" and get_icechunk(raster) is False
@@ -2456,8 +2469,8 @@ class TestKnob:
             validate_config(cfg)
         cfg.output["store_layout"] = "hive"
         cfg.output["windowing"] = _WINDOWING
-        with pytest.raises(ValueError, match=r"windowed stores \(spec §11.6\)"):
-            validate_config(cfg)
+        validate_config(cfg)  # windowed hive stores are in scope (issue #584)
+        cfg.output.pop("windowing")
         raster = default_config("sentinel2_l2a")
         raster.output["icechunk"] = True
         with pytest.raises(ValueError, match=r"raster products \(spec §11.6\)"):
@@ -2476,8 +2489,8 @@ class TestKnob:
             validate_config(cfg)
         cfg.output["store_layout"] = "hive"
         cfg.output["windowing"] = _WINDOWING
-        with pytest.raises(ValueError, match=r"windowed stores \(spec §11.6\)"):
-            validate_config(cfg)
+        validate_config(cfg)  # windowed hive stores are in scope (issue #584)
+        cfg.output.pop("windowing")
         raster = default_config("sentinel2_l2a")
         raster.output["icechunk"] = {}
         with pytest.raises(ValueError, match=r"raster products \(spec §11.6\)"):

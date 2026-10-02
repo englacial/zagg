@@ -1676,9 +1676,12 @@ def _leaf_icechunk_refs(
     """
     try:
         from zagg.icechunk_refs import leaf_units, record_leaf, resolve_options, vet_leaf_repo
+        from zagg.icechunk_rows import ALL_ROW
 
-        if window and window.get("label") is not None:
-            return {"skipped": "windowed"}
+        # A window leaf's refs land at its window's ROW (§11.2, issue #584
+        # phase 2): the leaves of one shard's windows share a shard rank, so
+        # the row is what separates them. ``all`` for an unwindowed leaf.
+        row = (window or {}).get("label") or ALL_ROW
         commit_leaf = resolve_options(config, grid.parent_order, grid=grid)["commit"] == "leaf"
         repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs) if commit_leaf else None
         units = leaf_units(
@@ -1689,6 +1692,7 @@ def _leaf_icechunk_refs(
             column=column,
             store_kwargs=store_kwargs,
             version=version,
+            row=row,
         )
         if commit_leaf:
             return record_leaf(

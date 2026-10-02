@@ -817,7 +817,13 @@ def _leaf_rel(store_root: str, leaf_path: str) -> str:
 
 
 def leaf_ref_plan(
-    grid, shard_key, store_root: str, *, store_kwargs: dict, version: str | None = None
+    grid,
+    shard_key,
+    store_root: str,
+    *,
+    store_kwargs: dict,
+    version: str | None = None,
+    window: str | None = None,
 ) -> list[dict]:
     """Per-array virtual refs for one committed leaf (§11.3), read off its objects.
 
@@ -831,11 +837,13 @@ def leaf_ref_plan(
     emit no entry. ``version`` is a versioned leaf's version subgroup (spec
     §1.5, issue #582): the refs then point into ``{leaf}/{version}/…``, the
     objects a replacement never rewrites; ``None`` plans a legacy leaf.
+    ``window`` is the window label of a windowed leaf (``{id}_{window}.zarr``,
+    issue #584 phase 2); ``None`` the unwindowed ``{id}.zarr``.
     """
     from zagg.hive import shard_leaf_path
 
     (rank,) = grid.block_index(int(shard_key))
-    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
+    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key, window=window))
     if version:
         leaf_rel = f"{leaf_rel}/{version}"
     return object_ref_plan(grid, leaf_rel, rank, store_root, store_kwargs=store_kwargs)
@@ -1116,14 +1124,23 @@ def leaf_units(
     from zagg.sweep_overview import _overview_config
 
     (rank,) = grid.block_index(int(shard_key))
-    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
+    # The row IS the window: a windowed leaf is ``{id}_{row}.zarr`` and its
+    # column artifact ``{column}`` already carries the window in its name
+    # (the caller passes the windowed basename), issue #584 phase 2.
+    window = None if row == ALL_ROW else str(row)
+    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key, window=window))
     node_rel = leaf_rel.rsplit("/", 1)[0]
     units = [
         {
             "level": int(grid.child_order),
             "row": row,
             "entries": leaf_ref_plan(
-                grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
+                grid,
+                shard_key,
+                store_root,
+                store_kwargs=store_kwargs,
+                version=version,
+                window=window,
             ),
         }
     ]
@@ -1184,24 +1201,32 @@ def record_leaf(
     the leaf's stats sidecar: ``{"path", "snapshot", "arrays", "refs",
     "levels", "rebases", "commit_s", "checksum"}`` (``checksum`` the form the
     refs carry: ``"etag"`` or ``"last_modified"``, §11.3), or ``{"skipped":
-    reason}`` for a unit stage 1 does not index (a windowed leaf, §11.6; a
-    leaf with no chunk objects). Raises on failure — the caller is fail-open.
-    ``repo`` is a handle :func:`vet_leaf_repo` already returned (the worker
-    seam vets before it plans); ``None`` opens and vets here, still BEFORE
-    the plan.
+    reason}`` for a leaf with no chunk objects. Raises on failure — the
+    caller is fail-open. ``repo`` is a handle :func:`vet_leaf_repo` already
+    returned (the worker seam vets before it plans); ``None`` opens and vets
+    here, still BEFORE the plan. ``window`` is the leaf's window label, used
+    only when ``units`` is ``None`` (the caller's units already name their
+    row); a windowed leaf is indexed as of issue #584 phase 2.
     """
     from zagg.grids.morton import morton_decimal
 
-    if window is not None:
-        return {"skipped": "windowed"}
     checksum = "etag" if container_prefix(store_root).startswith("s3://") else "last_modified"
     if repo is None:
         repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs)
     if units is None:
+        # ``window`` is the dispatcher's unit dict, or just its label.
+        label = window if isinstance(window, str) else (window or {}).get("label")
+        label = str(label) if label else None
         plan = leaf_ref_plan(
-            grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
+            grid,
+            shard_key,
+            store_root,
+            store_kwargs=store_kwargs,
+            version=version,
+            window=label,
         )
-        units = [{"level": int(grid.child_order), "row": ALL_ROW, "entries": plan}]
+        row = ALL_ROW if label is None else label
+        units = [{"level": int(grid.child_order), "row": row, "entries": plan}]
     if not any(entry["refs"] for unit in units for entry in unit["entries"]):
         return {"skipped": "empty"}
     outcome = commit_units(

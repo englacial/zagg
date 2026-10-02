@@ -1378,11 +1378,6 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.icechunk requires output.store_layout: hive (the companion repo "
             "references hive leaves by shard rank; flat stores have no leaves)"
         )
-    if enabled and get_windowing(config) is not None:
-        raise ValueError(
-            "output.icechunk is out of scope for windowed stores (spec §11.6): a "
-            "window's leaves share a shard rank, so stage 1 records no refs for them"
-        )
     if enabled and (config.data_source or {}).get("reader") == "raster":
         raise ValueError(
             "output.icechunk is out of scope for raster products (spec §11.6): "
@@ -3459,20 +3454,21 @@ def get_icechunk(config: PipelineConfig) -> bool:
     leaves stay normative; the repo is a regenerable index). ``output.icechunk:
     false`` opts out.
 
-    The default follows the stage-1 WRITER's scope, not the layout alone
-    (spec §11.6): windowed hive stores (a window's leaves share a shard rank)
-    and raster hive products (never sharded) record no refs, so the knob
+    The default follows the WRITER's scope, not the layout alone (spec
+    §11.6). **Windowed** hive stores are in scope as of issue #584 phase 2:
+    a window's leaves share a shard rank, and the repo's row dimension
+    (§11.2) is what separates them, so the knob defaults ON for them too.
+    Raster hive products (never sharded) still record no refs, so the knob
     resolves OFF there rather than standing up a repo no leaf can fill. A
     present-but-null key falls back to that default; an explicit ``true`` on
-    any of the three out-of-scope shapes — non-hive, windowed, raster — is
-    rejected by ``validate_config``, mirroring ``sweep``. Excluded from the
-    D19 semantic core like the other run triggers (:mod:`zagg.semantics`).
+    either out-of-scope shape — non-hive, raster — is rejected by
+    ``validate_config``, mirroring ``sweep``. Excluded from the D19 semantic
+    core like the other run triggers (:mod:`zagg.semantics`).
     """
     flag = config.output.get("icechunk")
     if flag is None:
         return (
             get_store_layout(config) == "hive"
-            and get_windowing(config) is None
             and (config.data_source or {}).get("reader") != "raster"
         )
     if isinstance(flag, dict):

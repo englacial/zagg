@@ -466,14 +466,82 @@ class TestRefsLandAtTheirRow:
         _write_leaf(monkeypatch, grid, root, shard, refs=False)
         units = icechunk_refs.leaf_units(grid, cfg, shard, root, column=None, store_kwargs={})
         assert [u["row"] for u in units] == ["all"]
-        units = icechunk_refs.leaf_units(
+        # The row IS the window: it names the unit's row AND selects the
+        # leaf the plan reads (``{id}_2019.zarr``), so on this unwindowed
+        # store the 2019 plan finds no object (issue #584 phase 2).
+        windowed = icechunk_refs.leaf_units(
             grid, cfg, shard, root, column=None, store_kwargs={}, row="2019"
         )
-        assert [u["row"] for u in units] == ["2019"]
+        assert [u["row"] for u in windowed] == ["2019"]
+        assert windowed[0]["entries"] == []
         # The plan itself is the object's cell-axis plan: row-free.
         (rank,) = grid.block_index(shard)
         count = next(e for e in units[0]["entries"] if e["path"] == "count")
         assert count["chunk_grid"] == (4,) and count["arr_offset"] == (rank * 4,)
+
+
+class TestWindowedStoresAreInScope:
+    """Issue #584 phase 2: §11.6 no longer refuses a windowed hive store."""
+
+    def test_the_knob_defaults_on_and_validates_for_a_windowed_store(self, cfg):
+        from zagg.config import get_icechunk, validate_config
+
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "h_li",
+            "epoch": "1970-01-01T00:00:00Z",
+            "scale": "utc",
+            "units": "seconds",
+        }
+        assert get_icechunk(cfg) is True
+        cfg.output["icechunk"] = True
+        validate_config(cfg)
+
+    def test_the_dispatchers_rows_are_its_units_window_labels(self, cfg):
+        # The init allocates exactly the rows the run can write: the labels
+        # its expanded dispatch units carry, plus ``all`` when the store
+        # maintains the cross-window fold.
+        from zagg import runner
+
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = _YEARLY
+        shard_units = [
+            (1, [], [({"label": "2019"}, []), ({"label": "2020"}, [])]),
+            (2, [], [({"label": "2019"}, [])]),
+        ]
+        assert runner._unit_window_labels(shard_units, "shard") == ["2019", "2020"]
+        window_units = [(1, [], {"label": "2020"}), (2, [], {"label": "2019"})]
+        assert runner._unit_window_labels(window_units, "window") == ["2020", "2019"]
+        # ``unit: shard`` is the default, so the shard-major units are read.
+        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020"]
+        cfg.output["pyramid"] = {"all_time": True}
+        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020", "all"]
+        # An unwindowed run is the one ``all`` row, whatever the units are.
+        cfg.output.pop("windowing")
+        assert runner._icechunk_rows(cfg, shard_units) == ["all"]
+
+    def test_a_window_leaf_records_its_refs_at_its_window_row(self, monkeypatch, cfg, tmp_path):
+        # The end-to-end worker path (``hive._leaf_icechunk_refs``): two
+        # windows of ONE shard, whose leaves share a shard rank, land at
+        # two different rows and read back their own values.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        (rank,) = grid.block_index(shard)
+        _init(root, grid, cfg, manifest, ["2019", "2020"])
+        cfg.output["windowing"] = _YEARLY  # the worker reads its time_field
+        cfg.output["icechunk"] = {"commit": "leaf"}
+        for label, fill in (("2019", 1.0), ("2020", 50.0)):
+            year = int(label)
+            window = {"label": label, "start": _Y[year], "end": _Y[year + 1]}
+            out = _write_leaf(
+                monkeypatch, grid, root, shard, fill=fill, refs=True, run_id=label, window=window
+            )
+            assert out["icechunk"].get("error") is None, out["icechunk"]
+        group, _repo = _open(root)
+        span = slice(rank * 16, (rank + 1) * 16)
+        np.testing.assert_array_equal(group["6"]["count"][0, span][:4], np.full(4, 1))
+        np.testing.assert_array_equal(group["6"]["count"][1, span][:4], np.full(4, 50))
 
 
 class TestRevisionOneIsRefused:
