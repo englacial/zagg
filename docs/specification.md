@@ -3714,7 +3714,7 @@ every later run, a finished leaf: zagg's rerun identity compares the
 configuration and the input set, not the record, so the leaf would be
 skipped as current and stay uncounted until something else forced its
 rewrite. A writer under this revision therefore **MUST NOT stamp a leaf
-whose record write failed**, when the leaf's fold saw at least one clocked
+whose record could not be built or written**, when the leaf's fold saw at least one clocked
 observation (espg ruling of 2026-10-01 on
 [PR #578](https://github.com/englacial/zagg/pull/578)). The failed write
 fails the unit before the stamp: the prefix is unstamped debris (D4); on a

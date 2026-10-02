@@ -2128,20 +2128,19 @@ def process_and_write_hive(
         # pointer does not move; the previous ``current`` keeps serving), the
         # caller writes no stats sidecar, and the next attempt rewrites the
         # unit like any failed shard. No retry loop of its own: the store
-        # client's policy (``store._S3_RETRY_CONFIG``) already ran. Absent,
-        # and NOT a failure, when the fold saw no clocked observation. It
-        # goes to ``data_path``, beside the bitmap: on a versioned leaf (spec
-        # §1.5) the version subgroup, BEFORE the version's stamp.
+        # client's policy (``store._S3_RETRY_CONFIG``) already ran. A record
+        # that cannot be BUILT raises as itself, outside the ``try`` (no store
+        # call was made), still before the stamp. Absent, and NOT a failure,
+        # when the fold saw no clocked observation. It goes to ``data_path``,
+        # beside the bitmap: on a versioned leaf (spec §1.5) the version
+        # subgroup, BEFORE the version's stamp.
         folded = temporal_acc.finish() if temporal_acc is not None else None
         if folded is not None:
+            record = leaf_temporal.build_leaf_temporal(
+                *folded, leaf_temporal.temporal_field_names(config)
+            )
             try:
-                leaf_temporal.write_leaf_temporal(
-                    data_path,
-                    leaf_temporal.build_leaf_temporal(
-                        *folded, leaf_temporal.temporal_field_names(config)
-                    ),
-                    **store_kwargs,
-                )
+                leaf_temporal.write_leaf_temporal(data_path, record, **store_kwargs)
             except Exception as exc:
                 raise RuntimeError(
                     f"leaf temporal record for {data_path} failed to write ({exc}); the leaf "

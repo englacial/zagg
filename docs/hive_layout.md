@@ -879,7 +879,9 @@ leaf column, but never looks for the record, so a leaf stamped without one
 would be skipped as current on every re-run and stay uncounted for good.
 The worker therefore raises before the stamp, after the object-store
 client's own retries (up to 12, backed off 1–30 s inside a 180 s budget —
-`zagg.store._S3_RETRY_CONFIG`; there is no second loop on top):
+`zagg.store._S3_RETRY_CONFIG`; there is no second loop on top). A record
+that cannot be *built* fails the unit the same way, before the stamp, with
+its own error and no store call:
 
 - a **legacy** leaf is left an unstamped prefix (arrays and bitmap, no
   record, no stamp) — debris, cleared wholesale by the next attempt's

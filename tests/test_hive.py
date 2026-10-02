@@ -1393,6 +1393,41 @@ class TestProcessAndWriteHive:
         assert hive.read_commit(open_store(leaf))["complete"] is True
         assert leaf_temporal.read_leaf_temporal_record(leaf)["n_obs"] == 4
 
+    def test_a_record_that_cannot_be_built_fails_as_itself_unstamped(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issue #575 review: a build/encode fault is not a store write failure.
+
+        The record is built outside the PUT's guard, so a deterministic build
+        fault propagates as its own exception (not the "failed to write"
+        ``RuntimeError`` that points triage at the store), no PUT is
+        attempted, and the leaf is still left unstamped — fail-closed holds.
+        """
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        cfg.output["leaf_versions"] = False
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+        monkeypatch.setattr(processing, "process_shard", self._temporal_fake(grid, shard, 4))
+        puts = []
+
+        def cap(*a, **k):
+            raise ValueError("cap")
+
+        monkeypatch.setattr(leaf_temporal, "build_leaf_temporal", cap)
+        monkeypatch.setattr(leaf_temporal, "write_leaf_temporal", lambda *a, **k: puts.append(a))
+        with pytest.raises(ValueError, match="^cap$"):
+            hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+            )
+        assert puts == []
+        assert hive.read_commit(open_store(leaf)) is None
+        assert not os.path.exists(f"{leaf}/{leaf_temporal.LEAF_TEMPORAL_NAME}")
+
     def test_a_failed_record_write_never_moves_a_versioned_pointer(
         self, monkeypatch, cfg, tmp_path
     ):
