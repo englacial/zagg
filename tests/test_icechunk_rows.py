@@ -833,6 +833,99 @@ class TestTheLadderWalksAWindowedStore:
         assert planned, "the ladder planned nothing"
         assert not [rel for rel in planned if rel.endswith("/2019.zarr")], sorted(set(planned))
 
+    def test_the_all_time_fold_reads_back_at_the_reserved_row(self, monkeypatch, cfg, tmp_path):
+        # Plan phase 2 acceptance (1): a windowed run reads back per window
+        # AND all-time through the repo. The all-time fold is the overview
+        # levels' ``all.zarr``, indexed at the reserved ``all`` row.
+        from pathlib import Path
+
+        from mortie import mort2healpix
+        from test_icechunk_refs import _ladder_run
+
+        from zagg.grids.morton import morton_word
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        _grid_, root, summary = _ladder_run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+            windows=_WINDOW_GRANULES,
+        )
+        assert summary["cells_error"] == 0
+        rows = icechunk_refs.read_block(root, store_kwargs={})["rows"]
+        fold = rows.index("all")
+        group, _repo = _open(root)
+        manifest = hive.read_manifest(root)
+        levels = {int(e["node"]): int(e["cells"][0]) for e in manifest["pyramid"]["overviews"]}
+        read = 0
+        for k, r in levels.items():
+            for obj in sorted(Path(root).glob("/".join(["*"] * (k + 1)) + "/all.zarr")):
+                node = "".join(obj.relative_to(root).parts[:-1])
+                rank = mort2healpix(morton_word(node))[0]
+                src = zarr.open_group(str(obj), mode="r")[str(r)]
+                n = 4 ** (r - k)
+                np.testing.assert_array_equal(
+                    group[str(r)]["count"][fold, rank * n : (rank + 1) * n], src["count"][:]
+                )
+                read += 1
+        assert read, "no all-time overview object was written"
+        # It is the fold of the windows, not a copy of one of them.
+        level = str(levels[min(levels)])
+        window = rows.index("2019")
+        assert group[level]["count"][fold, :].sum() > group[level]["count"][window, :].sum()
+
+    def test_a_tag_cut_before_an_append_still_reads_every_level(self, monkeypatch, cfg, tmp_path):
+        # Plan phase 2 acceptance (3). The fold is left off here: ``all.zarr``
+        # is the one overview object an append REWRITES, so a pre-append tag's
+        # virtual ref to it is stale until the fold is written natively
+        # (plan phase 3). Every per-window row is immutable and reads.
+        from test_icechunk_refs import _ladder_run
+
+        shards = _shards(_grid(cfg), 2)
+        run = dict(
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+        )
+        _grid_, root, first = _ladder_run(
+            monkeypatch, cfg, tmp_path, windows=_WINDOW_GRANULES[:1], **run
+        )
+        tag = first["icechunk_finalize"]["tag"]
+        assert first["icechunk_finalize"]["tagged"]
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        before = {
+            level: zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")[level]["count"][
+                :
+            ]
+            for level in icechunk_refs.read_block(root, store_kwargs={})["levels"]
+        }
+        assert before and all(v.shape[0] == 1 for v in before.values())  # the one 2019 row
+        _grid_, _root, second = _ladder_run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            windows=(("2020", "2020-03-01T00:00:00Z", "2020-03-02T00:00:00Z"),),
+            root=root,
+            **run,
+        )
+        assert second["cells_error"] == 0
+        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == ["2019", "2020"]
+        # The tag reads what it was cut with: one row, every level, the same
+        # values -- the append added a row and moved no ref.
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        tagged = zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")
+        for level, values in before.items():
+            np.testing.assert_array_equal(tagged[level]["count"][:], values)
+        # And the branch tip carries both rows, row 0 unchanged.
+        tip, _repo = _open(root)
+        for level, values in before.items():
+            assert tip[level]["count"].shape[0] == 2
+            np.testing.assert_array_equal(tip[level]["count"][:1], values)
+
 
 class TestRevisionOneIsRefused:
     def _downgrade(self, root):
