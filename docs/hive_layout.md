@@ -1938,9 +1938,12 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   cost is its own `phase_timings["icechunk"]`, not `write`.
 - **The ladder commits** (`zagg.icechunk_ladder`, hooked into every node of
   the [staged sweep](#the-staged-sweep-issue-384)): a stage node gathers its
-  subtree's carriers — leaf sidecars at the finest tuple, its children's
+  subtree's carriers — leaf sidecars at the finest tuple (one per
+  `(leaf, window)` on a windowed store, each naming its own row), its children's
   node ref columns above — adds the refs of the overview objects at its
-  tuple's orders, and either writes its own node column or **commits**. The
+  tuple's orders, and either writes its own node column or **commits**. On a
+  windowed store the hook runs once per node, after that node's window units
+  and its close, so each row's refs are gathered and committed together. The
   tuple whose order range contains `commit_order` commits everything
   gathered in **one commit per node** covering every order in its subtree
   (`node {decimal}`, refs into `/19/…`, `/13/…`, `/12/…`, … of the one repo); coarser

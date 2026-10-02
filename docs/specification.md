@@ -4448,14 +4448,16 @@ columns do:
    container prefix, which is vetted at the repo) and the entries (≈40 KB per
    leaf at production geometry), grouped into units that each name the
    **row** they land in by **label** (`row`: `all` for an unwindowed leaf
-   and its column; a carrier written before `/2` names none and is read as
-   `all`) — never a row index, which only the repo knows (§11.2), so a
+   and its column, the window's label for a windowed leaf — one leaf, and
+   so one carrier, per window; a carrier written before `/2` names none and
+   is read as `all`) — never a row index, which only the repo knows (§11.2), so a
    carrier stays valid whatever rows other runs allocate. It is a
    **writer-internal carrier**, not part of the reader contract — the repo
    is. No Icechunk session is opened on the leaf path.
 2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
    `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
-   the finest tuple, its children's **node ref columns** (the same carrier at
+   the finest tuple, one per `(leaf, window)` on a windowed store, its
+   children's **node ref columns** (the same carrier at
    `{node}/icechunk_refs.json`) above — and adds the refs of the overview
    objects at every order of its tuple beneath it (read the same way a
    leaf's are). A missing carrier is counted (`icechunk_missing`) and

@@ -261,11 +261,19 @@ def _get(store_root: str, rel: str, store_kwargs) -> bytes | None:
         return None
 
 
-def read_leaf_refs(store_root: str, shard_key, *, spec, store_kwargs) -> tuple[list, dict] | None:
-    """The leaf's ``(units, meta)``, or ``None`` when no sidecar exists."""
+def read_leaf_refs(
+    store_root: str, shard_key, *, spec, store_kwargs, window: str | None = None
+) -> tuple[list, dict] | None:
+    """The leaf's ``(units, meta)``, or ``None`` when no sidecar exists.
+
+    ``window`` names a windowed leaf (``{id}_{window}.zarr``, issue #584
+    phase 2), whose sidecar is that leaf's sibling: one shard has one
+    carrier per window, each naming its own row. ``None`` is the unwindowed
+    leaf.
+    """
     from zagg.hive import shard_leaf_path
 
-    leaf = shard_leaf_path(store_root, shard_key)
+    leaf = shard_leaf_path(store_root, shard_key, window=window)
     prefix, _, name = leaf.rpartition("/")
     rel = f"{prefix[len(store_root.rstrip('/')) + 1 :]}/{leaf_refs_key(name, spec)}"
     raw = _get(store_root, rel, store_kwargs)
@@ -304,9 +312,13 @@ def ladder_context(store_root: str, manifest: dict, *, store_kwargs) -> dict | N
     landed) and the ladder hook is a no-op. A block whose orders or container
     disagree with the manifest raises — refs gathered from this store must
     never land in a repo built for another.
+
+    A WINDOWED store walks the ladder like any other (§11.6, issue #584
+    phase 2): its node's window units write per-window leaves and overviews,
+    and the one hook that follows them gathers each at its own row
+    (:func:`stage_node_refs`). Refusing here would leave a ``commit:
+    "ladder"`` run's leaf sidecars ungathered and the repo empty.
     """
-    if manifest.get("temporal") is not None:
-        return None  # windowed stores are outside the writer's scope (§11.6)
     try:
         _repo, block = open_vetted(
             store_root,
@@ -375,7 +387,9 @@ def _overview_units(
     return units
 
 
-def _child_units(store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs):
+def _child_units(
+    store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs, windows
+):
     """Yield ``(units, missing)`` per child, one child at a time.
 
     A GENERATOR, not a list: the committing node feeds each child's units
@@ -385,12 +399,19 @@ def _child_units(store_root, node, child_order, shard_order, candidates, block, 
     (review finding). ``missing`` is 1 for a child whose carrier is absent,
     unreadable or for another geometry, whose siblings are kept regardless:
     a per-leaf fault never costs the node its whole gather (§11.4).
+
+    ``windows`` are the leaf windows this run wrote under ``node``
+    (``[None]`` on an unwindowed store): one shard has one leaf, and so one
+    carrier, per window (issue #584 phase 2), each naming its own row. A
+    node column above the leaf tuple carries every row already, so
+    ``windows`` applies to the leaf read alone.
     """
     from zagg.grids.morton import morton_word
     from zagg.sweep_overview import _node_at
 
     children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
-    for child in children:
+    pairs = [(c, w) for c in children for w in (windows if child_order == shard_order else [None])]
+    for child, window in pairs:
         # Per-CHILD fail-open: a foreign spec token, a truncated carrier
         # (``JSONDecodeError`` is a ``ValueError``) or a geometry mismatch is
         # this child's fault, not the node's. Letting it out would cost the
@@ -400,7 +421,11 @@ def _child_units(store_root, node, child_order, shard_order, candidates, block, 
         try:
             if child_order == shard_order:
                 got = read_leaf_refs(
-                    store_root, morton_word(child), spec=spec, store_kwargs=store_kwargs
+                    store_root,
+                    morton_word(child),
+                    spec=spec,
+                    store_kwargs=store_kwargs,
+                    window=window,
                 )
                 if got is None:
                     yield [], 1
@@ -449,6 +474,7 @@ def stage_node_refs(
     the hook, which counts ``icechunk_failed`` and moves on (D9).
     """
     dispatch, child_order = int(stage["dispatch"]), int(stage["child_order"])
+    rows = list(block.get("rows") or [ALL_ROW])
     commit_order, split_order = int(block["commit_order"]), int(block["split_order"])
     level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
     # Against the REPO'S groups, not the manifest's declaration alone: the
@@ -469,21 +495,27 @@ def stage_node_refs(
         orders = [k for k in orders if level_by_order[k] in have]
     per_leaf = block.get("commit") == "leaf"
     own = _overview_units(
-        store_root,
-        node,
-        orders,
-        level_by_order,
-        fields,
-        candidates,
-        store_kwargs,
-        rows=block.get("rows") or (ALL_ROW,),
+        store_root, node, orders, level_by_order, fields, candidates, store_kwargs, rows=rows
     )
+    # The leaf tuple reads one carrier per (leaf, WINDOW); the ``all`` row
+    # has no base leaf of its own (§11.2), so it names no leaf read.
+    windows = [None] if rows == [ALL_ROW] else [row for row in rows if row != ALL_ROW]
     # Which of the three roles this tuple plays (module docstring, §11.4).
     commits_all = dispatch <= commit_order < child_order and not per_leaf
     column_only = dispatch > commit_order and not per_leaf
     record: dict = {"node": node, "refs": 0, "missing": 0}
     source: Iterable[dict]
-    args = (store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs)
+    args = (
+        store_root,
+        node,
+        child_order,
+        shard_order,
+        candidates,
+        block,
+        spec,
+        store_kwargs,
+        windows,
+    )
     if column_only:
         units, missing = [], 0
         for child_units, miss in _child_units(*args):

@@ -1793,8 +1793,25 @@ class TestCarrier:
         assert units == [{"level": 6, "row": "all", "entries": []}]
 
 
-def _ladder_run(monkeypatch, cfg, tmp_path, *, icechunk_block, shards, workers=1):
-    """A local run with the staged sweep chained: leaves, columns, ladder, refs."""
+def _ladder_run(
+    monkeypatch,
+    cfg,
+    tmp_path,
+    *,
+    icechunk_block,
+    shards,
+    workers=1,
+    windowing=None,
+    windows=(),
+    root=None,
+):
+    """A local run with the staged sweep chained: leaves, columns, ladder, refs.
+
+    ``windowing`` declares a schedule (issue #584 phase 2): the run then
+    dispatches ``(shard, window)`` units and writes one leaf per window.
+    ``windows`` are ``(label, time_start, time_end)`` triples, one granule
+    per shard per window. ``root`` reuses an existing store (an append).
+    """
     import pandas as pd
 
     import zagg.processing as processing
@@ -1811,6 +1828,8 @@ def _ladder_run(monkeypatch, cfg, tmp_path, *, icechunk_block, shards, workers=1
     }
     cfg.output["sweep"] = "stages"
     cfg.output["icechunk"] = icechunk_block
+    if windowing is not None:
+        cfg.output["windowing"] = windowing
     monkeypatch.setattr(
         runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a", "secretAccessKey": "s"}
     )
@@ -1845,9 +1864,22 @@ def _ladder_run(monkeypatch, cfg, tmp_path, *, icechunk_block, shards, workers=1
             "layout": "fullsphere",
         },
         "shard_keys": shards,
-        "granules": [[{"id": f"g{i}", "s3": f"s3://b/g{i}.h5"}] for i in range(len(shards))],
+        "granules": [
+            [
+                {
+                    "id": f"g{i}{label}",
+                    "s3": f"s3://b/g{i}{label}.h5",
+                    "time_start": start,
+                    "time_end": end,
+                }
+                for label, start, end in windows
+            ]
+            if windows
+            else [{"id": f"g{i}", "s3": f"s3://b/g{i}.h5"}]
+            for i in range(len(shards))
+        ],
     }
-    root = str(tmp_path / "store")
+    root = root or str(tmp_path / "store")
     summary = runner._run_local(
         cfg,
         catalog,
@@ -2091,7 +2123,7 @@ class TestLadder:
         block = ladder_context(root, manifest, store_kwargs={})
         candidates = [morton_decimal(s) for s in shards]
         yielded = list(
-            _child_units(root, "1111", 4, 4, candidates, block, manifest.get("spec"), {})
+            _child_units(root, "1111", 4, 4, candidates, block, manifest.get("spec"), {}, [None])
         )
         assert len(yielded) == len(shards) and [miss for _u, miss in yielded] == [0, 0]
         # ... and the commit takes that stream in its generator form.

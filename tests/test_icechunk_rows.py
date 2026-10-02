@@ -617,6 +617,67 @@ class TestWindowedStoresAreInScope:
         np.testing.assert_array_equal(group["6"]["count"][1, span][:4], np.full(4, 50))
 
 
+#: A windowed ladder run's granules: one per shard per year.
+_WINDOW_GRANULES = (
+    ("2019", "2019-03-01T00:00:00Z", "2019-03-02T00:00:00Z"),
+    ("2020", "2020-03-01T00:00:00Z", "2020-03-02T00:00:00Z"),
+)
+
+
+class TestTheLadderWalksAWindowedStore:
+    """Issue #584 phase 2: a windowed store's nodes gather and commit per row."""
+
+    def test_a_windowed_ladder_run_commits_every_row_through_the_repo(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        from test_icechunk_refs import _ladder_run, _stage_rows
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        grid, root, summary = _ladder_run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+            windows=_WINDOW_GRANULES,
+        )
+        assert summary["cells_error"] == 0
+        init = summary["icechunk"]
+        assert init["options"]["commit"] == "ladder"
+        assert init["rows"] == ["2019", "2020", "all"]
+        # Every leaf wrote a SIDECAR, not a commit: the node commits.
+        for meta in summary["results"]:
+            assert "sidecar" in meta["icechunk"], meta["icechunk"]
+        rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
+        assert rows[3]["icechunk_commits"] > 0 and rows[3]["icechunk_failed"] == 0
+        assert rows[3]["icechunk_missing"] == 0
+        group, _repo = _open(root)
+        # Each window's leaf reads back at its own row, and the all-time
+        # fold at the reserved ``all`` row of the OVERVIEW levels (§11.2).
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            span = slice(rank * 16, (rank + 1) * 16)
+            for row, label in enumerate(("2019", "2020")):
+                path, _stamp = hive.resolve_leaf(
+                    hive.shard_leaf_path(root, shard, window=label)
+                )
+                leaf = zarr.open_group(path, mode="r")["6"]
+                assert leaf["count"][:].any(), "the window leaf wrote nothing to index"
+                np.testing.assert_array_equal(group["6"]["count"][row, span], leaf["count"][:])
+        assert (group["6"]["count"][2, :] == 0).all()  # no all-time leaf at the base
+        # The row — not the shard rank — is what separates one shard's
+        # windows: each row's refs point into that window's OWN leaf object.
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        refs = _refs(repo.readonly_session(icechunk_refs.BRANCH), "6/count")
+        by_row: dict = {}
+        for (row, _cell), (_kind, location, _offset, _length) in refs.items():
+            leaf = next(part for part in location.split("/") if part.endswith(".zarr"))
+            by_row.setdefault(row, set()).add(leaf.rpartition("_")[2])
+        assert by_row == {0: {"2019.zarr"}, 1: {"2020.zarr"}}
+
+
 class TestRevisionOneIsRefused:
     def _downgrade(self, root):
         """Rewrite the block's spec token to ``/1``: a repo of the earlier revision."""
