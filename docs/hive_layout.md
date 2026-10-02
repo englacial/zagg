@@ -231,6 +231,25 @@ output:
   body-level error is not retried and a `failed` status object is
   terminal): a re-run of the shard rewrites the failed window while the
   gate skips the windows that landed.
+- **The post-run tail reads leaves, not invokes.** The shard above is a
+  failed cell — its 500, its `failed` status object, `cells_error` — but the
+  leaves that landed are in the store, and the run's tail treats them as the
+  per-window fan-out would have: the **sweep work set** (the families sweep,
+  the staged sweep's `(node, window)` units and the node close) is every
+  result's stats **records**, each on its own `success`, never the invoke's
+  status; a shard enters the root **`coverage.moc`** when at least one of
+  its leaves stands (written by this run, or found current or refused by the
+  gate), and the root time-range union takes those leaves' ranges alone. The
+  failed window is in none of them. This is one rule on every dispatch path
+  — the local backend, `agg` on Lambda over the sync, async and Event
+  transports, and the `zagg.client` tail that `Run.attach` re-runs
+  (`runner._landed_coverage`, `sweep.leaves_from_stats_records`) — so a
+  backend never sweeps or covers what another would not. The run parquet
+  already carried one row per leaf, the failed window's unsuccessful, so
+  `python -m zagg.sweep`'s run-record discovery sees the same set. Only a
+  worker that RETURNED reports its landed windows: an invoke killed outright
+  (timeout, OOM) leaves no body, and on the fleet no D20 sidecar either, so
+  the re-run rewrites those windows rather than skipping them.
 - **Stamps carry the truth, the manifest the schema** (D15): each windowed
   leaf's commit stamp records its `window` label and the ACTUAL written
   `time_range` as ISO-8601 UTC strings (both ends at whole-second

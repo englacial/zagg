@@ -3064,6 +3064,51 @@ def _add_skipped_paths(identity: dict, touch: dict) -> None:
         )
 
 
+def _reported_units(results) -> list:
+    """``(shard_key, body)`` of the Lambda results whose body reports its leaves.
+
+    A clean 200, as ever — and a bulk multi-window unit (issue #586) whatever
+    its status: one failed window fails the shard (its 500, its ``failed``
+    status object, its error naming the window), but the body still carries
+    every window's own metadata, and those say which leaves landed (review
+    finding (8), ruled option (1)). A failure with no such body — a timeout,
+    an OOM, a dropped invoke, a raise before any window emitted — reports no
+    leaf.
+    """
+    units = []
+    for r in results:
+        body = r.get("body") or {}
+        if isinstance(body.get("windows"), list) or (
+            r.get("status_code") == 200 and not r.get("error")
+        ):
+            units.append((r.get("shard_key"), body))
+    return units
+
+
+def _landed_coverage(units) -> tuple[list, list | None]:
+    """Root-coverage inputs from ``(shard_key, metadata)`` unit outcomes.
+
+    Returns the shards to cover and the D15 time-range union. A shard is
+    covered when at least one of its leaves stands — one this run wrote, or
+    one the gate found current or refused — and the union takes those leaves'
+    ranges alone. A bulk multi-window unit stands for its windows
+    (:func:`zagg.telemetry.window_metas`), so a shard with a failed window is
+    covered through the ones that landed: what its ``(shard, window)`` fan-out
+    units would have reported, and the same on both backends (issue #586
+    review finding (8)).
+    """
+    from zagg.telemetry import window_metas
+    from zagg.windows import union_time_range
+
+    done, ranges = [], []
+    for key, meta in units:
+        standing = [m for m in window_metas(meta) if not m.get("error")]
+        if standing:
+            done.append(key)
+            ranges.extend(m.get("time_range") for m in standing)
+    return done, union_time_range(*ranges)
+
+
 def _warn_partial_auth_denials(metas) -> int:
     """WARN once when shards that PRODUCED data also hit denied reads (#449).
 
@@ -3486,22 +3531,18 @@ def _run_local(
     # failed write costs readers one walk, never a wrong answer.
     if store_layout == "hive" and get_coverage_moc(config):
         from zagg.hive import build_root_coverage, write_root_coverage
-        from zagg.windows import union_time_range
 
         try:
             # Inside the try so the fail-open claim survives result-envelope
-            # refactors (review finding, PR #208 round 3).
-            ok_results = [m for m in report.results if not m.get("error")]
-            done = [m["shard_key"] for m in ok_results]
+            # refactors (review finding, PR #208 round 3). Per leaf, not per
+            # unit: a bulk shard with a failed window is covered through the
+            # windows that landed (issue #586) — see _landed_coverage.
+            done, time_range = _landed_coverage((m["shard_key"], m) for m in report.results)
             if done:
                 # D15: windowed runs union the leaf stamps' ISO time ranges
                 # into the root summary; unwindowed metas carry no time_range,
                 # the union is None, and the envelope stays byte-identical.
-                envelope = build_root_coverage(
-                    done,
-                    int(grid.parent_order),
-                    time_range=union_time_range(*(m.get("time_range") for m in ok_results)),
-                )
+                envelope = build_root_coverage(done, int(grid.parent_order), time_range=time_range)
                 write_root_coverage(store_path, envelope, **store_kwargs)
                 logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
         except Exception as e:
@@ -4300,25 +4341,17 @@ def _run_lambda(
         if get_store_layout(config) == "hive" and get_coverage_moc(config):
             try:
                 from zagg.hive import build_root_coverage
-                from zagg.windows import union_time_range
 
                 # Inside the try so the fail-open claim survives result-envelope
-                # refactors (review finding, PR #208 round 3).
-                ok_results = [
-                    r for r in report.results if r.get("status_code") == 200 and not r.get("error")
-                ]
-                done = [r["shard_key"] for r in ok_results]
+                # refactors (review finding, PR #208 round 3). Per leaf, as on
+                # _run_local: a bulk shard whose invoke failed on one window is
+                # covered through the windows that landed (issue #586).
+                done, time_range = _landed_coverage(_reported_units(report.results))
                 if done:
                     # D15: union the windowed workers' stamped time ranges (each
                     # body mirrors its leaf stamp's ISO strings); unwindowed
                     # bodies carry none and the envelope stays byte-identical.
-                    envelope = build_root_coverage(
-                        done,
-                        int(parent_order),
-                        time_range=union_time_range(
-                            *(r.get("body", {}).get("time_range") for r in ok_results)
-                        ),
-                    )
+                    envelope = build_root_coverage(done, int(parent_order), time_range=time_range)
                     # An OLD deployment has no coverage mode: the event falls
                     # through to its process handler, which returns a LOGGED 400
                     # (missing shard_key/granule_urls...) — no writes, no result
@@ -4494,18 +4527,19 @@ def _run_lambda(
         # worker Event invoke — async, retries-0, fail-open (D9: rollups are
         # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
         # come from the envelope stats records; a stale deployed worker's
-        # record-less envelope simply contributes no leaf.
+        # record-less envelope simply contributes no leaf. The RECORDS drive
+        # the work set, each on its own ``success``, not the invoke's status
+        # (issue #586 review finding (8), ruled option (1)): a bulk shard that
+        # 500s on one window still sweeps the windows that landed, exactly as
+        # _run_local's sweep does — and a failed leaf's record is unsuccessful
+        # on every unit shape, so nothing that did not land gets in.
         stage_chained, staged = False, None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
-                ok_bodies = [
-                    r.get("body") or {}
-                    for r in report.results
-                    if r.get("status_code") == 200 and not r.get("error")
-                ]
-                leaves = leaves_from_stats_records([b.get("stats") for b in ok_bodies])
+                bodies = [r.get("body") or {} for r in report.results]
+                leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
                 if leaves:
                     _invoke_lambda_sweep(
                         state["lambda_client"],
@@ -4527,7 +4561,7 @@ def _run_lambda(
                 # `python -m zagg.sweep --stages` is the backstop). Touched
                 # current units ride as dirt-only (issue #580), as on
                 # _run_local: their nodes re-gather refs, nothing is re-folded.
-                dirt_only = dirt_only_leaves(ok_bodies)
+                dirt_only = dirt_only_leaves(bodies)
                 if (leaves or dirt_only) and config.output.get("sweep") == "stages":
                     stage_chained = True
                     staged = _invoke_lambda_stage_sweep(

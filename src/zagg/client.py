@@ -1224,21 +1224,17 @@ class Run:
                 handle._finalize_error = error
                 logger.warning(f"finalize invoke failed (surfaced via handle.wait()): {error}")
 
-        ok_results = [r for r in results if r.get("status_code") == 200 and not r.get("error")]
         if layout == "hive" and get_coverage_moc(self.config):
             try:
                 from zagg.hive import build_root_coverage
-                from zagg.windows import union_time_range
 
-                done = [r["shard_key"] for r in ok_results]
+                # Per leaf, the one rule every dispatch path shares (issue
+                # #586): see runner._landed_coverage.
+                done, time_range = runner._landed_coverage(runner._reported_units(results))
                 # hive is HEALPix-only (validated), so parent_order is set here.
                 if done and self._parent_order is not None:
                     envelope = build_root_coverage(
-                        done,
-                        int(self._parent_order),
-                        time_range=union_time_range(
-                            *(r.get("body", {}).get("time_range") for r in ok_results)
-                        ),
+                        done, int(self._parent_order), time_range=time_range
                     )
                     runner._invoke_lambda_coverage(
                         client,
@@ -1287,8 +1283,10 @@ class Run:
             try:
                 from zagg.sweep import leaves_from_stats_records
 
+                # The records drive the work set, each on its own ``success``
+                # (issue #586), as on runner._run_lambda and _run_local.
                 leaves = leaves_from_stats_records(
-                    [(r.get("body") or {}).get("stats") for r in ok_results]
+                    [(r.get("body") or {}).get("stats") for r in results]
                 )
                 if leaves:
                     runner._invoke_lambda_sweep(
