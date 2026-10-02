@@ -594,6 +594,41 @@ class TestWindowedStoresAreInScope:
         cfg.output.pop("windowing")
         assert runner._icechunk_rows(cfg, shard_units) == ["all"]
 
+    def test_the_init_rows_refuse_a_windowed_config_with_no_units(self, cfg):
+        # ``zagg.client`` calls this with no ``cells`` (it fans out nothing);
+        # it is safe today only because it refuses windowed configs earlier,
+        # so the seam says so rather than returning an empty row list that
+        # would make a repo with no row for any window (issue #584 review).
+        from zagg import runner
+
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = _YEARLY
+        with pytest.raises(ValueError, match="needs the run's cells"):
+            runner._icechunk_rows(cfg)
+        # An EMPTY fan-out is legitimate; an absent one is not.
+        cfg.output["pyramid"] = {"all_time": True}
+        assert runner._icechunk_rows(cfg, []) == ["all"]
+        # An unwindowed config never needs them.
+        cfg.output.pop("windowing")
+        assert runner._icechunk_rows(cfg) == ["all"]
+
+    def test_a_unit_of_the_wrong_shape_is_named_not_unpacked(self, cfg):
+        from zagg import runner
+
+        labels = runner._unit_window_labels
+        # The un-fanned ``(shard, records)`` pair the reordering exists to rule out.
+        with pytest.raises(ValueError, match="is not an expanded"):
+            labels([(1, [])], "shard")
+        # A shard-major unit read as window-major, and the reverse.
+        with pytest.raises(ValueError, match="names no window label"):
+            labels([(1, [], [({"label": "2019"}, [])])], "window")
+        with pytest.raises(ValueError, match=r"not the \(payload, subset\) pairs"):
+            labels([(1, [], {"label": "2019"})], "shard")
+        # A payload that lost its label.
+        for unit, mode in (((1, [], {"label": None}), "window"), ((1, [], [({}, [])]), "shard")):
+            with pytest.raises(ValueError, match="names no window label"):
+                labels([unit], mode)
+
     def test_a_window_leaf_records_its_refs_at_its_window_row(self, monkeypatch, cfg, tmp_path):
         # The end-to-end worker path (``hive._leaf_icechunk_refs``): two
         # windows of ONE shard, whose leaves share a shard rank, land at

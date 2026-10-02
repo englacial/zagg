@@ -5929,13 +5929,43 @@ def _unit_window_labels(cells: list[tuple], unit_mode: str) -> list[str]:
     ``unit: "window"`` units are ``(shard, subset, payload)``;
     ``unit: "shard"`` units are ``(shard, records, [(payload, subset), …])``
     (:func:`_windowed_units`, :func:`_shard_window_units`).
+
+    Every shape is checked rather than unpacked on faith: an un-fanned
+    ``(shard, records)`` pair, a unit read under the WRONG ``unit_mode``, or
+    a payload that lost its label would otherwise raise a bare
+    ``ValueError``/``TypeError``/``KeyError`` from deep inside the
+    comprehension, or quietly yield no label at all — and a row the init
+    never allocates fails every leaf under it much later (issue #584 review).
     """
     labels: list[str] = []
-    for _shard_key, _records, windows in cells:
+    for unit in cells:
+        if not isinstance(unit, (tuple, list)) or len(unit) != 3:
+            raise ValueError(
+                f"icechunk rows: {unit!r} is not an expanded (shard, records, windows) "
+                f"dispatch unit — a windowed run's rows are read off its fanned-out units, "
+                f"so the temporal fan-out runs BEFORE the init (spec §11.2, issue #584)"
+            )
         if unit_mode == "window":
-            labels.append(windows["label"])
+            payloads = [unit[2]]
         else:
-            labels.extend(payload["label"] for payload, _subset in windows)
+            pairs = unit[2]
+            if not isinstance(pairs, (tuple, list)) or any(
+                not isinstance(pair, (tuple, list)) or len(pair) != 2 for pair in pairs
+            ):
+                raise ValueError(
+                    f"icechunk rows: shard unit {unit[0]!r} carries {unit[2]!r}, not the "
+                    f"(payload, subset) pairs of output.windowing.unit: 'shard' "
+                    f"(spec §11.2, issue #584)"
+                )
+            payloads = [payload for payload, _subset in pairs]
+        for payload in payloads:
+            if not isinstance(payload, dict) or not payload.get("label"):
+                raise ValueError(
+                    f"icechunk rows: dispatch payload {payload!r} names no window label "
+                    f"under output.windowing.unit: {unit_mode!r} — the init allocates one "
+                    f"row per label (spec §11.2, issue #584)"
+                )
+            labels.append(str(payload["label"]))
     return list(dict.fromkeys(labels))
 
 
@@ -5948,13 +5978,25 @@ def _icechunk_rows(config, cells: list[tuple] | None = None) -> list:
     reserved ``all`` row when the store maintains the cross-window fold
     (``pyramid.overview.all_time``) — that row is populated at the overview
     levels only, there being no all-time leaf at the base.
+
+    ``cells`` is REQUIRED for a windowed config and is the run's expanded
+    units; a caller that has not fanned out is refused here rather than
+    handed an empty row list, which would make a repo with no row for any
+    window and fail every leaf's refs behind it (issue #584 review). An
+    empty list is legitimate — a run whose fan-out produced no unit.
     """
     from zagg.icechunk_rows import ALL_ROW, run_rows
 
     windowing = get_windowing(config)
     if windowing is None:
         return run_rows(None)
-    labels = _unit_window_labels(cells or [], get_windowing_unit(config))
+    if cells is None:
+        raise ValueError(
+            "a windowed run's init rows are read off its expanded dispatch units, so "
+            "_icechunk_rows needs the run's cells; fan the units out before the init "
+            "(spec §11.2, issue #584)"
+        )
+    labels = _unit_window_labels(cells, get_windowing_unit(config))
     if (get_pyramid(config) or {}).get("all_time"):
         labels = [*labels, ALL_ROW]
     return run_rows(windowing, labels)
