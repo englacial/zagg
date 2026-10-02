@@ -629,6 +629,17 @@ def run_stage_sweep_fleet(
     say gets the whole-node unit, which is correct on every store (the worker
     then runs the node's windows serially).
 
+    ``all_time`` is only the FIRST GUESS. ``pyramid`` is not a frozen manifest
+    key, so the caller's config can disagree with the store, and the workers
+    decide from the manifest. Every stage record says what its worker decided
+    (``closes`` — :func:`zagg.sweep_units.manifest_closes`); after the first
+    window barrier that saw a record, the closes follow that answer for the
+    rest of the run (one GET under the status prefix, which this side already
+    lists — a read, D8 intact). The guess stands only while no record can be
+    read (none landed, or a worker predating the key). The summary records the
+    effective value and where it came from (``all_time_from``: ``"store"`` or
+    ``"caller"``).
+
     ``pipeline_run_id`` (issue #593) names the pipeline run this sweep
     completes. It rides every stage event and the finisher's, and the
     workers record it beside the sweep's own ``run_id``.
@@ -703,6 +714,8 @@ def run_stage_sweep_fleet(
     }
 
     budget_left = [float(total_barrier_budget_s)]
+    # The close follows the STORE's declaration once a window record names it.
+    declared = {"closes": bool(all_time), "from": "caller"}
 
     # Record names are deterministic and the prefix is keyed on run_id alone,
     # so a SUPPLIED run_id that has been driven before would make every barrier
@@ -817,14 +830,8 @@ def run_stage_sweep_fleet(
         )
         if not nodes:
             continue
-        units = stage_units(
-            by_shard,
-            dispatch,
-            windowed=windowed,
-            all_time=all_time,
-            candidates=nodes,
-            dirt_only=regather,
-        )
+        unit_args = dict(windowed=windowed, candidates=nodes, dirt_only=regather)
+        units = stage_units(by_shard, dispatch, all_time=declared["closes"], **unit_args)
         block = {
             "role": "stage",
             "run_id": run_id,
@@ -869,6 +876,17 @@ def run_stage_sweep_fleet(
             "barrier_s": time.perf_counter() - t_stage,
         }
         _settle(row, fired, seen, timed_out)
+        if windowed and declared["from"] == "caller" and seen & set(fired):
+            told = _declared_closes(records_from, sorted(seen & set(fired)), run_id, store_kwargs)
+            if told is not None:
+                if told != declared["closes"]:
+                    logger.info(
+                        f"stage fleet: the store {'declares' if told else 'does not declare'} "
+                        f"the all-time fold, unlike the caller's config — following the store"
+                    )
+                declared["closes"], declared["from"] = told, "store"
+                units = stage_units(by_shard, dispatch, all_time=told, **unit_args)
+                close_nodes = [unit["node"] for unit in units if unit["close"]]
         if closing:
             _settle(closing[0], closing[1], seen, timed_out, prefix="close_")
         summary["stages"].append(row)
@@ -892,6 +910,7 @@ def run_stage_sweep_fleet(
         # The last tuple's close units have no next fan-out to ride with.
         seen, timed_out = _barrier(set(closing[1]))
         _settle(closing[0], closing[1], seen, timed_out, prefix="close_")
+    summary["all_time"], summary["all_time_from"] = declared["closes"], declared["from"]
     if not summary["stages"]:
         # No tuple produced a dispatch node, so no stage record can exist —
         # and the finisher REFUSES a zero-record run by design ("a finisher
@@ -932,6 +951,29 @@ def run_stage_sweep_fleet(
         summary["finisher"].update(_read_finisher_record(records_from, store_kwargs))
     summary["duration_s"] = time.perf_counter() - t0
     return summary
+
+
+def _declared_closes(records_from: str, names: list, run_id: str, store_kwargs: dict):
+    """The ``closes`` the first readable window-unit record reports; ``None`` if none.
+
+    A read under the run's status prefix (D8), fail-open: an unreadable record
+    or one predating the key leaves the caller's guess standing.
+    """
+    import obstore
+
+    from zagg.store import open_object_store
+
+    for name in names:
+        try:
+            store = open_object_store(records_from, **store_kwargs)
+            record = json.loads(bytes(obstore.get(store, name).bytes()))
+        except Exception as e:
+            logger.warning(f"stage fleet: stage record {name} unreadable ({e})")
+            continue
+        if isinstance(record, dict) and record.get("run_id") == run_id:
+            closes = record.get("closes")
+            return closes if isinstance(closes, bool) else None
+    return None
 
 
 def _read_finisher_record(records_from: str, store_kwargs: dict) -> dict:

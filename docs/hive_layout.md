@@ -658,7 +658,11 @@ not only the ones the run touched, records the windows it folded
 (`source_windows`), and is one more merge from raw than its sources — 2 at a
 gather level, 3 at a merge level
 ([specification §4.4](specification.md)). A store without the declaration
-has no close and pays no unit for it.
+has no close and pays no unit for it. The declaration is the store's: the
+fleet dispatcher reads it back from the first window unit's stage record
+(`closes`, taken from the manifest the worker ran against), so a run whose
+config omits or contradicts `all_time` still closes exactly the nodes the
+CLI would.
 
 **Memory.** A stage worker folds a level **one block of output cells at a
 time** — read the child members covering the block, fold, write, drop — and

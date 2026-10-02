@@ -4542,6 +4542,9 @@ def _run_lambda(
                         touch_policy=get_touch_policy(config),
                         dirt_only=dirt_only,
                         # The (node, window) units and the per-node close.
+                        # ``all_time`` is only a first guess: the fleet
+                        # follows the store's declaration once a window
+                        # unit's stage record names it (``closes``).
                         windowed=get_windowing(config) is not None,
                         all_time=bool((get_pyramid(config) or {}).get("all_time")),
                         # The run this sweep completes (issue #593).

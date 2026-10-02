@@ -949,7 +949,7 @@ def run_stage_worker(
     from zagg.hive import MANIFEST_NAME, _decimal_order, read_manifest
     from zagg.sweep import _normalize_leaves
     from zagg.sweep_lease import DEFAULT_TTL_S, acquire_lease, heartbeat_lease
-    from zagg.sweep_units import check_unit
+    from zagg.sweep_units import check_unit, manifest_closes
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
@@ -1028,6 +1028,7 @@ def run_stage_worker(
         "batch": int(batch),
         "unit": unit,  # which of the nodes' units ran; null = the nodes whole
         "window": window,
+        "closes": manifest_closes(manifest),  # what the store declares (the dispatcher reads it)
         "tuple_width": int(tuple_width),
         "n_nodes": len(nodes),
         "n_leaves": sum(len(w) for w in by_shard.values()),

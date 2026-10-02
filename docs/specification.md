@@ -1846,7 +1846,11 @@ stated here:
   rows count `window_units` and `close_units`, name a unit that raised in
   `unit_errors`, and report the streamed fold's accounting (`fold_blocks`,
   `fold_cells_read`, `fold_peak_cells` — the most source cells any one fold
-  block held).
+  block held). **`closes`** is whether the store's nodes take a close, as
+  the worker read it off the store manifest (a windowed store declaring
+  `pyramid.overview.all_time`). The fleet dispatcher fires the close units
+  from it, not from its run config: `pyramid` is not a frozen manifest key,
+  so the two can disagree, and the store is the source of truth.
 
 ### 4.8 The sweep-admission lease (`zagg-sweep-lease/1`)
 

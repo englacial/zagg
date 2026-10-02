@@ -778,6 +778,47 @@ class TestFleetUnits:
         assert "close_batches" not in row and summary["invokes"] == 5
         assert not _overviews(root, "all.zarr") and len(_overviews(root, "2020.zarr")) == 7
 
+    @pytest.mark.parametrize("store_all_time", (True, False), ids=("declared", "undeclared"))
+    def test_the_close_follows_the_store_not_the_config(
+        self, tmp_path, monkeypatch, store_all_time
+    ):
+        # ``pyramid`` is not a frozen manifest key, so a run's config can
+        # disagree with the store; the workers decide from the manifest and the
+        # dispatcher follows their records' ``closes`` — in either direction.
+        import zagg.sweep_fleet as fleet_mod
+
+        mod = _handler_module()
+        root = tmp_path / "s"
+        _windowed_store(root, all_time=store_all_time)
+        client = _FakeLambda(mod.lambda_handler)
+        waited = []
+        real = fleet_mod.await_records
+
+        def spy(records_from, expected, **kwargs):
+            waited.append(len(expected))
+            return real(records_from, expected, **kwargs)
+
+        monkeypatch.setattr(fleet_mod, "await_records", spy)
+        summary = _windowed_fleet(root, client, all_time=not store_all_time)
+        assert (summary["all_time"], summary["all_time_from"]) == (store_all_time, "store")
+        assert _stage_record(root, 0)["closes"] is store_all_time
+        units = [b.get("unit") for b in client.blocks()]
+        if store_all_time:
+            assert units == ["window"] * 4 + ["close"] * 2 + [None]
+            assert len(_overviews(root, "all.zarr")) == 7  # what the CLI writes
+        else:
+            # No close unit and no close barrier: the window barrier, the finisher.
+            assert units == ["window"] * 4 + [None] and waited == [4, 1]
+            assert not _overviews(root, "all.zarr")
+
+    def test_without_a_record_the_callers_guess_stands(self, tmp_path):
+        root = tmp_path / "s"
+        _windowed_store(root, all_time=False)
+        client = _FakeLambda(None)  # no worker runs, so no record ever lands
+        summary = _windowed_fleet(root, client, barrier_timeout_s=0.01)
+        assert [b.get("unit") for b in client.blocks()] == ["window"] * 4 + ["close"] * 2 + [None]
+        assert (summary["all_time"], summary["all_time_from"]) == (True, "caller")
+
     def test_a_dead_window_unit_is_named_and_costs_only_its_window(self, tmp_path):
         mod = _handler_module()
         root = tmp_path / "s"

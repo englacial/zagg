@@ -77,6 +77,23 @@ def closes_nodes(*, windowed: bool, all_time: bool) -> bool:
     return bool(windowed and all_time)
 
 
+def manifest_closes(manifest: dict) -> bool:
+    """:func:`closes_nodes` as the store's manifest declares it — the source of truth.
+
+    ``pyramid`` is not a frozen manifest key (it may be declared or changed
+    after the store exists), so a run's config can disagree with the store.
+    The workers decide from the manifest, and every stage record says what
+    they decided (``closes``): the fleet dispatcher takes the answer from a
+    landed window unit's record, never from its config
+    (:func:`zagg.sweep_fleet.run_stage_sweep_fleet`).
+    """
+    decl = (manifest.get("pyramid") or {}).get("overview")
+    return closes_nodes(
+        windowed=manifest.get("temporal") is not None,
+        all_time=bool(decl.get("all_time")) if isinstance(decl, dict) else False,
+    )
+
+
 def stage_units(
     work: dict,
     dispatch: int,
@@ -427,7 +444,6 @@ def run_tuple(
     manifest, by_shard = context["manifest"], context["by_shard"]
     dirt_only, ladder = context["dirt_only"], context["ladder"]
     windowed = manifest.get("temporal") is not None
-    decl = (manifest.get("pyramid") or {}).get("overview")
     counts = {
         "written": 0,
         "current": 0,
@@ -448,7 +464,7 @@ def run_tuple(
         by_shard,
         stage["dispatch"],
         windowed=windowed,
-        all_time=bool(decl.get("all_time")) if isinstance(decl, dict) else False,
+        all_time=manifest_closes(manifest),
         scope=context["scope"],
         candidates=context["candidates"],
         dirt_only=dirt_only,
