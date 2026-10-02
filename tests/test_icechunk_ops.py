@@ -843,6 +843,23 @@ class TestFinalizeOperation(_FinalizeFixtures):
         out = icechunk_ops.finalize(root, RUN, store_kwargs={})
         assert out["tagged"] is True and out["stage_record"] == own
 
+    def test_an_unreadable_record_names_no_run(self, monkeypatch, cfg, tmp_path, caplog):
+        # A torn or non-object record names no run: passed over with a warning,
+        # never a bare JSONDecodeError (a fleet 500) — alone, it is a refusal.
+        from zagg.store import open_object_store, put_object
+
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        self._manifest(root, RUN, cfg)
+        store = open_object_store(root)
+        put_object(store, f"sweep_stats_{self._stamp(180)}_stages.json", b"{torn")
+        with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no staged-sweep record"):
+            icechunk_ops.finalize(root, RUN, store_kwargs={})
+        own = self._record(root, ts=self._stamp(60))
+        put_object(store, f"sweep_stats_{self._stamp(120)}_stages.json", b"[1]")
+        out = icechunk_ops.finalize(root, RUN, store_kwargs={})
+        assert out["tagged"] is True and out["stage_record"] == own
+        assert "is not a JSON object" in caplog.text
+
     def test_the_runs_own_record_must_postdate_its_init_commit(self, monkeypatch, cfg, tmp_path):
         # The time anchor stands as the second condition: a record naming the
         # run but older than its init commit is a previous run's of that name.

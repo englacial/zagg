@@ -415,7 +415,11 @@ def newest_stage_record(
     ``python -m zagg.sweep --stages --pipeline-run-id``) stamped into the
     sweep it chained, spec §4.7. Records are read newest first until one
     matches; a record naming another run, or none (``null``: the pass
-    vouches for no run), is passed over.
+    vouches for no run), is passed over, and so is one that is not a JSON
+    object (it names no run either), with a warning. The newest match is
+    returned even when an older one is complete: the caller refuses on it.
+    Keys resolve to one second, so two passes finishing in the same second
+    write one key and the later overwrites the earlier.
     """
     import obstore
 
@@ -436,7 +440,13 @@ def newest_stage_record(
         reverse=True,
     )
     for name in names:
-        record = json.loads(bytes(obstore.get(store, name).bytes()))
+        try:
+            record = json.loads(bytes(obstore.get(store, name).bytes()))
+        except ValueError as e:
+            record = e
+        if not isinstance(record, dict):
+            logger.warning(f"stage record {name} is not a JSON object ({record}) — passed over")
+            continue
         if pipeline_run_id is None or record.get("pipeline_run_id") == pipeline_run_id:
             return name, record
     return None
@@ -522,7 +532,9 @@ def finalize_run(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     unrelated ``--stages`` pass, vouch for a ladder this run never built;
     a record naming another run, or none, now vouches for nothing here. The
     newest record naming the run decides: a later pass that names no run
-    neither vouches nor un-vouches.
+    (or an unreadable record) neither vouches nor un-vouches, and a failed
+    named retry refuses even over an earlier complete one — re-run the
+    ``--pipeline-run-id`` pass to completion.
     """
     from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
     from zagg.semantics import semantic_hash

@@ -966,7 +966,11 @@ the run's init commit. A `--stages` pass without it records
 `pipeline_run_id: null`, vouches for no run, and `finalize` refuses, naming
 the record it found and this command. The newest record that names the run
 decides: a later pass that names none neither vouches for the run nor
-blocks it.
+blocks it, and neither does a record that is not a JSON object (passed over
+with a warning). So a named retry that failed refuses even when an earlier
+named pass completed: run the named pass again, to completion. Record keys
+resolve to one second, so a pass finishing in the same second as the named
+one overwrites its record; leave a second between them.
 
 The families pass is idempotent; run it even when `tail.json` exists, since
 the launcher may have died before the families invoke (attach then runs no
