@@ -1489,6 +1489,7 @@ stage 1: refs-only, additive; the leaves stay normative):
      /19                           <- a group per LEVEL, named by cell order: the base leaves …
      /13                           <- … the leaf columns' declared member (one object per leaf) …
      /12, /11, … /4                <- … and one per declared overview order (one object per node)
+     /window_start, /window_end    <- the row coordinate every level shares
   {sign+base}/...                 <- the digit tree, unchanged
 ```
 
@@ -1500,7 +1501,25 @@ re-rooted on the whole sphere at that cell order — `count`, `morton`, every fi
 their siblings — chunked at the object's **inner** chunk (the leaf's inner
 chunk for the base; the whole object, one chunk per node, for a column or
 overview level) and coded with the inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
-ordinary arrays without moczarr. In a **browser**, icechunk-js reads the
+ordinary arrays without moczarr.
+
+Every level array is **`(n_rows, n_cells)`**, chunked one row deep
+(`zagg-icechunk/2`, [issue #584](https://github.com/englacial/zagg/issues/584),
+spec §11.2). A **row** is one window of the store's schedule, or the
+reserved row `all`; an unwindowed store has the single row `all`, so its
+arrays read as `array[0, …]`. The repo root's `zagg_icechunk.rows` lists
+the row labels in allocation order — row `w` is `rows[w]`, appended to in
+order of first appearance and never reordered, so a reader looks a row up
+by label rather than assuming chronological order — and two root arrays,
+`window_start` / `window_end` (`int64`, the manifest's temporal epoch and
+units; the fill value on the unbounded `all` row), carry each row's
+half-open time range. The level groups' `dggs` block (copied from the
+artifact, so `spatial_dimension: "cells"`, `coordinate: "morton"`) binds to
+each row slice `array[w, …]`: pick the row, then read it as the block says
+— `morton` holds the same words in every row that has the node's object.
+A repo written before the row dimension
+(`zagg-icechunk/1`) is refused by the writer with the remedy in the error:
+clear `{store_root}/icechunk/` and let the next run's init re-create it. In a **browser**, icechunk-js reads the
 **dense** arrays today — `morton`, `count`, the per-field summaries; the
 `zagg-ragged/1` `vlen-bytes` arrays await zarrita codec support (no
 `vlen-bytes` codec, and a closed dtype union —
@@ -1509,7 +1528,7 @@ ordinary arrays without moczarr. In a **browser**, icechunk-js reads the
 The Python pair decodes both. The repo's root attrs mirror the manifest's
 `zagg-multiscales/1` block as `multiscales`, so one open discovers every
 level (the icechunk-multiscales convention gridlook's level resolver reads).
-A leaf at shard rank `r` owns global chunks `[r·C, (r+1)·C)` (spec §11.3); absent inner
+A leaf at shard rank `r` owns chunks `(w, [r·C, (r+1)·C))` of its row `w` (spec §11.3); absent inner
 chunks emit no reference and read as fill; every reference carries the
 object's checksum in the form its container validates — the ETag on S3, the
 object's `last_modified` ceiled to the next whole second on a local store —
@@ -1525,13 +1544,15 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   creates-or-opens the repo with **every** level group — the base, the
   column's declared member and one per declared overview level, keyed by
   cell order — defines their array nodes, one manifest split per group, the
-  virtual chunk container and the `multiscales` mirror, and commits
-  `init {run_id}` (every run — empty when the block is unchanged, labelled
-  `split ratchet {from}->{to} {run_id}` when it re-cuts, so the ancestry
-  brackets each run). Idempotent — a rerun reopens; a repo built for another
-  geometry or container is refused, while `split_order` follows the ratchet
+  virtual chunk container and the `multiscales` mirror, **allocates the
+  run's rows** (the event's `rows`, `["all"]` for an unwindowed run: each new
+  label grows every array by one row, in order of first appearance) and commits
+  `init {run_id}` (every run — empty when neither the block nor the rows change,
+  labelled `split ratchet {from}->{to} {run_id}` when it re-cuts, so the
+  ancestry brackets each run). Idempotent — a rerun reopens; a repo built for another
+  geometry, container or spec revision is refused, while `split_order` follows the ratchet
   below and `commit` / `commit_order` are per-run, never compared. The record (`path`, `snapshot`, `created`, `options`,
-  `levels`, `ladder`, `split_ratchet`) rides the run summary under
+  `levels`, `ladder`, `split_ratchet`, `rows`) rides the run summary under
   `icechunk`; a failed init records `{"error": …}` there and the run proceeds
   refs-less. The run parquet broadcasts it as `icechunk_init_repo`,
   `icechunk_init_snapshot`, `icechunk_init_error` and
@@ -1604,12 +1625,14 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   python -m zagg.icechunk_ops <store_root> finalize <run_id> [--function-name <fn>]   # tag a completed-but-untagged ladder run (the repo's newest run only); an s3:// store is finalized by the worker
   ```
 
-  Before the commit the array model of every array must be unchanged and
+  Before the commit the array model of every array must be unchanged — but
+  for row growth: new labels appended to `rows`, every array holding that many
+  rows — and
   the block's compatibility keys must hold, else the session is discarded.
   `set-attrs` refuses the root's `zagg_icechunk` and `multiscales` keys;
   `declare-pyramid` adds a newly declared level's group (and its manifest
   split), delists a no-longer-declared one without deleting its group, and
-  refuses a geometry change (that is a `/2` revision). The manifest
+  refuses a geometry change (that is a new spec revision). The manifest
   retrofit runs `declare-pyramid` itself ([above](#retrofitting-the-pyramid-declaration)).
   `finalize` ([issue #588](https://github.com/englacial/zagg/issues/588))
   is the repair for a ladder run whose dispatcher died after the staged
@@ -1706,7 +1729,8 @@ passes them. Leaf objects are never touched by any of it.
 
 `output.icechunk: false` opts a hive run out (default on; excluded from the
 D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves and raster
-hive products are outside stage 1 (spec §11.6;
+hive products are not indexed yet (spec §11.6: the row model holds them, the
+writer does not record them, and the knob resolves off there;
 [issue #584](https://github.com/englacial/zagg/issues/584) tracks both); the sweep's overviews are in
 — every declared overview level has its group in the store's one repo.
 
@@ -1727,9 +1751,13 @@ repo = icechunk.Repository.open(
 )
 group = zarr.open_group(repo.readonly_session("main").store, mode="r")
 group.attrs["multiscales"]         # the manifest's zagg-multiscales/1 block: every level
-count = group["19/count"]          # the base leaves: shape 12·4^19, chunks 4^6
-column = group["13/count"]         # the leaf columns' member: shape 12·4^13, chunks 256 (one per leaf)
-coarse = group["11/count"]         # the order-7 overviews: shape 12·4^11, chunks 256 (one per node)
+rows = group.attrs["zagg_icechunk"]["rows"]   # the row labels, in allocation order: ["all"] when unwindowed
+row = rows.index("all")            # look a row up by label; never assume an order
+count = group["19/count"]          # the base leaves: shape (n_rows, 12·4^19), chunks (1, 4^6)
+column = group["13/count"]         # the leaf columns' member: shape (n_rows, 12·4^13), chunks (1, 256) (one per leaf)
+coarse = group["11/count"]         # the order-7 overviews: shape (n_rows, 12·4^11), chunks (1, 256) (one per node)
+cells = count[row, 0 : 4**10]      # one leaf's cells of that row
+group["window_start"][:], group["window_end"][:]   # each row's [start, end); the fill value on "all"
 
 # A run's snapshot, by tag (spec §11.4): the store as that run left it.
 as_of_run = zarr.open_group(repo.readonly_session(tag="run-<run_id>").store, mode="r")
@@ -1749,7 +1777,9 @@ either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `url_prefix` and the paths above, which is what makes the same two calls
 writable in icechunk-js.
 
-The manifest split (spec §11.5) is one base manifest per order-`split_order`
+The manifest split (spec §11.5) is on the cell axis alone — one manifest
+spans every row of its cell run, so the manifest count does not grow with
+the rows — at one base manifest per order-`split_order`
 cell — at the defaults an order-6 cell, 16,384 chunks, 64 leaves — and the
 same number of chunks per manifest at every coarser level (so a coarse
 manifest spans a coarser cell: order 2 at `/13`, a base cell at `/11` and

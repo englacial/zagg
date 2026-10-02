@@ -471,6 +471,9 @@ class TestDispatch:
         # ... with the very config dispatch() pinned and sent to the init.
         (init_event,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_init"]
         assert fin_event["config"] == init_event["config"]
+        # The run's row labels ride the init (issue #584, spec §11.4): an
+        # unwindowed run's one ``all`` row.
+        assert init_event["rows"] == ["all"]
         # The finalize outcome is surfaced on the handle, not write-only: the
         # stub's bare envelope is a fail-open error the caller can read.
         assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]

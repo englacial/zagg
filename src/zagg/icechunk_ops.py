@@ -7,7 +7,8 @@ repo**, never by rewriting leaves. Each operation here is one such commit:
 a message naming the operation, commit metadata ``{"operation",
 "zagg_version", …}`` so history reads as a log, a **validation pass before
 the commit** (the array model — shape, dtype, chunks, codecs, fill of every
-array — must be byte-identical before and after, the ``zagg_icechunk``
+array — must be identical before and after but for row growth: rows
+appended, to every array at once; the ``zagg_icechunk``
 compatibility keys must hold, every listed level must have its group; a
 mutation that fails is discarded, nothing lands), and no leaf touched.
 
@@ -21,7 +22,7 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
   and keeps its group and split (its refs stay readable on every snapshot
   that names them); a level whose
   geometry the manifest would change is refused — an array-model change is a
-  ``/2`` revision, never an operation. The retrofit tool calls this itself
+  new revision, never an operation. The retrofit tool calls this itself
   when the store has a repo, so one operator step declares both planes.
 - ``finalize`` — tag a ladder run its dispatcher left untagged (issue
   #588): the run's staged sweep completed but the dispatcher died before
@@ -84,6 +85,8 @@ from zagg.icechunk_refs import (
     repo_group_spec,
     repo_path,
 )
+from zagg.icechunk_rows import array_model as _array_model
+from zagg.icechunk_rows import check_array_model
 
 logger = logging.getLogger(__name__)
 
@@ -98,24 +101,14 @@ def _node_path(path: str) -> str:
     return path.strip().strip("/")
 
 
-def _array_model(session) -> dict[str, dict]:
-    """``{array path: metadata minus attrs}`` for every array in the session."""
-    import zarr
-
-    root = zarr.open_group(session.store, mode="r")
-    model = {}
-    for path, node in root.members(max_depth=None):
-        if isinstance(node, zarr.Array):
-            meta = node.metadata.to_dict()
-            meta.pop("attributes", None)
-            model[path] = meta
-    return model
-
-
 def _validate(
     session, before: dict[str, dict], allow_new: tuple[str, ...], block: dict, path: str
 ) -> None:
     """The pre-commit check; raises ``ValueError`` and the caller discards the session.
+
+    The array model may move by ROW GROWTH and nothing else
+    (:func:`zagg.icechunk_rows.check_array_model`): labels appended to the
+    block's ``rows``, every array holding exactly that many rows.
 
     It runs on the session as mutated, not after a rebase: ``_commit`` rebases
     with ``ConflictDetector``, which refuses any conflicting change, so a
@@ -123,19 +116,11 @@ def _validate(
     """
     import zarr
 
-    after = _array_model(session)
-    for array, meta in before.items():
-        if array not in after:
-            raise ValueError(f"operation would remove array {array!r}")
-        if after[array] != meta:
-            raise ValueError(f"operation would change the array model of {array!r} (spec §11.2)")
-    for array in after:
-        if array not in before and not array.startswith(allow_new):
-            raise ValueError(f"operation would add array {array!r}")
     root = zarr.open_group(session.store, mode="r")
     got = root.attrs.get(ICECHUNK_ATTR)
     if not isinstance(got, dict):
         raise ValueError(f"operation would remove the root {ICECHUNK_ATTR!r} block")
+    check_array_model(before, _array_model(session), block["rows"], got.get("rows"), allow_new)
     # ``cell_order`` apart: in ``_check_block`` it would also vet the level
     # keying and blame the repo for what is this operation's refusal.
     _check_block(got, {k: block.get(k) for k in _FIXED_BLOCK_KEYS if k != "cell_order"}, path)
@@ -174,6 +159,9 @@ def _operation(
         repo, block = open_vetted(store_root, store_kwargs=store_kwargs)
     path = repo_path(store_root)
     session = repo.writable_session(BRANCH)
+    # An init may have allocated rows since the vet: ``mutate`` and the check
+    # work from the rows this session reads (§11.2).
+    block = {**block, "rows": list(_session_block(session)["rows"])}
     before = _array_model(session)
     details = mutate(session, block)
     report = {"operation": name, "path": path, "snapshot": None, "message": None, **details}
@@ -265,7 +253,8 @@ def declare_pyramid(
     want = {"shard_order": int(grid.parent_order), **level_geometry(grid)}
     repo, block = open_vetted(store_root, store_kwargs=store_kwargs, want=want)
     options = {k: block[k] for k in ("commit", "commit_order", "split_order")}
-    spec = repo_group_spec(grid, store_root, options, manifest)
+    # A newly declared level's arrays are built at the repo's rows (§11.2).
+    spec = repo_group_spec(grid, store_root, options, manifest, block["rows"])
     levels = spec.attributes[ICECHUNK_ATTR]["levels"]
     mirror = spec.attributes.get(MULTISCALES_ATTR)
     recorded = dict(block.get("levels") or {})
@@ -273,7 +262,7 @@ def declare_pyramid(
         if levels[order] != recorded[order]:
             raise ValueError(
                 f"level /{order} is recorded as {recorded[order]}, the manifest now declares "
-                f"{levels[order]}: an array-model change is a /2 revision, not an operation"
+                f"{levels[order]}: an array-model change is a new revision, not an operation"
             )
     added = sorted(levels.keys() - recorded.keys(), key=int)
     dropped = sorted(recorded.keys() - levels.keys(), key=int)
@@ -282,23 +271,28 @@ def declare_pyramid(
     retired = {**(block.get("retired") or {}), **{o: recorded[o] for o in dropped}}
     retired = {o: lvl for o, lvl in retired.items() if o not in levels}
 
-    def mutate(session, _block):
+    def mutate(session, session_block):
         import zarr
 
+        # Built at the rows the session reads: an init may have grown them since the vet.
+        members = spec.members
+        if session_block["rows"] != block["rows"]:
+            rows = session_block["rows"]
+            members = repo_group_spec(grid, store_root, options, manifest, rows).members
         root = zarr.open_group(session.store, mode="r+")
         present = {name for name, _ in root.members()}
         for order in added:
             if order in present:
                 # Delisted earlier and declared again: its group is still there,
                 # and must still carry the declared model.
-                if not _group_matches(session, order, spec.members[order]):
+                if not _group_matches(session, order, members[order]):
                     raise ValueError(
                         f"level /{order} exists with another array model than the manifest "
-                        f"declares: an array-model change is a /2 revision, not an operation"
+                        f"declares: an array-model change is a new revision, not an operation"
                     )
                 continue
             with vlen_dtype_warning_suppressed():
-                spec.members[order].to_zarr(session.store, order, overwrite=False)
+                members[order].to_zarr(session.store, order, overwrite=False)
         attrs = root.attrs.asdict()
         new_block = {**attrs[ICECHUNK_ATTR], "levels": levels, "retired": retired}
         if not retired:

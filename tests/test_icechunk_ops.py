@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 
@@ -126,7 +127,7 @@ class TestValidation:
             return {}
 
         def resize(session, _block):
-            zarr.open_array(session.store, path="6/count", mode="r+").resize((8,))
+            zarr.open_array(session.store, path="6/count", mode="r+").resize((1, 8))
             return {}
 
         def drop_block(session, _block):
@@ -157,6 +158,91 @@ class TestValidation:
         assert len(_messages(root)) == n  # nothing landed
         assert "6/extra" not in icechunk_ops._array_model(_open(root)[1].readonly_session("main"))
 
+    @staticmethod
+    def _grow(session, rows, *, arrays=True, block=True, skip=()):
+        """Append ``rows`` the way an allocation does; each half can be left out."""
+        root_group = zarr.open_group(session.store, mode="r+")
+        have = list(root_group.attrs[ICECHUNK_ATTR]["rows"])
+        if arrays:
+            for path, node in root_group.members(max_depth=None):
+                if isinstance(node, zarr.Array) and path not in skip:
+                    node.resize((len(have) + len(rows), *node.shape[1:]))
+        if block:
+            root_group.attrs[ICECHUNK_ATTR] = {
+                **root_group.attrs[ICECHUNK_ATTR],
+                "rows": [*have, *rows],
+            }
+
+    def test_rows_may_grow_and_nothing_else(self, monkeypatch, cfg, tmp_path):
+        # The identity check's one allowance (§11.4): labels appended to the
+        # block's ``rows`` with EVERY array holding that many rows. Anything
+        # short of that — a shrink, a cell-extent change, arrays and block out
+        # of step, a reordered list, a label allocated twice — is refused and
+        # nothing lands.
+        _grid_, root = _store(monkeypatch, cfg, tmp_path)
+        n = len(_messages(root))
+        grow = self._grow
+
+        def shrink(session, _block):
+            zarr.open_array(session.store, path="6/count", mode="r+").resize((0, 12 * 4**6))
+            return {}
+
+        def grow_cells_too(session, _block):
+            grow(session, ["2019"])
+            arr = zarr.open_array(session.store, path="6/count", mode="r+")
+            arr.resize((arr.shape[0], arr.shape[1] + 4))
+            return {}
+
+        def reorder(session, _block):
+            grow(session, ["2019"])
+            root_group = zarr.open_group(session.store, mode="r+")
+            block = dict(root_group.attrs[ICECHUNK_ATTR])
+            root_group.attrs[ICECHUNK_ATTR] = {**block, "rows": block["rows"][::-1]}
+            return {}
+
+        for mutate, msg in (
+            (shrink, "would change the array model of '6/count'"),
+            (grow_cells_too, "would change the array model of '6/count'"),
+            (lambda s, _b: grow(s, ["2019"], block=False) or {}, "off the block's 1 rows"),
+            (lambda s, _b: grow(s, ["2019"], arrays=False) or {}, "off the block's 2 rows"),
+            (lambda s, _b: grow(s, ["2019"], skip=("6/count",)) or {}, r"\['6/count'\] off"),
+            (reorder, "would reorder or drop rows"),
+            (lambda s, _b: grow(s, ["all"]) or {}, "would allocate a row twice"),
+            (lambda s, _b: grow(s, ["2019", "2019"]) or {}, "would allocate a row twice"),
+        ):
+            with pytest.raises(ValueError, match=msg):
+                icechunk_ops._operation(root, "probe", mutate, store_kwargs={})
+        assert len(_messages(root)) == n  # nothing landed
+
+    def test_an_allocation_passes_the_check(self, cfg, tmp_path):
+        # The init's own allocation (``grow_rows`` plus the block's ``rows``,
+        # §11.4) on a windowed store is exactly the growth the check allows.
+        from test_icechunk_rows import _Y, _YEARLY
+
+        from zagg import icechunk_rows
+
+        cfg.output["pyramid"] = False
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        manifest = hive.build_manifest(grid, windowing=_YEARLY)
+        icechunk_refs.init_repo(
+            root, grid, cfg, run_id=RUN, store_kwargs={}, manifest=manifest, rows=["2019"]
+        )
+
+        def allocate(session, block):
+            rows = icechunk_rows.grow_rows(session, block["rows"], ["2020", "2021"], _YEARLY)
+            root_group = zarr.open_group(session.store, mode="r+")
+            root_group.attrs[ICECHUNK_ATTR] = {**root_group.attrs[ICECHUNK_ATTR], "rows": rows}
+            return {}
+
+        out = icechunk_ops._operation(root, "probe", allocate, store_kwargs={})
+        assert out["snapshot"] and _messages(root)[0] == "probe"
+        group, _repo = _open(root)
+        assert group.attrs[ICECHUNK_ATTR]["rows"] == ["2019", "2020", "2021"]
+        assert group["6"]["count"].shape == (3, 12 * 4**6)
+        assert group["window_start"][:].tolist() == [_Y[2019], _Y[2020], _Y[2021]]
+        assert int(group["6"]["count"][1:, :].sum()) == 0  # the new rows read fill
+
 
 class TestDeclarePyramid:
     def test_adds_the_declared_levels_and_the_mirror(self, monkeypatch, cfg, tmp_path):
@@ -176,7 +262,7 @@ class TestDeclarePyramid:
         )
         assert block["levels"] == fresh["levels"] == r["levels"]
         assert group.attrs[MULTISCALES_ATTR] == manifest[MULTISCALES_ATTR]
-        assert {k for k, _ in group.members()} == set(block["levels"])
+        assert {k for k, _ in group.groups()} == set(block["levels"])
         # Each new group carries the level's array model, and the repo's
         # persisted manifest splits cover it (a commit into it cuts at its
         # own order, §11.5).
@@ -225,14 +311,17 @@ class TestDeclarePyramid:
         key = "c/" + "/".join("0" * written.ndim)
         location = icechunk_refs.container_prefix(root) + f"obj/count/{key}"
         length = (tmp_path / "store" / "obj" / "count" / key).stat().st_size
+        # A unit's chunk keys are the object's cell-axis plan; the commit
+        # places them at the unit's row (the ``all`` row here, §11.3).
         unit = {
             "level": 5,
+            "row": "all",
             "entries": [
                 {
                     "path": "count",
                     "refs": 1,
                     "sharded": False,
-                    "chunks": [(f"count/{key}", location, length, None)],
+                    "chunks": [("count/c/0", location, length, None)],
                 }
             ],
         }
@@ -272,7 +361,10 @@ class TestDeclarePyramid:
             # An init ratchet lands right after this operation's commit.
             out = commit(session, message, **kw)
             _group, repo = _open(root)
-            icechunk_refs._update_block(repo, {"split_order": 1}, "ratchet", local=True, path="")
+            ratchet = repo.writable_session("main")
+            root_group = zarr.open_group(ratchet.store, mode="r+")
+            root_group.attrs[ICECHUNK_ATTR] = {**root_group.attrs[ICECHUNK_ATTR], "split_order": 1}
+            commit(ratchet, "ratchet", local=True)
             return out
 
         monkeypatch.setattr(icechunk_ops, "_commit", ratchet_lands_too)
@@ -296,7 +388,7 @@ class TestDeclarePyramid:
         group, _repo = _open(root)
         assert list(group.attrs[ICECHUNK_ATTR]["levels"]) == ["6"]
         assert MULTISCALES_ATTR not in group.attrs
-        assert {k for k, _ in group.members()} == {"1", "2", "3", "4", "5", "6"}  # kept
+        assert {k for k, _ in group.groups()} == {"1", "2", "3", "4", "5", "6"}  # kept
         cfg.output.pop("pyramid")
         _write_manifest(root, grid)
         r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
@@ -309,6 +401,85 @@ class TestDeclarePyramid:
             "5",
             "6",
         ]
+
+    def test_levels_follow_the_repos_rows(self, cfg, tmp_path):
+        # A level declared after the repo's rows were allocated is built at
+        # those rows, and a delisted level's surviving group grows with every
+        # later allocation, so relisting it still finds the declared model
+        # (§11.2, §11.4). A windowed manifest drives it: the model must hold
+        # one before the writer indexes windowed stores (§11.6).
+        from test_icechunk_rows import _YEARLY
+
+        def declare():
+            manifest = hive.build_manifest(grid, windowing=_YEARLY)
+            return icechunk_ops.declare_pyramid(
+                root, cfg, store_kwargs={}, manifest=manifest, grid=grid
+            )
+
+        def rows_of(order):
+            return {arr.shape[0] for _name, arr in _open(root)[0][order].arrays()}
+
+        cfg.output["pyramid"] = False
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        bare = hive.build_manifest(grid, windowing=_YEARLY)
+        icechunk_refs.init_repo(
+            root, grid, cfg, run_id=RUN, store_kwargs={}, manifest=bare, rows=["2019", "2020"]
+        )
+        cfg.output.pop("pyramid")
+        assert declare()["added"] == ["1", "2", "3", "4", "5"]
+        assert rows_of("5") == rows_of("6") == {2}
+        cfg.output["pyramid"] = False
+        assert declare()["dropped"] == ["1", "2", "3", "4", "5"]
+        out = icechunk_refs.init_repo(
+            root, grid, cfg, run_id="r2", store_kwargs={}, manifest=bare, rows=["2021"]
+        )
+        assert out["rows"] == ["2019", "2020", "2021"]
+        assert rows_of("5") == rows_of("6") == {3}  # the retired group grew too
+        cfg.output.pop("pyramid")
+        relisted = declare()
+        assert relisted["added"] == ["1", "2", "3", "4", "5"] and relisted["snapshot"]
+        assert all(rows_of(order) == {3} for order in ("1", "2", "3", "4", "5", "6"))
+
+    @pytest.mark.parametrize("relist", [False, True])
+    def test_an_init_landing_after_the_vet_is_built_at_its_rows(
+        self, monkeypatch, cfg, tmp_path, relist
+    ):
+        # An init that allocates rows between the vet and the operation's
+        # session: the new (or relisted) groups are built and checked at the
+        # rows the session reads, so the declaration lands (§11.2, §11.4).
+        from test_icechunk_rows import _YEARLY
+
+        cfg.output["pyramid"] = False
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        bare = hive.build_manifest(grid, windowing=_YEARLY)
+        icechunk_refs.init_repo(
+            root, grid, cfg, run_id=RUN, store_kwargs={}, manifest=bare, rows=["2019"]
+        )
+        cfg.output.pop("pyramid")
+        full = hive.build_manifest(grid, windowing=_YEARLY)
+        if relist:
+            icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=full, grid=grid)
+            icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=bare, grid=grid)
+        vet = icechunk_ops.open_vetted
+        run2 = copy.deepcopy(cfg)
+        run2.output["pyramid"] = False
+
+        def init_lands(*a, **k):
+            out = vet(*a, **k)
+            icechunk_refs.init_repo(
+                root, grid, run2, run_id="r2", store_kwargs={}, manifest=bare, rows=["2020"]
+            )
+            return out
+
+        monkeypatch.setattr(icechunk_ops, "open_vetted", init_lands)
+        r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=full, grid=grid)
+        assert r["added"] == ["1", "2", "3", "4", "5"] and r["snapshot"]
+        group, _repo = _open(root)
+        assert group.attrs[ICECHUNK_ATTR]["rows"] == ["2019", "2020"]
+        for order in ("1", "2", "3", "4", "5", "6"):
+            assert {arr.shape[0] for _name, arr in group[order].arrays()} == {2}
 
     def test_a_delisted_level_keeps_its_split_through_a_ratchet_and_relisting(
         self, monkeypatch, cfg, tmp_path
@@ -365,7 +536,7 @@ class TestDeclarePyramid:
         block["levels"] = {**block["levels"], "5": {**block["levels"]["5"], "chunk_order": 3}}
         root_group.attrs.put({**root_group.attrs.asdict(), ICECHUNK_ATTR: block})
         session.commit("tamper")
-        with pytest.raises(ValueError, match="/2 revision, not an operation"):
+        with pytest.raises(ValueError, match="a new revision, not an operation"):
             icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
         with pytest.raises(ValueError, match="no morton_hive.json"):
             icechunk_ops.declare_pyramid(str(tmp_path / "bare"), cfg, store_kwargs={})

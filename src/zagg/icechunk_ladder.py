@@ -25,11 +25,13 @@ travel the way the digest columns do:
    manifest COUNT the snapshot pays for (spec §11.5).
 
 The carrier is JSON — a member of the leaf's JSON-sibling family, keyed by
-the stats sidecar's grammar — holding a list of *units* ``{"level",
+the stats sidecar's grammar — holding a list of *units* ``{"level", "row",
 "entries"}`` whose entries are :func:`zagg.icechunk_refs.object_ref_plan`
 entries with the shared ``location`` and a ``present`` mask in place of the
-per-chunk location list (~40 KB per leaf at production geometry). It is a
-writer-internal carrier, not part of the reader contract (the repo is).
+per-chunk location list (~40 KB per leaf at production geometry), and whose
+``row`` is the label of the row they land in (spec §11.2; the committing
+node maps it to the repo's index). It is a writer-internal carrier, not
+part of the reader contract (the repo is).
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from zagg.icechunk_refs import (
     open_vetted,
     repo_path,
 )
+from zagg.icechunk_rows import ALL_ROW
 
 logger = logging.getLogger(__name__)
 
@@ -102,11 +105,14 @@ def _strip(location: str, prefix: str) -> str:
 
 
 def pack_units(units: list[dict], prefix: str, **meta) -> bytes:
-    """Serialize ``units`` (``[{"level", "entries"}]``) to the JSON carrier.
+    """Serialize ``units`` (``[{"level", "row", "entries"}]``) to the JSON carrier.
 
     Locations are stored **relative to the container prefix** (§11.3), so the
     carrier's bytes do not depend on where the store lives and a relocated
-    store's carriers re-expand against the new prefix.
+    store's carriers re-expand against the new prefix. A unit's ``row`` is
+    its LABEL (``all`` when it names none), never an index: the committing
+    node resolves it against the repo (§11.2), so a carrier stays valid
+    whatever rows other runs allocate.
     """
     out_units = []
     for unit in units:
@@ -142,7 +148,9 @@ def pack_units(units: list[dict], prefix: str, **meta) -> bytes:
                         "refs": int(entry["refs"]),
                     }
                 )
-        out_units.append({"level": int(unit["level"]), "entries": entries})
+        out_units.append(
+            {"level": int(unit["level"]), "row": unit.get("row", ALL_ROW), "entries": entries}
+        )
     return json.dumps({"spec": REFS_SPEC, **meta, "units": out_units}).encode()
 
 
@@ -187,7 +195,11 @@ def unpack_units(raw: bytes, prefix: str) -> tuple[list[dict], dict]:
                         "refs": int(entry["refs"]),
                     }
                 )
-        units.append({"level": int(unit["level"]), "entries": entries})
+        # A carrier written before ``zagg-icechunk/2`` names no row: only an
+        # unwindowed leaf ever wrote one (§11.6), and its row is ``all``.
+        units.append(
+            {"level": int(unit["level"]), "row": unit.get("row", ALL_ROW), "entries": entries}
+        )
     return units, meta
 
 
@@ -346,7 +358,8 @@ def _overview_units(store_root, node, orders, level_by_order, fields, candidates
                 )
             )
         if entries:
-            units.append({"level": int(level_by_order[k]), "entries": entries})
+            # ``all.zarr`` is the all-time fold: the ``all`` row (§11.2).
+            units.append({"level": int(level_by_order[k]), "row": ALL_ROW, "entries": entries})
     return units
 
 

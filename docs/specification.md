@@ -3450,12 +3450,14 @@ pinned.
 
 ## 11. Icechunk companion repo
 
-**Status: contract** (`zagg-icechunk/1`, issue
+**Status: contract** (`zagg-icechunk/2`, issue
 [#580](https://github.com/englacial/zagg/issues/580), stage 1 — refs-only,
 additive; issue [#582](https://github.com/englacial/zagg/issues/582), stage
 2 — the two-plane statement, run tags, finalize and the metadata operations
-below). The leaves remain the normative, self-describing data plane
-(§1–§10); the companion is a derived index over their bytes.
+below; issue [#584](https://github.com/englacial/zagg/issues/584) — the row
+dimension of §11.2, the `/2` array model). The leaves remain the normative,
+self-describing data plane (§1–§10); the companion is a derived index over
+their bytes.
 
 **Two planes.** A hive store is two planes with different mutability:
 
@@ -3480,15 +3482,28 @@ below). The leaves remain the normative, self-describing data plane
 repo in a commit, never by rewriting leaves — the §11.4 **operations**
 (`zagg.icechunk_ops`: `set-attrs`, `declare-pyramid`) are how an operator
 writes one. Stage 2's remaining items are tracked on issue #582: native
-overview chunks (the `/2` array model on issue #584), moczarr's reads
-through the repo (phase 6) and the browser (phase 7).
+overview chunks (issue #584 phase 3, on the `/2` array model), moczarr's
+reads through the repo (phase 6) and the browser (phase 7).
 
-**Succession.** A change to the repo's ARRAY MODEL is a `/2` revision,
-declared — as `/1` is — in the `zagg_icechunk.spec` token (§11.1), so a
-reader discriminates the two from the repo's own attrs; run tags and the
-finalize commit are additive on `/1`. `/1` remains valid and readable
-indefinitely: existing repos never require rewriting, whatever timing `/2`
-lands on.
+**Succession.** A change to the repo's ARRAY MODEL is a new revision,
+declared in the `zagg_icechunk.spec` token (§11.1), so a reader
+discriminates revisions from the repo's own attrs. **`zagg-icechunk/2`**
+(issue #584) is the row model: every level array gains a leading **row**
+dimension (§11.2), which is what lets one repo hold a windowed store's
+per-window leaves and an unwindowed store alike. `zagg-icechunk/1` (the
+same arrays without the row dimension; run tags and the finalize commit
+were additive on it) stays valid and readable as written — its arrays are
+exactly the `/2` arrays' single row — but it is **never written again**:
+the `/2` writer refuses a `/1` repo at every entry point (the init, every
+ref commit, finalize, the operations and the virtual-target collector) with
+an error naming the remedy, and there is **no in-place upgrade**, because
+no published store carries a `/1` repo. The remedy is to clear
+`{store_root}/icechunk/`: the next run's init re-creates the repo as `/2`
+and a staged sweep over the store re-gathers its refs (§11.4; a leaf's ref
+carrier written before `/2` names no row and is read as the `all` row).
+That re-gather reads the ladder's carriers, so it covers leaves written
+under `commit: "ladder"`; a leaf committed per leaf (`commit: "leaf"`)
+wrote no carrier, and is indexed again only when a run rewrites it.
 
 A morton hive is many leaf zarrs. The companion presents every leaf of one
 order as **one zarr hierarchy** by recording each leaf's inner chunks as
@@ -3509,6 +3524,7 @@ manifest's `zagg-multiscales/1` datasets (§4.9) plus the base:
    /19                           <- the base: the source leaves (node order 9, cells 19)
    /13                           <- the §4.6 leaf columns' declared member (node 9, cells 13)
    /12, /11, … /4                <- the §4 overviews, one level per ancestor order (node 8 … 0)
+   /window_start, /window_end    <- the row coordinate, shared by every level (§11.2)
 ```
 
 | level (group) | artifact per node | node order `n` | cells per object `4^(c−n)` | object arrays |
@@ -3545,9 +3561,10 @@ self-describing:
 
 ```json
 "zagg_icechunk": {
-  "spec": "zagg-icechunk/1",
+  "spec": "zagg-icechunk/2",
   "shard_order": 9, "chunk_order": 13, "cell_order": 19,
   "url_prefix": "s3://bucket/product/",
+  "rows": ["all"],
   "commit": "ladder", "commit_order": 6, "split_order": 6,
   "levels": {
     "19": {"node_order": 9, "artifact": "leaf",     "chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}},
@@ -3562,6 +3579,8 @@ self-describing:
 
 `shard_order` / `chunk_order` / `cell_order` mirror the manifest and the
 base grid; `url_prefix` is the virtual chunk container's prefix (§11.3);
+`rows` is the ordered list of row labels — row `w` of every level array is
+`rows[w]` (§11.2: `["all"]` on an unwindowed store);
 `levels` carries, per level group (keyed by cell order), its node order,
 its artifact kind, its chunk-axis order (the inner-chunk order for the base,
 the node order for a one-chunk-per-node level), its cell order and its
@@ -3572,7 +3591,9 @@ its manifest split; `commit`, `commit_order` and `split_order` are
 the ladder's knobs (§11.4, §11.5), read back by every stage node so the
 sweep needs no config. The repo root group's attrs are exactly these two
 keys: `zagg_icechunk` and the `multiscales` mirror (the mirror is absent
-only on a store whose manifest declares no `zagg-multiscales/1` block). A
+only on a store whose manifest declares no `zagg-multiscales/1` block), and
+its members exactly the level groups and the two row-coordinate arrays
+(§11.2). A
 leaf root group carries only its own commit stamp, which is a per-leaf fact
 and so has nothing to mirror. Each **level group** mirrors its artifact's
 resolution-group attrs verbatim (the `dggs` block, `zarr_conventions`), and
@@ -3584,19 +3605,72 @@ resolution-group attrs verbatim (the `dggs` block, `zarr_conventions`), and
 array `{cell_order}/{name}` for the base, a column's declared-member array
 `{c}/{name}` for the column level, an overview's `{c}/{name}` for an
 overview level), the repo holds `/{c}/{name}` whose metadata is the
-template array's, re-rooted on the whole sphere at that cell order (`n` the
-level's node order, `n_shards = 12·4^n`, the level's global shape
-`12·4^c`):
+template array's, re-rooted on the whole sphere at that cell order under a
+leading **row** dimension (`n` the level's node order, `n_shards = 12·4^n`,
+the level's global cell extent `12·4^c`, `n_rows` the length of the block's
+`rows`):
 
 | field | repo array | derivation |
 |---|---|---|
-| `shape` | `(n_shards · L₀, *L[1:])` | `L` the level's per-node object array's shape (the leaf's for the base); `n_shards = 12·4^n`, `n` the level's node order |
-| chunk shape | the object's **inner** chunk shape | the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5), else its own `chunk_grid` — the whole object for a column or overview level, one chunk per node |
+| `shape` | `(n_rows, n_shards · L₀, *L[1:])` | `L` the level's per-node object array's shape (the leaf's for the base); `n_shards = 12·4^n`, `n` the level's node order; `n_rows` the same for every array of the repo |
+| chunk shape | `(1, *inner)` — one row deep, the object's **inner** chunk shape across | `inner` is the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5), else its own `chunk_grid` — the whole object for a column or overview level, one chunk per node |
 | `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
-| `data_type`, `fill_value`, `dimension_names`, `attributes` | verbatim from the object array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
+| `dimension_names` | `("window", *names)` | the object array's names behind the row dimension's |
+| `data_type`, `fill_value`, `attributes` | verbatim from the object array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
 
-Zarr metadata therefore passes through untouched: a reader that decodes a
-leaf array per §1–§3 decodes the repo array the same way, chunk by chunk.
+A `(1, C)` chunk holds exactly the bytes the object's `(C,)` inner chunk
+does (C order; none of the inner codecs depends on the chunk's rank), so a
+reader that decodes a leaf array per §1–§3 decodes the repo array the same
+way, chunk by chunk, and a virtual reference needs no re-encoding.
+
+The level group's `dggs` block is the artifact's, verbatim, so it names
+`spatial_dimension: "cells"` and its cell `coordinate` (`morton`) as the
+artifact does: it binds to **each row slice** `array[w, …]`, which is
+exactly the artifact's 1-D array on the whole sphere. `morton` is a
+function of the cell alone, so every row holding a node's object holds the
+same words there (a row with no object at that node reads fill); a
+convention-following reader selects a row first, then reads the slice as
+the `dggs` block describes.
+
+**Contract — rows.** A **row** is one window of the store's schedule (§4.2,
+the manifest's `temporal` block), or the reserved row **`all`** — the same
+token the leaf and overview names reserve. Which rows a store has follows
+its kind, fixed at birth with its schedule:
+
+- an **unwindowed** store (`schedule: none`) has the single row `all`, its
+  only row at every level — it is the one-row case of the model, not a
+  different one;
+- a **windowed** store has one row per label its runs have named: a row
+  per window written, and `all` for its all-time fold once a run names it
+  (populated at the overview levels only — there is no all-time leaf at
+  the base). Nothing is allocated that no run named: which labels a
+  windowed run names is the dispatcher's (the `all` fold follows
+  `pyramid.overview.all_time`, §4.5) and lands with the windowed writer
+  (§11.6), and an init that names no label on a windowed store is refused
+  rather than creating a repo with no rows.
+
+The two meanings of `all` never meet in one store. **The row law:** a
+label's row is allocated **once**, by label, in **order of first
+appearance**, and never moves — a window that sorts before an existing one
+is still appended after it (sorted rank would move every later reference).
+The block's `rows` list is the authority: row `w` is `rows[w]`, the list is
+only ever appended to, and a reader looks a row up by label or sorts by the
+coordinate below, never assumes chronological order. (A chronological
+listing, if ever wanted, is a metadata operation — Icechunk's
+`Session.reindex_array` rewrites an array's manifests and no chunk.)
+
+**Contract — the row coordinate.** The repo root holds two `int64` arrays
+of shape `(n_rows,)` on the `window` dimension, `window_start` and
+`window_end`: row `w`'s half-open `[start, end)` as integers in the
+manifest's temporal `units` on its `scale` since its `epoch` (the encoding
+the leaves' `time_field` values are in). Their attrs mirror that encoding —
+`units` as the CF string `"{units} since {epoch}"`, `calendar`, and `scale`
+(`utc` / `gps` / `tai`, which CF does not carry) — and are empty on an
+unwindowed store. The **`all` row carries no bound**: both arrays read
+their `fill_value`, `−2^63`, there (never written). A window boundary that
+is not a whole number of the declared units is refused at allocation, not
+rounded. The arrays are chunked 1,024 rows deep (`[bytes, zstd]`), so the
+coordinate is one small chunk for any store's lifetime of windows.
 
 ### 11.3 Chunk index law and refs
 
@@ -3605,15 +3679,20 @@ leaf array per §1–§3 decodes the repo array the same way, chunk by chunk.
 level of cell order `c` and node order `n`, an object at nested rank `r` at
 order `n` (`r ∈ [0, 12·4^n)`, the rank `block_index` gives) holds `4^(c−n)`
 cells; its chunk `j` (C-order within the object's chunk grid along the cells
-axis, `j ∈ [0, C)`, `C` the object's chunk count) sits at global chunk index
+axis, `j ∈ [0, C)`, `C` the object's chunk count) sits, in row `w` (§11.2 —
+the row of the object's window; `all` for an unwindowed leaf, a leaf column
+and an all-time overview), at global chunk index
 
 ```text
-r · C + j        (trailing axes keep their object-local chunk index, 0 for a single-chunk payload dim)
+(w, r · C + j)   (trailing axes keep their object-local chunk index, 0 for a single-chunk payload dim)
 ```
 
 For the base level `C = 4^(chunk_order − shard_order)` inner chunks; for a
-column or overview level the object is ONE chunk, `C = 1`, and the global
-index is the node's rank itself.
+column or overview level the object is ONE chunk, `C = 1`, and the cell-axis
+index is the node's rank itself. The row index is the repo's, not the
+object's: a writer names an object's row by **label** and the commit
+resolves it against the block's `rows` (§11.4), so the same object bytes
+land at whatever row the repo allocated that label.
 
 At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
 
@@ -3643,7 +3722,10 @@ separator throughout — so the chunk at grid index `(i₀, i₁, …)` is
 
 with the trailing axes at their **leaf-local** chunk index (`0` for a
 dimension the array holds in a single chunk). A 1-D array's key is therefore
-`c/0` for its one chunk, and `c/{j}` where the cells axis is chunked. Keys
+`c/0` for its one chunk, and `c/{j}` where the cells axis is chunked. These
+are the **object's** keys, and an object's arrays have no row dimension: the
+row appears only in the repo array's own chunk index, `(w, r·C + j, …)`,
+never in a `location`. Keys
 are used **verbatim** as the path part of `location` (`//` and `.`/`..` are
 preserved), so a character that is reserved in a URL but part of the key MUST
 be percent-encoded — `?` → `%3F`, `#` → `%23`, `%` → `%25`
@@ -3710,9 +3792,13 @@ columns do:
    The carrier is JSON declaring `zagg-icechunk-refs/1`, the writer's
    geometry (`shard_order`, `chunk_order`, `cell_order` — never the
    container prefix, which is vetted at the repo) and the entries (≈40 KB per
-   leaf at production geometry). It is a **writer-internal carrier**, not part
-   of the reader contract — the repo is. No Icechunk session is opened on
-   the leaf path.
+   leaf at production geometry), grouped into units that each name the
+   **row** they land in by **label** (`row`: `all` for an unwindowed leaf
+   and its column; a carrier written before `/2` names none and is read as
+   `all`) — never a row index, which only the repo knows (§11.2), so a
+   carrier stays valid whatever rows other runs allocate. It is a
+   **writer-internal carrier**, not part of the reader contract — the repo
+   is. No Icechunk session is opened on the leaf path.
 2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
    `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
    the finest tuple, its children's **node ref columns** (the same carrier at
@@ -3727,7 +3813,10 @@ columns do:
      gathered in **one commit** — every level's refs into its group of the
      same repo, keyed by cell order (§11.1): the base leaves into
      `/{cell_order}/…` (`/19`), the column's declared member into `/{c}/…`
-     (`/13`) and each overview level into `/{c}/…` (`/12` … `/4`) —
+     (`/13`) and each overview level into `/{c}/…` (`/12` … `/4`) — each
+     unit at the row its label resolves to in the block's `rows` as the
+     committing session reads it (a unit naming a row the repo never
+     allocated fails the node's commit, fail-open) —
      message `node {decimal}`;
    - `d′ ≤ c` — a coarser tuple: its nodes commit only their **own**
      overview refs (their children already committed);
@@ -3774,18 +3863,42 @@ sidecar.
 fan-out: the repo exists with **every** level group (§11.1 — the base, the
 column's declared member and one per declared overview level, keyed by cell
 order, created here once because Icechunk's create is not safe under
-concurrent callers), its array nodes (§11.2) defined and the `multiscales`
-mirror in its root attrs. Idempotent: a repo that already carries a matching
-block is reopened, never re-templated; a block for another geometry or
-container is refused. **Every run commits its `init {run_id}`** — empty
-when the block is unchanged, labelled `split ratchet {from}->{to} {run_id}`
-instead when its init re-cuts (§11.5), with `run_id` in the commit
-metadata either way — so the
+concurrent callers), its array nodes (§11.2) defined, the row coordinate at
+its root and the `multiscales` mirror in its root attrs. Idempotent: a repo
+that already carries a matching block is reopened, never re-templated — the
+one thing a reopen may do to an array is grow its rows; a block for another
+geometry or container is refused, and so is a block of another revision (a
+`/1` repo: **Succession**, above). **Every run commits its
+`init {run_id}`** — empty when neither the block nor the rows change,
+labelled `split ratchet {from}->{to} {run_id}` instead when its init re-cuts
+(§11.5), with `run_id` in the commit metadata either way — so the
 ancestry brackets each run between its init and its finalize (the repo is
 its own run log, and finalize's newest-run check below reads it). The
 ladder settings are not compared: `split_order`
 follows the §11.5 ratchet (a finer config adopts the store's value, a
 coarser one re-cuts), and `commit` / `commit_order` are per-run.
+
+**Row allocation.** The init allocates **the run's rows** inside that same
+`init {run_id}` commit, before the fan-out, so every commit of the run finds
+its row. The dispatcher names the run's row labels — `["all"]` for an
+unwindowed run — and they ride the init (`rows` on the `icechunk_init`
+event; the local backend passes them in-process). Each label the block's
+`rows` does not hold is appended, in the order given (§11.2, the row law):
+every array of the repo with the `window` dimension — each level's, listed
+or retired, and the coordinate — grows by one row per new label, the new
+rows' `window_start` / `window_end` are written, and the block records the
+longer list. A label the repo already has is a no-op, no existing row
+moves, and growing rows rewrites no manifest (a resize is metadata only).
+An unwindowed store's one row `all` is allocated at creation whatever the
+event names, and a window label on an unwindowed store — or one its
+schedule does not declare — is refused. Two runs allocating at once both
+resize every array, which Icechunk's rebase does not reconcile: the loser's
+init retries in a fresh session (5 attempts in all), re-reads the rows the winner
+recorded and appends after them. A retry re-applies the loser's own block
+changes (a ratchet, the per-run knobs) only when the winner changed nothing
+else, or made the same changes: a block the winner moved otherwise — a
+different ratchet, other knobs — is not overwritten with changes computed
+from the block before it, and the loser's init raises (and fails open).
 
 **Finalize.** `finalize {run_id}` — the once-per-run close
 (`mode="icechunk_finalize"` on Lambda, in-process on the local backend),
@@ -3905,12 +4018,21 @@ An operation's commit message names it, its commit metadata carries
 reads as a log — and it touches no leaf. Before the commit the session is
 **validated**: the array model of every array (shape, dtype, chunk grid,
 codecs, fill value — everything but attrs) MUST be identical before and
-after, the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
+after **except for row growth** — the block's `rows` may gain labels at its
+end (never lose or reorder one, nor hold one twice, §11.2), and then every array with the
+`window` dimension MUST hold exactly that many rows, its cell extent and
+everything else unchanged; rows grow for the whole repo or not at all —
+the block's `spec` / `shard_order` / `chunk_order` / `cell_order` /
 `url_prefix` MUST hold, and every level the block lists MUST have its
-group; a session that fails is discarded and nothing lands. moczarr's
+group; a session that fails is discarded and nothing lands. (Neither
+validated operation below allocates a row — the init does, §11.4 **Row allocation** —
+so for them the allowance is the invariant: a group `declare-pyramid` adds
+is built at the repo's rows — those the operation's own session reads, so an
+init allocating rows after the operation first read the block does not
+refuse it.) moczarr's
 validator (issue #582 phase 6) runs in addition when it lands; the check
 above is zagg's own. An operation
-that would write nothing commits nothing. The operations of `/1`:
+that would write nothing commits nothing. The operations:
 
 - **`set-attrs <path> <json>`** merges the JSON object into the attrs of the
   root group (`/`), a level group (`/{cells}`) or an array
@@ -3924,13 +4046,13 @@ that would write nothing commits nothing. The operations of `/1`:
   root attrs to the manifest's declaration (§4.9): every level of §11.1
   (`level_grids` of the manifest — the base plus the `/2` block's datasets)
   that the block does not list gains its group, written from the same spec
-  the init writes, and its manifest split (§11.5) is persisted with the
+  the init writes at the repo's rows (§11.2), and its manifest split (§11.5) is persisted with the
   repo; a level the manifest no longer declares is **delisted** — dropped
   from `levels` — but its group stays, since every snapshot and tag that
   references it keeps reading (a later re-declaration relists the group
   after checking its array model); a listed level whose geometry the
-  manifest would change is refused: an array-model change is a `/2`
-  revision, never an operation. A delisted level's entry moves to the
+  manifest would change is refused: an array-model change is a new
+  revision of §11, never an operation. A delisted level's entry moves to the
   block's `retired` map (§11.1), whose splits every later split save —
   this operation's and the §11.5 ratchet's — persists with the listed
   levels', and a re-declaration moves it back to `levels`. The commit metadata records the manifest's
@@ -4024,13 +4146,21 @@ fields to `icechunk_*` columns.
 
 ### 11.5 Manifest splitting
 
-**Contract.** Manifests are split along the chunk axis into runs of `4^m`
-chunks, and `m` is fixed **once, from the base level**:
+**Contract.** Manifests are split along the **cell** axis into runs of
+`4^m` chunks — and along no other: one manifest spans **every row** of its
+run (§11.2) — and `m` is fixed **once, from the base level**:
 
 ```text
 m_base = chunk_order_base − split_order          (7 at production: 4^7 = 16,384 chunks)
 m      = min(m_base, chunk_order_level)          (per level)
 ```
+
+The split therefore names **both** axes of a level array: the cell axis at
+`4^m`, and the row axis at a run length no row count reaches (`2^31 − 1`).
+Naming the row axis is required, not decorative — Icechunk splits an axis
+its config does not name at **one** chunk, which would cut a manifest per
+(row, cell run) and multiply the manifest count, and the snapshot that lists
+every manifest, by the number of rows.
 
 Because the chunk axis is in nested order, one run of the **base** is
 exactly the chunks of one HEALPix cell at order `split_order`, so the split
@@ -4061,6 +4191,23 @@ subtree and is rewritten by each node that touches it (a rebase on disjoint
 chunks, `ConflictDetector`); that is deliberate: those manifests are tens of
 KB, so the amplification is negligible in bytes, while their **count** is
 what every snapshot read pays for.
+
+*(Informative — what the row axis costs; issue #584 phase 0, icechunk
+2.2.2, one order-6 cell's 64 leaves at production geometry.)* Growing the
+row axis rewrites nothing: a resize is metadata only, and every manifest
+keeps its id. Refs written into a new row rewrite, per array, exactly the
+manifests of the split cells they touch — **whole**, the earlier rows'
+refs included — and no other; every earlier reference stays byte-identical.
+The one-row case costs nothing over a row-less array (2.10 MB of manifests
+for 147,456 refs against 2.14 MB). A windowed store's 14 windows, each
+leaf's window holding ≈20 % of its inner chunks, are 2.8× the refs and
+≈3.0× the manifest bytes of one dense row, in the **same** manifest count —
+the snapshot does not grow with the rows. The price is the append: adding
+one window to that cell rewrites its 5.8 MB of manifests to add ≈0.4 MB of
+refs (the superseded manifests are what retention collects, §11.4).
+Splitting the row axis too would write only the new refs, at one manifest
+per (row, cell run) — 14× the manifests and the snapshot entries here —
+which is the trade the cell-axis-only rule declines.
 
 **Contract — the ratchet.** The store's recorded `split_order` is
 authoritative and moves **one way, toward coarser**. At `init`, the run
@@ -4105,13 +4252,17 @@ having precisely because all refs of one leaf array carry the **same**
 ### 11.6 What §11 does not cover (informative)
 
 Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
-across windows and so cannot share one chunk axis; stage 1 records no refs
-for them (the sidecar says `skipped: windowed`) and the ladder does not run
-on a windowed store. Raster hive products (`(time, cells)` arrays, never
-sharded) are likewise out of stage 1's writer scope. Both are tracked as a
-`/2` array-model revision (a leading window dimension per level; issue
-[#584](https://github.com/englacial/zagg/issues/584)); the finalize and
-tags of §11.4 apply to them unchanged once they have a repo. The sweep-built §4
+across windows, which is what the `/2` row dimension is for: each window is
+a row (§11.2), so the array model holds them. The **writer** does not index
+them yet: it records no refs for a windowed leaf (the sidecar says
+`skipped: windowed`), the ladder does not run on a windowed store, and
+`output.icechunk` resolves off there (an explicit `true` is refused), so no
+windowed store has a repo. Raster hive products (`(time, cells)` arrays,
+never sharded — one row per acquisition, in append order) are likewise out
+of the writer's scope. Both are tracked on issue
+[#584](https://github.com/englacial/zagg/issues/584) (its phases 2 and 4);
+the finalize and tags of §11.4 apply to them unchanged once they have a
+repo. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview
 level has its group in the store's one repo, and its refs. None of these change the leaf format, the
 t-digest storage or the moczarr reader.

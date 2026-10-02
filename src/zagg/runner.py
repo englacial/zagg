@@ -4043,6 +4043,7 @@ def _run_lambda(
                 parent_order=parent_order,
                 run_id=run_id,
                 output_creds_event=output_creds_event,
+                rows=_icechunk_rows(config),
             )
             if get_icechunk(config)
             else None
@@ -5723,19 +5724,38 @@ def _pin_icechunk_commit(config, grid, *, stages: bool):
     return replace(config, output={**config.output, "icechunk": block})
 
 
+def _icechunk_rows(config) -> list:
+    """The row labels this run writes in the companion repo (issue #584, spec §11.2).
+
+    What every dispatcher hands the once-per-run init, which allocates them:
+    an unwindowed run writes the single ``all`` row.
+    """
+    from zagg.icechunk_rows import run_rows
+
+    return run_rows(get_windowing(config))
+
+
 def _init_icechunk_local(config, grid, store_path, run_id, store_kwargs) -> dict | None:
     """The local backend's in-process Icechunk init (issue #580); its record.
 
     ``None`` when ``output.icechunk`` is off; ``{"error": ...}`` on a failed
     init (fail-open, D9 — the repo is a regenerable index and the leaves stay
-    normative); else :func:`zagg.icechunk_refs.init_repo`'s record.
+    normative); else :func:`zagg.icechunk_refs.init_repo`'s record. The init
+    allocates the run's rows (:func:`_icechunk_rows`, spec §11.2).
     """
     if not get_icechunk(config):
         return None
     from zagg.icechunk_refs import init_repo
 
     try:
-        record = init_repo(store_path, grid, config, run_id=run_id, store_kwargs=store_kwargs)
+        record = init_repo(
+            store_path,
+            grid,
+            config,
+            run_id=run_id,
+            store_kwargs=store_kwargs,
+            rows=_icechunk_rows(config),
+        )
     except Exception as e:
         logger.warning(f"icechunk init failed (fail-open, issue #580): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
@@ -5755,12 +5775,15 @@ def _invoke_lambda_icechunk_init(
     parent_order=None,
     run_id=None,
     output_creds_event=None,
+    rows=None,
 ) -> dict:
     """One synchronous ``mode="icechunk_init"`` invoke (issue #580); its record.
 
     The fleet twin of :func:`_init_icechunk_local`: the worker role creates
-    or reopens the store's repo and defines every level's array nodes BEFORE the
-    fan-out, so every leaf commit finds them. ``RequestResponse`` because the
+    or reopens the store's repo, defines every level's array nodes and
+    allocates ``rows`` — the run's row labels (:func:`_icechunk_rows`), which
+    ride the event — BEFORE the fan-out, so every leaf commit finds them
+    (spec §11.2, issue #584). ``RequestResponse`` because the
     fan-out must not start ahead of it; fail-open because the leaves never
     depend on it — a stale deployment (its process handler 400s the unknown
     mode), a throttled invoke, a refused init, or a 200 that is not the
@@ -5780,6 +5803,7 @@ def _invoke_lambda_icechunk_init(
         "parent_order": parent_order,
         "run_id": run_id,
         "config": config_dict,
+        "rows": list(rows or ()),
     }
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
@@ -5810,7 +5834,16 @@ def _invoke_lambda_icechunk_init(
         return {"error": f"{type(e).__name__}: {e}"}
     record = {
         k: body[k]
-        for k in ("path", "snapshot", "created", "options", "levels", "ladder", "split_ratchet")
+        for k in (
+            "path",
+            "snapshot",
+            "created",
+            "options",
+            "levels",
+            "ladder",
+            "split_ratchet",
+            "rows",
+        )
         if k in body
     }
     record["invoke_s"] = time.perf_counter() - t0
