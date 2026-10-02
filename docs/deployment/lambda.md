@@ -865,8 +865,8 @@ Attach rebuilds the handle from the manifest and the status objects, for
 unwindowed spatial runs (a windowed run raises). It only observes shards: it
 never re-dispatches one. A `failed` status, or no status by the drop deadline
 — the function timeout plus 150 s after the manifest's `dispatched_at` —
-resolves as a failure, so wait one function timeout after the launcher died
-before attaching, or a shard still running can be recorded as failed. Shards
+resolves as a failure, so wait that long after the launcher died before
+attaching, or a shard still running can be recorded as failed. Shards
 that failed or never ran need a new dispatch (`Run.dispatch(shard_keys=…)`).
 
 With no `tail.json`, the attached session runs the tail itself, through worker
