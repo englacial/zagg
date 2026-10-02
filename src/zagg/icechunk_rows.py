@@ -96,6 +96,20 @@ def resolve_rows_per_manifest(raw: Mapping) -> int:
     return value
 
 
+def stored_rows_per_manifest(block: Mapping) -> int:
+    """The row cut a RECORDED block carries — the ONE reading of an absent key (§11.5).
+
+    A block that names ``rows_per_manifest`` carries that cut; one that does
+    not predates the 2026-10-02 ruling and keeps its every-row-in-one cut
+    (:data:`LEGACY_ROW_SPLIT`), which is baked into the manifests it has
+    already written. Every reader of a recorded block goes through here —
+    :func:`adopt_row_cut`, ``icechunk_refs.block_splits`` and
+    ``icechunk_ops.declare_pyramid`` — so the absence cannot mean one thing
+    to the value a run adopts and another to the config it persists.
+    """
+    return int(block.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
+
+
 def adopt_row_cut(existing: Mapping, options: dict, path: str) -> dict:
     """``options`` with the STORE's row cut, warning when the config's differs (§11.5).
 
@@ -106,7 +120,7 @@ def adopt_row_cut(existing: Mapping, options: dict, path: str) -> dict:
     An absent key is a repo written before the row split: it keeps its
     every-row-in-one cut (:data:`LEGACY_ROW_SPLIT`).
     """
-    stored = int(existing.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
+    stored = stored_rows_per_manifest(existing)
     if int(options["rows_per_manifest"]) == stored:
         return options
     logger.warning(
@@ -494,5 +508,6 @@ __all__ = [
     "run_rows",
     "splits_follow_block",
     "store_rows",
+    "stored_rows_per_manifest",
     "write_bounds",
 ]

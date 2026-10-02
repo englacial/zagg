@@ -4918,7 +4918,12 @@ a layout knob outside the D19 semantic core: it changes no leaf byte.
 creation, because it is baked into every manifest already written. A later
 config value is not applied — the init adopts the store's and logs a
 warning naming both — and moving it on an existing repo is an operator
-`rewrite_manifests` pass. It MUST be at least 1.
+`rewrite_manifests` pass. It MUST be at least 1. Adoption governs the
+**repository handle** the run then writes through, not only the value it
+reports: an Icechunk config supplied when a repository is opened overrides
+the saved one, so an init whose config differs from the store reopens at
+the store's cut before any commit. The block and the manifests a run writes
+therefore always name the same cut.
 
 At the defaults (`split_order = commit_order = 6` at production) a
 shard-order manifest is `4^7` = 16,384 chunks — one order-6 cell, 64 leaves —

@@ -60,6 +60,7 @@ import numpy as np
 from zagg.icechunk_rows import (
     ALL_ROW,
     DEFAULT_ROWS_PER_MANIFEST,
+    LEGACY_ROW_SPLIT,
     adopt_row_cut,
     check_revision,
     commit_rows,
@@ -70,6 +71,7 @@ from zagg.icechunk_rows import (
     row_key,
     splits_follow_block,
     store_rows,
+    stored_rows_per_manifest,
     write_bounds,
 )
 
@@ -194,10 +196,14 @@ def block_splits(block: dict) -> dict:
 
     :func:`split_block`'s rule from each entry's recorded chunk axis, so the
     splits follow the block as it stands (a ratchet included), not the one a
-    caller read earlier.
+    caller read earlier. The row cut is the block's own
+    (:func:`~zagg.icechunk_rows.stored_rows_per_manifest`): what this
+    function persists through ``_save_splits`` is what the block records,
+    and an absent key is the legacy every-row-in-one cut — never the
+    default, which would silently flip a pre-ruling repo to the new cut.
     """
     base, split_order = int(block["chunk_order"]), int(block["split_order"])
-    rows = int(block.get("rows_per_manifest") or DEFAULT_ROWS_PER_MANIFEST)
+    rows = stored_rows_per_manifest(block)
     splits = {}
     for order, level in {**(block.get("retired") or {}), **(block.get("levels") or {})}.items():
         m = split_exponent(base, split_order, int(level["chunk_order"]))
@@ -419,7 +425,11 @@ def _repo_config(store_root: str, splits: dict, store_kwargs: dict):
     config.set_virtual_chunk_container(container)
     sizes = {
         C.path_matches(regex=rf"^/{int(order)}/.*"): level_split(
-            split["chunks"], int(split.get("rows") or DEFAULT_ROWS_PER_MANIFEST)
+            # A ``split`` block recorded before the row split names no
+            # ``rows``, and means the legacy cut — the same reading
+            # ``stored_rows_per_manifest`` gives the block's own key.
+            split["chunks"],
+            int(split.get("rows") or LEGACY_ROW_SPLIT),
         )
         for order, split in sorted(splits.items(), key=lambda kv: -int(kv[0]))
     }
@@ -455,12 +465,23 @@ def _auth(store_root: str, store_kwargs: dict) -> dict:
     return {container_prefix(store_root): creds}
 
 
-def _save_splits(repo, store_root: str, splits: dict, store_kwargs: dict):
-    """Persist a new per-level split config on the repo (the §11.5 ratchet); the reopened repo."""
-    repo = repo.reopen(
+def _reopen_splits(repo, store_root: str, splits: dict, store_kwargs: dict):
+    """``repo`` reopened so THIS handle cuts manifests at ``splits``; nothing is persisted.
+
+    A config handed to ``Repository.open_or_create`` / ``reopen`` takes
+    precedence over the repo's saved one for that handle, and is saved only
+    by :func:`_save_splits`. So a run that must follow the store's cut
+    rather than its own config's reopens here — a local call, no request.
+    """
+    return repo.reopen(
         config=_repo_config(store_root, splits, store_kwargs),
         authorize_virtual_chunk_access=_auth(store_root, store_kwargs),
     )
+
+
+def _save_splits(repo, store_root: str, splits: dict, store_kwargs: dict):
+    """Persist a new per-level split config on the repo (the §11.5 ratchet); the reopened repo."""
+    repo = _reopen_splits(repo, store_root, splits, store_kwargs)
     repo.save_config()
     return repo
 
@@ -739,7 +760,21 @@ def init_repo(
                 f"output.icechunk.commit_order {options['commit_order']} exceeds the store's "
                 f"recorded split_order {stored}: a commit must write whole manifests (§11.5)"
             )
+    config_rows = int(options["rows_per_manifest"])
     options = adopt_row_cut(existing, options, path)
+    if int(options["rows_per_manifest"]) != config_rows:
+        # The handle above was opened with the CONFIG's row cut, and a config
+        # passed at open beats the repo's saved one (``open_or_create``), so
+        # without this the run would cut its manifests at a value the block
+        # does not record. Reopen at the cut just adopted — the block and the
+        # handle then agree whatever the config said, and the repo's saved
+        # config is untouched (the cut does not ratchet, §11.5).
+        repo = _reopen_splits(
+            repo,
+            store_root,
+            block_splits({**existing, "rows_per_manifest": options["rows_per_manifest"]}),
+            store_kwargs,
+        )
     if wanted < stored:
         ratchet = {"from": stored, "to": wanted}
         block = repo_group_spec(grid, store_root, options, manifest).attributes[ICECHUNK_ATTR]

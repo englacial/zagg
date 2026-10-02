@@ -443,6 +443,79 @@ class TestRefsLandAtTheirRow:
         assert out["options"]["rows_per_manifest"] == icechunk_rows.LEGACY_ROW_SPLIT
         assert "fixed at creation" in caplog.text
 
+    def _legacy(self, root, grid, cfg, manifest):
+        """Strip the row cut from the committed block: a repo written before the ruling."""
+        _group, repo = _open(root)
+        session = repo.writable_session(icechunk_refs.BRANCH)
+        group = zarr.open_group(session.store, mode="a")
+        block = dict(group.attrs[ICECHUNK_ATTR])
+        block.pop("rows_per_manifest")
+        # Its per-level splits name the cell axis alone, as that writer cut them.
+        block["levels"] = {
+            o: {**lvl, "split": {k: v for k, v in lvl["split"].items() if k != "rows"}}
+            for o, lvl in block["levels"].items()
+        }
+        group.attrs[ICECHUNK_ATTR] = block
+        session.commit("drop the row cut")
+
+    def test_a_legacy_cut_survives_the_re_save_of_a_raising_init(
+        self, monkeypatch, cfg, tmp_path, caplog
+    ):
+        # ``block_splits`` is what ``_save_splits`` PERSISTS, so the absent
+        # key has to read as the legacy cut there too: the issue #597 re-save
+        # re-cuts from main's block, and resolving the absence to the
+        # one-row default would flip a pre-ruling repo's saved config to a
+        # cut none of its manifests were written at (issue #584 review).
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        cfg.output["icechunk"] = {"split_order": 3, "commit_order": 3}
+        _init(root, grid, cfg, manifest, ["2019"])
+        self._legacy(root, grid, cfg, manifest)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(icechunk_refs, "_commit", boom)
+        cfg.output["icechunk"] = {"split_order": 2, "commit_order": 2}
+        with caplog.at_level("WARNING"), pytest.raises(RuntimeError, match="boom"):
+            _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        monkeypatch.undo()
+        # Both the ratchet's own save and the re-save from the block cut at
+        # the legacy value, never at the default the config asked for.
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        legacy = icechunk_rows.LEGACY_ROW_SPLIT
+        assert icechunk_rows.stored_rows_per_manifest(block) == legacy
+        assert _saved_row_splits(root) == dict.fromkeys(block["levels"], legacy)
+
+    def test_the_adopted_cut_reaches_the_handle_the_run_writes_through(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # Adoption has to move the REPO HANDLE, not only the returned
+        # options: a config handed to ``open_or_create`` overrides the repo's
+        # saved one, so an init opened at the config's cut would write this
+        # run's manifests at a value the block does not record.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}
+        _init(root, grid, cfg, manifest, ["2019"])
+        real, reopened = icechunk_refs._reopen_splits, []
+
+        def spy(repo, store_root, splits, store_kwargs):
+            reopened.append({o: s["rows"] for o, s in splits.items()})
+            return real(repo, store_root, splits, store_kwargs)
+
+        monkeypatch.setattr(icechunk_refs, "_reopen_splits", spy)
+        cfg.output["icechunk"] = {"rows_per_manifest": 1}
+        out = _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        assert out["options"]["rows_per_manifest"] == 4
+        levels = icechunk_refs.read_block(root, store_kwargs={})["levels"]
+        assert reopened == [dict.fromkeys(levels, 4)]
+        # Nothing is persisted over the store's own config by the adoption.
+        assert _saved_row_splits(root) == dict.fromkeys(levels, 4)
+        # A config that agrees with the store reopens nothing.
+        reopened.clear()
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}
+        _init(root, grid, cfg, manifest, ["2021"], run_id="run-3")
+        assert reopened == []
+
     def test_a_row_the_repo_never_allocated_is_refused(self, monkeypatch, cfg, tmp_path):
         grid, root, manifest = _windowed(cfg, tmp_path)
         (shard,) = _shards(grid, 1)
