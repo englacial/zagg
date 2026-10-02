@@ -662,7 +662,7 @@ from zagg.sweep_fleet import run_stage_sweep_fleet
 
 summary = run_stage_sweep_fleet(
     boto3.client("lambda"),
-    "zagg-worker",
+    "process-shard",           # runner.DEFAULT_FUNCTION_NAME
     "s3://bucket/prefix.zarr",
     leaves,                    # [(shard_key, window), ...]
     shard_order=6,
@@ -904,11 +904,17 @@ the launcher may have died before the families invoke (attach then runs no
 tail). *The sweeps* run in the calling process and write the store from it, so
 they need the store's write credentials and a host in the store's region.
 Where the operator cannot write the store (a Source Cooperative–published
-one), drive the staged sweep's fleet form instead — `run_stage_sweep_fleet`, under
-[Running it](#running-it). It covers every leaf the run records name, not only
-this run's. On success it prints its summary: a `finisher` block with
-`lease_released: true` and `record`, the `sweep_stats_<ts>_stages.json` it
-wrote.
+one), drive the staged sweep's fleet form instead — `run_stage_sweep_fleet`,
+under [Running it](#running-it) — with `leaves` the run's own `(shard_key,
+window)` pairs, which keeps it to the run's footprint as the chained sweep is
+(`zagg.sweep.discover_leaves(store, store_kwargs=…)` gives every run's), and
+`shard_order` the store manifest's. The CLI `--stages` pass covers every leaf
+the run records name, not only this run's: a whole-store re-fold on one host
+(`--partitions` bounds its memory, not its scope). On success it prints its
+summary: `record`, the `sweep_stats_<ts>_stages.json` it wrote, and a
+`finisher` block with `lease_released: true`. Skip that pass when step 1
+found a completed staged sweep newer than the run and no run has dispatched
+to the store since.
 
 - `No completed leaves found in the store's run records` — no run record,
   this run's included, names a completed leaf: there is nothing to fold.
