@@ -221,27 +221,35 @@ def _put_status(store, shard_key, status="ok", attempt_id=None, **fields):
     obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
 
 
-def _pinned_config(commit):
+def _pinned_config(commit, **output):
     """The dispatched config as a manifest records it: ``output.icechunk.commit`` pinned."""
     from dataclasses import asdict
 
     cfg = default_config("atl06")
     cfg.output["icechunk"] = {"commit": commit}
+    cfg.output.update(output)
     return asdict(cfg)
 
 
-def _put_manifest(store, run_id, shards, dispatched_at=None, config=None):
-    """Hand-craft one dispatch manifest (what the worker writes off setup)."""
+def _put_manifest(store, run_id, shards, dispatched_at=None, config=None, slim=False):
+    """Hand-craft one dispatch manifest (what the worker writes off setup).
+
+    ``slim``: a large hive run's (issue #588) — the dispatcher's real slim
+    block, so the list is ``null`` and ``shards_omitted`` counts ``shards``.
+    """
     from dataclasses import asdict
     from datetime import datetime, timezone
 
-    manifest = {
-        "schema_version": 1,
+    block = {
         "run_id": run_id,
         "shards": [str(int(w)) for w in shards],
         "semantic_hash": "ab" * 32,
         "dispatched_at": dispatched_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "dataset": {"short_name": "ATL06", "version": "006"},
+    }
+    manifest = {
+        "schema_version": 1,
+        **(ct.slim_run_manifest_block(block) if slim else block),
         "config": config if config is not None else asdict(default_config("atl06")),
     }
     obstore.put(store, ct.MANIFEST_NAME, json.dumps(manifest).encode())
@@ -997,21 +1005,146 @@ class TestAttach:
         again_handle.wait(timeout=10)
         assert again.modes() == ["icechunk_finalize"]
 
-    def test_attach_never_finalizes_a_ladder_run(self, status_store):
-        # ``runner._run_lambda`` under ``sweep: "stages"`` pins ``commit:
-        # "ladder"``: its last commits land in the staged sweep chained AFTER
-        # the tail marker, so the finalize is that dispatcher's alone — attach
-        # fires none on either path (mid-run tail, then recorded tail).
-        _put_manifest(status_store, "ladder", _WORDS, config=_pinned_config("ladder"))
+    def test_attach_on_a_slim_manifest_takes_the_shards_from_the_statuses(
+        self, catalog, status_store, monkeypatch
+    ):
+        # A large hive run's manifest has no shard list (issue #588). Through
+        # the real halves: the dispatcher sends the slim block, the stub
+        # worker writes it, and attach rebuilds the run from its config with
+        # the shard set read off the status objects.
+        from test_client import _force_dispatch_manifest
+
+        _force_dispatch_manifest(monkeypatch, "slim")
+        live = EventStubLambdaClient(status_store)
+        handle = _run(catalog, client=live).dispatch(transport="event")
+        handle.results()
+        assert handle.dispatch_manifest == "slim"
+        run_id = live.cell_events()[0][2]["run_id"]
+        manifest = ct.read_dispatch_manifest("ignored", {})
+        assert manifest["shards"] is None and manifest["shards_omitted"] == 3
+        assert manifest["config"]["output"]["icechunk"]["commit"] == "leaf"
+
+        fresh = EventStubLambdaClient(status_store)
+        attached = Run.attach(_STORE, run_id, lambda_client=fresh)
+        assert attached.dispatch_manifest == "slim" and attached.unreported_shards == 0
+        results = attached.results()
+        assert set(results) == set(_WORDS)
+        assert all(r["body"]["total_obs"] == 7 for r in results.values())
+        attached.wait(timeout=10)
+        # Every shard is accounted for, so this is the ordinary recorded-tail
+        # attach: nothing re-fires but the idempotent finalize.
+        assert fresh.modes() == ["icechunk_finalize"]
+        assert fresh.events[0][2]["config"] == manifest["config"]
+
+    def test_attach_on_a_slim_manifest_mid_run_runs_no_tail(self, status_store, caplog):
+        # Two of three shards have reported: the handle covers those, says
+        # one is unaccounted for, and runs NO tail — its run record and
+        # marker would stand for the whole run with that shard missing.
+        _put_manifest(status_store, "slimrun", _WORDS, config=_pinned_config("leaf"), slim=True)
         body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        _put_status(status_store, _WORDS[0], body=dict(body))
+        _put_status(status_store, _WORDS[1], status="failed", error="boom", status_code=500)
+
+        stub = EventStubLambdaClient(status_store)
+        with caplog.at_level("WARNING"):
+            handle = Run.attach(_STORE, "slimrun", lambda_client=stub)
+        assert "attach again once the rest have" in caplog.text
+        assert handle.dispatch_manifest == "slim" and handle.unreported_shards == 1
+        assert set(handle.futures) == {_WORDS[0], _WORDS[1]}
+        results = handle.results(return_exceptions=True)
+        assert results[_WORDS[0]]["body"]["total_obs"] == 7
+        assert isinstance(results[_WORDS[1]], _shard_error())
+        handle.wait(timeout=10)
+        assert stub.events == [] and handle.icechunk_finalize is None
+        assert ct.tail_recorded("ignored", {}) is False
+
+        # The fleet finishes: the next attach names all three and runs the
+        # same worker-invoke tail a full manifest's would.
+        _put_status(status_store, _WORDS[2], body=dict(body))
+        again = EventStubLambdaClient(status_store)
+        done = Run.attach(_STORE, "slimrun", lambda_client=again)
+        assert done.unreported_shards == 0 and set(done.futures) == set(_WORDS)
+        done.results(return_exceptions=True)
+        done.wait(timeout=10)
+        modes = [m for m in again.modes() if m]
+        assert "finalize" in modes and "stats" in modes
+        assert modes[-1] == "icechunk_finalize" and again.cell_events() == []
+
+    def test_attach_on_a_slim_manifest_past_the_deadline_says_the_tail_is_lost(
+        self, status_store, caplog
+    ):
+        # A shard with no status by the drop deadline (killed at the timeout,
+        # a lost invoke) never reports, and a slim manifest cannot name it:
+        # still no tail, and the warning says attach cannot recover it.
+        _put_manifest(
+            status_store, "slimold", _WORDS, dispatched_at="2020-01-01T00:00:00+00:00", slim=True
+        )
+        for word in _WORDS[:2]:
+            _put_status(status_store, word, body={"total_obs": 7})
+        stub = EventStubLambdaClient(status_store)
+        with caplog.at_level("WARNING"):
+            handle = Run.attach(_STORE, "slimold", lambda_client=stub)
+        assert handle.unreported_shards == 1 and set(handle.futures) == set(_WORDS[:2])
+        assert "the other 1 never reported and attach cannot run this run's tail" in caplog.text
+        assert "attach again once the rest have" not in caplog.text
+        handle.results()
+        handle.wait(timeout=10)
+        assert stub.events == [] and ct.tail_recorded("ignored", {}) is False
+
+    def test_attach_on_a_slim_manifest_before_any_status_refuses(self, status_store):
+        _put_manifest(status_store, "early", _WORDS, slim=True)
+        with pytest.raises(ValueError, match="is slim .its 3 shards are not listed"):
+            Run.attach(_STORE, "early", lambda_client=EventStubLambdaClient(status_store))
+
+    def test_a_full_manifest_attach_is_unchanged(self, status_store):
+        # A full manifest never reads the status listing for its shard set: a
+        # status-less shard is still registered (and resolves at the deadline).
+        _put_manifest(status_store, "fullrun", _WORDS, config=_pinned_config("leaf"))
+        _put_status(status_store, _WORDS[0], body={"total_obs": 7})
+        handle = Run.attach(_STORE, "fullrun", lambda_client=EventStubLambdaClient(status_store))
+        assert handle.dispatch_manifest == "full" and handle.unreported_shards == 0
+        assert set(handle.futures) == set(_WORDS)
+        assert not handle.futures[_WORDS[2]].done()
+        for word in _WORDS[1:]:  # let the run finish so the poller shuts down
+            _put_status(status_store, word, body={"total_obs": 7})
+        handle.results()
+        handle.wait(timeout=10)
+
+    def test_reported_shards_names_only_shard_status_objects(self, status_store):
+        _put_manifest(status_store, "names", _WORDS, slim=True)
+        obstore.put(status_store, ct.TAIL_NAME, b"{}")
+        obstore.put(status_store, ct.shard_status_key(7, window="2019-01"), b"{}")
+        assert ct.reported_shards("ignored", {}) == []
+        _put_status(status_store, _WORDS[0])
+        _put_status(status_store, _WORDS[2])
+        assert ct.reported_shards("ignored", {}) == sorted([_WORDS[0], _WORDS[2]])
+
+    def test_attach_never_finalizes_a_ladder_run(self, status_store):
+        # Either Lambda dispatcher under ``sweep: "stages"`` (``_run_lambda``,
+        # ``Run.dispatch`` — issue #588) pins ``commit: "ladder"``: its last
+        # commits land in the staged sweep chained AFTER the tail marker, so
+        # the finalize is that dispatcher's alone — attach fires none on
+        # either path (mid-run tail, then recorded tail), and its mid-run
+        # tail chains no staged sweep of its own (observe-only): the rollup
+        # trigger fires for the leaves, no stage invoke does.
+        from zagg.telemetry import build_record
+
+        _put_manifest(
+            status_store, "ladder", _WORDS, config=_pinned_config("ladder", sweep="stages")
+        )
         for word in _WORDS:
-            _put_status(status_store, word, body=dict(body))
+            body = {"total_obs": 7, "duration_s": 1.0}
+            body["stats"] = build_record(shard_key=int(word), metadata=dict(body))
+            _put_status(status_store, word, body=body)
         stub = EventStubLambdaClient(status_store)
         handle = Run.attach(_STORE, "ladder", lambda_client=stub)
         handle.results()
         handle.wait(timeout=10)
         modes = [m for m in stub.modes() if m]
         assert "stats" in modes and "icechunk_finalize" not in modes
+        sweeps = [e for _, _, e in stub.events if e.get("mode") == "sweep"]
+        assert len(sweeps) == 1 and "stage" not in sweeps[0]  # the rollup, no stage
+        assert handle.stage_sweep is None
         assert "staged sweep" in handle.icechunk_finalize["skipped"]
         again = EventStubLambdaClient(status_store)
         again_handle = Run.attach(_STORE, "ladder", lambda_client=again)
@@ -1019,6 +1152,28 @@ class TestAttach:
         again_handle.wait(timeout=10)
         assert again.events == []
         assert "staged sweep" in again_handle.icechunk_finalize["skipped"]
+
+    def test_attach_never_finalizes_a_leaf_pinned_staged_run(self, status_store):
+        # An explicit ``commit: "leaf"`` under ``sweep: "stages"``: the
+        # dispatcher still chains the staged sweep, whose nodes commit
+        # overview refs under ``"leaf"`` too — so the gate is on the sweep,
+        # not the mode, and attach fires no finalize (review, PR #591).
+        from zagg.telemetry import build_record
+
+        _put_manifest(
+            status_store, "leafstg", _WORDS, config=_pinned_config("leaf", sweep="stages")
+        )
+        for word in _WORDS:
+            body = {"total_obs": 7, "duration_s": 1.0}
+            body["stats"] = build_record(shard_key=int(word), metadata=dict(body))
+            _put_status(status_store, word, body=body)
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "leafstg", lambda_client=stub)
+        handle.results()
+        handle.wait(timeout=10)
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "icechunk_finalize" not in modes
+        assert "staged sweep" in handle.icechunk_finalize["skipped"]
 
     def test_attach_never_finalizes_a_run_whose_knob_is_off(self, status_store):
         # ``output.icechunk: false`` in the dispatched config: no repo was
@@ -1141,6 +1296,54 @@ class TestD8Audit:
         handle.wait(timeout=10)
         expected = [ct.MANIFEST_NAME, ct.TAIL_NAME] + [ct.shard_status_key(w) for w in _WORDS]
         assert sorted(puts) == sorted(expected)
+
+    def test_client_event_run_with_a_staged_sweep_makes_no_store_writes(
+        self, catalog, status_store, monkeypatch
+    ):
+        # Issue #588: the tail's staged sweep is the runner's invoke-and-poll
+        # seam — the dispatcher LISTs the stage records and PUTs nothing.
+        # Driven through the REAL fleet path with the barriers collapsed: no
+        # stub worker writes a stage record, so every barrier expires, the
+        # finisher is fired and expires too, and the finalize is withheld
+        # (the completed-sweep gate) with the run left untagged.
+        import functools
+
+        import zagg.store as store_mod
+        from zagg import runner
+
+        real = runner._invoke_lambda_stage_sweep
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_stage_sweep",
+            functools.partial(real, barrier_timeout_s=0.05, total_barrier_budget_s=0.2),
+        )
+        # The fleet's record LIST opens the sweep's own status prefix through
+        # the store factory; route it at the in-memory status store.
+        monkeypatch.setattr(store_mod, "open_object_store", lambda path, *a, **k: status_store)
+        puts: list[str] = []
+        real_put = obstore.put
+
+        def counting_put(store, key, data, *a, **k):
+            puts.append(str(key))
+            return real_put(store, key, data, *a, **k)
+
+        monkeypatch.setattr(obstore, "put", counting_put)
+        cfg = default_config("atl06")
+        cfg.output["sweep"] = "stages"
+        cfg.output["grid"] = {**cfg.output["grid"], "chunk_inner": 9}
+        stub = EventStubLambdaClient(status_store, record=True)
+        handle = _run(catalog, client=stub, config=cfg).dispatch(transport="event")
+        handle.results()
+        handle.wait(timeout=30)
+        assert handle._tail_error is None
+        expected = [ct.MANIFEST_NAME, ct.TAIL_NAME] + [ct.shard_status_key(w) for w in _WORDS]
+        assert sorted(puts) == sorted(expected)
+        stage = [(t, e) for _, t, e in stub.events if e.get("mode") == "sweep" and e.get("stage")]
+        assert stage and all(t == "Event" for t, _ in stage)  # fired, then polled
+        assert {e["stage"]["role"] for _, e in stage} == {"stage", "finisher"}
+        assert handle.stage_sweep["barrier_timed_out"] is True
+        assert handle.icechunk_finalize == {"skipped": "staged sweep barrier timed out"}
+        assert "icechunk_finalize" not in stub.modes()
 
     def test_attach_makes_no_store_writes(self, status_store, monkeypatch):
         # The audit above only covers Run.dispatch, but Run.attach is the one

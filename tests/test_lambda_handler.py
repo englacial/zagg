@@ -1685,6 +1685,23 @@ class TestDispatchManifest:
         # rebuild the Run without the dispatcher duplicating it on the wire.
         assert manifest["config"] == event["config"]
 
+    def test_slim_block_lands_a_slim_manifest(self, handler_mod, tmp_path):
+        # A large hive run's block rides without its shard list (issue #588):
+        # the worker writes what it was sent, the config folded in as ever —
+        # which is all the operator finalize reads.
+        from zagg.client_transport import slim_run_manifest_block
+
+        event = self._event(tmp_path, run_manifest=slim_run_manifest_block(self._BLOCK))
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        assert self._read_manifest(tmp_path) == {
+            "schema_version": 1,
+            **self._BLOCK,
+            "shards": None,
+            "shards_omitted": 2,
+            "config": event["config"],
+        }
+
     def test_absent_block_writes_nothing(self, handler_mod, tmp_path):
         event = self._event(tmp_path)
         del event["run_manifest"]

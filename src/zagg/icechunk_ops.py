@@ -24,14 +24,40 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
   geometry the manifest would change is refused — an array-model change is a
   new revision, never an operation. The retrofit tool calls this itself
   when the store has a repo, so one operator step declares both planes.
+- ``finalize`` — tag a ladder run its dispatcher left untagged (issue
+  #588): the run's staged sweep completed but the dispatcher died before
+  its finalize. Reads the run's dispatch manifest for its config (a large
+  run's manifest is slim — no shard list — and serves as well; a run whose
+  manifest write was lost, or whose slim block did not fit, is refused), refuses
+  unless the newest staged-sweep record written since the run's init
+  commit (the repo's clock, not the dispatcher's) shows a completed sweep,
+  then runs the §11.4 finalize ``newest_only`` — so it can
+  only ever tag the repo's newest run (an older untagged run stays covered
+  by the next run's tag; tagging it would name later commits). No
+  ``--force``: a run whose sweep did not complete has no tip that means
+  "this run" — ``python -m zagg.sweep <store> --stages`` completes the
+  ladder first. Retention is the run config's ``retain_runs``; no override.
+  The record is tied to the run by time only (it names the sweep's own run
+  id): with overlapping runs on one store (§11.4's documented casualty
+  case) a sibling run's completed sweep record can vouch for this run.
+  All of that runs **where the writer is**: on an ``s3://`` store the command
+  fires one synchronous ``mode="icechunk_finalize"`` invoke and prints the
+  worker's report — the checks, the commit, the tag and the retention are
+  the worker's, and the operator's host reads nothing from the store and
+  writes nothing (an operator holds invoke rights, not the bucket's; and
+  the repo is not read out of its region). The worker is
+  ``--function-name``, else ``ZAGG_LAMBDA_FUNCTION_NAME``, else
+  ``process-shard``. Only a local store finalizes in-process.
 
     python -m zagg.icechunk_ops <store> set-attrs <path> '<json>'
     python -m zagg.icechunk_ops <store> declare-pyramid <config.yaml>
+    python -m zagg.icechunk_ops <store> finalize <run_id>
 
 ``<path>`` is ``/`` (the root), ``/{cells}`` (a level group) or
-``/{cells}/{array}``. Operator-side only, never a worker's job; the
-pre-commit check is zagg's half of the validation moczarr's reader will
-run (issue #582 phase 6).
+``/{cells}/{array}``. ``set-attrs`` and ``declare-pyramid`` run on the
+operator's host, never in a worker; ``finalize`` is operator-invoked and
+worker-run (above). The pre-commit check is zagg's half of the validation
+moczarr's reader will run (issue #582 phase 6).
 """
 
 from __future__ import annotations
@@ -39,7 +65,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import re
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from zagg.icechunk_refs import (
@@ -329,6 +358,266 @@ def _group_matches(session, order: str, group_spec) -> bool:
     return model(have) == model(group_spec)
 
 
+# ── finalize ────────────────────────────────────────────────────────────────
+
+
+class FinalizeRefusedError(ValueError):
+    """A precondition of the operator ``finalize`` does not hold; nothing was written.
+
+    Raised in-process by :func:`finalize_run`; the worker returns it as
+    ``{"ok": false, "refused": reason}`` and :func:`finalize` re-raises it on
+    the operator's host.
+    """
+
+
+#: The staged sweep's store-root run record (``zagg.sweep_stages._write_stage_record``).
+_STAGE_RECORD_RE = re.compile(r"sweep_stats_(\d{8}T\d{6}Z)_stages\.json")
+
+
+def _stage_record_incomplete(record: dict) -> str | None:
+    """Why a staged-sweep run record may not stand for a completed ladder, or ``None``.
+
+    The operator twin of :func:`zagg.runner._staged_sweep_incomplete`, read
+    off the durable record instead of the dispatcher's summary: the finisher
+    writes it as its last act, so its existence says the finisher landed;
+    an expired barrier (propagated into the record, ``barrier_timed_out``)
+    says a stage node may still have been committing when it did. The
+    in-process sweep writes the record on failure too, with ``error`` — refused
+    whatever else it carries. (``mode`` is not checked: :data:`_STAGE_RECORD_RE`
+    already pins it, every ``_stages`` record is written with ``"stages"``.)
+    """
+    if record.get("error"):
+        return f"the sweep failed ({record['error']})"
+    if record.get("barrier_timed_out"):
+        return "a barrier expired, so node commits may still have been in flight"
+    if not isinstance(record.get("finisher"), dict):
+        return "no finisher block"
+    return None
+
+
+def newest_stage_record(
+    store_root: str, *, store_kwargs: dict, since: datetime | None = None
+) -> tuple[str, dict] | None:
+    """``(key, record)`` of the newest ``sweep_stats_*_stages.json`` at the root, or ``None``.
+
+    One delimiter LIST of the store root (the timestamp-first naming sorts
+    by write time). ``since`` drops records written before it — the
+    ``written_at`` of a run's init commit — so a record from before the run
+    can never stand for its ladder. The key's stamp is whole seconds, so
+    ``since`` is floored to the second before the comparison.
+    """
+    import obstore
+
+    from zagg.store import open_object_store
+
+    store = open_object_store(store_root, **store_kwargs)
+    records = sorted(
+        (m[1], m[0])
+        for o in obstore.list_with_delimiter(store)["objects"]
+        if (m := _STAGE_RECORD_RE.fullmatch(o["path"].rsplit("/", 1)[-1]))
+    )
+    if not records:
+        return None
+    ts, name = records[-1]
+    written = datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    if since is not None and written < since.replace(microsecond=0):
+        return None
+    return name, json.loads(bytes(obstore.get(store, name).bytes()))
+
+
+def _run_dispatch_config(store_root: str, run_id: str, store_kwargs: dict):
+    """The run's config off its dispatch manifest; raises when absent.
+
+    The manifest at ``<store>.status/run-<run_id>/manifest.json`` (the setup
+    invoke's worker-side write, issue #327) carries the very config the run
+    dispatched — its ``retain_runs`` and the D19 hash the leaves were stamped
+    with — which is why ``finalize`` takes no config and no ``--retain-runs``.
+    A large hive run's manifest is slim (issue #588: its block did not fit
+    the fire-and-forget setup ``Event``, so it rode without the ``shards``
+    list) and still carries the config, which is all this reads. The write
+    stays best-effort: a lost setup invoke or a failed PUT leaves no
+    manifest, and so does a block that did not fit even slim (the run's
+    summary then says ``dispatch_manifest: "dropped"``) — such a run cannot
+    be finalized here.
+    """
+    from zagg.client_transport import MANIFEST_NAME, read_dispatch_manifest, run_status_prefix
+    from zagg.config import load_config_from_dict
+
+    prefix = run_status_prefix(store_root, run_id)
+    manifest = read_dispatch_manifest(prefix, store_kwargs)
+    if manifest is None or not manifest.get("config"):
+        raise FinalizeRefusedError(
+            f"no dispatch manifest with a config at {prefix}/{MANIFEST_NAME}: finalize reads "
+            f"the run's retain_runs and semantic hash from it. A Lambda-dispatched run "
+            f"has one, slim (no shard list) when the run is large; it is missing for a "
+            f"wrong store/run_id, a dispatcher predating issue #327, a lost setup invoke "
+            f"or write, or a block that did not fit the setup event even slim (the run "
+            f'summary then says dispatch_manifest: "dropped"). '
+            f"This operation cannot finalize such a run, and the next run's tag covers its "
+            f"commits. A local-backend run finalizes in-process"
+        )
+    return load_config_from_dict(manifest["config"])
+
+
+def _run_opened_at(store_root: str, run_id: str, store_kwargs: dict) -> datetime:
+    """``written_at`` of the run's init commit on ``main``; raises when there is none.
+
+    Every run opens with one (§11.4 **Init**: ``init {run_id}``, or the
+    ``split ratchet … {run_id}`` commit when its init re-cuts —
+    :func:`zagg.icechunk_finalize.run_marker`). Its stamp and the staged-sweep
+    record's key are both worker/object-store-side clocks.
+    """
+    from zagg.icechunk_finalize import run_marker
+
+    repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
+    for info in repo.ancestry(branch=BRANCH):
+        if run_marker(info.message) == ("init", run_id):
+            return info.written_at
+    raise FinalizeRefusedError(
+        f"no init commit for run {run_id} on {repo_path(store_root)}: every run opens with "
+        f"one (spec §11.4 Init): the run never initialized this repo, or a later run's "
+        f"retention has squashed its commits (it is then not the newest run either)"
+    )
+
+
+def finalize_run(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
+    """Tag a completed-but-untagged ladder run — the repo's newest — as its dispatcher would have.
+
+    Every check and the write, in the calling process: the worker's
+    ``mode="icechunk_finalize"`` under ``operator_checks``, or
+    :func:`finalize` on a local store. Refuses (:class:`FinalizeRefusedError`)
+    without the run's dispatch manifest, without the run's
+    init commit on the repo, without a staged-sweep record written since
+    that commit (:func:`_run_opened_at` — the manifest supplies the config
+    only), or when that record does not show a completed sweep. Otherwise
+    :func:`zagg.icechunk_finalize.finalize_repo` with ``newest_only``: the
+    report carries the finalize record plus ``operation``, ``run_id`` and
+    ``stage_record`` (the record that vouched for the ladder); ``skipped``
+    when the run is no longer the repo's newest or its tag already exists
+    (nothing written either way).
+
+    Residual: the record names the sweep's own run id, not this run's, so it
+    is tied to the run by time alone. With overlapping runs on one store (the
+    §11.4 casualty case) a sibling run's completed sweep, landing after this
+    run's init, can vouch for this run's ladder; a stronger link needs the
+    dispatcher to stamp the pipeline run id into the stage event.
+    """
+    from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
+    from zagg.semantics import semantic_hash
+
+    config = _run_dispatch_config(store_root, run_id, store_kwargs)
+    opened = _run_opened_at(store_root, run_id, store_kwargs)
+    found = newest_stage_record(store_root, store_kwargs=store_kwargs, since=opened)
+    if found is None:
+        raise FinalizeRefusedError(
+            f"no staged-sweep record at {store_root} since run {run_id}'s init commit "
+            f"({opened.isoformat(timespec='seconds')}): complete the ladder first with "
+            f"`python -m zagg.sweep {store_root} --stages`, then finalize"
+        )
+    name, record = found
+    reason = _stage_record_incomplete(record)
+    if reason is not None:
+        raise FinalizeRefusedError(
+            f"staged-sweep record {name} does not show a completed sweep ({reason}); "
+            f"re-run `python -m zagg.sweep {store_root} --stages`, then finalize"
+        )
+    out = finalize_repo(
+        store_root,
+        run_id=run_id,
+        semantic_hash=semantic_hash(config),
+        retain_runs=resolve_retain_runs(config),
+        store_kwargs=store_kwargs,
+        newest_only=True,
+    )
+    report = {"operation": "finalize", "run_id": run_id, "stage_record": name, **out}
+    if not out["tagged"] and "skipped" not in out:
+        report["skipped"] = f"{out['tag']} already exists"
+    logger.info(
+        f"icechunk finalize {run_id}: "
+        + (f"tagged {out['tag']}" if out["tagged"] else f"nothing written ({report['skipped']})")
+    )
+    return report
+
+
+def _lambda_client(region: str | None):
+    """A Lambda client for the one finalize invoke: no retry, a read past the 900 s ceiling."""
+    import boto3
+    from botocore.config import Config
+
+    config = Config(read_timeout=960, connect_timeout=10, retries={"max_attempts": 0})
+    return boto3.client("lambda", region_name=region, config=config)
+
+
+def finalize(
+    store_root: str,
+    run_id: str,
+    *,
+    store_kwargs: dict,
+    function_name: str | None = None,
+    lambda_client=None,
+) -> dict:
+    """The operator's ``finalize``: :func:`finalize_run`, run where the writer is.
+
+    A local store runs it in-process. Any other store gets ONE synchronous
+    ``mode="icechunk_finalize"`` invoke with ``operator_checks`` (through
+    :func:`zagg.runner._invoke_lambda_icechunk_finalize`): the worker reads
+    the manifest and the repo, checks, commits, tags and applies retention
+    under its execution role, and this returns its report (plus
+    ``invoke_s``). The operator's host opens neither the store nor the repo
+    and never falls back to finalizing in-process — it may hold no write
+    credentials (a Source Cooperative store's only writer is the worker
+    role), and a retention pass from outside the store's region would read
+    the repo out of it.
+
+    The function is ``function_name`` (``--function-name``), else the
+    ``ZAGG_LAMBDA_FUNCTION_NAME`` environment variable, else
+    :data:`zagg.runner.DEFAULT_FUNCTION_NAME` (``process-shard``), an empty
+    value counting as unset — what :func:`zagg.runner._resolve_function_name`
+    gives a config with no ``worker:`` block, except that the dispatchers
+    take an empty value verbatim. The run config's ``worker:`` suffix is never applied:
+    that config is in the run's dispatch manifest, which this host does not
+    read. The report names the function under ``function_name``. The event
+    carries no config, so a deployed worker that predates ``operator_checks``
+    fails on the missing key before any write instead of tagging without the
+    checks.
+
+    Raises :class:`FinalizeRefusedError` with the worker's reason when a
+    precondition does not hold, ``RuntimeError`` when the invoke failed or
+    the worker errored.
+    """
+    if _is_local(store_root):
+        return finalize_run(store_root, run_id, store_kwargs=store_kwargs)
+    from zagg.runner import DEFAULT_FUNCTION_NAME, _invoke_lambda_icechunk_finalize
+
+    function_name = (
+        function_name or os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME") or DEFAULT_FUNCTION_NAME
+    )
+    if lambda_client is None:
+        lambda_client = _lambda_client(store_kwargs.get("region"))
+    out = _invoke_lambda_icechunk_finalize(
+        lambda_client, function_name, store_root, run_id=run_id, operator_checks=True
+    )
+    if "refused" in out:
+        raise FinalizeRefusedError(out["refused"])
+    if "error" in out:
+        # Only a stale worker is known not to have finalized; a transport
+        # failure after delivery leaves the worker's outcome unknown.
+        stale = "'config'" in out["error"]
+        hint = (
+            "; a missing 'config' is a worker that predates the operator finalize, which "
+            "fails on that key before any write: deploy a current worker"
+            if stale
+            else f"; if the request reached it the worker may have tagged: re-run finalize, "
+            f"which reports an existing run-{run_id} tag and rewrites nothing"
+        )
+        outcome = "did not finalize" if stale else "may not have finalized"
+        raise RuntimeError(
+            f"the worker {function_name} {outcome} run {run_id}: {out['error']} "
+            f"(nothing was written from this host{hint})"
+        )
+    return {**out, "function_name": function_name}
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 
@@ -343,6 +632,16 @@ def main(argv=None) -> int:
     p.add_argument("--message", default=None, help="commit message (default: the operation)")
     p = sub.add_parser("declare-pyramid", help="mirror the manifest's declaration into the repo")
     p.add_argument("config", help="the store's pipeline config YAML")
+    p = sub.add_parser(
+        "finalize", help="tag a completed, untagged ladder run (the repo's newest run only)"
+    )
+    p.add_argument("run_id", help="the run id (its dispatch manifest and run-<id> tag name it)")
+    p.add_argument(
+        "--function-name",
+        default=None,
+        help="the Lambda worker that finalizes an s3:// store (else env "
+        "ZAGG_LAMBDA_FUNCTION_NAME, else process-shard; a local store finalizes in-process)",
+    )
     args = parser.parse_args(argv)
     store_kwargs = {"region": args.region}
     if args.operation == "set-attrs":
@@ -353,11 +652,18 @@ def main(argv=None) -> int:
             store_kwargs=store_kwargs,
             message=args.message,
         )
-    else:
+    elif args.operation == "declare-pyramid":
         from zagg.config import load_config
 
         report = declare_pyramid(
             args.store_root, load_config(args.config), store_kwargs=store_kwargs
+        )
+    else:
+        report = finalize(
+            args.store_root,
+            args.run_id,
+            store_kwargs=store_kwargs,
+            function_name=args.function_name,
         )
     print(json.dumps(report, indent=1, default=str))
     return 0

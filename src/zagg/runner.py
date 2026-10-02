@@ -80,6 +80,9 @@ from zagg.telemetry import billed_seconds
 
 logger = logging.getLogger(__name__)
 
+#: The worker function when nothing names one: the stack's unsuffixed function.
+DEFAULT_FUNCTION_NAME = "process-shard"
+
 
 def _resolve_function_name(config: PipelineConfig, function_name: str | None) -> str:
     """Resolve the Lambda function to invoke (issue #235).
@@ -95,7 +98,7 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
     """
     if function_name is not None:
         return function_name
-    base = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", "process-shard")
+    base = os.environ.get("ZAGG_LAMBDA_FUNCTION_NAME", DEFAULT_FUNCTION_NAME)
     worker = config.worker
     if not worker:
         return base
@@ -4013,7 +4016,7 @@ def _run_lambda(
             overwrite=overwrite,
             output_creds_event=output_creds_event,
         )
-        _invoke_lambda_setup_async(
+        manifest_sent = _invoke_lambda_setup_async(
             state["lambda_client"],
             function_name,
             store_path,
@@ -4068,6 +4071,7 @@ def _run_lambda(
             output_creds_event=output_creds_event,
             run_manifest=run_manifest,
         )
+        manifest_sent = "full"  # the synchronous setup has no size gate
     setup_s = time.time() - setup_start
 
     start_time = time.time()
@@ -4311,6 +4315,11 @@ def _run_lambda(
             "max_memory_mb": max_memory_mb,
             # Icechunk companion init record (issue #580): see _run_local.
             "icechunk": icechunk_init,
+            # How the dispatch manifest went out (issue #588): "full", "slim"
+            # (no shard list — the block did not fit the hive setup Event) or
+            # "dropped" (no manifest: no Run.attach, no operator finalize).
+            # What was SENT; the write is the worker's, best-effort.
+            "dispatch_manifest": manifest_sent,
             "store_path": store_path,
             "backend": "lambda",
             "function_name": function_name,
@@ -5288,6 +5297,11 @@ def _invoke_lambda_setup_async(
     idempotent ensure_manifest backstop — see ``_invoke_lambda_finalize``.
     ``run_manifest`` (issue #327) additionally has the worker record the
     run's dispatch manifest at the status prefix, size-gated below.
+
+    Returns how the block went out (issue #588): ``"full"``, ``"slim"`` (its
+    shard list left out), ``"dropped"`` (not sent at all), or ``None`` when
+    there was no block. It names what was SENT: the write is the worker's,
+    off a retries-0 Event invoke.
     """
     event = {
         "mode": "setup",
@@ -5299,19 +5313,37 @@ def _invoke_lambda_setup_async(
     if dataset is not None:
         event["dataset"] = dataset
     # Dispatch manifest (issue #327): attached only when it FITS the 256 KB
-    # Event cap — the shard list scales with the run, and this invoke
-    # dispatched fine before the block existed, so the block is dropped (never
-    # fatal) rather than failing the run; Run.attach then degrades to the
-    # status objects alone.
+    # Event cap. Only the shard list scales with the run, so a block that
+    # does not fit rides SLIM — without the list (issue #588): the worker
+    # still records the run's config and identity, which is all the operator
+    # ``finalize`` reads and what Run.attach rebuilds from (its shard set
+    # then comes from the status objects). Only when even the slim block
+    # does not fit (the config itself fills the event) is the block dropped —
+    # never fatal: this invoke dispatched fine before the block existed.
+    sent = None
     if run_manifest is not None:
-        with_block = {**event, "run_manifest": run_manifest}
-        if len(json.dumps(with_block)) <= _ASYNC_PAYLOAD_CAP_BYTES:
-            event = with_block
-        else:
+        from zagg.client_transport import slim_run_manifest_block
+
+        sent = "dropped"
+        for kind, block in (
+            ("full", run_manifest),
+            ("slim", slim_run_manifest_block(run_manifest)),
+        ):
+            with_block = {**event, "run_manifest": block}
+            if len(json.dumps(with_block)) <= _ASYNC_PAYLOAD_CAP_BYTES:
+                event, sent = with_block, kind
+                break
+        if sent != "full":
+            n_shards = len(run_manifest.get("shards") or [])
             logger.warning(
-                f"run_manifest block over the async setup budget "
-                f"({len(run_manifest.get('shards') or [])} shards); dropped — "
-                f"Run.attach for this run degrades to status objects only (issue #327)"
+                f"run_manifest block over the async setup budget ({n_shards} shards): "
+                + (
+                    "sent slim, without the shard list — Run.attach reads the shard set "
+                    "from the status objects (issue #588)"
+                    if sent == "slim"
+                    else "dropped, even without the shard list — this run has no dispatch "
+                    "manifest: no Run.attach, no operator finalize (issue #588)"
+                )
             )
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
@@ -5320,6 +5352,7 @@ def _invoke_lambda_setup_async(
         InvocationType="Event",
         Payload=json.dumps(event),
     )
+    return sent
 
 
 def _invoke_lambda_raster_setup(
@@ -5669,11 +5702,13 @@ def _pin_icechunk_commit(config, grid, *, stages: bool):
     ``"ladder"`` only when this dispatcher chains the staged sweep
     (``stages``) AND it walks the ladder
     (:func:`zagg.icechunk_refs.ladder_walks`), else ``"leaf"``. The Lambda
-    dispatchers ship the pinned block, so the init and every worker read one
-    explicit mode; the ``client`` facade chains no staged sweep at all, so it
-    pins ``"leaf"`` even under ``sweep: "stages"`` — a ladder there would
-    leave sidecars nothing gathers (review finding). An explicit ``commit``
-    is left alone; the knob is outside the D19 core, so this perturbs no
+    dispatchers — ``_run_lambda`` and the ``client`` facade's
+    :meth:`~zagg.client.Run.dispatch`, which chains the same staged sweep
+    (issue #588) — ship the pinned block, so the init and every worker read
+    one explicit mode; a dispatcher that chains no staged sweep passes
+    ``stages=False`` and pins ``"leaf"``, since a ladder there would leave
+    sidecars nothing gathers (review finding). An explicit ``commit`` is
+    left alone; the knob is outside the D19 core, so this perturbs no
     identity.
     """
     from dataclasses import replace
@@ -5872,11 +5907,12 @@ def _invoke_lambda_icechunk_finalize(
     function_name,
     store_path,
     *,
-    config_dict,
+    config_dict=None,
     run_id,
     icechunk_init=None,
     output_creds_event=None,
     newest_only=False,
+    operator_checks=False,
 ) -> dict:
     """One synchronous ``mode="icechunk_finalize"`` invoke (issue #582); its record.
 
@@ -5889,20 +5925,32 @@ def _invoke_lambda_icechunk_finalize(
     that is not the success envelope), never an empty dict. ``newest_only``
     (``Run.attach``) rides the event: the worker then finalizes only while
     the run is the newest on the repo (``{"skipped"}`` otherwise).
+
+    ``operator_checks`` (the operator's ``icechunk_ops finalize``, issue
+    #588): the event carries NO ``config`` and no init record — ``mode``,
+    ``store_path``, ``run_id``, ``newest_only`` and ``operator_checks`` only.
+    The worker reads the run's dispatch manifest for the config and runs the
+    operator's precondition checks itself; a check that does not hold comes
+    back as ``{"refused": reason}``. A worker that predates the flag fails on
+    the missing ``config`` before any write, where a forwarded config would
+    have let it tag without the checks.
     """
-    event = {
-        "mode": "icechunk_finalize",
-        "store_path": store_path,
-        "run_id": run_id,
-        "config": config_dict,
+    event = {"mode": "icechunk_finalize", "store_path": store_path, "run_id": run_id}
+    if operator_checks:
+        newest_only = True
+    elif config_dict is None:
+        raise TypeError("config_dict is required unless operator_checks")
+    else:
+        event["config"] = config_dict
         # The init record rides so a split ratchet this run applied is
         # reported as pending its operator rewrite (spec §11.5).
-        "icechunk_init": icechunk_init,
-    }
+        event["icechunk_init"] = icechunk_init
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     if newest_only:
         event["newest_only"] = True
+    if operator_checks:
+        event["operator_checks"] = True
     t0 = time.perf_counter()
     try:
         response = lambda_client.invoke(
@@ -5919,10 +5967,13 @@ def _invoke_lambda_icechunk_finalize(
             raise RuntimeError(
                 f"statusCode {result.get('statusCode')}: {body.get('error') or result.get('body')!r}"
             )
+        if body.get("refused"):
+            return {"refused": body["refused"]}
         if not body.get("ok") or not body.get("tag"):
             raise RuntimeError(f"unexpected icechunk_finalize body: {body!r}")
     except Exception as e:
-        logger.warning(f"icechunk finalize invoke failed (fail-open, issue #582): {e}")
+        how = "raised to the operator, issue #588" if operator_checks else "fail-open, issue #582"
+        logger.warning(f"icechunk finalize invoke failed ({how}): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
     record = {k: v for k, v in body.items() if k not in ("ok", "mode")}
     record["invoke_s"] = time.perf_counter() - t0

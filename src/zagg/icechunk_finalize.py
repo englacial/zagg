@@ -136,19 +136,35 @@ def _apply_retention(repo, retain_runs: int, counts: dict) -> None:
     }
 
 
-def _is_newest_run(repo, run_id: str) -> bool:
-    """Whether the newest ``init``/``finalize`` commit on ``main`` names ``run_id``.
+def run_marker(message: str) -> tuple[str, str] | None:
+    """``(kind, run_id)`` when a ``main`` commit opens or closes a run, else ``None``.
 
-    Walks the ancestry from the tip; the first init or finalize met is the
-    newest run's, since every run opens with an ``init {run_id}`` commit
-    (``init_repo``, empty when the block is unchanged) and closes with its
+    A run opens with ``init {run_id}`` — or, when its init ratchets
+    ``split_order`` (§11.5), with ``split ratchet {from}->{to} {run_id}``, the
+    same commit under the ratchet's label (``icechunk_refs.init_repo``) — and
+    closes with ``finalize {run_id}``; ``kind`` is ``"init"`` or ``"finalize"``.
+    """
+    head, _, rest = message.partition(" ")
+    if head in ("init", "finalize"):
+        return head, rest
+    if message.startswith("split ratchet "):
+        return "init", message.rsplit(" ", 1)[-1]
+    return None
+
+
+def _is_newest_run(repo, run_id: str) -> bool:
+    """Whether the newest run-opening or -closing commit on ``main`` names ``run_id``.
+
+    Walks the ancestry from the tip; the first :func:`run_marker` met is the
+    newest run's, since every run opens with its init commit (``init_repo``:
+    ``init {run_id}``, empty when the block is unchanged, or the
+    ``split ratchet … {run_id}`` commit when it re-cuts) and closes with its
     finalize. A later run's init or finalize makes this run no longer the
     newest.
     """
     for info in repo.ancestry(branch=BRANCH):
-        head, _, rest = info.message.partition(" ")
-        if head in ("init", "finalize"):
-            return rest == run_id
+        if (marker := run_marker(info.message)) is not None:
+            return marker[1] == run_id
     return False
 
 
