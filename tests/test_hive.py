@@ -1161,6 +1161,485 @@ class TestProcessAndWriteHive:
         # sidecar is debris like everything else in it.
         assert ops == ["dense", "ragged", "sidecar", "stamp"]
 
+    def _temporal_cfg(self, cfg):
+        """Arm the §10.6 record: one per-centroid field plus its clock."""
+        cfg.aggregation["variables"]["h"] = {
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [2],
+            "dtype": "float32",
+            "fill_value": 0,
+            "temporal": "per-centroid",
+        }
+        cfg.output["time_source"] = {
+            "field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        return cfg
+
+    def test_temporal_record_lands_between_the_sidecar_and_the_stamp(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issue #575: a per-centroid config writes the leaf's ``temporal.toc``
+        from the words the worker fed the accumulator, in the bitmap's slot —
+        after the arrays, before the stamp (D4) — and a non-temporal config
+        writes none and takes the code path it always did."""
+        from mortie import time2toc, toc_reduce
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.coverage_toc import quantize_words
+        from zagg.leaf_temporal import count_words, cover_from_counts
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(7)],
+            dtype=np.uint64,
+        )
+        ops: list = []
+
+        def rec(name, fn):
+            def wrapped(*a, **k):
+                ops.append(name)
+                return fn(*a, **k)
+
+            return wrapped
+
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 7.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words[:4])
+            kwargs["temporal_out"].add_words(words[4:])
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(
+            hive, "write_coverage_sidecar", rec("sidecar", hive.write_coverage_sidecar)
+        )
+        monkeypatch.setattr(
+            leaf_temporal, "write_leaf_temporal", rec("temporal", leaf_temporal.write_leaf_temporal)
+        )
+        monkeypatch.setattr(hive, "stamp_commit", rec("stamp", hive.stamp_commit))
+        root = str(tmp_path / "store")
+        hive.process_and_write_hive(shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={})
+        assert ops == ["sidecar", "temporal", "stamp"]
+        leaf = hive.shard_leaf_path(root, shard)
+        record = leaf_temporal.read_leaf_temporal_record(leaf)
+        word, counts = leaf_temporal.leaf_temporal_contribution(record)
+        assert record["source"] == "worker" and record["fields"] == ["h"]
+        assert word == int(toc_reduce(words)) and record["n_obs"] == 7
+        expect = count_words(words)
+        np.testing.assert_array_equal(counts.words, expect.words)
+        np.testing.assert_array_equal(counts.obs, expect.obs)
+        np.testing.assert_array_equal(cover_from_counts(counts)[0], quantize_words(words))
+        from zagg.store import open_store
+
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_a_versioned_leaf_carries_the_record_in_its_version(self, monkeypatch, cfg, tmp_path):
+        """Issue #575 under versioned leaves (issue #582, spec §1.5/§10.6): the
+        record goes where the arrays and the bitmap go — the version subgroup —
+        before the VERSION's stamp, the only moment a version may gain one.
+        The pointer root holds the pointer stamp and the version, nothing else.
+        """
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(5)],
+            dtype=np.uint64,
+        )
+        ops: list = []
+
+        def rec(name, fn):
+            def wrapped(*a, **k):
+                ops.append((name, str(a[0]) if name in ("sidecar", "temporal") else None))
+                return fn(*a, **k)
+
+            return wrapped
+
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 5.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        monkeypatch.setattr(
+            hive, "write_coverage_sidecar", rec("sidecar", hive.write_coverage_sidecar)
+        )
+        monkeypatch.setattr(
+            leaf_temporal, "write_leaf_temporal", rec("temporal", leaf_temporal.write_leaf_temporal)
+        )
+        monkeypatch.setattr(hive, "stamp_commit", rec("stamp", hive.stamp_commit))
+        monkeypatch.setattr(hive, "write_pointer_stamp", rec("pointer", hive.write_pointer_stamp))
+        root = str(tmp_path / "store")
+        meta = hive.process_and_write_hive(
+            shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}, run_id="a" * 32
+        )
+        leaf = hive.shard_leaf_path(root, shard)
+        version = f"{leaf}/{meta['leaf_version']}"
+        # Bitmap, record, the version's stamp, then the pointer swap — both
+        # sidecars addressed at the version, never at the pointer root.
+        assert ops == [
+            ("sidecar", version),
+            ("temporal", version),
+            ("stamp", None),
+            ("pointer", None),
+        ]
+        assert sorted(os.listdir(leaf)) == sorted(["zarr.json", meta["leaf_version"]])
+        assert os.path.exists(f"{version}/{leaf_temporal.LEAF_TEMPORAL_NAME}")
+        assert os.path.exists(f"{version}/{hive.COVERAGE_SIDECAR}")
+        record = leaf_temporal.read_leaf_temporal_record(version)
+        assert record["source"] == "worker" and record["n_obs"] == 5
+        # The sweep's seam resolves the pointer and reads it there.
+        got, route = leaf_temporal.leaf_contribution(leaf, grid.child_order, {"h": {}})
+        assert route == "record" and int(got[1].obs.sum()) == 5
+
+    def _temporal_fake(self, grid, shard, n):
+        """A streaming fake whose fold sees ``n`` clocked observations (0: none)."""
+        from mortie import time2toc
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(max(n, 1))],
+            dtype=np.uint64,
+        )
+        ragged = {"h": ([np.array([[1.0, max(n, 1)]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            if n:
+                kwargs["temporal_out"].add_words(words)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        return fake
+
+    @staticmethod
+    def _fail_record_write(patch):
+        """Arm ``patch`` (a monkeypatch or one of its contexts): the record PUT raises."""
+        from zagg import leaf_temporal
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        patch.setattr(leaf_temporal, "write_leaf_temporal", boom)
+
+    @pytest.mark.parametrize("run_id", [None, "a" * 32])
+    def test_a_failed_record_write_fails_a_legacy_leaf_unstamped(
+        self, monkeypatch, cfg, tmp_path, run_id
+    ):
+        """Issue #575, espg ruling of 2026-10-01: the record write fails CLOSED.
+
+        The record is the only source of the leaf's counts and the
+        skip-if-current gate never looks for it, so a leaf stamped without it
+        would be skipped as current forever. The failed PUT raises before the
+        stamp — the bitmap's posture — naming the record and the leaf, with
+        the store's error as its cause. A legacy leaf (``leaf_versions:
+        false``, with or without a run identity) is left an unstamped prefix:
+        arrays and bitmap, no record, no stamp, no granule-id sibling. The
+        next attempt's template clears it and starts clean.
+        """
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+        from zagg.telemetry import read_granule_ids
+
+        cfg.output["leaf_versions"] = False
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+        monkeypatch.setattr(processing, "process_shard", self._temporal_fake(grid, shard, 4))
+
+        def write():
+            return hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}, run_id=run_id
+            )
+
+        with monkeypatch.context() as failing:
+            self._fail_record_write(failing)
+            with pytest.raises(RuntimeError, match="leaf temporal record .* failed to write") as e:
+                write()
+        assert isinstance(e.value.__cause__, OSError)
+        assert leaf in str(e.value) and "503 SlowDown" in str(e.value)
+        # Debris: everything before the record landed, nothing after it.
+        assert hive.read_commit(open_store(leaf)) is None
+        assert os.path.exists(f"{leaf}/{hive.COVERAGE_SIDECAR}")
+        assert not os.path.exists(f"{leaf}/{leaf_temporal.LEAF_TEMPORAL_NAME}")
+        assert read_granule_ids(leaf) is None
+        stale = os.path.join(leaf, grid.group_path, "stale-debris")
+        with open(stale, "w") as fh:
+            fh.write("failed attempt")
+        # The next attempt starts clean and lands leaf, record and stamp.
+        meta = write()
+        assert meta.get("error") is None and "leaf_version" not in meta
+        assert not os.path.exists(stale)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        assert leaf_temporal.read_leaf_temporal_record(leaf)["n_obs"] == 4
+
+    def test_a_record_that_cannot_be_built_fails_as_itself_unstamped(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issue #575 review: a build/encode fault is not a store write failure.
+
+        The record is built outside the PUT's guard, so a deterministic build
+        fault propagates as its own exception (not the "failed to write"
+        ``RuntimeError`` that points triage at the store), no PUT is
+        attempted, and the leaf is still left unstamped — fail-closed holds.
+        """
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        cfg.output["leaf_versions"] = False
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+        monkeypatch.setattr(processing, "process_shard", self._temporal_fake(grid, shard, 4))
+        puts = []
+
+        def cap(*a, **k):
+            raise ValueError("cap")
+
+        monkeypatch.setattr(leaf_temporal, "build_leaf_temporal", cap)
+        monkeypatch.setattr(leaf_temporal, "write_leaf_temporal", lambda *a, **k: puts.append(a))
+        with pytest.raises(ValueError, match="^cap$"):
+            hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+            )
+        assert puts == []
+        assert hive.read_commit(open_store(leaf)) is None
+        assert not os.path.exists(f"{leaf}/{leaf_temporal.LEAF_TEMPORAL_NAME}")
+
+    def test_a_failed_record_write_never_moves_a_versioned_pointer(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Fail-closed on a versioned leaf (spec §1.5/§10.6): the attempt's
+        version stays unstamped debris, the pointer is not swapped, and the
+        previous ``current`` keeps serving byte-for-byte — arrays, bitmap and
+        record. The retry draws a FRESH version and lands its own record.
+        """
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+
+        def write(n, run_id):
+            monkeypatch.setattr(processing, "process_shard", self._temporal_fake(grid, shard, n))
+            return hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}, run_id=run_id
+            )
+
+        def served():
+            got, route = leaf_temporal.leaf_contribution(leaf, grid.child_order, {"h": {}})
+            return route, int(got[1].obs.sum())
+
+        first = write(4, "a" * 32)["leaf_version"]
+        before = TestLeafSkipIfCurrent._contents(leaf)
+        with monkeypatch.context() as failing:
+            self._fail_record_write(failing)
+            with pytest.raises(RuntimeError, match="leaf temporal record .* failed to write"):
+                write(6, "b" * 32)
+        # The pointer still names the first version, and not one byte of the
+        # pointer root or that version changed.
+        assert hive.read_commit(open_store(leaf))["current"] == first
+        after = TestLeafSkipIfCurrent._contents(leaf)
+        assert {k: after[k] for k in before} == before
+        assert served() == ("record", 4)
+        # The failed attempt: one more version subgroup, unstamped, recordless.
+        (debris,) = [d for d in os.listdir(leaf) if d.startswith("run-") and d != first]
+        assert debris.startswith(f"run-{'b' * 32}-")
+        assert hive.read_commit(open_store(f"{leaf}/{debris}")) is None
+        assert os.path.exists(f"{leaf}/{debris}/{hive.COVERAGE_SIDECAR}")
+        assert not os.path.exists(f"{leaf}/{debris}/{leaf_temporal.LEAF_TEMPORAL_NAME}")
+        # The retry — same run — writes a fresh version with its record and
+        # swaps the pointer to it; the debris stays for the collector.
+        retry = write(6, "b" * 32)["leaf_version"]
+        assert retry not in (first, debris)
+        assert hive.read_commit(open_store(leaf))["current"] == retry
+        assert leaf_temporal.read_leaf_temporal_record(f"{leaf}/{retry}")["n_obs"] == 6
+        assert served() == ("record", 6)
+        assert os.path.isdir(f"{leaf}/{debris}")
+
+    def test_a_fold_with_no_clocked_observation_stamps_without_a_record(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Fail-closed is about a record that FAILED to write. A temporal
+        leaf whose fold saw no clocked observation has no record to write
+        (§10.6's absence rule): it stamps, and the writer is never called."""
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        monkeypatch.setattr(processing, "process_shard", self._temporal_fake(grid, shard, 0))
+        self._fail_record_write(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+        )
+        leaf = hive.shard_leaf_path(root, shard)
+        assert meta.get("error") is None
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+
+    def test_a_leaf_rewrite_never_leaves_a_stale_record(self, monkeypatch, cfg, tmp_path):
+        """Issue #575: a rewritten leaf never keeps the PRIOR attempt's record.
+
+        The sweep trusts a record it finds, so the two write-site paths
+        that leave no record — a fold that saw no clocked observation
+        (``folded is None``) and a failed (fail-closed) PUT — must not leave an
+        older revision's object standing over new arrays. They cannot: since
+        issue #341 ``_leaf()`` templates with ``overwrite=True``, which
+        ``delete_dir("")``s the whole leaf prefix before the new template
+        lands, so the record goes with the arrays it described.
+        """
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake_feeding(feed: bool):
+            def fake(g, shard_key, urls, **kwargs):
+                carrier = self._carrier(grid, shard_key)
+                if feed:
+                    kwargs["temporal_out"].add_words(words)
+                kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+                kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+                return pd.DataFrame(), self._meta(shard_key)
+
+            return fake
+
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+
+        def rewrite(feed: bool):
+            monkeypatch.setattr(processing, "process_shard", fake_feeding(feed))
+            hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+            )
+            assert hive.read_commit(open_store(leaf))["complete"] is True
+
+        rewrite(feed=True)
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is not None
+        # A rewrite whose fold sees no clocked observation writes no record —
+        # and the prior one is gone with the prefix, never standing over a
+        # leaf that now holds no temporal claim at all.
+        rewrite(feed=False)
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+        # Same for a failed PUT: what it would have replaced was already
+        # deleted by the template clear, so the unstamped debris the failed
+        # attempt leaves carries no record either.
+        rewrite(feed=True)
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is not None
+        self._fail_record_write(monkeypatch)
+        with pytest.raises(RuntimeError, match="leaf temporal record"):
+            rewrite(feed=True)
+        assert hive.read_commit(open_store(leaf)) is None
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+
+    def test_a_rerun_hashes_before_either_sidecar_without_member_warnings(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issues #575/#580: the O11 pass runs BEFORE the coverage sidecar and
+        the temporal record, and the issue #341 clear has removed a prior
+        attempt's copies, so ``members()`` never meets ``temporal.toc`` or
+        ``coverage.moc`` — no warning filter guards the hash pass — and the
+        stamp carries ``content_hashes`` on the first write and the rewrite.
+        """
+        import warnings
+        from pathlib import Path
+
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        grid = self._grid(self._temporal_cfg(cfg))
+        shard = _shard_word()
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+
+        def fake(g, shard_key, urls, **kwargs):
+            carrier = self._carrier(grid, shard_key)
+            kwargs["temporal_out"].add_words(words)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            kwargs["occupied_out"].append(np.asarray(grid.children(shard)[:2], dtype=np.uint64))
+            return pd.DataFrame(), self._meta(shard_key)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+        for _ in range(2):
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                meta = hive.process_and_write_hive(
+                    shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}
+                )
+            assert not [w for w in seen if str(w.message).startswith("Object at")]
+            assert (Path(leaf) / leaf_temporal.LEAF_TEMPORAL_NAME).exists()
+            assert (Path(leaf) / hive.COVERAGE_SIDECAR).exists()
+            stamp = hive.read_commit(open_store(leaf))
+            assert stamp["content_hashes"] == meta["content_hashes"]
+            assert stamp["content_hashes"]["arrays"]
+
+    def test_non_temporal_config_writes_no_record(self, monkeypatch, cfg, tmp_path):
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        grid_probe = self._grid(cfg)
+        seen: dict = {}
+
+        def fake(g, shard_key, urls, **kwargs):
+            seen["temporal_out"] = kwargs.get("temporal_out")
+            carrier = self._carrier(grid_probe, shard_key)
+            kwargs["write_chunk"](grid_probe.block_index(int(shard_key)), carrier, {})
+            return pd.DataFrame(), self._meta(shard_key)
+
+        # The fail-closed record write (issue #575) is unreachable here: a
+        # writer that would raise is never called, and the leaf stamps.
+        self._fail_record_write(monkeypatch)
+        _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        leaf = hive.shard_leaf_path(root, shard)
+        assert seen["temporal_out"] is None and meta.get("error") is None
+        assert leaf_temporal.read_leaf_temporal_record(leaf) is None
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
 
 # ── leaf skip-if-current + contraction guard (issue #388 phase 2) ────────────
 
@@ -1596,6 +2075,97 @@ class TestLeafSkipIfCurrent:
         )
         assert calls == [int(shard)] and meta["identity"] == "unstamped-leaf"
 
+    @pytest.mark.parametrize("versioned", [True, False])
+    def test_a_failed_record_write_is_never_certified_current(
+        self, monkeypatch, cfg, tmp_path, versioned
+    ):
+        """Issue #575's fail-closed record write, against this gate.
+
+        The gate compares the identity pair and verifies the stamp and the
+        column; it never looks for ``temporal.toc``. So the guarantee has to
+        come from the write site: a failed record write stamps nothing, and
+        the caller — which a raise takes past its sidecar write — records
+        nothing, leaving no later run anything to certify that attempt by.
+        """
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.telemetry import build_record, read_sidecar, write_sidecar
+
+        helper = TestProcessAndWriteHive()
+        cfg.output["leaf_versions"] = versioned
+        grid = helper._grid(helper._temporal_cfg(cfg))
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+        grown = [*self.URLS, "s3://bucket/granule3.h5"]
+        folds: list = []
+        runs = iter("abcdef")
+
+        def attempt(urls, n, *, fails=False, **kw):
+            """One unit as a dispatcher runs it: the seam, then the sidecar on success."""
+            fake = helper._temporal_fake(grid, shard, n)
+
+            def counting(*a, **k):
+                folds.append(n)
+                return fake(*a, **k)
+
+            def seam():
+                return hive.process_and_write_hive(
+                    shard, list(urls), grid, {}, root, cfg, store_kwargs={}, run_id=run_id, **kw
+                )
+
+            run_id = next(runs) * 32
+            with monkeypatch.context() as patch:
+                patch.setattr(processing, "process_shard", counting)
+                if fails:
+                    helper._fail_record_write(patch)
+                    with pytest.raises(RuntimeError, match="leaf temporal record"):
+                        seam()
+                    return None
+                meta = seam()
+            if not meta.get("current"):
+                record = build_record(
+                    shard_key=int(shard),
+                    metadata=meta,
+                    granule_ids=list(urls),
+                    run_id=run_id,
+                    semantic_hash=meta["semantic_hash"],
+                )
+                write_sidecar(leaf, record)
+            return meta
+
+        def served():
+            got, route = leaf_temporal.leaf_contribution(leaf, grid.child_order, {"h": {}})
+            return route, int(got[1].obs.sum())
+
+        # A fresh store: the failed first attempt leaves no sidecar, so the
+        # next run has nothing to compare against and folds.
+        attempt(self.URLS, 3, fails=True, skip_if_current=True)
+        assert read_sidecar(leaf) is None
+        meta = attempt(self.URLS, 4, skip_if_current=True)
+        assert meta["identity"] == "no-sidecar" and "current" not in meta
+        assert served() == ("record", 4)
+        # A replacement (one more granule) whose record write fails: the
+        # sidecar still records the OLD inputs, so the next run rewrites.
+        attempt(grown, 5, fails=True, skip_if_current=True)
+        meta = attempt(grown, 6, skip_if_current=True)
+        assert meta["identity"] == "expansion" and "current" not in meta
+        assert served() == ("record", 6)
+        # A forced rewrite (gate off) of an UNCHANGED identity that fails.
+        attempt(grown, 7, fails=True)
+        meta = attempt(grown, 8, skip_if_current=True)
+        if versioned:
+            # The pointer never moved: what the rerun certifies is the
+            # previous version, which holds exactly this identity AND its
+            # record — never the failed attempt.
+            assert meta["current"] is True and folds == [3, 4, 5, 6, 7]
+            assert served() == ("record", 6)
+        else:
+            # The failed attempt cleared the legacy leaf in place, so the
+            # matching sidecar stands over an unstamped prefix: rewritten.
+            assert meta["identity"] == "unstamped-leaf" and folds == [3, 4, 5, 6, 7, 8]
+            assert served() == ("record", 8)
+
     def test_touch_failure_never_unskips_the_unit(self, monkeypatch, cfg, tmp_path):
         # Fail-open (issue #388 phase 3): a touch failure logs and counts —
         # it NEVER fails the unit and never degrades the skip to a rewrite.
@@ -1893,6 +2463,52 @@ class TestProcessAndWriteHiveSharded:
         assert hive.read_commit(open_store(leaf))["complete"] is True
         assert not os.path.exists(stale), "stale torn-write object survived the re-template"
         assert not os.path.exists(sidecar), "torn attempt's sidecar survived the re-template"
+
+    def test_a_failed_record_write_fails_the_sharded_leaf_too(self, monkeypatch, cfg, tmp_path):
+        """Issue #575 fail-closed, on the sharded (accumulate) switch: the one
+        post-stream leaf write and the streaming path share the record's write
+        site, so a failed record leaves the sharded version unstamped and the
+        pointer unwritten, and the retry lands a fresh version with its record."""
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import leaf_temporal
+        from zagg.store import open_store
+
+        helper = TestProcessAndWriteHive()
+        grid = self._grid(helper._temporal_cfg(cfg))
+        assert grid.sharded is True
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        leaf = hive.shard_leaf_path(root, shard)
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(5)],
+            dtype=np.uint64,
+        )
+        accumulate = self._accumulate_fake(grid, occupied=grid.children(shard)[:3])
+
+        def fake(g, shard_key, urls, **kwargs):
+            kwargs["temporal_out"].add_words(words)
+            return accumulate(g, shard_key, urls, **kwargs)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+
+        def write():
+            return hive.process_and_write_hive(
+                shard, ["s3://b/g1.h5"], grid, {}, root, cfg, store_kwargs={}, run_id="a" * 32
+            )
+
+        with monkeypatch.context() as failing:
+            helper._fail_record_write(failing)
+            with pytest.raises(RuntimeError, match="leaf temporal record .* failed to write"):
+                write()
+        assert hive.read_commit(open_store(leaf)) is None  # no pointer was ever written
+        (debris,) = os.listdir(leaf)
+        assert hive.read_commit(open_store(f"{leaf}/{debris}")) is None
+        version = write()["leaf_version"]
+        assert version != debris
+        assert hive.read_commit(open_store(leaf))["current"] == version
+        assert leaf_temporal.read_leaf_temporal_record(f"{leaf}/{version}")["n_obs"] == 5
 
     def test_k1_explicit_sharded_true_is_noop(self, monkeypatch, cfg, tmp_path):
         """K==1 no-op parity, matching flat (issue #215): explicit
@@ -2476,6 +3092,51 @@ class TestRunnerWiring:
         agg(cfg, catalog=catalog_path, store=root, backend="local")
         s2 = agg(cfg, catalog=catalog_path, store=root, backend="local", overwrite=True)
         assert calls == [shard, shard] and s2["cells_current"] == 0
+
+    def test_local_failed_record_write_is_a_cell_error_the_next_run_redoes(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        """Issue #575 fail-closed, through the local dispatcher: a record write
+        that fails is a cell ERROR — nothing stamped, no pointer, no stats
+        sidecar — and the next run's gate, finding nothing that records the
+        attempt, folds the shard again instead of skipping it as current."""
+        import zagg.processing as processing
+        from zagg import leaf_temporal, runner
+        from zagg.grids import from_config
+        from zagg.runner import agg
+        from zagg.store import open_store
+        from zagg.telemetry import read_sidecar
+
+        helper = TestProcessAndWriteHive()
+        cfg = helper._temporal_cfg(cfg)
+        cfg.output["store_layout"] = "hive"
+        # The runner validates the clock column against the declared reads.
+        cfg.data_source["variables"]["delta_time"] = "/{group}/land_ice_segments/delta_time"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        grid = from_config(cfg, parent_order=6)
+        fake = helper._temporal_fake(grid, shard, 4)
+        calls = []
+
+        def counting(g, shard_key, urls, **kwargs):
+            calls.append(int(shard_key))
+            return fake(g, shard_key, urls, **kwargs)
+
+        monkeypatch.setattr(processing, "process_shard", counting)
+        leaf = hive.shard_leaf_path(root, shard)
+        with monkeypatch.context() as failing:
+            helper._fail_record_write(failing)
+            s1 = agg(cfg, catalog=catalog_path, store=root, backend="local")
+        assert s1["cells_error"] == 1 and s1["cells_with_data"] == 0
+        assert hive.read_commit(open_store(leaf)) is None and read_sidecar(leaf) is None
+
+        s2 = agg(cfg, catalog=catalog_path, store=root, backend="local")
+        assert calls == [shard, shard]  # the second run folded: nothing was skipped
+        assert (s2["cells_error"], s2["cells_current"], s2["cells_with_data"]) == (0, 0, 1)
+        data_path, stamp = hive.resolve_leaf(leaf)
+        assert stamp["complete"] is True
+        assert leaf_temporal.read_leaf_temporal_record(data_path)["n_obs"] == 4
 
     def test_local_rerun_contraction_refuses_then_flag_rewrites(self, monkeypatch, cfg, tmp_path):
         """Issue #388 acceptance: a contracted shardmap REFUSES per leaf

@@ -1,0 +1,38 @@
+{
+ "spec": "zagg-leaf-temporal/1",
+ "source": "worker",
+ "generated_at": "2026-09-18T04:22:19+00:00",
+ "fields": [
+  "h_tdigest"
+ ],
+ "n_obs": 346,
+ "word": "10689250968998868755",
+ "temporal_order": 24,
+ "cap": 512,
+ "counts": {
+  "temporal_order": 24,
+  "cap": 512,
+  "element": {
+   "dtype": "uint64",
+   "shape": [
+    -1
+   ]
+  },
+  "encoding": "base64",
+  "words": "AO0rSgDZV5SA7StKANpXlIB2LUoA7FqUAHctSgDtWpSAdy1KAO5alA==",
+  "obs": "KQAAAAAAAAAFAAAAAAAAAFkAAAAAAAAAuAAAAAAAAAAbAAAAAAAAAA==",
+  "count": 5,
+  "obs_total": 346
+ },
+ "cover": {
+  "words": "gO0rSgDZV5SAdy1KAOxalA==",
+  "count": 2,
+  "element": {
+   "dtype": "uint64",
+   "shape": [
+    -1
+   ]
+  },
+  "encoding": "base64"
+ }
+}

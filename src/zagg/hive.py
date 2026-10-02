@@ -1191,8 +1191,9 @@ def build_root_coverage(
     object byte-identical to pre-#246 runs.
 
     ``temporal`` (issue #480): the spec §10 ``zagg-coverage-toc/1`` section —
-    the per-shard toc envelope word map plus the optional root time-digest,
-    built by :func:`zagg.coverage_toc.build_temporal_section`. ``None`` for a
+    the per-shard toc envelope word map plus the optional root counted cover
+    (§10.3, issue #575), built by
+    :func:`zagg.coverage_toc.build_temporal_section`. ``None`` for a
     store with no temporal channel, which keeps ITS root object byte-identical
     to a pre-#480 one; absence of the section is never a refusal.
     """
@@ -1994,6 +1995,13 @@ def process_and_write_hive(
     # Occupied-cell sink (issue #200): the worker already holds the shard's
     # populated cell words; collect them here to derive the stamp's coverage.
     occupied: list = []
+    # Temporal-record sink (issue #575): armed only by a §8.3 per-centroid
+    # declaration, so a store with no temporal channel writes no record and
+    # takes the code path it always did. The worker folds each chunk's toc
+    # words into it as it encodes them; the leaf write below drains it.
+    from zagg import leaf_temporal
+
+    temporal_acc = leaf_temporal.LeafTemporalAccumulator() if leaf_temporal.armed(config) else None
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
@@ -2008,6 +2016,7 @@ def process_and_write_hive(
         occupied_out=occupied,
         time_range_of=time_range_of,
         profile=profile,
+        temporal_out=temporal_acc,
     )
     # Windowed stamp truth (D15): convert the worker's dataset-unit extent to
     # ISO-8601 UTC once, here — the same strings feed the stamp below and the
@@ -2046,10 +2055,15 @@ def process_and_write_hive(
     # its debris semantics: a torn worker's coverage never becomes visible.
     # The leaf write order is pinned: dense (streamed, or one object each when
     # sharded) -> ragged (one object, issue #209) -> O11 hashes (in memory,
-    # issue #580) -> coverage sidecar -> stamp -> granule-id sibling (issue
-    # #388; after the stamp, inside the bracket) -> leaf pyramid column (issue
-    # #383) -> Icechunk refs commit (issue #580; last, after the one
-    # post-stamp phase that can still fail the unit).
+    # issue #580) -> coverage sidecar -> temporal record (issue #575,
+    # fail-closed) -> stamp -> granule-id sibling (issue #388; after the stamp,
+    # inside the bracket) -> leaf pyramid column (issue #383) -> Icechunk refs
+    # commit (issue #580; last, after the one post-stamp phase that can still
+    # fail the unit) -> pointer swap (issue #582; versioned leaves only). The
+    # hash pass precedes both sidecars, and the template's issue #341 clear
+    # removed a prior attempt's copies (a versioned leaf's version prefix is
+    # fresh per attempt), so its ``members()`` walk never meets
+    # ``coverage.moc`` or ``temporal.toc``.
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
@@ -2103,6 +2117,35 @@ def process_and_write_hive(
         if words is not None and not full and depth > 0:
             bitmap = encode_coverage_bitmap(shard_key, words, grid.child_order)
             write_coverage_sidecar(data_path, bitmap, **store_kwargs)
+        # The leaf temporal record (issue #575): the bitmap's SLOT and its
+        # posture — a per-leaf sidecar PUT before the stamp that FAILS CLOSED
+        # (espg ruling of 2026-10-01, §10.6). Nothing points at the record,
+        # but it is the only source of this leaf's counts, no later walk
+        # writes one, and the skip-if-current gate above never looks for it:
+        # a leaf stamped without it reads as current on every re-run and
+        # stays uncounted for good. So a failed write raises HERE, before
+        # the stamp — the prefix is unstamped debris (a versioned leaf's
+        # pointer does not move; the previous ``current`` keeps serving), the
+        # caller writes no stats sidecar, and the next attempt rewrites the
+        # unit like any failed shard. No retry loop of its own: the store
+        # client's policy (``store._S3_RETRY_CONFIG``) already ran. A record
+        # that cannot be BUILT raises as itself, outside the ``try`` (no store
+        # call was made), still before the stamp. Absent, and NOT a failure,
+        # when the fold saw no clocked observation. It goes to ``data_path``,
+        # beside the bitmap: on a versioned leaf (spec §1.5) the version
+        # subgroup, BEFORE the version's stamp.
+        folded = temporal_acc.finish() if temporal_acc is not None else None
+        if folded is not None:
+            record = leaf_temporal.build_leaf_temporal(
+                *folded, leaf_temporal.temporal_field_names(config)
+            )
+            try:
+                leaf_temporal.write_leaf_temporal(data_path, record, **store_kwargs)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"leaf temporal record for {data_path} failed to write ({exc}); the leaf "
+                    f"is left unstamped and the unit fails (issue #575)"
+                ) from exc
         stamp = stamp_commit(
             box["store"],
             cells_with_data=metadata.get("cells_with_data", 0),

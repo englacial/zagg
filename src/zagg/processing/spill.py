@@ -553,11 +553,17 @@ class SpillAggregator:
         block_bytes: int | None = None,
         tmp_dir: str | None = None,
         overlap: bool = True,
+        temporal_out=None,
     ):
         self.config = config
         self.grid = grid
         self.handoff = handoff
         self.buffer_granules = buffer_granules
+        # The leaf temporal accumulator (issue #575), fed wherever this path
+        # encodes toc words: the single-block regime through the pooled
+        # machinery (``_aggregate_chunk_cells``), the multi-block regime per
+        # cell in ``_fold_block`` — each observation exactly once either way.
+        self.temporal_out = temporal_out
         self.tmp_dir = tmp_dir or tempfile.gettempdir()
         agg_fields = get_agg_fields(config)
         self._data_vars = get_data_vars(config)
@@ -915,6 +921,8 @@ class SpillAggregator:
                     # the encode's transient allocation is unbudgeted by
                     # ``_default_block_bytes`` / ``_BUILD_MULT``.
                     cell_data[TOC_WORD_COLUMN] = _toc_word_column(cell_data, self.config)
+                    if self.temporal_out is not None:
+                        self.temporal_out.add_words(cell_data[TOC_WORD_COLUMN])
                 for name, f in self._digest_fields.items():
                     values = cell_data[f.source]
                     declared = _channels(f)  # every zip below is against THIS tuple
@@ -1107,6 +1115,7 @@ class SpillAggregator:
             self._data_vars,
             agg_fields,
             chunk_pooled=chunk_pooled,
+            temporal_out=self.temporal_out,
         )
 
     def _load_partition(self, key: int) -> None:

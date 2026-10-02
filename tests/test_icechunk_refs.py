@@ -653,6 +653,33 @@ class TestLeafRefs:
         assert rag["sharded"] is True and rag["refs"] == 1
         assert [bool(loc) for loc in rag["locations"]] == [True, False, False, False]
 
+    @pytest.mark.parametrize("run_id", [None, "c" * 32], ids=["legacy", "versioned"])
+    def test_a_foreign_leaf_root_object_is_never_planned(self, monkeypatch, cfg, tmp_path, run_id):
+        """A non-zarr object inside the leaf — the §10.6 ``temporal.toc``
+        record (issue #575) or the ``coverage.moc`` bitmap — is neither
+        enumerated nor referenced: the plan is keyed by the grid's named
+        arrays and reads under ``{leaf}/{group}/{name}/c/`` only. The same on
+        a versioned leaf (issue #582), where both objects sit in the version
+        subgroup the plan points into."""
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        shard = _shards(grid, 1)[0]
+        meta = _write_leaf(monkeypatch, grid, root, shard, run_id=run_id)
+        assert meta.get("error") is None
+        version = meta.get("leaf_version")
+        assert bool(version) == bool(run_id)
+        leaf = tmp_path / "store" / hive.shard_leaf_path("", shard).lstrip("/")
+        for name in ("temporal.toc", hive.COVERAGE_SIDECAR):
+            (leaf / (version or "") / name).write_bytes(b"{not zarr}")
+        plan = icechunk_refs.leaf_ref_plan(grid, shard, root, store_kwargs={}, version=version)
+        assert plan and {e["path"] for e in plan} <= set(grid.shard_spec().members)
+        locations = [loc for e in plan for loc in e.get("locations", [])] + [
+            c[1] for e in plan for c in e.get("chunks", [])
+        ]
+        assert locations and not [loc for loc in locations if loc.endswith((".toc", ".moc"))]
+        if version:
+            assert all(f"/{version}/" in loc for loc in locations if loc)
+
     @pytest.mark.parametrize(
         "mutate, match",
         [

@@ -753,6 +753,7 @@ shard plus two store-root objects:
 | 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
 | root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
 | root sibling | [§10.5](specification.md) word-set cover: a per-shard toc word SET (temporal stores only) | `{store_root}/coverage.toc` | one opt-in GET, temporal consumers only, on demand |
+| leaf record | [§10.6](specification.md) temporal record: the leaf's envelope word + counted cover (temporal stores only; written by the leaf's worker, never by a sweep) | `{full_id}.zarr/temporal.toc` sidecar (a versioned leaf's: in its `current` version, beside the bitmap) | one small GET — the sweep's per-leaf read; readers never need it |
 
 **Leaf envelope** (on the stamp, `zagg.hive.read_coverage`; strict
 `spec: morton-moc/1` gate — unknown specs read as absent):
@@ -803,7 +804,7 @@ the reference example can never drift from the implementation.
 
 A temporal-declaring store adds one more key here: `temporal`, the
 `zagg-coverage-toc/1` section (per-shard toc envelope words plus an optional
-root time-digest) whose grammar is normative in
+root counted cover) whose grammar is normative in
 [`specification.md`](specification.md) §10 — one metadata GET then answers
 "which shards hold data DURING my window" before any leaf is opened. A store
 with no temporal channel carries no such key and its root object is
@@ -826,6 +827,87 @@ spatial-only pre-#480 root — which is why it is not inline), discovered
 through the section's `cover` marker, and carries the same
 regenerable-accelerator staleness posture as everything else on this page.
 Grammar: [`specification.md`](specification.md) §10.5.
+
+**Leaf temporal record** (`{full_id}.zarr/temporal.toc`,
+[issue #575](https://github.com/englacial/zagg/issues/575)): on a temporal
+store every leaf the worker writes also carries a small JSON record — its
+§10.2 envelope word, its §10.3 counted cover (observation counts per
+aligned time bucket) and the §10.5 cover derived from it — computed per
+chunk from the toc words the aggregation already encodes, and PUT in the
+bitmap's slot: after the arrays, before the stamp, **fail-closed** — a
+record that does not land fails the unit before the stamp (below). It exists so
+the families sweep composes the root section and the cover sibling from
+one small GET per leaf instead of reading every leaf's raw `_times` column
+back (a million-row ragged array per field per leaf at California scale,
+which no single invoke could finish). On a **versioned** leaf the record
+(like the bitmap) lives in the version subgroup —
+`{full_id}.zarr/run-{run_id}-{attempt}/temporal.toc` — and every walk
+resolves `current` before reading it.
+
+**The record is the worker's, or there is none.** It is the only source of
+observation counts: the leaf stores no per-observation clock, so nothing
+can rebuild them afterwards. The sweep and the refresh escape hatch
+(`zagg.coverage.refresh_root_coverage`) read the record first and never
+write one — not for a leaf that lacks it, not over a stale, unparsable or
+foreign-revision one. A leaf without a usable record is read from its raw
+columns one chunk at a time and contributes its **coverage only**: its
+envelope word and its occupied buckets, every count zero (§10.3). So that
+nobody mistakes the result for a total, the root `counts` block carries
+`uncounted_shards` — the number of shards with such a leaf — and its
+`obs_total` is exact at 0 and a lower bound otherwise. The sweep record
+shows the same thing per pass: `temporal_routes: {records, raw}` (how each
+contributing leaf was read; `raw` leaves gave no counts) and, on a pass
+that wrote the section, `uncounted_shards` beside `temporal_shards` — both
+this pass's tally, not the root's: a pass over part of the store keeps the
+standing counts block and its marker (§10.4), so whether the published
+totals are exact is read from the root block's own `uncounted_shards`.
+
+There is no backfill for a store written before the record existed (espg
+ruling of 2026-10-01 on [issue #575](https://github.com/englacial/zagg/issues/575)):
+such a store is frozen and rebuilt in the current layout, where every leaf
+gets its record at commit. Swept as it stands, it publishes tier 1, the
+cover, and a counts block of zero-count buckets with every shard uncounted
+— and pays the raw column read per leaf on every pass, since nothing
+converges, which at California scale no single invoke can finish
+(`_handle_sweep` in `deployment/aws/lambda_handler.py` works that
+arithmetic).
+
+**A record that fails to write fails the unit** (espg ruling of 2026-10-01
+on [PR #578](https://github.com/englacial/zagg/pull/578)). The skip-if-current
+gate compares the semantic hash and the granule-id set and verifies the
+leaf column, but never looks for the record, so a leaf stamped without one
+would be skipped as current on every re-run and stay uncounted for good.
+The worker therefore raises before the stamp, after the object-store
+client's own retries (up to 12, backed off 1–30 s inside a 180 s budget —
+`zagg.store._S3_RETRY_CONFIG`; there is no second loop on top). A record
+that cannot be *built* fails the unit the same way, before the stamp, with
+its own error and no store call:
+
+- a **legacy** leaf is left an unstamped prefix (arrays and bitmap, no
+  record, no stamp) — debris, cleared wholesale by the next attempt's
+  template. As with any failed legacy write, the previous committed leaf is
+  already gone: the template cleared it before the first chunk;
+- a **versioned** leaf's attempt is left an unstamped version subgroup; the
+  pointer is not swapped, so the previous `current` (if any) keeps serving,
+  and the retry draws a fresh version;
+- no stats sidecar, granule-id sibling, sub-map or leaf column is written
+  for the attempt, so a later run's gate sees nothing of it and does not
+  skip the unit on its account: a legacy leaf is unstamped and rewritten; a
+  versioned leaf is judged on its previous `current` alone (rewritten
+  unless that version already holds the planned identity), and a unit with
+  no previous version has no sidecar and is processed;
+- on the fleet the invoke returns the handler's 500 envelope
+  (`{"error": "Unhandled exception: leaf temporal record for … failed to
+  write …", "shard_key", "request_id"}`) and its `.status` object is
+  `failed`. A `failed` status is terminal for that run — the poller never
+  re-fires a worker-reported error, and the fleet's async retry count is 0
+  — so the shard is counted in the run's errors and re-done by the next run.
+
+A leaf whose fold saw no clocked observation writes no record and stamps;
+that is not a failure. A raw leaf now means one written before the record
+existed, one whose record was lost or damaged after the stamp, a revision
+or field-set mismatch, or a record read that failed on that pass. Grammar:
+[`specification.md`](specification.md) §10.6.
 
 **Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`
 against the AOI to pick candidate shards (one GET, no walk); per leaf,
