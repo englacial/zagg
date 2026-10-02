@@ -16,6 +16,8 @@ the matrix from here.
 | `shardmaps/*.json` | one shard map per `(grid, order)` — **shared** by both aggregators on that grid |
 | `AOP_NEON.geojson` | the **default** AOI (NEON SERC AOP box) shard maps are built over |
 | `antarctic_88s.geojson` | a non-default AOI near the ±88° turning latitude, for an override 88°S stress target (issue #121) |
+| `antarctic_{85,85_5,86,86_5,87,87_5}s.geojson` | the equatorward bands of the 88°S latitude sweep (issue #148) — same shape, stepped off the turning latitude |
+| `targets_88s_latitude_sweep.json` | the latitude-sweep matrix: 7 bands × 2 worker arms (issue #148) |
 
 The workflow calls `run_benchmark.py --targets tests/data/benchmark/targets.json`,
 which loads `targets.json` and dispatches **one shard per target** (the pinned
@@ -260,9 +262,61 @@ NEON tdigest configs and temporal window; only the AOI override differs.
   deterministic, offline guard on the shardmap build + pin). Regenerate the
   snapshot only to deliberately re-pin.
 - **Run on demand** via explicit `--target` (they are provisional so a red
-  stress run never fails the every-merge matrix): OOM/timeout at 2 GB / 900 s
-  is the *expected* baseline result until the issue #148 streaming/cached-read
-  work lands.
+  stress run never fails the every-merge matrix). OOM/timeout at 2 GB / 900 s
+  was the expected baseline result for these two targets, and it still is —
+  they predate the streaming work and dispatch the *hierarchical* and *cached*
+  read paths on the base worker. The streaming half of issue #148 has since
+  landed (spill on a `-disk` worker is now the shipped per-merge
+  configuration), so the current polar picture is the **latitude sweep** below,
+  not these two rows: as of 0.36.0 memory is no longer the wall anywhere —
+  read is.
+
+## The 88°S latitude sweep (issue #148 reassessment)
+
+`targets_88s_latitude_sweep.json` is the reassessment matrix: **one o9 shard per
+0.3° latitude band** at 85 / 85.5 / 86 / 86.5 / 87 / 87.5 / 88 °S, each on **two
+worker arms** — 4 GB with disk and 8 GB with disk. Every arm is the shipped
+per-merge sidecar configuration (`configs/atl03_tdigest_healpix_o9_hive.yaml` +
+`index_backend: sidecar`, `streaming_mode: spill`, `sharded: true`,
+`aoi_mask: false`) pointed at a ring band instead of the NEON box, so **latitude
+and worker size are the only things that vary**. It is run on demand by explicit
+`--target`, never every merge, and a timeout is an expected result rather than a
+red build.
+
+- **The AOI family is generated, not hand-written.** `tools/make_lat_ring_aoi.py`
+  emits the bands to one set of rules — `[-L, -L+0.3]`, eight 45° sectors,
+  vertices every 1° of longitude — and its acceptance test is that it reproduces
+  the committed `antarctic_88s.geojson` **geometry exactly**, so the sweep bands
+  are the same shape as the pinned stress row they extend and the granule counts
+  stay comparable. It refuses to overwrite a committed band whose bytes differ
+  (`--force` is the way through), because the shipped 88°S ring's prose is not
+  what the generator writes:
+
+  ```bash
+  uv run python tools/make_lat_ring_aoi.py --check 85 85.5 86 86.5 87 87.5 88
+  ```
+
+- **One row is pinned; twelve are pending.** `healpix_o9_88s` reuses the
+  committed stress map and pin **verbatim** (the same entry `targets.json`
+  carries), so the drift guard and the re-pin driver keep covering it in the one
+  place they already do. The six equatorward bands have no shard map yet: the
+  committed `catalogs/cat_88s.parquet` is the CMR result for
+  `[-180, -88.0, 180, -87.7]` and is **not** a superset of them — a granule that
+  turns at 86°S and never reaches 87.7°S is simply absent, so a map rebuilt from
+  it would under-count silently. Their rows therefore live in
+  `pending_targets`, not `targets`: `run_benchmark.run_target` reads
+  `shard_key` unconditionally, so a pin-less row in `targets` would die
+  mid-dispatch instead of being visibly not-ready. `_pin_recipe` in the manifest
+  is the four-step recipe for moving one across, and
+  `tests/test_88s_latitude_sweep.py` fails loudly on a half-done pin.
+- **The window is the snapshot's, not the manifest default.** `2018-10-13 ..
+  2025-06-01` — the window `cat_88s.parquet` was fetched over, which is what
+  actually pins the 88°S row (a `catalog_parquet` entry rebuilds from the
+  snapshot, not from CMR). `targets.json`'s top-level default is the longer
+  full-mission window; the sweep does not inherit it.
+- **Both `-disk` variants must exist before a run.** Each row's `worker` block
+  resolves `process-shard-4096-disk` / `process-shard-8192-disk` off the base
+  function (`run_benchmark.resolve_variant`).
 
 ## Add a target over a different AOI (latitude sweep / polar stress)
 
@@ -282,6 +336,14 @@ top-level default (issue #121).
    antimeridian sliver — 10 cells instead of ~564 at o9). `antarctic_88s.geojson`
    is therefore a MultiPolygon of eight 45° sectors with vertices sampled every
    1° of longitude; follow that pattern for any AOI that wraps the globe.
+
+   For a **latitude ring** specifically, don't hand-write it — generate it, so
+   the band height and the sectorization are the same ones every issue #148
+   figure was measured over:
+
+   ```bash
+   uv run python tools/make_lat_ring_aoi.py 84.5      # writes antarctic_84_5s.geojson
+   ```
 
 2. **Build the shard map over that AOI** — point `--polygon` at the new geojson
    (and `--start-date`/`--end-date` if the override narrows the window):

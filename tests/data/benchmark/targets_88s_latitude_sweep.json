@@ -1,0 +1,309 @@
+{
+  "description": "88S reassessment latitude sweep (issue #148): one o9 shard per 0.3-deg latitude band at 85 / 85.5 / 86 / 86.5 / 87 / 87.5 / 88 degrees SOUTH, each run on TWO worker arms -- 4 GB with disk and 8 GB with disk. Every arm is the shipped per-merge sidecar configuration (tdigest, store_layout hive, sidecar read, spill streaming, sharded output, granule_workers=4, no AOI mask) pointed at a ring band instead of the NEON box, so the sweep measures LATITUDE and WORKER SIZE against a pipeline that is otherwise byte-identical to the one that ships. The question it answers is where the tractable band ends. Reference result, recorded on zagg 0.36.0 (issue #148, the 2026-07-19 reassessment comment): 85S/8GB completed at 865 s and every band poleward of it timed out, with the winning run splitting read 671 s / aggregate 194 s / write 10 s -- read-bound, memory not binding (2,221 MB peak of 8192, spill holding it). Those figures are a property of that code point, not of the bands: the SAME sweep on 0.35.0 timed out at every band including 85S, and the store-cache fix of issue #287 / PR #288 (675 credential-chain walks per shard down to 1) is what moved it. Re-record them when the sweep is next run. Run on demand by explicit --target; this is NOT an every-merge matrix, and a timeout is an expected result here, not a red build.",
+  "temporal": {
+    "start": "2018-10-13",
+    "end": "2025-06-01",
+    "note": "The window catalogs/cat_88s.parquet was fetched over, which is what actually pins the 88S row (an entry carrying catalog_parquet rebuilds from the snapshot, not from CMR -- bench_metrics.rebuild_shardmap). The sweep bands share it so their granule counts are comparable to that row rather than to a longer window. Note this is NOT targets.json's top-level 2018-10-13..2026-03-15: the 88S pins keep their own window (tests/data/benchmark/README.md)."
+  },
+  "cmr": {
+    "short_name": "ATL03",
+    "version": "007",
+    "provider": "NSIDC_CPRD",
+    "backend": "mortie",
+    "footprint": "swath"
+  },
+  "dispatch": {
+    "region": "us-west-2",
+    "function_name": "process-shard",
+    "note": "Base function; each target's worker block resolves the pre-provisioned variant off it (run_benchmark.resolve_variant) -- process-shard-4096-disk and process-shard-8192-disk. Both variants must exist before a run; a stale variant is what run_benchmark's pre-dispatch staleness guard is for."
+  },
+  "_aoi_note": "There is deliberately NO top-level aoi default here: every band IS a different AOI, so an entry that forgot its own would silently inherit a neighbour's ring (or, through bench_metrics.resolve_aoi_temporal_cmr, targets.json's NEON box). Each shardmap entry below carries its aoi explicitly, and test_88s_latitude_sweep asserts that.",
+  "shardmaps": {
+    "healpix_o9_85s": {
+      "aoi": {
+        "file": "antarctic_85s.geojson",
+        "name": "Antarctic 85S ring"
+      },
+      "pin": "unpinned",
+      "note": "Band [-85.0, -84.7]. The crossover band as of zagg 0.36.0 (issue #148, 2026-07-19): completed at 865 s / 189,852,320 obs on 8 GB with disk and timed out at 4 GB -- the first pole shard ever to fit one worker, and on 0.35.0 it did not. UNPINNED here: see _pin_recipe."
+    },
+    "healpix_o9_85_5s": {
+      "aoi": {
+        "file": "antarctic_85_5s.geojson",
+        "name": "Antarctic 85.5S ring"
+      },
+      "pin": "unpinned",
+      "note": "Band [-85.5, -85.2]. Timed out on both arms on 0.36.0; the granule-concurrency sweep of issue #290 is the lever expected to bring it in. UNPINNED here: see _pin_recipe."
+    },
+    "healpix_o9_86s": {
+      "aoi": {
+        "file": "antarctic_86s.geojson",
+        "name": "Antarctic 86S ring"
+      },
+      "pin": "unpinned",
+      "note": "Band [-86.0, -85.7]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
+    },
+    "healpix_o9_86_5s": {
+      "aoi": {
+        "file": "antarctic_86_5s.geojson",
+        "name": "Antarctic 86.5S ring"
+      },
+      "pin": "unpinned",
+      "note": "Band [-86.5, -86.2]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
+    },
+    "healpix_o9_87s": {
+      "aoi": {
+        "file": "antarctic_87s.geojson",
+        "name": "Antarctic 87S ring"
+      },
+      "pin": "unpinned",
+      "note": "Band [-87.0, -86.7]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
+    },
+    "healpix_o9_87_5s": {
+      "aoi": {
+        "file": "antarctic_87_5s.geojson",
+        "name": "Antarctic 87.5S ring"
+      },
+      "pin": "unpinned",
+      "note": "Band [-87.5, -87.2]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
+    },
+    "healpix_o9_88s": {
+      "path": "shardmaps/sm_healpix_o9_88s.json",
+      "shard_key": 11530143033882312713,
+      "n_granules": 5536,
+      "catalog_parquet": "catalogs/cat_88s.parquet",
+      "aoi": {
+        "file": "antarctic_88s.geojson",
+        "name": "Antarctic 88S ring"
+      },
+      "note": "Band [-88.0, -87.7] -- the turning latitude, and the ONLY pinned row of this sweep. Reuses the committed 88S stress map and pin verbatim (the same entry targets.json carries as healpix_o9_88s), so the drift guard and the issue #444 re-pin driver keep covering it in the one place they already do; this manifest does not fork it. Worst shard of the mission by granule count: 5,536 granules over 564 ring shards, ~84x NEON o9's 66. Committed map is PRUNED to this shard (metadata.pruned); the full ring map is ~0.7 GB of JSON."
+    }
+  },
+  "_pin_recipe": {
+    "why_unpinned": "A row is dispatchable only once its shard map is built and its densest shard pinned, and the six equatorward bands have no catalog to build from. catalogs/cat_88s.parquet is the CMR result for bbox [-180, -88.0, 180, -87.7] and is NOT a superset of them: every one of its 35,639 granules reaches north of 85S, but a granule that turns at 86S and never reaches 87.7S is simply absent, so an 85S map rebuilt from it would under-count silently rather than fail.",
+    "how_to_pin": [
+      "(1) Fetch a catalog covering the bands. One union fetch over [-180, -88.0, 180, -84.7] (the union of all seven) prefiltered per band is exact -- complete-ring lat-overlap is an exact test, which is why the ring maps rebuild offline where a box AOI cannot (README, 'Reproducing / re-pinning the NEON maps'). Save it with --catalog-out and point the entry's catalog_parquet at it.",
+      "(2) Add path + catalog_parquet to the entry, build the map over the band's own aoi with the recipe in bench_metrics.rebuild_shardmap, and select the pin with bench_metrics.select_pin (densest by granule count, ties to the lowest shard_key).",
+      "(3) Prune the written map to the pinned shard and record metadata.pruned -- a full ring map is hundreds of MB of JSON, which is why the 88S maps are committed pruned.",
+      "(4) Replace the entry's \"pin\": \"unpinned\" with shard_key + n_granules and move its two targets from pending_targets to targets. test_88s_latitude_sweep asserts the two halves stay consistent, so a half-done pin fails loudly."
+    ],
+    "open_question": "Where the catalog snapshots live is a size call, not a mechanical one: one union parquet is ~40 MB, seven per-band parquets are ~100 MB, and fetching nothing leaves the sweep re-fetching CMR on every run. Raised on the PR."
+  },
+  "targets": {
+    "latsweep_o9_88s_4gb": {
+      "_comment": "The reassessment's base configuration at the turning latitude: sidecar + hive + spill + sharded + o9 + no AOI mask on a 4 GB disk worker. Dispatchable today.",
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_88s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_88s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 4096,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_88s_8gb": {
+      "_comment": "The reassessment's second configuration: identical but 8 GB with disk. The arm that made 85S fit; at 88S it is expected to time out.",
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_88s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_88s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 8192,
+        "extra_disk": true
+      }
+    }
+  },
+  "pending_targets": {
+    "_comment": "The twelve rows whose shard map is not pinned yet (_pin_recipe). They are kept OUT of targets on purpose: run_benchmark.run_target reads shardmap_meta['shard_key'] unconditionally, so a row listed there without a pin would fail mid-dispatch with a bare KeyError instead of being visibly not-ready. Each row is otherwise complete -- moving it across is the last step of pinning its band, and nothing else about it changes.",
+    "latsweep_o9_85s_4gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_85s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_85s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 4096,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_85s_8gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_85s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_85s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 8192,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_85_5s_4gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_85_5s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_85_5s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 4096,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_85_5s_8gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_85_5s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_85_5s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 8192,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_86s_4gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_86s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_86s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 4096,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_86s_8gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_86s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_86s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 8192,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_86_5s_4gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_86_5s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_86_5s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 4096,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_86_5s_8gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_86_5s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_86_5s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 8192,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_87s_4gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_87s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_87s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 4096,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_87s_8gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_87s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_87s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 8192,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_87_5s_4gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_87_5s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_87_5s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 4096,
+        "extra_disk": true
+      }
+    },
+    "latsweep_o9_87_5s_8gb": {
+      "config": "configs/atl03_tdigest_healpix_o9_hive.yaml",
+      "shardmap": "healpix_o9_87_5s",
+      "aggregator": "tdigest",
+      "grid_type": "healpix",
+      "grid_size": "o9_87_5s",
+      "index_backend": "sidecar",
+      "streaming_mode": "spill",
+      "sharded": true,
+      "aoi_mask": false,
+      "worker": {
+        "memory": 8192,
+        "extra_disk": true
+      }
+    }
+  }
+}
