@@ -90,6 +90,8 @@ CHECKS_WINDOWED = (
 )
 
 _VALUE_CHECKS = ("readback", "counts", "digests", "composition")
+#: The §4.4 counter keys of ``source_windows`` and ``source_children``.
+_COUNTERS = ("folded", "missing", "unreadable")
 
 
 def window_roster(store_root, manifest, store_kwargs, mode) -> tuple[list, str]:
@@ -734,7 +736,6 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
     read-back findings; returns whether the fold's recorded sources are NOT
     the ones on disk (so its values are not comparable to them).
     """
-    from zagg.hive import COMMIT_ATTR
     from zagg.pyramid_check_v2 import _as_int
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import OVERVIEW_SPEC_V2, STAGE_GATHER, STAGE_MERGE, classify_level
@@ -771,16 +772,20 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
     if not prov.get("run_id"):
         out.append(f"{name}: no run_id in the zagg-overview/2 attrs (§4.4)")
     sw = prov.get("source_windows")
-    if not isinstance(sw, dict) or not {"folded", "missing", "unreadable"} <= set(sw):
+    if not isinstance(sw, dict) or not set(_COUNTERS) <= set(sw):
         out.append(f"{name}: source_windows {sw!r} lacks the folded/missing/unreadable counters")
         return True
-    if _as_int(sw.get("folded")) != len(held):
+    folded, missing, unreadable = (_as_int(sw.get(c)) for c in _COUNTERS)
+    if None in (folded, missing, unreadable):
+        out.append(f"{name}: source_windows {sw!r} carries a non-integer counter (§4.4)")
+        return True
+    if folded != len(held):
         out.append(
             f"{name}: STALE all-time fold — it folded {sw.get('folded')} window overview(s) and "
             f"the node now holds {len(held)} committed {sorted(held)}; re-sweep"
         )
         return True
-    if int(sw.get("missing") or 0) or int(sw.get("unreadable") or 0):
+    if missing or unreadable:
         if len(held) == n_expected:
             out.append(
                 f"{name}: STALE all-time fold — it records source_windows {sw} while all "
@@ -793,11 +798,16 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
                 f"node's {n_expected} window(s) uncommitted) — compared against the "
                 f"{len(held)} it folded; the next sweep heals it"
             )
-    blocks = [a.get(OVERVIEW_ATTR) or {} for a in held.values()]
-    children = {
-        key: sum(int((b.get("source_children") or {}).get(key) or 0) for b in blocks)
-        for key in ("folded", "missing", "unreadable")
-    }
+    parsed = {window: _source_block(a) for window, a in held.items()}
+    bad = sorted(window for window, p in parsed.items() if p is None)
+    if bad:
+        out.extend(
+            f"{node}[{window}]: malformed {OVERVIEW_ATTR!r} source_children/generation attrs — "
+            f"the all-time fold's sources cannot be summed (§4.4)"
+            for window in bad
+        )
+        return False
+    children = {c: sum(p[0][c] for p in parsed.values()) for c in _COUNTERS}
     recorded = prov.get("source_children")
     if (
         not isinstance(recorded, dict)
@@ -810,21 +820,19 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
     # §4.5's skip key over the consumed overviews: their blocks' leaf counts
     # summed, the newest leaf stamp among them, and every run id they relay
     # or were stamped by.
-    generations = [b.get("generation") or {} for b in blocks]
-    stamps = [g.get("max_leaf_timestamp") for g in generations if g.get("max_leaf_timestamp")]
-    runs = {run for g in generations for run in g.get("run_ids") or ()}
-    runs |= {a[COMMIT_ATTR]["run_id"] for a in held.values() if a[COMMIT_ATTR].get("run_id")}
+    stamps = [p[2] for p in parsed.values() if p[2]]
     summed = {
-        "n_leaves": sum(int(g.get("n_leaves") or 0) for g in generations),
+        "n_leaves": sum(p[1] for p in parsed.values()),
         "max_leaf_timestamp": max(stamps) if stamps else None,
-        "run_ids": sorted(runs),
+        "run_ids": sorted({run for p in parsed.values() for run in p[3]}),
     }
     block = prov.get("generation")
     block = block if isinstance(block, dict) else {}
+    runs = block.get("run_ids") or []
     recorded_generation = {
         "n_leaves": _as_int(block.get("n_leaves")),
         "max_leaf_timestamp": block.get("max_leaf_timestamp"),
-        "run_ids": sorted(set(block.get("run_ids") or ())),
+        "run_ids": sorted(set(runs)) if _str_list(runs) else runs,
     }
     if recorded_generation != summed:
         out.append(
@@ -833,3 +841,37 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
         )
         return True
     return False
+
+
+def _str_list(value) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _source_block(attrs) -> tuple | None:
+    """A consumed window overview's ``(children, n_leaves, stamp, run ids)``, or None.
+
+    The writer's own reading of the block (absent counters are 0, an absent
+    generation is empty), plus the run that stamped it; None when the attrs
+    are malformed — untrusted JSON is named, never summed into a traceback.
+    """
+    from zagg.hive import COMMIT_ATTR
+    from zagg.pyramid_check_v2 import _as_int
+    from zagg.sweep_overview import OVERVIEW_ATTR
+
+    block = attrs.get(OVERVIEW_ATTR)
+    sc = (block.get("source_children") or {}) if isinstance(block, dict) else None
+    gen = (block.get("generation") or {}) if isinstance(block, dict) else None
+    if not isinstance(sc, dict) or not isinstance(gen, dict):
+        return None
+    children = {c: _as_int(sc.get(c) or 0) for c in _COUNTERS}
+    n_leaves, stamp = _as_int(gen.get("n_leaves") or 0), gen.get("max_leaf_timestamp")
+    runs, run = gen.get("run_ids") or [], attrs[COMMIT_ATTR].get("run_id")
+    if (
+        None in children.values()
+        or n_leaves is None
+        or not isinstance(stamp, str | None)
+        or not _str_list(runs)
+        or not isinstance(run, str | None)
+    ):
+        return None
+    return children, n_leaves, stamp, {*runs, *([run] if run else [])}

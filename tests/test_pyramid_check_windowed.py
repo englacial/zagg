@@ -297,6 +297,14 @@ class TestDamage:
             ("-5", "regime", "stage-gather", "regime 'stage-gather' != 'stage-merge'"),
             ("-5", "source_children", {"folded": 0, "missing": 0, "unreadable": 0}, "summed"),
             ("-5", "source_windows", None, "lacks the folded/missing/unreadable counters"),
+            (
+                "-5",
+                "source_windows",
+                {"folded": "x", "missing": 0, "unreadable": 0},
+                "carries a non-integer counter",
+            ),
+            ("-5", "source_children", "bogus", "summed"),
+            ("-5", "generation", {"n_leaves": 1, "run_ids": 7}, "STALE all-time fold"),
         ],
     )
     def test_the_all_time_provenance_is_held_to_the_spec(self, store, node, key, value, expect):
@@ -308,6 +316,21 @@ class TestDamage:
         assert any(
             m.startswith(f"{node}[all]: ") and expect in m
             for m in report["checks"]["all_time"]["mismatches"]
+        )
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [("generation", "bogus"), ("generation", {"n_leaves": "x"}), ("source_children", [1])],
+    )
+    def test_a_malformed_window_overview_is_a_finding_not_a_traceback(self, store, key, value):
+        # The all-time leg sums the per-window blocks; a corrupt one is named.
+        _set_attrs(
+            store / _rel("-5", "2019.zarr"),
+            lambda a: a["zagg_overview"].__setitem__(key, value),
+        )
+        report = validate_pyramid(str(store), full=True)
+        assert "-5[2019]: malformed 'zagg_overview'" in str(
+            report["checks"]["all_time"]["mismatches"]
         )
 
     def test_a_missing_all_time_fold_fails_by_node(self, store):
