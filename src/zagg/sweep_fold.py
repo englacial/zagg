@@ -52,6 +52,39 @@ logger = logging.getLogger(__name__)
 STAGE_BLOCK_ORDER = 5
 
 
+class ColumnMovedError(ValueError):
+    """A source was rewritten after a fold had already read from it.
+
+    A streamed fold reads a member block by block, so a rewrite landing
+    between two blocks would hand it half of each write. The reader pins the
+    stamp its first served read validated under
+    (:class:`zagg.sweep_stage._ColumnReader`); a later read under another
+    stamp, or under none (a rewrite in flight), raises this instead of
+    serving data. The ARTIFACT being folded is then folded again from fresh
+    readers (:func:`refold_on_move`), never patched.
+    """
+
+
+def refold_on_move(fold, refresh, what: str, *, retry_on=(ColumnMovedError,)):
+    """``fold()``, once more after ``refresh()`` if it raised one of ``retry_on``.
+
+    ``refresh`` replaces the artifact's readers with fresh ones, so the second
+    attempt reads every source from scratch, each under one stamp. A second
+    failure propagates: the caller counts the artifact failed and moves on.
+    :class:`zagg.sweep_stage.ForeignSweepError` always propagates at once.
+    """
+    from zagg.sweep_stage import ForeignSweepError
+
+    try:
+        return fold()
+    except ForeignSweepError:
+        raise
+    except retry_on as e:
+        logger.info(f"stage sweep: {what} is folded again from fresh readers ({e})")
+    refresh()
+    return fold()
+
+
 def block_cells() -> int:
     """Cells per fold block (read at call time — the tests narrow it)."""
     return 4 ** int(STAGE_BLOCK_ORDER)

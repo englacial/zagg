@@ -282,8 +282,10 @@ def close_node(
     attrs: the close shares no object with a window unit either. It writes no stage column (a column relays
     gen-1 content; an all-time one would be merged).
     """
+    from functools import partial
+
     from zagg.column import generation_key
-    from zagg.sweep_fold import merge_level
+    from zagg.sweep_fold import ColumnMovedError, merge_level, refold_on_move
     from zagg.sweep_overview import _overview_basename
     from zagg.sweep_stage import (
         STAGE_MERGE,
@@ -309,15 +311,8 @@ def close_node(
                 logger.warning(f"stage sweep: cannot list the windows at node {target} ({e})")
                 counts["failed"] += 1
                 continue
-            row = _window_readers(
-                store_root,
-                target,
-                labels,
-                run_id=run_id,
-                run_started=run_started,
-                store_kwargs=store_kwargs,
-                counts=counts,
-            )
+            reader_args = dict(run_id=run_id, run_started=run_started, store_kwargs=store_kwargs)
+            row = _window_readers(store_root, target, labels, counts=counts, **reader_args)
             sources = [reader for reader in row if _is_reader(reader)]
             if not sources:
                 counts["empty"] += 1  # no window overview at this node yet
@@ -336,10 +331,34 @@ def close_node(
             ):
                 counts["current"] += 1
                 continue
-            slabs, broken, demotions = merge_level(
-                rows, fields, res_src=r, src_per_child=n_out, factor=1, n_out=n_out, meter=meter
-            )
-            counts["revalidated"] += sum(reader.revalidated for reader in sources)
+
+            def _fresh_readers(target=target, labels=labels, row=row, args=reader_args):
+                # In place: ``rows`` holds this list (the unreadable were counted once).
+                row[:] = _window_readers(store_root, target, labels, counts={"failed": 0}, **args)
+
+            try:
+                slabs, broken, demotions = refold_on_move(
+                    partial(
+                        merge_level,
+                        rows,
+                        fields,
+                        res_src=r,
+                        src_per_child=n_out,
+                        factor=1,
+                        n_out=n_out,
+                        meter=meter,
+                    ),
+                    _fresh_readers,
+                    f"the all-time fold at node {target}",
+                )
+            except ColumnMovedError as e:
+                logger.warning(f"stage sweep: all-time fold failed at node {target} ({e})")
+                counts["failed"] += 1
+                continue
+            # Recounted: a refold read the windows from fresh readers.
+            missing = sum(1 for reader in row if reader is None)
+            used = set(sources) | {reader for reader in row if _is_reader(reader)}
+            counts["revalidated"] += sum(reader.revalidated for reader in used)
             folded = [
                 reader
                 for w, reader in enumerate(row)

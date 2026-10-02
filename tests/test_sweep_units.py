@@ -53,7 +53,13 @@ import zagg.sweep_units as units_mod
 from zagg.grids.morton import morton_word
 from zagg.hive import MANIFEST_NAME, build_root_coverage, write_root_coverage
 from zagg.store import open_store
-from zagg.sweep_fold import FoldMeter, _gather_slabs, _merge_slabs
+from zagg.sweep_fold import (
+    ColumnMovedError,
+    FoldMeter,
+    _gather_slabs,
+    _merge_slabs,
+    refold_on_move,
+)
 from zagg.sweep_overview import ENVELOPE_NAME, decode_digest
 from zagg.sweep_stage import ForeignSweepError, _ColumnReader
 from zagg.sweep_stages import (
@@ -629,34 +635,153 @@ class TestStreamedFold:
         )
         assert written is None and not (root / "1" / "1" / "all.pyramid.zarr").exists()
 
-    def test_a_block_read_revalidates_the_stamp(self, tmp_path, monkeypatch):
+    def _swept_column(self, tmp_path, monkeypatch):
         monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", 1)
         root = tmp_path / "s"
         manifest = _wide_store(root)
         sweep_stage_pass(
             str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
         )
-        column = root / "1" / "1" / "all.pyramid.zarr"
+        return root / "1" / "1" / "all.pyramid.zarr"
+
+    def test_a_block_read_revalidates_the_stamp(self, tmp_path, monkeypatch):
+        column = self._swept_column(tmp_path, monkeypatch)
         reader = _column_reader(column)
-        assert reader.read_range(5, "count", 0, 4) is not None and reader.revalidated == 0
-        # A fleet rewrite between two block reads moves the stamp: the next
-        # block re-reads under the new one rather than mixing generations.
-        group = zarr.open_group(open_store(str(column)), path="", mode="r+", zarr_format=3)
-        stamp = dict(group.attrs["morton_hive_commit"])
-        group.attrs["morton_hive_commit"] = {**stamp, "written_at": "2031-01-01T00:00:00+00:00"}
-        monkeypatch.setattr(reader, "_root", _moving_root(reader))
-        assert reader.read_range(5, "count", 4, 8) is not None
+        # Before anything is served, a moved stamp is re-read under the new one.
+        _restamp(column, "2031-01-01T00:00:00+00:00")
+        first = reader.read_range(5, "count", 0, 4)
+        assert first is not None and reader.revalidated == 1
+        assert reader.stamp["written_at"] == "2031-01-01T00:00:00+00:00"
+        # Once a block has been served, a rewrite between two block reads is a
+        # torn member: the next block raises rather than hand over the new write.
+        _restamp(column, "2032-01-01T00:00:00+00:00")
+        with pytest.raises(ColumnMovedError, match="rewritten after this fold read"):
+            reader.read_range(5, "count", 4, 8)
         assert reader.revalidated == 1
 
+    def test_a_vanished_stamp_never_validates(self, tmp_path, monkeypatch):
+        # A rewrite in flight has no stamp (the template is re-emitted first):
+        # its bytes are never data, before or after a served read.
+        column = self._swept_column(tmp_path, monkeypatch)
+        served = _column_reader(column)
+        assert served.read_range(5, "count", 0, 4) is not None
+        fresh = _column_reader(column)
+        _restamp(column, None)
+        with pytest.raises(ColumnMovedError, match="stamp gone"):
+            served.read_range(5, "count", 4, 8)
+        with pytest.raises(ColumnMovedError, match="kept moving"):
+            fresh.read_range(5, "count", 0, 4)
 
-def _moving_root(reader):
-    """``_root`` that reports the on-disk stamp — the reader cached the old one."""
-    real = type(reader)._root
+    def test_a_torn_overview_is_folded_again_from_fresh_readers(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # A rewrite lands under a fold after its first block read: the artifact
+        # is folded again from scratch and lands with the clean build's content.
+        clean = self._swept_column(tmp_path / "clean", monkeypatch).parents[2]
+        root = tmp_path / "torn" / "s"
+        manifest = _wide_store(root)
+        moved = _move_after_first_read(monkeypatch, times=1)
+        with caplog.at_level("INFO", logger="zagg.sweep_fold"):
+            summary = sweep_stage_pass(
+                str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
+            )
+        assert moved == [True] and "folded again from fresh readers" in caplog.text
+        assert all(row["failed"] == 0 for row in summary["stages"])
+        for rel in _overviews(clean, "all.zarr"):
+            a, b = _artifact(clean, rel), _artifact(root, rel)
+            assert (
+                dict(a.attrs)["zagg_overview"]["content_hash"]
+                == dict(b.attrs)["zagg_overview"]["content_hash"]
+            ), rel
 
-    def _root():
-        return real(reader)
+    def test_an_artifact_torn_twice_fails_and_the_unit_goes_on(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", 1)
+        root = tmp_path / "s"
+        manifest = _wide_store(root)
+        moved = _move_after_first_read(monkeypatch, times=2)
+        summary = sweep_stage_pass(
+            str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
+        )
+        assert moved == [True, True]
+        assert sum(row["failed"] for row in summary["stages"]) == 1
+        assert sum(row["written"] for row in summary["stages"]) > 0
 
-    return _root
+    def test_a_torn_all_time_fold_is_folded_again(self, tmp_path, monkeypatch):
+        # The close reads the node's window overviews the same way: a source
+        # that moves under it costs one refold from fresh readers.
+        real, closes = fold_mod.merge_level, []
+
+        def merge_level(rows, *args, **kwargs):
+            if kwargs.get("factor") == 1 and len(rows) == 1:  # the all-time fold
+                closes.append(list(rows[0]))
+                if len(closes) == 1:
+                    raise ColumnMovedError("a window overview was rewritten")
+            return real(rows, *args, **kwargs)
+
+        monkeypatch.setattr(fold_mod, "merge_level", merge_level)
+        root = tmp_path / "s"
+        manifest = _windowed_store(root)
+        summary = sweep_stage_pass(str(root), manifest, _by_shard(), run_id="A")
+        assert all(row["failed"] == 0 for row in summary["stages"])
+        assert not set(map(id, closes[0])) & set(map(id, closes[1]))  # fresh readers
+        assert len(_overviews(root, "all.zarr")) == 7
+
+    def test_a_foreign_sweep_is_never_refolded(self):
+        calls = []
+
+        def fold():
+            raise ForeignSweepError("two sweeps")
+
+        with pytest.raises(ForeignSweepError):
+            refold_on_move(fold, lambda: calls.append(1), "x", retry_on=(Exception,))
+        assert calls == []
+
+
+def _restamp(column, written_at):
+    """Rewrite a column's commit stamp in place (``None`` removes it)."""
+    group = zarr.open_group(open_store(str(column)), path="", mode="r+", zarr_format=3)
+    stamp = dict(group.attrs["morton_hive_commit"])
+    if written_at is None:
+        attrs = dict(group.attrs)
+        attrs.pop("morton_hive_commit")
+        group.attrs.clear()
+        group.attrs.update(attrs)
+    else:
+        group.attrs["morton_hive_commit"] = {**stamp, "written_at": written_at}
+
+
+def _move_after_first_read(monkeypatch, *, times):
+    """Restamp the source an overview fold read first, ``times`` folds in a row.
+
+    Hooks the first overview fold of the pass (``_stage_fold``): its first
+    served read is followed by a rewrite of that source, so the fold's next
+    read of it is torn. Returns the list it appends to per move.
+    """
+    import zagg.sweep_stage as stage_mod
+
+    moved: list = []
+    state = {"fold": 0, "armed": False}
+    real_fold, real_fetch = stage_mod._stage_fold, fold_mod._fetch
+
+    def stage_fold(*args, **kwargs):
+        state["fold"] += 1
+        state["armed"] = state["fold"] <= times
+        try:
+            return real_fold(*args, **kwargs)
+        finally:
+            state["armed"] = False
+
+    def fetch(reader, *args, **kwargs):
+        values = real_fetch(reader, *args, **kwargs)
+        if state["armed"]:
+            state["armed"] = False
+            _restamp(reader.path, f"203{len(moved) + 1}-01-01T00:00:00+00:00")
+            moved.append(True)
+        return values
+
+    monkeypatch.setattr(stage_mod, "_stage_fold", stage_fold)
+    monkeypatch.setattr(fold_mod, "_fetch", fetch)
+    return moved
 
 
 # ---------------------------------------------------------------------------

@@ -90,7 +90,13 @@ import logging
 
 import numpy as np
 
-from zagg.sweep_fold import _gather_slabs, _merge_slabs, iter_gather
+from zagg.sweep_fold import (
+    ColumnMovedError,
+    _gather_slabs,
+    _merge_slabs,
+    iter_gather,
+    refold_on_move,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -278,8 +284,12 @@ class _ColumnReader:
     **optimistic stamp validation** the lease ruling requires: stamp before,
     read, stamp after — if the stamp moved (a fleet worker rewrote the leaf
     mid-read, the allowed fleet ∥ sweep regime), the read retries against the
-    fresh stamp, so a merge never consumes a torn (mixed-generation) column.
-    A stamp that keeps moving reads as unreadable, never as data. A stage
+    fresh stamp — but only until the reader has SERVED a read. The first
+    served read pins its stamp: the fold reads a member block by block (issue
+    #586 phase 4), so after that a moved stamp, or a vanished one (a rewrite
+    in flight), raises :class:`zagg.sweep_fold.ColumnMovedError` rather than
+    hand the fold half of each write, and a stamp that keeps moving raises it
+    too. The caller folds the artifact again from fresh readers. A stage
     column stamped by a foreign run SINCE this run started raises
     :class:`ForeignSweepError` (two live sweeps — the lease backstop).
     """
@@ -289,6 +299,7 @@ class _ColumnReader:
 
         self.path = path
         self.revalidated = 0
+        self._served = False  # whether a read was handed out (pins self.stamp)
         self._run_id, self._run_started = run_id, run_started
         self._store = open_store(path, read_only=True, **store_kwargs)
         self._arrays: dict = {}
@@ -368,18 +379,22 @@ class _ColumnReader:
         for _attempt in range(3):
             before = self.stamp
             array = self._array(res, name)
-            if array is None:
-                return None
-            values = array[cells]
+            values = None if array is None else array[cells]
             after, attrs = self._root()
-            if _same_stamp(before, after):
+            if after is not None and _same_stamp(before, after):
+                self._served = True
                 return values
             self._foreign_guard(after)
+            if self._served:
+                raise ColumnMovedError(
+                    f"column {self.path} was rewritten after this fold read from it "
+                    f"(stamp {'gone' if after is None else 'moved'})"
+                )
             logger.info(f"stage sweep: column {self.path} moved mid-read; re-reading")
             self.stamp, self.attrs = after, attrs
             self._arrays.clear()
             self.revalidated += 1
-        raise ValueError(f"column {self.path} stamp kept moving across re-reads")
+        raise ColumnMovedError(f"column {self.path} stamp kept moving across re-reads")
 
     def read(self, res: int, name: str) -> np.ndarray | None:
         """One group array, stamp-validated; ``None`` for an absent member.
@@ -1052,6 +1067,8 @@ def stage_node(
     read-modify-written. The all-time fold across windows is not a window
     unit's work (:func:`zagg.sweep_units.close_node`).
     """
+    from functools import partial
+
     from zagg.column import generation_key
     from zagg.sweep_overview import ENVELOPE_NAME, _overview_basename, _read_envelope
     from zagg.windows import union_time_range
@@ -1061,15 +1078,18 @@ def stage_node(
     level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
     orders = [k for k in stage["orders"] if k in level_by_order]
     children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
-    readers = _readers_for(
-        store_root,
-        children,
-        [window],
-        run_id=run_id,
-        run_started=run_started,
-        store_kwargs=store_kwargs,
-        counts=counts,
-    )
+    reader_args = dict(run_id=run_id, run_started=run_started, store_kwargs=store_kwargs)
+    readers = _readers_for(store_root, children, [window], counts=counts, **reader_args)
+    retired: list = []
+
+    def _fresh_readers():
+        # In place: every fold below holds this dict. An unreadable column was
+        # counted the first time; its UNREADABLE marker still says so.
+        retired.extend(r for row in readers.values() for r in row if _is_reader(r))
+        readers.update(
+            _readers_for(store_root, children, [window], counts={"failed": 0}, **reader_args)
+        )
+
     dispatch_level_current = False
     for k in orders:
         r = level_by_order[k]
@@ -1113,17 +1133,28 @@ def stage_node(
                 if k == dispatch and target == node:
                     dispatch_level_current = True
                 continue
-            fold = _stage_fold(
-                target,
-                k,
-                r,
-                readers,
-                fields,
-                shard_order=shard_order,
-                child_order=child_order,
-                relay=relay,
-                meter=meter,
-            )
+            try:
+                fold = refold_on_move(
+                    partial(
+                        _stage_fold,
+                        target,
+                        k,
+                        r,
+                        readers,
+                        fields,
+                        shard_order=shard_order,
+                        child_order=child_order,
+                        relay=relay,
+                        meter=meter,
+                    ),
+                    _fresh_readers,
+                    f"node {target} window {key!r}",
+                )
+            except ColumnMovedError as e:
+                logger.warning(f"stage sweep: fold failed at node {target} window {key!r} ({e})")
+                counts["failed"] += 1
+                _fresh_readers()  # the next artifact starts from unpinned readers
+                continue
             if fold is None:
                 counts["empty"] += 1
                 continue
@@ -1185,7 +1216,7 @@ def stage_node(
                     f"{_node_rel(target)}/{ENVELOPE_NAME}",
                     json.dumps(fresh, indent=1).encode(),
                 )
-    counts["revalidated"] += sum(
+    counts["revalidated"] += sum(r.revalidated for r in retired) + sum(
         r.revalidated for row in readers.values() for r in row if _is_reader(r)
     )
     if dispatch == 0:

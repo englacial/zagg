@@ -696,7 +696,7 @@ swept under one admission.
 | regime | allowed? | governed by |
 |---|---|---|
 | fleet ∥ fleet | yes, iff their (window, shard) write sets are disjoint | the existing leaf single-writer law |
-| fleet ∥ sweep | yes | disjoint object sets; the stage worker validates every column stamp before and after reading its groups and re-reads on movement, so a mid-read leaf rewrite never feeds a torn column into a merge; a mid-sweep append is recorded-and-healed under-coverage |
+| fleet ∥ sweep | yes | disjoint object sets; the stage worker validates every column stamp before and after reading its groups and re-reads on movement; once a column has served a block, a rewrite under it fails the artifact being folded, which is folded once more from fresh reads, so a mid-read leaf rewrite never feeds a torn column into a merge; a mid-sweep append is recorded-and-healed under-coverage |
 | sweep ∥ sweep | **no — serialized per store** | the admission lease |
 
 Only pyramid sweeps serialize. Admission is one conditional PUT of the

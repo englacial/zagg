@@ -1891,7 +1891,10 @@ artifact it alone writes, so no object — the sweep-internal node envelope
 included, which a windowed store does not have — is shared between them.
 Fleets are unaffected: fleet ∥ fleet is governed by the leaf single-writer law and
 fleet ∥ sweep is allowed (the stage workers validate every column stamp
-before and after reading its groups and re-read on movement; stage stamps
+before and after reading its groups and re-read on movement until a read has
+been served; after that a moved or vanished stamp fails the artifact being
+folded, which is folded once more from fresh reads and otherwise counted
+failed, never assembled from two writes; stage stamps
 carry `run_id`, and a skip-if-current read that sees a foreign stamp
 written after the run started aborts loudly). The same `run_id` is a **term
 of the skip key** (§4.5): the abort covers a foreign stamp written *since
