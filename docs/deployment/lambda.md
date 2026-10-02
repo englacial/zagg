@@ -887,21 +887,24 @@ shards that reported and runs **no tail**; past the drop deadline the rest
 never report, attach cannot finish that run, and its warning says to
 re-dispatch.
 
-**3. Finish a `sweep: "stages"` run by hand, in this order** — only once the
+**3. Finish the run by hand, in this order** — only once the
 run's own `stats_<ts>_<run_id>.parquet` is at the store root (the tail writes
 it, step 2). Without it the sweep cannot find the run's leaves, yet still
 succeeds over other runs' leaves, and `finalize` accepts any completed sweep
 since the run's init: it would tag a ladder without them. Re-dispatch instead.
 
 ```
-python -m zagg.sweep s3://bucket/store.zarr --stages
-python -m zagg.icechunk_ops s3://bucket/store.zarr finalize <run_id>
+python -m zagg.sweep s3://bucket/store.zarr             # the rollup families
+python -m zagg.sweep s3://bucket/store.zarr --stages    # sweep: "stages" only
+python -m zagg.icechunk_ops s3://bucket/store.zarr finalize <run_id>   # ditto
 ```
 
-*The sweep* runs in the calling process and writes the store from it, so it
-needs the store's write credentials and a host in the store's region. Where
-the operator cannot write the store (a Source Cooperative–published one),
-drive the fleet form instead — `run_stage_sweep_fleet`, under
+The families pass is idempotent; run it even when `tail.json` exists, since
+the launcher may have died before the families invoke (attach then runs no
+tail). *The sweeps* run in the calling process and write the store from it, so
+they need the store's write credentials and a host in the store's region.
+Where the operator cannot write the store (a Source Cooperative–published
+one), drive the staged sweep's fleet form instead — `run_stage_sweep_fleet`, under
 [Running it](#running-it). It covers every leaf the run records name, not only
 this run's. On success it prints its summary: a `finisher` block with
 `lease_released: true` and `record`, the `sweep_stats_<ts>_stages.json` it
