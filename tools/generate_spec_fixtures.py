@@ -1775,7 +1775,7 @@ def build_uncounted(out: Path) -> None:
             str(scratch), SHARD_KEY, None, "morton-hive/1", {}
         )
         family.finish(str(scratch), [{"payload": contribution}], 4, {})
-        assert family.summary() == {"temporal_routes": {"records": 0, "raw": 1}}
+        assert family.summary()["temporal_routes"] == {"records": 0, "raw": 1}
         assert not (leaf / LEAF_TEMPORAL_NAME).exists()  # the sweep writes no record
         envelope = hive.read_root_coverage(str(scratch))
         cover_obj = read_cover(str(scratch))

@@ -1328,12 +1328,61 @@ class TestHandlerSweepResponse:
         moc = body["families"]["moc"]
         assert moc["temporal_routes"] == {"records": 1, "raw": 1}
         assert moc["temporal_shards"] == 2 and moc["uncounted_shards"] == 1
+        # ...and WHICH shard (issue #598): the record-less one and only it.
+        assert moc["pass_uncounted"] == {"count": 1, "shards": ["11214"], "truncated": False}
         durable = json.loads((root / body["record"]).read_text())
         assert durable["families"]["moc"]["temporal_routes"] == moc["temporal_routes"]
+        assert durable["families"]["moc"]["pass_uncounted"] == moc["pass_uncounted"]
         block = read_root_coverage(str(root))["temporal"]["counts"]
         assert block["uncounted_shards"] == 1
         # Read-only on the leaves: the invoke wrote no record back.
         assert not (recordless / "temporal.toc").exists()
+
+    def test_a_partitioned_invoke_names_its_uncounted_shards_under_the_cap(
+        self, tmp_path, monkeypatch
+    ):
+        """Issue #598 on the fan-out: ``finish`` is deferred, the names are not.
+
+        A partition writes no root object, so its response and its own
+        ``_p{index}of{of}`` record are where an operator reads which of the
+        shards it visited came in uncounted. Two record-less shards under a
+        cap of one: the list is cut, the count is exact, the cut is flagged.
+        """
+        import shutil
+
+        import zagg.sweep as sweep
+        from zagg.hive import shard_leaf_path
+
+        mod = _handler_module()
+        root = tmp_path / "temporal"
+        shutil.copytree(Path(__file__).parent / "data" / "spec" / "temporal", root)
+        words = [int(morton_word(d)) for d in ("11213", "11214", "11212")]
+        for word in words[1:]:
+            recordless = Path(shard_leaf_path(str(root), word))
+            shutil.copytree(shard_leaf_path(str(root), words[0]), recordless)
+            (recordless / "temporal.toc").unlink()
+        for name in ("coverage.moc", "coverage.toc"):
+            (root / name).unlink()
+        monkeypatch.setattr(sweep, "UNCOUNTED_LIST_CAP", 1)
+        response = mod._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(root),
+                "leaves": [[w, None] for w in words],
+                "families": ["moc"],
+                "partition": {"index": 0, "of": 4},
+            }
+        )
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        moc = body["families"]["moc"]
+        assert moc["finish_deferred"] is True and "uncounted_shards" not in moc
+        assert moc["temporal_routes"] == {"records": 1, "raw": 2}
+        assert moc["pass_uncounted"] == {"count": 2, "shards": ["11212"], "truncated": True}
+        assert body["record"].endswith("_p0of4.json")
+        durable = json.loads((root / body["record"]).read_text())
+        assert durable["families"]["moc"]["pass_uncounted"] == moc["pass_uncounted"]
+        assert not (root / "coverage.moc").exists()  # the finisher's, still owed
 
     def test_discovery_path_reports_its_own_span(self, tmp_path):
         # discover_leaves is a LIST + a parquet read per run record; it is not

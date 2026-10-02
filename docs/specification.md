@@ -3242,6 +3242,18 @@ have for the cover sibling:
   (§10.4 replaces tier 2 whole). A §10.6 record's `counts` block omits it:
   a record is one leaf's exact count.
 
+  *(Informative.)* No object of this contract names the uncounted shards.
+  zagg's sweep names them in its own per-pass run record
+  (`sweep_stats_*.json`, telemetry outside this specification) as
+  `pass_uncounted: {count, shards, truncated}` — the decimal ids of the
+  shards **that pass** read coverage-only, capped at 1,024 with the exact
+  `count` beside them
+  ([issue #598](https://github.com/englacial/zagg/issues/598)). That list
+  is a pass's tally, scoped to the shards the pass visited (one partition's,
+  on a partitioned pass); it is not this marker, which is the standing
+  figure for the shards `shards` lists, and a reader MUST NOT substitute
+  one for the other.
+
 **What is counted (normative).** Counts have **one source**: the leaf's own
 worker, which folds the ONE clock column every declared field shares and
 writes the result as the leaf's §10.6 record. Each clocked observation the
@@ -3732,7 +3744,8 @@ existed; a record damaged or lost after its leaf was stamped; a record at
 another revision, or whose `fields` are not the declared set (below); and
 a record whose read failed on this pass. Each is reported the same way —
 the shard in the root block's `uncounted_shards` — instead of a total that
-silently omits it.
+silently omits it. *(Informative.)* The marker is a count; the sweep pass
+that read the leaf names its shard in its own run record (§10.3).
 
 **Absence is the rule for non-temporal stores.** A leaf is written with a
 record **iff** its config declares a §8.3 `"per-centroid"` field and the

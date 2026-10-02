@@ -869,6 +869,35 @@ this pass's tally, not the root's: a pass over part of the store keeps the
 standing counts block and its marker (§10.4), so whether the published
 totals are exact is read from the root block's own `uncounted_shards`.
 
+The root marker counts and does not name. **Which** shards came in
+uncounted is in the sweep record
+([issue #598](https://github.com/englacial/zagg/issues/598)), beside
+`temporal_routes` and on every pass of a temporal store that visited a
+leaf — in-process, in the Lambda sweep mode's response, and in the durable
+`sweep_stats_{ts}.json` — whether or not the pass wrote the root object:
+
+```json
+"pass_uncounted": {"count": 1, "shards": ["11214"], "truncated": false}
+```
+
+- `shards` — the decimal ids, in the root map's key order, of the shards
+  **this pass visited** that hold a leaf read raw. A shard the pass dropped
+  from the section (a window leaf that did not read) is not in it, exactly
+  as it is not in the marker.
+- `count` — how many there are, always exact.
+- `truncated` — `true` when `shards` was cut at 1,024 ids
+  (`zagg.sweep.UNCOUNTED_LIST_CAP`): a store written before the record
+  existed has every shard uncounted, and the record stays small.
+
+It is the pass's own tally, like `temporal_routes`: a **partitioned** pass
+writes no root object and names only the shards of its partition (its
+`sweep_stats_{ts}_p{index}of{of}.json` is one of `of` such lists), and a
+pass over part of the store names only what it read. It is not the standing
+list behind the root marker — no object holds that; a full partition-less
+pass is what names every uncounted shard, up to the cap. Each named shard
+has at least one leaf to rewrite (a forced rewrite of that unit, whose
+worker writes the record).
+
 There is no backfill for a store written before the record existed (espg
 ruling of 2026-10-01 on [issue #575](https://github.com/englacial/zagg/issues/575)):
 such a store is frozen and rebuilt in the current layout, where every leaf

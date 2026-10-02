@@ -62,6 +62,13 @@ SWEEP_SPEC = "zagg-sweep/1"
 #: explicit upgrade of a quiesced store, never a routine rollup's side effect.
 DEFAULT_FAMILIES = ("stats", "moc", "submap", "overview")
 
+#: Most shard ids one pass's ``pass_uncounted`` list names (issue #598). The
+#: list is for finding a damaged leaf — a handful of shards — while a store
+#: written before the leaf record existed has EVERY shard uncounted; at
+#: ~25 bytes an id this bounds the list near 25 KB, small beside the sweep
+#: record's other blocks and the 6 MB a synchronous Lambda response may carry.
+UNCOUNTED_LIST_CAP = 1024
+
 #: Grid types already warned about as unsupported leaf sub-maps (once-ish, so a
 #: raster sweep does not warn-spam per shard). Never security-load-bearing.
 _warned_unsupported_submap: set[str | None] = set()
@@ -302,7 +309,21 @@ class MocFamily(SweepFamily):
         if not self._temporal_fields:
             return {}
         routes = self._temporal_routes
-        return {"temporal_routes": {"records": routes["record"], "raw": routes["raw"]}}
+        # ``pass_uncounted`` (issue #598) NAMES the shards behind this pass's
+        # uncounted tally — the set ``finish`` counts, so a shard a later
+        # window dropped is not in it — in the root map's key order, at most
+        # ``UNCOUNTED_LIST_CAP`` of them beside the exact ``count``. Like the
+        # routes it is the PASS's (a partition names only the shards it
+        # visited), never the root block's standing ``uncounted_shards``.
+        uncounted = sorted(self._temporal_uncounted & self._temporal.keys())
+        return {
+            "temporal_routes": {"records": routes["record"], "raw": routes["raw"]},
+            "pass_uncounted": {
+                "count": len(uncounted),
+                "shards": uncounted[:UNCOUNTED_LIST_CAP],
+                "truncated": len(uncounted) > UNCOUNTED_LIST_CAP,
+            },
+        }
 
     def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
         # ``spec`` is unused here: leaf PATHS are the frozen /1-/2 grammar

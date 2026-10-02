@@ -520,6 +520,23 @@ def _tree(path: str) -> dict:
     }
 
 
+def _with_recordless(tmp_path, *others: str) -> tuple[str, list]:
+    """The fixture store plus a record-less copy of its leaf at each of ``others``.
+
+    The root objects are removed so the next pass composes them. Returns
+    ``(store_root, leaves)`` with ``SHARD`` (its worker's record intact) first.
+    """
+    from zagg.grids.morton import morton_word
+
+    root = _fixture_copy(tmp_path)
+    for other in others:
+        shutil.copytree(_leaf_of(root), _leaf_of(root, other))
+        (Path(_leaf_of(root, other)) / LEAF_TEMPORAL_NAME).unlink()
+    (Path(root) / "coverage.moc").unlink()
+    (Path(root) / "coverage.toc").unlink()
+    return root, [(int(morton_word(d)), None) for d in (SHARD, *others)]
+
+
 class TestSweepRoute:
     """§10.6 as the sweep sees it: one GET per leaf, the leaf only when it must."""
 
@@ -780,6 +797,108 @@ class TestSweepRoute:
         assert moc["temporal_shards"] == 1 and moc["uncounted_shards"] == 0
         assert coverage_toc_uncounted(read_root_coverage(root)) == 1
 
+    def test_the_pass_names_its_uncounted_shards(self, tmp_path):
+        """Issue #598: the sweep record says WHICH shards came in uncounted.
+
+        One worker-recorded shard and one record-less shard. ``pass_uncounted``
+        names the record-less one and only it, with the exact count and no
+        truncation — on the pass that writes the root section, on the pass
+        that finds it current (which reports no ``uncounted_shards`` at all),
+        and in the durable record. A pass over the counted shard alone names
+        nothing while the root marker stands at 1: the list is the pass's.
+        """
+        from zagg.coverage_toc import coverage_toc_uncounted
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        other = "11214"
+        root, leaves = _with_recordless(tmp_path, other)
+        named = {"count": 1, "shards": [other], "truncated": False}
+        for _pass in range(2):
+            summary = run_sweep(root, leaves, families=["moc"])
+            moc = summary["families"]["moc"]
+            assert moc["pass_uncounted"] == named
+            assert moc["root_moc_written"] is (_pass == 0)
+            if _pass == 0:  # the same set the finisher counted
+                assert moc["uncounted_shards"] == moc["pass_uncounted"]["count"]
+            else:
+                assert "uncounted_shards" not in moc
+            durable = json.loads((Path(root) / summary["record"]).read_text())
+            assert durable["families"]["moc"]["pass_uncounted"] == named
+        # The root object carries the count and no name (no wire change).
+        block = read_root_coverage(root)["temporal"]["counts"]
+        assert block["uncounted_shards"] == 1 and other not in json.dumps(block)
+        moc = run_sweep(root, leaves[:1], families=["moc"], record=False)["families"]["moc"]
+        assert moc["pass_uncounted"] == {"count": 0, "shards": [], "truncated": False}
+        assert coverage_toc_uncounted(read_root_coverage(root)) == 1
+
+    def test_a_partitioned_pass_names_the_shards_it_visited(self, tmp_path):
+        """A partition defers ``finish``, and its record still names its shards.
+
+        Both fixture shards are ``1121*``, so at ``of=4`` they land in
+        partition 0; the other partitions visited no leaf and say nothing. The
+        partition writes no root object, so its record is the only place the
+        name appears until the partition-less finisher pass.
+        """
+        from zagg.sweep import run_sweep
+
+        other = "11214"
+        root, leaves = _with_recordless(tmp_path, other)
+        for index in range(4):
+            summary = run_sweep(root, leaves, families=["moc"], partition={"index": index, "of": 4})
+            moc = summary["families"]["moc"]
+            assert moc["finish_deferred"] is True and "uncounted_shards" not in moc
+            assert summary["record"].endswith(f"_p{index}of4.json")
+            durable = json.loads((Path(root) / summary["record"]).read_text())
+            assert durable["families"]["moc"] == moc
+            if index == 0:
+                assert moc["pass_uncounted"] == {
+                    "count": 1,
+                    "shards": [other],
+                    "truncated": False,
+                }
+            else:
+                assert "pass_uncounted" not in moc
+        assert not (Path(root) / "coverage.moc").exists()
+
+    def test_the_list_is_capped_and_the_count_stays_exact(self, tmp_path, monkeypatch):
+        """A store over the cap: the first ``cap`` ids in order, flagged, counted whole."""
+        import zagg.sweep as sweep
+
+        others = ["11214", "11211", "11212"]
+        root, leaves = _with_recordless(tmp_path, *others)
+        monkeypatch.setattr(sweep, "UNCOUNTED_LIST_CAP", 2)
+        summary = sweep.run_sweep(root, leaves, families=["moc"])
+        moc = summary["families"]["moc"]
+        assert moc["pass_uncounted"] == {
+            "count": 3,
+            "shards": ["11211", "11212"],
+            "truncated": True,
+        }
+        assert moc["uncounted_shards"] == 3 and moc["temporal_shards"] == 4
+        durable = json.loads((Path(root) / summary["record"]).read_text())
+        assert durable["families"]["moc"]["pass_uncounted"] == moc["pass_uncounted"]
+        # Exactly at the cap nothing is cut, so nothing is flagged.
+        monkeypatch.setattr(sweep, "UNCOUNTED_LIST_CAP", 3)
+        moc = sweep.run_sweep(root, leaves, families=["moc"], record=False)["families"]["moc"]
+        assert moc["pass_uncounted"] == {"count": 3, "shards": sorted(others), "truncated": False}
+
+    def test_the_shipped_cap_keeps_a_legacy_store_record_small(self):
+        """Every shard of a pre-record store is uncounted: the list must not scale."""
+        from zagg.sweep import UNCOUNTED_LIST_CAP, MocFamily
+
+        ids = [f"-5{n:013d}" for n in range(UNCOUNTED_LIST_CAP + 7)]  # order-13 width
+        family = MocFamily()
+        family._temporal_fields = {"h_tdigest": {}}
+        family._temporal = dict.fromkeys(ids, [])
+        family._temporal_uncounted = set(ids)
+        block = family.summary()["pass_uncounted"]
+        assert block["count"] == len(ids) and block["truncated"] is True
+        assert block["shards"] == sorted(ids)[:UNCOUNTED_LIST_CAP]
+        # As the durable record serializes it: far under a sync response's 6 MB.
+        record = json.dumps({"families": {"moc": {"pass_uncounted": block}}}, indent=1)
+        assert len(record) < 32 * 1024
+
     @staticmethod
     def _windowed(tmp_path, monkeypatch, routes: dict) -> tuple[str, list]:
         """``SHARD`` split into window leaves whose seam routes are ``routes``.
@@ -836,6 +955,9 @@ class TestSweepRoute:
         if producer == "sweep":
             moc = run_sweep(root, leaves, families=["moc"], record=False)["families"]["moc"]
             assert moc["uncounted_shards"] == marker
+            # ...and named once (issue #598); a dropped shard is not named.
+            assert moc["pass_uncounted"]["shards"] == [SHARD] * marker
+            assert moc["pass_uncounted"]["count"] == marker
             envelope = read_root_coverage(root)
         else:
             envelope = refresh_root_coverage(root)
@@ -898,11 +1020,20 @@ class TestSweepRoute:
 
         root = tmp_path / "minimal"
         shutil.copytree(SPEC_DATA / "minimal", root)
-        summary = run_sweep(
-            str(root), [(int(morton_word(SHARD)), None)], families=["moc"], record=False
-        )
+        summary = run_sweep(str(root), [(int(morton_word(SHARD)), None)], families=["moc"])
         assert "temporal_routes" not in summary["families"]["moc"]
         assert "temporal_shards" not in summary["families"]["moc"]
+        # The whole block, as the durable record carries it (issue #598): a
+        # non-temporal store's sweep record gains no key.
+        durable = json.loads((root / summary["record"]).read_text())
+        assert set(durable["families"]["moc"]) == {
+            "written",
+            "current",
+            "empty",
+            "failed",
+            "root_moc_written",
+            "duration_s",
+        }
 
     def test_a_pass_that_published_nothing_still_reports_zeros(self, tmp_path, monkeypatch):
         """ "Nothing published" and "no temporal channel" are different states.
@@ -923,6 +1054,7 @@ class TestSweepRoute:
         summary = run_sweep(root, [(int(morton_word(SHARD)), None)], families=["moc"], record=False)
         moc = summary["families"]["moc"]
         assert moc["temporal_routes"] == {"records": 0, "raw": 0}
+        assert moc["pass_uncounted"] == {"count": 0, "shards": [], "truncated": False}
         # Nothing composed, so no section and no shard count — the route block
         # is the only thing separating this from the non-temporal store above.
         assert "temporal_shards" not in moc
