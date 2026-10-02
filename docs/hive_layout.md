@@ -855,8 +855,13 @@ resolves `current` before reading it.
 observation counts: the leaf stores no per-observation clock, so nothing
 can rebuild them afterwards. The sweep and the refresh escape hatch
 (`zagg.coverage.refresh_root_coverage`) read the record first and never
-write one — not for a leaf that lacks it, not over a stale, unparsable or
-foreign-revision one. A leaf without a usable record is read from its raw
+write one — not for a leaf that lacks it, not over an unparsable,
+inconsistent or foreign-revision one. A record that passes its checks is
+used whatever its `fields` list says
+([issue #600](https://github.com/englacial/zagg/issues/600)): the list is
+provenance — the counts come from one shared clock column, so they do not
+depend on which fields the store declares — and is never compared with the
+manifest's declaration. A leaf without a usable record is read from its raw
 columns one chunk at a time and contributes its **coverage only**: its
 envelope word and its occupied buckets, every count zero (§10.3). So that
 nobody mistakes the result for a total, the root `counts` block carries
