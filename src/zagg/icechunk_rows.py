@@ -349,8 +349,8 @@ def check_array_model(
     ``window`` extent may grow — never shrink — and nothing else of its
     metadata (the cell extent, dtype, chunk grid, codecs, fill value,
     dimension names) may differ. Rows grow for the whole repo or not at all:
-    the block's ``rows`` may only gain labels at its END (the row law,
-    §11.2), and every array with the row dimension must hold exactly that
+    the block's ``rows`` may only gain labels at its END, each label once
+    (the row law, §11.2), and every array with the row dimension must hold exactly that
     many rows. No array may disappear; a new one must sit under an
     ``allow_new`` path prefix.
     """
@@ -365,6 +365,8 @@ def check_array_model(
     old, new = list(rows_before), list(rows_after or [])
     if new[: len(old)] != old:
         raise ValueError(f"operation would reorder or drop rows: {old} -> {new} (spec §11.2)")
+    if len(set(new)) != len(new):
+        raise ValueError(f"operation would allocate a row twice: {new} (spec §11.2)")
     off = sorted(a for a, m in after.items() if _has_rows(m) and m["shape"][0] != len(new))
     if off:
         raise ValueError(f"operation would leave {off} off the block's {len(new)} rows (§11.2)")
