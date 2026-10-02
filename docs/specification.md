@@ -3693,8 +3693,8 @@ versioned leaf's: before the **version** stamp) — or, for a leaf holding
 no clocked observation, not at all. No other
 producer creates one or replaces one: a sweep or refresh that had to read a
 leaf raw MUST NOT write a record for it, and MUST NOT replace a record it
-finds — not a missing one, not a stale one (the `fields` gate below), not
-debris, not one at an unknown revision (espg ruling of 2026-10-01 on
+finds — not a missing one, not debris, not one at an unknown revision
+(espg ruling of 2026-10-01 on
 [issue #575](https://github.com/englacial/zagg/issues/575): no backfill).
 Two reasons, either sufficient:
 
@@ -3740,8 +3740,8 @@ record and stamps: that is the absence rule below, not a failure.
 only (§10.3), never a refusal of the leaf. With the writer failing closed,
 the cases that still reach it are a leaf written before the record
 existed; a record damaged or lost after its leaf was stamped; a record at
-another revision, or whose `fields` are not the declared set (below); and
-a record whose read failed on this pass. Each is reported the same way —
+another revision; and a record whose read failed on this pass. A record's
+`fields` list is not among them (below). Each is reported the same way —
 the shard in the root block's `uncounted_shards` — instead of a total that
 silently omits it. *(Informative.)* The marker is a count; a zagg sweep pass
 names the shards it read coverage-only, up to a cap, in its own run record
@@ -3799,17 +3799,14 @@ which is that rule pinned as bytes.
 - **`generated_at`** (required) — ISO-8601 UTC, the object's own clock.
 - **`fields`** (required) — the sorted payload field names the writing
   config declared `"per-centroid"`. Provenance, with §10.1 `fields`
-  semantics — and a staleness gate: a reader MAY treat a record whose
-  `fields` omit or exceed the set the manifest declares as absent (the
-  declaration moved under it — a field postdates the record, or has since
-  been dropped) and read the leaf over the manifest's declared set instead;
-  zagg's sweep does, so that every contribution to one section is folded
-  over one declared set. The record is left in place (above), and that
-  leaf contributes coverage only until it is rewritten. The cost is the
-  leaf's counts, although they do not depend on `fields` (the worker folds
-  one shared clock column, `n_obs` below): declaring or dropping a field
-  turns every leaf written before the change uncounted (§10.3), and with
-  no backfill only rewriting the leaf restores its count.
+  semantics, and nothing else: a reader MUST NOT gate on it. A record that
+  passes this section's checks is used whether its `fields` equal, omit or
+  exceed the set the manifest declares, because nothing else in the record
+  depends on the list — the worker folds one shared clock column (`n_obs`
+  below), so the word, the counts and the cover are the same under any
+  declared set — and because a record set aside is never replaced (above):
+  the leaf would contribute coverage only (§10.3) until it is rewritten,
+  its exact count discarded for none.
 - **`n_obs`** (required) — the leaf's temporal observation count, which
   MUST equal the counts block's `obs_total`: the number of clocked
   observations the leaf aggregated, **once each** (§10.3's count rule). The

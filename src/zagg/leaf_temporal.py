@@ -484,12 +484,19 @@ def leaf_contribution(
     The families sweep's per-leaf read (issue #575), and READ-ONLY: the
     record is written by the leaf's worker and by nothing else (spec §10.6).
     Returns ``(contribution, route)``: the decoded record with ``"record"``
-    when the leaf carries a readable ``temporal.toc`` at this revision whose
-    ``fields`` are the declared set (one small GET, no array opened);
-    otherwise :func:`zagg.coverage_toc.read_leaf_temporal`, one ragged chunk
-    at a time, with ``"raw"`` — the leaf's COVERAGE ONLY, every count zero,
-    which the caller reports in the root block's ``uncounted_shards``
-    (§10.3). ``contribution`` is ``None`` for a leaf holding no temporal row.
+    when the leaf carries a readable ``temporal.toc`` at this revision that
+    passes its MUST-checks (one small GET, no array opened); otherwise
+    :func:`zagg.coverage_toc.read_leaf_temporal` over the declared ``fields``,
+    one ragged chunk at a time, with ``"raw"`` — the leaf's COVERAGE ONLY,
+    every count zero, which the caller reports in the root block's
+    ``uncounted_shards`` (§10.3). ``contribution`` is ``None`` for a leaf
+    holding no temporal row.
+
+    The record's own ``fields`` list is provenance and is NOT compared with
+    the declared set (issue #600): the worker counts each clocked observation
+    once from the chunk's shared clock column, so a record's word and counts
+    do not depend on which fields the store declares. ``fields`` here only
+    tells the raw route which companions to read.
 
     ``leaf_root`` is the STABLE leaf root and ``stamp`` its root stamp, as the
     walk already read it (omitted: resolved here, one GET —
@@ -499,9 +506,7 @@ def leaf_contribution(
     ``coverage.moc``.
 
     Every record that cannot be used is BYPASSED and left exactly as found:
-    one at a foreign revision, an unparsable or inconsistent one, one whose
-    ``fields`` are not exactly the declared set (it omits a field that
-    postdates it, or names one the declaration has since dropped), and one
+    one at a foreign revision, an unparsable or inconsistent one, and one
     whose GET itself fails (an unreadable accelerator is no more evidence
     about the leaf than a missing one). The leaf stays on the raw route until
     its next replacement, whose worker writes a fresh record.
@@ -523,18 +528,10 @@ def leaf_contribution(
         raw = None
     record = load_leaf_temporal(raw)
     if record is not None:
-        if set(record.get("fields") or []) == set(fields):
-            try:
-                return leaf_temporal_contribution(record), "record"
-            except (KeyError, TypeError, ValueError) as e:
-                logger.warning(
-                    f"leaf temporal: {data_path} record is debris ({e}) — reading the leaf"
-                )
-        else:
-            logger.info(
-                f"leaf temporal: {data_path} record's fields are not the declared set — "
-                f"reading the leaf"
-            )
+        try:
+            return leaf_temporal_contribution(record), "record"
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(f"leaf temporal: {data_path} record is debris ({e}) — reading the leaf")
     return read_leaf_temporal(data_path, cell_order, fields, **store_kwargs), "raw"
 
 

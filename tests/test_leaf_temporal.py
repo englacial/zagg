@@ -520,6 +520,23 @@ def _tree(path: str) -> dict:
     }
 
 
+#: Issue #600: what a record's ``fields`` may say besides the declared set.
+_OTHER_FIELDS = ["omits", "exceeds", "absent"]
+
+
+def _relist_fields(leaf_data: str, listed: str, declared) -> None:
+    """Rewrite the record at ``leaf_data`` with another ``fields`` list (issue #600)."""
+    path = Path(leaf_data) / LEAF_TEMPORAL_NAME
+    record = json.loads(path.read_text())
+    if listed == "omits":
+        record["fields"] = []  # predates the declared field
+    elif listed == "exceeds":
+        record["fields"] = sorted([*declared, "zz_tdigest"])  # names one since dropped
+    else:
+        record.pop("fields")
+    path.write_text(json.dumps(record))
+
+
 def _with_recordless(tmp_path, *others: str) -> tuple[str, list]:
     """The fixture store plus a record-less copy of its leaf at each of ``others``.
 
@@ -643,12 +660,8 @@ class TestSweepRoute:
         assert route == "raw" and got is not None
         assert read_leaf_temporal_record(leaf) == future
 
-    @pytest.mark.parametrize(
-        "damage", ["not json {", "n_obs", "fields", "fields_extra", "unmarked"]
-    )
-    def test_debris_and_stale_records_are_bypassed_and_left_standing(
-        self, tmp_path, damage, monkeypatch
-    ):
+    @pytest.mark.parametrize("damage", ["not json {", "n_obs", "unmarked"])
+    def test_debris_records_are_bypassed_and_left_standing(self, tmp_path, damage, monkeypatch):
         """An unusable record is never replaced: the leaf reads raw, uncounted."""
         root = _fixture_copy(tmp_path)
         leaf = _leaf_of(root)
@@ -660,12 +673,6 @@ class TestSweepRoute:
             record = json.loads(path.read_text())
             if damage == "n_obs":
                 record["n_obs"] += 1  # inconsistent with its own counts
-            elif damage == "fields":
-                record["fields"] = []  # predates the declared field
-            elif damage == "fields_extra":
-                # The other direction: a field the declaration has since
-                # dropped. The gate is EQUALITY on the declared set.
-                record["fields"] = sorted([*fields, "zz_tdigest"])
             else:
                 record.pop("spec")  # claims no revision at all
             path.write_text(json.dumps(record))
@@ -675,6 +682,67 @@ class TestSweepRoute:
         assert route == "raw" and got is not None
         assert int(got[1].obs.sum()) == 0
         assert _tree(leaf) == before
+
+    @pytest.mark.parametrize("listed", _OTHER_FIELDS)
+    def test_a_record_is_read_whatever_its_fields_list_says(self, tmp_path, listed, monkeypatch):
+        """Issue #600: ``fields`` is provenance, not a gate (spec §10.6).
+
+        The worker counts one shared clock column, so the record's word and
+        counts do not depend on the declared set: a record that omits a
+        declared field, names one the declaration lacks, or carries no list
+        at all is the leaf's exact count, and no array is opened.
+        """
+        import zagg.coverage_toc as toc
+
+        root = _fixture_copy(tmp_path)
+        leaf = _leaf_of(root)
+        cell_order, fields = _declared(root)
+        word, counts = leaf_temporal_contribution(read_leaf_temporal_record(leaf))
+        _relist_fields(leaf, listed, fields)
+        monkeypatch.setattr(toc, "read_leaf_temporal", _boom)
+        before = _tree(leaf)
+        got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "record" and got[0] == word
+        _same(got[1], counts)
+        assert int(got[1].obs.sum()) > 0
+        assert _tree(leaf) == before
+
+    @pytest.mark.parametrize("listed", _OTHER_FIELDS)
+    def test_a_record_with_another_fields_list_is_counted_by_the_sweep(self, tmp_path, listed):
+        """Issue #600 at the sweep: route ``records``, exact counts, not uncounted.
+
+        Two shards whose records list other fields than the store declares:
+        neither is in the root marker nor in the pass's ``pass_uncounted``
+        (issue #598), and the root block is their exact sum.
+        """
+        from zagg.coverage_toc import coverage_toc_counts, coverage_toc_uncounted
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        root = _fixture_copy(tmp_path)
+        other = "11214"
+        shutil.copytree(_leaf_of(root), _leaf_of(root, other))
+        (Path(root) / "coverage.moc").unlink()
+        (Path(root) / "coverage.toc").unlink()
+        _cell_order, fields = _declared(root)
+        _word, worker = leaf_temporal_contribution(read_leaf_temporal_record(_leaf_of(root)))
+        for decimal in (SHARD, other):
+            _relist_fields(_leaf_of(root, decimal), listed, fields)
+        leaves = [(int(morton_word(d)), None) for d in (SHARD, other)]
+        summary = run_sweep(root, leaves, families=["moc"])
+        moc = summary["families"]["moc"]
+        assert moc["temporal_routes"] == {"records": 2, "raw": 0}
+        assert moc["temporal_shards"] == 2 and moc["uncounted_shards"] == 0
+        nothing = {"count": 0, "shards": [], "truncated": False}
+        assert moc["pass_uncounted"] == nothing
+        durable = json.loads((Path(root) / summary["record"]).read_text())
+        assert durable["families"]["moc"]["pass_uncounted"] == nothing
+        envelope = read_root_coverage(root)
+        assert coverage_toc_uncounted(envelope) == 0
+        total = coverage_toc_counts(envelope)
+        np.testing.assert_array_equal(total.words, worker.words)
+        np.testing.assert_array_equal(total.obs, 2 * worker.obs)
 
     def test_the_raw_route_reads_one_chunk_at_a_time(self, tmp_path, monkeypatch):
         """The memory shape issue #575 fixes: never a whole column, one chunk."""
@@ -1147,8 +1215,8 @@ class TestVersionedLeaf:
             _same(got[1], raw[1])
         assert _tree(leaf) == before
 
-    @pytest.mark.parametrize("damage", ["not json {", "n_obs", "fields", "unmarked"])
-    def test_a_debris_or_stale_record_in_a_version_is_left_standing(self, tmp_path, damage):
+    @pytest.mark.parametrize("damage", ["not json {", "n_obs", "unmarked"])
+    def test_a_debris_record_in_a_version_is_left_standing(self, tmp_path, damage):
         """As on a legacy leaf: the record is bypassed and nothing is rewritten."""
         root, leaf, version = _versioned_copy(tmp_path)
         cell_order, fields = _declared(root)
@@ -1159,14 +1227,25 @@ class TestVersionedLeaf:
             record = json.loads(path.read_text())
             if damage == "n_obs":
                 record["n_obs"] += 1
-            elif damage == "fields":
-                record["fields"] = []
             else:
                 record.pop("spec")
             path.write_text(json.dumps(record))
         before = _tree(leaf)
         got, route = leaf_contribution(leaf, cell_order, fields)
         assert route == "raw" and got is not None
+        assert _tree(leaf) == before
+
+    @pytest.mark.parametrize("listed", _OTHER_FIELDS)
+    def test_a_versions_record_is_read_whatever_its_fields_list_says(self, tmp_path, listed):
+        """As on a legacy leaf (issue #600): the record's exact counts, nothing rewritten."""
+        root, leaf, version = _versioned_copy(tmp_path)
+        cell_order, fields = _declared(root)
+        word, counts = leaf_temporal_contribution(read_leaf_temporal_record(version))
+        _relist_fields(version, listed, fields)
+        before = _tree(leaf)
+        got, route = leaf_contribution(leaf, cell_order, fields)
+        assert route == "record" and got[0] == word
+        _same(got[1], counts)
         assert _tree(leaf) == before
 
     def test_the_sweep_and_the_refresh_compose_without_writing_the_version(self, tmp_path):
