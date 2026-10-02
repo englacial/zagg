@@ -191,15 +191,17 @@ class TestSplit:
 
     def test_block_per_level_at_the_production_split(self, cfg):
         base = HealpixGrid(9, 19, config=cfg, chunk_inner=13)
-        assert icechunk_refs.split_block(base, 6) == {"chunks": 4**7, "order": 6}
-        assert icechunk_refs.split_block(base, 4) == {"chunks": 4**9, "order": 4}
+        assert icechunk_refs.split_block(base, 6) == {"chunks": 4**7, "order": 6, "rows": 1}
+        assert icechunk_refs.split_block(base, 4) == {"chunks": 4**9, "order": 4, "rows": 1}
+        # The row block is store-wide, so it is the same on every level.
+        assert icechunk_refs.split_block(base, 6, rows=4)["rows"] == 4
         # The column and overview levels, at the grids their writers use
         # (one chunk per node): the same 16,384 chunks, a coarser cell each.
         want = {13: (4**7, 2), 12: (4**7, 1), 11: (4**7, 0), 10: (4**6, 0), 4: (1, 0)}
         for cells, (chunks, order) in want.items():
             level = HealpixGrid(cells - 4, cells, config=cfg, sharded=True)
             block = icechunk_refs.split_block(level, 6, base_chunk_order=base.chunk_order)
-            assert block == {"chunks": chunks, "order": order}, cells
+            assert block == {"chunks": chunks, "order": order, "rows": 1}, cells
 
     def test_the_default_split_clears_the_dictionary_gate(self):
         # §11.5 (informative): the default split is one manifest per order-6
@@ -224,6 +226,7 @@ class TestOptions:
             "commit": "leaf",  # no grid: nothing says a ladder will run
             "commit_order": 6,
             "split_order": 6,
+            "rows_per_manifest": 1,
         }
         assert icechunk_refs.resolve_options(self._cfg(cfg), 4)["commit_order"] == 3
 
@@ -281,7 +284,12 @@ class TestOptions:
         opts = icechunk_refs.resolve_options(
             self._cfg(cfg, commit="ladder", split_order=4, commit_order=3), 9
         )
-        assert opts == {"commit": "ladder", "commit_order": 3, "split_order": 4}
+        assert opts == {
+            "commit": "ladder",
+            "commit_order": 3,
+            "split_order": 4,
+            "rows_per_manifest": 1,
+        }
 
     def test_split_finer_than_commit_is_refused(self, cfg):
         with pytest.raises(ValueError, match="whole manifests"):
@@ -291,6 +299,14 @@ class TestOptions:
 
         with pytest.raises(ValueError, match="finer than commit_order"):
             validate_config(self._cfg(cfg, split_order=2, commit_order=3))
+
+    def test_rows_per_manifest_defaults_to_one_and_must_be_positive(self, cfg):
+        # The §11.5 row cut: one manifest per row unless a store sets blocks.
+        assert icechunk_refs.resolve_options(self._cfg(cfg), 9)["rows_per_manifest"] == 1
+        opts = icechunk_refs.resolve_options(self._cfg(cfg, rows_per_manifest=4), 9)
+        assert opts["rows_per_manifest"] == 4
+        with pytest.raises(ValueError, match="must be at least 1"):
+            icechunk_refs.resolve_options(self._cfg(cfg, rows_per_manifest=0), 9)
 
     def test_orders_above_the_shard_order_are_refused(self, cfg):
         with pytest.raises(ValueError, match="shard_order"):
@@ -312,6 +328,7 @@ class TestOptions:
             "commit": "leaf",
             "commit_order": 4,
             "split_order": 4,
+            "rows_per_manifest": 1,
         }
 
     def test_block_shape_is_validated(self, cfg):
@@ -360,19 +377,19 @@ class TestInit:
             "cell_order": 6,
             "node_order": 4,
             "artifact": "leaf",
-            "split": {"chunks": 16, "order": 3},
+            "split": {"chunks": 16, "order": 3, "rows": 1},
         }
         assert out["levels"] == block["levels"] and out["options"]["commit_order"] == 3
         # Every level holds the base's 16 chunks per manifest, capped at its
         # own chunk axis: the column (5) spans an order-2 cell, the overviews
         # a coarser one each, down to one base cell (§11.5).
         assert {k: v["split"] for k, v in block["levels"].items()} == {
-            "6": {"chunks": 16, "order": 3},
-            "5": {"chunks": 16, "order": 2},
-            "4": {"chunks": 16, "order": 1},
-            "3": {"chunks": 16, "order": 0},
-            "2": {"chunks": 4, "order": 0},
-            "1": {"chunks": 1, "order": 0},
+            "6": {"chunks": 16, "order": 3, "rows": 1},
+            "5": {"chunks": 16, "order": 2, "rows": 1},
+            "4": {"chunks": 16, "order": 1, "rows": 1},
+            "3": {"chunks": 16, "order": 0, "rows": 1},
+            "2": {"chunks": 4, "order": 0, "rows": 1},
+            "1": {"chunks": 1, "order": 0, "rows": 1},
         }
         # The manifest's §4.9 multiscales mirror rides the root attrs.
         assert group.attrs["multiscales"] == hive.build_manifest(grid)["multiscales"]
@@ -462,11 +479,15 @@ class TestInit:
         (condition, dims) = sizes[0]
         assert isinstance(condition, icechunk.ManifestSplitCondition.PathMatches)
         # The split names BOTH axes (§11.5): the cell axis at the level's run,
-        # the row axis at a length no row count reaches — an axis left
-        # unnamed would split at one chunk, a manifest per row.
+        # the row axis at ``rows_per_manifest`` — one row per manifest by
+        # default, so an append adds manifests and rewrites no earlier row.
         by_axis = {axis._0: size for axis, size in dims}
         assert all(isinstance(a, icechunk.ManifestSplitDimCondition.Axis) for a, _ in dims)
-        assert by_axis == {0: icechunk_rows.ROW_SPLIT, 1: out["levels"]["6"]["split"]["chunks"]}
+        assert by_axis == {
+            0: icechunk_rows.DEFAULT_ROWS_PER_MANIFEST,
+            1: out["levels"]["6"]["split"]["chunks"],
+        }
+        assert out["levels"]["6"]["split"]["rows"] == 1
         assert isinstance(sizes[-1][0], icechunk.ManifestSplitCondition.AnyArray)
 
     def test_rerun_reopens_with_an_empty_init_commit(self, cfg, tmp_path):
@@ -543,7 +564,7 @@ class TestInit:
 
         root = str(tmp_path / "store")
         first = self._init(cfg, root, split_order=2, commit_order=2)
-        assert first["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2}
+        assert first["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2, "rows": 1}
         with caplog.at_level(logging.WARNING, logger="zagg.icechunk_refs"):
             again = self._init(cfg, root, split_order=3, commit_order=2)  # finer than the store
         assert "finer than the store's recorded 2" in caplog.text
@@ -571,7 +592,7 @@ class TestInit:
         assert "ratchets 3 -> 2" in caplog.text
         assert again["split_ratchet"] == {"from": 3, "to": 2}
         assert again["snapshot"] != first["snapshot"]  # the block rewrite is a commit
-        assert again["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2}
+        assert again["levels"]["6"]["split"] == {"chunks": 4**3, "order": 2, "rows": 1}
         block = icechunk_refs.read_block(root, store_kwargs={})
         assert block["split_order"] == 2 and block["levels"] == again["levels"]
         _group, repo = _open(root)
@@ -894,7 +915,7 @@ class TestLeafRefs:
         grid = _grid(cfg)
         root = str(tmp_path / "store")
         out = icechunk_refs.init_repo(root, grid, cfg, run_id=RUN_ID, store_kwargs={})
-        assert out["levels"]["3"]["split"] == {"chunks": 16, "order": 0}
+        assert out["levels"]["3"]["split"] == {"chunks": 16, "order": 0, "rows": 1}
         repo = icechunk_refs.open_repo(root, store_kwargs={})
         prefix = icechunk_refs.container_prefix(root)
         first, second = repo.writable_session("main"), repo.writable_session("main")
@@ -973,7 +994,12 @@ class TestLambdaInitInvoke:
             "path": "s3://b/p/icechunk",
             "snapshot": "SNAP",
             "created": True,
-            "options": {"commit": "ladder", "commit_order": 6, "split_order": 6},
+            "options": {
+                "commit": "ladder",
+                "commit_order": 6,
+                "split_order": 6,
+                "rows_per_manifest": 1,
+            },
             "levels": {
                 "9": {"chunk_order": 13, "cell_order": 19, "split": {"chunks": 16384, "order": 6}}
             },
@@ -1147,6 +1173,12 @@ def _saved_splits(root):
     """``{cell order: chunks per manifest}`` of the repo's SAVED splitting config (a plain open)."""
     sizes = icechunk_refs.open_repo(root, store_kwargs={}).config.manifest.splitting.split_sizes
     return {c.regex[2:-3]: {axis._0: n for axis, n in dims}[1] for c, dims in sizes[:-1]}
+
+
+def _saved_row_splits(root):
+    """``{cell order: rows per manifest}`` of the repo's SAVED splitting config."""
+    sizes = icechunk_refs.open_repo(root, store_kwargs={}).config.manifest.splitting.split_sizes
+    return {c.regex[2:-3]: {axis._0: n for axis, n in dims}[0] for c, dims in sizes[:-1]}
 
 
 def _block_splits(root):
@@ -1840,17 +1872,30 @@ class TestLadder:
         )
         assert summary["cells_error"] == 0
         init = summary["icechunk"]
-        assert init["options"] == {"commit": "ladder", "commit_order": 3, "split_order": 3}
+        assert init["options"] == {
+            "commit": "ladder",
+            "commit_order": 3,
+            "split_order": 3,
+            "rows_per_manifest": 1,
+        }
         assert init["ladder"] == [1, 2, 3, 4, 5, 6]  # cell orders: o0..o3 overviews, column, base
-        assert init["levels"]["6"]["split"] == {"chunks": 4**2, "order": 3}  # base: chunk order 5
+        assert init["levels"]["6"]["split"] == {
+            "chunks": 4**2,
+            "order": 3,
+            "rows": 1,
+        }  # base: chunk order 5
         assert init["levels"]["5"] == {
             "node_order": 4,
             "artifact": "column",
             "chunk_order": 4,
             "cell_order": 5,
-            "split": {"chunks": 16, "order": 2},  # the base's 16 chunks: one o2 cell
+            "split": {"chunks": 16, "order": 2, "rows": 1},  # the base's 16 chunks: one o2 cell
         }
-        assert init["levels"]["4"]["split"] == {"chunks": 16, "order": 1}  # one chunk per o3 node
+        assert init["levels"]["4"]["split"] == {
+            "chunks": 16,
+            "order": 1,
+            "rows": 1,
+        }  # one chunk / o3 node
         for meta in summary["results"]:
             assert "sidecar" in meta["icechunk"] and "snapshot" not in meta["icechunk"]
         rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
@@ -1943,6 +1988,7 @@ class TestLadder:
             "commit": "ladder",
             "commit_order": 0,
             "split_order": 0,
+            "rows_per_manifest": 1,
         }
         from zagg.icechunk_ladder import read_node_refs
 

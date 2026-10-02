@@ -49,20 +49,35 @@ ROW_COORDS = (ROW_START, ROW_END)
 ROW_FILL = int(np.iinfo(np.int64).min)
 #: Rows per coordinate chunk: one small chunk holds every window of a mission.
 ROW_COORD_CHUNK = 1024
-#: The manifest-split run length on the row axis (§11.5). Icechunk splits an
-#: axis the config does not name at ONE chunk, which would cut a manifest per
-#: row; naming it at a length no row count reaches is what makes the split
-#: "the cell axis alone" (issue #584 phase 0).
-ROW_SPLIT = 2**31 - 1
+#: Rows per manifest: the default cut on the row axis (§11.5, espg's ruling of
+#: 2026-10-02 on issue #584). ONE manifest per row, so an append only ADDS
+#: manifest files — the earlier rows' manifests are never rewritten, and a
+#: reader after one window downloads that window's refs alone. The knob
+#: ratchets the way ``split_order`` does, toward coarser (blocks of rows); a
+#: store at one row per manifest is the finest cut it can ever carry, which is
+#: the side the ratchet can still move from.
+DEFAULT_ROWS_PER_MANIFEST = 1
+#: The row cut a ``/2`` repo written BEFORE the 2026-10-02 ruling carries —
+#: every row in one manifest, a run length no row count reaches. Such a repo
+#: is recognized by the absent ``rows_per_manifest`` block key and keeps this
+#: cut: it is baked into the manifests it has already written. No published
+#: store has one (issue #584 question (1): interim repos are disposable).
+LEGACY_ROW_SPLIT = 2**31 - 1
 #: Fresh-session retries of an init whose row allocation lost to another run's.
 ROW_ALLOC_TRIES = 5
 
 
-def cell_axis_split(chunks: int) -> dict:
-    """A level's manifest-split sizes: ``chunks`` on the cell axis, every row in one (§11.5)."""
+def level_split(chunks: int, rows: int = DEFAULT_ROWS_PER_MANIFEST) -> dict:
+    """A level's manifest-split sizes: ``chunks`` on the cell axis, ``rows`` on the row axis (§11.5).
+
+    Both axes are named. Icechunk splits an axis its config does not name at
+    ONE chunk, so an unnamed cell axis would cut a manifest per chunk; the row
+    axis is named at ``rows`` because that cut is now a declared knob rather
+    than the "every row in one manifest" of ``zagg-icechunk/2``'s first cut.
+    """
     from icechunk import ManifestSplitDimCondition as D
 
-    return {D.Axis(0): ROW_SPLIT, D.Axis(1): int(chunks)}
+    return {D.Axis(0): int(rows), D.Axis(1): int(chunks)}
 
 
 def check_revision(have, want: str, path: str) -> None:
@@ -422,10 +437,11 @@ __all__ = [
     "ROW_DIM",
     "ROW_END",
     "ROW_FILL",
-    "ROW_SPLIT",
+    "DEFAULT_ROWS_PER_MANIFEST",
+    "LEGACY_ROW_SPLIT",
     "ROW_START",
     "array_model",
-    "cell_axis_split",
+    "level_split",
     "check_array_model",
     "check_revision",
     "commit_rows",

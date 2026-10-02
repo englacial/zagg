@@ -59,7 +59,8 @@ import numpy as np
 
 from zagg.icechunk_rows import (
     ALL_ROW,
-    cell_axis_split,
+    DEFAULT_ROWS_PER_MANIFEST,
+    LEGACY_ROW_SPLIT,
     check_revision,
     commit_rows,
     coordinate_specs,
@@ -165,15 +166,24 @@ def split_exponent(base_chunk_order: int, split_order: int, chunk_order: int | N
     return min(m, int(base_chunk_order if chunk_order is None else chunk_order))
 
 
-def split_block(grid, split_order: int, *, base_chunk_order: int | None = None) -> dict:
+def split_block(
+    grid,
+    split_order: int,
+    *,
+    base_chunk_order: int | None = None,
+    rows: int = DEFAULT_ROWS_PER_MANIFEST,
+) -> dict:
     """The per-level ``split`` block for ``grid`` at ``split_order`` (§11.5).
 
     ``base_chunk_order`` is the BASE level's chunk axis (the store's
     ``chunk_order``); ``grid`` is this level's. Absent, ``grid`` is the base.
+    ``rows`` is the row-axis cut, store-wide (the block's
+    ``rows_per_manifest``) and recorded per level because the split names
+    BOTH axes.
     """
     base = grid.chunk_order if base_chunk_order is None else base_chunk_order
     m = split_exponent(base, split_order, grid.chunk_order)
-    return {"chunks": 4**m, "order": int(grid.chunk_order) - m}
+    return {"chunks": 4**m, "order": int(grid.chunk_order) - m, "rows": int(rows)}
 
 
 def block_splits(block: dict) -> dict:
@@ -186,10 +196,11 @@ def block_splits(block: dict) -> dict:
     caller read earlier.
     """
     base, split_order = int(block["chunk_order"]), int(block["split_order"])
+    rows = int(block.get("rows_per_manifest") or DEFAULT_ROWS_PER_MANIFEST)
     splits = {}
     for order, level in {**(block.get("retired") or {}), **(block.get("levels") or {})}.items():
         m = split_exponent(base, split_order, int(level["chunk_order"]))
-        splits[order] = {"chunks": 4**m, "order": int(level["chunk_order"]) - m}
+        splits[order] = {"chunks": 4**m, "order": int(level["chunk_order"]) - m, "rows": rows}
     return splits
 
 
@@ -232,13 +243,15 @@ def ladder_walks(config, grid) -> bool:
 
 
 def resolve_options(config, shard_order: int, *, tuple_width: int | None = None, grid=None) -> dict:
-    """``{"commit", "commit_order", "split_order"}`` for this run, defaults applied.
+    """``{"commit", "commit_order", "split_order", "rows_per_manifest"}``, defaults applied.
 
     Defaults: ``commit: "ladder"`` when the run walks the ladder
     (:func:`ladder_walks` on ``grid``), else ``"leaf"`` — never a mode whose
     commits no step of the run makes; without a ``grid`` an unset ``commit``
     is ``"leaf"``. ``commit_order`` the finest dispatch node;
-    ``split_order = commit_order``. Validation (§11.5): a commit must write
+    ``split_order = commit_order``; ``rows_per_manifest`` one row per
+    manifest (:data:`~zagg.icechunk_rows.DEFAULT_ROWS_PER_MANIFEST`).
+    Validation (§11.5): a commit must write
     whole manifests, so ``split_order >= commit_order``; both at most the
     shard order (a leaf is the finest thing a commit or a manifest can be
     keyed to); ``commit_order`` non-negative. Under ``commit: "ladder"`` the
@@ -283,7 +296,21 @@ def resolve_options(config, shard_order: int, *, tuple_width: int | None = None,
             f"output.icechunk.split_order {split_order} must lie in [commit_order {commit_order}, "
             f"shard_order {shard_order}] — a commit must write whole manifests (spec §11.5)"
         )
-    return {"commit": commit, "commit_order": commit_order, "split_order": split_order}
+    rows_per_manifest = raw.get("rows_per_manifest")
+    rows_per_manifest = (
+        DEFAULT_ROWS_PER_MANIFEST if rows_per_manifest is None else int(rows_per_manifest)
+    )
+    if rows_per_manifest < 1:
+        raise ValueError(
+            f"output.icechunk.rows_per_manifest {rows_per_manifest} must be at least 1 — "
+            f"a manifest spans whole rows (spec §11.5)"
+        )
+    return {
+        "commit": commit,
+        "commit_order": commit_order,
+        "split_order": split_order,
+        "rows_per_manifest": rows_per_manifest,
+    }
 
 
 # ── storage and credentials ─────────────────────────────────────────────────
@@ -393,11 +420,15 @@ def _repo_config(store_root: str, splits: dict, store_kwargs: dict):
     from icechunk import ManifestSplitCondition as C
     from icechunk import ManifestSplitDimCondition as D
 
+    from zagg.icechunk_rows import level_split
+
     config = icechunk.RepositoryConfig.default()
     container, _creds = _container(store_root, store_kwargs)
     config.set_virtual_chunk_container(container)
     sizes = {
-        C.path_matches(regex=rf"^/{int(order)}/.*"): cell_axis_split(split["chunks"])
+        C.path_matches(regex=rf"^/{int(order)}/.*"): level_split(
+            split["chunks"], int(split.get("rows") or DEFAULT_ROWS_PER_MANIFEST)
+        )
         for order, split in sorted(splits.items(), key=lambda kv: -int(kv[0]))
     }
     sizes[C.AnyArray()] = {D.Axis(0): 1}
@@ -517,7 +548,10 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(
             "artifact": level["artifact"],
             **level_geometry(level["grid"]),
             "split": split_block(
-                level["grid"], options["split_order"], base_chunk_order=grid.chunk_order
+                level["grid"],
+                options["split_order"],
+                base_chunk_order=grid.chunk_order,
+                rows=options["rows_per_manifest"],
             ),
         }
         for cells, level in sorted(grids.items(), reverse=True)
@@ -533,10 +567,11 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(
         "rows": rows,
         "levels": levels,
         # The ladder's knobs (§11.4/§11.5), read back by every stage node.
-        # ``split_order`` is the store's authoritative, ratcheting value;
-        # ``commit`` / ``commit_order`` are per-run — recorded so this run's
-        # stage nodes can read them, never a compatibility key.
-        **{k: options[k] for k in ("commit", "commit_order", "split_order")},
+        # ``split_order`` and ``rows_per_manifest`` are the store's
+        # authoritative, ratcheting values; ``commit`` / ``commit_order`` are
+        # per-run — recorded so this run's stage nodes can read them, never a
+        # compatibility key.
+        **{k: options[k] for k in ("commit", "commit_order", "split_order", "rows_per_manifest")},
     }
     attributes: dict = {ICECHUNK_ATTR: block}
     mirror = manifest.get(MULTISCALES_ATTR)
@@ -712,7 +747,21 @@ def init_repo(
                 f"output.icechunk.commit_order {options['commit_order']} exceeds the store's "
                 f"recorded split_order {stored}: a commit must write whole manifests (§11.5)"
             )
-    elif wanted < stored:
+    # The row cut is fixed at the repo's creation (§11.5): it is baked into
+    # every manifest already written, so a later config value is
+    # adopted-with-a-warning the way a finer ``split_order`` is, and moving it
+    # on an existing repo is an operator ``rewrite_manifests`` concern.
+    # Unlike ``split_order`` it does NOT ratchet here. An absent key is a
+    # repo written before the ruling: it keeps its every-row-in-one cut.
+    rows_stored = int(existing.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
+    if int(options["rows_per_manifest"]) != rows_stored:
+        logger.warning(
+            f"output.icechunk.rows_per_manifest {options['rows_per_manifest']} differs from the "
+            f"store's recorded {rows_stored} at {path}; the row cut is fixed at creation — "
+            f"using {rows_stored} (spec §11.5)"
+        )
+        options = {**options, "rows_per_manifest": rows_stored}
+    if wanted < stored:
         ratchet = {"from": stored, "to": wanted}
         block = repo_group_spec(grid, store_root, options, manifest).attributes[ICECHUNK_ATTR]
         retired = existing.get("retired") or {}

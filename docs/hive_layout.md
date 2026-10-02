@@ -2149,15 +2149,16 @@ either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `url_prefix` and the paths above, which is what makes the same two calls
 writable in icechunk-js.
 
-The manifest split (spec §11.5) is on the cell axis alone — one manifest
-spans every row of its cell run, so the manifest count does not grow with
-the rows — at one base manifest per order-`split_order`
-cell — at the defaults an order-6 cell, 16,384 chunks, 64 leaves — and the
-same number of chunks per manifest at every coarser level (so a coarse
-manifest spans a coarser cell: order 2 at `/13`, a base cell at `/11` and
-above), recorded in the repo root's `zagg_icechunk` block as `split_order`,
-and per order group as `levels.{order}.split` (`chunks`, `order`), so a
-reader never assumes it.
+The manifest split (spec §11.5) cuts **both** axes: the cell axis at one
+base manifest per order-`split_order` cell — at the defaults an order-6
+cell, 16,384 chunks, 64 leaves — and the same number of chunks per manifest
+at every coarser level (so a coarse manifest spans a coarser cell: order 2
+at `/13`, a base cell at `/11` and above); and the row axis at
+`rows_per_manifest` rows, **one row per manifest** by default, so an append
+adds manifest files and rewrites none of the rows already written. Both are
+recorded in the repo root's `zagg_icechunk` block (`split_order`,
+`rows_per_manifest`) and per order group as `levels.{order}.split`
+(`chunks`, `order`, `rows`), so a reader never assumes them.
 
 ## Raster hive stores (issue #247)
 

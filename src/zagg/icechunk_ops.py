@@ -85,8 +85,8 @@ from zagg.icechunk_refs import (
     repo_group_spec,
     repo_path,
 )
+from zagg.icechunk_rows import LEGACY_ROW_SPLIT, check_array_model
 from zagg.icechunk_rows import array_model as _array_model
-from zagg.icechunk_rows import check_array_model
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +253,10 @@ def declare_pyramid(
     want = {"shard_order": int(grid.parent_order), **level_geometry(grid)}
     repo, block = open_vetted(store_root, store_kwargs=store_kwargs, want=want)
     options = {k: block[k] for k in ("commit", "commit_order", "split_order")}
+    # The row cut follows the repo as it stands, never this caller's config:
+    # an absent key is a repo written before the §11.5 row split and keeps
+    # its every-row-in-one cut (issue #584).
+    options["rows_per_manifest"] = int(block.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
     # A newly declared level's arrays are built at the repo's rows (§11.2).
     spec = repo_group_spec(grid, store_root, options, manifest, block["rows"])
     levels = spec.attributes[ICECHUNK_ATTR]["levels"]

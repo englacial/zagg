@@ -2,7 +2,7 @@
 
 ``zagg-icechunk/2``: every level array is ``(n_rows, n_cells)``. These tests
 pin the row law (allocated once, by label, in order of first appearance,
-never reordered), the root coordinate, the cell-axis-only manifest split, the
+never reordered), the root coordinate, the two-axis manifest split, the
 refusal of a ``/1`` repo — and that a run adding a row leaves every earlier
 ref byte-identical. A windowed store's repo is driven through ``init_repo``
 and ``commit_units`` directly: the config guard still resolves the companion
@@ -22,6 +22,7 @@ from test_icechunk_refs import (
     _grid,
     _leaf_arrays,
     _open,
+    _saved_row_splits,
     _saved_splits,
     _shards,
     _write_leaf,
@@ -325,9 +326,10 @@ class TestRefsLandAtTheirRow:
         assert old["6"]["count"].shape == (1, 12 * 4**6)
         np.testing.assert_array_equal(old["6"]["count"][0, span][:4], np.full(4, 1))
 
-    def test_the_manifest_split_is_the_cell_axis_alone(self, monkeypatch, cfg, tmp_path):
-        # One manifest per split cell spans EVERY row (§11.5): the snapshot's
-        # manifest count does not grow with the rows.
+    def test_the_manifest_split_cuts_the_row_axis_at_one_row(self, monkeypatch, cfg, tmp_path):
+        # One manifest per ROW per split cell (§11.5, the 2026-10-02 ruling):
+        # each manifest's row extent is a single row, so an append adds
+        # manifests instead of rewriting the rows already written.
         grid, root, manifest = _windowed(cfg, tmp_path)
         (shard,) = _shards(grid, 1)
         v1, v2 = self._two_versions(monkeypatch, grid, root, shard)
@@ -340,8 +342,106 @@ class TestRefsLandAtTheirRow:
         )
         _group, repo = _open(root)
         nodes = {n["path"]: n for n in repo.inspect_snapshot(out["snapshot"])["nodes"]}
+        refs = nodes["/6/count"]["manifest_refs"]
+        assert len(refs) == 2
+        assert sorted(r["extents"][0] for r in refs) == [[0, 1], [1, 2]]
+
+    def test_a_block_of_rows_per_manifest_is_a_knob(self, monkeypatch, cfg, tmp_path):
+        # ``rows_per_manifest`` widens the row block; a global store sets one.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        v1, v2 = self._two_versions(monkeypatch, grid, root, shard)
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}  # after _write_leaf pops the block
+        out = _init(root, grid, cfg, manifest, ["2019", "2020"])
+        assert out["options"]["rows_per_manifest"] == 4
+        assert out["levels"]["6"]["split"]["rows"] == 4
+        committed = icechunk_refs.commit_units(
+            root,
+            [self._unit(grid, root, shard, "2019", v1), self._unit(grid, root, shard, "2020", v2)],
+            "node",
+            store_kwargs={},
+        )
+        _group, repo = _open(root)
+        nodes = {n["path"]: n for n in repo.inspect_snapshot(committed["snapshot"])["nodes"]}
+        # Both rows fall inside the one 4-row block, so there is ONE
+        # manifest; its extent is clipped to the rows the array has.
         (ref,) = nodes["/6/count"]["manifest_refs"]
-        assert ref["extents"][0] == [0, 2]  # both rows in the one manifest
+        assert ref["extents"][0] == [0, 2]
+
+    def test_an_appended_row_supersedes_no_earlier_manifest(self, monkeypatch, cfg, tmp_path):
+        # The point of the row cut: run 2 adds manifest files and the row-0
+        # manifests keep their ids, so a reader's cached manifests stay valid.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        v1, v2 = self._two_versions(monkeypatch, grid, root, shard)
+        _init(root, grid, cfg, manifest, ["2019"])
+        first = icechunk_refs.commit_units(
+            root, [self._unit(grid, root, shard, "2019", v1)], "leaf", store_kwargs={}
+        )
+        _group, repo = _open(root)
+
+        def manifest_ids(snapshot):
+            # The LEVEL arrays only: the root row coordinate is a small
+            # native array that run 2 writes its new row's bounds into, so
+            # its manifest is rewritten by design (§11.2).
+            nodes = {n["path"]: n for n in repo.inspect_snapshot(snapshot)["nodes"]}
+            return {
+                path: {r["id"] for r in node["manifest_refs"]}
+                for path, node in nodes.items()
+                if node.get("manifest_refs") and path.startswith("/6/")
+            }
+
+        before = manifest_ids(first["snapshot"])
+        assert before
+        _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        second = icechunk_refs.commit_units(
+            root, [self._unit(grid, root, shard, "2020", v2)], "leaf", store_kwargs={}
+        )
+        _group, repo = _open(root)
+        after = manifest_ids(second["snapshot"])
+        for path, ids in before.items():
+            # Every row-0 manifest survives by id, and the row-1 refs arrive
+            # as NEW manifests alongside them -- nothing is rewritten.
+            assert ids <= after[path], path
+            assert len(after[path]) == len(ids) + 1, path
+
+    def test_the_row_cut_is_fixed_at_creation_and_a_later_config_adopts_it(
+        self, monkeypatch, cfg, tmp_path, caplog
+    ):
+        # ``rows_per_manifest`` is baked into every manifest already written,
+        # so it does NOT ratchet: a later run adopts the store's and warns.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        self._two_versions(monkeypatch, grid, root, shard)
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}
+        assert _init(root, grid, cfg, manifest, ["2019"])["options"]["rows_per_manifest"] == 4
+        cfg.output["icechunk"] = {"rows_per_manifest": 1}
+        with caplog.at_level("WARNING"):
+            again = _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        assert again["options"]["rows_per_manifest"] == 4
+        assert "fixed at creation" in caplog.text
+        assert _saved_row_splits(root)["6"] == 4
+
+    def test_a_repo_written_before_the_ruling_keeps_its_every_row_cut(
+        self, monkeypatch, cfg, tmp_path, caplog
+    ):
+        # A ``/2`` repo whose block carries no ``rows_per_manifest`` predates
+        # the row split; the absent key names it and its cut is kept.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        self._two_versions(monkeypatch, grid, root, shard)
+        _init(root, grid, cfg, manifest, ["2019"])
+        _group, repo = _open(root)
+        session = repo.writable_session(icechunk_refs.BRANCH)
+        group = zarr.open_group(session.store, mode="a")
+        block = dict(group.attrs[ICECHUNK_ATTR])
+        block.pop("rows_per_manifest")
+        group.attrs[ICECHUNK_ATTR] = block
+        session.commit("drop the row cut")
+        with caplog.at_level("WARNING"):
+            out = _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        assert out["options"]["rows_per_manifest"] == icechunk_rows.LEGACY_ROW_SPLIT
+        assert "fixed at creation" in caplog.text
 
     def test_a_row_the_repo_never_allocated_is_refused(self, monkeypatch, cfg, tmp_path):
         grid, root, manifest = _windowed(cfg, tmp_path)

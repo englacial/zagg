@@ -4815,21 +4815,34 @@ fields to `icechunk_*` columns.
 
 ### 11.5 Manifest splitting
 
-**Contract.** Manifests are split along the **cell** axis into runs of
-`4^m` chunks — and along no other: one manifest spans **every row** of its
-run (§11.2) — and `m` is fixed **once, from the base level**:
+**Contract.** Manifests are split along **both** axes of a level array: the
+**cell** axis into runs of `4^m` chunks, and the **row** axis into blocks of
+`rows_per_manifest` rows (§11.2), default **one row per manifest**. `m` is
+fixed **once, from the base level**:
 
 ```text
 m_base = chunk_order_base − split_order          (7 at production: 4^7 = 16,384 chunks)
 m      = min(m_base, chunk_order_level)          (per level)
 ```
 
-The split therefore names **both** axes of a level array: the cell axis at
-`4^m`, and the row axis at a run length no row count reaches (`2^31 − 1`).
-Naming the row axis is required, not decorative — Icechunk splits an axis
-its config does not name at **one** chunk, which would cut a manifest per
-(row, cell run) and multiply the manifest count, and the snapshot that lists
-every manifest, by the number of rows.
+Both axes are named explicitly, which is required rather than decorative:
+Icechunk splits an axis its config does not name at **one** chunk, so an
+unnamed cell axis would cut a manifest per chunk.
+
+**Why the row axis is split.** With one manifest per row an append only
+**adds** manifest files: the rows already written are never rewritten, so a
+reader's cached manifests stay valid and a reader after one window
+downloads that window's refs alone. The alternative — one manifest spanning
+every row of its cell run — makes each append rewrite the whole manifest of
+every cell it touches (at 7 yearly windows, ≈1.05 MB rewritten per order-6
+cell per array to add a row's refs) and makes a one-window read download
+every window's refs. The cost of splitting is the **snapshot**, which lists
+every manifest and so grows with the row count: negligible at regional
+scale, and the reason the cut is a knob
+(`output.icechunk.rows_per_manifest`, default 1) rather than a law — a
+global store sets blocks of several rows. One row per manifest is the
+**finest** cut a store can carry, which is the side a later coarsening can
+still move from.
 
 Because the chunk axis is in nested order, one run of the **base** is
 exactly the chunks of one HEALPix cell at order `split_order`, so the split
@@ -4849,9 +4862,12 @@ levels (≈5× at production).
 The split is configured **per order group** (Icechunk's path-matched split
 conditions, `^/{order}/`) and recorded per level as `levels.{order}.split`
 (`chunks` = `4^m`, `order` = `chunk_order − m` — the cell order one
-manifest spans, which differs per level by design) and once as
-`split_order` in the `zagg_icechunk` block (§11.1), never assumed by
-readers. `split_order` MUST satisfy `commit_order ≤ split_order ≤
+manifest spans, which differs per level by design — and `rows`, the row-axis
+block, the same for every level) and once each as `split_order` and
+`rows_per_manifest` in the `zagg_icechunk` block (§11.1), never assumed by
+readers. A `/2` repo whose block carries **no** `rows_per_manifest` predates
+this rule and keeps its every-row-in-one cut; the key's absence is what
+names it. `split_order` MUST satisfy `commit_order ≤ split_order ≤
 shard_order`: the committing node (§11.4) owns every leaf under its order,
 so a **base** manifest keyed to a cell at or below it is written by that one
 commit and no other — **zero rewrite amplification** at the only heavy
@@ -4868,15 +4884,18 @@ keeps its id. Refs written into a new row rewrite, per array, exactly the
 manifests of the split cells they touch — **whole**, the earlier rows'
 refs included — and no other; every earlier reference stays byte-identical.
 The one-row case costs nothing over a row-less array (2.10 MB of manifests
-for 147,456 refs against 2.14 MB). A windowed store's 14 windows, each
-leaf's window holding ≈20 % of its inner chunks, are 2.8× the refs and
-≈3.0× the manifest bytes of one dense row, in the **same** manifest count —
-the snapshot does not grow with the rows. The price is the append: adding
-one window to that cell rewrites its 5.8 MB of manifests to add ≈0.4 MB of
-refs (the superseded manifests are what retention collects, §11.4).
-Splitting the row axis too would write only the new refs, at one manifest
-per (row, cell run) — 14× the manifests and the snapshot entries here —
-which is the trade the cell-axis-only rule declines.
+for 147,456 refs against 2.14 MB). Under the default
+one-row cut, refs written into a new row therefore touch only that row's
+manifests and no earlier one. Measured on the issue #586 Sierra stores, a
+yearly-windowed leaf occupies ≈62 % of its 256 inner chunks (mean 158,
+min 34, max 234), so one shard's 7 yearly windows carry ≈4.3× the occupied
+chunks of one dense row — ≈8.4 MB of manifests for one order-6 cell: 8
+files of ≈1.05 MB spanning every row, against 56 files of ≈150 KB at one
+manifest per row. Row-spanning manifests rewrite that 1.05 MB per append;
+the one-row cut writes only the new row's ≈150 KB and supersedes nothing,
+paying ≈33 B of snapshot per manifest (≈4.8 KB per order-6 cell against
+≈1.4 KB). Occupancy did not track a leaf's pass count, so these numbers do
+not project to finer schedules — issue #602 measures those.
 
 **Contract — the ratchet.** The store's recorded `split_order` is
 authoritative and moves **one way, toward coarser**. At `init`, the run
@@ -4894,6 +4913,12 @@ the run's finalize (§11.4) reports as `rewrite_pending` for an **operator**
 by finalize; mixed cuts are valid — each manifest carries its own extents). A repo is never re-split finer. `split_order` is
 a layout knob outside the D19 semantic core: it changes no leaf byte.
 `commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`.
+
+`rows_per_manifest` does **not** ratchet: it is fixed at the repo's
+creation, because it is baked into every manifest already written. A later
+config value is not applied — the init adopts the store's and logs a
+warning naming both — and moving it on an existing repo is an operator
+`rewrite_manifests` pass. It MUST be at least 1.
 
 At the defaults (`split_order = commit_order = 6` at production) a
 shard-order manifest is `4^7` = 16,384 chunks — one order-6 cell, 64 leaves —

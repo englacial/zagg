@@ -3484,14 +3484,18 @@ def get_icechunk_options(config: PipelineConfig) -> dict:
     """The raw ``output.icechunk`` ladder knobs, absent keys ``None`` (issue #580 phase 6).
 
     ``{"commit": "ladder" | "leaf" | None, "commit_order": int | None,
-    "split_order": int | None, "retain_runs": int | None}`` — a boolean or
+    "split_order": int | None, "rows_per_manifest": int | None,
+    "retain_runs": int | None}`` — a boolean or
     absent knob yields all-``None``; :func:`zagg.icechunk_refs.resolve_options`
     applies the shard-order defaults and the §11.5 invariants, and
     :func:`zagg.icechunk_finalize.resolve_retain_runs` the retention default.
     """
     flag = config.output.get("icechunk")
     block = flag if isinstance(flag, dict) else {}
-    return {k: block.get(k) for k in ("commit", "commit_order", "split_order", "retain_runs")}
+    return {
+        k: block.get(k)
+        for k in ("commit", "commit_order", "split_order", "rows_per_manifest", "retain_runs")
+    }
 
 
 def get_pyramid(config: PipelineConfig) -> dict | None:
