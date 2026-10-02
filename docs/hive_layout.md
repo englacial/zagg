@@ -1977,12 +1977,16 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   refused and left to the next run's tag — the run summary's
   `dispatch_manifest` / `handle.dispatch_manifest` says which went out:
   `full`, `slim` or `dropped`), refuses unless
-  the newest `sweep_stats_*_stages.json` since the run's init commit
-  (the repo's clock) shows a completed sweep, and tags `newest_only` — an
-  older untagged run stays covered by the next run's tag. The record is
-  tied to the run by time only, so with overlapping runs on one store a
-  sibling run's sweep record can vouch for it. No `--force`: an incomplete sweep is
-  completed with `python -m zagg.sweep <store> --stages` first.
+  the newest `sweep_stats_*_stages.json` that names the run
+  (`pipeline_run_id == <run_id>`,
+  [issue #593](https://github.com/englacial/zagg/issues/593)) since the
+  run's init commit (the repo's clock) shows a completed sweep, and tags
+  `newest_only` — an older untagged run stays covered by the next run's
+  tag. A record naming another run, or none, vouches for nothing: a sibling
+  run's sweep or an unnamed `--stages` pass landing after this run opened
+  cannot tag it, and a later unnamed pass does not block the run's own
+  record either. No `--force`: an incomplete sweep is completed with
+  `python -m zagg.sweep <store> --stages --pipeline-run-id <run_id>` first.
   **Where it runs.** On an `s3://` store all of that is the worker's: the
   command fires one synchronous `mode: "icechunk_finalize"` invoke —
   `{mode, store_path, run_id, newest_only: true, operator_checks: true}`,

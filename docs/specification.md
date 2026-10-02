@@ -4737,7 +4737,9 @@ that would write nothing commits nothing. The operations:
   shard list left out so the block fits the setup event — and carries the
   config all the same. The write is best-effort: a lost setup invoke or
   failed write leaves none, as does a block that does not fit even slim;
-  such a run is not finalizable here and the next run's tag covers it), refuses unless the newest `sweep_stats_*_stages.json` written since
+  such a run is not finalizable here and the next run's tag covers it), refuses unless the newest `sweep_stats_*_stages.json` that **names this run** — its
+  `pipeline_run_id` (§4.7) equal to `<run_id>`
+  ([issue #593](https://github.com/englacial/zagg/issues/593)) — and was written since
   the run's init commit (its `written_at` on `main`, the repo's clock —
   a run with no init commit is refused) shows a completed sweep (the
   finisher wrote it, and no barrier expired), and then runs the **Finalize** above `newest_only`:
@@ -4751,11 +4753,16 @@ that would write nothing commits nothing. The operations:
   `retain_runs` > 0 it runs the retention (tag deletion, expiry,
   collection). There is no `--force`
   (a run whose sweep did not complete has no tip that means "this run":
-  `python -m zagg.sweep <store> --stages` completes the ladder first) and
-  no retention override. The record names the sweep's own run id, so it is
-  tied to the run by time alone: with overlapping runs on one store (the
-  retention casualty case above) a sibling run's completed sweep record can vouch
-  for this run.
+  `python -m zagg.sweep <store> --stages --pipeline-run-id <run_id>`
+  completes the ladder first) and
+  no retention override. The record is tied to the run by **both** conditions:
+  the name and the time. A record naming another run — a sibling run's sweep
+  landing after this run opened, the retention casualty case above — or
+  naming none (`pipeline_run_id: null`: a standalone `--stages` pass that
+  was not told which run it completes, or a record written before the key
+  existed) vouches for nothing here, however recent. The newest record that
+  **does** name the run decides; a later record that names no run neither
+  vouches for the run nor blocks it.
 
 **The reads the writer performs.** Recording refs costs I/O — the offsets
 come out of the object's own index, but the sizes and checksums do not. For

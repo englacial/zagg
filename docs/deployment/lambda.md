@@ -629,7 +629,12 @@ cap on 64 unwindowed leaves. The fold is now streamed block by block
 (`zagg.sweep_fold` — a worker holds one block of inputs, not a level), and
 the tier stays until that has been measured on the fleet; stage nodes sit at
 order 6 and coarser, so the larger function is a small share of a run. The
-dispatcher's role must be allowed to invoke that function.
+dispatcher's role must be allowed to invoke that function. Both dispatchers
+resolve it the same way — `python -m zagg` (`runner._run_lambda`) and the
+`zagg.client` facade's tail — from the run's own resolved function name
+(`runner.DEFAULT_FUNCTION_NAME`, `process-shard`, when nothing else names
+one), and both name the run in the stage event (`pipeline_run_id`), which is
+what the operator `finalize` matches.
 
 #### How wide the fan-out is
 
@@ -891,7 +896,8 @@ prefix is a staged sweep's own). In it:
 
 At the store root, a `sweep_stats_<ts>_stages.json` newer than the run with a
 `finisher` block and neither `error` nor `barrier_timed_out` is a completed
-staged sweep. In the repo (`<store>/icechunk`), `init <run_id>` (or `split
+staged sweep; its `pipeline_run_id` says which run it completed (`null`: a
+pass that named none). In the repo (`<store>/icechunk`), `init <run_id>` (or `split
 ratchet … <run_id>`, when its init re-cuts the split) opens each run on
 `main`, and a finished run has its tag:
 
@@ -944,14 +950,23 @@ re-dispatch.
 **3. Finish the run by hand, in this order** — only once the
 run's own `stats_<ts>_<run_id>.parquet` is at the store root (the tail writes
 it, step 2). Without it the sweep cannot find the run's leaves, yet still
-succeeds over other runs' leaves, and `finalize` accepts any completed sweep
-since the run's init: it would tag a ladder without them. Re-dispatch instead.
+succeeds over other runs' leaves, and a pass you NAME for this run is one
+`finalize` accepts: it would tag a ladder without them. Re-dispatch instead.
 
 ```
 python -m zagg.sweep s3://bucket/store.zarr             # the rollup families
-python -m zagg.sweep s3://bucket/store.zarr --stages    # sweep: "stages" only
+python -m zagg.sweep s3://bucket/store.zarr --stages --pipeline-run-id <run_id>   # sweep: "stages" only
 python -m zagg.icechunk_ops s3://bucket/store.zarr finalize <run_id>   # ditto
 ```
+
+`--pipeline-run-id` is what lets the `finalize` after it tag: `finalize`
+takes only a completed staged-sweep record that **names the run**
+([issue #593](https://github.com/englacial/zagg/issues/593)), written since
+the run's init commit. A `--stages` pass without it records
+`pipeline_run_id: null`, vouches for no run, and `finalize` refuses, naming
+the record it found and this command. The newest record that names the run
+decides: a later pass that names none neither vouches for the run nor
+blocks it.
 
 The families pass is idempotent; run it even when `tail.json` exists, since
 the launcher may have died before the families invoke (attach then runs no
@@ -962,13 +977,14 @@ one), drive the staged sweep's fleet form instead — `run_stage_sweep_fleet`,
 under [Running it](#running-it) — with `leaves` the run's own `(shard_key,
 window)` pairs, which keeps it to the run's footprint as the chained sweep is
 (`zagg.sweep.discover_leaves(store, store_kwargs=…)` gives every run's), and
-`shard_order` the store manifest's. The CLI `--stages` pass covers every leaf
+`shard_order` the store manifest's, and `pipeline_run_id="<run_id>"` (the
+fleet form's spelling of the flag). The CLI `--stages` pass covers every leaf
 the run records name, not only this run's: a whole-store re-fold on one host
 (`--partitions` bounds its memory, not its scope). On success it prints its
 summary: `record`, the `sweep_stats_<ts>_stages.json` it wrote, and a
 `finisher` block with `lease_released: true`. Skip that pass when step 1
-found a completed staged sweep newer than the run and no run has dispatched
-to the store since.
+found a completed staged sweep newer than the run whose `pipeline_run_id` is
+this run's.
 
 - `No completed leaves found in the store's run records` — no run record,
   this run's included, names a completed leaf: there is nothing to fold.

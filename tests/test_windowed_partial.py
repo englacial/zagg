@@ -526,9 +526,14 @@ class TestClientTail:
         handle.wait(timeout=10)
         self._assert_tail(stub, shard)
 
-    def test_attach_reads_the_same_set_off_the_status_object(self, failed_body, status_store):
+    @pytest.mark.parametrize("slim", [False, True])
+    def test_attach_reads_the_same_set_off_the_status_object(
+        self, failed_body, status_store, slim
+    ):
+        # ``slim``: a large run's manifest names no shards (issue #588), so
+        # attach takes them from the status objects — the same tail follows.
         shard, body = failed_body
-        _put_manifest(status_store, "partial", [shard])
+        _put_manifest(status_store, "partial", [shard], slim=slim)
         _put_status(status_store, shard, status="failed", error=ERROR, status_code=500, body=body)
         stub = EventStubLambdaClient(status_store)
         handle = Run.attach(_STORE, "partial", lambda_client=stub)
