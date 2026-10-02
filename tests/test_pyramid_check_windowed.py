@@ -6,7 +6,8 @@ node close — over three shards and three yearly windows, in two runs (the
 second appends), so the all-time fold exists in a superseded form too. The
 harness must PASS it, and FAIL by node and window each of: a missing window
 overview, a stale all-time fold, a window's overview built from another
-window's leaves.
+window's leaves. A second store, one run with a packed composition field
+added, runs the all-time fold's composition leg.
 """
 
 from __future__ import annotations
@@ -46,7 +47,33 @@ def _granule(site, days, seed):
     n = len(h5._arrays["/h"])
     h5._arrays["/lat"] = np.full(n, site[0])
     h5._arrays["/lon"] = np.full(n, site[1])
+    # Per-surface signal confidences, for the composition fixture's word.
+    rng = np.random.default_rng(seed)
+    for surface in SURFACES:
+        h5._arrays[f"/conf_{surface}"] = rng.integers(-1, 5, n).astype("i1")
     return h5
+
+
+SURFACES = ("land", "ocean", "sea_ice", "land_ice", "inland_water")
+
+
+def _composition(cfg) -> None:
+    """Add a signal digest and its packed composition word (spec §4.5 ``packed``)."""
+    cfg.data_source["variables"].update({f"conf_{s}": f"/conf_{s}" for s in SURFACES})
+    signal = " | ".join(f"(conf_{s} >= 2)" for s in SURFACES)
+    cfg.aggregation["variables"]["h_sig"] = {
+        **cfg.aggregation["variables"]["h_tdigest"],
+        "function": "zagg.stats.tdigest.build_tdigest_where",
+        "params": {"delta": 16, "where": signal},
+    }
+    cfg.aggregation["variables"]["composition"] = {
+        "function": "zagg.stats.composition.pack_composition",
+        "source": "h_li",
+        "dtype": "uint64",
+        "fill_value": 0,
+        "params": {**{f"conf_{s}": f"conf_{s}" for s in SURFACES}, "threshold": 2},
+        "attrs": {"composition": {"of": "h_sig", "threshold": 2}},
+    }
 
 
 def _sources(first_run: bool):
@@ -67,8 +94,10 @@ def _sources(first_run: bool):
     return fakes, records
 
 
-def _run(monkeypatch, tmp_path, root, *, first_run, all_time=True):
+def _run(monkeypatch, tmp_path, root, *, first_run, all_time=True, composition=False):
     cfg = emit._digest_cfg()
+    if composition:
+        _composition(cfg)
     cfg.output["sweep"] = "stages"
     cfg.output["pyramid"] = {"overviews": 7, "all_time": all_time}
     validate_config(cfg)
@@ -179,6 +208,18 @@ class TestACorrectStore:
     def test_the_cli_exits_zero(self, built, capsys):
         assert main([str(built[0])]) == 0
         assert "VERDICT: PASS" in capsys.readouterr().out
+
+    def test_a_nodes_windows_are_its_window_overviews_only(self, store):
+        from zagg.pyramid_check_windowed import _node_window_labels
+        from zagg.store import open_object_store
+
+        # Beside -5's 2018/2019/2020 overviews: its all-time fold, child digit
+        # 1, a stage column, a leaf-shaped name, a non-zarr prefix and debris
+        # outside the label grammar (the writer's node_windows reads the same).
+        for name in ("2021.pyramid.zarr", "-5_2022.zarr", "2023", "a.b.zarr"):
+            (store / "-5" / name).mkdir()
+            (store / "-5" / name / "zarr.json").write_text("{}")
+        assert _node_window_labels(open_object_store(str(store)), "-5") == set(WINDOWS)
 
     @pytest.mark.parametrize("mode", ["list", "moc"])
     def test_every_roster_source_finds_the_same_leaves(self, built, mode):
@@ -448,6 +489,51 @@ class TestDamage:
         report = validate_pyramid(str(store), full=True)
         assert _failed(report) == ["all_time"]
         assert "['-511']" in report["checks"]["all_time"]["mismatches"][0]
+
+
+@pytest.fixture(scope="module")
+def composed(tmp_path_factory):
+    """The windowed store with a packed composition field, in one run."""
+    tmp_path = tmp_path_factory.mktemp("windowed-composition")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _run(monkeypatch, tmp_path, tmp_path / "store", first_run=False, composition=True)
+    return tmp_path / "store"
+
+
+class TestTheAllTimeCompositionLeg:
+    def test_the_composition_word_is_folded_across_windows(self, composed):
+        report = validate_pyramid(str(composed), full=True)
+        assert report["passed"], format_report(report)
+        assert report["checks"]["composition"]["status"] == "pass"
+        detail = report["checks"]["all_time"]["detail"]
+        assert int(detail.split(" composition comparison")[0].rsplit(" ", 1)[-1]) > 0
+
+    def test_a_broken_all_time_word_fails_by_node(self, composed, tmp_path):
+        import zarr
+
+        from zagg.store import open_store
+
+        store = tmp_path / "store"
+        shutil.copytree(composed, store)
+        group = zarr.open_group(open_store(str(store / _rel("-5", "all.zarr"))), path="1")
+        words = group["composition"][:]
+        cell = int(np.flatnonzero(words)[0])
+        words[cell] = int(words[cell]) ^ (1 << 8)  # flip one packed lane bit
+        group["composition"][:] = words
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        (finding,) = report["checks"]["all_time"]["mismatches"]
+        assert finding.startswith(f"-5[{cell}]/composition: word ")
+
+    def test_a_window_without_the_word_poisons_the_all_time_cell(self, composed, tmp_path):
+        # The half-pair rule (§3.3): 2019 carries h_sig and no composition, so
+        # the fold's expectation at every populated cell is the fill word.
+        store = tmp_path / "store"
+        shutil.copytree(composed, store)
+        shutil.rmtree(store / _rel("-5", "2019.zarr") / "1" / "composition")
+        report = validate_pyramid(str(store), full=True)
+        found = [m for m in report["checks"]["all_time"]["mismatches"] if m.startswith("-5[")]
+        assert found and all(m.endswith("!= k-way merge 0") for m in found)
 
 
 def _drop_records(store: Path, keep) -> None:
