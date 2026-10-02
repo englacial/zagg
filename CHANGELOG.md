@@ -11,6 +11,22 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-10-02
+
+### Merged pull requests
+
+- small fixes 2026-08-26: refine's silent granule drop; reproject provenance passthrough; mypy over .github/scripts ([#539](https://github.com/englacial/zagg/pull/539)) by @espg
+- small fixes 2026-09-14: retry CMR-STAC 2xx-with-non-JSON bodies ([#568](https://github.com/englacial/zagg/pull/568)) by @espg
+- icechunk: per-order virtual-ref companion repo written by the fleet at leaf commit (issue #580) ([#581](https://github.com/englacial/zagg/pull/581)) by @espg
+- icechunk stage 2: two-plane contract, run finalize, versioned leaves (issue #582) ([#585](https://github.com/englacial/zagg/pull/585)) by @espg
+- Post-mortie-1.0 cleanup: drop the 1-D workarounds around mortie calls ([#563](https://github.com/englacial/zagg/pull/563)) by @espg
+- Worker stats record prices from the invocation wall (duration_total_s), not the aggregate clock ([#590](https://github.com/englacial/zagg/pull/590)) by @espg
+- The Icechunk companion repo gains a row dimension (zagg-icechunk/2) ([#595](https://github.com/englacial/zagg/pull/595)) by @espg
+- leaf temporal record: write the per-shard envelope word and counted cover at commit; the root tier 2 becomes the store-wide counted cover ([#578](https://github.com/englacial/zagg/pull/578)) by @espg
+- client facade chains the staged sweep under sweep: stages, plus an operator finalize op (issue #588) ([#591](https://github.com/englacial/zagg/pull/591)) by @espg
+- small fixes 2026-10-02: the sweep record names its uncounted shards (pass_uncounted); a failed Icechunk init re-saves the block's splits; a leaf temporal record is read whatever its fields list says ([#601](https://github.com/englacial/zagg/pull/601)) by @espg
+- windowed emit: bulk per-shard emit, derived cell word, (node, window) stage units and the streamed fold (issue #586) ([#587](https://github.com/englacial/zagg/pull/587)) by @espg
+
 ## [0.55.0] - 2026-09-17
 
 ### Merged pull requests
