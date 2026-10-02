@@ -313,7 +313,7 @@ def commit_rows(
 
 @contextlib.contextmanager
 def splits_follow_block(repo, store_root: str, store_kwargs: dict, saved: bool):
-    """Around a reopened repo's init commit: a failed init leaves no saved split ahead of the block.
+    """Around a reopened repo's init commit: a raising init re-saves the block's splits.
 
     A ratcheting init saves its splitting config BEFORE its commit (§11.5),
     and the save is not part of the commit. ``saved`` says this init made
@@ -325,7 +325,11 @@ def splits_follow_block(repo, store_root: str, store_kwargs: dict, saved: bool):
     (``icechunk_refs.block_splits``): the winner's ratchet, or the block this
     init found. The init's own error always raises; a re-save that fails is
     logged. Residual, as in ``declare-pyramid``: a ratchet saving between this
-    read and this save is lost (last writer wins).
+    read and this save is lost (last writer wins). Only a raised ``Exception``
+    is covered: an init killed between its save and its commit (a Lambda
+    timeout, an OOM kill) runs no handler, and its saved config stays ahead of
+    the block until the splits are saved again (a further ratchet, or a
+    ``declare-pyramid`` that adds a level).
     """
     from zagg.icechunk_refs import BRANCH, _save_splits, _session_block, block_splits
 
