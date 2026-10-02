@@ -814,7 +814,7 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
 | 2. rollup sweep | the rollup families (one fire-and-forget invoke) | nothing lost: `python -m zagg.sweep <store>` regenerates them |
-| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits; last, the finisher writes `sweep_stats_<ts>_stages.json` at the store root and releases the lease | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 
 Shards the launcher had not dispatched yet never run. Work through the steps
