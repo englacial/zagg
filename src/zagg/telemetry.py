@@ -10,7 +10,8 @@ writes at the store root (one row per shard, failure rows included).
 The schema is mergeable by construction: only associative stats (counts, sums,
 min/max — no stored means/medians), so the up-tree rollup is
 :func:`merge` — a fold that is associative and commutative up to float
-summation order. Identity-like fields (``shard_key``, ``granules_sha256``,
+summation order, given one precondition: the rows of one bulk invoke meet in
+ONE call (see :func:`merge`). Identity-like fields (``shard_key``, ``granules_sha256``,
 ``invoked_by``, ...) merge as equal-or-``None``: a mismatch collapses to
 ``None`` (absorbing), which keeps the fold associative.
 
@@ -87,8 +88,9 @@ _ARCH_ALIASES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64", "amd6
 #: recorded identity (``None`` — never provably current), never a wrong one.
 _SEMANTIC_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Merge dispositions (associative + commutative by construction). Floats sum,
-# so equality across fold orders holds up to FP summation order.
+# Merge dispositions (associative + commutative by construction, once the rows
+# of one bulk invoke meet in one call — see ``merge``). Floats sum, so equality
+# across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
 _SUM_OR_NONE_KEYS = (
     "gb_seconds",
@@ -481,7 +483,7 @@ def build_record(
 
 
 def merge(records: Iterable[dict]) -> dict:
-    """Fold stats records into one (associative + commutative; issue #297).
+    """Fold stats records into one (commutative; associative — see below; issue #297).
 
     Counts/sums sum, memory high-waters max, ``timestamp`` takes the latest,
     ``success`` ANDs, ``phase_timings`` sums per key over the key union, and
@@ -495,9 +497,12 @@ def merge(records: Iterable[dict]) -> dict:
     invoke's :data:`INVOKE_LEVEL_KEYS` and its ``read`` phase; the fold
     counts those once per invoke, so a shard's rollup carries the billed
     wall and the cost of the one invoke that wrote its N leaves, not N
-    times it. The rows of one invoke must meet in ONE call for that — they
-    do: a shard's window leaves fold at the shard node before anything
-    coarser (``sweep._rollup_shard_node``, ``choropleth._resolve_shard``).
+    times it. The rows of one invoke must meet in ONE call for that, which
+    is the precondition of associativity: split across two partial folds, the
+    first collapses ``shard_key`` to ``None`` (absorbing) and the invoke is
+    counted twice. They do meet: a shard's window leaves fold at the shard
+    node before anything coarser (``sweep._rollup_shard_node``,
+    ``choropleth._resolve_shard``).
     """
     records = list(records)
     if not records:

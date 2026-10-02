@@ -629,6 +629,52 @@ class TestMerge:
         anon = [self._bulk(w, run_id=None) for w in ("2019", "2020")]
         assert merge(anon)["duration_total_s"] == pytest.approx(160.0)
 
+    def test_a_bulk_invoke_split_across_partial_folds_counts_twice(self):
+        # The limit of associativity: the de-dup needs one invoke's rows in ONE
+        # call. A partial fold mixing shards collapses ``shard_key`` to None,
+        # so the invoke's other row is no longer recognized and bills again.
+        a, b = self._bulk("2019"), self._bulk("2020")
+        y = self._bulk("2019", shard=8, n=1)
+        assert merge([a, b, y])["duration_total_s"] == pytest.approx(160.0)
+        assert merge([merge([a, y]), b])["duration_total_s"] == pytest.approx(240.0)
+        # Grouped by shard first, as the sweep does, the fold is associative.
+        assert merge([merge([a, b]), y])["duration_total_s"] == pytest.approx(160.0)
+
+    def test_the_sweep_folds_a_shards_window_rows_in_one_call(self, tmp_path):
+        # The call graph the precondition rests on: the shard node merges ALL
+        # its windows' records at once, so a bulk invoke's rows always meet.
+        from obstore.store import LocalStore
+
+        from zagg.sweep import _rollup_shard_node
+
+        rows = {w: self._bulk(w) for w in ("2019", "2020", "2021")}
+        calls = []
+
+        class Family:
+            name, rollup_name = "stats", "stats.rollup.json"
+
+            def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+                return rows[window], "2026-10-01T00:00:00+00:00"
+
+            def merge(self, payloads, node, order):
+                calls.append(len(payloads))
+                return merge(payloads)
+
+        counts = dict.fromkeys(("written", "current", "empty", "failed"), 0)
+        envelope = _rollup_shard_node(
+            str(tmp_path),
+            LocalStore(str(tmp_path)),
+            Family(),
+            "1111",
+            set(rows),
+            3,
+            None,
+            {},
+            counts,
+        )
+        assert calls == [3]
+        assert envelope["payload"]["duration_total_s"] == pytest.approx(80.0)
+
     def test_bulk_shard_rollups_fold_up_tree_unchanged(self):
         # The shard node folds its windows in one call; everything coarser
         # sums shard rollups, each already one invoke.

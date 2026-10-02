@@ -1009,7 +1009,10 @@ def _rollup_interior(store, fam, node, computed, counts) -> dict | None:
     A child freshly computed this pass is used in memory; any other candidate
     is probed on the store (<= 4 GETs, no LIST) so prior runs' siblings keep
     contributing. Generation is the children's sum/max — fold-of-folds equals
-    the direct leaf fold because every family's merge is associative (§8.3).
+    the direct leaf fold because every family's merge is associative (§8.3)
+    over shard rollups: the stats fold is, once each bulk invoke's rows have
+    met in one call, which :func:`_rollup_shard_node` guarantees
+    (:func:`zagg.telemetry.merge`).
 
     The store is append-only at the leaf level (leaf deletion/GC is the
     registered debris family, deliberately stubbed), so a child that emptied
