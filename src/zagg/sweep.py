@@ -67,6 +67,8 @@ DEFAULT_FAMILIES = ("stats", "moc", "submap", "overview")
 #: written before the leaf record existed has EVERY shard uncounted; at
 #: ~25 bytes an id this bounds the list near 25 KB, small beside the sweep
 #: record's other blocks and the 6 MB a synchronous Lambda response may carry.
+#: It also bounds the post-run INFO line and the CLI's printed summary, which
+#: carry the same family dict (up to ~1,000 id lines there, by design).
 UNCOUNTED_LIST_CAP = 1024
 
 #: Grid types already warned about as unsupported leaf sub-maps (once-ish, so a
