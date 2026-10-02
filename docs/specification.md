@@ -3743,8 +3743,9 @@ existed; a record damaged or lost after its leaf was stamped; a record at
 another revision, or whose `fields` are not the declared set (below); and
 a record whose read failed on this pass. Each is reported the same way —
 the shard in the root block's `uncounted_shards` — instead of a total that
-silently omits it. *(Informative.)* The marker is a count; the sweep pass
-that read the leaf names its shard in its own run record (§10.3).
+silently omits it. *(Informative.)* The marker is a count; a zagg sweep pass
+names the shards it read coverage-only, up to a cap, in its own run record
+(§10.3).
 
 **Absence is the rule for non-temporal stores.** A leaf is written with a
 record **iff** its config declares a §8.3 `"per-centroid"` field and the
