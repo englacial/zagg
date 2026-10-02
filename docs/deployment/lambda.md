@@ -934,12 +934,14 @@ A refusal raises and writes nothing:
   response was lost, so the outcome is unknown: run it again, an existing tag
   is reported and nothing is rewritten.
 
-**4. Or do nothing.** An untagged run's commits stay on `main`, and the next
-run's tag covers them; no step above is needed for the repo to stay correct.
-What waits is the ladder — and, for a ladder-committed run, the repo's refs —
-over leaves no sweep has reached: a later run's chained sweep is scoped to its
-own footprint, so those leaves are folded by the next sweep that includes
-them. The unscoped `--stages` pass above does.
+**4. Or do nothing — only if the run's own `stats_<ts>_<run_id>.parquet` is at
+the store root.** An untagged run's commits stay on `main`, and the next
+run's tag covers them. What waits is the ladder — and, for a ladder-committed
+run, the repo's refs — over leaves no sweep has reached: a later run's
+chained sweep is scoped to its own footprint, so those leaves are folded by
+the next sweep that includes them, such as the unscoped `--stages` pass
+above. Without that record no sweep ever finds the run's leaves (discovery
+reads the run records only): re-dispatch its shards (step 2).
 
 The reference for each piece: the [staged sweep](../hive_layout.md#the-staged-sweep-issue-384),
 the [Icechunk repo and `finalize`](../hive_layout.md#the-icechunk-companion-repo),
