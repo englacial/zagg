@@ -796,6 +796,13 @@ is one ladder per window, so the same checks run per window over that
 window's objects, and every finding names the node and the window
 (`-511[2019]`, `window 2019: …`):
 
+- `records` — where the manifest declares a `per-centroid` temporal field
+  (§8.3): each sampled `(leaf, window)` is read as the families sweep reads
+  it, record first. A leaf with a usable `temporal.toc` passes, a leaf
+  holding no clocked observation needs none, and a stamped leaf with clocked
+  observations but no usable record — which the sweep would count as
+  coverage only, under `uncounted_shards` — fails by leaf and window. With
+  no temporal field declared the check is `SKIP`.
 - `materialization` — a committed `{window}.zarr` at every ladder node that
   has a leaf of that window beneath it; `columns` — a committed
   `{window}.pyramid.zarr` beside every `(leaf, window)`. Every check derives
@@ -1080,7 +1087,17 @@ back (a million-row ragged array per field per leaf at California scale,
 which no single invoke could finish). On a **versioned** leaf the record
 (like the bitmap) lives in the version subgroup —
 `{full_id}.zarr/run-{run_id}-{attempt}/temporal.toc` — and every walk
-resolves `current` before reading it.
+resolves `current` before reading it. On a **windowed** store every window
+leaf (`{full_id}_{window}.zarr`) carries its own record, counted from that
+window's observations alone, whichever unit wrote it: the bulk per-shard
+invoke ([issue #586](https://github.com/englacial/zagg/issues/586)) folds
+one accumulator per window — fed that window's binned observations on the
+pooled path and in both spill regimes — and writes each leaf's record before
+that leaf's stamp, so the record is the one `unit: window` writes, byte for
+byte. A record that cannot be built or written is its own window's failure:
+that leaf stays unstamped, the shard's other windows land with theirs, and
+the run's tail sweeps and covers the windows that landed (the "post-run tail
+reads leaves" rule above).
 
 **The record is the worker's, or there is none.** It is the only source of
 observation counts: the leaf stores no per-observation clock, so nothing

@@ -94,10 +94,14 @@ def _sources(first_run: bool):
     return fakes, records
 
 
-def _run(monkeypatch, tmp_path, root, *, first_run, all_time=True, composition=False):
+def _run(
+    monkeypatch, tmp_path, root, *, first_run, all_time=True, composition=False, temporal=False
+):
     cfg = emit._digest_cfg()
     if composition:
         _composition(cfg)
+    if temporal:
+        cfg.aggregation["variables"]["h_tdigest"]["temporal"] = "per-centroid"
     cfg.output["sweep"] = "stages"
     cfg.output["pyramid"] = {"overviews": 7, "all_time": all_time}
     validate_config(cfg)
@@ -169,12 +173,13 @@ class TestACorrectStore:
         report = validate_pyramid(str(built[0]), full=True, resweep=True)
         assert report["passed"], format_report(report)
         checks = report["checks"]
-        # No packed field and no located field in this store: those two are
+        # No packed, located or temporal field in this store: those three are
         # reported as not checked; everything else ran and passed.
         assert {name: c["status"] for name, c in checks.items()} == {
             **dict.fromkeys(CHECKS_WINDOWED, "pass"),
             "composition": "skip",
             "coordinates": "skip",
+            "records": "skip",
         }
         assert report["roster"] == {"source": "run records", "leaves": 9, "windows": 3}
         assert report["windows"] == list(WINDOWS)
@@ -534,6 +539,59 @@ class TestTheAllTimeCompositionLeg:
         report = validate_pyramid(str(store), full=True)
         found = [m for m in report["checks"]["all_time"]["mismatches"] if m.startswith("-5[")]
         assert found and all(m.endswith("!= k-way merge 0") for m in found)
+
+
+@pytest.fixture(scope="module")
+def clocked(tmp_path_factory):
+    """The store again, one run, with the digest's per-centroid clock declared (§8.3)."""
+    tmp_path = tmp_path_factory.mktemp("windowed-temporal")
+    root = tmp_path / "store"
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        summary = _run(monkeypatch, tmp_path, root, first_run=False, temporal=True)
+    assert summary["cells_error"] == 0
+    return root
+
+
+class TestATemporalStore:
+    """Every window leaf carries its §10.6 record, and the root counts are theirs (issue #575)."""
+
+    def test_every_window_leaf_has_its_record_and_the_root_sums_them(self, clocked):
+        from zagg.coverage_toc import coverage_toc_counts, coverage_toc_uncounted
+        from zagg.hive import read_root_coverage
+        from zagg.leaf_temporal import LEAF_TEMPORAL_NAME
+
+        # A versioned leaf's record sits in its version subgroup (spec §1.5).
+        records = {
+            next(p for p in path.parents if p.name.endswith(".zarr")).name: json.loads(
+                path.read_text()
+            )
+            for path in clocked.rglob(LEAF_TEMPORAL_NAME)
+        }
+        assert sorted(records) == sorted(f"{d}_{w}.zarr" for d in SHARDS for w in WINDOWS)
+        envelope = read_root_coverage(str(clocked))
+        total = int(coverage_toc_counts(envelope).obs.sum())
+        assert total == sum(r["n_obs"] for r in records.values()) > 0
+        assert coverage_toc_uncounted(envelope) == 0
+
+    def test_the_records_check_passes_in_full_mode(self, clocked):
+        report = validate_pyramid(str(clocked), full=True)
+        assert report["passed"], format_report(report)
+        detail = report["checks"]["records"]["detail"]
+        assert report["checks"]["records"]["status"] == "pass"
+        assert detail.startswith("9 window leaf/leaves carry their record; 0 hold no clocked")
+
+    def test_a_window_leaf_without_its_record_fails_by_leaf_and_window(self, clocked, tmp_path):
+        from zagg.leaf_temporal import LEAF_TEMPORAL_NAME
+
+        store = tmp_path / "store"
+        shutil.copytree(clocked, store)
+        (leaf,) = store.rglob(f"{SHARDS[1]}_2019.zarr")
+        (record,) = leaf.rglob(LEAF_TEMPORAL_NAME)
+        record.unlink()
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["records"]
+        detail = report["checks"]["records"]["detail"]
+        assert f"{SHARDS[1]}[2019]: clocked observations but no usable temporal.toc" in detail
 
 
 def _drop_records(store: Path, keep) -> None:

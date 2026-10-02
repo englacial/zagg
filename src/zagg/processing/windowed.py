@@ -71,8 +71,10 @@ def bin_chunk(chunk, time_field: str, windows: list[dict]):
 class WindowBins:
     """The per-window sinks one bulk shard read feeds.
 
-    ``make_buffered`` builds one streaming aggregator per window (``None`` on
-    the pooled path, where each window is a list of reads). ``granules`` on a
+    ``make_buffered(label)`` builds one streaming aggregator per window
+    (``None`` on the pooled path, where each window is a list of reads); the
+    label lets the caller hand each window's aggregator that window's own
+    sinks (the leaf temporal accumulator, issue #575). ``granules`` on a
     window payload names the granules (indices into the unit's granule list)
     that belong to it; ``granule_done`` advances only those windows' buffer
     cadence, reproducing the fan-out unit's flush boundaries. A payload
@@ -108,7 +110,7 @@ class WindowBins:
         self.reads: dict[str, list] = {w["label"]: [] for w in self.windows}
         self.buffered: dict[str, object] = {}
         if make_buffered is not None:
-            self.buffered = {w["label"]: make_buffered() for w in self.windows}
+            self.buffered = {w["label"]: make_buffered(w["label"]) for w in self.windows}
         self._members: dict[str, set | None] = {
             w["label"]: (set(w["granules"]) if w.get("granules") is not None else None)
             for w in self.windows

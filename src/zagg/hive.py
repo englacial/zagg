@@ -1722,7 +1722,8 @@ class _LeafUnit:
     behind ONE shard read: :meth:`gate` is the issue #388 identity check,
     :meth:`sinks` are the ``process_shard`` sink kwargs this leaf's chunks
     stream into, and :meth:`finish` is everything after the aggregate — the
-    sharded whole-leaf write, ragged, O11 hashes, coverage sidecar, D4 stamp,
+    sharded whole-leaf write, ragged, O11 hashes, coverage sidecar, the
+    issue #575 temporal record, D4 stamp,
     granule-id sibling, the #383 column, the #580 refs and the #582 pointer
     swap — returning the unit's metadata. ``granule_urls`` is the unit's own
     granule list (the window's subset on the bulk path): it is what the gate
@@ -1823,8 +1824,10 @@ class _LeafUnit:
         self.occupied: list = []
         # Temporal-record sink (issue #575): armed only by a §8.3 per-centroid
         # declaration, so a store with no temporal channel writes no record
-        # and takes the code path it always did. The worker folds each chunk's
-        # toc words into it as it encodes them; :meth:`finish` drains it.
+        # and takes the code path it always did. ONE accumulator per leaf —
+        # on the bulk path one per window, fed that window's observations
+        # alone — which the worker folds each chunk's toc words into as it
+        # encodes them; :meth:`finish` drains it.
         from zagg import leaf_temporal
 
         self.temporal_acc = (
@@ -2143,14 +2146,16 @@ class _LeafUnit:
             # HERE, before the stamp — the prefix is unstamped debris (a
             # versioned leaf's pointer does not move; the previous ``current``
             # keeps serving), the caller writes no stats sidecar, and the next
-            # attempt rewrites the unit like any failed shard. No retry loop of
-            # its own: the store client's policy (``store._S3_RETRY_CONFIG``)
-            # already ran. A record that cannot be BUILT raises as itself,
-            # outside the ``try`` (no store call was made), still before the
-            # stamp. Absent, and NOT a failure, when the fold saw no clocked
-            # observation. It goes to ``data_path``, beside the bitmap: on a
-            # versioned leaf (spec §1.5) the version subgroup, BEFORE the
-            # version's stamp.
+            # attempt rewrites the unit like any failed shard. On the bulk
+            # multi-window path the raise is THIS window's failure (issue
+            # #586: ``_process_windows`` records it and the other windows
+            # still land). No retry loop of its own: the store client's
+            # policy (``store._S3_RETRY_CONFIG``) already ran. A record that
+            # cannot be BUILT raises as itself, outside the ``try`` (no store
+            # call was made), still before the stamp. Absent, and NOT a
+            # failure, when the fold saw no clocked observation. It goes to
+            # ``data_path``, beside the bitmap: on a versioned leaf (spec
+            # §1.5) the version subgroup, BEFORE the version's stamp.
             folded = self.temporal_acc.finish() if self.temporal_acc is not None else None
             if folded is not None:
                 temporal_record = leaf_temporal.build_leaf_temporal(
@@ -2537,6 +2542,7 @@ def _process_windows(
     per-window callback. The returned shard metadata is assembled by
     :func:`_shard_meta`.
     """
+    from zagg import leaf_temporal
     from zagg.config import get_windowing
     from zagg.processing import process_shard
 
@@ -2613,6 +2619,11 @@ def _process_windows(
             windows=todo,
             time_field=windowing["time_field"],
             emit_window=_emit,
+            # One temporal record per window leaf (issue #575): each window's
+            # accumulator sees that window's binned observations alone.
+            temporal_out={w["label"]: units[w["label"]].temporal_acc for w in todo}
+            if leaf_temporal.armed(config)
+            else None,
             **shard_kwargs,
         )
     base["duration_s"] = time.time() - t0

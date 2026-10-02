@@ -409,7 +409,7 @@ class TestBinChunk:
 
 
 class _FakeAgg:
-    def __init__(self):
+    def __init__(self, label=None):  # WindowBins builds one per window, by label
         self.reads, self.done, self.flushed, self.closed = [], 0, 0, False
 
     def add_read(self, chunk):
@@ -489,7 +489,7 @@ class TestWindowBins:
         from zagg.processing.windowed import WindowBins
 
         class _Spill(SpillAggregator):
-            def __init__(self):  # no /tmp, no config: just the cap's two seams
+            def __init__(self, label):  # no /tmp, no config: just the cap's two seams
                 self.tmp_dir, self._open, self.closed = None, 0, 0
 
             @property
@@ -525,7 +525,7 @@ class TestWindowBins:
         from zagg.processing.windowed import WindowBins
 
         class _Spill(SpillAggregator):
-            def __init__(self):
+            def __init__(self, label):
                 self.tmp_dir, self._open, self.alive, self.mergeable = None, 0, False, True
 
             @property

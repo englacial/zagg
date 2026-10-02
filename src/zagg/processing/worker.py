@@ -304,7 +304,9 @@ def process_shard(
         chunk's toc words are folded into it as they are encoded — on the
         pooled path and both spill regimes — so the hive write path can
         write the leaf's ``temporal.toc`` record with no second pass;
-        ``None`` (default) folds nothing.
+        ``None`` (default) folds nothing. With ``windows`` it is a mapping
+        ``{window label: accumulator}``: each window's binned observations
+        fold into that window's own record (issue #586).
     time_range_of : str, optional
         Column name whose observed ``[min, max]`` is reported as
         ``metadata["time_range"]`` (issue #246): the ACTUAL dataset-unit time
@@ -327,25 +329,19 @@ def process_shard(
         function's behavior. (The ``write`` phase runs in the caller, outside
         this function.)
     windows : list of dict, optional
-        Bulk multi-window emit (issue #586 phase 2): the unit's time windows,
-        ``{"label", "start", "end", "granules"?}`` — bounds half-open in
-        dataset units, ``granules`` the indices (into ``granule_urls``) of the
-        granules that belong to the window. The shard is read ONCE; each group
-        read is split on ``time_field`` into the windows' sinks
-        (:class:`~zagg.processing.windowed.WindowBins`), and the aggregate
-        tail then runs once per window, in order, through ``emit_window``:
-        ``emit_window(window, aggregate)`` is called per window with a
-        callable that takes this function's own sink kwargs
-        (``chunk_results`` / ``write_chunk`` / ``ragged_out`` /
-        ``occupied_out``) and returns that window's metadata dict — the same
-        shape a ``(shard, window)`` unit's metadata has, plus ``window`` and
-        ``unit_windows`` — after which the window's reads are released before
-        the next window aggregates. The sink kwargs given to this function
-        are ignored on that path (each window brings its own); the return is
-        an empty carrier plus the shard-level metadata (read-phase fields, the
-        windows' summed ``total_obs`` / ``cells_with_data`` / timings). A
-        window whose sink is empty reports ``No data after filtering`` exactly
-        as a fan-out unit whose filtered read kept nothing.
+        Bulk multi-window emit (issue #586): ``{"label", "start", "end",
+        "granules"?}`` — half-open bounds in dataset units, ``granules`` the
+        member indices into ``granule_urls``. The shard is read ONCE, each
+        group read split on ``time_field`` into the windows' sinks
+        (:class:`~zagg.processing.windowed.WindowBins`); then per window, in
+        order, ``emit_window(window, aggregate)`` gets a callable taking this
+        function's sink kwargs and returning that window's metadata (a
+        ``(shard, window)`` unit's, plus ``window`` / ``unit_windows``), and
+        the window's reads are released. The sink kwargs given here are
+        ignored on that path; the return is an empty carrier plus shard-level
+        metadata (read-phase fields, summed ``total_obs`` /
+        ``cells_with_data`` / timings). An empty window reports ``No data
+        after filtering``, as a fan-out unit does.
     time_field : str, optional
         The per-observation timestamp column ``windows`` bins on (the windowing
         declaration's ``time_field``). Required with ``windows``.
@@ -443,14 +439,9 @@ def process_shard(
     files_processed = 0
     read_errors = 0
     # Granule-scope failures (fold review, issue #341): a fault that kills the
-    # WHOLE granule rather than one group -- an H5Coro construction failure, a
-    # bad/expired credential, a URL-rewriter fault, a streaming flush blowing up
-    # -- is warn-and-continue by design (issue #116 semantics), but it used to
-    # leave NO trace in the result: not counted, not exemplared, so a shard whose
-    # every granule failed at granule scope returned the blind "No data after
-    # filtering". Counted separately from ``read_errors`` because the scope
-    # matters to the diagnosis (all groups vs one), and it is arguably the more
-    # likely fleet shape: credentials and endpoints kill granules, not groups.
+    # WHOLE granule (H5Coro construction, a bad credential, a URL rewriter, a
+    # streaming flush) is warn-and-continue (issue #116) but counted and
+    # exemplared, apart from ``read_errors`` since the scope is the diagnosis.
     granule_errors = 0
 
     # Read-error exemplars (issue #341): the counter alone made the 121-failure
@@ -500,15 +491,11 @@ def process_shard(
         # the strata AttributeError entirely (issue #341).
         logger.warning(f"  Error {what}: {exc}", exc_info=trace)
 
-    # Streaming buffered aggregation (issue #148 phase 4): when
-    # ``aggregation.streaming`` is set, reads accumulate for ``buffer_granules``
-    # granules and are flushed instead of pooling the whole shard. ``mode:
-    # merge`` (default) folds each flush into running per-cell state (mergeable
-    # reducers only, validated up front); ``mode: spill`` (issue #217) appends
-    # the grouped flush to per-partition ``/tmp`` files and aggregates once
-    # after the reads — full pooled reducer surface, byte-identical to pooled
-    # in the single-block regime. ``None`` (default) is the unchanged pooled
-    # path.
+    # Streaming buffered aggregation (issue #148 phase 4): reads flush every
+    # ``buffer_granules`` granules instead of pooling the shard. ``mode: merge``
+    # folds into running per-cell state (mergeable reducers only); ``mode:
+    # spill`` (issue #217) spills grouped flushes to ``/tmp`` and aggregates
+    # once after the reads (byte-identical to pooled in one block).
     from zagg.processing.spill import SpillAggregator, SpillOverflowError, SpillReduceError
     from zagg.processing.streaming import StreamingAggregator, get_streaming
 
@@ -527,6 +514,11 @@ def process_shard(
             )
         return StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
 
+    def _temporal(label):
+        # A bulk unit folds one record per window leaf (issue #575): the
+        # caller hands one accumulator per window, keyed by label.
+        return temporal_out.get(label) if temporal_out is not None else None
+
     # Bulk multi-window emit (issue #586): the windows' sinks stand in for the
     # shard's single one — a list of reads per window, or one streaming
     # aggregator per window (each at the fan-out unit's own threshold).
@@ -536,7 +528,11 @@ def process_shard(
             raise ValueError("process_shard(windows=...) requires time_field and emit_window")
         from zagg.processing.windowed import WindowBins
 
-        bins = WindowBins(windows, time_field, _make_buffered if streaming_cfg else None)
+        bins = WindowBins(
+            windows,
+            time_field,
+            (lambda label: _make_buffered(_temporal(label))) if streaming_cfg else None,
+        )
         buffered = None
     else:
         buffered = None if streaming_cfg is None else _make_buffered(temporal_out)
@@ -777,11 +773,9 @@ def process_shard(
         bins.flush()
     phase_timings["read"] = time.time() - _read_t0
 
-    # Pre-filter read volume (issue #374), stamped as soon as the read loop is
-    # done so it survives the no-data early return below — a shard that decoded
-    # millions of photons and kept NONE is precisely the read-vs-keep case this
-    # counter exists to expose. Absent when no read route measured it, so
-    # absence stays "unmeasured" rather than a fabricated zero.
+    # Pre-filter read volume (issue #374), stamped before the no-data return
+    # below (read millions, kept none is the case it exposes). Absent when no
+    # read route measured it: "unmeasured", never a fabricated zero.
     if obs_read_total is not None:
         metadata["total_obs_read"] = obs_read_total
 
@@ -819,14 +813,9 @@ def process_shard(
                 )
                 exemplars = " | ".join(read_error_exemplars)
                 if auth_errors:
-                    # Its own failure CLASS (issue #449): the GEDI template shipped
-                    # without a credentials_provider, so NSIDC creds hit LP DAAC's
-                    # lp-prod-protected and the shard reported the data-shaped "No
-                    # data after filtering". The fault is the config, not the data,
-                    # and the message must say so. Reached only on a DEFINITE match
-                    # (a status code or a denial token in the exception) — the
-                    # empty-body shape those 403s also produce is a hint on the
-                    # generic branch below, not this class (fold review).
+                    # Its own failure CLASS (issue #449): a config fault (creds for
+                    # the wrong DAAC), not "No data after filtering". DEFINITE matches
+                    # only — the empty-body shape is a hint below (fold review).
                     logger.error(
                         f"  Access denied reading source granules for shard {label} "
                         f"({auth_errors} auth-shaped failures of {raised}) - skipping"
@@ -837,13 +826,9 @@ def process_shard(
                         f"the DAAC hosting this product; e.g. {exemplars}"
                     )
                 else:
-                    # Empty-body HINT (fold review, issue #449): the None-body
-                    # signature cannot prove a denial — h5coro returns the same
-                    # ``None`` for a missing object, throttling, a timeout or a
-                    # reset — so it appends likely causes to the generic message
-                    # instead of asserting the auth class. Credentials/DAAC
-                    # mismatch leads the list because it is the one cause the
-                    # operator can only find by being told to look.
+                    # Empty-body HINT (fold review, issue #449): a ``None`` body
+                    # cannot prove a denial (missing object, throttling, timeout
+                    # read the same), so it names likely causes, creds/DAAC first.
                     hint = ""
                     if empty_body_errors:
                         hint = (
@@ -1148,8 +1133,15 @@ def process_shard(
                 meta_w["granule_count"] = len(w["granules"])
             timings_w = dict(phase_timings)
 
-            def _aggregate_window(_r=reads_w, _b=buffered_w, _m=meta_w, _t=timings_w, **sinks):
-                _aggregate(_r, _b, metadata=_m, phase_timings=_t, **sinks)
+            def _aggregate_window(
+                _r=reads_w,
+                _b=buffered_w,
+                _m=meta_w,
+                _t=timings_w,
+                _a=_temporal(w["label"]),
+                **sinks,
+            ):
+                _aggregate(_r, _b, metadata=_m, phase_timings=_t, temporal_out=_a, **sinks)
                 return _m
 
             emit_window(w, _aggregate_window)

@@ -3937,6 +3937,21 @@ write is — a legacy leaf cleared and rewritten in place, a versioned one
 under a fresh version. A fold that saw no clocked observation writes no
 record and stamps: that is the absence rule below, not a failure.
 
+**One record per window leaf.** On a windowed store (§4.2) every
+`{id}_{window}.zarr` is a leaf, so each carries its own record, folded from
+that window's observations alone: its envelope word lies inside the window,
+and the shard's contribution to the root section is the composition of its
+window leaves' records (§10.2, §10.3). The rule does not depend on which
+unit wrote the leaf. A writer that emits several windows of a shard from one
+read (zagg's bulk per-shard unit,
+[issue #586](https://github.com/englacial/zagg/issues/586)) MUST count each
+observation into the record of the one window that holds it, MUST write each
+leaf's record before **that leaf's** stamp, and MUST treat a record that
+cannot be built or written as that window leaf's failure — the leaf is left
+unstamped and the shard's other window leaves are unaffected. The record is
+the one the window's own unit would have written, byte for byte but for
+`generated_at`.
+
 **A reader's rule is unchanged**: an absent or unusable record is coverage
 only (§10.3), never a refusal of the leaf. With the writer failing closed,
 the cases that still reach it are a leaf written before the record

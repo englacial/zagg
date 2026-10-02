@@ -29,6 +29,9 @@ unwindowed counterpart, and the harness holds it to what spec §4.2–§4.6 stat
   check is reported ``skip`` — *not applicable* — never left out, and a
   committed ``all.zarr`` found at a ladder node anyway is named as not
   validated (debris of an earlier declaration: the block is not frozen).
+- **the leaf temporal records** — on a store declaring a per-centroid
+  temporal field, each sampled stamped window leaf with clocked
+  observations carries its own §10.6 ``temporal.toc`` (:func:`_records_check`).
 
 Nothing here calls the fold it checks: expectations come from the leaves
 (the roster, the columns), from the per-window artifacts' own recorded
@@ -83,6 +86,7 @@ logger = logging.getLogger(__name__)
 CHECKS_WINDOWED = (
     "declaration",
     "coordinates",
+    "records",
     "materialization",
     "columns",
     "readback",
@@ -300,6 +304,17 @@ def validate_windowed(
         sample_cells=sample_cells,
         full=full,
     )
+    _records_check(
+        store_root,
+        manifest,
+        refs,
+        store_kwargs,
+        checks,
+        report,
+        seed=seed,
+        sample_nodes=sample_nodes,
+        full=full,
+    )
 
     # -- [2] materialization: one overview per (declared node, window).
     declared = {w: {k: _declared_nodes(ds, k) for k, _ in ladder} for w, ds in by_window.items()}
@@ -413,6 +428,70 @@ def validate_windowed(
             by_shard.setdefault(dec, set()).add(window)
         checks["idempotency"] = _restage_check(store_root, manifest, by_shard, store_kwargs)
     return _finish(report, CHECKS_WINDOWED)
+
+
+def _records_check(
+    store_root, manifest, refs, store_kwargs, checks, report, *, seed, sample_nodes, full
+):
+    """Settle ``records``: a stamped window leaf carries its §10.6 record (issue #575).
+
+    Per sampled ``(shard, window)`` leaf of a store declaring a per-centroid
+    temporal field, the leaf is read as the families sweep reads it
+    (:func:`zagg.leaf_temporal.leaf_contribution` — record first): a usable
+    record passes, a leaf holding no clocked observation needs none, and a
+    leaf whose observations are clocked but that has no usable record — the
+    sweep would count it as coverage only (``uncounted_shards``) — fails by
+    leaf and window. Its own generator (same ``seed``), as ``coordinates``.
+    """
+    from zagg.coverage_toc import temporal_cell_order, temporal_fields
+    from zagg.grids.morton import morton_word
+    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.leaf_temporal import leaf_contribution
+    from zagg.store import open_store
+
+    fields = temporal_fields(manifest)
+    cell_order = temporal_cell_order(manifest)
+    if not fields or cell_order is None:
+        checks["records"] = _entry("skip", "no per-centroid temporal field declared (§10)")
+        return
+    leaves = list(refs)
+    if not full and len(leaves) > sample_nodes:
+        picks = np.random.default_rng(seed).choice(len(leaves), sample_nodes, replace=False)
+        leaves = [leaves[i] for i in sorted(picks.tolist())]
+    errors: list = []
+    n_record = n_empty = 0
+    for dec, window in leaves:
+        label = f"{dec}[{window}]"
+        root = shard_leaf_path(store_root, morton_word(dec), window=window)
+        try:
+            stamp = read_commit(open_store(root, read_only=True, **store_kwargs))
+            if stamp is None:
+                report.setdefault("warnings", []).append(
+                    f"records: leaf {label} is uncommitted — not checked"
+                )
+                continue
+            got, route = leaf_contribution(root, cell_order, fields, stamp=stamp, **store_kwargs)
+        except Exception as exc:
+            errors.append(f"{label}: unreadable ({exc})")
+            continue
+        if got is None:
+            n_empty += 1
+        elif route == "record":
+            n_record += 1
+        else:
+            errors.append(f"{label}: clocked observations but no usable temporal.toc record")
+    if errors:
+        checks["records"] = _entry(
+            "fail",
+            f"{len(errors)} window leaf/leaves would be counted as coverage only "
+            f"(§10.3 uncounted): {errors[:8]}",
+        )
+        return
+    checks["records"] = _entry(
+        "pass",
+        f"{n_record} window leaf/leaves carry their record; {n_empty} hold no clocked "
+        f"observation (none needed) — of {len(leaves)} sampled",
+    )
 
 
 def _artifact_probes(
