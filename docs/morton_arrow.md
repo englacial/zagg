@@ -46,6 +46,14 @@ moczarr fabrication layer). The issue #135 `cell_ids_encoding` knob is
 retired — a config still carrying it fails validation with a migration
 pointer.
 
+One leaf form does not store even that: a **windowed** hive leaf
+(`{id}_{window}.zarr`) carries no per-cell `morton` array, because every
+window of a shard shares the shard's cells axis and the word is a pure
+function of the leaf id and the rank —
+`zagg.grids.morton.cell_words(shard, cell_order)`, the shard's children in
+nested order ([specification §1.5](specification.md#15-storage-geometries),
+issue #586). The declared coordinate is still `morton`; readers derive it.
+
 For transition stores (browser-direct demos until the gridlook morton decode
 lands), the escape hatch keeps writing the legacy NESTED array *in addition
 to* `morton`:

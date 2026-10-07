@@ -550,6 +550,9 @@ staged arm, reusing that event's credential resolution and its
 | `dispatch` | stage | The tuple's dispatch order. The worker runs exactly that one tuple |
 | `nodes` | stage | This invoke's dispatch nodes, as morton decimals. Must be non-empty and every entry must sit at exactly `dispatch` order — the worker refuses otherwise. In the example above the store is shard-order 6, so at `tuple_width: 3` the dispatch orders are 3 and 0, and an order-3 dispatch takes 4-digit nodes |
 | `batch` | stage | Optional (defaults to `0`); which batch of that tuple this is, and what names the record object |
+| `unit` | stage | Optional ([issue #586](https://github.com/englacial/zagg/issues/586)). Which of the nodes' stage units this invoke runs: `"window"` — ONE window's fold, named by `window` — or `"close"`, the per-node step that follows a node's window units (the all-time fold). Absent, the worker runs the nodes whole — every window, then the close, serially — which is an unwindowed store's one unit per node and what a dispatcher predating the units sends. Refused by name against an unwindowed store |
+| `window` | stage | The window label. **Required** with `unit: "window"`, refused with anything else |
+| `pipeline_run_id` | both | Optional ([issue #593](https://github.com/englacial/zagg/issues/593)). The id of the aggregation run this sweep **completes** — distinct from `run_id`, the sweep's own. Recorded verbatim in every stage record, `finisher.json` and the store-root run record; absent, they record `null`, which vouches for no run |
 | `tuple_width` | stage | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH`. A finisher takes no tuple width — one on a finisher block is inert |
 | `partition` | stage | Optional `{"index", "of"}`; recorded on the stage rows |
 | `lease_ttl_s` | both | Optional lease TTL override |
@@ -564,15 +567,27 @@ Every store write stays worker-side. The dispatcher only invokes and polls.
 `zagg.sweep_fleet.run_stage_sweep_fleet` mirrors the in-process driver's tuple
 ordering exactly:
 
-1. **fan out** one tuple's dispatch nodes, batched under `max_nodes_per_invoke`
+1. **fan out** one tuple's stage units, batched under `max_nodes_per_invoke`
    *and* the 250 KB async payload cap — whichever binds first closes a batch —
-   with one `InvocationType="Event"` invoke per batch;
+   with one `InvocationType="Event"` invoke per batch. On an unwindowed store
+   a unit is a dispatch node. On a windowed one it is a **`(node, window)`
+   pair** ([issue #586](https://github.com/englacial/zagg/issues/586)): one
+   fan-out per window over the nodes that window is dirty beneath, every
+   window in flight at once, each event carrying its own window's leaf refs
+   alone;
 2. **soft-barrier** — poll the status prefix until every batch's stage record
    lands, or the barrier budget expires. Per #381 point (6) the barrier is a
    *scheduling* preference, not a correctness device: under-coverage is
    recorded in each artifact's own `source_children` and heals on the next
    pass, so an expired barrier logs loudly and the run proceeds;
-3. next tuple; then the **finisher** invoke last — root `coverage.moc`,
+3. on a windowed store that declares `output.pyramid.all_time`, the tuple's
+   **close** units — one per node, the all-time fold over the node's
+   per-window overviews — are fired once its window units are in. The next
+   tuple reads only the window units' stage columns, so it is fired at the
+   same moment and the two share one barrier; the last tuple's closes get
+   their own before the finisher. A store that does not declare the fold
+   fires no close and waits for nothing;
+4. next tuple; then the **finisher** invoke last — root `coverage.moc`,
    manifest per-level actuals, `aggregation.yaml` touch, lease release —
    **unless no tuple produced a dispatch node at all** (every leaf skipped as
    mixed-order, or filtered out by scope), in which case nothing fires, there
@@ -581,6 +596,45 @@ ordering exactly:
    over zero stage records refuses by design, so firing it would buy one
    guaranteed 500 the Event invoke hides plus a full barrier on a record that
    can never land.
+
+The unit list is `zagg.sweep_units.stage_units` — the same function the
+worker's own pass runs — so the records the dispatcher waits for are exactly
+the units the workers execute. A tuple's row in the dispatcher's summary
+counts its window units (`batches` / `records_seen`) and its closes
+(`close_batches` / `close_records_seen`); a unit whose record never landed is
+**named** in `missing_units` (`{batch, nodes, unit, window}`, the first 50;
+`missing_unit_count` is exact), so a dead `(node, window)` is told apart from
+a late tuple. A window unit that *raises* is not one that died: on a windowed
+store the worker counts it, names it in its record's `unit_errors`, and still
+writes the record, so the barrier is met at once. Either way the failure
+costs that window's artifacts and nothing else — the node's other windows
+are separate invokes over separate objects — and the close records the gap
+(`source_windows.missing` on the all-time artifact).
+
+The declaration is handed to the dispatcher (`windowed=`, `all_time=`), like
+`shard_order`, because it never reads the manifest; the runner's tail takes
+both from the config. A caller that says neither gets whole-node events,
+which are correct on every store — the worker then runs a windowed node's
+windows serially.
+
+#### Which function the stage invokes go to
+
+The staged tail runs on its **own tier**: the 8,192 MB / 10 GB-`/tmp` variant
+of the run's function family (`process-shard-8192-disk` for the default
+stack), resolved by `runner._resolve_stage_function_name` — the run's
+function with its `-<memory>[-disk]` suffix replaced, or
+`ZAGG_LAMBDA_STAGE_FUNCTION_NAME` verbatim when set. It is the interim ruled
+on issue #586 (2026-09-26): the 0.55 fleet's order-6 stage died at the 4 GB
+cap on 64 unwindowed leaves. The fold is now streamed block by block
+(`zagg.sweep_fold` — a worker holds one block of inputs, not a level), and
+the tier stays until that has been measured on the fleet; stage nodes sit at
+order 6 and coarser, so the larger function is a small share of a run. The
+dispatcher's role must be allowed to invoke that function. Both dispatchers
+resolve it the same way — `python -m zagg` (`runner._run_lambda`) and the
+`zagg.client` facade's tail — from the run's own resolved function name
+(`runner.DEFAULT_FUNCTION_NAME`, `process-shard`, when nothing else names
+one), and both name the run in the stage event (`pipeline_run_id`), which is
+what the operator `finalize` matches.
 
 #### How wide the fan-out is
 
@@ -630,15 +684,16 @@ intent, not an open store.
 ### Running it
 
 Opt in with `output.sweep: "stages"` — the same knob the spatial local
-dispatcher reads — and the **spatial** Lambda tail (`runner._run_lambda`)
-chains the fleet sweep after the rollup-families leg, auto-scoped to the run's
-own footprint.
+dispatcher reads — and both **spatial** Lambda tails chain the fleet sweep
+after the rollup-families leg, auto-scoped to the run's own footprint:
+`runner._run_lambda` (`python -m zagg` / `agg`) and the `client` facade's
+`Run.dispatch` (issue #588, either transport), through the one seam
+`runner._invoke_lambda_stage_sweep`.
 
-!!! warning "Only the spatial Lambda tail chains it"
+!!! warning "Only the spatial Lambda tails chain it"
     `output.sweep: "stages"` validates on any hive config, and every tail
     reads it as truthy and runs the rollup-families sweep — but only the
-    spatial Lambda tail goes on to dispatch the staged one. The other two
-    unwired tails are not the same case:
+    spatial Lambda tails go on to dispatch the staged one. Two tails do not:
 
     * **raster** (`data_source.reader: raster`) does not chain, and is right
       not to. A raster store is column-less by construction — there are no
@@ -646,12 +701,11 @@ own footprint.
       `zagg-pyramid/2` ladder at all, and a stage worker handed one would
       refuse it at the `/2` declaration gate (`zagg.sweep_stage.ladder_entries`)
       rather than build anything. Nothing is missing from such a store.
-    * the v2 **`Run.dispatch`** tail is the real gap: a column-bearing `/2`
-      store dispatched through it accepts the knob, runs the families sweep
-      and silently builds no ladder, with no warning at the seam. The
-      operator's evidence is an absent ladder hours later. Follow such a run
-      with an explicit `run_stage_sweep_fleet` call (below) or a
-      `python -m zagg.sweep <root> --stages` pass.
+    * a session **reattached** with `Run.attach` runs the families sweep when
+      it runs the tail, and never the staged one: attach is observe-only, and
+      the staged sweep (with its lease) is the launching dispatcher's. A run
+      whose launcher died before or during the staged sweep is finished by
+      hand — see [Recovering a run whose launcher died](#recovering-a-run).
 
 Ad hoc, drive `zagg.sweep_fleet.run_stage_sweep_fleet` with a boto3 Lambda
 client:
@@ -662,13 +716,18 @@ from zagg.sweep_fleet import run_stage_sweep_fleet
 
 summary = run_stage_sweep_fleet(
     boto3.client("lambda"),
-    "zagg-worker",
+    "process-shard-8192-disk",  # the STAGE tier of runner.DEFAULT_FUNCTION_NAME's family
     "s3://bucket/prefix.zarr",
     leaves,                    # [(shard_key, window), ...]
     shard_order=6,
     store_kwargs={"region": "us-west-2"},
     # Omitted here, so the ruled default rides: one dispatch node per invoke.
     # max_nodes_per_invoke=None,   # payload-only packing instead
+    # A windowed store: one invoke per (node, window), plus the per-node
+    # close when the store declares the all-time fold.
+    # windowed=True, all_time=True,
+    # The aggregation run this sweep completes (issue #593), if any.
+    # pipeline_run_id="<run id>",
 )
 ```
 
@@ -802,6 +861,178 @@ prior ladder and heals on the next pass that does include it.
     implementing branch. The `stage` arm ships in the function zip like any
     other handler change — there is no template, layer, or IAM change to
     stage first.
+
+## Recovering a run whose launcher died {#recovering-a-run}
+
+The process that launches a run — `python -m zagg`, or a notebook's
+`Run.dispatch` — also finishes it. Workers write every byte, but the launcher
+holds the order: it fans the shards out and, once the last one settles (after
+the idempotent store-manifest backstop and the root `coverage.moc`), fires:
+
+| End-of-run step | What lands | If the launcher dies before it |
+|---|---|---|
+| 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
+| 2. rollup sweep | the rollup families (one fire-and-forget invoke) | nothing lost: `python -m zagg.sweep <store>` regenerates them |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
+
+Shards the launcher had not dispatched yet never run. Work through the steps
+below from a host in the store's region: they read status objects and, for the
+hand sweep, the leaf columns.
+
+**1. Find the run and where it stopped.** A Lambda-dispatched run has a
+prefix *beside* the store, `<store>.status/run-<run_id>/` (a `run-stage-…`
+prefix is a staged sweep's own). In it:
+
+- `manifest.json` — the dispatch manifest: `run_id`, `dispatched_at`, the
+  config the run shipped, and its shard list (`shards: null` plus
+  `shards_omitted` on a large run: a *slim* manifest). Pick the run by
+  `dispatched_at`. No manifest at all means the setup write was lost or the
+  block did not fit its event (the launcher's summary said
+  `dispatch_manifest: "dropped"`): neither `Run.attach` nor `finalize` can
+  serve that run — go to step 4.
+- `shard-<key>.json` — one per shard that reported (`status`: `ok`,
+  `no_data` or `failed`); `tail.json` — the run-record step completed.
+
+At the store root, a `sweep_stats_<ts>_stages.json` newer than the run with a
+`finisher` block and neither `error` nor `barrier_timed_out` is a completed
+staged sweep; its `pipeline_run_id` says which run it completed (`null`: a
+pass that named none). In the repo (`<store>/icechunk`), `init <run_id>` (or `split
+ratchet … <run_id>`, when its init re-cuts the split) opens each run on
+`main`, and a finished run has its tag:
+
+```python
+from zagg.icechunk_refs import open_repo
+
+repo = open_repo("s3://bucket/store.zarr", store_kwargs={"region": "us-west-2"})
+sorted(repo.list_tags())       # run-<run_id>; retain_runs > 0 deletes the older ones
+[s.message for s in repo.ancestry(branch="main")][:10]    # newest first
+```
+
+**2. Reattach.**
+
+```python
+from zagg.client import Run
+
+handle = Run.attach("s3://bucket/store.zarr", "<run_id>")  # the store root as dispatched
+handle.wait()                    # every shard settled, plus whatever tail attach ran
+handle.status()                  # {"pending": 0, "ok": n, "failed": n}
+handle.icechunk_finalize         # the tag record, {"skipped": ...}, {"error": ...} or None
+handle.dispatch_manifest, handle.unreported_shards        # "full" | "slim", and a count
+```
+
+Attach rebuilds the handle from the manifest and the status objects, for
+unwindowed spatial runs (a windowed run raises). It only observes shards: it
+never re-dispatches one. A `failed` status, or no status by the drop deadline
+— the function timeout plus 150 s after the manifest's `dispatched_at` —
+resolves as a failure, so wait that long after the launcher died before
+attaching, or a shard still running can be recorded as failed. Shards
+that failed or never ran need a new dispatch: `Run.dispatch(shard_keys=…)` on
+a `Run.from_config(...)` built from the run's config and shard map (the
+handle carries no granules). That is a new run with its own `init` commit,
+after which `finalize` of the old run is always skipped (the new run's tag
+covers it), so finalize the old run first if you want it tagged.
+
+With no `tail.json`, the attached session runs the tail itself, through worker
+invokes: the store-manifest backstop, the root `coverage.moc`, the run record
+and the rollup sweep. It **never** runs the staged sweep, and for a `sweep:
+"stages"` run it never tags (`handle.icechunk_finalize` is `{"skipped": …}`);
+only a run pinned `commit: "leaf"` with no staged sweep is tagged by attach,
+and only while it is the repo's newest run. With `tail.json` present, attach
+does that finalize and nothing else.
+
+A slim manifest names no shards, so attach takes them from the status objects.
+While `handle.unreported_shards` is non-zero the handle is a snapshot of the
+shards that reported and runs **no tail**; past the drop deadline the rest
+never report, attach cannot finish that run, and its warning says to
+re-dispatch.
+
+**3. Finish the run by hand, in this order** — only once the
+run's own `stats_<ts>_<run_id>.parquet` is at the store root (the tail writes
+it, step 2). Without it the sweep cannot find the run's leaves, yet still
+succeeds over other runs' leaves, and a pass you NAME for this run is one
+`finalize` accepts: it would tag a ladder without them. Re-dispatch instead.
+
+```
+python -m zagg.sweep s3://bucket/store.zarr             # the rollup families
+python -m zagg.sweep s3://bucket/store.zarr --stages --pipeline-run-id <run_id>   # sweep: "stages" only
+python -m zagg.icechunk_ops s3://bucket/store.zarr finalize <run_id>   # ditto
+```
+
+`--pipeline-run-id` is what lets the `finalize` after it tag: `finalize`
+takes only a completed staged-sweep record that **names the run**
+([issue #593](https://github.com/englacial/zagg/issues/593)), written since
+the run's init commit. A `--stages` pass without it records
+`pipeline_run_id: null`, vouches for no run, and `finalize` refuses, naming
+the record it found and this command. The newest record that names the run
+decides: a later pass that names none neither vouches for the run nor
+blocks it, and neither does a record that is not a JSON object (passed over
+with a warning). So a named retry that failed refuses even when an earlier
+named pass completed: run the named pass again, to completion. Record keys
+resolve to one second, so a pass finishing in the same second as the named
+one overwrites its record; leave a second between them.
+
+The families pass is idempotent; run it even when `tail.json` exists, since
+the launcher may have died before the families invoke (attach then runs no
+tail). *The sweeps* run in the calling process and write the store from it, so
+they need the store's write credentials and a host in the store's region.
+Where the operator cannot write the store (a Source Cooperative–published
+one), drive the staged sweep's fleet form instead — `run_stage_sweep_fleet`,
+under [Running it](#running-it) — with `leaves` the run's own `(shard_key,
+window)` pairs, which keeps it to the run's footprint as the chained sweep is
+(`zagg.sweep.discover_leaves(store, store_kwargs=…)` gives every run's), and
+`shard_order` the store manifest's, and `pipeline_run_id="<run_id>"` (the
+fleet form's spelling of the flag). The CLI `--stages` pass covers every leaf
+the run records name, not only this run's: a whole-store re-fold on one host
+(`--partitions` bounds its memory, not its scope). On success it prints its
+summary: `record`, the `sweep_stats_<ts>_stages.json` it wrote, and a
+`finisher` block with `lease_released: true`. Skip that pass when step 1
+found a completed staged sweep newer than the run whose `pipeline_run_id` is
+this run's.
+
+- `No completed leaves found in the store's run records` — no run record,
+  this run's included, names a completed leaf: there is nothing to fold.
+- `SweepRefusedError: a sweep already holds this store: run '…'` — the dead
+  launcher's sweep (or a live one) holds the lease. Wait out the `ttl` the
+  message quotes and run it again; the new sweep claims the expired lease.
+- A sweep that fails midway leaves a record carrying `error` and the lease
+  held: wait out the TTL and run it again.
+
+*The finalize* on an `s3://` store is one synchronous Lambda invoke; this host
+reads nothing from the store and writes nothing, and needs only invoke rights.
+The function is `--function-name`, else `ZAGG_LAMBDA_FUNCTION_NAME`, else
+`process-shard`, and the deployed worker must be at least as new as this
+operation: an older one fails on the event's missing `config` before any
+write, and the command reports a worker that `predates the operator
+finalize` — deploy a current worker. On success it prints the worker's
+report: `tagged: true`, the `tag`, its `snapshot`, the `stage_record` that
+vouched for the ladder and the `function_name` invoked.
+`tagged: false` comes with `skipped`: either the tag `already exists`, or `a
+later run has committed since` — it only ever tags the repo's **newest** run.
+A refusal raises and writes nothing:
+
+- `no staged-sweep record … since run …'s init commit`, or `… does not show a
+  completed sweep` — run the sweep above (again), then finalize.
+- `no dispatch manifest with a config` — wrong store or run id, or the
+  manifest was lost or dropped: this run cannot be tagged here (step 4).
+- `no init commit for run …` — the run never initialized this repo, or a
+  later run's retention squashed its commits: nothing to tag.
+- `may not have finalized` (a `RuntimeError`) — the invoke failed or its
+  response was lost, so the outcome is unknown: run it again, an existing tag
+  is reported and nothing is rewritten.
+
+**4. Or do nothing — only if the run's own `stats_<ts>_<run_id>.parquet` is at
+the store root.** An untagged run's commits stay on `main`, and the next
+run's tag covers them. What waits is the ladder — and, for a ladder-committed
+run, the repo's refs — over leaves no sweep has reached: a later run's
+chained sweep is scoped to its own footprint, so those leaves are folded by
+the next sweep that includes them, such as the unscoped `--stages` pass
+above. Without that record no sweep ever finds the run's leaves (discovery
+reads the run records only): re-dispatch its shards (step 2).
+
+The reference for each piece: the [staged sweep](../hive_layout.md#the-staged-sweep-issue-384),
+the [Icechunk repo and `finalize`](../hive_layout.md#the-icechunk-companion-repo),
+and specification §11.4.
 
 ## Cost Estimate
 

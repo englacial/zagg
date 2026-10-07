@@ -29,7 +29,13 @@ from zagg.grids.base import (
     vector_array_spec,
     vlen_dtype_warning_suppressed,
 )
-from zagg.grids.morton import MORTON_CONVENTION, morton_decimal, to_morton_array
+from zagg.grids.morton import (
+    LATITUDE_CONVENTION,
+    MORTON_CONVENTION,
+    cell_words,
+    morton_decimal,
+    to_morton_array,
+)
 from zagg.time_axis import TOC_SHAPE_PER_CENTROID
 
 HEALPIX_BASE_CELLS: int = 12
@@ -196,8 +202,8 @@ class HealpixGrid:
         # sub-chunk's block index is its own nested-cell id (fullsphere only).
         sub_chunks = generate_morton_children(int(shard_key), self.chunk_order)
         for sub in np.asarray(sub_chunks):
-            healpix, _ = mort2healpix(np.asarray([int(sub)]))
-            block = (int(healpix[0]),)
+            healpix, _ = mort2healpix(int(sub))  # scalar in → scalar out (mortie ≥1.0)
+            block = (healpix,)
             children = generate_morton_children(int(sub), self.child_order)
             yield (block, children)
 
@@ -356,6 +362,9 @@ class HealpixGrid:
         are unchanged. Encoding rides the numpy-level ``geo2mort(...,
         points=True)`` (mortie 0.8.5, espg/mortie#100 — the issue #87 phase-6
         surface, replacing the pandas ``MortonIndexArray`` wrapper + unwrap).
+
+        Elementwise, per the protocol: N-D input returns the input shape
+        (``geo2mort`` reshapes to its input, mortie >=1.0 / espg/mortie#219).
         """
         from mortie import geo2mort
 
@@ -390,7 +399,11 @@ class HealpixGrid:
         return sample_nearest(lons, lats, "EPSG:4326", crs, transform, shape)
 
     def shards_of(self, leaf_ids) -> np.ndarray:
-        """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`."""
+        """Vectorized parent-morton lookup. ``leaf_ids`` at :data:`HEALPIX_REF_ORDER`.
+
+        Elementwise, per the protocol: N-D input returns the input shape
+        (``clip2order`` reshapes to its input, mortie >=1.0).
+        """
         from mortie import clip2order
 
         return clip2order(self.parent_order, np.asarray(leaf_ids))
@@ -420,8 +433,8 @@ class HealpixGrid:
         """
         from mortie import mort2healpix
 
-        healpix, _ = mort2healpix(np.asarray([int(shard_key)]))
-        return (int(healpix[0]),)
+        healpix, _ = mort2healpix(int(shard_key))  # scalar in → scalar out (mortie ≥1.0)
+        return (healpix,)
 
     def shard_label(self, shard_key) -> str:
         """Decimal morton string for this shard's packed word (issue #199).
@@ -444,10 +457,14 @@ class HealpixGrid:
         return Polygon(zip(lons, lats))
 
     def children(self, shard_key) -> np.ndarray:
-        """Child morton IDs under a parent, in canonical order."""
-        from mortie import generate_morton_children
+        """Child morton IDs under a parent, in canonical order.
 
-        return generate_morton_children(int(shard_key), self.child_order)
+        The cells axis itself: cell ``j`` of the shard's leaf carries
+        ``children(shard_key)[j]`` (:func:`zagg.grids.morton.cell_words`, the
+        spec §1.5 derivation law) — stored as the leaf's ``morton`` array on
+        an unwindowed leaf, derived by readers on a windowed one.
+        """
+        return cell_words(shard_key, self.child_order)
 
     def encode_cell_ids(self, leaf_ids) -> np.ndarray:
         """Convert morton IDs to HEALPix nested cell IDs."""
@@ -542,8 +559,13 @@ class HealpixGrid:
             spec.to_zarr(store, self.group_path, overwrite=overwrite)
         return store
 
-    def emit_shard_template(self, store: Store, *, overwrite: bool = False) -> Store:
+    def emit_shard_template(
+        self, store: Store, *, overwrite: bool = False, cell_coordinate: bool = True
+    ) -> Store:
         """Write ONE shard's leaf-zarr template to ``store`` (issue #199 phase 2).
+
+        ``cell_coordinate=False`` (issue #586 phase 3) is the WINDOWED leaf's
+        template: no per-cell ``morton`` member — see :meth:`shard_spec`.
 
         The hive layout (D3 in ``docs/design/sparse_coverage.md``) gives every
         shard its own self-describing leaf zarr: the same group structure as
@@ -593,7 +615,10 @@ class HealpixGrid:
         prefix_store``), which is what makes a name-prefix twin like
         ``<leaf>.status`` safe rather than merely unlikely.
         """
-        spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
+        spec = GroupSpec(
+            members={self.group_path: self.shard_spec(cell_coordinate=cell_coordinate)},
+            attributes={},
+        )
         # Ragged vlen-array creation warns about the dtype NAME only
         # (zarr-python#3517); message-scoped suppression, see grids.base.
         with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
@@ -608,7 +633,7 @@ class HealpixGrid:
         """Return the pydantic-zarr GroupSpec for this grid's template."""
         return self._spec()
 
-    def shard_spec(self) -> GroupSpec:
+    def shard_spec(self, *, cell_coordinate: bool = True) -> GroupSpec:
         """GroupSpec for ONE shard's hive leaf (issue #199 phase 2).
 
         Identical member set to :meth:`spec` — same dtypes, fills, chunking —
@@ -618,8 +643,36 @@ class HealpixGrid:
         leaf — a ragged field's vlen array always (issue #209), the dense
         per-cell arrays when ``sharded`` (issue #236) — so each is ONE object
         per leaf.
+
+        ``cell_coordinate=False`` drops the per-cell ``morton`` member: a
+        WINDOWED leaf stores none (issue #586 phase 3, spec §1.5 "The cell
+        coordinate") — the word is a pure function of the leaf id and the
+        rank (:func:`zagg.grids.morton.cell_words`), and N windows of one
+        shard would each store the same 8 B per cell. The ``dggs`` attrs still
+        name ``morton`` as the coordinate; readers derive it. The legacy
+        ``cell_ids`` member rides its ``emit_cell_ids`` hatch either way (an
+        explicit opt-in for readers that need the array on disk).
         """
-        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,), leaf=True)
+        return self._group_spec(
+            self.cells_per_shard,
+            (self.chunks_per_shard,),
+            leaf=True,
+            cell_coordinate=cell_coordinate,
+        )
+
+    def chunked_spec(self) -> GroupSpec:
+        """GroupSpec for ONE shard on plain inner chunks — no whole-leaf shard.
+
+        :meth:`shard_spec`'s member set with every per-cell array, ragged
+        ones included, left on its ``cells_per_chunk`` chunk grid (one object
+        per chunk). For an artifact written one chunk at a time and never
+        held whole — the streamed stage column (issue #586 phase 4) — where a
+        ShardingCodec array would be re-read and re-PUT whole on every chunk.
+        Requires an unsharded grid.
+        """
+        if self.sharded:
+            raise ValueError("chunked_spec is the unsharded layout; build the grid sharded=False")
+        return self._group_spec(self.cells_per_shard, (self.chunks_per_shard,))
 
     # ── internals ────────────────────────────────────────────────────────
 
@@ -628,7 +681,12 @@ class HealpixGrid:
         return self._group_spec(n_pixels, self.chunk_grid_shape)
 
     def _group_spec(
-        self, n_pixels: int, chunk_grid_shape: tuple[int, ...], *, leaf: bool = False
+        self,
+        n_pixels: int,
+        chunk_grid_shape: tuple[int, ...],
+        *,
+        leaf: bool = False,
+        cell_coordinate: bool = True,
     ) -> GroupSpec:
         base = ArraySpec(
             attributes={},
@@ -671,6 +729,10 @@ class HealpixGrid:
             # carries an array the writer will not fill. Keyed off the same
             # flag as coords_of, so template and writes cannot disagree.
             if name == "cell_ids" and not self.emit_cell_ids:
+                continue
+            # A windowed leaf stores no per-cell coordinate (issue #586 phase
+            # 3): its writer drops the ``morton`` column to match.
+            if name == "morton" and not cell_coordinate:
                 continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")
@@ -813,6 +875,10 @@ class HealpixGrid:
                 "inverse_flattening": 298.257223563,
             },
             "compression": "none",
+            # mortie spec §9 latitude convention (issue #549): mandatory at the
+            # current mortie spec version; zagg stores are authalic-wgs84 by
+            # construction (no override, mortie >= 1.0 floor).
+            "latitude": LATITUDE_CONVENTION,
         }
         # D16 / issue #304 phase 3: every HEALPix aggregation store is
         # morton-declared — the DISTINCT grid name "morton" with the typed

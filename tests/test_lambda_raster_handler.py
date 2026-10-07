@@ -57,7 +57,7 @@ def _shard_for_raster():
 
     to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
     lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
-    leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+    leaf = geo2mort(lat, lon, order=29, points=True)
     return int(clip2order(10, leaf)[0])
 
 
@@ -514,6 +514,11 @@ class TestProcessRasterHiveMode:
         assert stamp and stamp["complete"] and stamp["spec"] == "morton-hive/2"
         assert stamp["window"] == "20260713"
         assert body["cells_with_data"] == stamp["cells_with_data"] > 0
+        # The fleet path writes the same windowed leaf the local one does:
+        # no per-cell `morton` array (issue #586 phase 3).
+        group = Path(leaf) / str(event["config"]["output"]["grid"]["child_order"])
+        assert sorted(p.name for p in group.iterdir() if p.is_dir()) == ["red", "time"]
+        assert not any(k.endswith("/morton") for k in stamp["content_hashes"]["arrays"])
 
     def test_schedule_none_bare_leaf(self, handler_mod, tmp_path):
         from zagg import hive
@@ -526,6 +531,9 @@ class TestProcessRasterHiveMode:
         leaf = hive.shard_leaf_path(event["store_path"], event["shard_key"])
         stamp = hive.read_commit(leaf)
         assert stamp and stamp["spec"] == "morton-hive/1" and "window" not in stamp
+        # An unwindowed raster leaf keeps its stored coordinate.
+        group = Path(leaf) / str(event["config"]["output"]["grid"]["child_order"])
+        assert (group / "morton" / "zarr.json").exists()
 
     def test_hive_leaf_gets_stats_sidecar(self, handler_mod, tmp_path):
         # Issue #297: the raster hive worker writes the stats record SIBLING
@@ -549,6 +557,9 @@ class TestProcessRasterHiveMode:
         # Always-on sample/write collection flows into the record.
         assert {"sample", "write"} <= set(record["phase_timings"])
         assert record["max_memory_mb"] is not None
+        # The invocation wall rides the raster record too (issue #589): one
+        # column across paths, stamped just before the record is built.
+        assert record["duration_total_s"] >= record["duration_s"]
         # Read-volume counters (issue #297): whole tiles are fetched+decoded to
         # sample the shard's cells. The decoded/sampled ratio reads as
         # over-provision only when the output grid is coarser than the source; a

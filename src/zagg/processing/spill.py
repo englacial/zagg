@@ -475,6 +475,12 @@ def _memory_budget_bytes() -> int:
 #: worst case; do not lower without re-measuring the replay.
 _BUILD_MULT = 3
 
+#: Share of the spill directory's free space one worker may hold in open
+#: blocks: the cap on :func:`_default_block_bytes`, and the cap the bulk
+#: multi-window bins (:class:`zagg.processing.windowed.WindowBins`) enforce
+#: over their N aggregators' open blocks together.
+SPILL_TMP_FRACTION = 0.45
+
 
 def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
     """Default spill-block threshold (issue #217 design comment).
@@ -499,7 +505,7 @@ def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
     """
     mem = _memory_budget_bytes()
     st = os.statvfs(tmp_dir or tempfile.gettempdir())
-    tmp_cap = int(0.45 * st.f_bavail * st.f_frsize)
+    tmp_cap = int(SPILL_TMP_FRACTION * st.f_bavail * st.f_frsize)
     return max(1, min(int(0.8 * 0.75 * mem * n_partitions / _BUILD_MULT), tmp_cap))
 
 
@@ -553,11 +559,17 @@ class SpillAggregator:
         block_bytes: int | None = None,
         tmp_dir: str | None = None,
         overlap: bool = True,
+        temporal_out=None,
     ):
         self.config = config
         self.grid = grid
         self.handoff = handoff
         self.buffer_granules = buffer_granules
+        # The leaf temporal accumulator (issue #575), fed wherever this path
+        # encodes toc words: the single-block regime through the pooled
+        # machinery (``_aggregate_chunk_cells``), the multi-block regime per
+        # cell in ``_fold_block`` — each observation exactly once either way.
+        self.temporal_out = temporal_out
         self.tmp_dir = tmp_dir or tempfile.gettempdir()
         agg_fields = get_agg_fields(config)
         self._data_vars = get_data_vars(config)
@@ -645,6 +657,9 @@ class SpillAggregator:
         self.overlap = bool(overlap)
         self._reducer: threading.Thread | None = None
         self._reduce_err: BaseException | None = None
+        # Called before every block close: the bulk multi-window bins join all
+        # N aggregators' reducers there, so one block reduces at a time.
+        self.before_close = None
         # Cross-block mergeable running state (only ever fed on block close).
         self._counts: dict[int, int] = {}
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
@@ -766,6 +781,21 @@ class SpillAggregator:
         return self.n_obs_total == 0 and not self._buffer
 
     @property
+    def open_block_bytes(self) -> int:
+        """Bytes appended to the block still filling (the ``/tmp`` it holds)."""
+        return self._block.bytes_written
+
+    def close_block(self) -> None:
+        """Close the filling block now — the bulk bins' shared ``/tmp`` cap
+        (:class:`zagg.processing.windowed.WindowBins`); the threshold crossing
+        in :meth:`flush` is the same fold."""
+        self._close_block()
+
+    def join_reducer(self) -> None:
+        """Wait for this aggregator's in-flight block reduce (the bulk bins)."""
+        self._join_reducer()
+
+    @property
     def closed_blocks(self) -> int:
         """Blocks closed at the threshold; 0 = exact single-block regime.
 
@@ -827,6 +857,8 @@ class SpillAggregator:
                 f"widen to their members' envelope, composition takes "
                 f"one k-way re-quantization; counts stay exact."
             )
+        if self.before_close is not None:
+            self.before_close()
         block = self._block
         self._block = SpillBlock(self.tmp_dir)
         self._closed_blocks += 1
@@ -915,6 +947,8 @@ class SpillAggregator:
                     # the encode's transient allocation is unbudgeted by
                     # ``_default_block_bytes`` / ``_BUILD_MULT``.
                     cell_data[TOC_WORD_COLUMN] = _toc_word_column(cell_data, self.config)
+                    if self.temporal_out is not None:
+                        self.temporal_out.add_words(cell_data[TOC_WORD_COLUMN])
                 for name, f in self._digest_fields.items():
                     values = cell_data[f.source]
                     declared = _channels(f)  # every zip below is against THIS tuple
@@ -1107,6 +1141,7 @@ class SpillAggregator:
             self._data_vars,
             agg_fields,
             chunk_pooled=chunk_pooled,
+            temporal_out=self.temporal_out,
         )
 
     def _load_partition(self, key: int) -> None:

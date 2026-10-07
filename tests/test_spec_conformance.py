@@ -29,7 +29,7 @@ import zarr
 from numcodecs import Zstd
 from zarr.storage import LocalStore
 
-from zagg.coverage_toc import coverage_toc, coverage_toc_digest
+from zagg.coverage_toc import coverage_toc, coverage_toc_counts, coverage_toc_uncounted
 from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
@@ -39,7 +39,7 @@ SPEC_DATA = Path(__file__).parent / "data" / "spec"
 #: same production path: the column writer must leave that leaf untouched
 #: (it holds the same payload ``bytes`` objects the leaf staged), and running
 #: the suite over both is what asserts it.
-FIXTURES = ("minimal", "kitchen_sink", "column")
+FIXTURES = ("minimal", "kitchen_sink", "column", "versioned")
 #: The manifest-only §4.5 declaration fixture (issue #382) — deliberately NOT
 #: in ``FIXTURES``: it has no leaf, so nothing leaf-shaped applies to it.
 PYRAMID = "pyramid"
@@ -48,6 +48,7 @@ PYRAMID = "pyramid"
 RAGGED_ARRAYS = [
     ("minimal", "h_tdigest", "float32", (2,)),
     ("column", "h_tdigest", "float32", (2,)),
+    ("versioned", "h_tdigest", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_signal", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_noise", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_signal_locations", "uint64", ()),
@@ -56,6 +57,8 @@ RAGGED_ARRAYS = [
     ("temporal", "h_tdigest", "float32", (2,)),
     ("temporal", "h_tdigest_locations", "uint64", ()),
     ("temporal", "h_tdigest_times", "uint64", ()),
+    ("windowed", "h_tdigest", "float32", (2,)),
+    ("windowed", "h_tdigest_locations", "uint64", ()),
 ]
 SENTINEL = 2**64 - 1
 
@@ -75,6 +78,10 @@ FROZEN_COMBINED = {
     # column/'s LEAF is minimal's, byte for byte — the same literal is the
     # cross-fixture pin that writing a column perturbs nothing.
     "column": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    # versioned/'s arrays are minimal's, byte for byte, behind a pointer root
+    # (§1.5, issue #582) — the same literal pins that versioning a leaf
+    # perturbs nothing the §5 recipe hashes.
+    "versioned": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
     # The §2.0 flux fixture (issue #424) — asserted by TestFluxDeclaration
     # (flux is not in FIXTURES: the leaf-shaped suite hardcodes h_tdigest).
     "flux": "910a9b12d34b4d072f454b2dd1cc232a6a9a92b536a8d26f5395154a1c02bc32",
@@ -88,6 +95,10 @@ FROZEN_COMBINED = {
     # Re-pinned for the §10.5 gap cell (issue #489): the last cell's clock
     # moved, so its two toc companions -- and only those -- hash differently.
     "temporal": "6c7a0c5a3f54684b67e7e2daa66e29ffcf1af102833e7b3c4a4f989e36752887",
+    # The §1.5 derived-coordinate fixture (issue #586 phase 3) — asserted by
+    # TestDerivedCellCoordinate. A WINDOWED leaf: the digest is over three
+    # arrays, with no ``6/morton`` among them.
+    "windowed": "5b712e804d5120bac66031739483f319fb1bdf346d82e2d0b087f9bd2ddec170",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -124,6 +135,12 @@ FROZEN_ARRAYS = {
         "temporal",
         "6/h_tdigest_times",
     ): "03a1e44b982a553c8a419f66563d712b7f070c5f0761e1982f9912740ffee468",
+    # The located sibling a windowed leaf's derived coordinate is checked
+    # against (§1.5, issue #586 phase 3).
+    (
+        "windowed",
+        "6/h_tdigest_locations",
+    ): "701d6902b05f31e90be26279b150cb53749016403b377d20f1402d4256674347",
 }
 
 
@@ -1209,12 +1226,15 @@ class TestFixtureSemanticHash:
         "minimal",
         "kitchen_sink",
         "column",
+        "versioned",
         "flux",
         PYRAMID,
         MULTISCALES,
         "raster_toc",
         "temporal",
+        "uncounted",
         "demoted",
+        "windowed",
     )
 
     @pytest.mark.parametrize(
@@ -1223,6 +1243,9 @@ class TestFixtureSemanticHash:
             ("minimal", {"kitchen_sink": False}),
             ("kitchen_sink", {"kitchen_sink": True}),
             ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+            # versioned/ is minimal's config: leaf versioning is layout, not
+            # semantics (the run identity names the version, never the hash).
+            ("versioned", {"kitchen_sink": False}),
             # The §2.0 flux fixture (issue #424) landed after the epoch's
             # phase 3, so its committed digest was pre-epoch until now.
             ("flux", {"kitchen_sink": False, "flux": True}),
@@ -1258,6 +1281,19 @@ class TestFixtureSemanticHash:
 
         gen = self._generator()
         assert self._recorded("temporal") == semantic_hash(gen._temporal_config())
+        # `uncounted/` is the same store's root objects over a record-less
+        # leaf (§10.3), so it records the same identity.
+        assert self._recorded("uncounted") == self._recorded("temporal")
+
+    def test_the_windowed_fixture_hash_is_reproducible(self):
+        # The §1.5 fixture (issue #586 phase 3) is built from its own config
+        # literal. ``output.windowing`` is leaf-shaping, so this digest is not
+        # the unwindowed product's — and dropping the stored coordinate moved
+        # nothing in it: the derivation is layout, not semantics.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("windowed") == semantic_hash(gen._windowed_config())
 
     def test_every_fixture_is_covered(self):
         # The gate on the gate: a fixture added without a hash pin ships a
@@ -1321,7 +1357,7 @@ class TestFixtureGranuleIdentity:
     #: ``test_every_fixture_is_covered`` is, so a new fixture cannot ship one
     #: unguarded.
     SIBLINGS = sorted(
-        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules.json")
+        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules*.json")
     )
 
     def test_every_leaf_fixture_carries_the_sibling(self):
@@ -1329,11 +1365,18 @@ class TestFixtureGranuleIdentity:
         # a fixture with a leaf but no recorded id list ships a leaf the
         # contraction guard cannot protect. ``pyramid/`` is manifest-only (no
         # leaf, hence no sibling), which is why this keys on the leaf.
-        want = {
-            f"{name}/{Path(_expected(name)['leaf']).parent.as_posix()}/granules.json"
-            for name in TestFixtureSemanticHash.COVERED
-            if _expected(name).get("leaf")
-        }
+        # The sibling sits beside the STABLE root (``pointer`` on a versioned
+        # fixture, §1.5), never inside a version subgroup.
+        # A windowed leaf's sibling takes the window into its name
+        # (``granules_{window}.json``, the sidecar grammar).
+        from zagg.telemetry import granule_ids_key
+
+        want = set()
+        for name in TestFixtureSemanticHash.COVERED:
+            if not (exp := _expected(name)).get("leaf"):
+                continue
+            root = Path(exp.get("pointer", exp["leaf"]))
+            want.add(f"{name}/{root.parent.as_posix()}/{granule_ids_key(root.name)}")
         assert set(self.SIBLINGS) == want
 
     @pytest.mark.parametrize("rel", SIBLINGS)
@@ -1962,45 +2005,46 @@ class TestRootCoverageTemporalSection:
         # JSON parser would mangle a raw number, exactly as for the ranges.
         assert section["shards"] == exp["shards"]
         assert all(isinstance(w, str) for w in section["shards"].values())
-        digest = section["digest"]
-        assert digest["element"] == {"dtype": "float32", "shape": [-1, 2]}
-        assert (digest["encoding"], digest["weights"], digest["value"]) == (
-            "base64",
-            "counts",
-            "toc-ns",
-        )
-        assert digest["delta"] == exp["digest"]["delta"]
+        counts = section["counts"]
+        assert counts["element"] == {"dtype": "uint64", "shape": [-1]}
+        assert counts["encoding"] == "base64"
+        assert counts["temporal_order"] == exp["counts"]["temporal_order"] == 24
+        assert counts["cap"] == 512
+        # §10.3's exactness marker: every leaf came in with its worker's record.
+        assert counts["uncounted_shards"] == exp["uncounted_shards"] == 0
+        assert "digest" not in section  # the retired tier-2 block (issue #575)
 
-    def test_digest_decodes_through_the_native_grammars(self):
-        """§10.3: the payload is §2.1 bytes and the sibling is §8.3 words.
+    def test_counts_decode_through_the_native_grammar(self):
+        """§10.3: two row-aligned §1.4 uint64 buffers on the §10.5 word grid.
 
         Decoded here with the SPEC-TEXT recipe (base64, then the §1.4 raw
         little-endian buffer at the declared dtype) — no zagg decoder — so the
         "zero new grammar" claim is what is being asserted.
         """
-        exp = _expected("temporal")["root_coverage"]["digest"]
-        block = self._envelope()["temporal"]["digest"]
-        payload = np.frombuffer(
-            base64.b64decode(block["payload"]), dtype=np.dtype("float32").newbyteorder("<")
-        ).reshape(-1, 2)
-        words = np.frombuffer(
-            base64.b64decode(block["times"]), dtype=np.dtype("uint64").newbyteorder("<")
-        )
-        assert len(payload) == len(words) == block["centroids"]
-        np.testing.assert_array_equal(payload, np.array(exp["centroids"], dtype=np.float32))
-        np.testing.assert_array_equal(words, np.array(exp["times"], dtype=np.uint64))
-        # §2.1: rows ascend by mean, and every weight is a positive count.
-        assert (np.diff(payload[:, 0]) >= 0).all()
-        assert (payload[:, 1] > 0).all()
+        from mortie import toc2time
 
-    def test_weight_conservation(self):
-        """§10.3: `sum(weights)` is the store's temporal observation count."""
+        exp = _expected("temporal")["root_coverage"]["counts"]
+        block = self._envelope()["temporal"]["counts"]
+        words = np.frombuffer(base64.b64decode(block["words"]), "<u8")
+        obs = np.frombuffer(base64.b64decode(block["obs"]), "<u8")
+        assert len(words) == len(obs) == block["count"]
+        np.testing.assert_array_equal(words, np.array(exp["words"], dtype=np.uint64))
+        np.testing.assert_array_equal(obs, np.array(exp["obs"], dtype=np.uint64))
+        # Sorted, unique, aligned buckets at the block's order; positive counts.
+        assert (np.diff(words) > 0).all() and (obs > 0).all()
+        span = 1 << (63 - block["temporal_order"])
+        start, end = (np.atleast_1d(np.asarray(x, np.uint64)) for x in toc2time(words))
+        assert (start % span == 0).all() and ((end - start) == span).all()
+
+    def test_count_conservation(self):
+        """§10.3: at `uncounted_shards` 0, `obs_total` IS the store's observation count."""
         exp = _expected("temporal")
-        block = self._envelope()["temporal"]["digest"]
-        payload, _words = coverage_toc_digest(self._envelope())
+        block = self._envelope()["temporal"]["counts"]
+        counts = coverage_toc_counts(self._envelope())
+        assert coverage_toc_uncounted(self._envelope()) == 0
         total = exp["root_coverage"]["obs_total"]
         assert total == sum(cell["count"] for cell in exp["cells"])
-        assert float(payload[:, 1].sum()) == block["weight_total"] == float(total)
+        assert int(counts.obs.sum()) == block["obs_total"] == total
 
     def test_shard_word_conservatively_contains_every_instant(self):
         """§10.2's whole claim, on committed bytes.
@@ -2022,41 +2066,58 @@ class TestRootCoverageTemporalSection:
         for t in internal:
             assert bool(np.asarray(toc_overlaps(np.array([word]), int(t), int(t) + 1))[0])
 
-    def test_the_value_axis_is_the_envelope_midpoint(self):
-        """§10.3: column 0 is derived from the words, not from the observations.
+    def test_the_root_block_is_the_leaf_records_exact_counts(self):
+        """§10.3 via §10.6: the sweep composes the root from the leaf record.
 
-        Each contributing centroid enters the fold at the midpoint of its own
-        §8.3 envelope, so a weight-1 centroid — whose word is a timestamp and
-        whose ``toc2time`` envelope is a point — carries that EXACT instant,
-        and every other mean is a convex combination of midpoints and so lies
-        inside its own centroid's word. Both hold to the float32 quantum the
-        section documents, which is why the words, never the means, are the
-        exact temporal claim.
+        On this one-leaf store the root block therefore IS the worker's
+        counted cover — every observation in its own exact bucket (the
+        generator's per-instant expectation, never read back). The leaf's
+        per-centroid companions could not have produced it: their payload
+        weights, bucketed at each centroid's representative instant, total
+        the same but land differently on three of the five buckets — which
+        is why a raw read of the leaf contributes those buckets and NO count
+        (``uncounted/``, :class:`TestUncountedRootSection`).
         """
         from mortie import toc2time
 
-        payload, words = coverage_toc_digest(self._envelope())
-        start, end = (np.asarray(b, dtype=np.float64) for b in toc2time(np.asarray(words)))
-        means = payload[:, 0].astype(np.float64)
-        # The one exact arm: weight-1 rows sit on their word's instant.
-        single = payload[:, 1] == 1
-        assert single.any()
-        assert (start[single] == end[single]).all()
-        np.testing.assert_array_equal(payload[single, 0], start[single].astype(np.float32))
-        # Everything else: inside its own envelope, up to float32 rounding
-        # (~2^-24 relative — roughly ten minutes at present-day magnitudes).
-        quantum = np.abs(means) * 2.0**-23
-        assert ((means >= start - quantum) & (means <= end + quantum)).all()
-
-    def test_the_root_words_reduce_to_the_shard_word(self):
-        # The tier-2 companion and the tier-1 map are two views of the same
-        # join: reducing the digest's per-centroid envelopes reproduces the
-        # shard's envelope word exactly (mortie's semilattice, spec §8.4).
-        from mortie import toc_reduce
+        from zagg.leaf_temporal import count_words
 
         exp = _expected("temporal")
-        _payload, words = coverage_toc_digest(self._envelope())
-        assert int(toc_reduce(words)) == coverage_toc(self._envelope())[exp["shard"]]
+        block = self._envelope()["temporal"]["counts"]
+        counts = coverage_toc_counts(self._envelope())
+        assert [str(int(w)) for w in counts.words] == exp["leaf_temporal"]["counts"]["words"]
+        assert counts.obs.tolist() == exp["leaf_temporal"]["counts"]["obs"]
+        assert block["obs_total"] == exp["leaf_temporal"]["n_obs"]
+        words = np.concatenate(
+            [np.array(cell["h_tdigest_times"], dtype=np.uint64) for cell in exp["cells"]]
+        )
+        weights = np.concatenate(
+            [np.array(cell["h_tdigest"], dtype=np.float64)[:, 1] for cell in exp["cells"]]
+        )
+        weighed = count_words(words, weights, block["temporal_order"])
+        np.testing.assert_array_equal(counts.words, weighed.words)  # same buckets ...
+        assert not np.array_equal(counts.obs, weighed.obs)  # ... and not the exact counts
+        assert int(weighed.obs.sum()) == int(counts.obs.sum())
+        # And every centroid's representative instant overlaps a counted bucket.
+        start, end = (np.atleast_1d(np.asarray(x, np.uint64)) for x in toc2time(words))
+        mid = start + (end - start) // np.uint64(2)
+        b_start, b_end = (np.atleast_1d(np.asarray(x, np.uint64)) for x in toc2time(counts.words))
+        assert all(np.any((b_start <= t) & (t < b_end)) for t in mid)
+
+    def test_the_root_cover_lies_inside_the_shard_word(self):
+        # The tier-2 buckets and the tier-1 word are two views of the same
+        # instants: the buckets' envelope sits inside the quantized shard word
+        # (§10.5's parity relation — equal where every centroid is exact).
+        from mortie import toc2time, toc_reduce
+
+        from zagg.coverage_toc import quantize_words
+
+        exp = _expected("temporal")
+        counts = coverage_toc_counts(self._envelope())
+        word = coverage_toc(self._envelope())[exp["shard"]]
+        lo_c, hi_c = (int(x) for x in toc2time(int(toc_reduce(counts.words))))
+        lo_w, hi_w = (int(x) for x in toc2time(int(toc_reduce(quantize_words([word])))))
+        assert lo_w <= lo_c and hi_c <= hi_w
 
     def test_the_shard_word_is_the_join_of_the_committed_leaf_words(self):
         # Derived from the LEAF bytes, not from the sidecar: a writer that
@@ -2070,7 +2131,7 @@ class TestRootCoverageTemporalSection:
         assert int(toc_reduce(leaf)) == coverage_toc(self._envelope())[exp["shard"]]
 
     @pytest.mark.parametrize(
-        "name", ["minimal", "kitchen_sink", "column", "flux", "raster_toc", "pyramid"]
+        "name", ["minimal", "kitchen_sink", "column", "flux", "raster_toc", "pyramid", "versioned"]
     )
     def test_non_temporal_fixtures_carry_no_root_coverage_object(self, name):
         # §10's absence rule, pinned as bytes — WITH its precondition, which
@@ -2083,6 +2144,15 @@ class TestRootCoverageTemporalSection:
         assert temporal_fields(manifest) == {}
         assert not (SPEC_DATA / name / "coverage.moc").exists()
         assert not (SPEC_DATA / name / "coverage.toc").exists()
+        # §10.6 extends it once more, per leaf: no temporal channel, no record
+        # (the pyramid fixture has no leaf of its own to check). ``versioned``'s
+        # leaf is its version subgroup — where a record would live (§10.6) —
+        # and its pointer root carries none either.
+        exp = _expected(name)
+        if "leaf" in exp:
+            assert not (_leaf_dir(name, exp) / "temporal.toc").exists()
+        if "pointer" in exp:
+            assert not (SPEC_DATA / name / exp["pointer"] / "temporal.toc").exists()
 
     def _cover(self):
         return json.loads((SPEC_DATA / "temporal" / "coverage.toc").read_text())
@@ -2188,6 +2258,103 @@ class TestRootCoverageTemporalSection:
                 assert bool(np.any((start.astype(np.uint64) <= t) & (t < end.astype(np.uint64))))
 
 
+class TestUncountedRootSection:
+    """§10.3's coverage-only contribution, on the committed ``uncounted/`` objects.
+
+    ``uncounted/`` is metadata only: the root objects the production sweep
+    writes over ``temporal/``'s leaf when that leaf carries no §10.6 record.
+    It is the one committed counted-cover block whose ``obs`` are 0 and whose
+    ``uncounted_shards`` is not — the zero-count grammar and the lower-bound
+    marker, pinned as bytes for a reader decoding from the spec and the
+    fixtures alone. ``temporal/`` is the same leaf read through its record:
+    the same buckets, exact counts, marker 0.
+    """
+
+    def _envelope(self, name="uncounted"):
+        return json.loads((SPEC_DATA / name / "coverage.moc").read_text())
+
+    def test_it_is_the_temporal_leaf_without_its_record(self):
+        exp = _expected("uncounted")
+        assert exp["source_fixture"] == "temporal"
+        assert exp["leaf_content_hash"] == FROZEN_COMBINED["temporal"]
+        # Metadata only: three root objects, no leaf of its own.
+        assert sorted(p.name for p in (SPEC_DATA / "uncounted").rglob("*")) == [
+            "coverage.moc",
+            "coverage.toc",
+            "morton_hive.json",
+        ]
+
+    def test_zero_counts_decode_through_the_native_grammar(self):
+        """§10.3 with the SPEC-TEXT recipe: `obs: 0` rows are legal and are kept."""
+        exp = _expected("uncounted")["root_coverage"]
+        section = self._envelope()["temporal"]
+        assert section["spec"] == exp["spec"] and section["fields"] == exp["fields"]
+        assert section["shards"] == exp["shards"]
+        block = section["counts"]
+        words = np.frombuffer(base64.b64decode(block["words"]), "<u8")
+        obs = np.frombuffer(base64.b64decode(block["obs"]), "<u8")
+        assert len(words) == len(obs) == block["count"] == len(exp["counts"]["words"]) > 0
+        np.testing.assert_array_equal(words, np.array(exp["counts"]["words"], dtype=np.uint64))
+        assert obs.tolist() == exp["counts"]["obs"] and not obs.any()
+        assert block["obs_total"] == exp["obs_total"] == 0
+        assert block["uncounted_shards"] == exp["uncounted_shards"] == 1
+        # zagg's own reader accepts the block and reports the marker.
+        counts = coverage_toc_counts(self._envelope())
+        np.testing.assert_array_equal(counts.words, words)
+        assert coverage_toc_uncounted(self._envelope()) == 1
+
+    def test_a_zero_count_bucket_is_still_occupied(self):
+        """ "Is there data" reads `words`; a reader keying on `obs > 0` loses it all."""
+        from mortie import toc_normalize
+
+        from zagg.coverage_toc import cover_words
+
+        exp = _expected("uncounted")
+        shard = exp["shard"]
+        uncounted = coverage_toc_counts(self._envelope())
+        exact = coverage_toc_counts(self._envelope("temporal"))
+        # One leaf, two readings: the same occupied buckets and the same
+        # tier-1 word, with the counts present only where the record is.
+        np.testing.assert_array_equal(uncounted.words, exact.words)
+        assert exact.obs.all() and not uncounted.obs.any()
+        assert coverage_toc(self._envelope()) == coverage_toc(self._envelope("temporal"))
+        # The §10.5 sibling is the key set, normalized — zero counts included.
+        cover = json.loads((SPEC_DATA / "uncounted" / "coverage.toc").read_text())
+        np.testing.assert_array_equal(cover_words(cover)[shard], toc_normalize(uncounted.words))
+        assert [str(int(w)) for w in cover_words(cover)[shard]] == exp["cover"]["words"]
+
+    def test_the_total_is_a_lower_bound_not_the_count(self):
+        exp = _expected("uncounted")["root_coverage"]
+        block = self._envelope()["temporal"]["counts"]
+        temporal = _expected("temporal")["root_coverage"]
+        assert block["obs_total"] < exp["clocked_obs"] == temporal["obs_total"]
+        assert temporal["uncounted_shards"] == 0  # ... where the same total is exact
+
+    def test_the_production_sweep_reproduces_it_and_writes_no_record(self, tmp_path):
+        import shutil
+
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_root_coverage
+        from zagg.sweep import run_sweep
+
+        exp = _expected("temporal")
+        root = tmp_path / "temporal"
+        shutil.copytree(SPEC_DATA / "temporal", root)
+        record = root / exp["leaf"] / "temporal.toc"
+        for path in (record, root / "coverage.moc", root / "coverage.toc"):
+            path.unlink()
+        leaves = [(int(morton_word(exp["shard"])), None)]
+        summary = run_sweep(str(root), leaves, families=["moc"], record=False)
+        assert summary["families"]["moc"]["temporal_routes"] == {"records": 0, "raw": 1}
+        assert not record.exists()
+        written = read_root_coverage(str(root))["temporal"]
+        committed = self._envelope()["temporal"]
+        assert written["shards"] == committed["shards"]
+        assert written["counts"] == committed["counts"]
+        cover = json.loads((SPEC_DATA / "uncounted" / "coverage.toc").read_text())
+        assert json.loads((root / "coverage.toc").read_text())["shards"] == cover["shards"]
+
+
 class TestDemotionAttrs:
     """§4.3 ``demotions``: the packed rail's record, on committed bytes (#518).
 
@@ -2242,3 +2409,322 @@ class TestDemotionAttrs:
         assert "h_tdigest_signal" not in dict(demoted.arrays())
         assert int(clean["composition"][:].astype("uint64").sum()) > 0
         assert int(demoted["composition"][:].astype("uint64").sum()) == 0
+
+
+class TestLeafTemporalRecord:
+    """§10.6 — the ``zagg-leaf-temporal/1`` record, on the committed leaf.
+
+    ``temporal/`` is the only fixture whose leaf carries one: every other
+    fixture declares no per-centroid field, and their leaves' LACK of the
+    object is the absence rule pinned as bytes
+    (``test_non_temporal_fixtures_carry_no_root_coverage_object``).
+    """
+
+    def _record(self):
+        exp = _expected("temporal")
+        return json.loads((_leaf_dir("temporal", exp) / exp["leaf_temporal"]["object"]).read_text())
+
+    def test_the_record_declares_the_10_6_grammar(self):
+        # The keys §10.6 REQUIRES, on committed bytes — spec text only, no
+        # zagg decoder: the object gates on its own marker, records its
+        # producer and the fields it folded, the pin and cap it wrote
+        # against, and two blocks self-describing their element bytes.
+        exp = _expected("temporal")["leaf_temporal"]
+        record = self._record()
+        assert record["spec"] == exp["spec"] == "zagg-leaf-temporal/1"
+        assert record["source"] == exp["source"] == "worker"
+        assert record["fields"] == exp["fields"] == ["h_tdigest"]
+        assert record["temporal_order"] == exp["temporal_order"] == 24
+        assert record["cap"] == exp["cap"] == 512
+        assert (
+            record["n_obs"] == exp["n_obs"] == _expected("temporal")["root_coverage"]["obs_total"]
+        )
+        counts = record["counts"]
+        assert counts["temporal_order"] == 24 and counts["cap"] == 512
+        assert counts["element"] == {"dtype": "uint64", "shape": [-1]}
+        assert counts["encoding"] == "base64"
+        words = np.frombuffer(base64.b64decode(counts["words"]), "<u8")
+        obs = np.frombuffer(base64.b64decode(counts["obs"]), "<u8")
+        assert len(words) == len(obs) == counts["count"] == exp["counts"]["count"]
+        assert [str(int(w)) for w in words] == exp["counts"]["words"]
+        assert obs.tolist() == exp["counts"]["obs"]
+        assert counts["obs_total"] == int(obs.sum()) == record["n_obs"]
+        cover = record["cover"]
+        assert cover["element"] == {"dtype": "uint64", "shape": [-1]}
+        assert cover["encoding"] == "base64"
+        assert "temporal_order" not in cover  # absence means the record's pin
+        raw = base64.b64decode(cover["words"])
+        assert len(raw) == 8 * cover["count"] == 8 * exp["cover"]["count"]
+        assert [str(int(w)) for w in np.frombuffer(raw, "<u8")] == exp["cover"]["words"]
+
+    def test_the_word_is_the_root_shard_word(self):
+        # §10.6: the join is a semilattice, so the leaf's word — folded on the
+        # worker over per-observation instants — equals the §10.2 word the
+        # sweep derives from the leaf's per-centroid companions.
+        exp = _expected("temporal")
+        record = self._record()
+        assert record["word"] == exp["leaf_temporal"]["word"]
+        assert record["word"] == exp["root_coverage"]["shards"][exp["shard"]]
+        envelope = json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
+        assert record["word"] == str(coverage_toc(envelope)[exp["shard"]])
+
+    def test_the_cover_is_the_counts_key_set_normalized(self):
+        # §10.3's derivation law on committed bytes: normalize the counts'
+        # words and you have the cover — spec text only, mortie's normalize.
+        from mortie import toc_normalize
+
+        record = self._record()
+        words = np.frombuffer(base64.b64decode(record["counts"]["words"]), "<u8")
+        cover = np.frombuffer(base64.b64decode(record["cover"]["words"]), "<u8")
+        np.testing.assert_array_equal(np.asarray(toc_normalize(words), np.uint64), cover)
+
+    def test_the_reader_decodes_it_and_the_parity_holds(self):
+        from mortie import from_datetime64, toc_overlaps, toc_reduce
+
+        from zagg.coverage_toc import quantize_words
+        from zagg.leaf_temporal import (
+            cover_from_counts,
+            leaf_temporal_contribution,
+            load_leaf_temporal,
+        )
+
+        exp = _expected("temporal")
+        record = load_leaf_temporal(self._record())
+        assert record is not None
+        word, counts = leaf_temporal_contribution(record)
+        assert word == int(exp["leaf_temporal"]["word"])
+        assert int(counts.obs.sum()) == exp["leaf_temporal"]["n_obs"]
+        cover, _order = cover_from_counts(counts)
+        assert [str(int(w)) for w in cover] == exp["leaf_temporal"]["cover"]["words"]
+        assert int(toc_reduce(cover)) == int(toc_reduce(quantize_words([word])))
+        # Contains every real observation span the cell plan records, and
+        # keeps the gap the fixture's two clusters leave (§10.5's law, per leaf).
+        for cell in exp["cells"]:
+            span = np.array(cell["obs_span_ns"], dtype="int64").astype("datetime64[ns]")
+            lo, hi = (int(w) for w in from_datetime64(span))
+            assert bool(np.any(np.atleast_1d(toc_overlaps(cover, lo, hi + 1))))
+        gap_lo, gap_hi = (int(t) for t in exp["cover"]["gap_ns"])
+        assert not bool(np.any(np.atleast_1d(toc_overlaps(cover, gap_lo, gap_hi))))
+
+    def test_the_record_is_not_a_zarr_member(self):
+        # Like the bitmap sidecar: a foreign key inside the vanilla leaf that
+        # zarr's member enumeration warn-skips, never a data read failure.
+        import warnings
+
+        import zarr
+
+        exp = _expected("temporal")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            group = zarr.open_group(_leaf_store("temporal", exp), path="", mode="r", zarr_format=3)
+            members = [name for name, _ in group.members(max_depth=None)]
+        assert exp["leaf_temporal"]["object"] not in {m.rsplit("/", 1)[-1] for m in members}
+        assert any(exp["leaf_temporal"]["object"] in str(w.message) for w in caught)
+
+
+class TestVersionedLeaf:
+    """§1.5 versioned leaves: the pointer root and the version subgroup, decoded
+    from the on-disk JSON alone (a spec-text reader never imports zagg)."""
+
+    NAME = "versioned"
+
+    def _root_stamp(self):
+        exp = _expected(self.NAME)
+        root = SPEC_DATA / self.NAME / exp["pointer"]
+        attrs = json.loads((root / "zarr.json").read_text())["attributes"]
+        return exp, root, attrs["morton_hive_commit"]
+
+    def test_the_root_is_a_pointer_stamp(self):
+        exp, root, stamp = self._root_stamp()
+        assert stamp["current"] == exp["version"]
+        assert exp["version"].startswith(f"run-{exp['run_id']}-")
+        assert exp["leaf"] == f"{exp['pointer']}/{exp['version']}"
+        # The stamp is otherwise a legacy stamp: no new spec token (the
+        # ``/3`` dialect is D23's), complete, hashes keyed as a legacy leaf's.
+        assert stamp["spec"] == "morton-hive/1" and stamp["complete"] is True
+        assert set(stamp["content_hashes"]["arrays"]) == set(exp["content_hashes"]["arrays"])
+        # Nothing but the pointer and its version live at the root.
+        assert sorted(p.name for p in root.iterdir()) == sorted(["zarr.json", exp["version"]])
+        assert not (root / exp["group"]).exists()
+
+    def test_the_version_carries_its_own_stamp(self):
+        exp, root, pointer = self._root_stamp()
+        version = json.loads((root / exp["version"] / "zarr.json").read_text())["attributes"][
+            "morton_hive_commit"
+        ]
+        assert "current" not in version
+        assert version == {k: v for k, v in pointer.items() if k != "current"}
+        # The arrays and the coverage sidecar are the version's.
+        assert (root / exp["version"] / exp["group"] / "count" / "zarr.json").exists()
+        assert (root / exp["version"] / "coverage.moc").exists()
+
+    def test_the_one_reader_rule(self):
+        # Open the root, follow ``current`` when named, else read the root:
+        # the same recipe resolves ``minimal/`` (legacy) and ``versioned/``.
+        for name in ("minimal", self.NAME):
+            exp = _expected(name)
+            root = SPEC_DATA / name / exp.get("pointer", exp["leaf"])
+            stamp = json.loads((root / "zarr.json").read_text())["attributes"]["morton_hive_commit"]
+            data = root / stamp["current"] if stamp.get("current") else root
+            assert data == SPEC_DATA / name / exp["leaf"]
+            count = zarr.open_array(LocalStore(str(data)), path=f"{exp['group']}/count", mode="r")
+            assert int(count[:].sum()) == sum(c["count"] for c in exp["cells"])
+
+
+class TestDerivedCellCoordinate:
+    """§1.5 "The cell coordinate" — a windowed leaf stores no ``morton`` array.
+
+    Pinned on the committed ``windowed/`` leaf (issue #586 phase 3): the
+    array is absent, the §5 key set has no entry for it, and the words a
+    reader must DERIVE — the shard's children at the cell order, in nested
+    order — are the fixture's recorded ones, reproduced here three ways:
+    through mortie, through the strided arithmetic the law reduces to at
+    ``cell_order <= 27``, and through the shipping readers. The located
+    sibling is what holds the derivation against committed bytes.
+    """
+
+    NAME = "windowed"
+
+    def test_the_leaf_stores_no_coordinate(self):
+        exp = _expected(self.NAME)
+        group = _leaf_dir(self.NAME, exp) / exp["group"]
+        assert sorted(p.name for p in group.iterdir() if p.is_dir()) == [
+            "count",
+            "h_tdigest",
+            "h_tdigest_locations",
+        ]
+        # The dggs block still NAMES the coordinate; it is derived, not stored.
+        attrs = json.loads((group / "zarr.json").read_text())["attributes"]
+        assert attrs["dggs"]["coordinate"] == "morton"
+        assert attrs["dggs"]["refinement_level"] == exp["cell_order"]
+
+    def test_the_stamp_is_windowed_and_its_key_set_has_no_coordinate(self):
+        exp = _expected(self.NAME)
+        stamp = json.loads((_leaf_dir(self.NAME, exp) / "zarr.json").read_text())["attributes"][
+            "morton_hive_commit"
+        ]
+        assert stamp["spec"] == "morton-hive/2" and stamp["window"] == exp["window"]
+        assert Path(exp["leaf"]).name == f"{exp['shard']}_{exp['window']}.zarr"
+        # §5.3: the stamp's copy and the fixture's record are one key set,
+        # and `{cell_order}/morton` is not in it.
+        assert stamp["content_hashes"] == exp["content_hashes"]
+        assert sorted(exp["content_hashes"]["arrays"]) == [
+            "6/count",
+            "6/h_tdigest",
+            "6/h_tdigest_locations",
+        ]
+        assert (
+            TestContentHashes._hash_leaf(_leaf_dir(self.NAME, exp))
+            == (exp["content_hashes"]["arrays"])
+        )
+        assert exp["content_hashes"]["combined"] == FROZEN_COMBINED[self.NAME]
+
+    def test_the_unwindowed_fixtures_still_store_theirs(self):
+        # The other half of the rule: every unwindowed leaf keeps its array,
+        # key and bytes — no committed fixture moved (the FROZEN literals
+        # above are the byte pin; this is the presence pin).
+        for name in (*FIXTURES, "flux", "temporal", "raster_toc"):
+            exp = _expected(name)
+            assert (_leaf_dir(name, exp) / exp["group"] / "morton" / "zarr.json").exists()
+            assert f"{exp['group']}/morton" in exp["content_hashes"]["arrays"]
+
+    def test_the_derivation_law_reproduces_the_recorded_words(self):
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import cell_words, morton_word
+
+        exp = _expected(self.NAME)
+        want = np.array([int(w) for w in exp["derivation"]["words"]], dtype=np.uint64)
+        shard = morton_word(exp["shard"])
+        assert shard == int(exp["shard_word"])
+        # The law, in mortie's terms: cell j is the shard's j-th child.
+        np.testing.assert_array_equal(
+            np.asarray(generate_morton_children(shard, exp["cell_order"]), dtype=np.uint64), want
+        )
+        np.testing.assert_array_equal(cell_words(shard, exp["cell_order"]), want)
+        # ... and the arithmetic it reduces to at cell_order <= 27, from the
+        # spec text alone: one stride of 2**(60 - 2c) from the first child,
+        # and the first child is the shard word plus (c - p).
+        assert int(want[0]) - shard == exp["cell_order"] - exp["shard_order"]
+        stride = 2 ** (60 - 2 * exp["cell_order"])
+        assert int(exp["derivation"]["stride"]) == stride
+        assert [int(want[0]) + j * stride for j in range(len(want))] == [int(w) for w in want]
+        for cell in exp["cells"]:
+            assert int(want[cell["index"]]) == int(cell["morton"])
+
+    def test_the_order_19_instance_is_one_stride_in_both_hemispheres(self):
+        # The production geometry (order-9 shards, order-19 cells): 4,194,304
+        # between consecutive cells across the whole shard. The southern
+        # shard's word sets bit 63 — the case a signed reader gets wrong.
+        from zagg.grids.morton import cell_words, morton_word
+
+        pins = _expected(self.NAME)["derivation"]["order19"]
+        assert sorted(p["bit63"] for p in pins) == [0, 1]
+        for pin in pins:
+            word = morton_word(pin["shard"])
+            assert word == int(pin["shard_word"]) and word >> 63 == pin["bit63"]
+            words = cell_words(word, 19)
+            assert words.dtype == np.uint64 and len(words) == pin["n_cells"] == 4**10
+            assert int(pin["stride"]) == 4_194_304 == 2 ** (60 - 2 * 19)
+            assert int(words[0]) == int(pin["first"]) and int(words[-1]) == int(pin["last"])
+            assert int(pin["first"]) - int(pin["shard_word"]) == 19 - 9  # word[0] = shard + (c - p)
+            expected = np.uint64(int(pin["first"])) + np.arange(4**10, dtype=np.uint64) * np.uint64(
+                4_194_304
+            )
+            np.testing.assert_array_equal(words, expected)
+
+    def test_every_location_word_lies_inside_its_derived_cell(self):
+        # The check that needs no stored coordinate: decode each word's own
+        # order (they are heterogeneous, §2.2) and take its ancestor at the
+        # cell order. Stated twice — mortie's clip, and the decimal-prefix
+        # rule ("a string prefix is the spatial ancestor").
+        from mortie import clip2order, orders_of
+
+        from zagg.grids.morton import morton_decimal, words_in_cell
+
+        exp = _expected(self.NAME)
+        store = _leaf_store(self.NAME, exp)
+        orders_seen = set()
+        for cell in exp["cells"]:
+            words = read_cell(store, f"{exp['group']}/h_tdigest_locations", cell["index"])
+            np.testing.assert_array_equal(
+                words, np.array(cell["h_tdigest_locations"], dtype=np.uint64)
+            )
+            derived = int(cell["morton"])
+            orders = [int(o) for o in orders_of(words)]
+            assert orders == cell["location_orders"] and min(orders) >= exp["cell_order"]
+            orders_seen.update(orders)
+            assert (clip2order(exp["cell_order"], words) == np.uint64(derived)).all()
+            assert words_in_cell(words, derived).all()
+            prefix = morton_decimal(derived)
+            assert all(morton_decimal(int(w)).startswith(prefix) for w in words)
+            # A neighbouring cell's word is NOT this cell's: the check bites.
+            other = int(exp["derivation"]["words"][(cell["index"] + 1) % 16])
+            assert not words_in_cell(words, other).any()
+        assert len(orders_seen) > 1  # heterogeneous on committed bytes
+
+    def test_the_shipping_readers_derive_the_chunk_words(self):
+        # No stored coordinate to read: the readers derive it from the leaf's
+        # own stamp, and report the same read-chunk ids a stored one gives.
+        from mortie import clip2order
+
+        from zagg.readers.tdigest_tensor import cell_index as resolve_index
+
+        exp = _expected(self.NAME)
+        store = _leaf_store(self.NAME, exp)
+        derived = np.array([int(w) for w in exp["derivation"]["words"]], dtype=np.uint64)
+        chunk_words = clip2order(exp["chunk_order"], derived)
+        per_chunk = exp["cells_per_chunk"]
+        rows = list(read_locations(store, f"{exp['group']}/h_tdigest"))
+        assert len(rows) == len(exp["cells"])
+        got = {}
+        for word, (row, col), locs in rows:
+            index = resolve_index(store, f"{exp['group']}/h_tdigest", word, row, col)
+            assert int(chunk_words[index]) == word and index // per_chunk != exp["empty_chunk"]
+            got[index] = [str(int(w)) for w in locs]
+        assert got == {c["index"]: c["h_tdigest_locations"] for c in exp["cells"]}
+        # The empty chunk is in the stored span but holds no payload: its id
+        # resolves to nothing, as it does under a stored coordinate.
+        empty = int(chunk_words[exp["empty_chunk"] * per_chunk])
+        with pytest.raises(ValueError, match="no stored read chunk"):
+            resolve_index(store, f"{exp['group']}/h_tdigest", empty, 0, 0)

@@ -59,6 +59,16 @@ Event payload (default / process mode):
         holding a synchronous connection open while the shard runs. Written
         with the output-store credentials. Absent -> no write, and the event
         and behavior are byte-identical to the synchronous path.
+    "skip_if_current": bool (optional, issue #388, hive only) -- arms the
+        leaf identity gate: a unit whose (semantic_hash, granule-id set)
+        matches its leaf's sidecar writes nothing and returns
+        {"current": true, ...} (plus "icechunk_dirty" when its touch rewrote
+        the ladder ref sidecar, issue #580); a contraction returns
+        {"refused": true, ...}. Neither carries a stats record. Absent -> the
+        unconditional rewrite.
+    "semantic_hash": str (sent with skip_if_current) -- the RUN config's D19
+        digest the gate compares against,
+    "allow_contraction": bool (optional, issue #388) -- rewrite a refused unit.
 }
 
 Setup mode (creates the zarr template once before per-cell fan-out; for a
@@ -89,8 +99,10 @@ writes the raster (time, cells) template instead, from a synchronous invoke):
         owns the global timestep index and threads it here so the template
         write needs no S3 access from the dispatcher.
     "run_manifest": dict (optional, issue #327) -- {"run_id", "shards"
-        (decimal shard-key strings), "semantic_hash", "dispatched_at",
-        "dataset"} dispatch identity: on a successful setup the worker writes
+        (decimal shard-key strings; null, with a "shards_omitted" count, on
+        a large run's slim block -- issue #588), "semantic_hash",
+        "dispatched_at", "dataset"} dispatch identity: on a successful setup
+        the worker writes
         it (plus this event's "config") as
         "<store>.status/run-<run_id>/manifest.json" -- what Run.attach
         rebuilds a handle from (D8: the dispatcher never writes). Fail-open;
@@ -158,6 +170,22 @@ end of run, like coverage mode; also invocable ad hoc):
                                   #   decimals (role="stage")
           "batch": int,           # which batch of that tuple this is; names
                                   #   the record object (role="stage")
+          "unit": "window" | "close",  # optional, role="stage" (issue #586):
+                                  #   which of the nodes' stage units this
+                                  #   invoke runs -- ONE window's fold (named
+                                  #   by "window"), or the per-node close that
+                                  #   follows a node's window units (the
+                                  #   all-time fold). Absent -> the nodes
+                                  #   whole: every window, then the close,
+                                  #   serially -- an unwindowed store's one
+                                  #   unit per node
+          "window": str,          # the window label; REQUIRED with
+                                  #   unit="window", refused otherwise
+          "pipeline_run_id": str, # optional, both roles (issue #593): the
+                                  #   PIPELINE run this sweep completes,
+                                  #   recorded in the stage records beside the
+                                  #   sweep's own run_id. Absent -> null, which
+                                  #   vouches for no run
           "tuple_width": int,     # optional; defaults to
                                   #   zagg.sweep_stage.DEFAULT_TUPLE_WIDTH, the one
                                   #   source the CLI path uses too -- a copied
@@ -186,6 +214,10 @@ end of run, like coverage mode; also invocable ad hoc):
         SAME "leaves"/"discover" keys the families arm uses -- a stage invoke
         is sent only the slice under its own nodes, so the batching that keeps
         "nodes" under the async cap keeps "leaves" under it too.
+    "dirt_only": [[shard_key, window-or-null], ...] (optional, issue #580,
+        role="stage") -- leaves whose data is current but whose Icechunk ref
+        sidecar was rewritten; their nodes re-gather refs without a fold.
+        Absent -> none.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -206,6 +238,45 @@ the dispatcher at end of run, like coverage mode):
         run's tail-completion marker on success (the v2 status prefix's
         tail.json); a reattached handle (Run.attach) then skips a tail that
         already ran. Fail-open; absent -> no write, byte-identical.
+    "output_credentials": dict (optional, same shape as process mode),
+}
+
+Icechunk-init mode (issue #580, spec §11 — the once-per-run companion-repo
+init; one synchronous RequestResponse invoke from the dispatcher after the
+ping and BEFORE the fan-out, so every leaf's refs commit finds the array
+nodes; idempotent, fail-open at the dispatcher):
+{
+    "mode": "icechunk_init",
+    "store_path": str,
+    "config": dict,             # same single-source config as setup/ping
+    "parent_order": int (optional, same meaning as setup),
+    "run_id": str,              # stamped into the "init {run_id}" commit
+    "rows": [str, ...] (optional) -- the run's row labels (issue #584, spec
+        §11.2), allocated by this init in order of first appearance; an
+        unwindowed run sends ["all"]. Absent/empty -> an unwindowed store
+        still gets its one "all" row.
+    "output_credentials": dict (optional, same shape as process mode),
+}
+
+Icechunk-finalize mode (issue #582, spec §11.4 — the once-per-run close; one
+synchronous RequestResponse invoke from the dispatcher AFTER every commit of
+the run landed, i.e. after the staged sweep returned; fail-open at the
+dispatcher; idempotent — an existing run tag is returned, nothing rewritten):
+{
+    "mode": "icechunk_finalize",
+    "store_path": str,
+    "config": dict,             # same single-source config; retain_runs read here
+        (absent under operator_checks: the worker reads the run's manifest)
+    "run_id": str,              # the tag is "run-{run_id}"
+    "icechunk_init": dict (optional) -- the run's init record; its
+        split_ratchet is reported back as rewrite_pending,
+    "newest_only": bool (optional) -- finalize only while the run is the
+        repo's newest (Run.attach, the operator finalize); else {"skipped"},
+    "operator_checks": bool (optional, issue #588) -- the operator's
+        `icechunk_ops finalize`: no "config" in the event; the worker reads
+        the run's dispatch manifest for it and checks the run's init commit
+        and its newest staged-sweep record before a newest_only finalize. A
+        failed check is a 200 {"ok": false, "refused": reason},
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -688,6 +759,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     ``mode="ping"`` is the hive pre-fan-out preflight (issue #252);
     ``mode="coverage"`` writes the store-root ``coverage.moc`` (issue #200);
     ``mode="sweep"`` folds the D22 rollup families worker-side (issue #300);
+    ``mode="icechunk_init"`` creates-or-opens the order's Icechunk companion
+    repo before the fan-out (issue #580); ``mode="icechunk_finalize"`` tags
+    the run's tip after every commit landed (issue #582);
     ``mode="extract"`` extracts chunk-boundary geometry parquets (issue #148);
     ``mode="process_event"`` runs the temporal/event worker (issue #12).
     """
@@ -716,6 +790,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return _handle_sweep(event)
     if mode == "stats":
         return _handle_stats(event)
+    if mode == "icechunk_init":
+        return _handle_icechunk_init(event)
+    if mode == "icechunk_finalize":
+        return _handle_icechunk_finalize(event)
     # Extract mode returns directly: the result_url mirror below is for the
     # per-unit fan-out handlers (spatial process, temporal process_event) only.
     if mode == "extract":
@@ -1321,7 +1399,7 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 #: The per-stage counts the stage arm's envelope totals for a driver.
-_STAGE_COUNTS = ("written", "current", "failed", "under_covered")
+_STAGE_COUNTS = ("written", "current", "failed", "under_covered", "icechunk_regathered")
 
 
 def _stage_body(
@@ -1362,6 +1440,8 @@ def _stage_body(
         "run_id": block.get("run_id"),
         "dispatch": out.get("dispatch"),
         "batch": out.get("batch"),
+        "unit": block.get("unit"),
+        "window": block.get("window"),
         "n_nodes": out.get("n_nodes"),
         "n_leaves": n_leaves,
         "stage_records": out.get("stage_records"),
@@ -1437,6 +1517,7 @@ def _handle_stage_sweep(
                 # place that can say the per-level actuals may be short.
                 barrier_timed_out=bool(block.get("barrier_timed_out")),
                 store_kwargs=store_kwargs,
+                pipeline_run_id=block.get("pipeline_run_id"),
             )
         elif role == "stage":
             out = run_stage_worker(
@@ -1452,6 +1533,12 @@ def _handle_stage_sweep(
                 records_from=block.get("records_from"),
                 lease_ttl_s=block.get("lease_ttl_s"),
                 store_kwargs=store_kwargs,
+                dirt_only=[(int(k), w) for k, w in event.get("dirt_only") or []],
+                # The (node, window) stage unit (issue #586 phase 4) and the
+                # pipeline run the sweep completes (issue #593).
+                unit=block.get("unit"),
+                window=block.get("window"),
+                pipeline_run_id=block.get("pipeline_run_id"),
             )
         else:
             raise ValueError(f"unknown stage role {role!r} (expected 'stage' or 'finisher')")
@@ -1483,6 +1570,133 @@ def _handle_stage_sweep(
                     error=e,
                 )
             ),
+        }
+
+
+def _handle_icechunk_init(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Create-or-open the shard order's Icechunk companion repo (issue #580, spec §11).
+
+    One synchronous ``RequestResponse`` invoke per run, posted by the
+    dispatcher after the ping and BEFORE the fan-out (the dispatcher never
+    writes, D8; every leaf's refs commit needs the array nodes to exist).
+    Idempotent — an initialized repo is reopened, never re-templated — so a
+    rerun into an existing store is a no-op commit-wise. The grid comes from
+    the same forwarded ``config`` (+ ``parent_order``) the workers fan out
+    on, so the repo's array model cannot drift from the leaf template. The
+    body echoes :func:`zagg.icechunk_refs.init_repo`'s record (repo ``path``,
+    ``snapshot``, ``created``, ``split``, ``rows``); a 500 carries the error and the
+    dispatcher treats either failure fail-open (the leaves never depend on
+    the index).
+    """
+    logger.info(f"Icechunk init mode: repo for {event.get('store_path')}")
+    try:
+        from zagg.grids import from_config
+        from zagg.icechunk_refs import init_repo
+
+        config = load_config_from_dict(event["config"])
+        grid = from_config(config, parent_order=event.get("parent_order"))
+        # The one repo, every level the ladder commits into — the base group
+        # plus one per declared overview order (phase 6) — so no stage node
+        # ever has to create anything.
+        record = init_repo(
+            event["store_path"],
+            grid,
+            config,
+            # Required, not defaulted: §11.4 fixes the commit grammar as
+            # ``init {run_id}``, and an unattributable commit cannot be
+            # rewritten out of the repo's permanent ancestry. Both dispatchers
+            # always send one; a hand-rolled or older event 500s through the
+            # except below, which is the case where identifying the commit
+            # matters most.
+            run_id=str(event["run_id"]),
+            store_kwargs=_output_store_kwargs(event),
+            # The run's row labels (issue #584, spec §11.2): allocated here,
+            # once, before the fan-out, so every commit of the run finds its
+            # row. An older dispatcher sends none; an unwindowed store's one
+            # ``all`` row is allocated regardless.
+            rows=event.get("rows"),
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "icechunk_init", **record}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "icechunk_init"}),
+        }
+
+
+def _handle_icechunk_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Tag the run's tip and apply retention on the companion repo (issue #582, spec §11.4).
+
+    The closing bracket of :func:`_handle_icechunk_init`: one synchronous
+    invoke per run, posted by the dispatcher AFTER the staged sweep returned
+    (its finisher makes the last ladder commit) or, under ``commit: "leaf"``,
+    after the fan-out drained — never by a stage node (tags, expiry and GC are
+    singleton repo operations). The ``semantic_hash`` in the commit metadata
+    is computed here from the same forwarded ``config`` the workers ran on,
+    so it cannot drift from what the leaves were stamped with. The body
+    echoes :func:`zagg.icechunk_finalize.finalize_repo`'s record; a 500
+    carries the error and the dispatcher treats either fail-open.
+
+    ``operator_checks`` (the operator's ``python -m zagg.icechunk_ops <store>
+    finalize <run_id>``, issue #588): the event carries no ``config``. The
+    worker runs :func:`zagg.icechunk_ops.finalize_run` — the config off the
+    run's dispatch manifest, the run's init commit, the newest staged-sweep
+    record since it, then the finalize ``newest_only`` — so the operator's
+    host neither reads the repo nor writes. A precondition that does not
+    hold is a 200 ``{"ok": false, "refused": reason}``, nothing written.
+    Without the flag ``config`` is required as before: an event with neither
+    500s on the missing key before any write, which is what a worker that
+    predates the flag does with the operator's event.
+    """
+    logger.info(f"Icechunk finalize mode: repo for {event.get('store_path')}")
+    try:
+        from zagg.icechunk_finalize import finalize_repo, resolve_retain_runs
+        from zagg.semantics import semantic_hash
+
+        if event.get("operator_checks"):
+            from zagg.icechunk_ops import FinalizeRefusedError, finalize_run
+
+            try:
+                record = finalize_run(
+                    event["store_path"],
+                    str(event["run_id"]),
+                    store_kwargs=_output_store_kwargs(event),
+                )
+            except FinalizeRefusedError as e:
+                logger.warning(f"Icechunk finalize refused: {e}")
+                body = {"ok": False, "mode": "icechunk_finalize", "refused": str(e)}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"ok": True, "mode": "icechunk_finalize", **record}),
+            }
+        config = load_config_from_dict(event["config"])
+        init = event.get("icechunk_init") or {}
+        record = finalize_repo(
+            event["store_path"],
+            # Required like init's: the tag is ``run-{run_id}`` and an
+            # unattributable one could never be matched to a run record.
+            run_id=str(event["run_id"]),
+            semantic_hash=semantic_hash(config),
+            retain_runs=resolve_retain_runs(config),
+            store_kwargs=_output_store_kwargs(event),
+            split_ratchet=init.get("split_ratchet") if isinstance(init, dict) else None,
+            # ``Run.attach``'s finalize: only while the run is the newest.
+            newest_only=bool(event.get("newest_only")),
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "mode": "icechunk_finalize", **record}),
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "icechunk_finalize"}),
         }
 
 
@@ -1529,6 +1743,9 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
             # defers a finalize failure through its tail, so this is where the
             # failure becomes durable. Absent on a pre-#335 dispatcher -> None.
             finalize_error=event.get("finalize_error"),
+            # Run-level companion init record (issue #580); absent on a
+            # pre-#580 dispatcher -> both columns null.
+            icechunk_init=event.get("icechunk_init"),
         )
         # Tail-completion marker (issue #327): the stats leg is the recorded
         # end of the post-run tail, so a reattached handle can skip a tail
@@ -1793,6 +2010,9 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
             # inside stays gated on ``profile`` (raster.py).
             if "phase_timings" in meta:
                 body["phase_timings"] = meta["phase_timings"]
+            # Invocation wall to the record (issue #589; uniform column with
+            # the point path — a raster ``duration_s`` already spans the write).
+            body["duration_total_s"] = time.time() - start_time
             # Per-shard stats record (issue #297): envelope ride + the leaf
             # sidecar (only when the unit wrote a leaf — ``leaf_written`` is the
             # accurate signal, set iff a slab streamed and the leaf was stamped;
@@ -1928,6 +2148,7 @@ def _handle_process_raster(event: Dict[str, Any]) -> Dict[str, Any]:
         }
         if profile:
             body["phase_timings"]["stages"] = stage_stats
+        body["duration_total_s"] = time.time() - start_time  # issue #589, as above
         # Stats record (issue #297): envelope ride only — a flat store has no
         # per-shard leaf for a sidecar sibling (see the PR #302 discussion).
         from zagg.telemetry import build_record, lambda_env, raster_granule_ids
@@ -1991,6 +2212,9 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # process-cumulative (like ``ru_maxrss``), so snapshot at entry and diff at
     # the telemetry stamp below for THIS invocation's user+sys seconds.
     cpu_t0 = os.times()
+    # Invocation wall clock (issue #589): entry -> the stats record, so the
+    # billed duration covers the write side ``duration_s`` stops before.
+    t_entry = time.time()
 
     try:
         # Validate required parameters. ``child_order`` is HEALPix-specific and
@@ -2113,6 +2337,21 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # response body (this metadata) then carries time_range back
                 # for the dispatcher's root-summary union.
                 window=event.get("window"),
+                # Bulk multi-window shard unit (issue #586 phase 2): every
+                # window the shard's granules span, emitted from one read;
+                # the body then carries one metadata dict per window under
+                # ``windows`` and the records below go one per emitted leaf.
+                windows=event.get("windows"),
+                # Leaf skip-if-current (issue #388): armed only when the
+                # dispatcher sends the key (with the RUN config's D19 digest),
+                # exactly where the local backend arms it; absent -> rewrite.
+                skip_if_current=bool(event.get("skip_if_current")),
+                allow_contraction=bool(event.get("allow_contraction")),
+                semantic_hash=event.get("semantic_hash"),
+                # Versioned leaves (issue #582, spec §1.5): the run identity
+                # names the version subgroup; an event without one (a
+                # hand-rolled or older dispatcher) writes a legacy leaf.
+                run_id=event.get("run_id"),
             )
         else:
             # Flat layout: lazy store + one-time template check, opened on the
@@ -2239,6 +2478,10 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         metadata["cpu_seconds"] = round(
             (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system), 3
         )
+        # Whole-invocation wall (issue #589): ``duration_s`` is the worker's
+        # read + index + aggregate clock, stamped before the leaf write, hash,
+        # column fold and refs commit — this is what the record prices from.
+        metadata["duration_total_s"] = time.time() - t_entry
 
         # Per-shard stats record (issue #297): rides the response envelope
         # (``body["stats"]``) so the dispatcher builds the run parquet with no
@@ -2248,41 +2491,82 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # verbatim from the invoke payload (the dispatcher resolves it; the
         # worker cannot). Fail-open: a sidecar PUT failure never fails a shard
         # whose data landed — the record still rides the envelope.
-        from zagg.telemetry import build_record, lambda_env, write_sidecar
+        from zagg.telemetry import build_record, lambda_env, window_metas, write_sidecar
 
-        record = build_record(
-            shard_key=int(shard_key),
-            metadata=metadata,
-            granule_ids=event.get("granule_urls"),
-            invoked_by=event.get("invoked_by"),
-            run_id=event.get("run_id"),
-            window=(event.get("window") or {}).get("label"),
-            lambda_config=lambda_env(),
-        )
-        metadata["stats"] = record
-        if get_store_layout(config) == "hive" and not metadata.get("error"):
+        # A current/refused unit (issue #388) wrote nothing: no record, no
+        # sidecar, no sub-map -- clobbering its good sidecar with a zero-count
+        # record is exactly what the gate exists to prevent (issue #401).
+        # A bulk multi-window shard unit (issue #586) records one leaf per
+        # window it emitted, each from its own metadata (``windows``) and its
+        # own granule subset (``windows[i].granules`` indexes granule_urls);
+        # the invoke-level telemetry stamped above rides every leaf's record,
+        # and ``body["stats"]`` is then the LIST of records. Skipped windows
+        # record nothing, as a skipped unit does.
+        skipped = metadata.get("current") or metadata.get("refused")
+        bulk = "windows" in metadata
+        granule_urls = event.get("granule_urls") or []
+        by_label = {w["label"]: w for w in event.get("windows") or []}
+
+        def _unit_granules(m):
+            w = by_label.get(m.get("window")) if bulk else None
+            if w is None or w.get("granules") is None:
+                return granule_urls
+            return [granule_urls[i] for i in w["granules"]]
+
+        recorded = []
+        for m in [] if skipped else window_metas(metadata):
+            if m.get("current") or m.get("refused"):
+                continue
+            if m is not metadata:
+                # ``duration_total_s`` (issue #589) with them: the billed wall
+                # is the invoke's, so each leaf's record prices from it and a
+                # roll-up counts it once per ``(run_id, shard_key)``.
+                for key in ("max_memory_mb", "container_hwm_mb", "cpu_seconds", "duration_total_s"):
+                    m[key] = metadata[key]
+            label = m.get("window") if bulk else (event.get("window") or {}).get("label")
+            m["stats"] = build_record(
+                shard_key=int(shard_key),
+                metadata=m,
+                granule_ids=_unit_granules(m),
+                invoked_by=event.get("invoked_by"),
+                run_id=event.get("run_id"),
+                window=label,
+                lambda_config=lambda_env(),
+            )
+            recorded.append((m, label))
+        if bulk:
+            metadata["stats"] = [m["stats"] for m, _label in recorded]
+        if get_store_layout(config) == "hive":
             from zagg.hive import shard_leaf_path
 
-            try:
-                window = event.get("window")
-                leaf = shard_leaf_path(
-                    store_path, int(shard_key), window=window["label"] if window else None
-                )
-                write_sidecar(leaf, record, **_output_store_kwargs(event))
-            except Exception as e:
-                logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
-            # Leaf sub-map (issue #300, D22): full ShardMap JSON next to the
-            # stats sidecar. The event's bare granule_urls can't reconstruct
-            # the ShardMap entries, so the dispatcher threads them (plus the
-            # catalog identity) in the size-gated ``submap`` block; absent
-            # (old dispatcher, or dropped for the async cap) -> no write.
-            submap = event.get("submap")
-            if submap:
+            for m, label in recorded:
+                if m.get("error"):
+                    continue
+                try:
+                    leaf = shard_leaf_path(store_path, int(shard_key), window=label)
+                    write_sidecar(leaf, m["stats"], **_output_store_kwargs(event))
+                except Exception as e:
+                    logger.warning(f"stats sidecar write failed (fail-open, issue #297): {e}")
+                # Leaf sub-map (issue #300, D22): full ShardMap JSON next to
+                # the stats sidecar. The event's bare granule_urls can't
+                # reconstruct the ShardMap entries, so the dispatcher threads
+                # them (plus the catalog identity) in the size-gated
+                # ``submap`` block; absent (old dispatcher, or dropped for the
+                # async cap) -> no write. A bulk window's sub-map holds the
+                # entries of its own granule subset, matched by the href the
+                # worker read (the driver's endpoint, as _resolve_urls picks).
+                submap = event.get("submap")
+                if not submap:
+                    continue
                 try:
                     from zagg.sweep import submap_emittable, write_leaf_submap
 
-                    window = event.get("window")
                     granules = submap.get("granules") or []
+                    if bulk:
+                        hrefs = {u["url"] if isinstance(u, dict) else u for u in _unit_granules(m)}
+                        driver = (config.data_source or {}).get("driver", "s3")
+                        key = "https" if driver == "https" else "s3"
+                        granules = [r for r in granules if r.get(key) in hrefs]
                     if submap_emittable(submap["grid_signature"], granules):
                         write_leaf_submap(
                             store_path,
@@ -2290,7 +2574,7 @@ def _handle_process(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                             granules,
                             grid_signature=submap["grid_signature"],
                             metadata=submap.get("metadata"),
-                            window=window["label"] if window else None,
+                            window=label,
                             store_kwargs=_output_store_kwargs(event),
                         )
                     else:

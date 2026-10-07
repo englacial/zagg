@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from mortie import from_datetime64, time2toc, to_datetime64
+from mortie import from_datetime64, time2toc, to_datetime64, toc_reduce
 
 from zagg.catalog.closest_obs import (
     ReferenceEpochs,
@@ -36,14 +36,16 @@ from zagg.coverage_toc import (
     write_cover,
 )
 from zagg.grids.morton import morton_word
+from zagg.leaf_temporal import count_words
 
 SPEC_DATA = Path(__file__).parent / "data" / "spec"
 DAY_NS = 86_400 * 10**9
 #: An arbitrary but realistic base instant on the §8 internal-ns scale
 #: (mirrors ``test_coverage_toc``'s convention).
 BASE_NS = 5_344_000_000_000_000_000
-#: One order-18 cover bucket (2^45 ns) and half of it — the epoch-midpoint
-#: error bound is half a BUCKET, not half a word (a word is a run of buckets).
+#: One cover bucket at the pinned order (2^39 ns since issue #575) and half of
+#: it — the epoch-midpoint error bound is half a BUCKET, not half a word (a
+#: word is a run of buckets).
 BUCKET_NS = 2 ** (63 - TEMPORAL_COVER_ORDER)
 HALF_BUCKET = np.timedelta64(BUCKET_NS // 2, "ns")
 
@@ -71,10 +73,10 @@ def _write_store(root, shards: dict[str, np.ndarray], order: int = 4) -> str:
     """A store root carrying a §10.5 cover claiming ``shards``' instants."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    contributions = {
-        decimal: [(None, None, None, quantize_words(time2toc(np.asarray(inst, dtype=np.uint64))))]
-        for decimal, inst in shards.items()
-    }
+    contributions = {}
+    for decimal, inst in shards.items():
+        words = np.asarray(time2toc(np.asarray(inst, dtype=np.uint64)), dtype=np.uint64)
+        contributions[decimal] = [(int(toc_reduce(words)), count_words(words))]
     write_cover(str(root), build_cover_section(contributions, ["h"], order))
     return str(root)
 
@@ -122,13 +124,22 @@ class TestWordMidpoints:
         assert _nearest_gap(mids, _utc(inst)) <= HALF_BUCKET
 
     def test_a_contiguous_campaign_yields_one_epoch_per_covered_bucket(self):
-        """A 10-day, 6-hourly campaign is one word — and 25 covered buckets."""
-        inst = np.array([BASE_NS + i * 6 * 3600 * 10**9 for i in range(40)], dtype=np.uint64)
+        """A two-hour campaign sampled every 5 min is one word — and 14 buckets.
+
+        The literal is the point: both sides of the equality below are derived
+        from the same instants, so only a hand-checked number tests the
+        expansion rather than the derivation. At order 24 a bucket is 2^39 ns
+        = 549,755,813,888 ns; ``BASE_NS`` sits 204,811,010,048 ns into its
+        own, leaving 344,944,803,840 ns of it, and the remaining
+        7,200,000,000,000 − 344,944,803,840 = 6,855,055,196,160 ns of the
+        campaign spill into ⌈6,855,055,196,160 / 549,755,813,888⌉ = 13 more.
+        """
+        inst = np.array([BASE_NS + i * 5 * 60 * 10**9 for i in range(25)], dtype=np.uint64)
         words = quantize_words(time2toc(inst))
         assert len(words) == 1
         covered = {int(t) >> (63 - TEMPORAL_COVER_ORDER) for t in inst}
         mids = np.sort(_word_midpoints(words))
-        assert mids.size == len(covered) == 25
+        assert mids.size == len(covered) == 1 + 13
         assert _nearest_gap(mids, _utc(inst)) <= HALF_BUCKET
 
     def test_a_pass_straddling_a_bucket_edge_yields_two_epochs(self):
@@ -143,10 +154,11 @@ class TestWordMidpoints:
 
     def test_a_coarser_order_widens_the_buckets(self):
         """The block's effective order drives the expansion, not the pin."""
-        inst = np.array([BASE_NS, BASE_NS + BUCKET_NS], dtype=np.uint64)
+        lo = (BASE_NS >> (65 - TEMPORAL_COVER_ORDER)) << (65 - TEMPORAL_COVER_ORDER)
+        inst = np.array([lo, lo + BUCKET_NS], dtype=np.uint64)
         coarse = quantize_words(time2toc(inst), TEMPORAL_COVER_ORDER - 2)
         mids = _word_midpoints(coarse, TEMPORAL_COVER_ORDER - 2)
-        assert mids.size == 1  # both passes now share one 39 h bucket
+        assert mids.size == 1  # both passes now share one 4x-span bucket
         assert _nearest_gap(mids, _utc(inst)) <= 4 * HALF_BUCKET
 
 
@@ -267,7 +279,7 @@ class TestCoarsenedBlock:
     """§10.5 lets a block coarsen below the pin — the read half must be loud."""
 
     #: Enough single-bucket claims (2 buckets apart, so no gap coalesces) to
-    #: blow the 512-word cap and force ``_cap_cover`` down an order.
+    #: blow the 512-word cap and force ``cap_counts`` down an order.
     COARSE_INSTANTS = np.array(
         [BASE_NS + i * 2 * BUCKET_NS for i in range(COVER_CAP + 88)], dtype=np.uint64
     )
@@ -316,14 +328,21 @@ class TestCoarsenedBlock:
 class TestGoldenFixture:
     """The committed §7 ``temporal/`` fixture pins the frozen grammar bytes."""
 
-    #: The two epochs the committed fixture decodes to, pinned as literals
+    #: The five epochs the committed fixture decodes to, pinned as literals
     #: rather than recomputed with the function under test. Verified by hand:
-    #: each is the midpoint of an order-18 bucket (internal ns congruent to
-    #: 2^44 - 1 mod 2^45, buckets 151903 and 151915 — twelve apart, the
-    #: fixture's five-day gap), and each sits within half a bucket of the
-    #: generator's two campaign clusters (``TEMPORAL_BASE`` and +5 days).
+    #: each is the midpoint of an order-24 bucket (internal ns congruent to
+    #: 2^38 - 1 mod 2^39; buckets 9721817-9721818 and 9722604-9722606, the
+    #: two runs the fixture's five-day gap separates), and each sits within
+    #: half a bucket of the generator's two campaign clusters
+    #: (``TEMPORAL_BASE`` and +5 days).
     GOLDEN = np.array(
-        ["2019-05-14T03:14:07.595891711", "2019-05-19T00:31:00.060957695"],
+        [
+            "2019-05-14T02:14:34.183101439",
+            "2019-05-14T02:23:43.938915327",
+            "2019-05-19T02:25:32.008631295",
+            "2019-05-19T02:34:41.764445183",
+            "2019-05-19T02:43:51.520259071",
+        ],
         dtype="datetime64[ns]",
     )
 
@@ -334,12 +353,12 @@ class TestGoldenFixture:
         assert np.array_equal(out.epochs[SHARD_KEY], self.GOLDEN)
         assert out.orders == {SHARD_KEY: TEMPORAL_COVER_ORDER}
 
-    def test_the_golden_epochs_are_order_18_bucket_midpoints(self):
-        """The arithmetic the ±4.9 h claim rests on, checked independently."""
+    def test_the_golden_epochs_are_pinned_order_bucket_midpoints(self):
+        """The arithmetic the ±4.6 min claim rests on, checked independently."""
         k = 63 - TEMPORAL_COVER_ORDER
         internal = np.asarray(from_datetime64(self.GOLDEN), dtype=np.uint64)
-        assert [int(t) % 2**k for t in internal] == [2 ** (k - 1) - 1] * 2
-        assert [int(t) >> k for t in internal] == [151903, 151915]
+        assert [int(t) % 2**k for t in internal] == [2 ** (k - 1) - 1] * 5
+        assert [int(t) >> k for t in internal] == [9721817, 9721818, 9722604, 9722605, 9722606]
 
     def test_every_fixture_observation_has_an_epoch_within_half_a_bucket(self):
         """The property the ruling actually claims, against the generator's
@@ -804,19 +823,35 @@ class TestClosestObsShardmap:
         assert isinstance(calls[0]["region"], list)
         assert sm.shard_keys == [SHARD_KEY]
 
-    def test_reprojecting_a_paired_map_drops_the_provenance(self, tmp_path):
-        # Pins the documented trap: ShardMap._granule_entry does not know the
-        # two provenance keys, so even the same-order noop branch strips them
-        # while metadata["closest_obs"] rides through describing the SOURCE
-        # map. Carrying them through reproject is a shardmap.py change left
-        # standing for review — until then, rebuild, never reproject.
+    def test_reprojecting_a_paired_map_keeps_the_provenance(self, tmp_path):
+        # PR #511's pin, flipped by issue #517: ShardMap._granule_entry's key set
+        # is closed, so every reproject arm — the same-order noop branch included
+        # — used to strip the two provenance keys, leaving a map that is
+        # spatially valid but can no longer say why any granule is in it. The
+        # generic auxiliary-key passthrough now carries them through verbatim.
+        # metadata["closest_obs"] still rides through describing the SOURCE map;
+        # that half of the trap is unchanged and stays pinned below.
         store, cat = self._setup(tmp_path)
         sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
         assert "paired_epochs" in sm.granules[0][0]
         noop = sm.reproject(_grid())
-        assert "paired_epochs" not in noop.granules[0][0]
-        assert "epoch_offsets_ns" not in noop.granules[0][0]
+        assert noop.granules == sm.granules
+        assert noop.granules[0][0]["paired_epochs"] == sm.granules[0][0]["paired_epochs"]
+        assert noop.granules[0][0]["epoch_offsets_ns"] == sm.granules[0][0]["epoch_offsets_ns"]
         assert noop.metadata["closest_obs"] == sm.metadata["closest_obs"]
+
+    def test_coarsening_a_paired_map_keeps_the_provenance(self, tmp_path):
+        # The coarsen arm regroups the map's own entries rather than rebuilding
+        # from a catalog, but it too rebuilt each entry through _granule_entry
+        # and dropped the keys with it (issue #517).
+        store, cat = self._setup(tmp_path)
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        source = sm.granules[0][0]
+        coarse = sm.reproject(_grid(parent_order=3))
+        carried = [g for shard in coarse.granules for g in shard if g["id"] == source["id"]]
+        assert carried, "the granule must survive the coarsen to say anything about its keys"
+        assert all(g["paired_epochs"] == source["paired_epochs"] for g in carried)
+        assert all(g["epoch_offsets_ns"] == source["epoch_offsets_ns"] for g in carried)
 
 
 # ── phase 4: two-store scenarios ─────────────────────────────────────────────

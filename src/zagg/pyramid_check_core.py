@@ -114,21 +114,26 @@ def _composable_fields(manifest: dict) -> dict:
     }
 
 
-def _node_object_rel(node: str) -> str:
-    """An above-shard ladder artifact's relative zarr root (``all.zarr``)."""
+def _node_object_rel(node: str, window: str | None = None) -> str:
+    """An above-shard ladder artifact's relative zarr root (§4.2).
+
+    ``all.zarr`` — an unwindowed store's one overview, and a windowed store's
+    all-time fold — or ``{window}.zarr`` for one window's.
+    """
     from zagg.sweep import _node_rel
+    from zagg.windows import leaf_name_v3
 
-    return f"{_node_rel(node)}/all.zarr"
+    return f"{_node_rel(node)}/{leaf_name_v3(window)}"
 
 
-def _column_object_rel(decimal: str) -> str:
-    """A leaf's column artifact root (§4.6): ``{node prefix}/all.pyramid.zarr``."""
+def _column_object_rel(decimal: str, window: str | None = None) -> str:
+    """A leaf's column artifact root (§4.6): ``{node prefix}/{window or all}.pyramid.zarr``."""
     from zagg.column import column_name
     from zagg.grids.morton import morton_word
     from zagg.hive import shard_leaf_path
 
     leaf_rel = shard_leaf_path("", morton_word(decimal)).lstrip("/")
-    return f"{leaf_rel.rsplit('/', 1)[0]}/{column_name(None)}"
+    return f"{leaf_rel.rsplit('/', 1)[0]}/{column_name(window)}"
 
 
 def _leaf_roster(store_root, manifest, store_kwargs, mode) -> tuple[list[str], str]:
@@ -307,19 +312,32 @@ def _digest_mismatch(stored: np.ndarray, ref: np.ndarray) -> str | None:
 class _Harness:
     """One validation pass's shared context: store handles + group cache.
 
+    ``window`` binds the pass to one window of a windowed store (issue #586):
+    every leaf, column and overview it opens is then that window's.
+
     ``workers`` is the read concurrency of the per-cell value legs
     (:func:`_run_cells`); the handle caches and the warning list are safe to
     share across those threads (race-tolerant publishing, a per-thread
     warning buffer so the merge keeps cell order). No lock is ever held
     across a store open: a duplicate open is harmless, a serialized one
-    costs ``workers``x (:meth:`_open`, :meth:`array`).
+    costs ``workers``x (:meth:`_open`, :meth:`array`, :meth:`leaf_group`).
     """
 
     def __init__(
-        self, store_root, manifest, store_kwargs, *, rng, sample_nodes, sample_cells, workers=8
+        self,
+        store_root,
+        manifest,
+        store_kwargs,
+        *,
+        rng,
+        sample_nodes,
+        sample_cells,
+        window=None,
+        workers=8,
     ):
         from zagg.store import open_store
 
+        self.window = window
         self.store_root = str(store_root).rstrip("/")
         self.manifest = manifest
         self.store_kwargs = dict(store_kwargs)
@@ -350,6 +368,7 @@ class _Harness:
         # store therefore shared nothing across a 2,918-leaf roster.
         self.store = open_store(self.store_root, read_only=True, **self.store_kwargs)
         self._groups: dict = {}
+        self._leaf_rels: dict = {}
         self._arrays: dict = {}
         self._gates: dict = {}
         self._lock = threading.Lock()
@@ -445,18 +464,32 @@ class _Harness:
         return self._arrays[key]
 
     def node_group(self, node: str, t: int):
-        return self._open(_node_object_rel(node), t)
+        return self._open(_node_object_rel(node, self.window), t)
 
     def column_group(self, decimal: str, r: int):
         """A leaf column's resolution group (§4.6) — the ``/2`` gen-1 tier."""
-        return self._open(_column_object_rel(decimal), r)
+        return self._open(_column_object_rel(decimal, self.window), r)
 
     def leaf_group(self, decimal: str):
-        from zagg.grids.morton import morton_word
-        from zagg.hive import shard_leaf_path
+        """A leaf's cell-order group, resolved through its root stamp (spec §1.5).
 
-        rel = shard_leaf_path("", morton_word(decimal)).lstrip("/")
-        return self._open(rel, self.cell_order)
+        A versioned leaf's arrays live under ``{root}/{current}/``; the one
+        stamp GET per leaf is cached with the group.
+        """
+        data_rel = self._leaf_rels.get(decimal)
+        if data_rel is None:
+            from zarr.storage import StorePath
+
+            from zagg.grids.morton import morton_word
+            from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
+
+            # The stamp GET goes through the pass's one store (``StorePath``
+            # scopes it to the leaf root), and is raced like :meth:`_open`:
+            # two threads on a cold leaf cost one duplicate GET, never a lock.
+            rel = shard_leaf_path("", morton_word(decimal), window=self.window).lstrip("/")
+            stamp = read_commit(StorePath(self.store, rel))
+            data_rel = self._leaf_rels.setdefault(decimal, leaf_data_path(rel, stamp))
+        return self._open(data_rel, self.cell_order)
 
     def containers(self, cell_dec: str, src_order: int, roster: list[str]) -> list[str]:
         """Roster members contributing to the cell at ``cell_dec``."""
@@ -624,7 +657,7 @@ def _settle_value_checks(
         )
     report["sampled"] = counted
     if harness.warnings:
-        report["warnings"] = list(harness.warnings)
+        report["warnings"] = [*report.get("warnings", []), *harness.warnings]
 
 
 def _declared_subset(node, t, attrs, provenance_attr, arrays, harness, errors):
@@ -991,6 +1024,192 @@ def _check_node(
             )
 
     _run_cells(harness, probe_empty, empty_probe, errors, counted)
+
+
+def _occupied_ranks(leaf_root, stamp, arrays, derived, store_kwargs):
+    """Cells-axis ranks of a leaf's occupied cells, or ``None`` (no occupancy source).
+
+    The stamp's coverage first (``full``, or the exact bitmap sidecar — one
+    small GET, no array read), then the ``count`` array where the leaf
+    declares one. A bitmap word that is not a derived cell word is an error
+    the caller reports: it raises here.
+    """
+    from zagg.hive import read_coverage_bitmap
+
+    coverage = (stamp or {}).get("coverage") or {}
+    if coverage.get("encoding") == "full":
+        return np.arange(len(derived))
+    words = read_coverage_bitmap(leaf_root, coverage=coverage, **store_kwargs)
+    if words is not None:
+        ranks = np.searchsorted(derived, words)
+        if np.any(ranks >= len(derived)) or np.any(derived[ranks] != words):
+            raise ValueError("the occupancy bitmap names a word that is no derived cell word")
+        return ranks
+    if "count" in arrays:
+        return np.flatnonzero(np.asarray(arrays["count"][:]))
+    return None
+
+
+def _leaf_coordinates(
+    store_root, cell_order, leaves, store_kwargs, *, rng, sample_nodes, sample_cells, full
+) -> tuple[dict, list]:
+    """The leaf cell-coordinate check (spec §1.5 "The cell coordinate"): ``(entry, warnings)``.
+
+    Needs no stored coordinate. Per sampled leaf — ``leaves`` are ``(shard
+    decimal, window label | None)`` refs — the cell words are DERIVED from the
+    leaf id and the rank (:func:`zagg.grids.morton.cell_words`), and for each
+    sampled occupied cell: every location word of every located field (bound
+    by the payload's §1.2 ``ragged.locations`` attrs) must lie inside the
+    cell (:func:`zagg.grids.morton.words_in_cell` — per-word order decode, a
+    coarser §9 area word passing on the ancestor line, and counted in the
+    ``pass`` detail), and where the leaf
+    still STORES a ``morton`` array (every unwindowed leaf; a windowed leaf
+    written before issue #586 phase 3) the stored word must equal the
+    derived one.
+
+    A leaf with neither a located field nor a stored coordinate has nothing
+    on disk to hold the derivation against. That is a legal store, and it is
+    reported as exactly that — ``skip``, "derivation only" — never as a pass.
+    """
+    import zarr
+    from mortie import orders_of
+
+    from zagg.grids.morton import cell_words, morton_word, words_in_cell
+    from zagg.hive import leaf_data_path, read_commit, shard_leaf_path
+    from zagg.store import open_store
+
+    leaves = list(leaves)
+    if not full and len(leaves) > sample_nodes:
+        picks = sorted(rng.choice(len(leaves), sample_nodes, replace=False).tolist())
+        leaves = [leaves[i] for i in picks]
+    errors: list = []
+    warnings: list = []
+    n_leaves = n_cells = n_stored = n_located = n_coarse = 0
+    for dec, window in leaves:
+        label = f"{dec}[{window or 'all'}]"
+        root = shard_leaf_path(store_root, morton_word(dec), window=window)
+        try:
+            stamp = read_commit(open_store(root, read_only=True, **store_kwargs))
+            if stamp is None:
+                warnings.append(f"coordinates: leaf {label} is uncommitted — not checked")
+                continue
+            store = open_store(leaf_data_path(root, stamp), read_only=True, **store_kwargs)
+            group = zarr.open_group(store, path=str(cell_order), mode="r", zarr_format=3)
+            arrays = dict(group.arrays())
+            derived = cell_words(morton_word(dec), cell_order)
+            ranks = _occupied_ranks(root, stamp, arrays, derived, store_kwargs)
+        except Exception as exc:
+            errors.append(f"{label}: unreadable ({exc})")
+            continue
+        if ranks is None:
+            warnings.append(
+                f"coordinates: leaf {label} has no occupancy source (no bitmap/full "
+                f"coverage, no 'count' array) — not checked"
+            )
+            continue
+        n_leaves += 1
+        # Located fields, bound by the payload's own declaration (§1.2).
+        located = {}
+        for name, arr in arrays.items():
+            block = arr.attrs.get("ragged")
+            if isinstance(block, dict) and block.get("locations"):
+                located[name] = str(block["locations"])
+        if not full and len(ranks) > sample_cells:
+            ranks = np.sort(rng.choice(ranks, sample_cells, replace=False))
+        for j in ranks.tolist():
+            n_cells += 1
+            word = int(derived[j])
+            if "morton" in arrays:
+                n_stored += 1
+                stored = int(np.asarray(arrays["morton"][j]))
+                if stored != word:
+                    errors.append(f"{label}[{j}]: stored morton {stored} != derived {word}")
+            for name, sibling in located.items():
+                if sibling not in arrays:
+                    errors.append(f"{label}: {name} declares locations {sibling!r}, absent")
+                    continue
+                raw = _payload_bytes(arrays[sibling][j : j + 1][0])
+                try:  # a torn payload or a word mortie refuses fails the cell, never the report
+                    locs = np.frombuffer(raw, dtype="<u8")
+                    within = words_in_cell(locs, word)
+                    # Passed only on the ancestor line: legal for §9 coarse ingest alone,
+                    # so it is counted, never hidden (a point-ingest writer makes none).
+                    n_coarse += int(np.count_nonzero(orders_of(locs[within]) < cell_order))
+                except ValueError as exc:
+                    errors.append(f"{label}[{j}]/{sibling}: undecodable location word(s) ({exc})")
+                    continue
+                n_located += len(locs)
+                outside = locs[~within]
+                if len(outside):
+                    errors.append(
+                        f"{label}[{j}]/{sibling}: {len(outside)} of {len(locs)} location "
+                        f"word(s) lie outside the derived cell {word} (first: {int(outside[0])})"
+                    )
+    if errors:
+        entry = _entry(
+            "fail", f"{len(errors)} mismatch(es); first: {errors[0]}", mismatches=errors[:20]
+        )
+    elif n_located:
+        entry = _entry(
+            "pass",
+            f"{n_located} location word(s) in {n_cells} cell(s) of {n_leaves} leaf(s) lie inside "
+            f"their derived cells; {n_stored} stored coordinate(s) agree"
+            + (
+                f"; {n_coarse} word(s) coarser than their cell, accepted under §9.1 coarse "
+                f"ingest only"
+                if n_coarse
+                else ""
+            ),
+        )
+    elif n_stored:
+        entry = _entry(
+            "pass",
+            f"{n_stored} stored coordinate(s) in {n_leaves} leaf(s) equal the derivation; no "
+            f"located field — containment not checked",
+        )
+    elif n_cells:
+        entry = _entry(
+            "skip",
+            f"derivation only: {n_cells} cell(s) of {n_leaves} leaf(s) carry neither a located "
+            f"field nor a stored coordinate — nothing on disk to check the derived cell words "
+            f"against (spec §1.5)",
+        )
+    else:
+        entry = _entry("fail", "0 coordinate comparison(s) performed — NOTHING was validated")
+    return entry, warnings
+
+
+def _coordinates_check(
+    store_root,
+    manifest,
+    leaves,
+    store_kwargs,
+    checks,
+    report,
+    *,
+    seed,
+    sample_nodes,
+    sample_cells,
+    full,
+) -> None:
+    """Settle the ``coordinates`` check over ``(shard decimal, window)`` leaf refs.
+
+    Draws from its OWN generator (same ``seed``), so adding the check moves
+    none of the value checks' samples.
+    """
+    entry, warnings = _leaf_coordinates(
+        str(store_root).rstrip("/"),
+        int(manifest["cell_order"]),
+        leaves,
+        dict(store_kwargs),
+        rng=np.random.default_rng(seed),
+        sample_nodes=sample_nodes,
+        sample_cells=sample_cells,
+        full=full,
+    )
+    checks["coordinates"] = entry
+    if warnings:
+        report["warnings"] = [*report.get("warnings", []), *warnings]
 
 
 def _ladder_materialization(

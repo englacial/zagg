@@ -1307,6 +1307,87 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
         )
+    # Versioned leaves (issue #582, spec §1.5): a boolean kill-switch, default
+    # ON for hive (get_leaf_versions resolves it); ``false`` keeps the legacy
+    # in-place leaf for readers that do not yet follow ``current``.
+    leaf_versions = config.output.get("leaf_versions")
+    if leaf_versions is not None and not isinstance(leaf_versions, bool):
+        raise ValueError(f"output.leaf_versions must be a boolean (got {leaf_versions!r})")
+    if leaf_versions and get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.leaf_versions requires output.store_layout: hive (a version subgroup "
+            "lives under a hive leaf's stable root)"
+        )
+    # Icechunk companion repo (issue #580, spec §11): same posture as sweep —
+    # boolean when present, default ON for hive (get_icechunk resolves it),
+    # explicit true on a non-hive store is a config mistake (the repo indexes
+    # hive leaves by shard rank).
+    icechunk = config.output.get("icechunk")
+    if icechunk is not None and not isinstance(icechunk, (bool, dict)):
+        raise ValueError(
+            f"output.icechunk must be a boolean or an options block (got {icechunk!r})"
+        )
+    if isinstance(icechunk, dict):
+        # The ladder's knobs (issue #580 phase 6, spec §11.4/§11.5): the
+        # shard-order-relative checks run at init (icechunk_refs.resolve_options,
+        # where the shard order is known); the shape and the one invariant
+        # that needs no geometry — a commit must write whole manifests — here.
+        unknown = set(icechunk) - {"commit", "commit_order", "split_order", "retain_runs"}
+        if unknown:
+            raise ValueError(
+                f"output.icechunk has unknown key(s) {sorted(unknown)} (accepts commit, "
+                f"commit_order, split_order, retain_runs)"
+            )
+        # Run-tag retention (issue #582): how many run tags finalize keeps;
+        # 0 (the default) keeps every run and never expires or collects.
+        retain = icechunk.get("retain_runs")
+        if retain is not None and (
+            isinstance(retain, bool) or not isinstance(retain, int) or retain < 0
+        ):
+            raise ValueError(
+                f"output.icechunk.retain_runs must be a non-negative integer (got {retain!r})"
+            )
+        commit = icechunk.get("commit")
+        if commit is not None and commit not in ("ladder", "leaf"):
+            raise ValueError(f"output.icechunk.commit must be 'ladder' or 'leaf' (got {commit!r})")
+        orders = {k: icechunk.get(k) for k in ("commit_order", "split_order")}
+        for key, value in orders.items():
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(
+                    f"output.icechunk.{key} must be a non-negative integer (got {value!r})"
+                )
+        if (
+            orders["commit_order"] is not None
+            and orders["split_order"] is not None
+            and orders["split_order"] < orders["commit_order"]
+        ):
+            raise ValueError(
+                f"output.icechunk.split_order {orders['split_order']} is finer than commit_order "
+                f"{orders['commit_order']}: a manifest (one per split_order cell) would be written "
+                f"by more than one commit (spec §11.5)"
+            )
+    # The RESOLVED opt-in, not the literal's truthiness: an options block is
+    # an opt-in whatever it holds, and the empty one -- the spelling for "the
+    # ladder defaults" -- is falsy, so the three scope guards below skipped it
+    # and stood up a repo §11.6 exists to prevent (review finding).
+    enabled = icechunk is True or isinstance(icechunk, dict)
+    if enabled and get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.icechunk requires output.store_layout: hive (the companion repo "
+            "references hive leaves by shard rank; flat stores have no leaves)"
+        )
+    if enabled and get_windowing(config) is not None:
+        raise ValueError(
+            "output.icechunk is out of scope for windowed stores (spec §11.6): a "
+            "window's leaves share a shard rank, so stage 1 records no refs for them"
+        )
+    if enabled and (config.data_source or {}).get("reader") == "raster":
+        raise ValueError(
+            "output.icechunk is out of scope for raster products (spec §11.6): "
+            "raster leaves are never sharded, so stage 1 records no refs for them"
+        )
     # Overview pyramid declaration (issue #201): explicit blocks are grammar-
     # checked here; the D24 none-field warning fires at manifest build time
     # (template time for the store), not per config validation. The NaN-fill
@@ -1334,7 +1415,10 @@ def _validate_windowing(config: PipelineConfig) -> None:
     is decided per observation. On the RASTER path (issue #247) membership is
     the acquisition's STAC ``datetime`` instead: ``time_field`` is optional
     (fixed to ``datetime``) and the ``epoch``/``scale``/``units`` conversion
-    knobs are rejected.
+    knobs are rejected. ``unit`` (issue #586 phase 2) picks the dispatch
+    unit — ``shard`` (default: one invoke per shard emits every window its
+    granules span) or ``window`` (one invoke per ``(shard, window)``); the
+    raster path always dispatches per window and rejects the key.
     """
     from zagg import windows as _windows
 
@@ -1373,8 +1457,21 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "output.windowing requires output.store_layout: hive (window leaves "
             "are hive leaf zarrs; the flat shared store has no leaves to window)"
         )
+    unit = block.get("unit")
+    if unit is not None and unit not in WINDOWING_UNITS:
+        raise ValueError(
+            f"output.windowing.unit must be one of {WINDOWING_UNITS} (got {unit!r}): "
+            f"'shard' emits every window from one invoke per shard, 'window' "
+            f"dispatches one invoke per (shard, window)"
+        )
     time_field = block.get("time_field")
     if (config.data_source or {}).get("reader") == "raster":
+        if unit is not None:
+            raise ValueError(
+                "output.windowing.unit does not apply to raster pipelines: window "
+                "membership is decided per acquisition at dispatch, one unit per "
+                "(shard, window) (drop the key)"
+            )
         # Raster window membership is the acquisition's STAC ``datetime``,
         # decided at dispatch (issue #247, ratified): there is no
         # per-observation timestamp column, so ``time_field`` is optional and
@@ -3335,6 +3432,68 @@ def get_sweep(config: PipelineConfig) -> bool:
     return bool(flag)
 
 
+def get_leaf_versions(config: PipelineConfig) -> bool:
+    """Whether hive leaves are written VERSIONED (issue #582, spec §1.5).
+
+    Default ON for hive-layout stores: each unit's arrays go to a fresh
+    ``run-{run_id}-{attempt}`` subgroup under the stable leaf root, whose
+    stamp names it as ``current``, so a replacement never rewrites bytes an
+    earlier run tag references. ``output.leaf_versions: false`` keeps the
+    legacy in-place leaf — the switch for a store whose readers do not yet
+    follow ``current``. Default ON carries spec §1.5's operator
+    preconditions: no bucket expiration rule over the hive tree (the
+    collector owns version lifetime) and readers that follow ``current``.
+    Layout, not semantics: outside the D19 core.
+    """
+    flag = config.output.get("leaf_versions")
+    if flag is None:
+        return get_store_layout(config) == "hive"
+    return bool(flag)
+
+
+def get_icechunk(config: PipelineConfig) -> bool:
+    """Whether the Icechunk companion repo is written (issue #580, spec §11).
+
+    Default ON for hive-layout stores: the once-per-run ``icechunk_init`` step
+    and the per-leaf virtual-ref commit at leaf commit, both fail-open (the
+    leaves stay normative; the repo is a regenerable index). ``output.icechunk:
+    false`` opts out.
+
+    The default follows the stage-1 WRITER's scope, not the layout alone
+    (spec §11.6): windowed hive stores (a window's leaves share a shard rank)
+    and raster hive products (never sharded) record no refs, so the knob
+    resolves OFF there rather than standing up a repo no leaf can fill. A
+    present-but-null key falls back to that default; an explicit ``true`` on
+    any of the three out-of-scope shapes — non-hive, windowed, raster — is
+    rejected by ``validate_config``, mirroring ``sweep``. Excluded from the
+    D19 semantic core like the other run triggers (:mod:`zagg.semantics`).
+    """
+    flag = config.output.get("icechunk")
+    if flag is None:
+        return (
+            get_store_layout(config) == "hive"
+            and get_windowing(config) is None
+            and (config.data_source or {}).get("reader") != "raster"
+        )
+    if isinstance(flag, dict):
+        return True  # an options block (phase 6) is an opt-in with knobs
+    return bool(flag)
+
+
+def get_icechunk_options(config: PipelineConfig) -> dict:
+    """The raw ``output.icechunk`` ladder knobs, absent keys ``None`` (issue #580 phase 6).
+
+    ``{"commit": "ladder" | "leaf" | None, "commit_order": int | None,
+    "split_order": int | None, "retain_runs": int | None}`` — a boolean or
+    absent knob yields all-``None``; :func:`zagg.icechunk_refs.resolve_options`
+    applies the shard-order defaults and the §11.5 invariants, and
+    :func:`zagg.icechunk_finalize.resolve_retain_runs` the retention default.
+    """
+    flag = config.output.get("icechunk")
+    block = flag if isinstance(flag, dict) else {}
+    return {k: block.get(k) for k in ("commit", "commit_order", "split_order", "retain_runs")}
+
+
 def get_pyramid(config: PipelineConfig) -> dict | None:
     """The overview pyramid declaration knob, or ``None`` when disabled (#201).
 
@@ -3625,6 +3784,28 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         "units": block.get("units") or "seconds",
         "windows": declared,
     }
+
+
+#: ``output.windowing.unit`` values (issue #586 phase 2): ``shard`` is one
+#: invoke per shard emitting every window its granules span (the default);
+#: ``window`` keeps the per-``(shard, window)`` fan-out.
+WINDOWING_UNITS = ("shard", "window")
+
+
+def get_windowing_unit(config: PipelineConfig) -> str:
+    """The windowed dispatch unit, ``"shard"`` (default) or ``"window"`` (issue #586).
+
+    Read apart from :func:`get_windowing` on purpose: the unit is how a run
+    is DISPATCHED, not what the store holds — the leaves, the manifest's
+    temporal block and the D19 semantic hash (which folds the normalized
+    windowing declaration, :mod:`zagg.semantics`) are byte-identical either
+    way, so the knob must move none of them. Raster configs always read
+    ``"window"`` (membership is per acquisition at dispatch).
+    """
+    if (config.data_source or {}).get("reader") == "raster":
+        return "window"
+    block = config.output.get("windowing") or {}
+    return block.get("unit") or "shard"
 
 
 def window_time_filters(config: PipelineConfig, start: float, end: float) -> list[dict]:

@@ -10,7 +10,8 @@ writes at the store root (one row per shard, failure rows included).
 The schema is mergeable by construction: only associative stats (counts, sums,
 min/max — no stored means/medians), so the up-tree rollup is
 :func:`merge` — a fold that is associative and commutative up to float
-summation order. Identity-like fields (``shard_key``, ``granules_sha256``,
+summation order, given one precondition: the rows of one bulk invoke meet in
+ONE call (see :func:`merge`). Identity-like fields (``shard_key``, ``granules_sha256``,
 ``invoked_by``, ...) merge as equal-or-``None``: a mismatch collapses to
 ``None`` (absorbing), which keeps the fold associative.
 
@@ -87,8 +88,9 @@ _ARCH_ALIASES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64", "amd6
 #: recorded identity (``None`` — never provably current), never a wrong one.
 _SEMANTIC_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Merge dispositions (associative + commutative by construction). Floats sum,
-# so equality across fold orders holds up to FP summation order.
+# Merge dispositions (associative + commutative by construction, once the rows
+# of one bulk invoke meet in one call — see ``merge``). Floats sum, so equality
+# across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
 _SUM_OR_NONE_KEYS = (
     "gb_seconds",
@@ -101,8 +103,17 @@ _SUM_OR_NONE_KEYS = (
     "raster_px_sampled",
 )
 _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
+#: Invoke-level fields (issue #586): a bulk multi-window shard unit stamps
+#: these once per INVOKE and repeats them on each of its N leaf records
+#: (``unit_windows: N``), so a sum counts them once per ``(run_id,
+#: shard_key)`` — :func:`merge` and every readout that totals rows. The
+#: ``read`` phase is the invoke's too (the shard is read once).
+INVOKE_LEVEL_KEYS = ("duration_s", "duration_total_s", "gb_seconds", "est_cost_usd", "n_obs_read")
 _EQ_OR_NONE_KEYS = (
     "window",
+    # Bulk multi-window unit width (issue #586): every leaf of one shard
+    # invoke carries the same N; a rollup across invokes collapses it.
+    "unit_windows",
     "shard_key",
     "run_id",
     "semantic_hash",
@@ -116,6 +127,10 @@ _EQ_OR_NONE_KEYS = (
     # existence must be discoverable without a tree listing. Named
     # ``leaf_column``, not ``column`` — see _ROW_SCALARS below.
     "leaf_column",
+    # Icechunk companion refs record (issue #580): per-leaf by definition —
+    # one commit per leaf — so a rollup collapses it to None like the O11
+    # record above.
+    "icechunk",
     "zagg_version",
     "lambda",
     "invoked_by",
@@ -251,6 +266,19 @@ def lambda_env() -> dict | None:
     }
 
 
+def billed_seconds(body: dict | None) -> float:
+    """A worker result body's billed seconds (issue #589).
+
+    The invocation wall ``duration_total_s`` when the worker stamped it, else
+    the aggregate clock ``duration_s`` (older workers) -- the same fallback
+    :func:`build_record` prices with, so the dispatcher's cost and
+    timeout-margin figures agree with the record's ``est_cost_usd``.
+    """
+    b = body or {}
+    total = b.get("duration_total_s")
+    return total if total is not None else b.get("duration_s", 0)
+
+
 def build_record(
     *,
     shard_key,
@@ -290,8 +318,16 @@ def build_record(
     is the caller's own value and is trusted as given.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
-    ``duration_s`` (the billed-duration approximation the dispatcher's cost
-    estimate already uses).
+    ``duration_total_s`` — the invocation wall from handler entry to this
+    record (issue #589) — falling back to ``duration_s`` for a record
+    without one (a worker predating the key, the column sidecar, failure
+    rows). ``duration_s`` stays the read + index + aggregate wall, the
+    meaning every existing pin and readout reads. The write side,
+    ``phase_timings.{write,hash,column,icechunk}`` (``phase_*`` in the run
+    parquet), lands AFTER it on the sharded (fleet) leaf path — what the
+    total covers and the fallback undercounts by (~23–70 s per unit on the
+    #586 measurement); the unsharded streaming path writes inside
+    ``process_shard``, so there the two clocks overlap.
     """
     error = metadata.get("error")
     if semantic_hash is None:
@@ -299,9 +335,12 @@ def build_record(
         if isinstance(fallback, str) and _SEMANTIC_HASH_RE.match(fallback):
             semantic_hash = fallback
     duration_s = float(metadata.get("duration_s") or 0.0)
+    # Nullable, like ``n_obs_read``: absence means unmeasured, never zero.
+    duration_total_s = _opt_float(metadata.get("duration_total_s"))
     gb_seconds = est_cost = None
     if lambda_config and lambda_config.get("memory_mb"):
-        gb_seconds = duration_s * lambda_config["memory_mb"] / 1024.0
+        billed = duration_total_s if duration_total_s is not None else duration_s
+        gb_seconds = billed * lambda_config["memory_mb"] / 1024.0
         # Arch-keyed rate (issue #298's price table, folded in here): the
         # record prices with the same table as the dispatcher's cost block.
         arch = _ARCH_ALIASES.get(str(lambda_config.get("arch") or "").lower())
@@ -341,6 +380,17 @@ def build_record(
         "schema_version": SCHEMA_VERSION,
         "shard_key": int(shard_key),
         "window": str(window) if window is not None else None,
+        # Bulk multi-window emit (issue #586 phase 2): the number of leaves
+        # the shard invoke that wrote this leaf emitted, when it emitted more
+        # than its own — one record per leaf, so ``duration_s`` /
+        # ``max_memory_mb`` / ``gb_seconds`` / the read phase / ``n_obs_read``
+        # (the shard's decoded rows: one read feeds every window) repeat
+        # across the N rows of one invoke (per-invoke quantiles stay the
+        # fleet-safety numbers; the #374 read-vs-keep ratio is per invoke,
+        # ``n_obs_read`` over the rows' summed ``n_obs``); a per-invoke SUM
+        # de-duplicates on ``(run_id, shard_key)`` where this is set. ``None`` on a ``(shard, window)`` fan-out unit
+        # and on unwindowed runs.
+        "unit_windows": _opt_int(metadata.get("unit_windows")),
         "run_id": run_id,
         # The semantic-core hash (D19 rev 2, issue #299): hashes the config's
         # semantic core, NOT the whole template. Nullable for callers without
@@ -371,6 +421,7 @@ def build_record(
         "cells_with_data": int(metadata.get("cells_with_data") or 0),
         "phase_timings": phase_timings,
         "duration_s": duration_s,
+        "duration_total_s": duration_total_s,
         "spill_bytes": spill_bytes,
         # Fold-regime marker (issue #370): blocks closed at the spill threshold.
         # 0/absent = exact single-block leaf; > 0 = the leaf's outputs were
@@ -408,6 +459,17 @@ def build_record(
         # sidecar scan for column-bearing units must key on the LEAF records,
         # not on the column artifacts' own.
         "leaf_column": metadata.get("leaf_column"),
+        # Icechunk companion refs (issue #580, spec §11.4): the leaf's refs
+        # commit — ``{path, snapshot, arrays, refs, rebases, commit_s,
+        # checksum}`` on success (``commit: "leaf"``), or in ladder mode the
+        # ref sidecar it wrote instead — ``{sidecar, bytes, refs, arrays,
+        # checksum}`` — ``{"skipped": reason}`` for a unit stage 1
+        # does not index (windowed, empty), ``{"error": ...}`` when the
+        # fail-open write did not land. ``rebases`` and ``commit_s`` are the
+        # fleet's first measurement of commit contention (the issue's open
+        # question (1)). None wherever no writer recorded it (the knob off,
+        # flat layouts, raster, failures).
+        "icechunk": metadata.get("icechunk"),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
@@ -421,7 +483,7 @@ def build_record(
 
 
 def merge(records: Iterable[dict]) -> dict:
-    """Fold stats records into one (associative + commutative; issue #297).
+    """Fold stats records into one (commutative; associative — see below; issue #297).
 
     Counts/sums sum, memory high-waters max, ``timestamp`` takes the latest,
     ``success`` ANDs, ``phase_timings`` sums per key over the key union, and
@@ -429,6 +491,18 @@ def merge(records: Iterable[dict]) -> dict:
     mismatch (``None`` is absorbing, which is what keeps the fold
     associative). ``merge([r]) == r`` up to key order. Raises ``ValueError``
     on an empty iterable or a ``schema_version`` mismatch.
+
+    The leaf records of one bulk multi-window invoke (issue #586:
+    ``unit_windows`` set, one ``(run_id, shard_key)``) each repeat the
+    invoke's :data:`INVOKE_LEVEL_KEYS` and its ``read`` phase; the fold
+    counts those once per invoke, so a shard's rollup carries the billed
+    wall and the cost of the one invoke that wrote its N leaves, not N
+    times it. The rows of one invoke must meet in ONE call for that, which
+    is the precondition of associativity: split across two partial folds, the
+    first collapses ``shard_key`` to ``None`` (absorbing) and the invoke is
+    counted twice. They do meet: a shard's window leaves fold at the shard
+    node before anything coarser (``sweep._rollup_shard_node``,
+    ``choropleth._resolve_shard``).
     """
     records = list(records)
     if not records:
@@ -452,16 +526,46 @@ def merge(records: Iterable[dict]) -> dict:
                 out[key] = first
         else:
             out[key] = None
+    # One representative per bulk invoke (issue #586) for the invoke-level
+    # sums; every record counts for everything else.
+    seen: set = set()
+    invokes = []
+    for r in records:
+        key = (r.get("run_id"), r.get("shard_key"))
+        if r.get("unit_windows") is not None and None not in key:
+            if key in seen:
+                continue
+            seen.add(key)
+        invokes.append(r)
+    repeated = {id(r) for r in records} - {id(r) for r in invokes}
+
+    def _parts(key):
+        return invokes if key in INVOKE_LEVEL_KEYS else records
+
     for key in _SUM_KEYS:
-        out[key] = sum(r.get(key) or 0 for r in records)
+        out[key] = sum(r.get(key) or 0 for r in _parts(key))
     phase_timings: dict[str, float] = {}
     for r in records:
         for name, secs in (r.get("phase_timings") or {}).items():
+            if name == "read" and id(r) in repeated:
+                continue
             phase_timings[name] = phase_timings.get(name, 0.0) + secs
     out["phase_timings"] = phase_timings
     for key in _SUM_OR_NONE_KEYS:
-        vals = [r.get(key) for r in records if r.get(key) is not None]
+        vals = [r.get(key) for r in _parts(key) if r.get(key) is not None]
         out[key] = sum(vals) if vals else None
+    # ``duration_total_s`` (issue #589) is the billed wall: None when no part
+    # measured it (so ``merge([r]) == r``), else each part counts its total or,
+    # for an older leaf, its ``duration_s`` -- build_record's pricing fallback,
+    # so a mixed-vintage rollup never reads below its aggregate clock.
+    totals = [r.get("duration_total_s") for r in invokes]
+    out["duration_total_s"] = (
+        None
+        if all(t is None for t in totals)
+        else sum(
+            t if t is not None else (r.get("duration_s") or 0) for t, r in zip(totals, invokes)
+        )
+    )
     for key in _MAX_OR_NONE_KEYS:
         vals = [r.get(key) for r in records if r.get(key) is not None]
         out[key] = max(vals) if vals else None
@@ -509,6 +613,7 @@ _ROW_SCALARS = (
     "schema_version",
     "shard_key",
     "window",
+    "unit_windows",
     "run_id",
     "semantic_hash",
     "zagg_version",
@@ -519,6 +624,7 @@ _ROW_SCALARS = (
     "n_obs_read",
     "cells_with_data",
     "duration_s",
+    "duration_total_s",
     "gb_seconds",
     "est_cost_usd",
     "spill_bytes",
@@ -574,6 +680,38 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     ident = record.get("invoked_by") or {}
     row["invoked_by"] = ident.get("arn")
     row["invoked_by_userid"] = ident.get("userid")
+    # Icechunk refs commit (issue #580): the scalars a fleet run's contention
+    # question reads straight off the parquet — ``rebases`` and ``commit_s``
+    # per leaf — plus the snapshot for joining a leaf to the repo's history,
+    # and ``checksum``, the form the leaf's refs carry (``"etag"`` on an object
+    # store, ``"last_modified"`` on a local one, §11.3). ``checksum`` is here
+    # because it varies by STORE SCHEME rather than by run, so "did this run's
+    # refs land with staleness detection, and in which form?" is not derivable
+    # from any other column (review finding).
+    # Coerced, never dereferenced blind: ``metadata`` is not always locally
+    # built — the dispatcher's stale-worker path (``runner._lambda_result_rows``)
+    # passes the JSON body a remote worker returned — so a version-skewed body
+    # carrying a non-dict here must not take down the WHOLE run-parquet write
+    # on a path that is otherwise fail-open (review finding).
+    ice = record.get("icechunk")
+    ice = ice if isinstance(ice, dict) else {}
+    row["icechunk_snapshot"] = ice.get("snapshot")
+    row["icechunk_refs"] = ice.get("refs")
+    row["icechunk_rebases"] = ice.get("rebases")
+    row["icechunk_commit_s"] = ice.get("commit_s")
+    row["icechunk_checksum"] = ice.get("checksum")
+    # Ladder mode (phase 6): the leaf wrote a ref sidecar instead of committing.
+    row["icechunk_sidecar"] = ice.get("sidecar")
+    row["icechunk_bytes"] = ice.get("bytes")
+    # The levels the leaf's refs cover, by CELL order — comma-joined so the
+    # column stays a parquet scalar. Both record shapes carry it (the ladder's
+    # sidecar and the ``commit: "leaf"`` twin), and it is the only place
+    # "did this leaf's column level get indexed, or only its base?" is
+    # answerable from the run parquet (review finding).
+    levels = ice.get("levels")
+    row["icechunk_levels"] = ",".join(str(o) for o in levels) if levels else None
+    row["icechunk_skipped"] = ice.get("skipped")
+    row["icechunk_error"] = ice.get("error")
     return row
 
 
@@ -737,6 +875,7 @@ def write_run_parquet(
     timestamp: str | None = None,
     store_kwargs: dict | None = None,
     finalize_error: str | None = None,
+    icechunk_init: dict | None = None,
 ) -> str:
     """PUT the run-level stats parquet at the store root (issue #297 phase 3).
 
@@ -758,6 +897,18 @@ def write_run_parquet(
     across the rows like ``run_id``/``n_shards`` already are, so a postmortem
     can tell "finalize failed" from "the run never happened" off the parquet
     alone. Always written, so the column set is the same every run.
+
+    ``icechunk_init`` (issue #580) is the run's companion-repo init record
+    (``summary["icechunk"]``): three more run-level columns, split the way the
+    row-level ``icechunk_*`` flattener splits its record rather than collapsed
+    into one — ``icechunk_init_repo`` (the record's ``path``),
+    ``icechunk_init_snapshot`` (the init commit), ``icechunk_init_error``
+    and ``icechunk_split_ratchet`` (the §11.5 ratchet this run applied, or null)
+    (the fail-open failure string, on the ``finalize_error`` precedent). So a
+    run's leaves join to the repo history they were committed into, and
+    "init failed" is never something a reader infers from whether a value
+    looks like a hex id. ``None`` (knob off, non-hive) writes all three null;
+    all three are always written, so the column set is the same every run.
     """
     import tempfile
 
@@ -771,6 +922,17 @@ def write_run_parquet(
     df = pd.DataFrame(rows)
     # Run-level (issue #335): constant down the column, None on a clean run.
     df["finalize_error"] = finalize_error
+    init = icechunk_init or {}
+    df["icechunk_init_repo"] = init.get("path")
+    df["icechunk_init_snapshot"] = init.get("snapshot")
+    df["icechunk_init_error"] = init.get("error")
+    # The §11.5 split ratchet (phase 6): ``"{from}->{to}"`` when this run
+    # moved the store's split_order coarser — the flag a later
+    # rewrite_manifests pass reads — else null.
+    ratchet = init.get("split_ratchet")
+    df["icechunk_split_ratchet"] = (
+        f"{ratchet['from']}->{ratchet['to']}" if isinstance(ratchet, dict) else None
+    )
     # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
     # the DataFrame's float64 inference on a column that mixes ints with
     # failure-row ``None``s silently corrupts them (issue #300 — the sweep's
@@ -829,7 +991,7 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
     listing = obstore.list_with_delimiter(store)
     keys = [meta["path"] for meta in listing["objects"] if meta["path"].endswith(".json")]
 
-    def _record(key: str) -> dict | None:
+    def _record(key: str) -> list:
         try:
             envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
             # Two object shapes share the prefix layout: the #151 result
@@ -843,13 +1005,44 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
             record = (body or {}).get("stats") if isinstance(body, dict) else None
         except Exception as e:
             logger.warning(f"skipping unparsable status envelope {key}: {e}")
-            return None
-        return record if isinstance(record, dict) else None
+            return []
+        return stats_records(record)
 
     if not keys:
         return []
     with ThreadPoolExecutor(max_workers=min(16, len(keys))) as pool:
-        return [flatten_record(rec) for rec in pool.map(_record, keys) if rec is not None]
+        return [flatten_record(rec) for recs in pool.map(_record, keys) for rec in recs]
+
+
+def stats_records(stats) -> list:
+    """The D20 records a unit's ``stats`` carries: one, or one per emitted leaf.
+
+    A ``(shard, window)`` unit and an unwindowed shard ride ONE record; a
+    bulk multi-window shard invoke (issue #586 phase 2) rides a LIST, one per
+    leaf it emitted. Anything else (absent, a stale worker's body) is none.
+    """
+    if isinstance(stats, dict):
+        return [stats]
+    if isinstance(stats, list):
+        return [r for r in stats if isinstance(r, dict)]
+    return []
+
+
+def window_metas(meta) -> list:
+    """The per-leaf metadata dicts one unit result stands for.
+
+    A bulk multi-window shard invoke (issue #586 phase 2) returns the shard's
+    metadata with ``windows``, one per-window dict in dispatch order — each
+    the shape a ``(shard, window)`` unit returns — so every consumer that
+    counts, classifies or sweeps per leaf reads through this; any other unit
+    result is its own single leaf.
+    """
+    if not isinstance(meta, dict):
+        return []
+    windows = meta.get("windows")
+    if isinstance(windows, list):
+        return [m for m in windows if isinstance(m, dict)]
+    return [meta]
 
 
 # ---------------------------------------------------------------------------

@@ -912,7 +912,9 @@ def _check_raster_grid(grid) -> None:
         )
 
 
-def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
+def _raster_members(
+    grid, config, n_time: int, n_cells: int, *, cell_coordinate: bool = True
+) -> dict:
     """The ``time``/``morton``/band ArraySpec members for one raster store.
 
     ``morton`` (packed u64 words) is the sole stored cell coordinate — the
@@ -920,6 +922,9 @@ def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
     review: one default cell coordinate everywhere). The legacy NESTED
     ``cell_ids`` array rides only the same ``emit_cell_ids`` transition
     hatch as the spatial path — never a separate schedule.
+    ``cell_coordinate=False`` drops ``morton``: a WINDOWED leaf stores none
+    (issue #586 phase 3, spec §1.5 "The cell coordinate") — for raster the
+    derived word simply IS the coordinate.
 
     ``time``'s element type and attrs come from the config's declared
     encoding (spec §8): int64 microseconds with CF ``units``/``calendar``
@@ -938,8 +943,11 @@ def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
             0,
             time_axis_attrs(encoding),
         ),
-        "morton": _raster_array_spec((n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0),
     }
+    if cell_coordinate:
+        members["morton"] = _raster_array_spec(
+            (n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0
+        )
     if grid.emit_cell_ids:
         members["cell_ids"] = _raster_array_spec(
             (n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0
@@ -1006,7 +1014,7 @@ def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite
     return store
 
 
-def raster_leaf_spec(grid, config, n_time: int):
+def raster_leaf_spec(grid, config, n_time: int, *, cell_coordinate: bool = True):
     """GroupSpec for ONE shard's hive leaf zarr (issue #247, D3/D13).
 
     The raster analog of ``HealpixGrid.shard_spec``: the same member set as
@@ -1017,12 +1025,15 @@ def raster_leaf_spec(grid, config, n_time: int):
     × window, known at dispatch from the catalog). Wrapped in a ROOT group
     (members under ``grid.group_path``, mirroring ``emit_shard_template``) so
     the D4 commit stamp is one attrs update on an object that exists anyway.
+    ``cell_coordinate=False`` is the WINDOWED leaf: no ``morton`` member.
     """
     from pydantic_zarr.experimental.v3 import GroupSpec
 
     _check_raster_grid(grid)
     inner = GroupSpec(
-        members=_raster_members(grid, config, n_time, grid.cells_per_shard),
+        members=_raster_members(
+            grid, config, n_time, grid.cells_per_shard, cell_coordinate=cell_coordinate
+        ),
         # The same morton-declared dggs attrs as the spatial leaf (issue
         # #304 — one reader contract), on the inner group like
         # HealpixGrid._group_spec.
@@ -1040,6 +1051,7 @@ def emit_raster_leaf_template(
     *,
     overwrite: bool = False,
     staged_out: dict | None = None,
+    cell_coordinate: bool = True,
 ):
     """Write one leaf's template plus its ``time`` and ``morton`` coords.
 
@@ -1056,19 +1068,26 @@ def emit_raster_leaf_template(
     written here are recorded in it under their leaf-relative paths — the
     O11 hash source for the arrays this function writes WHOLE (the band
     arrays stream per timestep and hash incrementally instead).
+
+    ``cell_coordinate=False`` (a WINDOWED leaf, issue #586 phase 3) writes
+    and stages no ``morton``: readers derive the word from the leaf id and
+    the rank (:func:`zagg.grids.morton.cell_words`).
     """
     from zarr import config as zarr_config
     from zarr import open_array
 
-    spec = raster_leaf_spec(grid, config, int(len(times_us)))
+    spec = raster_leaf_spec(grid, config, int(len(times_us)), cell_coordinate=cell_coordinate)
     children = np.asarray(grid.children(int(shard_key)), dtype=np.uint64)
     with zarr_config.set({"async.concurrency": 128}):
         spec.to_zarr(store, "", overwrite=overwrite)
         arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
         times = np.asarray(times_us, dtype=time_axis_dtype(time_encoding(config)))
         arr[:] = times
-        arr = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
-        arr[:] = children
+        if cell_coordinate:
+            arr = open_array(
+                store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False
+            )
+            arr[:] = children
         cell_ids = None
         if grid.emit_cell_ids:
             arr = open_array(
@@ -1078,7 +1097,8 @@ def emit_raster_leaf_template(
             arr[:] = cell_ids
     if staged_out is not None:
         staged_out[f"{grid.group_path}/time"] = times
-        staged_out[f"{grid.group_path}/morton"] = children
+        if cell_coordinate:
+            staged_out[f"{grid.group_path}/morton"] = children
         if cell_ids is not None:
             staged_out[f"{grid.group_path}/cell_ids"] = cell_ids
     return store
@@ -1303,6 +1323,7 @@ def process_and_write_raster_hive(
         build_coverage,
         encode_coverage_bitmap,
         leaf_identity_gate,
+        read_commit,
         shard_leaf_path,
         stamp_commit,
         write_coverage_sidecar,
@@ -1390,6 +1411,15 @@ def process_and_write_raster_hive(
 
     def _leaf():
         if "store" not in box:
+            # The raster writer is legacy (in place); clearing a VERSIONED
+            # root would delete every version behind its pointer: refuse
+            # (spec §1.5, issue #582).
+            pointer = read_commit(open_store(leaf_path, read_only=True, **store_kwargs))
+            if pointer and pointer.get("current"):
+                raise ValueError(
+                    f"leaf {leaf_path} is versioned (current {pointer['current']!r}); "
+                    f"the raster writer cannot replace it in place (spec §1.5)"
+                )
             store = open_store(leaf_path, **store_kwargs)
             # overwrite=True: an existing prefix is debris from a torn run
             # (D4) or a prior committed leaf being redone (D13 re-run) — both
@@ -1408,6 +1438,9 @@ def process_and_write_raster_hive(
                     times_us,
                     overwrite=True,
                     staged_out=staged,
+                    # A windowed leaf stores no per-cell coordinate (issue
+                    # #586 phase 3): the word is derived.
+                    cell_coordinate=window is None,
                 )
             _arm_leaf_hashes(store, staged, streams)
             box["store"] = store
@@ -1468,6 +1501,7 @@ def process_and_write_raster_hive(
     # with acquisitions but no occupied cell writes no leaf). ``phase_timings``
     # cannot serve as the gate — it rides only under ``profile``.
     meta["leaf_written"] = "store" in box
+    hash_s = 0.0
     if "store" in box:
         _t0 = time.time()
         words = occupied[0] if occupied and occupied[0].size else None
@@ -1490,6 +1524,26 @@ def process_and_write_raster_hive(
                 time_range = [_us_iso(min(instants)), _us_iso(max(instants))]
                 meta["time_range"] = time_range
         meta["cells_with_data"] = int(words.size) if words is not None else 0
+        # O11 finalize (issue #342 phase 5), BEFORE the stamp (issue #580) so
+        # the record rides it: the per-row digests close out here — no
+        # read-back, a handful of hashes over bytes already consumed. The
+        # caller's ``build_record`` rides the same record into the leaf's D20
+        # sidecar; ``None`` leaves both absent (§5.3 unverifiable, not
+        # tampered).
+        _t1 = time.time()
+        try:
+            record = _finalize_leaf_hashes(staged, streams)
+        except Exception as e:
+            # Fail-open like every other hash site (D9): now that the record
+            # rides the stamp, an unanticipated raise here would otherwise
+            # leave a fully written leaf UNSTAMPED — debris — over a
+            # telemetry-class digest. A ``None`` record and a raise must cost
+            # the same thing: the key, never the leaf.
+            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
+            record = None
+        if record is not None:
+            meta["content_hashes"] = record
+        hash_s = time.time() - _t1
         stamp_commit(
             box["store"],
             cells_with_data=meta["cells_with_data"],
@@ -1499,6 +1553,7 @@ def process_and_write_raster_hive(
             ),
             window=label,
             time_range=time_range,
+            content_hashes=record,
         )
         # The recorded granule-id list as this leaf's sibling object (issue
         # #388), after the stamp and in the raster id space the gate plans
@@ -1510,24 +1565,12 @@ def process_and_write_raster_hive(
         write_granule_ids(
             leaf_path, raster_granule_ids(granules), spec=sidecar_spec, **store_kwargs
         )
-        write_s += time.time() - _t0
+        write_s += time.time() - _t0 - hash_s
     # Phase split (issues #100/#249; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default): only a unit that
     # actually wrote carries it, so a no-data unit stays write-less and
     # sample/write always decompose this call's wall. The per-stage ``stages``
     # block stays verbosity, gated on profiling/debug (a passed stage_stats).
-    hash_s = 0.0
-    if "store" in box:
-        # O11 finalize (issue #342 phase 5): the per-row digests close out
-        # here — no read-back, so this is a handful of hashes over bytes
-        # already consumed, not another pass over the data. The caller's
-        # ``build_record`` rides it into the leaf's D20 sidecar; ``None``
-        # leaves the record absent (§5.3 unverifiable, not tampered).
-        _t0 = time.time()
-        record = _finalize_leaf_hashes(staged, streams)
-        if record is not None:
-            meta["content_hashes"] = record
-        hash_s = time.time() - _t0
     if "store" in box:
         meta["phase_timings"] = {
             "sample": (time.time() - t_start) - write_s - hash_s,

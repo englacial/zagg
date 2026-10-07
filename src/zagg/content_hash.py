@@ -79,19 +79,33 @@ def _element_bytes(element: object) -> bytes:
     )
 
 
-def hash_array(values: np.ndarray) -> str:
-    """The §5.2 hash of ONE decoded array (fixed-width or vlen/object dtype)."""
+def update_hash(digest, values: np.ndarray) -> None:
+    """Feed one C-order block of a decoded array into a live §5.2 digest.
+
+    The block-wise form of :func:`hash_array`: the recipe is a plain
+    concatenation along the flat C order (raw little-endian bytes for a
+    fixed-width dtype, length-prefixed payloads for vlen), so consecutive
+    leading-axis blocks fed in order finalize to exactly the digest of the
+    assembled array. What a writer that never holds the whole array uses
+    (the streamed stage column, issue #586 phase 4).
+    """
     values = np.ascontiguousarray(values)
     if values.dtype.kind == "O":  # vlen: length-prefixed payloads, flat C order
-        digest = hashlib.sha256()
         for element in values.ravel(order="C"):
             payload = _element_bytes(element)
             digest.update(len(payload).to_bytes(VLEN_LENGTH_PREFIX, "little"))
             digest.update(payload)
-        return digest.hexdigest()
+        return
     if values.dtype.byteorder == ">":  # canonical form is little-endian
         values = values.astype(values.dtype.newbyteorder("<"))
-    return hashlib.sha256(values.tobytes()).hexdigest()
+    digest.update(values.tobytes())
+
+
+def hash_array(values: np.ndarray) -> str:
+    """The §5.2 hash of ONE decoded array (fixed-width or vlen/object dtype)."""
+    digest = hashlib.sha256()
+    update_hash(digest, values)
+    return digest.hexdigest()
 
 
 def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -> dict[str, str]:
@@ -280,3 +294,42 @@ def content_hashes_record(hashes: Mapping[str, str]) -> dict:
     (``combined`` is order-immune either way — it sorts the digests).
     """
     return {"arrays": dict(sorted(hashes.items())), "combined": combined_hash(hashes)}
+
+
+def staged_record(store: Any, staged: Mapping[str, np.ndarray], what: str) -> dict | None:
+    """The §5.3 record over ``staged`` (read-back for the rest), or ``None``.
+
+    The one entry point for every stamp writer that already holds its slabs
+    (hive leaf, overview, stage overview, leaf column, stage column):
+    computed before the stamp so the record rides the stamp itself (issue
+    #580). Fail-open (D9 telemetry posture) — a failure logs and returns
+    ``None``, and the caller stamps without the key, which §5.3 reads as
+    unverifiable, never tampered.
+
+    ``what`` is a log label only (the failing artifact, in whatever grammar
+    the call site names it); nothing parses it.
+    """
+    try:
+        import zarr
+
+        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        return content_hashes_record(hash_arrays(group, staged=staged))
+    except Exception as e:
+        logger.warning(f"{what}: O11 content hashing failed (fail-open, issue #342): {e}")
+        return None
+
+
+def streamed_record(digests: Mapping[str, Any], what: str) -> dict | None:
+    """The §5.3 record from live per-array digests (:func:`update_hash`), or ``None``.
+
+    :func:`staged_record` for a writer that hashed its arrays block by block
+    as it wrote them: ``digests`` maps each array's path relative to the
+    artifact root to its digest object, and MUST name every array the writer
+    put beneath that root — the §5.1 scope is the artifact's whole array set,
+    and nothing is read back here to complete it. Fail-open, same posture.
+    """
+    try:
+        return content_hashes_record({key: d.hexdigest() for key, d in digests.items()})
+    except Exception as e:
+        logger.warning(f"{what}: O11 content hashing failed (fail-open, issue #342): {e}")
+        return None

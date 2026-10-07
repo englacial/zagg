@@ -904,7 +904,8 @@ neither gap and is safe now.
   Each successful shard writes a versioned stats record as a **sibling**
   object next to the leaf (not inside the `.zarr/`): timings
   (read/index/aggregate/write/spill), counts, memory, cost (GB-s ×
-  price), catalog identity (D19), zagg version, and `invoked_by` (caller
+  price, over the unit's whole wall `duration_total_s` — issue #589 — not
+  the aggregate `duration_s`), catalog identity (D19), zagg version, and `invoked_by` (caller
   identity resolved once per run by the dispatcher via STS and stamped
   through the invoke payload — workers cannot see the caller). The schema
   is **mergeable by construction** — only associative stats (counts, sums,

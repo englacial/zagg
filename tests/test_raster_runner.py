@@ -58,7 +58,7 @@ def _shard_for_raster_at(dx):
 
     to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
     lon, lat = to_wgs.transform(ORIGIN[0] + dx + 480.0, ORIGIN[1] - 480.0)
-    leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+    leaf = geo2mort(lat, lon, order=29, points=True)
     return int(clip2order(10, leaf)[0])
 
 
@@ -104,6 +104,9 @@ class TestRasterAgg:
         assert summary["cells_error"] == 0
         assert summary["timesteps"] == 2
         assert summary["total_obs"] == 2
+        # Shared across strategies (issue #580): always present, always None
+        # here — raster is outside the stage-1 writer's scope (spec §11.6).
+        assert summary["icechunk"] is None and summary["icechunk_finalize"] is None
 
         grid = from_config(cfg)
         store_path = cfg.output["store"]
@@ -417,6 +420,9 @@ class TestRasterLambdaBackend:
         # worker bodies carry no stats records and nothing failed, so there
         # are no rows and no mode="stats" dispatch (issue #313).
         assert "run_stats_path" in summary and summary["run_stats_path"] is None
+        # Icechunk init record (issue #580): present and None, as on the local
+        # raster path — spec §11.6 puts raster outside stage 1's writer.
+        assert summary["icechunk"] is None and summary["icechunk_finalize"] is None
         assert not any(e["mode"] == "stats" for e in fake.events)
         # Cost block (issue #298, rolled into the raster path here): the
         # pre-invoke ceiling, the deferred estimate stub, and the billed
@@ -1050,6 +1056,9 @@ class TestRasterHiveLocalBackend:
         assert record["shard_key"] == int(shard)
         assert record["invoked_by"] is None and record["lambda"] is None
         assert {"sample", "write"} <= set(record["phase_timings"])
+        # The local backend records the unit wall too (issue #589), unpriced.
+        assert record["duration_total_s"] >= record["duration_s"]
+        assert record["gb_seconds"] is None
         # Read-volume counters (issue #297) ride the local record too. Order of
         # decoded vs sampled is regime-bound (a grid finer than the source
         # inverts it), so assert each counter is positive, not their ratio.

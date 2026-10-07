@@ -771,7 +771,7 @@ def _healpix_setup(tmp_path, time_encoding=None):
 
     to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
     lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
-    leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+    leaf = geo2mort(lat, lon, order=29, points=True)
     shard = int(clip2order(10, leaf)[0])
     cfg = _raster_config(
         bands={"red": {"asset": "red", "dtype": "uint16", "scale": 0.0001, "offset": -0.1}},
@@ -887,7 +887,7 @@ class TestTemplateAndSlabs:
 
         to_wgs = Transformer.from_crs(CRS(UTM18), CRS("EPSG:4326"), always_xy=True)
         lon, lat = to_wgs.transform(ORIGIN[0] + 480.0, ORIGIN[1] - 480.0)
-        leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+        leaf = geo2mort(lat, lon, order=29, points=True)
         shard = int(clip2order(4, leaf)[0])
         cfg = _raster_config(
             bands={"red": {"asset": "red", "dtype": "uint16"}},
@@ -934,6 +934,9 @@ class TestLeafTemplate:
         assert red.attributes["scale_factor"] == 0.0001
         assert tuple(inner.members["time"].shape) == (3,)
         assert tuple(inner.members["morton"].shape) == (grid.cells_per_shard,)
+        # The windowed leaf's template (issue #586 phase 3) drops only that.
+        windowed = raster_leaf_spec(grid, cfg, 3, cell_coordinate=False).members[grid.group_path]
+        assert set(inner.members) - set(windowed.members) == {"morton"}
 
     def test_leaf_spec_sharded_rejected(self, tmp_path):
         from zagg.processing.raster import raster_leaf_spec
@@ -1243,6 +1246,9 @@ class TestRasterHiveWorker:
         assert stamp["time_range"] == [T0, T0]
         assert meta["time_range"] == [T0, T0]
         assert stamp["granule_count"] == 1
+        # The streamed O11 record rides the stamp (issue #580 phase 2).
+        assert stamp["content_hashes"] == meta["content_hashes"]
+        assert set(stamp["content_hashes"]) == {"arrays", "combined"}
         # Occupied union = cells whose center lands on the (nodata-free) raster.
         cells = grid.children(shard)
         _rows, _cols, valid = grid.sample(cells, UTM18, TRANSFORM, (96, 96))
@@ -1256,6 +1262,38 @@ class TestRasterHiveWorker:
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (1, grid.cells_per_shard)
         assert (red[0, :][valid] == 555).all()
+        # A windowed leaf stores no per-cell coordinate (issue #586 phase 3):
+        # for raster the derived word simply IS the coordinate — cell j of
+        # the band axis is the shard's j-th child.
+        import zarr
+
+        from zagg.grids.morton import cell_words
+        from zagg.store import open_store
+
+        group = zarr.open_group(open_store(leaf), path=grid.group_path, mode="r", zarr_format=3)
+        assert set(group.array_keys()) == {"time", "red"}
+        assert set(stamp["content_hashes"]["arrays"]) == {
+            f"{grid.group_path}/time",
+            f"{grid.group_path}/red",
+        }
+        np.testing.assert_array_equal(cell_words(shard, grid.child_order), cells)
+
+    def test_refuses_a_versioned_root(self, tmp_path):
+        # The raster writer stays legacy; its clear-and-template must not
+        # delete a versioned leaf's versions (spec §1.5, issue #582).
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.store import open_store
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        leaf = hive.shard_leaf_path(root, shard)
+        pointer = {"complete": True}
+        hive.write_pointer_stamp(open_store(leaf), pointer, "run-r-cafef00d")
+        with pytest.raises(ValueError, match="is versioned"):
+            process_and_write_raster_hive(
+                shard, granules, grid, root, cfg, store_kwargs={}, window=None
+            )
+        assert hive.read_commit(leaf)["current"] == "run-r-cafef00d"
 
     def test_schedule_none_bare_leaf(self, tmp_path):
         from zagg import hive
@@ -1758,6 +1796,27 @@ class TestRasterHiveContentHashes:
         )
         assert "content_hashes" not in meta  # unverifiable, not tampered (§5.3)
 
+    def test_stamp_lands_when_hashing_raises(self, tmp_path, monkeypatch):
+        # The raster analogue of ``test_stamp_key_absent_when_hashing_fails``:
+        # since #580 the finalize runs BEFORE the stamp, so an unanticipated
+        # raise must still cost only the key. A committed-but-unhashed leaf is
+        # unverifiable (§5.3); an unstamped one is debris.
+        from zagg import hive
+        from zagg.processing import raster as raster_mod
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        monkeypatch.setattr(
+            raster_mod,
+            "_finalize_leaf_hashes",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        meta = raster_mod.process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window=None
+        )
+        assert "content_hashes" not in meta
+        stamp = hive.read_commit(hive.shard_leaf_path(root, shard))
+        assert stamp["complete"] is True and "content_hashes" not in stamp
+
     def test_a_violated_precondition_records_no_hash_at_all(self, tmp_path, caplog):
         # Trap (2) at the integration level: a row written twice invalidates
         # that array's digest, and the WHOLE record drops rather than
@@ -1809,7 +1868,7 @@ class TestRasterHivePopcount:
 
         def shard_at(dx, dy):
             lon, lat = to_wgs.transform(ORIGIN[0] + dx, ORIGIN[1] - dy)
-            leaf = geo2mort(np.array([lat]), np.array([lon]), order=29, points=True)
+            leaf = geo2mort(lat, lon, order=29, points=True)
             return int(clip2order(14, leaf)[0])
 
         return cfg, granules, shard_at, str(tmp_path / "store")

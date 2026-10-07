@@ -642,6 +642,7 @@ def write_column(
     from zarr import open_array
     from zarr.core.sync import sync
 
+    from zagg.content_hash import staged_record
     from zagg.grids.base import vlen_dtype_warning_suppressed
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_decimal
@@ -713,16 +714,32 @@ def write_column(
         }
     )
     populated = _populated_mask(folded[resolutions[0]], fields)
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
+    # sidecar carries the same record.
+    hashes = staged_record(store, staged, f"leaf column {basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
         granule_count=int(granule_count),
         window=window,
         time_range=time_range if window is not None else None,
+        content_hashes=hashes,
     )
-    _write_sidecar(
-        store, path, shard_key, staged, int(populated.sum()), granule_count, window, store_kwargs
-    )
+    # No record -> no sidecar: the column's sidecar carries nothing the stamp
+    # does not, save the O11 record, and a hash-less sidecar on a rewrite would
+    # read as a stale-or-absent ambiguity (test_sidecar_lands_after_the_stamp_
+    # and_fails_open). The stamp above already stands without the key.
+    if hashes is not None:
+        _write_sidecar(
+            store,
+            path,
+            shard_key,
+            hashes,
+            int(populated.sum()),
+            granule_count,
+            window,
+            store_kwargs,
+        )
     return basename
 
 
@@ -773,12 +790,13 @@ def _clear_column(store_root: str, shard_key, window: str | None, store_kwargs: 
 
 
 def _write_sidecar(
-    store, path, shard_key, staged, cells_with_data, granule_count, window, store_kwargs
+    store, path, shard_key, hashes, cells_with_data, granule_count, window, store_kwargs
 ) -> None:
     """The column's D20 stats sidecar: ``{stem}.stats.json``, after the stamp.
 
-    The overview writer's O11 recipe (issue #342, spec §5): the content
-    hashes computed from the staged arrays just written, in a
+    The overview writer's O11 recipe (issue #342, spec §5): ``hashes`` is the
+    content-hash record computed from the staged arrays just written (the
+    same record the stamp carries, issue #580), in a
     :func:`zagg.telemetry.build_record` row keyed by the shard. The name is
     derived from the column's own stem — ``telemetry.sidecar_key``'s label
     grammar (rightly) rejects the dotted ``.pyramid`` stem, and the rule is
@@ -792,19 +810,15 @@ def _write_sidecar(
     try:
         import json
 
-        import zarr
-
-        from zagg.content_hash import content_hashes_record, hash_arrays
         from zagg.store import open_object_store, put_object
         from zagg.telemetry import build_record
 
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=int(shard_key),
             metadata={
                 "cells_with_data": int(cells_with_data),
                 "granule_count": int(granule_count),
-                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+                "content_hashes": hashes,
             },
             window=window,
         )
@@ -840,13 +854,30 @@ def leaf_column_plan(config, grid) -> tuple[list[int], dict] | None:
     composable classes; the template-time warning for excluded fields is NOT
     repeated per shard (``build_pyramid_block`` owns the loud warning).
     """
+    from zagg.pyramid import declared_fields
+
+    levels = _leaf_levels(config, grid)
+    if levels is None:
+        return None
+    resolutions = column_resolutions(levels, grid.parent_order)
+    if not resolutions:
+        return None
+    fields = composable_fields(declared_fields(config)[0])
+    if not fields:
+        return None
+    return resolutions, fields
+
+
+def _leaf_levels(config, grid) -> list | None:
+    """The expanded ``/2`` ladder this config declares for ``grid``, or ``None``.
+
+    The gate half of :func:`leaf_column_plan` (see its docstring for the
+    default flip); factored out so the Icechunk companion can ask which of a
+    column's members are LEVELS (:func:`leaf_level_cells`) through the same
+    derivation the column writer used.
+    """
     from zagg.config import get_pyramid
-    from zagg.pyramid import (
-        declared_fields,
-        expand_overviews,
-        normalize_overviews,
-        validate_overviews,
-    )
+    from zagg.pyramid import expand_overviews, normalize_overviews, validate_overviews
 
     knob = get_pyramid(config)
     if knob is None:
@@ -863,14 +894,27 @@ def leaf_column_plan(config, grid) -> tuple[list[int], dict] | None:
     validate_overviews(
         declared, parent_order=int(grid.parent_order), child_order=int(grid.child_order)
     )
-    levels = expand_overviews(declared, parent_order=int(grid.parent_order))
-    resolutions = column_resolutions(levels, grid.parent_order)
-    if not resolutions:
-        return None
-    fields = composable_fields(declared_fields(config)[0])
-    if not fields:
-        return None
-    return resolutions, fields
+    return expand_overviews(declared, parent_order=int(grid.parent_order))
+
+
+def leaf_level_cells(config, grid) -> list[int]:
+    """The column members that are multiscales LEVELS: the leaf entry's declared cells.
+
+    A column carries more (:func:`column_resolutions`: the within-footprint
+    intermediates and the node-order partial), but the §4.9 mirror lists one
+    ``column`` dataset per declared leaf-node entry — ``[13]`` at the
+    production geometry against a column holding ``13, 12, 11, 10, 9`` — and
+    only those are indexed by the Icechunk companion (spec §11.1): the rest
+    overlap the overview levels for the same cells. Empty when no column is
+    declared.
+    """
+    levels = _leaf_levels(config, grid)
+    if not levels:
+        return []
+    node = int(grid.parent_order)
+    return sorted(
+        {int(c) for e in levels if int(e["node"]) == node for c in e["cells"]}, reverse=True
+    )
 
 
 def write_leaf_column(

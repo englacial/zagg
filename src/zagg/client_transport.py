@@ -46,14 +46,17 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import uuid
 from concurrent.futures import Future
+from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from zagg.dispatch import BENIGN_ERRORS
+from zagg.telemetry import billed_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -105,11 +108,18 @@ def drop_timeout_s(function_timeout_s: float) -> float:
 
 #: Version stamped into every status object; bump on any key change. Read back
 #: in :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump
-#: is loud rather than subtly wrong (review finding, PR #343).
+#: is loud rather than subtly wrong (review finding, PR #343). The manifest and
+#: tail marker carry it too, but the slim manifest (issue #588) did not bump it:
+#: the worker stamps it while the dispatcher picks slim-or-full, so only the
+#: ``shards: null`` + ``shards_omitted`` shape can say which; status objects
+#: are unchanged; the manifest's keys are not normative in the spec.
 STATUS_SCHEMA_VERSION = 1
 
 #: Dispatch-manifest object name under the run prefix (issue #327 phase 2).
 MANIFEST_NAME = "manifest.json"
+
+#: An unwindowed shard's status object name (:func:`shard_status_key`).
+_SHARD_STATUS_RE = re.compile(r"shard-(\d+)\.json")
 
 #: Tail-completion marker under the run prefix (issue #327 phase 5): written
 #: by the mode="stats" worker when the post-run tail's record leg completes AND
@@ -222,14 +232,38 @@ def build_run_manifest_block(
     }
 
 
+def slim_run_manifest_block(block: dict) -> dict:
+    """``block`` without its shard list: what rides when the full one does not fit.
+
+    The hive setup invoke is a size-capped ``Event``
+    (``runner._invoke_lambda_setup_async``) and ``shards`` is the only key
+    that scales with the run, so a large run's block goes out slim rather
+    than not at all (issue #588): the written manifest keeps the config and
+    the run's identity — everything ``icechunk_ops finalize`` reads — and
+    :func:`attach_run` takes the shard set from the status objects instead.
+
+    ``shards`` stays in the key set as ``null`` and ``shards_omitted`` counts
+    the keys left out (the full block has none, so its bytes are unchanged).
+    ``null`` rather than ``[]`` or a missing key: an empty list would read as
+    a run that dispatched nothing, while ``null`` fails loudly in a reader
+    that iterates it and reads as "no list" in one that does
+    ``manifest.get("shards") or []`` — a pre-#588 ``Run.attach`` then refuses
+    with "lists no shards". :data:`STATUS_SCHEMA_VERSION` is not bumped.
+    """
+    return {**block, "shards": None, "shards_omitted": len(block.get("shards") or [])}
+
+
 def write_dispatch_manifest(event: dict, store_kwargs: dict[str, Any]) -> None:
     """PUT the run's dispatch manifest from a setup event — fail-open, worker-side.
 
     Called from the Lambda handler's setup seam on a successful setup. The
     ``run_manifest`` block (see :func:`build_run_manifest_block`) plus the
     setup event's ``config`` land at ``<run prefix>/manifest.json`` — what
-    ``Run.attach`` rebuilds a handle from. Absent block (an old dispatcher, or
-    one dropped over the async payload cap) writes nothing, keeping the event
+    ``Run.attach`` rebuilds a handle from. The block is written as it came,
+    so a slim one (:func:`slim_run_manifest_block`, a large hive run) lands a
+    slim manifest: ``shards: null``, ``shards_omitted``, and the config.
+    Absent block (an old dispatcher, or one dropped because even the slim
+    block was over the async payload cap) writes nothing, keeping the event
     byte-identical to pre-#327; any failure logs and never fails the setup.
     """
     try:
@@ -337,6 +371,25 @@ def read_dispatch_manifest(prefix: str, store_kwargs: dict[str, Any]) -> dict | 
         return None
 
 
+def reported_shards(prefix: str, store_kwargs: dict[str, Any]) -> list[int]:
+    """Shard keys with a status object under the run prefix (one LIST, read-only).
+
+    The shard set a slim dispatch manifest leaves out (issue #588), read back
+    off the always-on status objects: the inverse of :func:`shard_status_key`
+    for unwindowed units (``attach_run`` refuses windowed runs before it gets
+    here), so the manifest and the tail marker are not shards.
+    """
+    import obstore
+
+    keys = set()
+    for batch in obstore.list(open_status_store(prefix, store_kwargs)):
+        for meta in batch:
+            m = _SHARD_STATUS_RE.fullmatch(str(meta["path"]).rsplit("/", 1)[-1])
+            if m:
+                keys.add(int(m[1]))
+    return sorted(keys)
+
+
 def tail_recorded(prefix: str, store_kwargs: dict[str, Any]) -> bool:
     """Whether the run's post-run tail marker exists (read-only).
 
@@ -397,6 +450,7 @@ def dispatch_event_shards(
         max_in_flight=workers,
         on_failed=on_failed,
     )
+    skip_hash = runner._fleet_skip_hash(run.config, run.overwrite)
     futures: dict[int, Future] = {}
     for key, records in cells:
         key = int(key)
@@ -419,6 +473,7 @@ def dispatch_event_shards(
             aoi_payload=aoi_by_shard.get(key),
             invoked_by=invoked_by,
             run_id=run_id,
+            semantic_hash=skip_hash,
         )
         submap = {
             "grid_signature": run.catalog_data["grid_signature"],
@@ -455,6 +510,17 @@ def attach_run(
     the manifest's ``dispatched_at``), and starts the finisher with the
     read-only ``tail_recorded`` check so an already-recorded tail never
     re-runs.
+
+    A SLIM manifest (issue #588: a large hive run's, ``shards: null`` +
+    ``shards_omitted``) still supplies the config; the shard set is then the
+    shards that have REPORTED (:func:`reported_shards`). While that is fewer
+    than ``shards_omitted`` the handle is a snapshot of the reported shards
+    (``handle.unreported_shards`` counts the rest) and runs NO tail: the
+    tail's run record and its marker stand for the whole run, and the shards
+    this handle cannot name would be missing from them. Past the drop
+    deadline the rest never report (a worker killed at the timeout, a lost
+    invoke, a dispatcher that died mid-fan-out), so attach can never run that
+    run's tail; the warning says so and points at a re-dispatch.
     """
     import threading
     from dataclasses import asdict
@@ -480,8 +546,10 @@ def attach_run(
     if manifest is None:
         raise ValueError(
             f"no dispatch manifest at {prefix}/{MANIFEST_NAME} — wrong store/run_id, "
-            f"a dispatcher predating issue #327, or a hive setup Event that was "
-            f"dropped (its manifest write is best-effort)"
+            f"a dispatcher predating issue #327, a hive setup Event that was lost "
+            f"(its manifest write is best-effort), or a run whose block did not fit "
+            f"that event even without its shard list (its summary says "
+            f'dispatch_manifest: "dropped")'
         )
     if not manifest.get("config"):
         raise ValueError(f"dispatch manifest for run {run_id} carries no config")
@@ -492,9 +560,20 @@ def attach_run(
             "Run.attach covers unwindowed spatial runs; windowed units are "
             "(shard, window) pairs the manifest does not enumerate"
         )
-    shards = [int(s) for s in manifest.get("shards") or []]
-    if not shards:
-        raise ValueError(f"dispatch manifest for run {run_id} lists no shards")
+    omitted = manifest.get("shards_omitted")
+    if omitted is None:
+        shards = [int(s) for s in manifest.get("shards") or []]
+        if not shards:
+            raise ValueError(f"dispatch manifest for run {run_id} lists no shards")
+    else:
+        shards = reported_shards(prefix, store_kwargs)
+        if not shards:
+            raise ValueError(
+                f"dispatch manifest for run {run_id} is slim (its {omitted} shards are not "
+                f"listed) and no shard has reported a status yet: attach again once the "
+                f"fleet has"
+            )
+    unreported = max(int(omitted or 0) - len(shards), 0)
 
     grid = grid_from_config(config)
     catalog_data = {
@@ -515,6 +594,7 @@ def attach_run(
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url or get_output_endpoint_url(config),
     )
+    run._attached = True  # the tail finalizes the repo off the knob (issue #582)
     client = lambda_client
     if client is None:
         import boto3
@@ -536,10 +616,10 @@ def attach_run(
         dispatched_at = datetime.fromisoformat(manifest["dispatched_at"]).timestamp()
     except (KeyError, TypeError, ValueError):
         pass
-    timeout_s = runner._get_function_timeout_s(client, run.function_name)
+    drop_s = drop_timeout_s(runner._get_function_timeout_s(client, run.function_name))
     poller = StatusPoller(
         lambda: open_status_store(prefix, store_kwargs),
-        drop_timeout_s=drop_timeout_s(timeout_s),
+        drop_timeout_s=drop_s,
         on_failed=_fail_with_shard_error,
     )
     futures: dict[int, Future] = {}
@@ -549,26 +629,49 @@ def attach_run(
     poller.start()
 
     handle = RunHandle(futures, store_path=store)
-    finisher = threading.Thread(
-        target=run._post_run,
-        args=(
-            handle,
-            client,
-            poller,
-            asdict(config),
-            manifest.get("dataset"),
-            output_creds_event,
-            run_id,
-        ),
-        kwargs={
-            "tail_done_check": lambda: tail_recorded(prefix, store_kwargs),
-            # An attached run's rows are the same status objects, so an
-            # oversized row set has the same pointer to fall back to.
-            "result_prefix": prefix,
-        },
-        name="zagg-client-finish",
-        daemon=True,
-    )
+    handle.dispatch_manifest = "full" if omitted is None else "slim"
+    handle.unreported_shards = unreported
+    if unreported:
+        late = dispatched_at is not None and time.time() >= dispatched_at + drop_s
+        then = (
+            f"the drop deadline has passed, so the other {unreported} never reported and attach "
+            f"cannot run this run's tail: re-dispatch the run to cover them"
+            if late
+            else "attach again once the rest have"
+        )
+        logger.warning(
+            f"run {run_id}: slim dispatch manifest, {len(shards)} of {omitted} shards have "
+            f"reported — this handle covers those and runs no tail; {then} (issue #588)"
+        )
+
+        def _settle():  # no tail: its record would stand for a partial shard set
+            try:
+                futures_wait(list(futures.values()))
+            finally:
+                poller.shutdown(wait=False)
+
+        finisher = threading.Thread(target=_settle, name="zagg-client-finish", daemon=True)
+    else:
+        finisher = threading.Thread(
+            target=run._post_run,
+            args=(
+                handle,
+                client,
+                poller,
+                asdict(config),
+                manifest.get("dataset"),
+                output_creds_event,
+                run_id,
+            ),
+            kwargs={
+                "tail_done_check": lambda: tail_recorded(prefix, store_kwargs),
+                # An attached run's rows are the same status objects, so an
+                # oversized row set has the same pointer to fall back to.
+                "result_prefix": prefix,
+            },
+            name="zagg-client-finish",
+            daemon=True,
+        )
     handle._finisher = finisher
     finisher.start()
     return handle
@@ -997,7 +1100,7 @@ class StatusPoller:
             "status_code": status_code,
             "body": body,
             "wall_time": self._clock() - start,
-            "lambda_duration": (body or {}).get("duration_s", 0),
+            "lambda_duration": billed_seconds(body),
             "error": error,
             "retries": entry.attempts - 1,
             "timeout": False,

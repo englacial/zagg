@@ -175,33 +175,100 @@ _RETRY_STATUSES = (502, 503, 504)
 _RETRY_ATTEMPTS = 4
 _RETRY_BACKOFF_S = 2.0
 
+#: Bytes of an unparsable body echoed in the exhausted-retry raise (#562), so
+#: a CI log alone attributes the failure to its endpoint and page. Sliced off
+#: ``resp.content``, not ``resp.text``: the bound is then the byte bound this
+#: comment advertises, and a multi-MB HTML error page is not decoded whole
+#: (charset sniffing included) just to take its head. The slice alone is
+#: decoded for the message (UTF-8, undecodable bytes replaced) so the log
+#: reads as text rather than a bytes repr.
+_BODY_SNIPPET = 200
 
-def _search_request(url, *, params=None, body=None, timeout=60):
-    """One item-search request, retrying transient gateway errors.
 
-    Retries ``_RETRY_STATUSES`` with exponential backoff (``_RETRY_ATTEMPTS``
-    tries total); any other status falls through to ``raise_for_status`` on
-    the first response, an exhausted retry budget on the last.
+class STACSearchError(ValueError):
+    """Raised when a STAC item-search exhausts its retry budget on 2xx
+    responses that carry no usable JSON object (issue #562).
+
+    A ``ValueError`` subclass so existing ``except ValueError`` handlers keep
+    working; catch this type to tell "the endpoint answered garbage for every
+    attempt" from any other ``ValueError``. ``__cause__`` is the rejection
+    ``_json_body`` raised on the last attempt (a ``json.JSONDecodeError``, or
+    the plain ``ValueError`` of the content-type / shape refusals).
     """
+
+
+def _json_body(resp) -> dict:
+    """Parsed JSON body of a search response.
+
+    Raises ``ValueError`` (``json.JSONDecodeError`` is one) when the body is
+    not a JSON object. CMR-STAC transiently answers **200 with a
+    maintenance/HTML page**, which clears both ``_RETRY_STATUSES`` and
+    ``raise_for_status`` (issue #562). A declared non-JSON content-type is
+    taken at its word; an absent one is not held against an otherwise
+    parseable body.
+
+    Shape is checked too, not just parseability: ``null``, ``[]`` or a bare
+    JSON string served as ``application/json`` parse fine and then die a
+    frame later on ``doc.get("features", ...)``, unretried and with no
+    endpoint in the traceback -- the same #562 failure spelled
+    ``AttributeError``.
+    """
+    ctype = resp.headers.get("Content-Type", "")
+    if ctype and "json" not in ctype.lower():
+        raise ValueError(f"content-type {ctype!r} is not JSON")
+    doc = resp.json()
+    if not isinstance(doc, dict):
+        raise ValueError(f"body parsed to {type(doc).__name__}, not a JSON object")
+    return doc
+
+
+def _search_request(url, *, params=None, body=None, timeout=60) -> dict:
+    """One item-search request, retrying transient failures; returns the doc.
+
+    Retries ``_RETRY_STATUSES`` *and* 2xx responses whose body is not a JSON
+    object (issue #562) with exponential backoff (``_RETRY_ATTEMPTS`` tries total),
+    under one shared budget. Any other status falls through to
+    ``raise_for_status`` on the first response; an exhausted budget raises
+    that status, or -- for a 2xx -- a ``STACSearchError`` naming the status,
+    content-type and head of the body, quoting and chained to whichever
+    rejection ``_json_body`` last raised (a decode error, or the
+    content-type refusal, which prints a body that does parse).
+    """
+    bad: ValueError | None = None
     for attempt in range(_RETRY_ATTEMPTS):
         if body is not None:
             resp = requests.post(url, json=body, timeout=timeout)
         else:
             resp = requests.get(url, params=params, timeout=timeout)
-        if resp.status_code not in _RETRY_STATUSES or attempt == _RETRY_ATTEMPTS - 1:
+        bad = None
+        if resp.status_code not in _RETRY_STATUSES:
+            resp.raise_for_status()
+            try:
+                return _json_body(resp)
+            except ValueError as exc:
+                bad = exc
+        if attempt == _RETRY_ATTEMPTS - 1:
             break
         wait = _RETRY_BACKOFF_S * 2**attempt
+        # Counted in attempts, not retries, so this agrees with the
+        # "after N attempts" the exhausted raise below prints.
         logging.warning(
-            "STAC search got %s from %s; retrying in %.0fs (%d/%d)",
-            resp.status_code,
+            "STAC search got %s from %s; retrying in %.0fs (attempt %d/%d)",
+            f"no usable JSON body ({bad})" if bad else f"status {resp.status_code}",
             url,
             wait,
             attempt + 1,
-            _RETRY_ATTEMPTS - 1,
+            _RETRY_ATTEMPTS,
         )
         time.sleep(wait)
     resp.raise_for_status()
-    return resp
+    snippet = resp.content[:_BODY_SNIPPET].decode("utf-8", errors="replace")
+    raise STACSearchError(
+        f"STAC search at {url} gave no usable JSON body after {_RETRY_ATTEMPTS} attempts "
+        f"({bad}): status={resp.status_code} "
+        f"content-type={resp.headers.get('Content-Type', '')!r} "
+        f"body[:{_BODY_SNIPPET}]={snippet!r}"
+    ) from bad
 
 
 def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
@@ -214,8 +281,7 @@ def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
     """
     items: list[dict] = []
     while True:
-        resp = _search_request(url, params=params, body=body, timeout=timeout)
-        doc = resp.json()
+        doc = _search_request(url, params=params, body=body, timeout=timeout)
         feats = doc.get("features", [])
         items.extend(feats)
         nxt = next((ln for ln in doc.get("links", []) if ln.get("rel") == "next"), None)
@@ -876,6 +942,7 @@ class Catalog:
 __all__ = [
     "Query",
     "STACQuery",
+    "STACSearchError",
     "CMRSource",
     "STACSource",
     "Catalog",

@@ -1,0 +1,41 @@
+{
+ "spec": "morton-moc/1",
+ "encoding": "ranges",
+ "order": 4,
+ "source": "sweep",
+ "generated_at": "2026-10-01T23:27:51+00:00",
+ "ranges": [
+  [
+   "11213",
+   "11213"
+  ]
+ ],
+ "temporal": {
+  "spec": "zagg-coverage-toc/1",
+  "source": "sweep",
+  "generated_at": "2026-10-01T23:27:51+00:00",
+  "fields": [
+   "h_tdigest"
+  ],
+  "shards": {
+   "11213": "10689250968998868755"
+  },
+  "counts": {
+   "temporal_order": 24,
+   "cap": 512,
+   "element": {
+    "dtype": "uint64",
+    "shape": [
+     -1
+    ]
+   },
+   "encoding": "base64",
+   "words": "AO0rSgDZV5SA7StKANpXlIB2LUoA7FqUAHctSgDtWpSAdy1KAO5alA==",
+   "obs": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "count": 5,
+   "obs_total": 0,
+   "uncounted_shards": 1
+  },
+  "cover": "zagg-coverage-toc-cover/1"
+ }
+}

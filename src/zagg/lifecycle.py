@@ -123,6 +123,7 @@ def touch_current_unit(
     sidecar_spec=None,
     store_kwargs=None,
     policy="auto",
+    current=None,
 ) -> dict:
     """The issue #388 skip-path touch for ONE ``(shard, window)`` unit.
 
@@ -132,21 +133,35 @@ def touch_current_unit(
     caller passes one — then touches it via :func:`touch_unit_footprint`.
     Returns the counts dict; NEVER raises (assembly errors count as one
     failure and the touch is skipped).
+
+    ``current`` (issue #582, spec §1.5) says the leaf is VERSIONED: the
+    footprint is then the root ``zarr.json`` (the pointer stamp) plus the
+    siblings — and NO version object, current or superseded: a touch re-mints
+    an object's checksum (a multipart ETag, the ``file://`` mtime), which the
+    run tags' refs depend on; a version's lifetime is the §11 collector's,
+    never an expiration rule's. ``None`` touches the whole leaf tree, the
+    legacy leaf's footprint.
     """
     try:
         from zagg.column import _sidecar_name as column_sidecar_name
+        from zagg.icechunk_ladder import leaf_refs_key
         from zagg.sweep import submap_key
         from zagg.telemetry import granule_ids_path, sidecar_path
 
         prefix, _, name = str(leaf_path).rstrip("/").rpartition("/")
-        trees = [str(leaf_path)]
-        objects = [
+        leaf = str(leaf_path).rstrip("/")
+        trees = [] if current else [leaf]
+        objects = ([f"{leaf}/zarr.json"] if current else []) + [
             sidecar_path(str(leaf_path), sidecar_spec),
             # The recorded id list (issue #388) ages with the sidecar it
             # pairs with: losing it to a lifecycle rule would silently
             # disarm the contraction guard on a leaf that is otherwise fresh.
             granule_ids_path(str(leaf_path), sidecar_spec),
             f"{prefix}/{submap_key(name, sidecar_spec)}",
+            # The Icechunk ref sidecar (issue #580 phase 6): the ladder's
+            # input for this leaf; a skipped leaf must keep it as fresh as
+            # the leaf, or the next staged sweep gathers a hole.
+            f"{prefix}/{leaf_refs_key(name, sidecar_spec)}",
         ]
         if column_path:
             trees.append(str(column_path))

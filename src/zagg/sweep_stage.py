@@ -68,6 +68,16 @@ the root ``coverage.moc`` refresh, the manifest RMW writing per-entry
 actuals into ``pyramid.overviews`` (which also satisfies the PR #397
 lifecycle root-touch for the manifest), and lease release as its final act.
 
+**Units and the streamed fold** (issue #586 phase 4). The unit of stage
+work is ``(node, window)``: :func:`stage_node` folds ONE window of a dispatch
+node, and on a windowed store a node's windows are separate units that share
+no object — the enumeration, the per-node close (the all-time fold over the
+node's per-window overviews) and their execution live in
+:mod:`zagg.sweep_units`. The fold kernels live in :mod:`zagg.sweep_fold` and
+run block by block over the output range, so a worker holds one block of
+inputs rather than a level; :func:`write_stage_column` writes a column the
+same way, one chunk object per block.
+
 Raster hive stores are column-less by construction (§4.6 is written for the
 aggregation pipeline): the sweep refuses them loudly; issue #399's
 reducer-keyed folds join this orchestration later under the same schema.
@@ -79,6 +89,14 @@ import json
 import logging
 
 import numpy as np
+
+from zagg.sweep_fold import (
+    ColumnMovedError,
+    _gather_slabs,
+    _merge_slabs,
+    iter_gather,
+    refold_on_move,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -266,8 +284,12 @@ class _ColumnReader:
     **optimistic stamp validation** the lease ruling requires: stamp before,
     read, stamp after — if the stamp moved (a fleet worker rewrote the leaf
     mid-read, the allowed fleet ∥ sweep regime), the read retries against the
-    fresh stamp, so a merge never consumes a torn (mixed-generation) column.
-    A stamp that keeps moving reads as unreadable, never as data. A stage
+    fresh stamp — but only until the reader has SERVED a read. The first
+    served read pins its stamp: the fold reads a member block by block (issue
+    #586 phase 4), so after that a moved stamp, or a vanished one (a rewrite
+    in flight), raises :class:`zagg.sweep_fold.ColumnMovedError` rather than
+    hand the fold half of each write, and a stamp that keeps moving raises it
+    too. The caller folds the artifact again from fresh readers. A stage
     column stamped by a foreign run SINCE this run started raises
     :class:`ForeignSweepError` (two live sweeps — the lease backstop).
     """
@@ -277,8 +299,10 @@ class _ColumnReader:
 
         self.path = path
         self.revalidated = 0
+        self._served = False  # whether a read was handed out (pins self.stamp)
         self._run_id, self._run_started = run_id, run_started
         self._store = open_store(path, read_only=True, **store_kwargs)
+        self._arrays: dict = {}
         self.stamp, self.attrs = self._root()
         self._foreign_guard(self.stamp)
 
@@ -328,6 +352,50 @@ class _ColumnReader:
         block = (self.attrs.get(COLUMN_ATTR) or {}).get("generation")
         return stamped_generation_key(block, self.stamp)
 
+    def _array(self, res: int, name: str):
+        """The member's open array, or ``None`` when it is absent.
+
+        Handles are kept for the reader's life so a member read block by block
+        (issue #586 phase 4) pays its metadata opens once; absence is never
+        cached, and a moved stamp drops every handle (:meth:`_read`).
+        """
+        import zarr
+        from zarr.errors import GroupNotFoundError
+
+        key = (int(res), name)
+        if key not in self._arrays:
+            try:
+                group = zarr.open_group(self._store, path=str(res), mode="r", zarr_format=3)
+                self._arrays[key] = group[name]
+            except (KeyError, FileNotFoundError, GroupNotFoundError):
+                return None  # the member postdates this column: fill
+        return self._arrays[key]
+
+    def has(self, res: int, name: str) -> bool:
+        """Whether the column carries ``{res}/{name}`` (metadata only)."""
+        return self._array(res, name) is not None
+
+    def _read(self, res: int, name: str, cells: slice) -> np.ndarray | None:
+        for _attempt in range(3):
+            before = self.stamp
+            array = self._array(res, name)
+            values = None if array is None else array[cells]
+            after, attrs = self._root()
+            if after is not None and _same_stamp(before, after):
+                self._served = True
+                return values
+            self._foreign_guard(after)
+            if self._served:
+                raise ColumnMovedError(
+                    f"column {self.path} was rewritten after this fold read from it "
+                    f"(stamp {'gone' if after is None else 'moved'})"
+                )
+            logger.info(f"stage sweep: column {self.path} moved mid-read; re-reading")
+            self.stamp, self.attrs = after, attrs
+            self._arrays.clear()
+            self.revalidated += 1
+        raise ColumnMovedError(f"column {self.path} stamp kept moving across re-reads")
+
     def read(self, res: int, name: str) -> np.ndarray | None:
         """One group array, stamp-validated; ``None`` for an absent member.
 
@@ -339,24 +407,16 @@ class _ColumnReader:
         foreign-fresh guard: a column rewritten mid-read by a FOREIGN sweep
         is the exact race the backstop exists for (review finding).
         """
-        import zarr
-        from zarr.errors import GroupNotFoundError
+        return self._read(res, name, slice(None))
 
-        for _attempt in range(3):
-            before = self.stamp
-            try:
-                group = zarr.open_group(self._store, path=str(res), mode="r", zarr_format=3)
-                values = group[name][:]
-            except (KeyError, FileNotFoundError, GroupNotFoundError):
-                return None  # the member postdates this column: fill
-            after, attrs = self._root()
-            if _same_stamp(before, after):
-                return values
-            self._foreign_guard(after)
-            logger.info(f"stage sweep: column {self.path} moved mid-read; re-reading")
-            self.stamp, self.attrs = after, attrs
-            self.revalidated += 1
-        raise ValueError(f"column {self.path} stamp kept moving across re-reads")
+    def read_range(self, res: int, name: str, start: int, stop: int) -> np.ndarray | None:
+        """Cells ``[start, stop)`` of one group array — :meth:`read`, for a block.
+
+        What the chunk-streamed fold reads (:mod:`zagg.sweep_fold`): only the
+        chunk objects covering the range are fetched, under the same stamp
+        validation and foreign-fresh guard as a whole-member read.
+        """
+        return self._read(res, name, slice(int(start), int(stop)))
 
 
 def _readers_for(
@@ -421,396 +481,6 @@ def _summed_generation(rows: list) -> dict:
     }
 
 
-def _source_counts(rows: list, broken=()) -> tuple:
-    """``(folded, missing, unreadable)`` over the dense child range.
-
-    A child counts **folded** when at least one of its windows delivered a
-    usable column, **missing** when every window's column is cleanly absent
-    (never generated, or a fleet still in flight), and **unreadable**
-    otherwise — the distinction the two counters must not launder into one.
-
-    ``broken`` is the set of ``(child index, window index)`` contributors a
-    fold refused MID-READ: a located payload present without its §9 channel
-    (:func:`_located_pair`). Such a contributor is not usable, exactly as an
-    unreadable column is not, so it is classified here rather than counted as
-    a clean fold — the counters are what ``source_children`` records, and an
-    artifact folded without a contributor must say so (spec §4.5).
-    """
-    folded = missing = unreadable = 0
-    for i, row in enumerate(rows):
-        if row is None:
-            continue
-        if any(_is_reader(r) and (i, w) not in broken for w, r in enumerate(row)):
-            folded += 1
-        elif all(r is None for r in row):
-            missing += 1
-        else:
-            unreadable += 1
-    return folded, missing, unreadable
-
-
-def _companion_group(reader, res: int, name: str, declared: list) -> dict | None:
-    """One contributor's ``{array: values}`` at ``res``, or ``None`` if refused.
-
-    A field and EVERY companion it declares are read together and validated
-    before any of them is used (issue #410). ``_StageReader.read`` returns
-    ``None`` per ARRAY, not per member — its documented schema-evolution
-    contract — so a column written before ``location:``/``temporal:`` joined the
-    declaration reads its payload fine and its siblings as ``None``. That is not
-    under-coverage: the words are exact only *given* the centroid partition the
-    payload describes (spec §9.1/§8.3/§2.3), so a payload gathered or folded
-    without its words is **corruption**, not a missing member. All absent
-    together is the honest schema-evolution case and reads as fill.
-
-    Returns ``None`` for a partial group; the caller counts the contributor
-    unreadable and skips it, which is the posture
-    ``sweep_overview._fold_node`` takes at a leaf missing a sibling (skip
-    loudly, ``failed += 1``) rather than aborting the level — a single stale
-    child column must not take a whole stage down.
-    """
-    arrays = {name: reader.read(res, name)}
-    for _kwarg, sibling in declared:
-        arrays[sibling] = reader.read(res, sibling)
-    present = [k for k, v in arrays.items() if v is not None]
-    if not present or len(present) == len(arrays):
-        return arrays
-    logger.warning(
-        f"stage sweep: column {reader.path} carries {sorted(present)} at resolution {res} "
-        f"but not {sorted(set(arrays) - set(present))}; counting the contributor "
-        f"unreadable rather than writing a payload and channels that describe different "
-        f"partitions (spec §9.1/§8.3, §1.1)"
-    )
-    return None
-
-
-def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) -> tuple:
-    """Concatenate child members at ``res`` — gen-1 content, untouched.
-
-    ``rows`` is the DENSE rank-ordered child range: ``None`` for a child no
-    candidate leaf inhabits (genuinely empty — fill, uncounted), else the
-    child's reader row (gathers are per-window by construction, one reader,
-    itself ``None`` when the candidate's column is missing — under-coverage,
-    counted). Payloads are ASSIGNED, never decoded or re-folded — the
-    acceptance contract that gather levels carry gen-1 bytes untouched.
-    Returns ``(slabs, folded, missing, unreadable, demotions)`` — the last
-    always empty here because a gather FOLDS nothing, so the packed rail has
-    no site to fire in; NOT because a gather cannot relay the half-paired
-    shape the rail exists for. It can, and the residual is the laundering
-    case named at the return.
-
-    A located field's sibling is gathered under the same rule as its payload
-    (ruling 4 on issue #410): a gather ASSIGNS gen-1 bytes, so the pair stays
-    row-aligned by construction — **given that both arrays are present**, which
-    is the one thing the read does not establish. The pair is therefore read
-    and validated (:func:`_located_pair`) BEFORE anything is assigned, so a
-    child carrying one half contributes neither and is counted unreadable
-    rather than half-applied into the span.
-    """
-    from zagg.sweep_overview import _empty_slab, field_companions
-
-    slabs = {name: _empty_slab(meta, n_out) for name, meta in fields.items()}
-    companions = {
-        name: field_companions(name, meta)
-        for name, meta in fields.items()
-        if field_companions(name, meta)
-    }
-    for declared in companions.values():
-        for _kwarg, sibling in declared:
-            slabs[sibling] = np.full(n_out, b"", dtype=object)
-    broken: set = set()
-    for i, row in enumerate(rows):
-        if row is None:
-            continue
-        reader = row[0]
-        if not _is_reader(reader):
-            continue
-        grouped: dict = {}
-        skip: set = set()
-        for name, declared in companions.items():
-            group = _companion_group(reader, res, name, declared)
-            if group is None:
-                # EVERY half stays fill: the child's span for this field reads
-                # as under-covered, never as a payload with an absent channel.
-                broken.add((i, 0))
-                skip |= {name, *(sib for _kw, sib in declared)}
-                continue
-            grouped.update(group)
-        seg = slice(i * span, (i + 1) * span)
-        for name in list(slabs):
-            if name in skip:
-                continue
-            values = grouped[name] if name in grouped else reader.read(res, name)
-            if values is not None:
-                slabs[name][seg] = values
-    # A gather ASSIGNS gen-1 bytes, so the packed guard rail — a fold-site
-    # check — has no site to fire in and the demotions slot is empty (issue
-    # #518), kept so every fold arm returns one shape. Empty because nothing
-    # folds here, NOT because a gather cannot produce the half-paired shape
-    # the rail exists for: a source column carrying the ``of`` digest without
-    # the word relays a PRESENT, all-fill word array beside a populated
-    # divisor (the packed pair is not validated the way ``_located_pair``
-    # validates a located one), which the next rung's ``_merge_slabs`` then
-    # reads as legitimate ``(0, n)`` parts — diluting the lane fractions
-    # instead of blanking them, with no rail fired and nothing in any attrs.
-    # That relay laundering predates issue #518 and stands as a question on
-    # its PR; the fix belongs beside ``_companion_group``'s
-    # pairing logic, not in this observability path (review finding).
-    return (slabs, *_source_counts(rows, broken), [])
-
-
-def _merge_slabs(
-    rows: list, fields: dict, *, res_src: int, src_per_child: int, factor: int, n_out: int
-) -> tuple:
-    """K-way fold of the gen-1 tier, ``factor``-to-one — the ruled merge.
-
-    ``rows`` is the DENSE rank-ordered child range (``None`` for uninhabited
-    children, else ``[reader-or-None per window]``). The sources are the
-    relayed partials (``res_src`` the relay member —
-    :func:`zagg.column.relay_resolution`, the leaf columns' res-``shard_order
-    + 2`` member) or, for the all-time fold on a windowed store, the
-    per-window members at the level's own resolution (``factor == 1``,
-    windows folding across). Either way the inputs are gen-1 leaf-tier
-    content, and each output cell folds in ONE flat k-way call — what makes
-    the merge tree independent of ``tuple_width`` (the merge-source law;
-    ``merge_tdigests_kway`` is order-independent by its sort, #370).
-
-    Memory bound: exact classes accumulate one dense source vector per
-    window (scalars); digest classes stream child by child, holding one
-    child's slab plus the open output cells' decoded digests (~``factor``
-    digests per cell — the envelope the ruling priced). Since issue #538
-    ``factor`` is ``4 ** (relay - r)``, not the one-order ``4``: a one-order
-    merge off the res-``shard_order + 2`` relay k-ways 64 δ-bounded digests
-    per output cell where it k-wayed 4, and each child contributes
-    ``src_per_child`` 16 rather than 1. The digests saturate their budget at
-    production scale, so that is a straight 16x in the ladder tier's read and
-    merge bytes — tens of MB per node against a δ-bounded budget, next to a
-    leaf tier measured in GB, which is the trade #538 makes. Missing
-    candidates contribute fill and are counted (``source_children.missing``).
-
-    A located field's pair is read together (:func:`_located_pair`) and a
-    contributor carrying one half is **skipped for that field and counted
-    unreadable** — the same posture as the gather, and as
-    ``sweep_overview._fold_node``'s at a leaf missing the sibling. It is not a
-    raise: one stale child column must not take a whole stage level down, and
-    the fold is a fold — dropping a contributor is under-coverage the artifact
-    records, where writing a payload without its words would be corruption
-    (spec §9.1). Fields whose reads are sound still fold that contributor: the
-    read succeeded, so the loss is known per field, and the per-child
-    ``unreadable`` count is what says the artifact folded short.
-
-    Returns ``(slabs, folded, missing, unreadable, demotions)`` — the last a
-    :func:`zagg.sweep_overview.demotion_records` list naming every packed
-    field the half-pair rail demoted here, per direction (issue #518).
-
-    The rail marks a fired contributor ``broken``, which is a WHOLE-contributor
-    verdict, not a per-field one: where it fires on every contributor (the
-    mis-declared-divisor shape) ``folded == 0`` and :func:`_stage_fold` drops
-    the level, records included — see the note at its ``folded == 0`` guard.
-    """
-    from zagg.stats.composition import merge_composition_kway
-    from zagg.sweep_overview import (
-        DEMOTION_DIVISOR_MISSING,
-        DEMOTION_WORD_MISSING,
-        _empty_slab,
-        combine_dense,
-        decode_digest,
-        demotion_records,
-        field_companions,
-        fold_dense,
-        fold_digests,
-        note_demotion,
-        overview_fold_delta,
-        payload_weight,
-    )
-
-    windows = next((len(row) for row in rows if row is not None), 1)
-    n_src = src_per_child * len(rows)
-    # The coverage counters are computed at the END, from the same
-    # ``(child, window)`` classification the gather uses: a contributor whose
-    # located pair this fold refuses (:func:`_located_pair`) is unreadable, not
-    # a clean fold, and that is only known once the sources have been read.
-    broken: set = set()
-    slabs: dict = {}
-    for name, meta in fields.items():
-        if meta["class"] != "exact":
-            continue
-        law, fill = meta.get("method"), meta.get("fill_value", "NaN")
-        out = None
-        for w in range(windows):
-            acc = _empty_slab(meta, n_src)
-            for i, row in enumerate(rows):
-                reader = row[w] if row is not None else None
-                if not _is_reader(reader):
-                    continue
-                values = reader.read(res_src, name)
-                if values is not None:
-                    acc[i * src_per_child : (i + 1) * src_per_child] = values
-            part = fold_dense(acc, factor, law, fill)
-            out = part if out is None else combine_dense(out, part, law, fill)
-        slabs[name] = out
-    for name, meta in fields.items():
-        if meta["class"] != "approximate":
-            continue
-        dtype = meta.get("dtype") or "float32"
-        inner = tuple(meta.get("inner_shape") or (2,))
-        delta = overview_fold_delta(meta)
-        # A located field folds its sibling in the SAME k-way call as its
-        # payload (ruling 4 on issue #410): the merged words are keyed on the
-        # centroid partition that merge produces (spec §9.1), so the two are
-        # accumulated together per open cell and folded together. A contributor
-        # carrying one half of the pair is SKIPPED loudly and counted
-        # unreadable — the gather's posture, and ``_fold_node``'s at a leaf
-        # missing the sibling — never folded payload-only, and never a raise
-        # that takes the whole level down over one stale child column.
-        declared = field_companions(name, meta)
-        out = np.full(n_out, b"", dtype=object)
-        sibling_slabs = {kwarg: np.full(n_out, b"", dtype=object) for kwarg, _ in declared}
-        pending: dict[int, list] = {}
-        # {kernel kwarg: {open cell: [word vectors]}} — accumulated in lockstep
-        # with ``pending`` so a cell closes with its payload and every channel.
-        words: dict[str, dict[int, list]] = {kwarg: {} for kwarg, _ in declared}
-
-        def _close(j, out=out, delta=delta, dtype=dtype, declared=declared):
-            cell = pending.pop(j)
-            if not declared:
-                out[j] = fold_digests(cell, delta=delta, dtype=dtype)
-                return
-            payload, *encoded = fold_digests(
-                cell,
-                delta=delta,
-                dtype=dtype,
-                channels={kwarg: words[kwarg].pop(j) for kwarg, _ in declared},
-            )
-            out[j] = payload
-            for (kwarg, _), value in zip(declared, encoded, strict=True):
-                sibling_slabs[kwarg][j] = value
-
-        for i, row in enumerate(rows):
-            base = i * src_per_child
-            for w, reader in enumerate(row or ()):
-                if not _is_reader(reader):
-                    continue
-                group = _companion_group(reader, res_src, name, declared)
-                if group is None:
-                    broken.add((i, w))
-                    continue
-                slab = group[name]
-                if slab is None:
-                    continue
-                for pos, payload in enumerate(slab):
-                    if payload is None or not len(payload):
-                        continue
-                    key = (base + pos) // factor
-                    pending.setdefault(key, []).append(decode_digest(payload, dtype, inner))
-                    for kwarg, sibling in declared:
-                        words[kwarg].setdefault(key, []).append(
-                            decode_digest(group[sibling][pos], "uint64", ())
-                        )
-            # Cells wholly covered by children 0..i are complete: fold and
-            # free them, so resident state never exceeds the open boundary.
-            done = ((i + 1) * src_per_child) // factor
-            for j in [j for j in pending if j < done]:
-                _close(j)
-        for j in list(pending):
-            _close(j)
-        slabs[name] = out
-        for kwarg, sibling in declared:
-            slabs[sibling] = sibling_slabs[kwarg]
-    demoted: dict = {}
-    for name, meta in fields.items():
-        if meta["class"] != "packed":
-            continue
-        # The packed composition fold (issue #515, spec §3.4): each source
-        # cell contributes its ``(word, n)`` pair, ``n`` being the ``of``
-        # digest's weight at the same cell, and every output cell collapses in
-        # ONE k-way call (single quantization). A contributor carrying one
-        # half of the pair is SKIPPED and counted unreadable — the word is
-        # uninterpretable without its divisor digest, and a divisor without
-        # its word says nothing.
-        #
-        # Skipping alone does NOT keep the pair consistent in ONE of the two
-        # directions, and that is the difference from the located pair above:
-        # there both halves are the same field's, so refusing one refuses both.
-        # Here the divisor is a DIFFERENT declared field, folded by the digest
-        # loop above, which knows nothing about this one — so a contributor
-        # carrying the DIVISOR but not the word lands in the level's
-        # ``N_signal`` while its word is excluded, and a reader doing the §3.3
-        # recovery divides by a denominator the word never covered (a ~29%
-        # skew, reproduced on review). Absence over wrongness: every output
-        # cell that contributor's span covers keeps the fill word ``0``, which
-        # makes no §3.2 presence/fraction claim, while the digest itself stays
-        # correct on its own and ``source_children.unreadable`` records that
-        # the level folded short (spec §4.5).
-        #
-        # The REVERSE direction poisons nothing: when the divisor is the
-        # missing half, the digest loop above reads that same array for the
-        # ``of`` field itself and drops the contributor too (``slab is None``),
-        # so word and ``N_signal`` already exclude the same rows. It is still
-        # counted ``broken`` — the level did fold short — but the other
-        # children's correct words stand (review finding).
-        #
-        # In the skew direction the blanking IS wider than the offending
-        # contributor: at every level with ``r < child_order`` one output cell
-        # is shared by ``factor / src_per_child`` children (this test's own
-        # shape), so poisoning it drops SIBLING contributions as well. Left by
-        # design — a shared cell whose folded ``N_signal`` counts rows no
-        # surviving word describes cannot carry an honest word, and blanking
-        # beats skewing.
-        of_name = meta.get("of")
-        of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
-        out = _empty_slab(meta, n_out)
-        parts_by_cell: dict[int, list] = {}
-        poisoned: set[int] = set()
-        for i, row in enumerate(rows):
-            base = i * src_per_child
-            for w, reader in enumerate(row or ()):
-                if not _is_reader(reader):
-                    continue
-                # Not ``words``: that name is a free variable of the digest
-                # loop's ``_close`` closure 65 lines up, with an incompatible
-                # type — harmless today (every close happens before this loop
-                # starts) but a latent wrong-cell write for the next editor.
-                word_slab = reader.read(res_src, name)
-                of_values = reader.read(res_src, of_name)
-                if word_slab is None or of_values is None:
-                    if (word_slab is None) != (of_values is None):
-                        logger.warning(
-                            f"stage sweep: column {reader.path} carries only one of "
-                            f"{name!r}/{of_name!r} at resolution {res_src}; counting the "
-                            f"contributor unreadable (spec §3.3, §1.1)"
-                        )
-                        broken.add((i, w))
-                        # Either direction is a demotion the artifact must
-                        # record (issue #518, spec §4.3): the level's word
-                        # coverage folded short, and the bytes alone cannot
-                        # say so (the fill word makes no §3.2 claim).
-                        if of_values is not None:
-                            blanked = range(
-                                base // factor,
-                                (base + src_per_child + factor - 1) // factor,
-                            )
-                            poisoned.update(blanked)
-                            note_demotion(
-                                demoted, name, DEMOTION_WORD_MISSING, of_name, cells=blanked
-                            )
-                        else:
-                            note_demotion(demoted, name, DEMOTION_DIVISOR_MISSING, of_name)
-                    continue
-                for pos in range(len(word_slab)):
-                    n = payload_weight(of_values[pos], of_dtype)
-                    if n > 0:
-                        parts_by_cell.setdefault((base + pos) // factor, []).append(
-                            (int(word_slab[pos]), n)
-                        )
-        # Poisoned cells drop out HERE, after accumulation: every surviving
-        # cell still folds its parts in one k-way call (single quantization).
-        for j, parts in parts_by_cell.items():
-            if j not in poisoned:
-                out[j] = merge_composition_kway(parts)
-        slabs[name] = out
-    return (slabs, *_source_counts(rows, broken), demotion_records(demoted))
-
-
 def _dense_rows(readers: dict, node: str, *, depth: int) -> list:
     """The full rank range of ``node``'s children: reader rows or ``None``."""
     from zagg.sweep_overview import _rel_rank
@@ -832,42 +502,39 @@ def _stage_fold(
     shard_order: int,
     child_order: int,
     relay: int,
-    all_time: bool,
+    meter=None,
 ) -> dict | None:
     """Fold one ``(artifact node, level)`` from the dispatch worker's readers.
 
-    ``readers`` is the dispatch node's ``{child decimal: [reader per
-    window]}``; this densifies to the rank range under ``node`` and folds per
+    ``readers`` is the dispatch node's ``{child decimal: [reader]}`` for ONE
+    window; this densifies to the rank range under ``node`` and folds per
     the level's derived regime; ``relay`` is the member a merge reads
     (:func:`zagg.column.relay_resolution`). Returns the fold dict (slabs +
-    generation + provenance) or ``None`` when no child contributed. The
-    all-time fold on a windowed store is ALWAYS a merge — its inputs are the
-    per-window gen-1 members at the level's own resolution (never a merged
-    all-time relay, which would breach the merge-source law) — so it records
-    ``stage-merge`` at gen 2 even where the per-window level is a gather.
+    generation + provenance) or ``None`` when no child contributed. Both
+    kernels stream their inputs block by block (:mod:`zagg.sweep_fold`,
+    issue #586 phase 4); ``meter`` accounts for what a block holds. The
+    all-time fold of a windowed store is not made here: it merges the node's
+    own per-window overviews (:func:`zagg.sweep_units.close_node`).
     """
-    from zagg.sweep_overview import _content_hash
-    from zagg.windows import union_time_range
-
     rows = _dense_rows(readers, node, depth=child_order - k)
     n_out = 4 ** (r - k)
     regime = classify_level(r, shard_order=shard_order)
-    if regime == STAGE_GATHER and not all_time:
+    if regime == STAGE_GATHER:
         slabs, folded, missing, unreadable, demotions = _gather_slabs(
-            rows, fields, res=r, span=4 ** (r - child_order), n_out=n_out
+            rows, fields, res=r, span=4 ** (r - child_order), n_out=n_out, meter=meter
         )
         merges_from_raw = 1
     else:
-        res_src = r if (all_time and regime == STAGE_GATHER) else int(relay)
         slabs, folded, missing, unreadable, demotions = _merge_slabs(
             rows,
             fields,
-            res_src=res_src,
-            src_per_child=4 ** (res_src - child_order),
-            factor=4 ** (res_src - r) if res_src != r else 1,
+            res_src=int(relay),
+            src_per_child=4 ** (int(relay) - child_order),
+            factor=4 ** (int(relay) - r),
             n_out=n_out,
+            meter=meter,
         )
-        regime, merges_from_raw = STAGE_MERGE, 2
+        merges_from_raw = 2
     if folded == 0:
         # No contributor folded cleanly — the level is not materialized, and
         # any packed-rail record dies with it (issue #518, spec §4.3). That
@@ -881,6 +548,33 @@ def _stage_fold(
         # in ``_merge_slabs``'s ``broken`` set, which is committed
         # ``source_children`` semantics predating #518.
         return None
+    return _fold_result(
+        node,
+        k,
+        r,
+        fields,
+        rows,
+        slabs,
+        regime=regime,
+        merges_from_raw=merges_from_raw,
+        source_children=(folded, missing, unreadable),
+        demotions=demotions,
+    )
+
+
+def _fold_result(
+    node, k, r, fields, rows, slabs, *, regime, merges_from_raw, source_children, demotions
+) -> dict:
+    """The fold dict a stage overview is written from — one shape, both units.
+
+    ``rows`` are the reader rows the fold consumed (child columns for a
+    window unit, the node's per-window overviews for the all-time fold): their
+    stamps give the granule count and the time-range union, their generations
+    the summed skip key.
+    """
+    from zagg.sweep_overview import _content_hash
+    from zagg.windows import union_time_range
+
     granules, ranges = 0, []
     for row in rows:
         for reader in row or ():
@@ -888,6 +582,7 @@ def _stage_fold(
                 granules += int(reader.stamp.get("granule_count") or 0)
                 if reader.stamp.get("time_range") is not None:
                     ranges.append(reader.stamp["time_range"])
+    folded, missing, unreadable = source_children
     fold = {
         "slabs": slabs,
         "generation": _summed_generation([row for row in rows if row is not None]),
@@ -895,7 +590,7 @@ def _stage_fold(
         "granule_count": granules,
         "time_range": union_time_range(*ranges) if ranges else None,
         "regime": regime,
-        "merges_from_raw": merges_from_raw,
+        "merges_from_raw": int(merges_from_raw),
         "source_children": {
             "folded": int(folded),
             "missing": int(missing),
@@ -938,6 +633,7 @@ def _write_stage_overview(
     from mortie import generate_morton_children
     from zarr import open_array
 
+    from zagg.content_hash import staged_record
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
@@ -977,6 +673,11 @@ def _write_stage_overview(
         "merges_from_raw": int(fold["merges_from_raw"]),
         "source_children": dict(fold["source_children"]),
     }
+    if fold.get("source_windows") is not None:
+        # The all-time fold of a windowed store (issue #586 phase 4): its
+        # direct sources are the node's per-window overviews, counted here.
+        # Keyed only on that artifact, so every other one is byte-identical.
+        provenance["source_windows"] = dict(fold["source_windows"])
     if fold.get("demotions"):
         # Artifact-visible packed-rail demotions (issue #518, spec §4.3) —
         # keyed only when the rail fired, so a clean level's attrs are
@@ -992,6 +693,11 @@ def _write_stage_overview(
     )
     root.attrs.update({ROLE_ATTR: "overview", OVERVIEW_ATTR: provenance})
     stamp_window = key if windowed else None
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580; the /1
+    # writer's posture in ``sweep_overview._write_overview``).
+    staged = {f"{r}/morton": words}
+    staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
+    hashes = staged_record(store, staged, f"stage sweep at {node}/{basename}")
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
@@ -999,20 +705,17 @@ def _write_stage_overview(
         window=stamp_window,
         time_range=fold["time_range"] if stamp_window is not None else None,
         run_id=run_id,
+        content_hashes=hashes,
     )
-    try:  # D20 sidecar: fail-open telemetry, §5 O11 record (the /1 writer's posture)
-        from zagg.content_hash import content_hashes_record, hash_arrays
+    try:  # D20 sidecar: fail-open telemetry, the same §5 O11 record
         from zagg.telemetry import SPEC_V3, build_record, write_sidecar
 
-        staged = {f"{r}/morton": words}
-        staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=morton_word(node),
             metadata={
                 "cells_with_data": int(populated.sum()),
                 "granule_count": int(fold["granule_count"]),
-                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+                "content_hashes": hashes,
             },
             window=stamp_window,
         )
@@ -1022,24 +725,62 @@ def _write_stage_overview(
     return basename
 
 
+def _column_group_spec(node_order: int, res: int, cfg):
+    """One stage-column resolution group's spec, and its cells per chunk.
+
+    A group no wider than one fold block is ONE chunk per array — the layout
+    every stage column had before issue #586 phase 4, byte for byte. A wider
+    group is laid on regular inner chunks of exactly one block
+    (:func:`zagg.sweep_fold.block_cells`), one object per chunk and no
+    ShardingCodec: the gather then writes a block as one chunk object and
+    drops it, and a parent reads back only the chunks its own block covers.
+    (A sharded array would re-read and re-PUT its whole shard object on every
+    block.) The chunking is a function of ``(node_order, res)`` alone.
+    """
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.sweep_fold import STAGE_BLOCK_ORDER
+
+    if res - node_order <= STAGE_BLOCK_ORDER:
+        grid = HealpixGrid(node_order, res, config=cfg, sharded=True)
+        return grid.shard_spec(), grid.cells_per_shard
+    grid = HealpixGrid(
+        node_order, res, config=cfg, chunk_inner=res - STAGE_BLOCK_ORDER, sharded=False
+    )
+    return grid.chunked_spec(), grid.cells_per_chunk
+
+
 def write_stage_column(
     store_root,
     node,
-    folded: dict,
+    rows: list,
     fields: dict,
     *,
+    members: list,
+    child_order: int,
     node_order: int,
     relay: int,
     cell_order: int,
     generation: dict,
-    source_children: dict,
     window: str | None = None,
     time_range=None,
     granule_count: int = 0,
     run_id: str | None = None,
     store_kwargs: dict | None = None,
-) -> str:
-    """Write one stage column at its dispatch node; returns the basename.
+    meter=None,
+) -> dict | None:
+    """Gather and write one stage column at its dispatch node, block by block.
+
+    ``rows`` is the dispatch node's dense child range (reader rows, one
+    window) and ``members`` the resolutions the column carries
+    (:func:`column_members`). Returns ``{"object", "source_children"}`` — the
+    basename and the relay member's coverage counters — or ``None`` when the
+    relay member folds nothing, in which case NOTHING is written and an
+    existing column is left as it was. Otherwise the committed column is
+    cleared BEFORE the streamed reads that feed it, so a read that fails
+    mid-stream leaves it cleared and unstamped: the next tuple reads the child
+    as missing (under-coverage, recorded) until a later pass rewrites it — the
+    column is a regenerable cache (spec §4.1). :func:`stage_node` therefore
+    retries a failed column once, from fresh readers, before counting it.
 
     The §4.6 column artifact shape (``zagg-column/1``) with the stage
     regime: every group is a PURE GATHER of the child columns' members at
@@ -1048,14 +789,24 @@ def write_stage_column(
     merge-source tier) plus the gatherable members coarser tuples need — so
     ``merges_from_raw`` stays 1 for every group and the artifact carries
     gen-1 content only. The relay member is the one group a parent merge may
-    assume; a ``folded`` without it is refused by name. Attrs additionally
+    assume; ``members`` without it is refused by name. Attrs additionally
     record the summed ``generation``
     (the parent's skip-gate basis), ``source_children`` (a gather that
     under-covered says so in the artifact), and the run id; the commit stamp
     carries ``run_id`` too (lease backstop). D4 order throughout; the D20
     sidecar lands after the stamp, fail-open. Single-writer law: the column
     lives under its own node prefix, one writer per lease-serialized run.
+
+    **Streamed** (issue #586 phase 4): each group is gathered and written one
+    fold block at a time (:func:`zagg.sweep_fold.iter_gather`) — read the
+    child members covering the block, assign, write the chunk, drop it — so
+    the worker holds one block's inputs, not the level's. The §5 O11 record
+    is accumulated across blocks (:func:`zagg.content_hash.update_hash`, one
+    live digest per array) and written once, at the stamp; so are the
+    populated-cell count and the relay member's ``source_children``.
     """
+    import hashlib
+
     import zarr
     from mortie import generate_morton_children
     from pydantic_zarr.experimental.v3 import GroupSpec
@@ -1074,33 +825,44 @@ def write_stage_column(
         column_name,
         composable_fields,
     )
+    from zagg.content_hash import streamed_record, update_hash
     from zagg.grids.base import vlen_dtype_warning_suppressed
-    from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
     from zagg.store import open_store
+    from zagg.sweep_fold import _source_counts, broken_groups
     from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     store_kwargs = dict(store_kwargs or {})
-    node_order = int(node_order)
+    node_order, child_order, relay = int(node_order), int(child_order), int(relay)
     fields = composable_fields(fields)
-    resolutions = sorted((int(r) for r in folded), reverse=True)
-    if int(relay) not in resolutions:
+    resolutions = sorted((int(r) for r in members), reverse=True)
+    if relay not in resolutions:
         raise ValueError(
             f"a stage column must carry the relay member ({relay} — the subtree's leaf "
             f"raw-fold-boundary partials, the ruled merge-source tier); got {resolutions}"
         )
+    # Known BEFORE the prefix is cleared: presence alone decides which
+    # contributors the relay gather refuses, so a column whose relay member
+    # folds nothing is never started.
+    folded_n, missing, unreadable = _source_counts(rows, broken_groups(rows, fields, res=relay))
+    if folded_n == 0:
+        return None
+    source_children = {
+        "folded": int(folded_n),
+        "missing": int(missing),
+        "unreadable": int(unreadable),
+    }
     node_prefix = f"{store_root}/{_node_rel(node)}"
     basename = column_name(window)
     path = f"{node_prefix}/{basename}"
     cfg = _overview_config(fields)
-    grids = {res: HealpixGrid(node_order, res, config=cfg, sharded=True) for res in resolutions}
-    spec = GroupSpec(
-        members={str(res): grids[res].shard_spec() for res in resolutions}, attributes={}
-    )
+    specs = {res: _column_group_spec(node_order, res, cfg) for res in resolutions}
+    spec = GroupSpec(members={str(res): specs[res][0] for res in resolutions}, attributes={})
     store = open_store(path, **store_kwargs)
-    staged: dict = {}
+    hashers: dict = {}
+    populated = 0
     with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
         sync(store.delete_dir(""))
         _delete_sidecar(node_prefix, _sidecar_name(basename), store_kwargs)
@@ -1109,11 +871,28 @@ def write_stage_column(
             words = np.asarray(generate_morton_children(morton_word(node), res), dtype=np.uint64)
             arr = open_array(store, path=f"{res}/morton", zarr_format=3, consolidated=False)
             arr[:] = words
-            staged[f"{res}/morton"] = words
-            for name, slab in folded[res].items():
-                arr = open_array(store, path=f"{res}/{name}", zarr_format=3, consolidated=False)
-                arr[:] = slab
-                staged[f"{res}/{name}"] = slab
+            update_hash(hashers.setdefault(f"{res}/morton", hashlib.sha256()), words)
+            arrays: dict = {}
+            for lo, hi, slabs in iter_gather(
+                rows,
+                fields,
+                res=res,
+                span=4 ** (res - child_order),
+                n_out=4 ** (res - node_order),
+                broken=set(),
+                block=specs[res][1],
+                meter=meter,
+            ):
+                for name, slab in slabs.items():
+                    key = f"{res}/{name}"
+                    if name not in arrays:
+                        arrays[name] = open_array(
+                            store, path=key, zarr_format=3, consolidated=False
+                        )
+                    arrays[name][lo:hi] = slab
+                    update_hash(hashers.setdefault(key, hashlib.sha256()), slab)
+                if res == resolutions[0]:
+                    populated += int(_populated_mask(slabs, fields).sum())
     root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
     root.attrs.update(
         {
@@ -1134,33 +913,41 @@ def write_stage_column(
                     for res in resolutions
                 },
                 "generation": dict(generation),
-                "source_children": dict(source_children),
+                "source_children": source_children,
                 "cells_with_data_order": resolutions[0],
                 "run_id": run_id,
                 "generated_at": _utcnow(),
             },
         }
     )
-    populated = _populated_mask(folded[resolutions[0]], fields)
+    # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
+    # sidecar carries the SAME record — ``_write_sidecar`` takes the finished
+    # record, exactly as ``column.write_column`` does.
+    hashes = streamed_record(hashers, f"stage column {node}/{basename}")
     stamp_commit(
         store,
-        cells_with_data=int(populated.sum()),
+        cells_with_data=populated,
         granule_count=int(granule_count),
         window=window,
         time_range=time_range if window is not None else None,
         run_id=run_id,
+        content_hashes=hashes,
     )
-    _write_sidecar(
-        store,
-        path,
-        morton_word(node),
-        staged,
-        int(populated.sum()),
-        granule_count,
-        window,
-        store_kwargs,
-    )
-    return basename
+    # No record -> no sidecar, the leaf column's gate: a hash-less sidecar on
+    # a rewrite reads as a stale-or-absent ambiguity, and the stamp above
+    # already stands without the key (spec §5.3, unverifiable not tampered).
+    if hashes is not None:
+        _write_sidecar(
+            store,
+            path,
+            morton_word(node),
+            hashes,
+            populated,
+            granule_count,
+            window,
+            store_kwargs,
+        )
+    return {"object": basename, "source_children": source_children}
 
 
 def _node_rel(decimal: str) -> str:
@@ -1197,6 +984,45 @@ def _artifact_stamp(store_root, node, basename, run_id, run_started, store_kwarg
     return stamp
 
 
+def _artifact_entry(store_root, node, basename, run_id, run_started, store_kwargs) -> dict | None:
+    """A committed stage overview's skip-gate entry, read off its OWN attrs.
+
+    ``None`` when the artifact is absent, unstamped or carries no
+    ``zagg-overview/2`` block. The same fields the node envelope records per
+    window (``generation``, ``regime``, ``merges_from_raw``,
+    ``source_children``, ``content_hash``, ``run_id``) — every one of them is
+    written into the artifact's attrs first — so a ``(node, window)`` unit
+    (issue #586 phase 4) decides skip-if-current from the one object it alone
+    writes, and N concurrent window units of a node share no read-modify-write.
+    One GET, the one :func:`_artifact_stamp` already made; foreign-gated the
+    same way.
+    """
+    import zarr
+
+    from zagg.hive import COMMIT_ATTR
+    from zagg.store import open_store
+    from zagg.sweep_overview import OVERVIEW_ATTR
+
+    try:
+        store = open_store(f"{store_root}/{_node_rel(node)}/{basename}", **store_kwargs)
+        attrs = dict(zarr.open_group(store, path="", mode="r", zarr_format=3).attrs)
+    except Exception as e:
+        logger.debug(f"stage sweep: cannot confirm {node}/{basename} ({e})")
+        return None
+    stamp, block = attrs.get(COMMIT_ATTR), attrs.get(OVERVIEW_ATTR)
+    if not isinstance(stamp, dict) or not isinstance(block, dict):
+        return None
+    if _foreign_fresh(stamp, run_id, run_started):
+        raise ForeignSweepError(
+            f"stage artifact {node}/{basename} carries a fresh stamp from foreign sweep run "
+            f"{stamp.get('run_id')!r} (written {stamp.get('written_at')}); two sweeps are "
+            f"live on this store — aborting (lease backstop)"
+        )
+    if block.get("spec") != OVERVIEW_SPEC_V2:
+        return None
+    return {"object": basename, **block}
+
+
 def stage_node(
     store,
     store_root,
@@ -1206,8 +1032,7 @@ def stage_node(
     fields,
     *,
     key,
-    fold_windows,
-    all_time,
+    window,
     windowed,
     shard_order,
     cell_order,
@@ -1218,13 +1043,17 @@ def stage_node(
     counts,
     store_kwargs,
     level_actuals=None,
+    envelope=True,
+    meter=None,
 ) -> None:
-    """One stage worker: fold a dispatch node's tuple for one window item.
+    """One ``(node, window)`` stage unit: fold a dispatch node's tuple for one window.
 
-    ``relay`` is the merge-source member (:func:`zagg.column.relay_resolution`
-    over the manifest's FULL ``overviews`` list — ``levels`` here are the
-    above-shard :func:`ladder_entries`, which exclude the leaf entry that
-    places it).
+    ``window`` is the unit's window label (``None`` on an unwindowed store)
+    and ``key`` its overview key (the label, or the reserved ``all`` token of
+    an unwindowed store). ``relay`` is the merge-source member
+    (:func:`zagg.column.relay_resolution` over the manifest's FULL
+    ``overviews`` list — ``levels`` here are the above-shard
+    :func:`ladder_entries`, which exclude the leaf entry that places it).
 
     Reads the node's candidate child columns once (stamp-validated), then per
     tuple order materializes every dirty artifact node beneath the dispatch
@@ -1232,12 +1061,21 @@ def stage_node(
     a healed or appended child moves the sum and forces the rewrite; a
     content hash cannot be had without folding, so #417's count/timestamp/
     run-id key is the gate) — and finally its own stage column (relay +
-    gatherables), unless this is the root tuple (no parent consumes it) or
-    the all-time item (per-window columns carry the gen-1 tier; an all-time
-    column would relay merged content, breaching the merge-source law).
+    gatherables), unless this is the root tuple (no parent consumes it).
+    Every fold streams its inputs block by block (:mod:`zagg.sweep_fold`).
+
+    ``envelope`` is whether this unit owns the node's sweep-internal envelope
+    (``overview.rollup.json``). It does on an unwindowed store, where the unit
+    is the node's only writer. A windowed store's window units run
+    concurrently (issue #586 phase 4), so they pass ``False``: the gate reads
+    the artifact's own attrs (:func:`_artifact_entry`) and no shared object is
+    read-modify-written. The all-time fold across windows is not a window
+    unit's work (:func:`zagg.sweep_units.close_node`).
     """
+    from functools import partial
+
     from zagg.column import generation_key
-    from zagg.sweep_overview import ENVELOPE_NAME, _read_envelope
+    from zagg.sweep_overview import ENVELOPE_NAME, _overview_basename, _read_envelope
     from zagg.windows import union_time_range
 
     dispatch, child_order = int(stage["dispatch"]), int(stage["child_order"])
@@ -1245,64 +1083,83 @@ def stage_node(
     level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
     orders = [k for k in stage["orders"] if k in level_by_order]
     children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
-    readers = _readers_for(
-        store_root,
-        children,
-        fold_windows,
-        run_id=run_id,
-        run_started=run_started,
-        store_kwargs=store_kwargs,
-        counts=counts,
-    )
+    reader_args = dict(run_id=run_id, run_started=run_started, store_kwargs=store_kwargs)
+    readers = _readers_for(store_root, children, [window], counts=counts, **reader_args)
+    retired: list = []
+
+    def _fresh_readers():
+        # In place: every fold below holds this dict. An unreadable column was
+        # counted the first time; its UNREADABLE marker still says so.
+        retired.extend(r for row in readers.values() for r in row if _is_reader(r))
+        readers.update(
+            _readers_for(store_root, children, [window], counts={"failed": 0}, **reader_args)
+        )
+
     dispatch_level_current = False
     for k in orders:
         r = level_by_order[k]
-        regime_plan = (
-            STAGE_MERGE
-            if (all_time or classify_level(r, shard_order=shard_order) == STAGE_MERGE)
-            else STAGE_GATHER
-        )
+        regime_plan = classify_level(r, shard_order=shard_order)
         for target in sorted({_node_at(d, k) for d in candidates if d.startswith(node)}):
             rows = [row for c, row in readers.items() if c.startswith(target)]
             fresh_gen = _summed_generation(rows)
-            envelope = _read_envelope(store, target)
-            entries = dict((envelope or {}).get("windows") or {})
-            entry = entries.get(key)
+            if envelope:
+                stored = _read_envelope(store, target)
+                entries = dict((stored or {}).get("windows") or {})
+                entry = entries.get(key)
+            else:
+                entry = _artifact_entry(
+                    store_root, target, _overview_basename(key), run_id, run_started, store_kwargs
+                )
             if (
                 isinstance(entry, dict)
                 and generation_key(entry.get("generation")) == generation_key(fresh_gen)
                 and entry.get("regime") == regime_plan
-                and _artifact_stamp(
-                    store_root, target, entry.get("object"), run_id, run_started, store_kwargs
+                # An envelope entry is a claim about another object: confirm
+                # its stamp. An attrs entry was read off the committed artifact.
+                and (
+                    not envelope
+                    or _artifact_stamp(
+                        store_root, target, entry.get("object"), run_id, run_started, store_kwargs
+                    )
+                    is not None
                 )
-                is not None
             ):
                 counts["current"] += 1
-                if not all_time:
-                    _accumulate_actuals(
-                        level_actuals,
-                        k,
-                        r,
-                        target,
-                        key,
-                        entry.get("regime"),
-                        entry.get("merges_from_raw"),
-                        entry.get("source_children"),
-                    )
+                _accumulate_actuals(
+                    level_actuals,
+                    k,
+                    r,
+                    target,
+                    key,
+                    entry.get("regime"),
+                    entry.get("merges_from_raw"),
+                    entry.get("source_children"),
+                )
                 if k == dispatch and target == node:
                     dispatch_level_current = True
                 continue
-            fold = _stage_fold(
-                target,
-                k,
-                r,
-                readers,
-                fields,
-                shard_order=shard_order,
-                child_order=child_order,
-                relay=relay,
-                all_time=all_time,
-            )
+            try:
+                fold = refold_on_move(
+                    partial(
+                        _stage_fold,
+                        target,
+                        k,
+                        r,
+                        readers,
+                        fields,
+                        shard_order=shard_order,
+                        child_order=child_order,
+                        relay=relay,
+                        meter=meter,
+                    ),
+                    _fresh_readers,
+                    f"node {target} window {key!r}",
+                )
+            except ColumnMovedError as e:
+                logger.warning(f"stage sweep: fold failed at node {target} window {key!r} ({e})")
+                counts["failed"] += 1
+                _fresh_readers()  # the next artifact starts from unpinned readers
+                continue
             if fold is None:
                 counts["empty"] += 1
                 continue
@@ -1328,17 +1185,18 @@ def stage_node(
                 counts["failed"] += 1
                 continue
             counts["written"] += 1
-            if not all_time:
-                _accumulate_actuals(
-                    level_actuals,
-                    k,
-                    r,
-                    target,
-                    key,
-                    fold["regime"],
-                    fold["merges_from_raw"],
-                    fold["source_children"],
-                )
+            _accumulate_actuals(
+                level_actuals,
+                k,
+                r,
+                target,
+                key,
+                fold["regime"],
+                fold["merges_from_raw"],
+                fold["source_children"],
+            )
+            if not envelope:
+                continue
             entries[key] = {
                 "object": basename,
                 "generation": fold["generation"],
@@ -1355,7 +1213,7 @@ def stage_node(
                 "order": int(k),
                 "windows": entries,
             }
-            if fresh != envelope:
+            if fresh != stored:
                 from zagg.store import put_object
 
                 put_object(
@@ -1363,69 +1221,69 @@ def stage_node(
                     f"{_node_rel(target)}/{ENVELOPE_NAME}",
                     json.dumps(fresh, indent=1).encode(),
                 )
-    counts["revalidated"] += sum(
+    counts["revalidated"] += sum(r.revalidated for r in retired) + sum(
         r.revalidated for row in readers.values() for r in row if _is_reader(r)
     )
-    if dispatch == 0 or (windowed and all_time):
+    if dispatch == 0:
         return
     members = column_members(
         levels, dispatch, shard_order=shard_order, cell_order=cell_order, relay=relay
     )
     fresh_gen = _summed_generation(list(readers.values()))
     if dispatch_level_current and _stage_column_current(
-        store_root, node, fold_windows[0], fresh_gen, run_id, run_started, store_kwargs
+        store_root, node, window, fresh_gen, run_id, run_started, store_kwargs
     ):
         counts["columns_current"] += 1
         return
-    folded: dict = {}
-    relay_sc = None
-    for res in members:
-        slabs, folded_n, missing, unreadable, _demotions = _gather_slabs(
-            _dense_rows(readers, node, depth=child_order - dispatch),
-            fields,
-            res=res,
-            span=4 ** (res - child_order),
-            n_out=4 ** (res - dispatch),
-        )
-        folded[res] = slabs
-        if res == relay:
-            relay_sc = {
-                "folded": int(folded_n),
-                "missing": int(missing),
-                "unreadable": int(unreadable),
-            }
-    if relay_sc is None or relay_sc["folded"] == 0:
-        return
-    granules, ranges = 0, []
-    for row in readers.values():
-        for reader in row:
-            if _is_reader(reader) and reader.stamp:
-                granules += int(reader.stamp.get("granule_count") or 0)
-                if reader.stamp.get("time_range") is not None:
-                    ranges.append(reader.stamp["time_range"])
-    try:
-        write_stage_column(
+
+    def _write_column():
+        granules, ranges = 0, []
+        for row in readers.values():
+            for reader in row:
+                if _is_reader(reader) and reader.stamp:
+                    granules += int(reader.stamp.get("granule_count") or 0)
+                    if reader.stamp.get("time_range") is not None:
+                        ranges.append(reader.stamp["time_range"])
+        return write_stage_column(
             store_root,
             node,
-            folded,
+            _dense_rows(readers, node, depth=child_order - dispatch),
             fields,
+            members=members,
+            child_order=child_order,
             node_order=dispatch,
             relay=relay,
             cell_order=cell_order,
-            generation=fresh_gen,
-            source_children=relay_sc,
-            window=fold_windows[0],
+            generation=_summed_generation(list(readers.values())),
+            window=window,
             time_range=union_time_range(*ranges) if ranges else None,
             granule_count=granules,
             run_id=run_id,
             store_kwargs=store_kwargs,
+            meter=meter,
         )
-        counts["columns_written"] += 1
-        if relay_sc["missing"]:
-            counts["under_covered"] += 1
+
+    try:
+        # The column is cleared before its streamed reads, so a read failing
+        # mid-stream would leave the node with none: ANY failure is retried
+        # once, from fresh readers, before it is counted.
+        written = refold_on_move(
+            _write_column,
+            _fresh_readers,
+            f"the stage column at node {node} window {key!r}",
+            retry_on=(Exception,),
+        )
+    except ForeignSweepError:
+        raise
     except Exception as e:
         logger.warning(f"stage sweep: column write failed at node {node} window {key!r} ({e})")
         counts["failed"] += 1
+        return
+    if written is None:
+        return
+    counts["columns_written"] += 1
+    if written["source_children"]["missing"]:
+        counts["under_covered"] += 1
 
 
 def _stage_column_current(

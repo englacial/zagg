@@ -260,7 +260,11 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     fail-open per SHARD, so an unreadable companion costs the section that
     shard and never the refresh; and a walk that lost any shard COMPOSES its
     rebuild with the standing section (§10.4) instead of replacing it, so the
-    escape hatch can never be the thing that deletes the section. A successful
+    escape hatch can never be the thing that deletes the section. That walk
+    reads each leaf's §10.6 record where its worker wrote one and the leaf's
+    raw companions otherwise — coverage only, counted into the rebuilt
+    block's ``uncounted_shards`` (§10.3) — and writes NOTHING into a leaf
+    (issue #575): the repair is a read plus the root objects. A successful
     refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
@@ -281,12 +285,12 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         build_cover_section,
         build_temporal_section,
         read_cover,
-        read_leaf_temporal,
         temporal_cell_order,
         temporal_fields,
         write_cover,
     )
     from zagg.grids.morton import morton_words_from_decimals
+    from zagg.leaf_temporal import leaf_contribution
     from zagg.store import open_store, put_object
 
     manifest = read_manifest(store_root, **store_kwargs)
@@ -295,7 +299,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     order = int(manifest["shard_order"])
     # The §10 temporal section (issue #480) is rebuilt from the SAME walk, so
     # the escape hatch regenerates it rather than deleting it — and, because
-    # this walk is whole-store by construction, its root time-digest is the
+    # this walk is whole-store by construction, its root counted cover is the
     # authoritative one (spec §10's whole-coverage rule). The §10.5 word-set
     # cover sibling (issue #489) rebuilds from the same contributions.
     toc_fields = temporal_fields(manifest)
@@ -308,6 +312,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         toc_fields = {}
     contributions: dict[str, list] = {}
     toc_failed: set[str] = set()
+    uncounted: set[str] = set()
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
     # Decimals accumulate through the walk and parse once at the end (issue
@@ -386,8 +391,11 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 decimals.append(decimal)
                 if toc_fields and decimal not in toc_failed:
                     try:
-                        got = read_leaf_temporal(
-                            f"{root}/{rel}", cell_order, toc_fields, **store_kwargs
+                        # The leaf's ROOT stamp rides along: a versioned
+                        # leaf's record and arrays sit under the version it
+                        # names (spec §1.5). Read-only (§10.6).
+                        got, route = leaf_contribution(
+                            f"{root}/{rel}", cell_order, toc_fields, stamp=stamp, **store_kwargs
                         )
                     except Exception as e:  # fail-open: the section is a cache
                         # Shard-scoped, not leaf-scoped: §10.2's word must
@@ -404,6 +412,8 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                         got = None
                     if got is not None:
                         contributions.setdefault(decimal, []).append(got)
+                        if route == "raw":
+                            uncounted.add(decimal)
                 # D15: windowed stamps carry the leaf's actual time range;
                 # the rebuilt root summary re-derives the union from this
                 # walk's stamps (truth), superseding any cached value.
@@ -426,7 +436,9 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         # discard; a foreign-revision object survives under succession).
         delete_cover(store_root, **store_kwargs)
         return None
-    section = build_temporal_section(contributions, toc_fields, source="refresh")
+    section = build_temporal_section(
+        contributions, toc_fields, source="refresh", uncounted=uncounted
+    )
     cover_sec = build_cover_section(contributions, toc_fields, order, source="refresh")
     if toc_failed:
         # Fail-open per leaf is fail-DESTRUCTIVE in aggregate. This walk PUTs

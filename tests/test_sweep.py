@@ -1138,6 +1138,22 @@ class TestSweepHook:
         ]
         assert leaves_from_stats_records(records) == [(7, None), (7, "2019"), (8, None)]
 
+    def test_dirt_only_leaves(self):
+        # Issue #580 (PR #581 question (11)): only a CURRENT unit the worker
+        # marked ``icechunk_dirty`` (its ladder ref sidecar was rewritten after
+        # the lifecycle touch) rides the staged sweep as dirt-only.
+        from zagg.sweep import dirt_only_leaves
+
+        metas = [
+            {"shard_key": 7, "window": None, "current": True, "icechunk_dirty": True},
+            {"shard_key": 7, "window": "2019", "current": True, "icechunk_dirty": True},
+            {"shard_key": 8, "window": None, "current": True},  # untouched / no sidecar
+            {"shard_key": 9, "current": True, "icechunk": {"snapshot": "S"}},  # commit: leaf
+            {"shard_key": 10, "icechunk_dirty": True, "stats": {}},  # written: a real leaf
+            None,
+        ]
+        assert dirt_only_leaves(metas) == [(7, None), (7, "2019")]
+
     def test_local_run_folds_rollups(self, monkeypatch, tmp_path):
         # End-to-end through the local backend (fake hive write): the
         # in-process hook folds the stats family up the ancestor chain.
@@ -1275,6 +1291,136 @@ class TestHandlerSweepResponse:
         assert (tmp_path / body["record"]).exists()
         # The leaves rode inline: no work set was derived to charge for.
         assert body["discover_s"] is None
+
+    def test_response_surfaces_the_temporal_routes_and_the_root_marker(self, tmp_path):
+        """The fleet path of issue #575: the worker-side sweep IS the production sweep.
+
+        One shard with its worker's record and one without. The response (and
+        the durable store-root record it names) reports how each leaf was
+        read and how many of THIS pass's shards came in uncounted; on a full
+        pass the root object the invoke wrote carries the same marker — the
+        only place a reader sees that its totals are a lower bound (a partial
+        pass's tally can differ from it: ``test_leaf_temporal.py``).
+        """
+        import shutil
+
+        from zagg.hive import read_root_coverage, shard_leaf_path
+
+        mod = _handler_module()
+        root = tmp_path / "temporal"
+        shutil.copytree(Path(__file__).parent / "data" / "spec" / "temporal", root)
+        words = [int(morton_word(d)) for d in ("11213", "11214")]
+        recordless = Path(shard_leaf_path(str(root), words[1]))
+        shutil.copytree(shard_leaf_path(str(root), words[0]), recordless)
+        (recordless / "temporal.toc").unlink()
+        for name in ("coverage.moc", "coverage.toc"):
+            (root / name).unlink()
+        response = mod._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(root),
+                "leaves": [[w, None] for w in words],
+                "families": ["moc"],
+            }
+        )
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        moc = body["families"]["moc"]
+        assert moc["temporal_routes"] == {"records": 1, "raw": 1}
+        assert moc["temporal_shards"] == 2 and moc["uncounted_shards"] == 1
+        # ...and WHICH shard (issue #598): the record-less one and only it.
+        assert moc["pass_uncounted"] == {"count": 1, "shards": ["11214"], "truncated": False}
+        durable = json.loads((root / body["record"]).read_text())
+        assert durable["families"]["moc"]["temporal_routes"] == moc["temporal_routes"]
+        assert durable["families"]["moc"]["pass_uncounted"] == moc["pass_uncounted"]
+        block = read_root_coverage(str(root))["temporal"]["counts"]
+        assert block["uncounted_shards"] == 1
+        # Read-only on the leaves: the invoke wrote no record back.
+        assert not (recordless / "temporal.toc").exists()
+
+    def test_a_record_listing_other_fields_is_counted_on_the_fleet_path(self, tmp_path):
+        """Issue #600 through the worker-side sweep: a record's ``fields`` is not a gate.
+
+        The record lists no field the store declares. It is still the leaf's
+        exact count: route ``records``, the shard neither in the root marker
+        nor in ``pass_uncounted``, and the block's total the record's own.
+        """
+        import shutil
+
+        from zagg.hive import read_root_coverage, shard_leaf_path
+
+        mod = _handler_module()
+        root = tmp_path / "temporal"
+        shutil.copytree(Path(__file__).parent / "data" / "spec" / "temporal", root)
+        word = int(morton_word("11213"))
+        path = Path(shard_leaf_path(str(root), word)) / "temporal.toc"
+        record = json.loads(path.read_text())
+        record["fields"] = ["zz_tdigest"]
+        path.write_text(json.dumps(record))
+        for name in ("coverage.moc", "coverage.toc"):
+            (root / name).unlink()
+        response = mod._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(root),
+                "leaves": [[word, None]],
+                "families": ["moc"],
+            }
+        )
+        assert response["statusCode"] == 200
+        moc = json.loads(response["body"])["families"]["moc"]
+        assert moc["temporal_routes"] == {"records": 1, "raw": 0}
+        assert moc["temporal_shards"] == 1 and moc["uncounted_shards"] == 0
+        assert moc["pass_uncounted"] == {"count": 0, "shards": [], "truncated": False}
+        block = read_root_coverage(str(root))["temporal"]["counts"]
+        assert block["uncounted_shards"] == 0
+        assert block["obs_total"] == record["n_obs"] > 0
+
+    def test_a_partitioned_invoke_names_its_uncounted_shards_under_the_cap(
+        self, tmp_path, monkeypatch
+    ):
+        """Issue #598 on the fan-out: ``finish`` is deferred, the names are not.
+
+        A partition writes no root object, so its response and its own
+        ``_p{index}of{of}`` record are where an operator reads which of the
+        shards it visited came in uncounted. Two record-less shards under a
+        cap of one: the list is cut, the count is exact, the cut is flagged.
+        """
+        import shutil
+
+        import zagg.sweep as sweep
+        from zagg.hive import shard_leaf_path
+
+        mod = _handler_module()
+        root = tmp_path / "temporal"
+        shutil.copytree(Path(__file__).parent / "data" / "spec" / "temporal", root)
+        words = [int(morton_word(d)) for d in ("11213", "11214", "11212")]
+        for word in words[1:]:
+            recordless = Path(shard_leaf_path(str(root), word))
+            shutil.copytree(shard_leaf_path(str(root), words[0]), recordless)
+            (recordless / "temporal.toc").unlink()
+        for name in ("coverage.moc", "coverage.toc"):
+            (root / name).unlink()
+        monkeypatch.setattr(sweep, "UNCOUNTED_LIST_CAP", 1)
+        response = mod._handle_sweep(
+            {
+                "mode": "sweep",
+                "store_path": str(root),
+                "leaves": [[w, None] for w in words],
+                "families": ["moc"],
+                "partition": {"index": 0, "of": 4},
+            }
+        )
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        moc = body["families"]["moc"]
+        assert moc["finish_deferred"] is True and "uncounted_shards" not in moc
+        assert moc["temporal_routes"] == {"records": 1, "raw": 2}
+        assert moc["pass_uncounted"] == {"count": 2, "shards": ["11212"], "truncated": True}
+        assert body["record"].endswith("_p0of4.json")
+        durable = json.loads((root / body["record"]).read_text())
+        assert durable["families"]["moc"]["pass_uncounted"] == moc["pass_uncounted"]
+        assert not (root / "coverage.moc").exists()  # the finisher's, still owed
 
     def test_discovery_path_reports_its_own_span(self, tmp_path):
         # discover_leaves is a LIST + a parquet read per run record; it is not

@@ -32,8 +32,17 @@ Two modes share every check:
   idempotency is asserted there, and this harness only reads.
 
 The printed checklist mirrors issue #434's phases: declaration (the
-build-side contract), materialization (the sweep's output), read-back, then
-the conservation checks. Digest comparisons re-fold contributors with the
+build-side contract), the leaf cell coordinates, materialization (the sweep's
+output), read-back, then the conservation checks. ``coordinates`` (issue #586
+phase 3, spec §1.5 "The cell coordinate") is the one check about the LEAVES
+themselves — the one a windowed store gets, and the one an unwindowed store
+gets even when its ``declaration`` fails: per sampled leaf it derives the
+cell words from the leaf id and the rank, requires every location word of a
+sampled occupied cell to lie inside the derived cell, and — where a leaf
+still stores a ``morton`` array, which a windowed leaf no longer does —
+compares the stored word with the derived one. A store with no located field
+and no stored coordinate is reported as *derivation only* (``skip``), never
+as a pass. Digest comparisons re-fold contributors with the
 k-way merge law at the manifest's overview δ (issue #424) and re-sort
 centroids by mean before any CDF interpolation — concatenation does not
 preserve the sort, and an unsorted digest interpolates garbage (the
@@ -53,6 +62,15 @@ which validates the ``/2`` declaration grammar, the §4.6 leaf-column tier,
 and the ladder against the gen-1 columns under the derived
 stage-gather/stage-merge regimes. The grammar-independent machinery both
 arms share lives in :mod:`zagg.pyramid_check_core`.
+
+A WINDOWED ``/2`` store (a manifest ``temporal`` block; issue #586) routes to
+:mod:`zagg.pyramid_check_windowed`: the ``/2`` checklist once per window —
+each window's ladder against its own leaf columns, its columns against its
+own leaves — plus ``all_time``, the all-time fold at every ladder node held
+to the k-way fold of that node's per-window overviews and to its §4.4
+provenance, or reported *not applicable* where the store declares none. That
+module's header says what the windowed arm reads. A windowed ``/1`` store is
+not modelled: its ``declaration`` fails saying so.
 
 **Read bounds, including memory.** The store-wide reads are the ones named
 above; everything else is sampled. ``--workers`` bounds how many cells are
@@ -82,6 +100,7 @@ from zagg.pyramid_check_core import (
     WEIGHT_RTOL,  # noqa: F401
     _check_node,
     _composable_fields,
+    _coordinates_check,
     _entry,
     _field_groups,
     _finish,
@@ -95,8 +114,13 @@ from zagg.pyramid_check_core import (
 logger = logging.getLogger(__name__)
 
 #: Checklist keys, in print order (mirrors issue #434's phases) — the ``/1`` arm.
+#: ``coordinates`` is the leaf cell-coordinate check (issue #586 phase 3, spec
+#: §1.5): derived cell words against the located fields' location words and,
+#: where a leaf still stores one, its ``morton`` array. It is the one check a
+#: WINDOWED store gets — its leaves are the ones that store no coordinate.
 CHECKS = (
     "declaration",
+    "coordinates",
     "materialization",
     "readback",
     "counts",
@@ -106,9 +130,11 @@ CHECKS = (
 )
 
 #: The ``/2`` arm's checklist: the same phases plus the §4.6 leaf-column tier
-#: (``columns``), between the ladder materialization and the value checks.
+#: (``columns``), between the ladder materialization and the value checks. A
+#: windowed store adds ``all_time`` (``pyramid_check_windowed.CHECKS_WINDOWED``).
 CHECKS_V2 = (
     "declaration",
+    "coordinates",
     "materialization",
     "columns",
     "readback",
@@ -153,6 +179,7 @@ def validate_pyramid(
     full: bool = False,
     resweep: bool = False,
     roster: str = "auto",
+    sample_windows: int = 3,
     workers: int = 8,
 ) -> dict:
     """Run the issue #434 checklist against a store; return the report dict.
@@ -165,7 +192,9 @@ def validate_pyramid(
     (refused for ``s3://`` roots: production sweeps are fleet-side, issue
     #547). The report's ``checks`` map carries one ``status``/``detail``
     entry per :data:`CHECKS` phase (:data:`CHECKS_V2` on a ``/2`` store);
-    ``passed`` is True iff no check failed.
+    ``passed`` is True iff no check failed. On a windowed store
+    ``sample_windows`` bounds how many windows the value checks read (the
+    artifact rosters always cover every window).
 
     ``workers`` bounds the read concurrency of the independent legs — the
     per-node / per-leaf metadata probes and the per-cell value reads — via
@@ -198,6 +227,40 @@ def validate_pyramid(
                 continue
             checks[name] = _entry("skip", reason)
 
+    def leaves_only():
+        # ``coordinates`` is about the leaves alone, so a store whose
+        # declaration FAILED still gets it (review finding): the roster needs
+        # only ``shard_order`` — and, windowed, the run records' (leaf, window)
+        # set, a windowed leaf being the one that stores no ``morton`` array
+        # (issue #586 phase 3). No leaves, no check.
+        try:
+            if windowed:
+                from zagg.pyramid_check_windowed import window_roster
+
+                refs, source = window_roster(
+                    store_root, manifest, store_kwargs, roster, workers=workers
+                )
+            else:
+                leaves, source = _leaf_roster(store_root, manifest, store_kwargs, roster)
+                refs = [(dec, None) for dec in leaves]
+        except Exception as exc:
+            checks["coordinates"] = _entry("fail", f"no leaf roster: {exc}")
+            return
+        report["roster"] = {"source": source, "leaves": len(refs)}
+        if refs:
+            _coordinates_check(
+                store_root,
+                manifest,
+                refs,
+                store_kwargs,
+                checks,
+                report,
+                seed=seed,
+                sample_nodes=sample_nodes,
+                sample_cells=sample_cells,
+                full=full,
+            )
+
     manifest = read_manifest(store_root, **store_kwargs)
     checks["idempotency"] = _entry(
         "skip", "production sweeps are fleet-side (issue #547); asserted in fixture mode"
@@ -211,14 +274,7 @@ def validate_pyramid(
     report["spec"] = manifest.get("spec")
     pyramid = manifest.get("pyramid") or {}
     report["pyramid_spec"] = pyramid.get("spec") if isinstance(pyramid, dict) else None
-    if manifest.get("temporal") is not None:
-        checks["declaration"] = _entry(
-            "fail",
-            "windowed store — this harness validates unwindowed stores only "
-            "(both issue #547 targets are unwindowed)",
-        )
-        skip_rest("windowed store", after="declaration")
-        return _finish(report, CHECKS)
+    windowed = manifest.get("temporal") is not None
     ladder = _ladder(manifest)
     fields = _composable_fields(manifest)
     classes: dict = {}
@@ -245,6 +301,7 @@ def validate_pyramid(
             )
         checks["declaration"] = _entry("fail", detail)
         skip_rest("no declaration", after="declaration")
+        leaves_only()
         return _finish(report, CHECKS)
     if not fields:
         checks["declaration"] = _entry(
@@ -253,7 +310,38 @@ def validate_pyramid(
             f"{report['field_classes']}) — a v1-era declaration; redeclare per issue #547",
         )
         skip_rest("no composable fields", after="declaration")
+        leaves_only()
         return _finish(report, CHECKS)
+    if windowed and report["pyramid_spec"] != "zagg-pyramid/2":
+        checks["declaration"] = _entry(
+            "fail",
+            f"windowed {report['pyramid_spec']} store — the harness models a windowed "
+            "store's per-window ladder and all-time fold for the zagg-pyramid/2 staged "
+            "sweep only (issue #586); nothing above the leaves was validated",
+        )
+        skip_rest("windowed /1 store: not modelled", after="declaration")
+        leaves_only()
+        return _finish(report, CHECKS)
+    if windowed:
+        # One ladder per window, plus the all-time fold (issue #586).
+        from zagg.pyramid_check_windowed import validate_windowed
+
+        return validate_windowed(
+            store_root,
+            manifest,
+            report,
+            ladder=ladder,
+            fields=fields,
+            store_kwargs=store_kwargs,
+            sample_nodes=sample_nodes,
+            sample_cells=sample_cells,
+            sample_windows=sample_windows,
+            seed=seed,
+            full=full,
+            resweep=resweep,
+            roster=roster,
+            workers=workers,
+        )
     if report["pyramid_spec"] == "zagg-pyramid/2":
         # The /2 arm (the espg ruling of 2026-09-11 on issue #547: the
         # re-declaration IS /2, and this harness is its acceptance gate). The
@@ -291,6 +379,18 @@ def validate_pyramid(
         checks["materialization"] = _entry("fail", f"empty leaf roster (source {roster_source})")
         skip_rest("empty roster", after="materialization")
         return _finish(report, CHECKS)
+    _coordinates_check(
+        store_root,
+        manifest,
+        [(dec, None) for dec in leaves],
+        store_kwargs,
+        checks,
+        report,
+        seed=seed,
+        sample_nodes=sample_nodes,
+        sample_cells=sample_cells,
+        full=full,
+    )
 
     # -- [2] materialization: declared node roster vs stored overview objects.
     # "Materialized" means COMMITTED, in the sweep's own sense: ``role:
@@ -503,8 +603,13 @@ def format_report(report: dict, *, workers: int | None = None) -> str:
         )
     if report.get("roster"):
         roster = report["roster"]
-        lines.append(f"  leaf roster: {roster['leaves']} shards (source: {roster['source']})")
-    for name in CHECKS_V2:  # the superset, in print order; /1 reports skip "columns"
+        what = "shards"
+        if "windows" in roster:
+            what = f"(shard, window) leaves in {roster['windows']} window(s)"
+        lines.append(f"  leaf roster: {roster['leaves']} {what} (source: {roster['source']})")
+    # The superset, in print order: /1 reports skip "columns", and only a
+    # windowed store carries "all_time".
+    for name in (*CHECKS_V2[:-1], "all_time", CHECKS_V2[-1]):
         entry = report["checks"].get(name)
         if entry is not None:
             lines.append(f"  [{entry['status'].upper():4}] {name:15} {entry['detail']}")
@@ -542,6 +647,13 @@ def main(argv=None) -> int:
         default=8,
         help="Populated cells sampled per node (default: 8)",
     )
+    parser.add_argument(
+        "--sample-windows",
+        type=int,
+        default=3,
+        help="Windows whose values are checked on a windowed store (default: 3; the "
+        "artifact rosters always cover every window)",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Sampling seed (default: 0)")
     parser.add_argument(
         "--full",
@@ -553,7 +665,8 @@ def main(argv=None) -> int:
         "--roster",
         choices=("auto", "moc", "list"),
         default="auto",
-        help="Leaf roster source: root coverage.moc, a flat store list, or auto (default)",
+        help="Leaf roster source: root coverage.moc, a flat store list, or auto (default; "
+        "on a windowed store auto is the run records, and moc adds one list per shard)",
     )
     parser.add_argument("--json", default=None, metavar="PATH", help="Also write the report JSON")
     parser.add_argument(
@@ -586,6 +699,7 @@ def main(argv=None) -> int:
         store_kwargs=store_kwargs,
         sample_nodes=args.sample_nodes,
         sample_cells=args.sample_cells,
+        sample_windows=args.sample_windows,
         seed=args.seed,
         full=args.full,
         roster=args.roster,

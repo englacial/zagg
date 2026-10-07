@@ -29,6 +29,11 @@ timestamps and compressed bytes may differ across zstd versions — the
 conformance tests assert decoded values, never object bytes.
 
 - ``minimal/`` — one UNLOCATED digest field (`h_tdigest`) + `count`.
+- ``versioned/`` — ``minimal/``'s inputs written as a VERSIONED leaf (spec
+  §1.5, issue #582): the stable root is a pointer stamp naming ``current``,
+  the arrays sit in the ``run-{run_id}-{attempt}`` subgroup with their own
+  stamp. ``expected["leaf"]`` is the version path (every leaf-shaped
+  assertion applies to it); ``pointer`` / ``version`` pin the resolution.
 - ``kitchen_sink/`` — located signal/noise strata + `composition` + `count`
   (the `atl03_tdigest_strata_healpix.yaml` field shapes), including a
   single-photon cell that packs the §3.1 golden word `0xFF000000FF0000FF`
@@ -104,6 +109,23 @@ conformance tests assert decoded values, never object bytes.
   temporal field, so a sweep of one produces no section (and no sibling) —
   leaving them without either root object IS §10's absence rule, and keeps
   those trees byte-identical.
+
+- ``uncounted/`` — the §10.3 COVERAGE-ONLY surface (issue #575): METADATA
+  ONLY — the manifest and the two root objects the production sweep writes
+  over ``temporal/``'s leaf when that leaf carries NO §10.6 record. Its
+  counted-cover block is the only committed one whose ``obs`` are 0
+  (occupied buckets, nothing counted) under ``uncounted_shards: 1``, the
+  marker that makes ``obs_total`` a lower bound. The leaf is not committed
+  twice: its arrays are ``temporal/``'s, pinned by their §5 combined digest.
+
+- ``windowed/`` — the §1.5 DERIVED-COORDINATE surface (issue #586 phase 3):
+  ``minimal/``'s geometry and cell plan with a located digest field, written
+  as one WINDOWED leaf (``{id}_{window}.zarr``, ``morton-hive/2``). It stores
+  NO per-cell ``morton`` array — the one fixture that does not — and its
+  expected file records the derived words (from mortie, never read back),
+  their stride, and the order-19 instance of the law on an order-9 shard in
+  each hemisphere. The located sibling lets a reader check the derivation
+  on committed bytes: each location word lies inside its cell's derived word.
 
 - ``demoted/`` — the §4.3 ``demotions`` surface (issue #518):
   ``kitchen_sink/``'s store swept under a hand-installed ``/1`` cascade
@@ -510,7 +532,19 @@ def _o11_hashes(leaf_path: str) -> dict:
     return {"arrays": dict(sorted(hashes.items())), "combined": combined}
 
 
-def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False) -> None:
+#: The fixed run identity the ``versioned/`` fixture is written under: its
+#: version subgroup is ``run-{FIXTURE_RUN_ID}-{attempt}`` (spec §1.5), the
+#: attempt nonce drawn by the writer and recorded in the expected file.
+FIXTURE_RUN_ID = "specfixture"
+
+
+def build(
+    out: Path,
+    kitchen_sink: bool,
+    pyramid: dict | None = None,
+    flux: bool = False,
+    run_id: str | None = None,
+) -> None:
     import zagg.processing as processing
     from zagg import hive
     from zagg.grids import HealpixGrid
@@ -543,12 +577,22 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None, flux: bool
             root,
             cfg,
             store_kwargs={},
+            # ``run_id`` makes the leaf VERSIONED (spec §1.5, issue #582): the
+            # arrays land in a version subgroup behind the root's pointer
+            # stamp; ``None`` writes the legacy in-place leaf.
+            run_id=run_id,
         )
     finally:
         processing.process_shard = original
     assert meta.get("error") is None, meta
 
-    leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
+    pointer_rel = hive.shard_leaf_path("", shard).lstrip("/")
+    leaf_rel = pointer_rel
+    if run_id is not None:
+        # ``leaf`` is where the ARRAYS are — the version subgroup — so every
+        # leaf-shaped assertion runs unchanged against it; ``pointer`` is the
+        # stable root a reader resolves through, ``version`` its ``current``.
+        leaf_rel = f"{pointer_rel}/{meta['leaf_version']}"
     expected = {
         "shard": SHARD_KEY,
         "leaf": leaf_rel,
@@ -563,6 +607,10 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None, flux: bool
         "cells": expected_cells,
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
     }
+    if run_id is not None:
+        expected["pointer"] = pointer_rel
+        expected["version"] = meta["leaf_version"]
+        expected["run_id"] = run_id
     if flux:
         # The §2.0 declaration + provenance the conformance tests assert
         # against the committed array attrs (issue #424).
@@ -656,6 +704,7 @@ def _expected_multiscales(levels: list, s: int) -> list:
             "fold": {"fold_source": "cascade", "exact_levels": 1},
         }
     ]
+
 
 def build_demoted(out: Path) -> None:
     """The §4.3 ``demotions`` fixture (issue #518): the packed rail, recorded.
@@ -1342,6 +1391,13 @@ def _fake_temporal_shard(grid, by_chunk):
             }
             kwargs["chunk_results"].append((block, df, ragged))
             occupied.extend(int(children[i]) for i in sorted(cells))
+            # The §10.6 leaf record's feed (issue #575): the chunk's
+            # per-OBSERVATION words, exactly as the worker hands them over
+            # (`_aggregate_chunk_cells`, one array per chunk).
+            if kwargs.get("temporal_out") is not None:
+                kwargs["temporal_out"].add_words(
+                    np.concatenate([cells[i]["obs_words"] for i in ids])
+                )
         kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
         return pd.DataFrame(), {
             "shard_key": int(shard_key),
@@ -1415,6 +1471,9 @@ def build_temporal(out: Path) -> None:
             "count": n,
             "observed": per_cell,
             "h_tdigest": (digest, locs, per_centroid),
+            # One exact timestamp word per observation — the §10.6 record's
+            # worker feed (the words `_chunk_toc_words` would encode).
+            "obs_words": _toc_words(times_ns, times_ns),
         }
         expected_cells.append(
             {
@@ -1472,7 +1531,6 @@ def build_temporal(out: Path) -> None:
         TEMPORAL_COVER_ORDER,
         cover_words,
         coverage_toc,
-        coverage_toc_digest,
         quantize_words,
         read_cover,
     )
@@ -1482,14 +1540,13 @@ def build_temporal(out: Path) -> None:
     contribution, _written_at = family.read_leaf(root, SHARD_KEY, None, "morton-hive/1", {})
     family.finish(root, [{"payload": contribution}], 4, {})
     envelope = hive.read_root_coverage(root)
-    root_digest, root_words = coverage_toc_digest(envelope)
     # The shard envelope word is DERIVED from the generator's inputs — the
     # join over every per-centroid word it handed the writer — so a writer
     # that folds the wrong thing fails here instead of certifying itself. The
-    # digest rows are the writer's committed output read back (pinned the way
-    # column/'s group values are); the claims that matter over them — weight
-    # conservation and per-centroid containment — are derived, from the cell
-    # plan's own observation counts and the instants recorded per cell.
+    # §10.3 counted cover is the writer's committed output read back (pinned
+    # the way column/'s group values are); the claims that matter over it —
+    # count conservation and per-centroid bucketing — are derived, from the
+    # cell plan's own observation counts and the instants recorded per cell.
     shard_word = int(
         toc_reduce(
             np.concatenate(
@@ -1526,6 +1583,61 @@ def build_temporal(out: Path) -> None:
     assert not bool(np.any(np.atleast_1d(toc_overlaps(expect_cover, gap_start, gap_end))))
 
     leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
+
+    # The §10.6 leaf temporal record (issue #575), written by the PRODUCTION
+    # worker write path from the per-observation words the fake handed it.
+    # Pinned against the generator's inputs: its word is the join over the
+    # observation instants (and so equals the root section's shard word —
+    # the join is a semilattice), its cover the quantized normalize over
+    # those same instants, its count the cell plan's observation total.
+    from mortie import toc2time
+
+    from zagg.leaf_temporal import (
+        LEAF_TEMPORAL_NAME,
+        LEAF_TEMPORAL_SPEC,
+        count_words,
+        cover_from_counts,
+        leaf_temporal_contribution,
+        read_leaf_temporal_record,
+    )
+
+    every_instant = np.concatenate(
+        [cell["obs_words"] for cells in by_chunk.values() for cell in cells.values()]
+    ).astype(np.uint64)
+    record = read_leaf_temporal_record(str(out / leaf_rel))
+    assert record is not None and record["spec"] == LEAF_TEMPORAL_SPEC, record
+    assert record["source"] == "worker" and record["fields"] == ["h_tdigest"]
+    leaf_word, leaf_counts = leaf_temporal_contribution(record)
+    assert leaf_word == int(toc_reduce(every_instant)) == shard_word
+    # The §10.3 counted cover, DERIVED from the per-observation instants: one
+    # exact bucket per instant, counts by bucket, un-coalesced.
+    expect_counts = count_words(every_instant)
+    assert leaf_counts.order == expect_counts.order == TEMPORAL_COVER_ORDER
+    assert np.array_equal(leaf_counts.words, expect_counts.words), leaf_counts
+    assert np.array_equal(leaf_counts.obs, expect_counts.obs), leaf_counts
+    assert int(leaf_counts.obs.sum()) == record["n_obs"] == sum(c["count"] for c in expected_cells)
+    # ... and the §10.5 cover it derives is the quantization of those instants.
+    leaf_cover, _leaf_cover_order = cover_from_counts(leaf_counts)
+    expect_leaf_cover = quantize_words(every_instant)
+    assert np.array_equal(leaf_cover, expect_leaf_cover), leaf_cover
+    # The worker's cover is contained in the companion-derived one (§10.6):
+    # every one of its words overlaps the root sibling's word set.
+    for lo, hi in zip(*(np.atleast_1d(x) for x in toc2time(leaf_cover)), strict=True):
+        assert bool(np.any(np.atleast_1d(toc_overlaps(expect_cover, int(lo), int(hi)))))
+    # The §10.3 root tier composes from the leaf record (the sweep's
+    # record-first route, issue #575), so on this one-leaf store it IS the
+    # record's counted cover — derived from the instants above, never read
+    # back — and its total is the cell plan's.
+    from zagg.coverage_toc import coverage_toc_counts, coverage_toc_uncounted
+
+    root_counts = coverage_toc_counts(envelope)
+    assert root_counts is not None and root_counts.order == TEMPORAL_COVER_ORDER
+    # Every leaf came in with its worker's record, so the block is exact.
+    assert coverage_toc_uncounted(envelope) == 0
+    assert np.array_equal(root_counts.words, expect_counts.words), root_counts
+    assert np.array_equal(root_counts.obs, expect_counts.obs), root_counts
+    assert int(root_counts.obs.sum()) == sum(c["count"] for c in expected_cells)
+
     expected = {
         "shard": SHARD_KEY,
         "leaf": leaf_rel,
@@ -1538,18 +1650,20 @@ def build_temporal(out: Path) -> None:
         "empty_chunk": EMPTY_CHUNK,
         "delta": DELTA,
         # The §10 root coverage temporal section: the tier-1 word (derived),
-        # the tier-2 digest (the writer's, read back) and the weight total the
-        # cell plan says it must carry.
+        # the tier-2 counted cover (the writer's, read back) and the
+        # observation total the cell plan says it must carry.
         "root_coverage": {
             "object": "coverage.moc",
             "spec": "zagg-coverage-toc/1",
             "fields": ["h_tdigest"],
             "shards": {SHARD_KEY: str(shard_word)},
+            # §10.3's exactness marker: 0, so `obs_total` IS the count.
+            "uncounted_shards": 0,
             "obs_total": sum(c["count"] for c in expected_cells),
-            "digest": {
-                "delta": envelope["temporal"]["digest"]["delta"],
-                "centroids": [[float(m), float(w)] for m, w in root_digest],
-                "times": [str(int(w)) for w in root_words],
+            "counts": {
+                "temporal_order": TEMPORAL_COVER_ORDER,
+                "words": [str(int(w)) for w in expect_counts.words],
+                "obs": [int(n) for n in expect_counts.obs],
             },
         },
         # The §10.5 sibling: the object name, its markers, and the DERIVED
@@ -1572,6 +1686,29 @@ def build_temporal(out: Path) -> None:
             # discriminating: a cover that bridges the fixture's two clusters
             # over-claims here (§10.5's never-bridge law).
             "gap_ns": [str(int(gap_start)), str(int(gap_end))],
+        },
+        # The §10.6 leaf record (issue #575): the object name under the leaf,
+        # its markers, and the DERIVED word and cover — from the generator's
+        # per-observation instants, never read back — so the committed
+        # record is pinned against the inputs, not against itself.
+        "leaf_temporal": {
+            "object": LEAF_TEMPORAL_NAME,
+            "spec": LEAF_TEMPORAL_SPEC,
+            "source": "worker",
+            "fields": ["h_tdigest"],
+            "n_obs": sum(c["count"] for c in expected_cells),
+            "word": str(shard_word),
+            "temporal_order": TEMPORAL_COVER_ORDER,
+            "cap": COVER_CAP,
+            "counts": {
+                "count": len(expect_counts.words),
+                "words": [str(int(w)) for w in expect_counts.words],
+                "obs": [int(n) for n in expect_counts.obs],
+            },
+            "cover": {
+                "count": len(expect_leaf_cover),
+                "words": [str(int(w)) for w in expect_leaf_cover],
+            },
         },
         # The declarations the conformance tests assert against the committed
         # attrs — each on the array that HOLDS the words (§8/§9), and the
@@ -1596,7 +1733,372 @@ def build_temporal(out: Path) -> None:
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     print(
         f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells, both toc "
-        f"variants, root coverage.moc with {len(root_digest)} digest centroids"
+        f"variants, root coverage.moc with {len(root_counts.words)} counted buckets"
+    )
+
+
+def build_uncounted(out: Path) -> None:
+    """The §10.3 ``uncounted/`` fixture: the root objects over a record-less leaf.
+
+    METADATA ONLY, like ``multiscales/``: the manifest and the two root
+    objects the production sweep writes over ``temporal/``'s leaf when that
+    leaf carries NO §10.6 record. The ``temporal/`` store is built into a
+    scratch directory, the worker's ``temporal.toc`` is deleted — the bytes
+    of a leaf written before the record existed, or of one whose record was
+    lost after its stamp — and the sweep's own leaf read and finisher run over
+    it. Nothing writes the record back (§10.6), so the leaf contributes its
+    coverage and no count: every ``obs`` is 0 under ``uncounted_shards: 1``.
+
+    The expectations are derived from the generator's per-centroid words
+    (``temporal/``'s recorded ``h_tdigest_times``), each keyed at the bucket
+    of its representative instant — never read back from the object.
+    """
+    import tempfile
+
+    from mortie import toc_reduce
+
+    from zagg import hive
+    from zagg.coverage_toc import (
+        COVER_NAME,
+        COVER_SPEC,
+        TEMPORAL_COVER_ORDER,
+        cover_words,
+        coverage_toc,
+        coverage_toc_counts,
+        coverage_toc_uncounted,
+        read_cover,
+    )
+    from zagg.leaf_temporal import LEAF_TEMPORAL_NAME, count_words, cover_from_counts
+    from zagg.sweep import MocFamily
+
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = Path(tmp) / "temporal"
+        build_temporal(scratch)
+        source = json.loads((Path(tmp) / "temporal.expected.json").read_text())
+        leaf = scratch / source["leaf"]
+        (leaf / LEAF_TEMPORAL_NAME).unlink()
+        for name in (hive.ROOT_COVERAGE_NAME, COVER_NAME):
+            (scratch / name).unlink()
+        family = MocFamily()
+        contribution, _written_at = family.read_leaf(
+            str(scratch), SHARD_KEY, None, "morton-hive/1", {}
+        )
+        family.finish(str(scratch), [{"payload": contribution}], 4, {})
+        assert family.summary()["temporal_routes"] == {"records": 0, "raw": 1}
+        assert not (leaf / LEAF_TEMPORAL_NAME).exists()  # the sweep writes no record
+        envelope = hive.read_root_coverage(str(scratch))
+        cover_obj = read_cover(str(scratch))
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir(parents=True)
+        for name in (hive.MANIFEST_NAME, hive.ROOT_COVERAGE_NAME, COVER_NAME):
+            shutil.copy(scratch / name, out / name)
+
+    words = np.array(
+        [int(w) for cell in source["cells"] for w in cell["h_tdigest_times"]], dtype=np.uint64
+    )
+    shard_word = int(toc_reduce(words))
+    assert coverage_toc(envelope) == {SHARD_KEY: shard_word}
+    # Occupied buckets, nothing counted: one key per representative instant.
+    expect = count_words(words, np.zeros(len(words)))
+    counts = coverage_toc_counts(envelope)
+    assert coverage_toc_uncounted(envelope) == 1
+    assert counts.order == TEMPORAL_COVER_ORDER
+    assert np.array_equal(counts.words, expect.words) and not counts.obs.any(), counts
+    expect_cover, _order = cover_from_counts(expect)
+    assert cover_obj["spec"] == COVER_SPEC
+    assert np.array_equal(cover_words(cover_obj)[SHARD_KEY], expect_cover), cover_obj
+    clocked = sum(cell["count"] for cell in source["cells"])
+    assert clocked > 0
+
+    expected = {
+        "shard": SHARD_KEY,
+        "shard_order": 4,
+        # The leaf these root objects describe: `temporal/`'s, without its
+        # `temporal.toc`. Pinned by the §5 combined digest of its arrays, so
+        # the two fixtures are provably two readings of ONE leaf.
+        "source_fixture": "temporal",
+        "leaf_content_hash": source["content_hashes"]["combined"],
+        "root_coverage": {
+            "object": "coverage.moc",
+            "spec": "zagg-coverage-toc/1",
+            "fields": ["h_tdigest"],
+            "shards": {SHARD_KEY: str(shard_word)},
+            # §10.3's exactness marker: the one shard came in uncounted, so
+            # `obs_total` is a lower bound — on `clocked_obs`, the leaf's
+            # real observation count, which no object in this store carries.
+            "uncounted_shards": 1,
+            "obs_total": 0,
+            "clocked_obs": clocked,
+            "counts": {
+                "temporal_order": TEMPORAL_COVER_ORDER,
+                "words": [str(int(w)) for w in expect.words],
+                "obs": [0] * len(expect.words),
+            },
+        },
+        "cover": {
+            "object": "coverage.toc",
+            "spec": COVER_SPEC,
+            "count": len(expect_cover),
+            "words": [str(int(w)) for w in expect_cover],
+        },
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(
+        f"{out.name}: root objects over a record-less leaf, {len(expect.words)} zero-count buckets"
+    )
+
+
+#: The ``windowed/`` fixture's window (issue #586 phase 3): one ``yearly``
+#: label, its observations clocked inside it on the declared time field.
+WINDOWED_LABEL = "2019"
+#: Order-9 shards the ``windowed/`` expectations pin the ORDER-19 instance of
+#: the §1.5 derivation law on — one per hemisphere; the southern word sets
+#: bit 63 (base cells 7-11), the case a signed reader gets wrong.
+WINDOWED_ORDER19_SHARDS = ("3232131144", "-5112333142")
+
+
+def _windowed_config():
+    """The ``windowed/`` fixture's config: a located digest + ``count``, windowed.
+
+    Constructed rather than validated, like :func:`_temporal_config` — the
+    fake ``process_shard`` stands in for a reader, so ``data_source`` declares
+    only what the window machinery consults (the ``time_field`` column).
+    """
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        data_source={"groups": ["g"], "variables": {"h": "/h", "delta_time": "/dt"}},
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0},
+                "h_tdigest": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest",
+                    "source": "h",
+                    "location": "leaf_id",
+                    "inner_shape": [2],
+                    "dtype": "float32",
+                    "fill_value": 0,
+                    "params": {"delta": DELTA},
+                },
+            },
+        },
+        output={
+            "store_layout": "hive",
+            "grid": {
+                "type": "healpix",
+                "parent_order": 4,
+                "child_order": 6,
+                "chunk_inner": 5,
+                "sharded": True,
+            },
+            "windowing": {
+                "schedule": "yearly",
+                "time_field": "delta_time",
+                "epoch": "2018-01-01T00:00:00Z",
+            },
+        },
+    )
+
+
+def _fake_windowed_shard(grid, by_chunk, time_range):
+    """``process_shard`` stand-in for ``windowed/``: dense + one located field.
+
+    The carrier still holds the ``morton`` column the real worker builds —
+    it is the WRITER that drops it for a windowed leaf, which is the path
+    this fixture pins.
+    """
+
+    def fake(g, shard_key, urls, **kwargs):
+        occupied = []
+        for ordinal, (block, children) in enumerate(grid.iter_chunks(int(shard_key))):
+            cells = by_chunk.get(ordinal, {})
+            if not cells:
+                kwargs["chunk_results"].append((block, pd.DataFrame(), {}))
+                continue
+            n = grid.cells_per_chunk
+            df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
+            df["count"] = np.array(
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+            )
+            ids = sorted(cells)
+            ragged = {
+                "h_tdigest": (
+                    [cells[i]["h_tdigest"][0] for i in ids],
+                    ids,
+                    [cells[i]["h_tdigest"][1] for i in ids],
+                )
+            }
+            kwargs["chunk_results"].append((block, df, ragged))
+            occupied.extend(int(children[i]) for i in sorted(cells))
+        kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
+        return pd.DataFrame(), {
+            "shard_key": int(shard_key),
+            "cells_with_data": len(occupied),
+            "total_obs": sum(c["count"] for cells in by_chunk.values() for c in cells.values()),
+            "granule_count": 1,
+            "files_processed": 1,
+            "duration_s": 0.0,
+            "time_range": time_range,
+            "error": None,
+        }
+
+    return fake
+
+
+def build_windowed(out: Path) -> None:
+    """The §1.5 derived-coordinate ``windowed/`` fixture (issue #586 phase 3).
+
+    ``minimal/``'s geometry and cell plan with a LOCATED digest field, written
+    as one WINDOWED leaf (``{id}_{window}.zarr``, a ``morton-hive/2`` stamp).
+    A windowed leaf stores no per-cell ``morton`` array: its cell words are
+    derived from the leaf id and the rank, and the ``derivation`` block of the
+    expected file records them — from mortie, never read back — beside the
+    order-19 instance of the law (one stride across an order-9 shard, both
+    hemispheres). The located sibling is what lets a reader CHECK the
+    derivation on committed bytes: every location word of a cell lies inside
+    that cell's derived word.
+    """
+    from mortie import clip2order, orders_of
+
+    import zagg.processing as processing
+    from zagg import hive
+    from zagg.config import get_windowing
+    from zagg.grids import HealpixGrid
+    from zagg.grids.morton import cell_words, morton_word
+    from zagg.stats.tdigest import build_tdigest
+    from zagg.windows import parse_utc, utc_to_offset, window_range
+
+    cfg = _windowed_config()
+    windowing = get_windowing(cfg)
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    shard = morton_word(SHARD_KEY)
+    derived = cell_words(shard, 6)
+    rng = np.random.default_rng(586)
+
+    to_dataset = {k: windowing[k] for k in ("epoch", "scale", "units")}
+    lo, hi = window_range(WINDOWED_LABEL, windowing["schedule"])
+    window = {
+        "label": WINDOWED_LABEL,
+        "start": utc_to_offset(lo, **to_dataset),
+        "end": utc_to_offset(hi, **to_dataset),
+    }
+    # The leaf's written extent, in dataset units (the worker's own return).
+    time_range = (
+        utc_to_offset(parse_utc("2019-03-01T00:00:00Z"), **to_dataset),
+        utc_to_offset(parse_utc("2019-09-01T00:00:00Z"), **to_dataset),
+    )
+
+    by_chunk: dict = {}
+    expected_cells = []
+    for chunk, local, n in [(0, 0, 40), (0, 2, 1), (1, 1, 5), (3, 3, 300)]:
+        cell_index = chunk * grid.cells_per_chunk + local
+        cell_word = int(derived[cell_index])
+        h = np.round(rng.normal(30.0, 5.0, n), 3).astype(np.float64)
+        words = np.asarray(_point_words(grid, cell_word, n, rng))
+        digest, locs = build_tdigest(h, DELTA, locations=words)
+        # The claim the fixture exists to pin, asserted on the INPUTS: every
+        # location word's ancestor at the cell order is the derived cell word.
+        assert np.all(orders_of(locs) >= 6), orders_of(locs)
+        assert np.all(clip2order(6, np.asarray(locs, dtype=np.uint64)) == derived[cell_index])
+        by_chunk.setdefault(chunk, {})[local] = {"count": n, "h_tdigest": (digest, locs)}
+        expected_cells.append(
+            {
+                "index": cell_index,
+                # DERIVED — the leaf stores no coordinate to read it from.
+                "morton": str(cell_word),
+                "count": n,
+                "h_tdigest": [[float(m), float(w)] for m, w in digest],
+                "h_tdigest_locations": [str(int(w)) for w in locs],
+                "location_orders": [int(o) for o in orders_of(locs)],
+            }
+        )
+    assert EMPTY_CHUNK not in by_chunk
+    # Heterogeneous orders (§2.2): the 300-observation cell merges, so its
+    # words are common ancestors coarser than the order-29 points beside them.
+    assert len({o for c in expected_cells for o in c["location_orders"]}) > 1
+
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    root = str(out)
+    hive.ensure_manifest(
+        root,
+        hive.build_manifest(
+            grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"}, windowing=windowing
+        ),
+    )
+    original = processing.process_shard
+    processing.process_shard = _fake_windowed_shard(grid, by_chunk, time_range)
+    try:
+        meta = hive.process_and_write_hive(
+            shard,
+            ["s3://fixture/a.h5"],
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            window=window,
+            sidecar_spec=hive.HIVE_SPEC_V2,
+        )
+    finally:
+        processing.process_shard = original
+    assert meta.get("error") is None, meta
+
+    leaf_rel = hive.shard_leaf_path("", shard, window=WINDOWED_LABEL).lstrip("/")
+    assert not (out / leaf_rel / grid.group_path / "morton").exists()
+
+    order19 = []
+    for dec in WINDOWED_ORDER19_SHARDS:
+        word = morton_word(dec)
+        words = cell_words(word, 19)
+        strides = np.unique(np.diff(words))
+        assert len(words) == 4**10 and len(strides) == 1, (dec, strides)
+        order19.append(
+            {
+                "shard": dec,
+                "shard_word": str(word),
+                "bit63": int(word >> 63),
+                "n_cells": len(words),
+                "first": str(int(words[0])),
+                "last": str(int(words[-1])),
+                "stride": str(int(strides[0])),
+            }
+        )
+    assert {e["bit63"] for e in order19} == {0, 1}, order19
+
+    expected = {
+        "shard": SHARD_KEY,
+        "shard_word": str(shard),
+        "leaf": leaf_rel,
+        "window": WINDOWED_LABEL,
+        "group": grid.group_path,
+        "shard_order": 4,
+        "chunk_order": 5,
+        "cell_order": 6,
+        "cells_per_chunk": grid.cells_per_chunk,
+        "chunks_per_shard": grid.chunks_per_shard,
+        "empty_chunk": EMPTY_CHUNK,
+        "delta": DELTA,
+        # §1.5 "The cell coordinate": the words a reader must derive for this
+        # leaf's cells axis (rank order), their one stride at this cell
+        # order, and the order-19 instance of the same law.
+        "derivation": {
+            "words": [str(int(w)) for w in derived],
+            "stride": str(int(derived[1] - derived[0])),
+            "order19": order19,
+        },
+        "cells": expected_cells,
+        "content_hashes": _o11_hashes(str(out / leaf_rel)),
+    }
+    assert f"{grid.group_path}/morton" not in expected["content_hashes"]["arrays"]
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(
+        f"{out.name}: windowed leaf {leaf_rel}, {len(expected_cells)} populated cells, "
+        f"no stored morton"
     )
 
 
@@ -1624,8 +2126,13 @@ def main() -> None:
         "multiscales": lambda: build_multiscales(args.out / "multiscales"),
         "demoted": lambda: build_demoted(args.out / "demoted"),
         "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
+        "versioned": lambda: build(
+            args.out / "versioned", kitchen_sink=False, run_id=FIXTURE_RUN_ID
+        ),
         "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
         "temporal": lambda: build_temporal(args.out / "temporal"),
+        "uncounted": lambda: build_uncounted(args.out / "uncounted"),
+        "windowed": lambda: build_windowed(args.out / "windowed"),
     }
     unknown = set(args.only or ()) - set(builders)
     if unknown:

@@ -1099,6 +1099,64 @@ class TestProcessHive:
         # Always-on write bracket (issue #297) flows into the record too.
         assert "write" in record["phase_timings"]
 
+    def test_hive_duration_total_spans_the_write_side(self, handler_mod, monkeypatch, tmp_path):
+        # Issue #589: ``duration_s`` is the worker's read/aggregate clock; on
+        # the fleet's sharded leaf path the leaf write, hash and column fold
+        # all run after it, so the record prices from ``duration_total_s`` —
+        # the handler-entry -> record wall — which must cover the aggregate
+        # AND every write-side phase. (The unsharded streaming path writes
+        # from inside ``process_shard``, where the two clocks overlap.)
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.config import load_config_from_dict
+        from zagg.telemetry import read_sidecar
+
+        event = self._event(tmp_path)
+        event["profile"] = True
+        event["config"]["output"]["grid"]["chunk_inner"] = 8  # sharded, as the fleet
+        # A leaf-node declaration (issue #383) so the worker folds the leaf
+        # column — the largest untimed term of the issue's measurement.
+        event["config"]["output"]["pyramid"] = {"overviews": 10}
+        grid = from_config(load_config_from_dict(event["config"]))
+        assert grid.sharded is True
+
+        def slow_fake(g, shard_key, urls, **kwargs):
+            t0 = time.time()
+            time.sleep(0.02)  # a measurable aggregate, so the bound is not trivial
+            sink = kwargs["chunk_results"]
+            for block, children in grid.iter_chunks(int(shard_key)):
+                sink.append((block, self._carrier_of(grid, children), {}))
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 5,
+                "total_obs": 7,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": time.time() - t0,
+                "phase_timings": {"read": 0.0, "index": 0.0, "aggregate": 0.0},
+                "error": None,
+            }
+
+        monkeypatch.setattr(processing, "process_shard", slow_fake)
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "2048")
+        resp = handler_mod._handle_process(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        timings = body["phase_timings"]
+        assert {"write", "hash", "column"} <= set(timings)
+        write_side = timings["write"] + timings["hash"] + timings["column"]
+        assert body["duration_s"] >= 0.02
+        assert body["duration_total_s"] >= body["duration_s"] + write_side
+        # duration_s keeps its meaning: the aggregate clock, not the invocation.
+        assert body["duration_s"] < body["duration_total_s"]
+        record = body["stats"]
+        assert record["duration_total_s"] == body["duration_total_s"]
+        assert record["duration_s"] == body["duration_s"]
+        assert record["gb_seconds"] == pytest.approx(body["duration_total_s"] * 2048 / 1024)
+        # The sidecar carries the same priced record.
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        assert read_sidecar(leaf)["duration_total_s"] == body["duration_total_s"]
+
     def test_hive_no_data_shard_writes_no_sidecar(self, handler_mod, monkeypatch, tmp_path):
         import zagg.processing as processing
         from zagg import hive
@@ -1188,6 +1246,215 @@ class TestProcessHive:
         resp = handler_mod._handle_process(event, _context())
         assert resp["statusCode"] == 500  # error envelope, as on flat
         assert not os.path.exists(hive.shard_leaf_path(event["store_path"], self._WORD))
+
+    def test_armed_rerun_skips_and_keeps_the_sidecar(self, handler_mod, monkeypatch, tmp_path):
+        # Issue #388 on the fleet: an event carrying skip_if_current + the run's
+        # D19 digest arms the seam's identity gate. The rerun of an unchanged
+        # unit folds nothing, returns {"current": true}, carries no stats
+        # record, and leaves the first run's sidecar intact (issue #401's
+        # clobber gate) -- the local backend's contract, on the handler.
+        import zagg.processing as processing
+        from zagg import hive
+        from zagg.config import load_config_from_dict
+        from zagg.semantics import semantic_hash
+        from zagg.telemetry import read_sidecar
+
+        grid = self._grid()
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
+        event = self._event(tmp_path)
+        event["run_id"] = "first"
+        assert handler_mod._handle_process(event, _context())["statusCode"] == 200
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+        before = read_sidecar(leaf)
+
+        def must_not_fold(*a, **k):
+            raise AssertionError("a current unit must not fold")
+
+        monkeypatch.setattr(processing, "process_shard", must_not_fold)
+        rerun = {
+            **event,
+            "run_id": "second",
+            "skip_if_current": True,
+            "semantic_hash": semantic_hash(load_config_from_dict(event["config"])),
+        }
+        resp = handler_mod._handle_process(rerun, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert body["current"] is True and "stats" not in body
+        assert body["touched_objects"] > 0  # the lifecycle touch ran worker-side
+        assert read_sidecar(leaf) == before and before["run_id"] == "first"
+
+    @pytest.mark.parametrize("armed", [True, False])
+    def test_the_gate_keys_reach_the_seam(self, handler_mod, monkeypatch, tmp_path, armed):
+        # The three event keys ride to process_and_write_hive; absent keys keep
+        # the pre-#388 unconditional rewrite. A touched current unit's
+        # ``icechunk_dirty`` marker (issue #580) survives into the response
+        # body -- the dispatcher's dirt-only work set is built from it.
+        from zagg import hive
+        from zagg.telemetry import read_sidecar
+
+        seen = {}
+
+        def seam(shard_key, *a, **k):
+            seen.update(k)
+            return {
+                "shard_key": int(shard_key),
+                "window": None,
+                "current": True,
+                "icechunk_dirty": True,
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "granule_count": 1,
+                "duration_s": 0.0,
+                "error": None,
+            }
+
+        monkeypatch.setattr(hive, "process_and_write_hive", seam)
+        event = self._event(tmp_path)
+        event.pop("run_id", None)
+        if armed:
+            event.update(skip_if_current=True, semantic_hash="abc", allow_contraction=True)
+            event["run_id"] = "r1"  # names the versioned leaf (issue #582, spec §1.5)
+        body = json.loads(handler_mod._handle_process(event, _context())["body"])
+        assert (seen["skip_if_current"], seen["allow_contraction"], seen["semantic_hash"]) == (
+            (True, True, "abc") if armed else (False, False, None)
+        )
+        assert seen["run_id"] == ("r1" if armed else None)
+        assert body["icechunk_dirty"] is True and "stats" not in body
+        assert read_sidecar(hive.shard_leaf_path(event["store_path"], self._WORD)) is None
+
+    def test_a_failed_temporal_record_write_is_a_terminal_failed_shard(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        """Issue #575 on the fleet: the leaf temporal record write fails CLOSED.
+
+        What a record-write failure looks like end to end, dispatcher included
+        (the real ``StatusPoller`` drives the invoke and reads the status
+        object the worker wrote):
+
+        - the worker raises before the stamp, so the handler returns its
+          caught-exception 500 envelope naming the record and the leaf, with
+          no stats record, and writes a ``failed`` status object;
+        - a ``failed`` status is TERMINAL for the run (fault class (a)): the
+          invoke is not re-fired, and the shard resolves as failed;
+        - nothing certifies the attempt — no pointer, no stamped version, no
+          stats sidecar — so a LATER run's unit, gate armed, is not skipped as
+          current: it folds, and lands a fresh version with its record.
+        """
+        import os
+
+        import numpy as np
+        from mortie import time2toc
+
+        import zagg.processing as processing
+        from zagg import client_transport as ct
+        from zagg import hive, leaf_temporal
+        from zagg.config import load_config_from_dict
+        from zagg.semantics import semantic_hash
+        from zagg.store import open_object_store, open_store
+        from zagg.telemetry import read_sidecar
+
+        config = self._hive_config_dict()
+        config["aggregation"]["variables"]["h"] = {
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [2],
+            "dtype": "float32",
+            "fill_value": 0,
+            "temporal": "per-centroid",
+        }
+        config["output"]["time_source"] = {
+            "field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        cfg = load_config_from_dict(config)
+        grid = from_config(cfg, parent_order=6)
+        words = np.asarray(
+            [int(time2toc(5_344_000_000_000_000_000 + i * 3 * 10**9)) for i in range(4)],
+            dtype=np.uint64,
+        )
+        ragged = {"h": ([np.array([[1.0, 4.0]], np.float32)], [0], None, [words[-1:]])}
+        folds: list = []
+
+        def fake(g, shard_key, urls, **kwargs):
+            folds.append(int(shard_key))
+            kwargs["temporal_out"].add_words(words)
+            carrier = self._carrier(grid, shard_key)
+            kwargs["write_chunk"](grid.block_index(int(shard_key)), carrier, ragged)
+            return pd.DataFrame(), {
+                "shard_key": int(shard_key),
+                "cells_with_data": 5,
+                "total_obs": 4,
+                "granule_count": 1,
+                "files_processed": 1,
+                "duration_s": 0.0,
+                "phase_timings": {"read": 0.0, "index": 0.0, "aggregate": 0.0},
+                "error": None,
+            }
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        event = {
+            **self._event(tmp_path),
+            "config": config,
+            "run_id": "first",
+            # Armed exactly as the dispatcher arms it (issue #388).
+            "skip_if_current": True,
+            "semantic_hash": semantic_hash(cfg),
+        }
+        leaf = hive.shard_leaf_path(event["store_path"], self._WORD)
+
+        # The dispatcher half: one Event invoke per fire (its return value is
+        # discarded), resolved from the run's status objects.
+        fired: list = []
+
+        def dispatch():
+            fired.append(event["run_id"])
+            handler_mod.lambda_handler(event, _context())
+
+        prefix = ct.run_status_prefix(event["store_path"], "first")
+        poller = ct.StatusPoller(
+            lambda: open_object_store(prefix), drop_timeout_s=60.0, max_retries=3
+        )
+        future = poller.register(self._WORD, "shard", dispatch=dispatch, granule_count=1)
+
+        def boom(*a, **k):
+            raise OSError("503 SlowDown")
+
+        with monkeypatch.context() as failing:
+            failing.setattr(leaf_temporal, "write_leaf_temporal", boom)
+            for _ in range(3):  # fire, resolve, and one more tick that must not re-fire
+                poller._tick()
+        result = future.result(timeout=0)
+        assert fired == ["first"] and result["retries"] == 0
+        assert result["status_code"] == 500
+        assert result["error"].startswith("Unhandled exception: leaf temporal record for ")
+        assert leaf in result["error"] and "503 SlowDown" in result["error"]
+        assert result["body"]["shard_key"] == self._WORD and "stats" not in result["body"]
+        status_path = tmp_path / "hive-out.status" / "run-first" / f"shard-{self._WORD}.json"
+        status = json.loads(status_path.read_text())
+        assert (status["status"], status["status_code"]) == ("failed", 500)
+        # Nothing certifies the attempt: an unstamped version, no pointer, no
+        # stats sidecar beside the leaf.
+        (debris,) = os.listdir(leaf)
+        assert debris.startswith("run-first-")
+        assert hive.read_commit(open_store(leaf)) is None
+        assert hive.read_commit(open_store(f"{leaf}/{debris}")) is None
+        assert read_sidecar(leaf) is None
+
+        # A later run over the store: the unit is processed, not skipped.
+        resp = handler_mod.lambda_handler({**event, "run_id": "second"}, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert "current" not in body and body["identity"] == "no-sidecar"
+        assert folds == [self._WORD, self._WORD]
+        assert body["leaf_version"].startswith("run-second-")
+        data_path, stamp = hive.resolve_leaf(leaf)
+        assert stamp["current"] == body["leaf_version"]
+        assert leaf_temporal.read_leaf_temporal_record(data_path)["n_obs"] == 4
+        assert read_sidecar(leaf)["run_id"] == "second"
 
 
 class TestProcessHiveWindowed:
@@ -1418,6 +1685,23 @@ class TestDispatchManifest:
         # rebuild the Run without the dispatcher duplicating it on the wire.
         assert manifest["config"] == event["config"]
 
+    def test_slim_block_lands_a_slim_manifest(self, handler_mod, tmp_path):
+        # A large hive run's block rides without its shard list (issue #588):
+        # the worker writes what it was sent, the config folded in as ever —
+        # which is all the operator finalize reads.
+        from zagg.client_transport import slim_run_manifest_block
+
+        event = self._event(tmp_path, run_manifest=slim_run_manifest_block(self._BLOCK))
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        assert self._read_manifest(tmp_path) == {
+            "schema_version": 1,
+            **self._BLOCK,
+            "shards": None,
+            "shards_omitted": 2,
+            "config": event["config"],
+        }
+
     def test_absent_block_writes_nothing(self, handler_mod, tmp_path):
         event = self._event(tmp_path)
         del event["run_manifest"]
@@ -1622,6 +1906,52 @@ class TestStatsMode:
         assert resp["statusCode"] == 200, resp["body"]
         df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
         assert set(df["finalize_error"]) == {"RuntimeError: invoke failed"}
+
+    def test_icechunk_init_from_event_lands_in_the_parquet(self, handler_mod, tmp_path):
+        """Issue #580: the same forwarding leg for the companion-repo init
+        record — the dispatcher holds it, only the worker can PUT (D8), so a
+        typo or a renamed event key here would ship a fleet run with the
+        run-level columns silently null."""
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {
+                "mode": "stats",
+                "store_path": root,
+                "run_id": "runid4",
+                "timestamp": "20260720T010204Z",
+                "rows": self._rows(),
+                "icechunk_init": {"path": f"{root}/icechunk/4", "snapshot": "SNAP"},
+            },
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
+        assert set(df["icechunk_init_repo"]) == {f"{root}/icechunk/4"}
+        assert set(df["icechunk_init_snapshot"]) == {"SNAP"}
+        assert df["icechunk_init_error"].isna().all()
+
+    def test_icechunk_init_absent_leaves_the_columns_null(self, handler_mod, tmp_path):
+        # The pre-#580 dispatcher sends no such key: the columns are still
+        # written (the "same column set every run" contract), just null.
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {
+                "mode": "stats",
+                "store_path": root,
+                "run_id": "runid5",
+                "timestamp": "20260720T010205Z",
+                "rows": self._rows(),
+            },
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
+        for col in ("icechunk_init_repo", "icechunk_init_snapshot", "icechunk_init_error"):
+            assert col in df.columns and df[col].isna().all()
 
     def test_empty_rows_is_ok_and_writes_nothing(self, handler_mod, tmp_path):
         root = str(tmp_path / "out")

@@ -819,10 +819,9 @@ class TestManifestTemporal:
 
 def _shard_word(order=6):
     """A real southern packed shard word (decimal form ``-5112333`` at order 6)."""
-    import numpy as np
     from mortie import geo2mort
 
-    return int(geo2mort(np.array([-78.5]), np.array([-132.0]), order=order)[0])
+    return int(geo2mort(-78.5, -132.0, order=order)[0])
 
 
 class TestWindowedLeafPath:
@@ -1919,7 +1918,7 @@ class TestWindowedRunnerWiring:
         from zagg import runner
         from zagg.runner import agg
 
-        _windowed(cfg)
+        _windowed(cfg, unit="window")
         catalog_path, shard = self._catalog(tmp_path)
         root = str(tmp_path / "out")
         calls = []

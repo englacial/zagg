@@ -89,8 +89,11 @@ def shard_status(
         "semantic_hash_match": sidecar.get("semantic_hash") == semantic_hash,
         "catalog_match": None,
     }
-    if content := sidecar.get("content_hashes"):
-        # O11 verifier, surfaced when recorded (never recomputed here).
+    if content := (stamp.get("content_hashes") or sidecar.get("content_hashes")):
+        # O11 verifier, surfaced when recorded (never recomputed here). The
+        # §5.3 preference is the STAMP's copy — sealed with the bytes it
+        # certifies (issue #580) — with the sidecar as the fallback for a
+        # leaf written before the stamp carried it.
         detail["content_hashes"] = content
     if granule_ids is not None:
         recorded = sidecar.get("granules_sha256")

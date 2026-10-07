@@ -71,6 +71,34 @@ def test_unknown_grid_area_raises():
         bench_metrics.shard_area_km2(object())
 
 
+# --- shard_cell_orders ----------------------------------------------------
+
+
+def test_healpix_shard_cell_orders():
+    g = HealpixGrid(parent_order=9, child_order=17)
+    assert bench_metrics.shard_cell_orders(g) == (9, 17)
+
+
+def test_rect_shard_cell_orders_raises():
+    # The rectilinear grid has no shard/cell orders at all -- the drivers
+    # recording them dispatch HEALPix targets only, so this is named rather
+    # than left to surface as an AttributeError at the record site.
+    g = RectilinearGrid(
+        crs="EPSG:32618",
+        resolution=10,
+        bounds=[358300, 4299600, 370300, 4311600],
+        chunk_shape=(300, 300),
+    )
+    with pytest.raises(TypeError, match="shard/cell orders"):
+        bench_metrics.shard_cell_orders(g)
+
+
+def test_unknown_grid_cell_orders_raises():
+    # A duck-typed non-grid is named too, not just the two real backends.
+    with pytest.raises(TypeError):
+        bench_metrics.shard_cell_orders(object())
+
+
 # --- build_record ---------------------------------------------------------
 
 
@@ -2159,6 +2187,28 @@ def test_88s_nested_pin_invariant():
             f"{sm_key}: pinned shard {sm_meta['shard_key']} is not inside its "
             f"nested_in parent {parent_meta['shard_key']} (got {containing})"
         )
+
+
+def test_containing_shard_scalar_form_matches_the_uint64_array_path():
+    # ``_containing_shard`` hands mort2geo a bare Python int since the explicit
+    # ``np.array([shard_key], dtype=np.uint64)`` boxing came off (issue #543). A
+    # southern (base 7-11) word sets bit 63, so the int infers uint64 where a
+    # northern one infers int64; pin both against the explicit-uint64 array
+    # kernel (the old boxed form was its length-1 case) and against the nesting.
+    import numpy as np
+    from mortie import clip2order, geo2mort, mort2geo
+
+    grid = HealpixGrid(parent_order=9, child_order=12)
+    words = geo2mort(np.array([40.0, -88.0]), np.array([-105.0, 30.0]), order=10)
+    north, south = keys = [int(w) for w in words]
+    assert north < 2**63 and np.asarray(north).dtype == np.int64
+    assert south >= 2**63 and np.asarray(south).dtype == np.uint64
+
+    lat, lon = mort2geo(np.array(keys, dtype=np.uint64))
+    want = grid.shards_of(grid.assign(lat, lon)).tolist()
+    got = [bench_metrics._containing_shard(grid, k) for k in keys]
+    assert all(type(g) is int for g in got)
+    assert got == want == clip2order(9, np.array(keys, dtype=np.uint64)).tolist()
 
 
 # --- store object-count tripwire (issue #240) --------------------------------

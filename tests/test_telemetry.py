@@ -7,6 +7,7 @@ import pytest
 from zagg.telemetry import (
     SCHEMA_VERSION,
     SPEC_V3,
+    billed_seconds,
     build_record,
     failure_record,
     flatten_record,
@@ -33,6 +34,7 @@ def _record(
     n_obs=1000,
     cells=7,
     duration=12.5,
+    duration_total=None,
     granules=("s3://b/g1.h5", "s3://b/g2.h5"),
     phases=None,
     memory=512.0,
@@ -47,6 +49,8 @@ def _record(
         "cells_with_data": cells,
         "granule_count": len(granules),
         "duration_s": duration,
+        # Invocation wall (issue #589); absent on records predating the key.
+        **({"duration_total_s": duration_total} if duration_total is not None else {}),
         "max_memory_mb": memory,
         "container_hwm_mb": memory + 100 if memory is not None else None,
         "phase_timings": {"read": 8.0, "index": 1.0, "aggregate": 2.0}
@@ -112,8 +116,33 @@ class TestBuildRecord:
         cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
         rec = _record(duration=10.0, lambda_config=cfg)
         assert rec["lambda"] == cfg
+        # No invocation wall on the record (a worker predating issue #589):
+        # the price falls back to the aggregate clock, and the column is
+        # null — unmeasured, never zero.
+        assert rec["duration_total_s"] is None
         assert rec["gb_seconds"] == pytest.approx(40.0)
         assert rec["est_cost_usd"] == pytest.approx(40.0 * 0.0000133334)
+
+    def test_duration_total_prices_cost_when_present(self):
+        # Issue #589: the write side (leaf write, hash, column fold, refs)
+        # runs AFTER ``duration_s`` is stamped, so the invocation wall is what
+        # Lambda bills; ``duration_s`` keeps its read/aggregate meaning.
+        cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
+        rec = _record(duration=10.0, duration_total=13.0, lambda_config=cfg)
+        assert rec["duration_s"] == 10.0 and rec["duration_total_s"] == 13.0
+        assert rec["gb_seconds"] == pytest.approx(52.0)
+        assert rec["est_cost_usd"] == pytest.approx(52.0 * 0.0000133334)
+        # Off-Lambda the total is recorded but unpriced, like duration_s.
+        local = _record(duration=10.0, duration_total=13.0)
+        assert local["duration_total_s"] == 13.0 and local["gb_seconds"] is None
+
+    def test_billed_seconds_prefers_the_invocation_wall(self):
+        # Issue #589: the dispatcher's cost/timeout figures bill the same
+        # clock build_record prices with -- the total, else duration_s.
+        assert billed_seconds({"duration_s": 10.0, "duration_total_s": 13.0}) == 13.0
+        assert billed_seconds({"duration_s": 10.0}) == 10.0
+        assert billed_seconds({"duration_s": 10.0, "duration_total_s": 0.0}) == 0.0
+        assert billed_seconds({}) == 0 and billed_seconds(None) == 0
 
     def test_unknown_arch_falls_back_to_default_rate(self):
         # The record prices via the #298 arch table; an unmapped arch uses the
@@ -450,6 +479,21 @@ class TestMerge:
         # Differing lambda blocks collapse to None (absorbing identity).
         assert m["lambda"] is None
 
+    def test_duration_total_sums_or_none(self):
+        # Populated totals sum; a rollup over records that never measured the
+        # invocation wall stays None (the merge identity law), and a mixed
+        # fold counts an older part at its duration_s (build_record's
+        # pricing fallback), so the rollup total never reads below duration_s.
+        a = _record(1, duration=10.0, duration_total=13.0)
+        b = _record(2, duration=5.0, duration_total=6.5)
+        assert merge([a, b])["duration_total_s"] == pytest.approx(19.5)
+        assert merge([a, b])["duration_s"] == pytest.approx(15.0)
+        assert merge([_record(1), _record(2)])["duration_total_s"] is None
+        mixed = merge([a, _record(2, duration=5.0)])
+        assert mixed["duration_total_s"] == pytest.approx(13.0 + 5.0)
+        assert mixed["duration_total_s"] >= mixed["duration_s"]
+        assert merge([a])["duration_total_s"] == 13.0
+
     def test_cost_fields_shared_lambda_survives(self):
         cfg = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}
         a = _record(1, duration=10.0, lambda_config=cfg)
@@ -527,6 +571,120 @@ class TestMerge:
         direct = merge(records)
         grouped = merge([merge(records[:2]), merge(records[2:5]), merge(records[5:])])
         _assert_records_close(grouped, direct)
+
+    def _bulk(self, window, *, run_id="rid", shard=7, n=3, n_obs=10, write=4.0):
+        # One leaf record of a bulk multi-window invoke (issue #586): the
+        # invoke's clocks, price and decoded rows repeat; the leaf's own
+        # counts and write-side phases do not.
+        return build_record(
+            shard_key=shard,
+            metadata={
+                "duration_s": 50.0,
+                "duration_total_s": 80.0,
+                "total_obs": n_obs,
+                "total_obs_read": 1000,
+                "unit_windows": n,
+                "phase_timings": {"read": 20.0, "write": write},
+            },
+            run_id=run_id,
+            window=window,
+            lambda_config={"memory_mb": 2048, "arch": "arm64"},
+        )
+
+    def test_a_bulk_invokes_rows_count_its_billed_wall_once(self):
+        # PR #587 question (15), option (a): ``duration_total_s`` (issue
+        # #589) is invoke-level on a bulk unit and repeats across its N
+        # rows with ``duration_s`` / ``gb_seconds`` / ``est_cost_usd`` /
+        # ``n_obs_read`` and the ``read`` phase; a roll-up counts the
+        # invoke once, never N times its bill.
+        rows = [self._bulk(w) for w in ("2019", "2020", "2021")]
+        one = rows[0]
+        assert one["gb_seconds"] == pytest.approx(160.0)  # 80 s x 2 GB: the total, not 50 s
+        m = merge(rows)
+        for key in ("duration_s", "duration_total_s", "gb_seconds", "est_cost_usd", "n_obs_read"):
+            assert m[key] == pytest.approx(one[key]), key
+        assert m["phase_timings"] == {"read": 20.0, "write": 12.0}
+        # The leaves' own counts still sum, and the invoke width survives.
+        assert (m["n_obs"], m["n_shards"], m["unit_windows"]) == (30, 3, 3)
+
+    def test_bulk_dedup_is_per_invoke_not_per_shard_or_run(self):
+        rows = [self._bulk(w) for w in ("2019", "2020")]
+        # Another shard's invoke, a later run's invoke of the same shard, and
+        # a per-window fan-out unit (``unit_windows`` null) are each their own bill.
+        other_shard = self._bulk("2019", shard=8, n=1)
+        rerun = self._bulk("2021", run_id="rid2", n=1)
+        fan_out = build_record(
+            shard_key=7,
+            metadata={"duration_s": 5.0, "duration_total_s": 9.0},
+            run_id="rid",
+            window="2022",
+        )
+        m = merge([*rows, other_shard, rerun, fan_out])
+        assert m["duration_total_s"] == pytest.approx(80.0 * 3 + 9.0)
+        assert m["duration_s"] == pytest.approx(50.0 * 3 + 5.0)
+        assert m["gb_seconds"] == pytest.approx(160.0 * 3)
+        assert m["n_obs_read"] == 3000
+        # An unidentified run (no ``run_id``) cannot be told apart, so it is
+        # never collapsed.
+        anon = [self._bulk(w, run_id=None) for w in ("2019", "2020")]
+        assert merge(anon)["duration_total_s"] == pytest.approx(160.0)
+
+    def test_a_bulk_invoke_split_across_partial_folds_counts_twice(self):
+        # The limit of associativity: the de-dup needs one invoke's rows in ONE
+        # call. A partial fold mixing shards collapses ``shard_key`` to None,
+        # so the invoke's other row is no longer recognized and bills again.
+        a, b = self._bulk("2019"), self._bulk("2020")
+        y = self._bulk("2019", shard=8, n=1)
+        assert merge([a, b, y])["duration_total_s"] == pytest.approx(160.0)
+        assert merge([merge([a, y]), b])["duration_total_s"] == pytest.approx(240.0)
+        # Grouped by shard first, as the sweep does, the fold is associative.
+        assert merge([merge([a, b]), y])["duration_total_s"] == pytest.approx(160.0)
+
+    def test_the_sweep_folds_a_shards_window_rows_in_one_call(self, tmp_path):
+        # The call graph the precondition rests on: the shard node merges ALL
+        # its windows' records at once, so a bulk invoke's rows always meet.
+        from obstore.store import LocalStore
+
+        from zagg.sweep import _rollup_shard_node
+
+        rows = {w: self._bulk(w) for w in ("2019", "2020", "2021")}
+        calls = []
+
+        class Family:
+            name, rollup_name = "stats", "stats.rollup.json"
+
+            def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+                return rows[window], "2026-10-01T00:00:00+00:00"
+
+            def merge(self, payloads, node, order):
+                calls.append(len(payloads))
+                return merge(payloads)
+
+        counts = dict.fromkeys(("written", "current", "empty", "failed"), 0)
+        envelope = _rollup_shard_node(
+            str(tmp_path),
+            LocalStore(str(tmp_path)),
+            Family(),
+            "1111",
+            set(rows),
+            3,
+            None,
+            {},
+            counts,
+        )
+        assert calls == [3]
+        assert envelope["payload"]["duration_total_s"] == pytest.approx(80.0)
+
+    def test_bulk_shard_rollups_fold_up_tree_unchanged(self):
+        # The shard node folds its windows in one call; everything coarser
+        # sums shard rollups, each already one invoke.
+        a = merge([self._bulk(w, shard=7) for w in ("2019", "2020", "2021")])
+        b = merge([self._bulk(w, shard=8) for w in ("2019", "2020", "2021")])
+        top = merge([a, b])
+        assert top["duration_total_s"] == pytest.approx(160.0)
+        assert top["gb_seconds"] == pytest.approx(320.0)
+        assert top["phase_timings"]["read"] == pytest.approx(40.0)
+        _assert_records_close(merge([a]), a)
 
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="at least one"):
@@ -784,6 +942,10 @@ class TestRunParquet:
         # The point-path read counter is a column of every run parquet too, so
         # the read-vs-keep ratio is queryable alongside n_obs (issue #374).
         assert "n_obs_read" in row
+        # The invocation wall is a column beside duration_s (issue #589): null
+        # here (no total on the record), populated when the worker stamped it.
+        assert row["duration_total_s"] is None
+        assert flatten_record(_record(duration_total=13.0))["duration_total_s"] == 13.0
         assert "phase_timings" not in row and "lambda" not in row  # flattened away
 
     def test_n_obs_read_flattens_to_a_column(self):

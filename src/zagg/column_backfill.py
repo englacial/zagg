@@ -455,7 +455,9 @@ def stored_leaf_slabs(
     borrowed from the sweep's own from-leaves fold
     (:func:`zagg.sweep_overview._fold_node`): the leaf's ``morton`` extent pins
     the geometry (a leaf at another cell order is not this declaration's leaf
-    — mixed-order sources are unsupported, issue #347), and every digest
+    — mixed-order sources are unsupported, issue #347; a windowed leaf stores
+    no coordinate, so there a declared field's extent pins it,
+    :func:`zagg.hive.leaf_cells_shape`), and every digest
     field's stored §2.0 ``weights`` / §8.4 companion declaration is checked
     against the manifest's (:func:`zagg.sweep_overview.check_weights_match`,
     :func:`zagg.sweep_overview.check_companion_match`). All three raise: a
@@ -484,16 +486,26 @@ def stored_leaf_slabs(
     )
 
     cell_order, n_cells = int(cell_order), int(n_cells)
+    # A versioned leaf's arrays live under its current version (spec §1.5,
+    # issue #582): resolve through the root stamp, which is the same GET the
+    # COMMITTED-leaf precondition above already pays.
+    from zagg.hive import leaf_cells_shape, resolve_leaf
+    from zagg.windows import split_leaf_name
+
+    data_path, _stamp = resolve_leaf(leaf_path, **dict(store_kwargs or {}))
     group = zarr.open_group(
-        open_store(leaf_path, read_only=True, **dict(store_kwargs or {})),
+        open_store(data_path, read_only=True, **dict(store_kwargs or {})),
         path=str(cell_order),
         mode="r",
         zarr_format=3,
     )
-    morton = group["morton"]
-    if morton.shape != (n_cells,):
+    # The stored ``morton`` extent, or — on a windowed leaf, which stores no
+    # coordinate (spec §1.5) — a declared field's.
+    windowed = split_leaf_name(leaf_path.rstrip("/").rsplit("/", 1)[-1])[1] is not None
+    axis = leaf_cells_shape(group, composable_fields(fields), windowed=windowed)
+    if axis is not None and axis != (n_cells,):
         raise ValueError(
-            f"leaf {leaf_path} carries {morton.shape} morton words, not the declared "
+            f"leaf {leaf_path} has a {axis} cells axis, not the declared "
             f"cell_order {cell_order} subtree ({n_cells} cells) — mixed-order source "
             f"leaves are unsupported (issue #347)"
         )

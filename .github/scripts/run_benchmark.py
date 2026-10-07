@@ -227,7 +227,7 @@ def run_target(
     manifest: dict,
     base: Path,
     *,
-    store: str,
+    store: str | None,
     region: str,
     function_name: str,
     context: dict,

@@ -62,6 +62,15 @@ SWEEP_SPEC = "zagg-sweep/1"
 #: explicit upgrade of a quiesced store, never a routine rollup's side effect.
 DEFAULT_FAMILIES = ("stats", "moc", "submap", "overview")
 
+#: Most shard ids one pass's ``pass_uncounted`` list names (issue #598). The
+#: list is for finding a damaged leaf — a handful of shards — while a store
+#: written before the leaf record existed has EVERY shard uncounted; at
+#: ~25 bytes an id this bounds the list near 25 KB, small beside the sweep
+#: record's other blocks and the 6 MB a synchronous Lambda response may carry.
+#: It also bounds the post-run INFO line and the CLI's printed summary, which
+#: carry the same family dict (up to ~1,000 id lines there, by design).
+UNCOUNTED_LIST_CAP = 1024
+
 #: Grid types already warned about as unsupported leaf sub-maps (once-ish, so a
 #: raster sweep does not warn-spam per shard). Never security-load-bearing.
 _warned_unsupported_submap: set[str | None] = set()
@@ -129,6 +138,19 @@ class SweepFamily:
         """Post-walk hook over the base-node artifacts; extra summary keys."""
         return {}
 
+    def summary(self) -> dict:
+        """Per-pass telemetry keys, reported whether or not ``finish`` ran.
+
+        A partitioned pass defers ``finish`` (issue #377) but still did per-leaf
+        work worth recording — the issue #575 route tally, which is the only
+        place a partition says how its leaves were read — so this rides every
+        pass that goes through the bottom-up walk, partitioned or not. A
+        family overriding :attr:`sweep_store` (the whole-tree runner
+        :func:`run_sweep` dispatches to instead of ``_sweep_family``) never
+        reaches this hook and folds its own telemetry.
+        """
+        return {}
+
 
 class StatsFamily(SweepFamily):
     """Stats/cost rollups (D20 fold): leaf ``stats.json`` sidecars up-tree.
@@ -176,34 +198,53 @@ class MocFamily(SweepFamily):
 
     The spec §10 TEMPORAL section (issue #480) rides this same walk: every
     stamped leaf of a temporal-declaring store also yields its §8.3 toc
-    envelope word and a per-leaf time digest
-    (:func:`zagg.coverage_toc.read_leaf_temporal`), accumulated on the family
+    envelope word and its §10.3 counted cover — from the leaf's own
+    ``temporal.toc`` record where its worker wrote one, else its coverage
+    alone (every count zero), read back from its raw companions one chunk at
+    a time (:func:`zagg.leaf_temporal.leaf_contribution`, issue #575; the
+    walk never writes a record) — accumulated on the family
     INSTANCE — one per run, since :func:`get_family` constructs a fresh one —
     and folded into the section :meth:`finish` writes. It stays OUT of the
     per-node rollup payloads on purpose: those are the skip-if-current
-    currency, compared byte for byte, and a per-node k-way fold would
-    describe a different centroid partition at every node (the fold-tree
-    caveat on :func:`zagg.stats.tdigest.merge_tdigests_kway`). A store
-    declaring no temporal field accumulates nothing, and its root object is
-    byte-identical to a pre-#480 one.
+    currency, compared byte for byte, and the root section composes at its
+    own GET-union-PUT seam (§10.4). A store declaring no temporal field
+    accumulates nothing, and its root object is byte-identical to a pre-#480
+    one.
     """
 
     name = "moc"
 
     def __init__(self):
-        #: ``{shard decimal: [(word, digest, times, cover), ...]}`` — one
-        #: entry per window leaf this run visited (issues #480, #489; the
-        #: fourth element is the leaf's §10.5 word-set cover).
+        #: ``{shard decimal: [(word, counts), ...]}`` — one entry per window
+        #: leaf this run visited (issues #480, #489, #575): the leaf's §10.2
+        #: envelope word and its §10.3 counted cover.
         self._temporal: dict[str, list] = {}
         #: Shards whose temporal read failed: dropped from the map entirely,
         #: never published from the window leaves that did read (issue #480).
         self._temporal_failed: set[str] = set()
+        #: How each CONTRIBUTING leaf's contribution was obtained (issue
+        #: #575): from its worker's record, or raw — coverage only, no
+        #: counts. Counted per contributing leaf — a leaf holding no
+        #: temporal row contributes nothing and is not counted at all — and
+        #: never decremented: a later window leaf that drops its whole shard
+        #: (the ``except`` below) leaves the earlier windows' counts standing,
+        #: so the two need not reconcile with ``temporal_shards``.
+        self._temporal_routes: dict[str, int] = {"record": 0, "raw": 0}
+        #: Shards with a raw-route leaf: the root block's ``uncounted_shards``
+        #: (spec §10.3), which is what marks its totals a lower bound.
+        self._temporal_uncounted: set[str] = set()
         #: Resolved once, on the first leaf read; ``None`` until then.
         self._temporal_fields: dict | None = None
         self._cell_order = 0
 
-    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs) -> None:
+    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs, stamp=None) -> None:
         """Read one leaf's §10 temporal contribution; fail-open per SHARD (D9).
+
+        ``stamp`` is the leaf's root stamp: a versioned leaf's record and
+        arrays are read from the version it names (spec §1.5), resolved inside
+        the fail-open. The read never writes: a leaf without a usable record
+        stays on the raw route — coverage only, its shard uncounted — until
+        its next replacement (§10.6).
 
         A store declaring no temporal field short-circuits after one manifest
         read. An unreadable companion is logged and skipped rather than
@@ -219,7 +260,8 @@ class MocFamily(SweepFamily):
         candidate), which is always safe, while a shard listed with a partial
         word is not.
         """
-        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+        from zagg.coverage_toc import temporal_cell_order, temporal_fields
+        from zagg.leaf_temporal import leaf_contribution
 
         if self._temporal_fields is None:
             from zagg.hive import read_manifest
@@ -237,7 +279,9 @@ class MocFamily(SweepFamily):
         if not self._temporal_fields or decimal in self._temporal_failed:
             return
         try:
-            got = read_leaf_temporal(leaf, self._cell_order, self._temporal_fields, **store_kwargs)
+            got, route = leaf_contribution(
+                leaf, self._cell_order, self._temporal_fields, stamp=stamp, **store_kwargs
+            )
         except Exception as e:
             logger.warning(
                 f"sweep[moc]: dropping shard {decimal} from the temporal section — "
@@ -247,7 +291,41 @@ class MocFamily(SweepFamily):
             self._temporal.pop(decimal, None)
             return
         if got is not None:
+            self._temporal_routes[route] += 1
+            if route == "raw":
+                self._temporal_uncounted.add(decimal)
             self._temporal.setdefault(decimal, []).append(got)
+
+    def summary(self) -> dict:
+        # ``temporal_routes: {records, raw}`` (issue #575): how this pass
+        # obtained each leaf's contribution — ``raw`` leaves gave coverage and
+        # no counts — named apart from the root object's §10 ``temporal``
+        # section and from ``temporal_shards``, neither of which it reconciles
+        # with. Gated on the DECLARATION, not on the tally:
+        # ``_temporal_fields`` is ``None`` until the first leaf read and ``{}``
+        # on a non-temporal store, so a non-temporal store's sweep record stays
+        # as it was and a partition that visited no leaf still says nothing —
+        # while a temporal pass that published nothing (every shard dropped by
+        # the fail-open above) reports zeros rather than reading as a store
+        # with no temporal channel at all.
+        if not self._temporal_fields:
+            return {}
+        routes = self._temporal_routes
+        # ``pass_uncounted`` (issue #598) NAMES the shards behind this pass's
+        # uncounted tally — the set ``finish`` counts, so a shard a later
+        # window dropped is not in it — in the root map's key order, at most
+        # ``UNCOUNTED_LIST_CAP`` of them beside the exact ``count``. Like the
+        # routes it is the PASS's (a partition names only the shards it
+        # visited), never the root block's standing ``uncounted_shards``.
+        uncounted = sorted(self._temporal_uncounted & self._temporal.keys())
+        return {
+            "temporal_routes": {"records": routes["record"], "raw": routes["raw"]},
+            "pass_uncounted": {
+                "count": len(uncounted),
+                "shards": uncounted[:UNCOUNTED_LIST_CAP],
+                "truncated": len(uncounted) > UNCOUNTED_LIST_CAP,
+            },
+        }
 
     def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
         # ``spec`` is unused here: leaf PATHS are the frozen /1-/2 grammar
@@ -261,7 +339,7 @@ class MocFamily(SweepFamily):
         stamp = read_commit(open_store(leaf, **store_kwargs))
         if stamp is None:
             return None  # absent leaf or unstamped debris (D4)
-        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs)
+        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs, stamp)
         payload = _moc_payload([morton_word(decimal)], stamp.get("time_range"))
         return payload, stamp.get("written_at")
 
@@ -320,7 +398,10 @@ class MocFamily(SweepFamily):
         if not tops:
             return {"root_moc_written": False}
         section = build_temporal_section(
-            self._temporal, self._temporal_fields or {}, source="sweep"
+            self._temporal,
+            self._temporal_fields or {},
+            source="sweep",
+            uncounted=self._temporal_uncounted,
         )
         cover = build_cover_section(
             self._temporal, self._temporal_fields or {}, shard_order, source="sweep"
@@ -372,6 +453,9 @@ class MocFamily(SweepFamily):
             # that landed lists at least these shards and usually more; the
             # run summary reports what the run did.
             out["temporal_shards"] = len(section["shards"])
+            # ... of which this many came in uncounted (§10.3) — also per pass: a
+            # partial pass keeps the root's standing marker (§10.4), so read that.
+            out["uncounted_shards"] = len(self._temporal_uncounted & set(section["shards"]))
         if cover is not None:
             out["cover_shards"] = len(cover["shards"])
         return out
@@ -929,6 +1013,7 @@ def _sweep_family(
             break
     tops = [computed[d] for d in frontier]
     result = dict(counts)
+    result.update(fam.summary())
     if min_order:
         # Deferred in ORDERS as well as by name, so the finisher's obligation
         # is machine-readable and sized: split == shard_order is permitted,
@@ -1000,7 +1085,10 @@ def _rollup_interior(store, fam, node, computed, counts) -> dict | None:
     A child freshly computed this pass is used in memory; any other candidate
     is probed on the store (<= 4 GETs, no LIST) so prior runs' siblings keep
     contributing. Generation is the children's sum/max — fold-of-folds equals
-    the direct leaf fold because every family's merge is associative (§8.3).
+    the direct leaf fold because every family's merge is associative (§8.3)
+    over shard rollups: the stats fold is, once each bulk invoke's rows have
+    met in one call, which :func:`_rollup_shard_node` guarantees
+    (:func:`zagg.telemetry.merge`).
 
     The store is append-only at the leaf level (leaf deletion/GC is the
     registered debris family, deliberately stubbed), so a child that emptied
@@ -1163,12 +1251,40 @@ def leaves_from_stats_records(records) -> list:
     ``shard_key`` + the issue #300 ``window`` field. Records without a window
     key (older workers) map to the unwindowed leaf name — on a windowed store
     that read simply misses (fail-open; the CLI backstops). Failure and
-    ``None`` records are skipped; pairs are deduplicated and sorted.
+    ``None`` records are skipped; pairs are deduplicated and sorted. A bulk
+    multi-window unit's ``stats`` is a LIST of records, one per emitted leaf
+    (issue #586 phase 2, :func:`zagg.telemetry.stats_records`).
     """
+    from zagg.telemetry import stats_records
+
     refs = {
         (int(r["shard_key"]), r.get("window"))
-        for r in records
-        if r and r.get("success") and r.get("shard_key") is not None
+        for stats in records
+        for r in stats_records(stats)
+        if r.get("success") and r.get("shard_key") is not None
+    }
+    return sorted(refs, key=lambda p: (p[0], p[1] is not None, p[1] or ""))
+
+
+def dirt_only_leaves(metas) -> list:
+    """``(shard_key, window)`` pairs of the run's DIRT-ONLY units (issue #580).
+
+    A skip-if-current unit writes no stats record (issue #388), so it never
+    reaches :func:`leaves_from_stats_records`. The one exception to "a current
+    unit enters no sweep": its lifecycle touch moved the checksums its Icechunk
+    refs carry and it rewrote its ladder sidecar, which the worker marks
+    ``icechunk_dirty``. Those units re-gather their node's refs in the staged
+    sweep without re-folding it (PR #581 question (11), ruled (a)). A bulk
+    multi-window unit stands for its per-window metas
+    (:func:`zagg.telemetry.window_metas`).
+    """
+    from zagg.telemetry import window_metas
+
+    refs = {
+        (int(m["shard_key"]), m.get("window"))
+        for meta in metas
+        for m in window_metas(meta)
+        if m.get("current") and m.get("icechunk_dirty")
     }
     return sorted(refs, key=lambda p: (p[0], p[1] is not None, p[1] or ""))
 
@@ -1328,6 +1444,16 @@ def main(argv=None) -> int:
         "The families sweep does not run in this mode.",
     )
     parser.add_argument(
+        "--pipeline-run-id",
+        default=None,
+        metavar="RUN_ID",
+        help="With --stages: the PIPELINE run this pass completes (issue #593) — the "
+        "run id of an aggregation run whose dispatcher died before its staged sweep "
+        "finished. Recorded in the sweep's run record (pipeline_run_id) beside the "
+        "sweep's own id, so the record vouches for that run by name. Omitted, the "
+        "record carries null and vouches for no run",
+    )
+    parser.add_argument(
         "--tuple-width",
         type=int,
         default=3,
@@ -1376,6 +1502,10 @@ def main(argv=None) -> int:
         "to /2 must not get. Validated against the manifest's own shard/cell orders",
     )
     args = parser.parse_args(argv)
+    if args.pipeline_run_id is not None and not args.stages:
+        # The key lives in the STAGED run record; a families pass has nowhere
+        # to put it, and dropping it silently would look like it was recorded.
+        parser.error("--pipeline-run-id only applies to --stages")
     if args.overviews is not None and args.declare_pyramid is None:
         # --overviews rides the declaration, and a sweep pass would silently
         # ignore it — refuse rather than run something the operator did not ask
@@ -1435,6 +1565,7 @@ def main(argv=None) -> int:
             tuple_width=args.tuple_width,
             partitions=args.partitions if args.partitions != 1 else None,
             store_kwargs=store_kwargs,
+            pipeline_run_id=args.pipeline_run_id,
         )
         print(json.dumps(summary, indent=2))
         return 0
