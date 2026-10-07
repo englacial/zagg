@@ -2119,7 +2119,9 @@ storage = icechunk.s3_storage(
 )
 repo = icechunk.Repository.open(
     storage,
-    authorize_virtual_chunk_access={root_prefix: icechunk.s3_anonymous_credentials()},
+    authorize_virtual_chunk_access={
+        root_prefix: icechunk.Credentials.S3(icechunk.s3_anonymous_credentials())
+    },
 )
 group = zarr.open_group(repo.readonly_session("main").store, mode="r")
 group.attrs["multiscales"]         # the manifest's zagg-multiscales/1 block: every level

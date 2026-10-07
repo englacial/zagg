@@ -2471,13 +2471,18 @@ class TestS3Kwargs:
 
             return fake
 
+        real_static = icechunk.s3_static_credentials
+        real_refreshable = icechunk.s3_refreshable_credentials
+
         def static(**kwargs):
+            # The credential constructors record AND build: ``_container``
+            # wraps the result as a ``Credentials.S3`` (issue #606).
             seen["static"] = kwargs
-            return "<static>"
+            return real_static(**kwargs)
 
         def refreshable(fn):
             seen["refreshable"] = fn
-            return "<refreshable>"
+            return real_refreshable(fn)
 
         real_store = icechunk.s3_store
 
@@ -2510,7 +2515,7 @@ class TestS3Kwargs:
         store = captured["s3_store"]
         assert store["region"] == "us-west-2" and store["endpoint_url"] is None
         assert store["allow_http"] is False and store["force_path_style"] is False
-        assert creds == "<refreshable>"
+        assert isinstance(creds, icechunk.Credentials.S3)
         assert captured["refreshable"] is icechunk_refs._boto3_credentials
         assert isinstance(container, icechunk.VirtualChunkContainer)
 
@@ -2525,7 +2530,7 @@ class TestS3Kwargs:
         assert kwargs["write_headers"] == {"x-amz-acl": "bucket-owner-full-control"}
 
         _container, cred = icechunk_refs._container("s3://theirs", {"credentials": creds})
-        assert cred == "<static>"
+        assert isinstance(cred, icechunk.Credentials.S3)
         assert captured["static"] == {
             "access_key_id": "AK",
             "secret_access_key": "SK",
@@ -2557,6 +2562,32 @@ class TestS3Kwargs:
         icechunk_refs._container("s3://minio", kw)
         store = captured["s3_store"]
         assert store["allow_http"] is True and store["force_path_style"] is True
+
+
+class TestS3Auth:
+    """The S3 container's credential reaches the open as a ``Credentials.S3``
+    (issue #606): icechunk types ``authorize_virtual_chunk_access`` values as
+    ``Credentials`` members and refuses a bare ``S3Credentials``. A local repo
+    carrying the S3 container exercises the seam with no AWS in reach — the
+    refreshable form's callable is never invoked at open.
+    """
+
+    @pytest.mark.parametrize(
+        "store_kwargs",
+        [
+            {"region": "us-west-2"},
+            {"region": "us-west-2", "credentials": {"accessKeyId": "AK", "secretAccessKey": "SK"}},
+        ],
+        ids=["refreshable", "static"],
+    )
+    def test_opens_with_the_s3_container_authorized(self, tmp_path, store_kwargs):
+        root = "s3://bucket/product"
+        repo = icechunk.Repository.open_or_create(
+            icechunk.local_filesystem_storage(str(tmp_path)),
+            config=icechunk_refs._repo_config(root, {}, store_kwargs),
+            authorize_virtual_chunk_access=icechunk_refs._auth(root, store_kwargs),
+        )
+        assert list(repo.config.virtual_chunk_containers) == [icechunk_refs.container_prefix(root)]
 
 
 def test_container_prefix_forms():
