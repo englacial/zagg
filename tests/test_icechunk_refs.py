@@ -2455,9 +2455,10 @@ class TestS3Kwargs:
     takes, and the one every other test in this file sidesteps by running on
     ``local_filesystem_storage``.
 
-    Pure kwargs assembly: the four icechunk constructors are captured, never
-    called for real, so this pins the claim that the module mirrors
-    :mod:`zagg.store`'s credential and ACL rules (issue #495).
+    Kwargs assembly: the four icechunk constructors are captured; only
+    ``s3_storage`` is faked, the other three also build the real object, so
+    this pins the claim that the module mirrors :mod:`zagg.store`'s
+    credential and ACL rules (issue #495).
     """
 
     @pytest.fixture
@@ -2515,7 +2516,7 @@ class TestS3Kwargs:
         store = captured["s3_store"]
         assert store["region"] == "us-west-2" and store["endpoint_url"] is None
         assert store["allow_http"] is False and store["force_path_style"] is False
-        assert isinstance(creds, icechunk.Credentials.S3)
+        assert isinstance(creds._0, icechunk.S3Credentials.Refreshable)
         assert captured["refreshable"] is icechunk_refs._boto3_credentials
         assert isinstance(container, icechunk.VirtualChunkContainer)
 
@@ -2530,7 +2531,7 @@ class TestS3Kwargs:
         assert kwargs["write_headers"] == {"x-amz-acl": "bucket-owner-full-control"}
 
         _container, cred = icechunk_refs._container("s3://theirs", {"credentials": creds})
-        assert isinstance(cred, icechunk.Credentials.S3)
+        assert isinstance(cred._0, icechunk.S3Credentials.Static)
         assert captured["static"] == {
             "access_key_id": "AK",
             "secret_access_key": "SK",
