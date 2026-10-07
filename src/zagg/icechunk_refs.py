@@ -379,7 +379,10 @@ def _container(store_root: str, store_kwargs: dict):
         allow_http=bool(endpoint and endpoint.startswith("http://")),
         force_path_style=bool(endpoint),
     )
-    return icechunk.VirtualChunkContainer(prefix, store), _s3_credentials(store_kwargs)
+    # Issue #606: the authorization dict takes ``Credentials`` members, so the
+    # bare ``S3Credentials`` (static or refreshable) is wrapped here, at the one seam.
+    creds = icechunk.Credentials.S3(_s3_credentials(store_kwargs))
+    return icechunk.VirtualChunkContainer(prefix, store), creds
 
 
 def _repo_config(store_root: str, splits: dict, store_kwargs: dict):
