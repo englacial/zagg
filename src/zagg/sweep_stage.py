@@ -1207,7 +1207,7 @@ def stage_node(
     # folded (in memory), opened for its skip gate, or read back for a merge.
     sources: dict = {}
 
-    def _open(target):
+    def _open(target, cells):
         try:
             reader = _OverviewReader(f"{_node_rel(target)}/{basename}", store=store, **reader_args)
         except ForeignSweepError:
@@ -1215,21 +1215,33 @@ def stage_node(
         except Exception as e:
             logger.warning(f"stage sweep: unreadable overview {target}/{basename} ({e})")
             return UNREADABLE
-        return reader if reader.committed and reader.provenance else None
+        if not (reader.committed and reader.provenance):
+            return None
+        if reader.provenance.get("cell_order") != cells:
+            # Another geometry's artifact (a redeclared ladder, a hand-built
+            # manifest): its group at ``cells`` is absent, so it would fold
+            # as all-fill and still count folded.
+            logger.warning(
+                f"stage sweep: overview {target}/{basename} records cell_order "
+                f"{reader.provenance.get('cell_order')!r}, not {cells}; counted unreadable"
+            )
+            return UNREADABLE
+        return reader
 
     def _source_rows(target, k):
-        src_order = finer[k][0]
+        src_order, res_src = finer[k]
         at = sources.setdefault(src_order, {})
         for desc in {_node_at(d, src_order) for d in candidates if d.startswith(target)}:
             if desc not in at:
-                at[desc] = _open(desc)
+                at[desc] = _open(desc, res_src)
         return _dense_rows({d: [s] for d, s in at.items()}, target, depth=src_order - k)
 
     def _refresh_sources(k):
-        at = sources[finer[k][0]]
+        src_order, res_src = finer[k]
+        at = sources[src_order]
         for desc, src in list(at.items()):
             if _is_reader(src) and not isinstance(src, _FoldedSource):
-                at[desc] = _open(desc)
+                at[desc] = _open(desc, res_src)
 
     dispatch_level_current = False
     for k in orders:
@@ -1249,7 +1261,7 @@ def stage_node(
             rows = rows_of(target)
             fresh_gen = _summed_generation(rows)
             depth = _gather_depth(rows, r) if regime == STAGE_GATHER else _source_depth(rows)
-            mine = _open(target)
+            mine = _open(target, r)
             if envelope:
                 stored = _read_envelope(store, target)
                 entries = dict((stored or {}).get("windows") or {})

@@ -527,6 +527,44 @@ class TestCascade:
             "0": 3,
         }
 
+    def test_a_source_at_another_cell_order_is_unreadable_not_folded(self, tmp_path, caplog):
+        # Another geometry's child artifact has no group at the cells the
+        # merge reads: it would fold as all-fill, so it counts unreadable.
+        from zagg.store import open_object_store
+        from zagg.sweep_overview import _candidate_decimals
+        from zagg.sweep_stage import one_stage_tuple, stage_node
+
+        root = tmp_path / "s"
+        m = _stage_store(root)
+        _sweep(root, m)
+        g = zarr.open_group(open_store(str(root / "1/1/2/all.zarr")), mode="r+", zarr_format=3)
+        g.attrs["zagg_overview"] = {**dict(g.attrs)["zagg_overview"], "cell_order": 4}
+        candidates, _ = _candidate_decimals(str(root), 3, _by_shard(), {})
+        counts = dict.fromkeys(("written", "current", "empty", "failed", "under_covered"), 0)
+        counts["revalidated"] = 0
+        stage_node(
+            open_object_store(str(root)),
+            str(root),
+            "11",
+            one_stage_tuple(3, 1, 2),
+            ladder_entries(m["pyramid"], 3),
+            FIELDS,
+            key="all",
+            window=None,
+            windowed=False,
+            shard_order=3,
+            cell_order=5,
+            candidates=candidates,
+            run_id="B",
+            run_started=_utcnow(),
+            counts=counts,
+            store_kwargs={},
+        )
+        assert counts["written"] == 1
+        attrs = dict(_artifact(root, "1/1/all.zarr").attrs)["zagg_overview"]
+        assert attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 1}
+        assert "records cell_order 4, not 3" in caplog.text
+
     def test_the_depth_is_recorded_truthfully_at_every_level(self, tmp_path):
         m = _stage_store(tmp_path / "s")
         summary = _sweep(tmp_path / "s", m)
