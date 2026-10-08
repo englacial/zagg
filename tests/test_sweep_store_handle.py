@@ -33,22 +33,23 @@ SUBMAP_SIG = {
 }
 
 
-def _decimals(n: int) -> list[str]:
-    """``n`` distinct order-4 shard ids under base ``1`` (digits ``1..4``)."""
+def _decimals(n: int, base: str = "1") -> list[str]:
+    """``n`` distinct order-4 shard ids under ``base`` (digits ``1..4``)."""
     out = []
     for i in range(n):
         digits, k = "", i
         for _ in range(SHARD_ORDER):
             digits, k = "1234"[k % 4] + digits, k // 4
-        out.append("1" + digits)
+        out.append(base + digits)
     return out
 
 
-def _store(tmp_path, n: int) -> tuple[str, list]:
+def _store(tmp_path, n: int, bases: tuple = ("1",)) -> tuple[str, list]:
     """The temporal fixture with its leaf cloned to ``n`` shards, each with every family's artifact.
 
     Every other leaf loses its ``temporal.toc`` record, so the temporal pass
-    takes both routes: the record route and the raw route.
+    takes both routes: the record route and the raw route. ``bases`` clones
+    ``n`` shards under each named base cell.
     """
     root = tmp_path / "store"
     shutil.copytree(FIXTURE, root)
@@ -56,7 +57,7 @@ def _store(tmp_path, n: int) -> tuple[str, list]:
         (root / name).unlink()
     source = Path(shard_leaf_path(str(root), morton_word(SHARD)))
     leaves = []
-    for i, decimal in enumerate(_decimals(n)):
+    for i, decimal in enumerate(d for base in bases for d in _decimals(n, base)):
         word = morton_word(decimal)
         leaf = shard_leaf_path(str(root), word)
         if Path(leaf) != source:

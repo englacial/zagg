@@ -10,6 +10,7 @@ use sends it back to the leaf walk, and its record says so.
 """
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -29,18 +30,78 @@ def _finisher(root: str, names: list) -> dict:
     return {"of": OF, "records_from": run_status_prefix(root, "r610"), "accumulators": names}
 
 
-def _no_leaf_reads(monkeypatch):
-    """Every leaf-reading seam the three families have raises."""
+# Anything below the node directories at the shard order: a leaf's zarr
+# group (its sidecar, ``temporal.toc`` and bitmap included) or a node's
+# per-leaf JSON. Rollups, run records and the manifest stay readable.
+_LEAF_SUFFIXES = (".zarr", "stats.json", "shardmap.json", "temporal.toc", "granules.json")
+
+
+def _leaf_key(key) -> bool:
+    key = str(key).rstrip("/")
+    return ".zarr/" in key or key.endswith(_LEAF_SUFFIXES)
+
+
+def _no_leaf_reads(monkeypatch) -> list:
+    """Every leaf-reading seam raises, by name AND at the store layer; the hits.
+
+    The named seams are the three families' current ones. The store-layer
+    guard wraps every ``obstore`` read entry point and the ``zagg.store``
+    open factories, so a leaf read through any other path fails too. The
+    hits are also returned, since a fail-open caller may swallow the raise.
+    """
+    import obstore
+
+    import zagg.hive as hive
     import zagg.leaf_temporal as leaf_temporal
+    import zagg.store as zstore
     import zagg.sweep as sweep
 
+    hits: list = []
+
     def boom(*_a, **_k):
+        hits.append(_a[1:2])
         raise AssertionError("the finisher must not read a leaf (issue #610)")
 
     for family in ("StatsFamily", "MocFamily", "SubmapFamily"):
         monkeypatch.setattr(getattr(sweep, family), "read_leaf", boom)
     monkeypatch.setattr(sweep, "_rollup_shard_node", boom)
     monkeypatch.setattr(leaf_temporal, "leaf_contribution", boom)
+
+    def guarded(real, at):
+        def read(*a, **k):
+            if len(a) > at and _leaf_key(a[at]):
+                hits.append(a[at])
+                raise AssertionError(f"the finisher read leaf key {a[at]} (issue #610)")
+            return real(*a, **k)
+
+        return read
+
+    for name in ("get", "get_range", "get_ranges", "head"):
+        for fn in (name, f"{name}_async"):
+            monkeypatch.setattr(obstore, fn, guarded(getattr(obstore, fn), 1))
+    for module in (zstore, hive):
+        for fn in ("open_store", "open_object_store"):
+            if hasattr(module, fn):
+                monkeypatch.setattr(module, fn, guarded(getattr(module, fn), 0))
+    return hits
+
+
+def _copy(root: str, to: Path) -> str:
+    """A byte-identical copy of a built store: the single-pass reference.
+
+    Copied rather than rebuilt, because the fixture stamps each leaf's
+    sidecar with the wall clock — two builds straddling a second differ.
+    """
+    shutil.copytree(root, to / "store")
+    return str(to / "store")
+
+
+def _empty(root: str, leaves) -> None:
+    """Remove every artifact of ``leaves``: nothing to fold there."""
+    from zagg.hive import shard_leaf_path
+
+    for word, _window in leaves:
+        shutil.rmtree(Path(shard_leaf_path(root, word)).parent)
 
 
 def _objects(root: str) -> dict:
@@ -59,8 +120,10 @@ def _objects(root: str) -> dict:
 
 def _fan_out(root: str, leaves) -> list:
     """Run every non-empty partition in-process; the status-prefix record names, in index order."""
+    from zagg.grids.morton import morton_decimal
+
     prefix, names = run_status_prefix(root, "r610"), []
-    for index in partition_leaves(leaves, OF):
+    for index, mine in partition_leaves(leaves, OF).items():
         partition = {"index": index, "of": OF}
         summary = run_sweep(
             root,
@@ -70,8 +133,7 @@ def _fan_out(root: str, leaves) -> list:
             status_record=(prefix, families_record_name(partition)),
         )
         assert summary["families"]["moc"]["finish_deferred"] is True
-        # The returned summary carries the block's size; both records, the block.
-        assert summary["families"]["moc"]["accumulator"] == {"shards": 4}
+        visited = sorted({morton_decimal(int(k)) for k, _w in mine})
         for path in (Path(root) / summary["record"], Path(summary["status_record"])):
             record = json.loads(path.read_text())
             block = record["families"]["moc"]["accumulator"]
@@ -83,22 +145,26 @@ def _fan_out(root: str, leaves) -> list:
                 "uncounted",
                 "visited",
             ]
-            assert block["visited"] == sorted(block["shards"])  # every leaf here holds a row
-            assert block["fields"] == ["h_tdigest"] and len(block["shards"]) == 4
+            # Every shard the partition walked, whether or not it held a row.
+            assert block["visited"] == visited and set(block["shards"]) <= set(visited)
+            assert block["fields"] == (["h_tdigest"] if block["shards"] else [])
             assert "accumulator" not in record["families"]["stats"]
+        # The returned summary carries the block's size; both records, the block.
+        assert summary["families"]["moc"]["accumulator"] == {"shards": len(block["shards"])}
         names.append(families_record_name(partition))
-    assert len(names) == 4
     return names
 
 
 class TestComposedFinisher:
     def test_the_finisher_reads_no_leaf_and_matches_the_single_pass(self, tmp_path, monkeypatch):
         root, leaves = _store(tmp_path / "fan", 16)
-        single, _same = _store(tmp_path / "single", 16)
+        single = _copy(root, tmp_path / "single")
         names = _fan_out(root, leaves)
-        _no_leaf_reads(monkeypatch)
+        assert len(names) == 4
+        hits = _no_leaf_reads(monkeypatch)
         summary = run_sweep(root, leaves, families=FAMILIES, finisher=_finisher(root, names))
         monkeypatch.undo()
+        assert hits == []
         assert summary["finisher"] == {"of": OF, "accumulators": 4}
         moc = summary["families"]["moc"]
         assert moc["root_moc_written"] is True
@@ -112,11 +178,48 @@ class TestComposedFinisher:
         assert reference["families"]["moc"]["temporal_shards"] == 16
         assert _objects(root) == _objects(single)
 
+    def test_the_guard_sees_a_leaf_read_by_any_path(self, tmp_path, monkeypatch):
+        import obstore
+
+        from zagg.hive import shard_leaf_path
+        from zagg.store import open_object_store
+
+        root, leaves = _store(tmp_path / "fan", 1)
+        store = open_object_store(root)
+        rel = Path(shard_leaf_path(root, leaves[0][0])).relative_to(root)
+        hits = _no_leaf_reads(monkeypatch)
+        for key in (f"{rel}/zarr.json", f"{rel.parent}/stats.json", f"{rel}/temporal.toc"):
+            with pytest.raises(AssertionError, match="leaf key"):
+                obstore.get(store, key)
+        assert obstore.get(store, "morton_hive.json").bytes()  # the manifest stays readable
+        assert len(hits) == 3
+
+    def test_two_base_cells_and_an_empty_partition_match_the_single_pass(
+        self, tmp_path, monkeypatch
+    ):
+        root, leaves = _store(tmp_path / "fan", 16, bases=("1", "2"))
+        # One partition's leaves hold nothing, in both copies (emptied before
+        # the copy): it writes no split-order rollup, and the single pass
+        # finds nothing there either.
+        _empty(root, partition_leaves(leaves, OF)[0])
+        single = _copy(root, tmp_path / "single")
+        names = _fan_out(root, leaves)
+        assert len(names) == 4  # a partition is a subtree index, spanning both bases
+        hits = _no_leaf_reads(monkeypatch)
+        summary = run_sweep(root, leaves, families=FAMILIES, finisher=_finisher(root, names))
+        monkeypatch.undo()
+        assert hits == [] and summary["finisher"] == {"of": OF, "accumulators": 4}
+        assert summary["families"]["stats"]["empty"] == 2  # its missing rollup, under each base
+        reference = run_sweep(single, leaves, families=FAMILIES)
+        assert summary["families"]["moc"]["temporal_shards"] == 24
+        assert reference["families"]["moc"]["temporal_shards"] == 24
+        assert _objects(root) == _objects(single)
+
     def test_a_missing_record_sends_the_finisher_to_the_leaves(self, tmp_path, caplog):
         import logging
 
         root, leaves = _store(tmp_path / "fan", 16)
-        single, _same = _store(tmp_path / "single", 16)
+        single = _copy(root, tmp_path / "single")
         names = _fan_out(root, leaves)
         (Path(run_status_prefix(root, "r610")) / names[1]).unlink()
         with caplog.at_level(logging.WARNING, logger="zagg.sweep"):
