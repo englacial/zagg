@@ -6270,9 +6270,11 @@ def _invoke_lambda_families_sweep(
     :data:`zagg.sweep_fleet.DEFAULT_BARRIER_TIMEOUT_S` at most, before the
     staged sweep and the finalize.
 
-    Fail-open (D9): a dispatch failure logs and returns ``None``; a short or
-    missing record is REPORTED in the outcome dict (``finisher``:
-    ``"timed_out"`` / ``"records_short"``, and ``landed < fired``), which the
+    Fail-open (D9): a dispatch failure before anything was fired logs and
+    returns ``None``, so ``None`` means nothing is in flight; one after is the
+    outcome's ``finisher: "dispatch_failed"``. A short or missing record is
+    REPORTED in the outcome dict (``finisher``: ``"timed_out"`` /
+    ``"records_short"``, and ``landed < fired``), which the
     run summary and the client handle carry as ``families_sweep``, never
     swallowed. The local backend keeps its in-process single pass
     (:func:`zagg.sweep.sweep_after_run`).

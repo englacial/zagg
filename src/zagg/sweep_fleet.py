@@ -1010,9 +1010,11 @@ def run_families_sweep_fleet(
     "landed", "finisher", "run_id", "records_from", "duration_s"}``, where
     ``finisher`` is ``"ok"`` (every record landed), ``"records_short"`` (the
     finisher's landed but a partition's did not — it folded from what was
-    there) or ``"timed_out"`` (the finisher's own record never landed: the
-    root section is whatever stood before). Anything but ``"ok"`` is also a
-    warning.
+    there), ``"timed_out"`` (the finisher's own record never landed: the
+    root section is whatever stood before) or ``"dispatch_failed"`` (an
+    invoke raised after others were fired; ``error`` says why, and nothing
+    further is fired or awaited). Anything but ``"ok"`` is also a warning. An
+    invoke that raises before anything was fired propagates.
     """
     import uuid
     from datetime import datetime, timezone
@@ -1066,23 +1068,30 @@ def run_families_sweep_fleet(
         "records_from": records_from,
     }
     finisher = {families_record_name(None)}
-    if n == 1:
-        _fire(leaves, None)
-        summary["fired"] = 1
-        summary["landed"] = len(_wait(finisher))
-        summary["finisher"] = "ok" if summary["landed"] else "timed_out"
-    else:
-        buckets = partition_leaves(leaves, n)
-        for index, bucket in buckets.items():
-            _fire(bucket, {"index": index, "of": n})
-            summary["fired"] += 1
-        seen = _wait({families_record_name({"index": i, "of": n}) for i in buckets})
-        summary["landed"] = len(seen)
-        _fire(leaves, None)
-        landed = _wait(finisher)
-        summary["finisher"] = (
-            "timed_out" if not landed else "records_short" if len(seen) < len(buckets) else "ok"
-        )
+    try:
+        if n == 1:
+            _fire(leaves, None)
+            summary["fired"] = 1
+            summary["landed"] = len(_wait(finisher))
+            summary["finisher"] = "ok" if summary["landed"] else "timed_out"
+        else:
+            buckets = partition_leaves(leaves, n)
+            for index, bucket in buckets.items():
+                _fire(bucket, {"index": index, "of": n})
+                summary["fired"] += 1
+            seen = _wait({families_record_name({"index": i, "of": n}) for i in buckets})
+            summary["landed"] = len(seen)
+            _fire(leaves, None)
+            landed = _wait(finisher)
+            summary["finisher"] = (
+                "timed_out" if not landed else "records_short" if len(seen) < len(buckets) else "ok"
+            )
+    except Exception as e:
+        # Invokes are in flight: the outcome, not None ("nothing was fired").
+        if not summary["fired"]:
+            raise
+        logger.warning(f"families sweep: an invoke failed after {summary['fired']} fired: {e}")
+        summary.update(finisher="dispatch_failed", error=str(e))
     summary["duration_s"] = time.perf_counter() - t0
     if summary["finisher"] != "ok":
         logger.warning(
