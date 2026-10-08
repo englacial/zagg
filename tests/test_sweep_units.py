@@ -57,11 +57,11 @@ from zagg.sweep_fold import (
     ColumnMovedError,
     FoldMeter,
     _gather_slabs,
-    _merge_slabs,
+    cascade_fold,
     refold_on_move,
 )
 from zagg.sweep_overview import ENVELOPE_NAME, decode_digest
-from zagg.sweep_stage import ForeignSweepError, _ColumnReader
+from zagg.sweep_stage import ForeignSweepError, _ColumnReader, _OverviewReader
 from zagg.sweep_stages import (
     FINISHER_RECORD_NAME,
     run_stage_worker,
@@ -283,7 +283,7 @@ class TestWindowUnits:
                 merged = merge_tdigests_kway([d for d in digests if len(d)], delta=delta)
                 assert np.array_equal(decode_digest(payload, "float32"), merged), (rel, j)
             # One more merge than its sources: 2 over a gather level's gen-1
-            # overviews, 3 over a merge level's gen-2 ones.
+            # overviews, one more than the cascade depth over a merge level's.
             assert block["regime"] == "stage-merge"
             assert block["merges_from_raw"] == 1 + per_window[0][0]["merges_from_raw"]
             assert block["source_windows"] == {"folded": 2, "missing": 0, "unreadable": 0}
@@ -292,7 +292,7 @@ class TestWindowUnits:
             _overview(root, rel)[0]["order"]: _overview(root, rel)[0]["merges_from_raw"]
             for rel in names
         }
-        assert gens == {2: 2, 1: 3, 0: 3}
+        assert gens == {2: 2, 1: 3, 0: 4}
 
     def test_a_gather_level_all_time_fold_keeps_its_gen1_inputs(self, tmp_path):
         # At a gather level the per-window overviews ARE the gen-1 members the
@@ -480,60 +480,73 @@ def _column_reader(path):
 
 
 class TestStreamedFold:
-    def _relay_rows(self, tmp_path):
-        """The order-1 stage columns of the wide store: a 256-cell relay each."""
+    def _swept_wide(self, tmp_path, **geometry):
         root = tmp_path / "s"
-        manifest = _wide_store(root)
+        manifest = _wide_store(root, **geometry)
         sweep_stage_pass(
             str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
         )
+        return root
+
+    def _cascade_rows(self, tmp_path):
+        """The order-1 artifacts of the wide store, as the root's cascade sources."""
+        root = self._swept_wide(tmp_path)
         rows: list = [None] * 4
-        rows[0] = [_column_reader(root / "1" / "1" / "all.pyramid.zarr")]
+        rows[0] = [
+            _OverviewReader(
+                str(root / "1" / "1" / "all.zarr"),
+                run_id="A",
+                run_started=RUN_STARTED,
+                store_kwargs={},
+            )
+        ]
         return rows
 
-    def test_a_streamed_merge_equals_the_whole_level_merge(self, tmp_path):
-        # A multi-chunk level: 4 output cells from a 256-cell relay member,
-        # folded 64-to-one, in 16-cell blocks — against the same fold in one.
-        rows = self._relay_rows(tmp_path)
-        geometry = dict(res_src=5, src_per_child=256, factor=64, n_out=16)
+    def test_a_streamed_cascade_equals_the_whole_level_cascade(self, tmp_path):
+        # The (0, 2) level from the (1, 3) artifacts (16 cells each), folded
+        # 4-to-one, one output cell per block — against the same fold in one.
+        rows = self._cascade_rows(tmp_path)
+        geometry = dict(k=0, r=2, src_order=1, res_src=3)
         whole_meter, block_meter = FoldMeter(), FoldMeter()
-        whole = _merge_slabs(rows, FIELDS, block=4**10, meter=whole_meter, **geometry)
-        streamed = _merge_slabs(rows, FIELDS, block=16, meter=block_meter, **geometry)
-        assert streamed[1:] == whole[1:]
-        for name in whole[0]:
-            assert _same(streamed[0][name], whole[0][name]), name
-        assert whole[0]["count"].sum() > 0
-        # The whole-level fold holds the level's inputs at once: the child's
-        # 256 relay cells, once per field. The streamed one never holds more
-        # than ONE output cell's — the 64 sources its flat k-way law needs.
-        assert (whole_meter.blocks, whole_meter.peak_cells) == (1, 2 * 256)
-        assert (block_meter.blocks, block_meter.peak_cells) == (16, 2 * 64)
-        assert block_meter.cells_read == whole_meter.cells_read == 2 * 256
-
-    def test_a_merge_block_is_never_more_than_one_fold_block(self, tmp_path):
-        # Where a fold block covers several output cells (factor < block),
-        # the bound is the block itself.
-        rows = self._relay_rows(tmp_path)
-        geometry = dict(res_src=5, src_per_child=256, factor=4, n_out=256)
-        whole_meter, block_meter = FoldMeter(), FoldMeter()
-        whole = _merge_slabs(rows, FIELDS, block=4**10, meter=whole_meter, **geometry)
-        streamed = _merge_slabs(rows, FIELDS, block=64, meter=block_meter, **geometry)
-        for name in whole[0]:
-            assert _same(streamed[0][name], whole[0][name]), name
-        assert block_meter.peak_cells == 2 * 64 < whole_meter.peak_cells == 2 * 256
-        assert block_meter.blocks == 16  # 256 output cells, 16 (= 64 sources) per block
-
-    def test_a_streamed_gather_equals_the_whole_level_gather(self, tmp_path):
-        rows = self._relay_rows(tmp_path)
-        geometry = dict(res=5, span=256, n_out=1024)
-        whole_meter, block_meter = FoldMeter(), FoldMeter()
-        whole = _gather_slabs(rows, FIELDS, block=4**10, meter=whole_meter, **geometry)
-        streamed = _gather_slabs(rows, FIELDS, block=16, meter=block_meter, **geometry)
+        whole = cascade_fold(rows, FIELDS, block=4**10, meter=whole_meter, **geometry)
+        streamed = cascade_fold(rows, FIELDS, block=4, meter=block_meter, **geometry)
         assert streamed[1:] == whole[1:] == (1, 0, 0, [])
         for name in whole[0]:
             assert _same(streamed[0][name], whole[0][name]), name
-        assert whole_meter.peak_cells == 2 * 256
-        assert block_meter.peak_cells == 2 * 16 and block_meter.blocks == 64
+        assert whole[0]["count"].sum() > 0
+        # The whole-level fold holds the child's 16 cells, once per field; the
+        # streamed one never holds more than ONE output cell's four sources.
+        assert (whole_meter.blocks, whole_meter.peak_cells) == (1, 2 * 16)
+        assert (block_meter.blocks, block_meter.peak_cells) == (16, 2 * 4)
+        assert block_meter.cells_read == whole_meter.cells_read == 2 * 16
+
+    def test_a_cascade_block_is_never_more_than_one_fold_block(self, tmp_path):
+        # Where a fold block covers several output cells (factor < block),
+        # the bound is the block itself.
+        rows = self._cascade_rows(tmp_path)
+        geometry = dict(k=0, r=2, src_order=1, res_src=3)
+        whole_meter, block_meter = FoldMeter(), FoldMeter()
+        whole = cascade_fold(rows, FIELDS, block=4**10, meter=whole_meter, **geometry)
+        streamed = cascade_fold(rows, FIELDS, block=8, meter=block_meter, **geometry)
+        for name in whole[0]:
+            assert _same(streamed[0][name], whole[0][name]), name
+        assert block_meter.peak_cells == 2 * 8 < whole_meter.peak_cells == 2 * 16
+        assert block_meter.blocks == 8  # 16 output cells, 2 (= 8 sources) per block
+
+    def test_a_streamed_gather_equals_the_whole_level_gather(self, tmp_path):
+        # A leaf column's 16-cell member 5 gathered into a 64-cell parent span.
+        root = self._swept_wide(tmp_path)
+        rows: list = [None] * 4
+        rows[0] = [_column_reader(root / "1" / "1" / "1" / "1" / "all.pyramid.zarr")]
+        geometry = dict(res=5, span=16, n_out=64)
+        whole_meter, block_meter = FoldMeter(), FoldMeter()
+        whole = _gather_slabs(rows, FIELDS, block=4**10, meter=whole_meter, **geometry)
+        streamed = _gather_slabs(rows, FIELDS, block=4, meter=block_meter, **geometry)
+        assert streamed[1:] == whole[1:] == (1, 0, 0, [])
+        for name in whole[0]:
+            assert _same(streamed[0][name], whole[0][name]), name
+        assert whole_meter.peak_cells == 2 * 16
+        assert block_meter.peak_cells == 2 * 4 and block_meter.blocks == 16
 
     @pytest.mark.parametrize("fields", (FIELDS, BOTH_CHANNEL_FIELDS), ids=("plain", "channels"))
     def test_the_ladder_is_the_same_at_any_block_size(self, tmp_path, monkeypatch, fields):
@@ -544,7 +557,7 @@ class TestStreamedFold:
         for order in (5, 1):
             monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", order)
             root = tmp_path / f"b{order}"
-            manifest = _stage_store(root, fields=fields)
+            manifest = _wide_store(root, fields=fields)
             summary = sweep_stage_pass(
                 str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
             )
@@ -569,7 +582,7 @@ class TestStreamedFold:
             assert row_block["fold_peak_cells"] <= row_whole["fold_peak_cells"]
         assert streamed["stages"][1]["fold_peak_cells"] < whole["stages"][1]["fold_peak_cells"]
         columns = [n for n in _overviews(whole_root, "all.pyramid.zarr") if n.count("/") < 4]
-        assert len(columns) == 5  # the stage columns: orders 2 and 1
+        assert len(columns) == 3  # the stage columns: the order-2 dispatch nodes
         for rel in columns:
             a, b = _artifact(whole_root, rel), _artifact(block_root, rel)
             stamp_a = dict(a.attrs)["morton_hive_commit"]
@@ -579,84 +592,76 @@ class TestStreamedFold:
             for key in ("groups", "source_children"):
                 assert dict(a.attrs)["zagg_column"][key] == dict(b.attrs)["zagg_column"][key]
 
+    #: Shard 3 / cells 7, overviews [6] (d = 3): every ladder level gathers,
+    #: so the order-2 dispatch columns carry member 4 (16 cells) for the
+    #: (1, 4) level and member 3 for the (0, 3) one — a group wider than a
+    #: 4-cell block, which is what the chunked column layout is for.
+    DEEP = dict(cell_order=7, overviews=(6,))
+
     def test_a_wide_column_group_is_one_chunk_object_per_block(self, tmp_path, monkeypatch):
         from zagg.content_hash import content_hashes_record, hash_arrays
 
         monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", 1)
-        root = tmp_path / "s"
-        manifest = _wide_store(root)
-        sweep_stage_pass(
-            str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
-        )
-        column = root / "1" / "1" / "all.pyramid.zarr"
-        group = _artifact(root, "1/1/all.pyramid.zarr")
-        relay = group["5"]["h_tdigest"]
-        assert relay.shape == (256,) and relay.chunks == (4,)
-        assert "sharding_indexed" not in (column / "5" / "h_tdigest" / "zarr.json").read_text()
-        # 64 chunks; only the populated ones are objects (three leaves' worth).
-        chunks = [p for p in (column / "5" / "count" / "c").iterdir()]
-        assert 1 < len(chunks) <= 64
+        root = self._swept_wide(tmp_path, **self.DEEP)
+        column = root / "1" / "1" / "1" / "all.pyramid.zarr"
+        group = _artifact(root, "1/1/1/all.pyramid.zarr")
+        member = group["4"]["h_tdigest"]
+        assert member.shape == (16,) and member.chunks == (4,)
+        assert "sharding_indexed" not in (column / "4" / "h_tdigest" / "zarr.json").read_text()
+        # 4 chunks; only the populated ones are objects (two leaves' worth).
+        chunks = [p for p in (column / "4" / "count" / "c").iterdir()]
+        assert 1 < len(chunks) <= 4
         # The record accumulated across blocks is the record of the artifact.
         stamp = dict(group.attrs)["morton_hive_commit"]
         assert stamp["content_hashes"] == content_hashes_record(hash_arrays(group))
         # A parent reads it back a block at a time: one chunk object per read.
         reader = _column_reader(column)
-        whole = reader.read(5, "count")
-        assert np.array_equal(reader.read_range(5, "count", 8, 12), whole[8:12])
-        assert reader.has(5, "count") and not reader.has(5, "absent")
+        whole = reader.read(4, "count")
+        assert np.array_equal(reader.read_range(4, "count", 8, 12), whole[8:12])
+        assert reader.has(4, "count") and not reader.has(4, "absent")
 
     def test_a_narrow_column_group_is_laid_out_as_before(self, tmp_path):
         # At the default block a group no wider than one block is ONE chunk —
         # the layout every stage column had, so no existing store moves.
-        root = tmp_path / "s"
-        manifest = _wide_store(root)
-        sweep_stage_pass(
-            str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
-        )
-        relay = _artifact(root, "1/1/all.pyramid.zarr")["5"]["h_tdigest"]
-        assert relay.shape == relay.chunks == (256,)
+        root = self._swept_wide(tmp_path, **self.DEEP)
+        member = _artifact(root, "1/1/1/all.pyramid.zarr")["4"]["h_tdigest"]
+        assert member.shape == member.chunks == (16,)
 
-    def test_a_column_whose_relay_folds_nothing_is_never_started(self, tmp_path):
+    def test_a_column_whose_members_fold_nothing_is_never_started(self, tmp_path):
         from zagg.sweep_stage import write_stage_column
 
         root = tmp_path / "s"
         _wide_store(root)
         written = write_stage_column(
             str(root),
-            "11",
+            "111",
             [[None], None, None, None],
             FIELDS,
-            members=[5],
-            child_order=2,
-            node_order=1,
-            relay=5,
+            members=[3],
+            child_order=3,
+            node_order=2,
             cell_order=6,
             generation={},
         )
-        assert written is None and not (root / "1" / "1" / "all.pyramid.zarr").exists()
+        assert written is None and not (root / "1" / "1" / "1" / "all.pyramid.zarr").exists()
 
     def _swept_column(self, tmp_path, monkeypatch):
         monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", 1)
-        root = tmp_path / "s"
-        manifest = _wide_store(root)
-        sweep_stage_pass(
-            str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
-        )
-        return root / "1" / "1" / "all.pyramid.zarr"
+        return self._swept_wide(tmp_path, **self.DEEP) / "1" / "1" / "1" / "all.pyramid.zarr"
 
     def test_a_block_read_revalidates_the_stamp(self, tmp_path, monkeypatch):
         column = self._swept_column(tmp_path, monkeypatch)
         reader = _column_reader(column)
         # Before anything is served, a moved stamp is re-read under the new one.
         _restamp(column, "2031-01-01T00:00:00+00:00")
-        first = reader.read_range(5, "count", 0, 4)
+        first = reader.read_range(4, "count", 0, 4)
         assert first is not None and reader.revalidated == 1
         assert reader.stamp["written_at"] == "2031-01-01T00:00:00+00:00"
         # Once a block has been served, a rewrite between two block reads is a
         # torn member: the next block raises rather than hand over the new write.
         _restamp(column, "2032-01-01T00:00:00+00:00")
         with pytest.raises(ColumnMovedError, match="rewritten after this fold read"):
-            reader.read_range(5, "count", 4, 8)
+            reader.read_range(4, "count", 4, 8)
         assert reader.revalidated == 1
 
     def test_a_vanished_stamp_never_validates(self, tmp_path, monkeypatch):
@@ -664,20 +669,21 @@ class TestStreamedFold:
         # its bytes are never data, before or after a served read.
         column = self._swept_column(tmp_path, monkeypatch)
         served = _column_reader(column)
-        assert served.read_range(5, "count", 0, 4) is not None
+        assert served.read_range(4, "count", 0, 4) is not None
         fresh = _column_reader(column)
         _restamp(column, None)
         with pytest.raises(ColumnMovedError, match="stamp gone"):
-            served.read_range(5, "count", 4, 8)
+            served.read_range(4, "count", 4, 8)
         with pytest.raises(ColumnMovedError, match="kept moving"):
-            fresh.read_range(5, "count", 0, 4)
+            fresh.read_range(4, "count", 0, 4)
 
     def test_a_torn_overview_is_folded_again_from_fresh_readers(
         self, tmp_path, monkeypatch, caplog
     ):
         # A rewrite lands under a fold after its first block read: the artifact
         # is folded again from scratch and lands with the clean build's content.
-        clean = self._swept_column(tmp_path / "clean", monkeypatch).parents[2]
+        monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", 1)
+        clean = self._swept_wide(tmp_path / "clean")
         root = tmp_path / "torn" / "s"
         manifest = _wide_store(root)
         moved = _move_after_first_read(monkeypatch, root, times=1)
@@ -738,6 +744,7 @@ class TestStreamedFold:
         manifest = json.loads((root / MANIFEST_NAME).read_text())
         column = root / "-2" / "1" / "1" / "all.pyramid.zarr"  # node -211's, the first written
         assert dict(_artifact(root, "-2/1/1/all.pyramid.zarr").attrs)["morton_hive_commit"]
+        monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", 5)
         monkeypatch.setattr(stage_mod, "_stage_column_current", lambda *a, **k: False)
         real_write, real_fetch = stage_mod.write_stage_column, fold_mod._fetch
         state = {"in": False, "n": 0, "failed": 0}

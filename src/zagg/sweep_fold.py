@@ -1,14 +1,21 @@
-"""The chunk-streamed stage fold (issue #586 phase 4; kernels from issue #384).
+"""The chunk-streamed fold kernels (issue #586 phase 4; kernels from issue #384).
 
 :mod:`zagg.sweep_stage` owns one stage worker — the planner, the column
-reader, the writers; this module owns the two fold kernels that worker runs,
-in the form the 2026-09-26 amendment on issue #586 ruled: **block by block
-over the output range**. Every output cell's fold is independent — a gather
-assigns a child's span, a merge k-way merges the children's partials for that
-cell — so a level is folded one block of output cells at a time: read only
-the child members covering the block, fold, hand the block on, free. Nothing
-is spilled to disk: the inputs already live in the store and are re-read per
-block, so a spill would only add billed ephemeral storage.
+reader, the writers; :mod:`zagg.sweep_overview` the ``/1`` retrofit sweep.
+This module owns the fold kernels BOTH run, in the form the 2026-09-26
+amendment on issue #586 ruled: **block by block over the output range**.
+Every output cell's fold is independent — a gather assigns a child's span, a
+cascade k-way merges the children's cells that fold into it — so a level is
+folded one block of output cells at a time: read only the child members
+covering the block, fold, hand the block on, free. Nothing is spilled to
+disk: the inputs already live in the store and are re-read per block, so a
+spill would only add billed ephemeral storage.
+
+:func:`cascade_fold` is THE per-node fold of a ladder level from the level
+below it (issue #620): the ``/1`` cascade (:func:`zagg.sweep_overview._cascade_node`)
+and every ``/2`` stage-merge level (:func:`zagg.sweep_stage._stage_fold`)
+produce their outputs through it, and nothing else folds a node — any
+future overview regime (raster included, issue #399) joins here.
 
 What that bounds. Before this module a fold densified a whole level: one slab
 per field for all ``4^(r - k)`` output cells, each child member read whole
@@ -16,9 +23,8 @@ per field for all ``4^(r - k)`` output cells, each child member read whole
 order-6 stage died at 4,094 MB on 64 unwindowed leaves that way. Resident
 inputs are now one block's: :data:`STAGE_BLOCK_ORDER` output cells of a
 gather, or the source cells of the output cells one block covers in a merge
-(never fewer than one output cell's ``factor`` sources — the flat k-way law
-of the merge-source ruling folds a cell in ONE call, so that is a floor, not
-a choice).
+(never fewer than one output cell's ``factor`` sources — a cell folds in ONE
+k-way call, so that is a floor, not a choice).
 
 The block is aligned to the **stage column's own zarr chunking**: a column
 group wider than one block is written on regular inner chunks of exactly one
@@ -45,10 +51,8 @@ logger = logging.getLogger(__name__)
 
 #: One fold block, as a HEALPix order difference: ``4 ** STAGE_BLOCK_ORDER``
 #: cells (1,024). It is also the inner-chunk extent of a streamed stage
-#: column group, so writer and reader blocks are whole chunk objects. At the
-#: reference geometry (shard 9, relay 11) an order-6 column's relay group is
-#: exactly one block and an order-3 column's is 64. A power of four so blocks
-#: nest in every child span and merge factor.
+#: column group, so writer and reader blocks are whole chunk objects. A power
+#: of four so blocks nest in every child span and merge factor.
 STAGE_BLOCK_ORDER = 5
 
 
@@ -213,7 +217,7 @@ def broken_groups(rows: list, fields: dict, *, res: int) -> set:
     Presence only — one metadata open per array, which the block reads then
     reuse — so a writer can know a member's ``source_children`` BEFORE it
     streams a single block (:func:`zagg.sweep_stage.write_stage_column` must
-    not clear an existing column for a relay member that folds nothing).
+    not clear an existing column for a member that folds nothing).
     """
     from zagg.sweep_stage import _is_reader
 
@@ -345,8 +349,8 @@ def _gather_slabs(
     # the rail exists for: a source column carrying the ``of`` digest without
     # the word relays a PRESENT, all-fill word array beside a populated
     # divisor (the packed pair is not validated the way ``_companion_group``
-    # validates a located one), which the next rung's ``_merge_slabs`` then
-    # reads as legitimate ``(0, n)`` parts — diluting the lane fractions
+    # validates a located one), which the next rung's :func:`cascade_fold`
+    # then reads as legitimate ``(0, n)`` parts — diluting the lane fractions
     # instead of blanking them, with no rail fired and nothing in any attrs.
     # That relay laundering predates issue #518 and stands as a question on
     # its PR; the fix belongs beside ``_companion_group``'s
@@ -355,8 +359,8 @@ def _gather_slabs(
 
 
 # ---------------------------------------------------------------------------
-# The merge: a flat k-way fold of the gen-1 tier, one block of output cells
-# at a time.
+# The cascade: a k-way fold of the children's cells, one block of output
+# cells at a time.
 # ---------------------------------------------------------------------------
 
 
@@ -512,9 +516,11 @@ def _merge_block(
         # cell contributes its ``(word, n)`` pair, ``n`` being the ``of``
         # digest's weight at the same cell, and every output cell collapses in
         # ONE k-way call (single quantization). A contributor carrying one
-        # half of the pair is SKIPPED and counted unreadable — the word is
-        # uninterpretable without its divisor digest, and a divisor without
-        # its word says nothing.
+        # half of the pair is SKIPPED for this field and the demotion recorded
+        # (issue #518, spec §4.3) — the word is uninterpretable without its
+        # divisor digest, and a divisor without its word says nothing. Its
+        # other fields still fold: the rail is per FIELD, not a verdict on the
+        # contributor (the one rule of both sweeps since issue #620).
         #
         # Skipping alone does NOT keep the pair consistent in ONE of the two
         # directions, and that is the difference from the located pair above:
@@ -527,21 +533,20 @@ def _merge_block(
         # skew, reproduced on review). Absence over wrongness: every output
         # cell that contributor's span covers keeps the fill word ``0``, which
         # makes no §3.2 presence/fraction claim, while the digest itself stays
-        # correct on its own and ``source_children.unreadable`` records that
-        # the level folded short (spec §4.5).
+        # correct on its own.
         #
         # The REVERSE direction poisons nothing: when the divisor is the
         # missing half, the digest loop above reads that same array for the
         # ``of`` field itself and drops the contributor too (``slab is None``),
-        # so word and ``N_signal`` already exclude the same rows. It is still
-        # counted ``broken`` — the level did fold short — but the other
-        # children's correct words stand (review finding).
+        # so word and ``N_signal`` already exclude the same rows. The record's
+        # ``cells`` is keyed there only where the contributor OWNS its span —
+        # one window and no output cell shared between children, the cascade's
+        # shape — since a shared cell is still covered by its siblings.
         #
         # In the skew direction the blanking IS wider than the offending
-        # contributor: at every level with ``r < child_order`` one output cell
-        # is shared by ``factor / src_per_child`` children (this test's own
-        # shape), so poisoning it drops SIBLING contributions as well. Left by
-        # design — a shared cell whose folded ``N_signal`` counts rows no
+        # contributor where output cells are shared (the all-time fold across
+        # windows), so poisoning it drops SIBLING contributions as well. Left
+        # by design — a shared cell whose folded ``N_signal`` counts rows no
         # surviving word describes cannot carry an honest word, and blanking
         # beats skewing.
         #
@@ -554,6 +559,7 @@ def _merge_block(
         out = _empty_slab(meta, hi - lo)
         parts_by_cell: dict[int, list] = {}
         poisoned: set[int] = set()
+        disjoint = windows == 1 and factor <= src_per_child
         for i, row, a, b in _pieces(rows, **span):
             base = i * src_per_child
             for w, reader in enumerate(row):
@@ -568,27 +574,29 @@ def _merge_block(
                         noted.add((name, i, w))
                         if first:
                             logger.warning(
-                                f"stage sweep: column {reader.path} carries only one of "
-                                f"{name!r}/{of_name!r} at resolution {res_src}; counting the "
-                                f"contributor unreadable (spec §3.3, §1.1)"
+                                f"fold: source {reader.path} carries only one of "
+                                f"{name!r}/{of_name!r} at resolution {res_src}; the field "
+                                f"folds short of it (spec §3.3, §4.3)"
                             )
-                        broken.add((i, w))
                         # Either direction is a demotion the artifact must
                         # record (issue #518, spec §4.3): the level's word
                         # coverage folded short, and the bytes alone cannot
                         # say so (the fill word makes no §3.2 claim).
+                        owned = range(base // factor, (base + src_per_child + factor - 1) // factor)
                         if of_values is not None:
-                            blanked = range(
-                                base // factor,
-                                (base + src_per_child + factor - 1) // factor,
-                            )
-                            poisoned.update(blanked)
+                            poisoned.update(owned)
                             if first:
                                 note_demotion(
-                                    demoted, name, DEMOTION_WORD_MISSING, of_name, cells=blanked
+                                    demoted, name, DEMOTION_WORD_MISSING, of_name, cells=owned
                                 )
                         elif first:
-                            note_demotion(demoted, name, DEMOTION_DIVISOR_MISSING, of_name)
+                            note_demotion(
+                                demoted,
+                                name,
+                                DEMOTION_DIVISOR_MISSING,
+                                of_name,
+                                cells=owned if disjoint else None,
+                            )
                     continue
                 for pos in range(len(word_slab)):
                     n = payload_weight(of_values[pos], of_dtype)
@@ -616,12 +624,13 @@ def merge_level(
     block=None,
     meter=None,
 ) -> tuple:
-    """One merge level, block by block: ``(slabs, broken, demotions)``.
+    """One k-way level, block by block: ``(slabs, broken, demotions)``.
 
-    :func:`_merge_slabs` without the per-child roll-up — ``broken`` is the raw
-    ``(child, window)`` set the fold refused, for a caller whose coverage
-    counters are per WINDOW (the all-time fold, where the one "child" is the
-    node itself — :func:`zagg.sweep_units.close_node`).
+    The kernel under :func:`cascade_fold`, without the per-child roll-up —
+    ``broken`` is the raw ``(child, window)`` set the fold refused, for a
+    caller whose coverage counters are per WINDOW (the all-time fold, where
+    the one "child" is the node itself and the windows fold across,
+    ``factor == 1`` — :func:`zagg.sweep_units.close_node`).
     """
     from zagg.sweep_overview import demotion_records
 
@@ -651,76 +660,65 @@ def merge_level(
     return _joined(parts), state["broken"], demotion_records(state["demoted"])
 
 
-def _merge_slabs(
+def cascade_fold(
     rows: list,
     fields: dict,
     *,
+    k: int,
+    r: int,
+    src_order: int,
     res_src: int,
-    src_per_child: int,
-    factor: int,
-    n_out: int,
     block=None,
     meter=None,
 ) -> tuple:
-    """K-way fold of the gen-1 tier, ``factor``-to-one — the ruled merge.
+    """Fold level ``(k, r)`` of one node from its children's level — THE engine.
 
-    ``rows`` is the DENSE rank-ordered child range (``None`` for uninhabited
-    children, else ``[reader-or-None per window]``). The sources are the
-    relayed partials (``res_src`` the relay member —
-    :func:`zagg.column.relay_resolution`, the leaf columns' res-``shard_order
-    + 2`` member) or, for the all-time fold on a windowed store, the node's
-    own per-window overviews at the level's resolution (``factor == 1``,
-    windows folding across — :func:`zagg.sweep_units.close_node`). Each
-    output cell folds in ONE flat k-way call — what makes the merge tree
-    independent of ``tuple_width`` (the merge-source law;
-    ``merge_tdigests_kway`` is order-independent by its sort, #370).
+    The one fold-of-folds every ladder path runs (issue #620; the cascade
+    espg ruled on issue #376 for ``/1`` and re-ruled for the staged ``/2``
+    ladder): a node's level is folded from its ``4^(src_order - k)``
+    children's artifacts at order ``src_order``, each carrying ``4^(res_src -
+    src_order)`` cells at resolution ``res_src``, ``4^(res_src - r)``-to-one
+    into the node's ``4^(r - k)`` output cells. ``rows`` is that DENSE
+    rank-ordered child range (``None`` for an uninhabited child, else
+    ``[reader-or-None]`` — a :class:`zagg.sweep_stage._ColumnReader` over the
+    child's artifact, ``None`` when it is missing, ``UNREADABLE`` when it
+    could not be read). Every output cell folds in ONE k-way call over the
+    child cells it covers (``merge_tdigests_kway`` is order-independent by
+    its sort, #370), so the values are a fixed function of the ladder — the
+    same whether the children were just folded in memory or read back off
+    the store, and at any tuple grouping. The input per node is the four
+    children's slabs, constant in the subtree's leaf count.
 
     Memory bound: one block of output cells at a time (:func:`_merge_block`),
     sized so its sources are one fold block (:func:`block_cells`) or one
-    output cell's ``factor`` of them, whichever is larger. Inside a block the
-    exact classes hold one dense source vector per window (scalars); the
-    digest classes stream piece by piece, holding one piece plus the open
-    output cells' decoded digests (~``factor`` digests per cell — the envelope
-    the ruling priced). Since issue #538 ``factor`` is ``4 ** (relay - r)``,
-    not the one-order ``4``: a one-order merge off the res-``shard_order + 2``
-    relay k-ways 64 δ-bounded digests per output cell where it k-wayed 4, and
-    each child contributes ``src_per_child`` 16 rather than 1. Missing
-    candidates contribute fill and are counted (``source_children.missing``).
+    output cell's sources, whichever is larger. Inside a block the exact
+    classes hold one dense source vector (scalars); the digest classes stream
+    piece by piece, holding one piece plus the open output cells' decoded
+    digests. Missing candidates contribute fill and are counted
+    (``source_children.missing``).
 
     A located field's pair is read together (:func:`_companion_group`) and a
     contributor carrying one half is **skipped for that field and counted
     unreadable** — the same posture as the gather, and as
     ``sweep_overview._fold_node``'s at a leaf missing the sibling. It is not a
-    raise: one stale child column must not take a whole stage level down, and
-    the fold is a fold — dropping a contributor is under-coverage the artifact
-    records, where writing a payload without its words would be corruption
-    (spec §9.1). Fields whose reads are sound still fold that contributor: the
-    read succeeded, so the loss is known per field, and the per-child
-    ``unreadable`` count is what says the artifact folded short.
+    raise: one stale child must not take a whole level down, and the fold is
+    a fold — dropping a contributor is under-coverage the artifact records,
+    where writing a payload without its words would be corruption (spec
+    §9.1). A packed field's half-pair is a per-FIELD demotion (issue #518):
+    the contributor still folds for its other fields and the record says
+    which field folded short of it.
 
     Returns ``(slabs, folded, missing, unreadable, demotions)`` — the last a
     :func:`zagg.sweep_overview.demotion_records` list naming every packed
-    field the half-pair rail demoted here, per direction (issue #518).
-
-    The rail marks a fired contributor ``broken``, which is a WHOLE-contributor
-    verdict, not a per-field one: where it fires on every contributor (the
-    mis-declared-divisor shape) ``folded == 0`` and
-    :func:`zagg.sweep_stage._stage_fold` drops the level, records included —
-    see the note at its ``folded == 0`` guard.
-
-    The order a cell's sources reach its k-way call is the whole-level
-    fold's: child-major, and within one child's piece window-major. The two
-    orders coincide because no fold has ``factor > 1`` AND more than one
-    window — a relay merge is one window's, and the cross-window fold is
-    cell-for-cell.
+    field the half-pair rail demoted here, per direction.
     """
     slabs, broken, demotions = merge_level(
         rows,
         fields,
-        res_src=res_src,
-        src_per_child=src_per_child,
-        factor=factor,
-        n_out=n_out,
+        res_src=int(res_src),
+        src_per_child=4 ** (int(res_src) - int(src_order)),
+        factor=4 ** (int(res_src) - int(r)),
+        n_out=4 ** (int(r) - int(k)),
         block=block,
         meter=meter,
     )

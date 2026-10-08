@@ -620,7 +620,7 @@ class TestSizedByteIdentity:
     def test_a_sized_build_is_the_fixed_width_build(self, tmp_path):
         # The merge-source law across GROUPINGS (#381 point (6)): the sized
         # fleet walks two tuples where the CLI walks one width-3 tuple, so it
-        # writes relay stage columns the CLI build never needs — which is why
+        # writes stage columns the CLI build never needs — which is why
         # this compares the ladder overviews, the product, exactly as
         # ``test_identity_survives_a_different_tuple_width`` does.
         from test_sweep_stage_fleet import (

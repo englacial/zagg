@@ -359,7 +359,12 @@ class TestDamage:
         report = validate_pyramid(str(store), full=True)
         assert not report["passed"]
         findings = report["checks"]["counts"]["mismatches"]
-        assert findings and all(f.startswith("window 2018: -5112[") for f in findings)
+        # The misfiled node against its own window's columns, and the merge
+        # above it, re-folded from the artifact it now finds there.
+        assert findings and {f.split("[")[0] for f in findings} == {
+            "window 2018: -5112",
+            "window 2018: -511",
+        }
         # ... and the all-time fold at that node no longer equals its windows' fold.
         assert report["checks"]["all_time"]["status"] == "fail"
 
@@ -412,9 +417,10 @@ class TestDamage:
     @pytest.mark.parametrize(
         ("node", "key", "value", "expect"),
         [
-            # node 5 is the gather level (cells 6 == the shard order): 2, not 3.
+            # node 5 is the gather level (cells 6 == the shard order): 2, not 3;
+            # the root's per-window overviews cascade to depth 6, so 7.
             ("-511233", "merges_from_raw", 3, "merges_from_raw 3 != 2"),
-            ("-5", "merges_from_raw", 2, "merges_from_raw 2 != 3"),
+            ("-5", "merges_from_raw", 2, "merges_from_raw 2 != 7"),
             ("-5", "regime", "stage-gather", "regime 'stage-gather' != 'stage-merge'"),
             ("-5", "source_children", {"folded": 0, "missing": 0, "unreadable": 0}, "summed"),
             ("-5", "source_windows", None, "lacks the folded/missing/unreadable counters"),

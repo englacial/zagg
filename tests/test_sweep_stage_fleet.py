@@ -422,7 +422,7 @@ class TestFinisherArm:
         entries = {e["node"]: e for e in read_manifest(str(root))["pyramid"]["overviews"]}
         # Node 0's two base-cell artifacts, summed ONCE across the two invokes.
         assert entries[0]["actuals"]["source_children"] == {
-            "folded": 4,
+            "folded": 2,  # the two base cells' one order-1 child each
             "missing": 0,
             "unreadable": 0,
         }
@@ -513,8 +513,9 @@ class TestFinisherArm:
             records_from=str(prefix),
         )
         assert summary["stage_records"] == 1 and summary["lease"]["released"]
-        # 4 with both records (see above); the lost batch under-reports, loudly.
-        assert summary["levels"]["0"]["source_children"]["folded"] == 3
+        # 2 with both records (one order-1 child per base cell); the lost
+        # batch under-reports, loudly.
+        assert summary["levels"]["0"]["source_children"]["folded"] == 1
 
     def test_a_prior_attempts_record_cannot_win_the_merge(self, tmp_path):
         # Same prefix, same id, a dead attempt's higher-numbered batch: the
@@ -536,7 +537,7 @@ class TestFinisherArm:
             records_from=str(prefix),
         )
         assert summary["stage_records"] == 2  # the stale one is not one of ours
-        assert summary["levels"]["0"]["source_children"]["folded"] == 4
+        assert summary["levels"]["0"]["source_children"]["folded"] == 2
 
     def test_read_stage_records_filters_on_run_id(self, tmp_path):
         from zagg.sweep_stages import read_stage_records
@@ -599,7 +600,7 @@ class TestFinisherArm:
             run_id="F",
             records_from=str(prefix),
         )
-        assert summary["levels"]["0"]["source_children"]["folded"] == 4
+        assert summary["levels"]["0"]["source_children"]["folded"] == 2
 
     def test_unreadable_record_is_skipped_not_fatal(self, tmp_path):
         root, prefix = tmp_path / "s", tmp_path / "status"
@@ -618,9 +619,11 @@ class TestFinisherArm:
     def test_merge_level_actuals_first_wins_on_level_metadata(self):
         # The merge runs in sorted record-NAME order, which is a dispatcher
         # batching artifact, so the level metadata must not be last-wins: the
-        # second worker here disagrees on all three values and loses. (They
+        # second worker here disagrees on cells/regime and loses. (They
         # cannot legitimately disagree — every worker derives them per level
         # via ``classify_level`` — which is exactly why the tie is pinned.)
+        # ``merges_from_raw`` is the level's MAXIMUM across workers, the
+        # in-process rule too (issue #620).
         target: dict = {}
         merge_level_actuals(
             target,
@@ -639,7 +642,7 @@ class TestFinisherArm:
         )
         assert target[2]["cells"] == 3
         assert target[2]["regime"] == "stage-gather"
-        assert target[2]["merges_from_raw"] == 1
+        assert target[2]["merges_from_raw"] == 7
         # The per-(node, window) rows still merge in from both.
         assert target[2]["children"] == {"111|all": {"folded": 2, "missing": 0, "unreadable": 0}}
 
@@ -877,8 +880,13 @@ class TestUnderCoverageHeals(object):
             records_from=str(prefix),
         )
         assert record["stages"][0]["under_covered"] > 0
-        attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
-        assert attrs["source_children"] == {"folded": 2, "missing": 1, "unreadable": 0}
+        # '112' folds nothing and writes no artifact: the merge at '11' records
+        # it missing, and the root's one child '11' is whole (the cascade
+        # records under-coverage at the level whose direct source is absent).
+        attrs = dict(_artifact(root, "1/1/all.zarr").attrs)["zagg_overview"]
+        assert attrs["source_children"] == {"folded": 1, "missing": 1, "unreadable": 0}
+        root_attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
+        assert root_attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 0}
         _write_leaf(root, "1121", 2)
         # A second RUN: run F's finisher released the lease as its final act,
         # and the dispatcher pins the new run's start stamp at dispatch time —
@@ -897,8 +905,10 @@ class TestUnderCoverageHeals(object):
             nodes=["1"],
             records_from=str(prefix),
         )
-        attrs = dict(_artifact(root, "1/all.zarr").attrs)["zagg_overview"]
-        assert attrs["source_children"] == {"folded": 3, "missing": 0, "unreadable": 0}
+        attrs = dict(_artifact(root, "1/1/all.zarr").attrs)["zagg_overview"]
+        assert attrs["source_children"] == {"folded": 2, "missing": 0, "unreadable": 0}
+        # ...and the healed child's generation moved the root, which re-folded.
+        assert list(_artifact(root, "1/all.zarr")["1"]["count"][:])[0] == 136 + 272 + 408
 
 
 # ---------------------------------------------------------------------------
@@ -1619,7 +1629,7 @@ class TestFleetOrchestration:
         assert (root / "1" / "all.zarr").exists() and (root / "-2" / "all.zarr").exists()
         assert read_lease(str(root)) is None and summary["finisher"]["lease"]["released"]
         entries = {e["node"]: e for e in read_manifest(str(root))["pyramid"]["overviews"]}
-        assert entries[0]["actuals"]["merges_from_raw"] == 2
+        assert entries[0]["actuals"]["merges_from_raw"] == 3  # the cascade depth at the root
 
     def test_the_dispatcher_writes_nothing_itself(self, tmp_path):
         # D8, pinned: with a client that only RECORDS invokes, the store is
@@ -2218,9 +2228,9 @@ class TestByteIdentityOracle:
         ``max_nodes_per_invoke``; ``"default"`` leaves the dispatcher's own
         default in force. ``windows`` swaps in the windowed/all-time store so
         the leaf refs carry a window rather than ``None``. ``wide`` swaps in the
-        issue #538 boundary geometry (3/6, leaf members {5, 4, 3}) whose
-        relay is the res-5 partial rather than the node member — the arm
-        that puts the relay itself on the wire.
+        issue #538 boundary geometry (3/6, leaf members {5, 4, 3}), whose
+        ladder is the one on which a tuple's dispatch nodes write stage
+        columns at all — the arm that puts a column on the wire.
         Returns ``(cli, fleet, summary, client)``.
         """
         mod = _handler_module()
@@ -2281,8 +2291,10 @@ class TestByteIdentityOracle:
 
     # +4 per arm since issue #394: the finisher writes the §4.10 companion group
     # (multiscales/zarr.json + one group doc per ladder level) on /2 stores —
-    # byte-identity covers them; only the census moved.
-    @pytest.mark.parametrize("width,tuples,objects", ((1, 3, 185), (2, 2, 167), (3, 1, 140)))
+    # byte-identity covers them; only the census moved. Since issue #620 no
+    # width writes a stage column on this d = 1 ladder (nothing above order 2
+    # gathers), so the census is the same at every width.
+    @pytest.mark.parametrize("width,tuples,objects", ((1, 3, 140), (2, 2, 140), (3, 1, 140)))
     def test_the_fleet_build_is_byte_identical_to_the_cli_build(
         self, tmp_path, width, tuples, objects
     ):
@@ -2300,37 +2312,32 @@ class TestByteIdentityOracle:
         # leaf `all.pyramid.stats.json` per column and the root `coverage.moc`,
         # so their mere presence would pass on a fleet arm that wrote nothing.
         # This work set's ladder is exactly seven nodes (3 at order 2, 2 at
-        # order 1, 2 at order 0), each one a group and a rollup; the object
-        # total moves with the width because narrower tuples also write relay
-        # stage columns the width-3 build never needs.
+        # order 1, 2 at order 0), each one a group and a rollup.
         rels = _artifacts(fleet)
         assert sum(_is_group_metadata(r) for r in rels) == 7
         assert sum(r.endswith("overview.rollup.json") for r in rels) == 7
         assert len(rels) == objects
 
-    def test_the_fleet_build_is_byte_identical_on_the_boundary_relay(self, tmp_path):
-        # The parametrized arm above runs the 3/5 store, whose relay IS the
-        # node member — so reverting ``relay_resolution`` to ``shard_order``
-        # left the whole fleet suite green (review finding). This arm is the
-        # 3/6 boundary geometry: the relay is the res-5 partial, so the
-        # stage columns the fleet ships between tuples carry member 5 and
-        # every merge k-ways ``4 ** (5 - r)`` sources per output cell. Width
-        # 1 is the width that writes stage columns at all (a width-3 build
-        # folds the whole o3 ladder from one tuple and needs none).
+    def test_the_fleet_build_is_byte_identical_with_stage_columns_on_the_wire(self, tmp_path):
+        # The parametrized arm above runs the 3/5 store, whose ladder needs no
+        # stage column. This arm is the 3/6 geometry: the (1, [3]) gather
+        # reads its order-2 children's member 3, so at width 1 the order-2
+        # dispatch nodes ship a column between tuples (a width-3 build folds
+        # the whole o3 ladder from one tuple and needs none).
         cli, fleet, summary, _ = self._both_arms(tmp_path, width=1, wide=True)
         assert summary["finisher"]["landed"] and not summary["barrier_timed_out"]
         _assert_identical(cli, fleet)
-        # Never vacuous: the relay member has to be ON the wire, not merely
-        # agreed on. The stage columns the dispatch nodes write carry group
-        # 5 — under the node-order relay they would carry group 3.
+        # Never vacuous: the column has to be ON the wire, not merely agreed
+        # on — group 3 at every order-2 dispatch node, and none at order 1,
+        # whose [1] tuple's level is itself what the root cascades from.
         cols = {rel.split("/all.pyramid.zarr/")[0] for rel in fleet if "all.pyramid.zarr/" in rel}
         stage_cols = sorted(c for c in cols if c.count("/") < 3)  # above the shard order
-        assert stage_cols, sorted(cols)
+        assert stage_cols and all(c.count("/") == 2 for c in stage_cols), sorted(cols)
         for node in stage_cols:
-            assert f"{node}/all.pyramid.zarr/5/zarr.json" in fleet, node
-        # ... and the merge levels they feed are populated, not fill: the
-        # ladder's one stage-MERGE level here is (0, [2]), the base-cell
-        # nodes, which read the relay member out of those stage columns.
+            assert f"{node}/all.pyramid.zarr/3/zarr.json" in fleet, node
+        # ... and the merge levels above are populated, not fill: the ladder's
+        # one stage-MERGE level here is (0, [2]), the base-cell nodes, which
+        # cascade the (1, [3]) artifacts the [1] tuple wrote.
         merges = sorted(
             rel.split("/all.zarr/")[0]
             for rel in fleet
@@ -2362,7 +2369,7 @@ class TestByteIdentityOracle:
         a = _devolatilize(json.loads(cli[MANIFEST_NAME]))["pyramid"]["overviews"]
         b = _devolatilize(json.loads(fleet[MANIFEST_NAME]))["pyramid"]["overviews"]
         assert a == b
-        assert {e["node"]: e["actuals"]["merges_from_raw"] for e in b} == {3: 1, 2: 1, 1: 2, 0: 2}
+        assert {e["node"]: e["actuals"]["merges_from_raw"] for e in b} == {3: 1, 2: 1, 1: 2, 0: 3}
 
     def test_identity_survives_a_multi_batch_fan_out(self, tmp_path, monkeypatch):
         # The transport's own degree of freedom: with the payload cap squeezed
@@ -2409,11 +2416,11 @@ class TestByteIdentityOracle:
     def test_identity_survives_a_different_tuple_width(self, tmp_path):
         # Grouping across EXECUTORS and across tuple widths at once: the CLI
         # walks one width-3 tuple, the fleet walks three width-1 tuples. The
-        # stage COLUMNS differ by construction (width 1 dispatches at orders 2
-        # and 1, so it writes relay columns width 3 never needs), which is why
-        # this arm compares the ladder overviews — the product — not the
-        # scaffolding. `TestMergeSourceLaw` in test_sweep_stage.py pins the
-        # same claim in-process.
+        # stage COLUMNS may differ by construction (a narrower width writes
+        # columns a wider one never needs), which is why this arm compares
+        # the ladder overviews — the product — not the scaffolding.
+        # `TestCascadeLaw` in test_sweep_stage.py pins the same claim
+        # in-process.
         cli, fleet, _, _ = self._both_arms(tmp_path, fleet_width=1)
         _assert_identical(cli, fleet, ladder_data_only=True)
         # And say exactly what the group attrs are allowed to differ in, so a

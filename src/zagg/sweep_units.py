@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 
-from zagg.sweep_stage import UNREADABLE, _ColumnReader, _is_reader
+from zagg.sweep_stage import UNREADABLE, _is_reader, _OverviewReader
 
 logger = logging.getLogger(__name__)
 
@@ -157,28 +157,6 @@ def stage_units(
     return units
 
 
-class _OverviewReader(_ColumnReader):
-    """Stamp-validated reads over one per-window ladder overview.
-
-    The all-time fold's source. Everything :class:`_ColumnReader` gives a
-    child column — one root GET for stamp + attrs, optimistic re-validation
-    around every read, the foreign-fresh abort — over a ``zagg-overview/2``
-    artifact, whose generation block lives in its own attrs key.
-    """
-
-    @property
-    def provenance(self) -> dict:
-        from zagg.sweep_overview import OVERVIEW_ATTR
-
-        block = self.attrs.get(OVERVIEW_ATTR)
-        return block if isinstance(block, dict) else {}
-
-    def generation(self) -> tuple:
-        from zagg.column import stamped_generation_key
-
-        return stamped_generation_key(self.provenance.get("generation"), self.stamp)
-
-
 def node_windows(store, node: str) -> set:
     """The window labels with an overview object at ``node`` (one delimiter LIST).
 
@@ -273,10 +251,10 @@ def close_node(
     Provenance, recorded on the artifact:
 
     - ``regime`` is ``stage-merge``; ``merges_from_raw`` is one more than its
-      sources' — **2** at a gather level, whose per-window overviews are
-      gen-1 content (the same digests the previous all-time fold read off the
-      child columns, so those levels are byte-identical to it), **3** at a
-      merge level, whose per-window overviews are themselves gen-2 merges;
+      sources' (:func:`zagg.sweep_stage._source_depth`, the same rule a merge
+      level applies to its children) — **2** at a gather level, whose
+      per-window overviews are gen-1 content, one more than the cascade
+      depth at a merge level;
     - ``source_windows`` — ``{folded, missing, unreadable}`` over the window
       overviews: a window with a dirty leaf and no committed overview is
       ``missing``;
@@ -299,9 +277,9 @@ def close_node(
         _artifact_entry,
         _fold_result,
         _node_at,
+        _source_depth,
         _summed_generation,
         _write_stage_overview,
-        classify_level,
     )
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
@@ -310,7 +288,6 @@ def close_node(
     for k in (k for k in stage["orders"] if k in level_by_order):
         r = level_by_order[k]
         n_out = 4 ** (r - k)
-        base_gen = 1 if classify_level(r, shard_order=shard_order) != STAGE_MERGE else 2
         for target in sorted({_node_at(d, k) for d in candidates if d.startswith(node)}):
             try:
                 labels = sorted(node_windows(store, target) | set(dirty_windows(target)))
@@ -388,8 +365,7 @@ def close_node(
                 rows,
                 slabs,
                 regime=STAGE_MERGE,
-                merges_from_raw=1
-                + max(int(rd.provenance.get("merges_from_raw") or base_gen) for rd in folded),
+                merges_from_raw=_source_depth([folded]),
                 source_children=(children["folded"], children["missing"], children["unreadable"]),
                 demotions=demotions,
             )
@@ -544,7 +520,6 @@ def run_tuple(
                     key=SCHEDULE_NONE_TOKEN if window is None else window,
                     window=window,
                     windowed=windowed,
-                    relay=context["relay"],
                     level_actuals=context["level_actuals"],
                     # An unwindowed node has ONE writer, so its unit owns the
                     # node envelope; window units run concurrently on the
