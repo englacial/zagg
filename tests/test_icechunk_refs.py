@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from dateutil.tz import tzoffset, tzutc
 
 from zagg import hive, icechunk_refs, icechunk_rows
 from zagg.config import default_config, get_data_vars
@@ -2594,16 +2595,20 @@ class TestBoto3Credentials:
 
         monkeypatch.setattr(boto3, "Session", Session)
 
-    def test_tzutc_expiry_is_handed_over_as_timezone_utc(self, monkeypatch):
-        from dateutil.tz import tzutc
-
-        expiry = datetime.datetime(2026, 10, 8, 12, 30, tzinfo=tzutc())
-        self._chain(monkeypatch, expiry)
+    # A ``credential_process`` reporting ``+02:00`` reaches botocore's dateutil
+    # parse as a ``tzoffset``: converted to the same instant, not relabeled.
+    @pytest.mark.parametrize(
+        "tz, utc_hour", [(tzutc(), 12), (tzoffset(None, 7200), 10)], ids=["tzutc", "tzoffset"]
+    )
+    def test_aware_expiry_is_handed_over_as_timezone_utc(self, monkeypatch, tz, utc_hour):
+        self._chain(monkeypatch, datetime.datetime(2026, 10, 8, 12, 30, tzinfo=tz))
         creds = icechunk_refs._boto3_credentials()
         assert creds.access_key_id == "AK" and creds.secret_access_key == "SK"
         assert creds.session_token == "TOK"
         assert creds.expires_after.tzinfo is datetime.timezone.utc
-        assert creds.expires_after == expiry
+        assert creds.expires_after == datetime.datetime(
+            2026, 10, 8, utc_hour, 30, tzinfo=datetime.timezone.utc
+        )
 
     def test_naive_expiry_is_read_as_utc(self, monkeypatch):
         self._chain(monkeypatch, datetime.datetime(2026, 10, 8, 12, 30))
