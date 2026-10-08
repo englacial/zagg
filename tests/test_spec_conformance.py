@@ -29,7 +29,9 @@ import zarr
 from numcodecs import Zstd
 from zarr.storage import LocalStore
 
+from zagg.config import default_config
 from zagg.coverage_toc import coverage_toc, coverage_toc_counts, coverage_toc_uncounted
+from zagg.grids import HealpixGrid
 from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
@@ -198,26 +200,28 @@ def _digest_expectations(exp):
 
 
 class TestDggsEllipsoid:
-    """§1 — the ``dggs`` block's ellipsoid spells the v1 schema's keys."""
+    """§1 — every committed ``dggs`` block is what the writer emits today."""
 
-    def test_every_committed_dggs_block_spells_semi_major_axis(self):
+    def test_every_committed_dggs_block_matches_the_writer(self):
         # Issue #616: every committed ``zarr.json`` carrying a ``dggs`` block
-        # — leaves, columns, overviews, pyramid declarations — is a
-        # re-templated artifact and so spells the schema's ``semi_major_axis``
-        # (``ellipsoidObject`` is ``additionalProperties: false``). The
-        # pre-fix ``semimajor_axis`` vintage survives only in stores written
-        # through 0.58.0, never in these fixtures.
+        # — leaves, columns, overviews — equals ``HealpixGrid._dggs_attrs()``
+        # modulo the per-group ``refinement_level``, so it spells the schema's
+        # ``semi_major_axis`` (``ellipsoidObject`` is
+        # ``additionalProperties: false``) and carries the mortie §9
+        # ``latitude`` token. The pre-fix ``semimajor_axis`` vintage survives
+        # only in stores written through 0.58.0, never in these fixtures.
+        grid = HealpixGrid(
+            parent_order=4, child_order=6, layout="fullsphere", config=default_config("atl06")
+        )
+        want = {k: v for k, v in grid._dggs_attrs()["dggs"].items() if k != "refinement_level"}
         seen = 0
         for meta in SPEC_DATA.rglob("zarr.json"):
             attrs = json.loads(meta.read_text()).get("attributes", {})
             if "dggs" not in attrs:
                 continue
             seen += 1
-            assert set(attrs["dggs"]["ellipsoid"]) == {
-                "name",
-                "semi_major_axis",
-                "inverse_flattening",
-            }, meta.relative_to(SPEC_DATA)
+            got = {k: v for k, v in attrs["dggs"].items() if k != "refinement_level"}
+            assert got == want, meta.relative_to(SPEC_DATA)
         assert seen > 0
 
 

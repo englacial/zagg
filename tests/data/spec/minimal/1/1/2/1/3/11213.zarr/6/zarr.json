@@ -26,6 +26,7 @@
         "inverse_flattening": 298.257223563
       },
       "compression": "none",
+      "latitude": "authalic-wgs84",
       "coordinate": "morton"
     }
   },
