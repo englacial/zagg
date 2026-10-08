@@ -118,6 +118,39 @@ class TestSizing:
         assert _spans(schedule) == _spans(stage_tuples(9, tuple_width=3))
         assert all(int(st["fold_max"]) == 0 for st in schedule)
 
+    @pytest.mark.parametrize("shard_order", (7, 8, 10, 11))
+    @pytest.mark.parametrize("width", (3, 4))
+    def test_a_ragged_ladder_keeps_the_fixed_width_schedule(self, shard_order, width):
+        # The sizing REFINES the fixed-width schedule — it subdivides a tuple
+        # inside its own span and never moves a boundary — so a ladder that
+        # needs no narrowing reproduces ``stage_tuples`` item for item at a
+        # ragged ``shard_order`` too. A walk that took full widths down from
+        # ``shard_order`` instead anchored its ragged tuple at the COARSE end
+        # and reshaped every boundary here (review finding).
+        keys = ("dispatch", "orders", "child_order")
+        sized = sized_stage_tuples(shard_order, nodes_at=lambda order: [], tuple_width=width)
+        assert [{k: st[k] for k in keys} for st in sized] == stage_tuples(
+            shard_order, tuple_width=width
+        )
+
+    @pytest.mark.parametrize("width,bound", ((1, 1), (2, 5), (3, 21), (4, 85)))
+    def test_the_dense_bound_is_what_a_blind_dispatcher_assumes(self, width, bound):
+        # No ``nodes_at``: a dispatcher cannot see the store's density and may
+        # not read it (D8), so it assumes the DENSE subtree — 1 + 4 + ... +
+        # 4**(width-1). Never an under-estimate, which is the safe direction
+        # (review finding: measuring the RUN's work set under-counts every
+        # append, because the worker folds the store's coverage too).
+        schedule = sized_stage_tuples(width, tuple_width=width, target=bound)
+        assert [int(st["width"]) for st in schedule] == [width]
+        assert int(schedule[0]["fold_max"]) == bound
+
+    def test_the_blind_default_takes_the_width_the_v3_store_needed(self):
+        # One node under the width-3 bound and the dense arm refuses it: the
+        # schedule the tail now gets without reading anything.
+        schedule = sized_stage_tuples(9, target=STAGE_TARGET_NODES)
+        assert [int(st["width"]) for st in schedule] == [2, 1] * 3
+        assert [int(st["fold_max"]) for st in schedule] == [5, 1] * 3
+
     @pytest.mark.parametrize(
         "kwargs,message",
         (
@@ -160,11 +193,14 @@ def _fold_max(shard_order, dispatch, child_order, nodes_at):
 
 
 class TestSizedDispatch:
-    """The o3 fixture is sparse — its fattest order-0 fold is four nodes — so a
-    target of 2 is what forces the narrowing a dense store meets at the
-    default. The schedule it chooses, ``[2]@2`` then ``[1,0]@0``, is the one a
-    fixed width 2 would NOT give (that is ``[2]@2``, ``[1,0]@0`` — the same
-    here; width 3 gives the single ``[2,1,0]@0`` the default takes)."""
+    """The dispatcher is handed no coverage MOC here (the tail hands none —
+    D8), so the sizing takes the DENSE bound rather than measuring this
+    four-leaf fixture. At ``shard_order=3`` a target of 21 admits the whole
+    width-3 tuple, a target in ``[5, 20]`` refines it into ``[2,1]@1`` then
+    ``[0]@0``, and anything under 5 collapses it to width 1 throughout.
+    ``[2,1]@1`` is the grouping no fixed ``tuple_width`` produces — width 2
+    gives ``[2]@2`` then ``[1,0]@0`` — which is why the span has to ride on
+    the event."""
 
     def test_the_default_is_the_fixed_width_mirror(self, tmp_path):
         from test_sweep_stage_fleet import _FakeLambda, _fleet
@@ -276,6 +312,48 @@ class TestSizedDispatch:
             )
             assert _spans_of(summary) == _spans(stage_tuples(3, tuple_width=3))
 
+    @pytest.mark.parametrize("cap,spans", ((1, [(0, 3)]), (3, [(1, 3), (0, 1)])))
+    def test_the_target_is_shared_out_across_an_invokes_nodes(self, tmp_path, cap, spans):
+        # ``max_nodes_per_invoke`` nodes ride ONE invoke and each folds its own
+        # subtree, so one invoke's fold is up to ``n x fold_max`` and a target
+        # of 21 bounds a width-3 tuple only at one node an invoke (review
+        # finding). At three it admits width 2 — a third of the target.
+        from test_sweep_stage_fleet import _FakeLambda, _fleet
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _fleet(
+            root,
+            _FakeLambda(None),
+            barrier_timeout_s=0.01,
+            total_barrier_budget_s=0.01,
+            stage_target_nodes=21,
+            max_nodes_per_invoke=cap,
+        )
+        assert _spans_of(summary) == spans
+
+    def test_payload_only_packing_says_the_target_bounds_no_invoke(self, tmp_path, caplog):
+        # ``None`` puts a whole tuple on one worker, so the node count is not
+        # known here and the target cannot bound the invoke at all. Said once,
+        # loudly; the sizing then proceeds as if one node an invoke.
+        import logging
+
+        from test_sweep_stage_fleet import _FakeLambda, _fleet
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            summary = _fleet(
+                root,
+                _FakeLambda(None),
+                barrier_timeout_s=0.01,
+                total_barrier_budget_s=0.01,
+                stage_target_nodes=21,
+                max_nodes_per_invoke=None,
+            )
+        assert "cannot bound what ONE invoke folds" in caplog.text
+        assert _spans_of(summary) == [(0, 3)]
+
     @pytest.mark.parametrize("bad", (-1, True, 2.9, "8", "eight"))
     def test_a_nonsense_target_is_refused_by_name(self, tmp_path, bad):
         # The validation the knob three lines above it in the module already
@@ -297,6 +375,76 @@ class TestSizedDispatch:
                 barrier_timeout_s=0.01,
                 total_barrier_budget_s=0.01,
             )
+
+
+class TestFoldsWhatTheWorkerFolds:
+    """The sizing must count the tree the INVOKE walks, not the one it is sent
+    (review finding). A stage worker folds its candidate set — the run's leaves
+    UNION the store's root ``coverage.moc`` (``sweep_overview._candidate_decimals``)
+    — so on every append, where the work set is a strict subset of the
+    coverage, a schedule sized from the work set's own ancestors keeps a width
+    whose invokes fold far more than the target."""
+
+    def test_the_candidate_nodes_are_the_work_set_union_the_coverage(self):
+        from test_sweep_stage import LEAVES
+
+        from zagg.grids.morton import morton_word
+        from zagg.sweep_fleet import candidate_dispatch_nodes, coverage_dispatch_nodes
+
+        work = {"1111": {None}}  # one leaf of a store that has committed four
+        coverage = [morton_word(d) for d in LEAVES]
+        assert candidate_dispatch_nodes(work, 0, coverage) == ["-2", "1"]
+        assert candidate_dispatch_nodes(work, 2, coverage) == ["-211", "111", "112"]
+        # What the dispatcher INVOKES stays the work set's own ancestors: the
+        # coverage only filters those, which is exactly why it cannot size.
+        assert coverage_dispatch_nodes(work, 0, coverage) == ["1"]
+        assert coverage_dispatch_nodes(work, 2, coverage) == ["111"]
+
+    def test_a_scope_filters_the_candidates_the_way_the_fold_does(self):
+        from test_sweep_stage import LEAVES
+
+        from zagg.grids.morton import morton_word
+        from zagg.sweep_fleet import candidate_dispatch_nodes
+        from zagg.sweep_stages import normalize_scope
+
+        coverage = [morton_word(d) for d in LEAVES]
+        nodes = candidate_dispatch_nodes({"1111": {None}}, 0, coverage, normalize_scope(["1"]))
+        assert nodes == ["1"]
+
+    def test_it_refuses_a_missing_coverage_by_name(self):
+        from zagg.sweep_fleet import candidate_dispatch_nodes
+
+        with pytest.raises(ValueError, match="needs the store's coverage MOC"):
+            candidate_dispatch_nodes({"1111": {None}}, 0, None)
+
+    def test_a_work_set_inside_the_coverage_is_sized_from_the_coverage(self, tmp_path):
+        # The regression for the blocking finding: ONE leaf of the four-leaf
+        # fixture, with the store's coverage handed in. The work set's order-0
+        # ancestor chain is three nodes — inside a target of 3 — but the
+        # invoke folds the coverage's four, so the width must narrow.
+        from test_sweep_stage import LEAVES
+        from test_sweep_stage_fleet import _FakeLambda, _fleet
+
+        from zagg.grids.morton import morton_word
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _fleet(
+            root,
+            _FakeLambda(None),
+            leaves=[(morton_word("1111"), None)],
+            coverage=[morton_word(d) for d in LEAVES],
+            stage_target_nodes=3,
+            barrier_timeout_s=0.01,
+            total_barrier_budget_s=0.01,
+        )
+        assert summary["coverage_computed"] is True
+        assert _spans_of(summary) == [(1, 3), (0, 1)]
+        rows = {int(st["dispatch_order"]): st for st in summary["stages"]}
+        assert (rows[1]["width"], rows[1]["fold_max"]) == (2, 3)
+        # And the invoke TARGETS are still this run's own ancestors — one node
+        # a tuple, not the coverage's two base cells.
+        assert [int(st["nodes"]) for st in summary["stages"]] == [1, 1]
 
 
 class TestShortOrders:
@@ -353,6 +501,76 @@ class TestShortOrders:
             assert entries[node]["actuals"]["run_id"] == "PRIOR", node
         # And the leaf tier's own law is not an observation, so it still lands.
         assert entries[3]["actuals"]["regime"] == "leaf-column"
+
+    def test_a_lost_close_record_withholds_the_tuples_window_levels(self, tmp_path):
+        # A tuple is short on EITHER fan-out: every window unit's record
+        # landed here and only the all-time close of node ``-2`` was lost, and
+        # the whole span is still withheld (review finding). The safe
+        # direction — the close folds the node's windows, so its loss leaves
+        # the level's all-time artifact unaccounted for.
+        from test_sweep_stage_fleet import _FakeLambda
+        from test_sweep_units import _windowed_fleet, _windowed_store
+
+        from zagg.hive import MANIFEST_NAME
+        from zagg.sweep_stages import stage_record_name
+
+        root = tmp_path / "s"
+        _windowed_store(root)
+        _stamp_prior_actuals(root, run_id="PRIOR")
+        client = _FakeLambda(_handler(), drop={stage_record_name(0, 4)})
+        summary = _windowed_fleet(root, client, barrier_timeout_s=0.05)
+        (row,) = summary["stages"]
+        assert row["records_seen"] == row["batches"]  # every window unit in
+        assert (row["close_batches"], row["close_records_seen"]) == (2, 1)
+        assert row["missing_unit_count"] == 1
+        assert summary["short_orders"] == [2, 1, 0]
+        assert _finisher_block(client)["short_orders"] == [2, 1, 0]
+        entries = {
+            int(e["node"]): e
+            for e in json.loads((root / MANIFEST_NAME).read_text())["pyramid"]["overviews"]
+        }
+        for node in (2, 1, 0):
+            assert entries[node]["actuals"]["run_id"] == "PRIOR", node
+        # The leaf tier's law is not an observation of this run, so it lands.
+        assert entries[3]["actuals"]["regime"] == "leaf-column"
+
+    def test_an_all_short_run_touches_no_level_entry(self, tmp_path):
+        # The state the runner seam's own warning test produces: no record
+        # landed, so every order is short and there is no actual to record.
+        # ``run_finisher`` writes only ``if changed or level_actuals``, so the
+        # manifest is not re-PUT at all — the §4.10 companion and the
+        # lifecycle touch stand on their own ``by_shard``/``touch_policy``
+        # gates rather than on that write, and the lease release is
+        # unconditional (review finding).
+        from zagg.hive import MANIFEST_NAME, read_manifest
+        from zagg.sweep_stages import run_finisher
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        _stamp_prior_actuals(root, run_id="PRIOR")
+        before = (root / MANIFEST_NAME).read_bytes()
+        released = []
+        out = run_finisher(
+            str(root),
+            read_manifest(str(root)),
+            {},
+            {},
+            run_id="NOW",
+            withhold_levels=[2, 1, 0],
+            release=lambda: released.append(True),
+            store_kwargs={},
+        )
+        assert out["actuals_withheld"] == [2, 1, 0]
+        assert out["manifest_updated"] is False
+        assert (root / MANIFEST_NAME).read_bytes() == before
+        assert released == [True]
+        # The leaf tier's ``leaf-column`` law is not written either: its branch
+        # is gated on ``level_actuals``, which an all-short run has none of.
+        entries = {
+            int(e["node"]): e
+            for e in json.loads((root / MANIFEST_NAME).read_text())["pyramid"]["overviews"]
+        }
+        assert {e["actuals"]["run_id"] for e in entries.values()} == {"PRIOR"}
 
     def test_withhold_levels_is_reported_by_the_finisher(self, tmp_path):
         from zagg.hive import MANIFEST_NAME, read_manifest
@@ -520,13 +738,19 @@ class TestRunnerSeam:
     def test_the_seam_warns_about_the_orders_it_withheld(self, tmp_path, caplog):
         import logging
 
+        from zagg.hive import MANIFEST_NAME
+
         root = tmp_path / "s"
         _stage_store(root)
+        _stamp_prior_actuals(root, run_id="PRIOR")
+        before = (root / MANIFEST_NAME).read_bytes()
         with caplog.at_level(logging.WARNING, logger="zagg.runner"):
             # No handler, so no record lands: every tuple is short.
             summary, _ = self._seam(root, stage_target_nodes=3)
         assert summary["short_orders"] == [2, 1, 0]
         assert "withheld their manifest actuals" in caplog.text
+        # And an all-short run stamps nothing, leaf tier included.
+        assert (root / MANIFEST_NAME).read_bytes() == before
 
 
 class TestHandlerForwarding:
