@@ -294,28 +294,31 @@ class TestFunctionRequirements:
                 )
 
     def test_build_script_installs_the_pins_without_resolving(self):
-        """build_function.sh installs ``-r function-requirements.txt --no-deps``, no floors.
+        """build_function.sh installs zagg and ``-r function-requirements.txt``, both --no-deps.
 
-        The file is only the contract if the script reads it: a floor spec
-        reintroduced on the install line, or ``--no-deps`` dropped, puts pip's
-        resolver back between the lock and the zip.
+        The file is only the contract if the script reads it and nothing else: a
+        spec added to either install (any quoting), a third install, or
+        ``--no-deps`` dropped puts pip's resolver back between the lock and the zip.
         """
+        import shlex
+
         script = (REPO_ROOT / "deployment" / "aws" / "build_function.sh").read_text()
-        installs = [
-            line
-            for line in TestLayerExtraParity._install_lines(script)
-            if "function-requirements.txt" in line
-        ]
-        assert len(installs) == 1, (
-            "build_function.sh must install -r function-requirements.txt once"
+        installs = []
+        for line in TestLayerExtraParity._install_lines(script):
+            args = shlex.split(line)
+            args = args[args.index("install") + 1 :]
+            assert "--no-deps" in args, f"build_function.sh resolves deps: {line.strip()}"
+            valued = {i + 1 for i, arg in enumerate(args) if arg in ("--target", "-r")}
+            positional = [a for i, a in enumerate(args) if i not in valued and a[0] != "-"]
+            reqs = [args[i] for i in sorted(valued) if args[i - 1] == "-r"]
+            installs.append((" ".join(positional + reqs), args))
+        keys = sorted(key for key, _ in installs)
+        assert keys == ["$REPO_ROOT", "$SCRIPT_DIR/function-requirements.txt"], (
+            f"build_function.sh must install exactly zagg and -r function-requirements.txt, "
+            f"got {keys} (issue #613)"
         )
-        assert "--no-deps" in installs[0], "the requirements install must pass --no-deps"
-        assert "--only-binary=:all:" in installs[0], "a pin with no wheel must fail, not build"
-        floors = re.findall(r'"[A-Za-z0-9._-]+>=[0-9.]+"', script)
-        assert not floors, (
-            f"build_function.sh resolves {floors} from PyPI at build time -- pins come "
-            "from function-requirements.txt (issue #613)"
-        )
+        reqs_install = dict(installs)["$SCRIPT_DIR/function-requirements.txt"]
+        assert "--only-binary=:all:" in reqs_install, "a pin with no wheel must fail, not build"
 
 
 class TestLambdaHandlerSyntax:
