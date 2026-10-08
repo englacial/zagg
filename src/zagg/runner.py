@@ -5848,7 +5848,7 @@ def _invoke_lambda_coverage(
 
 
 def _build_sweep_event(
-    store_path, leaves, output_creds_event=None, partition=None, records_from=None
+    store_path, leaves, output_creds_event=None, partition=None, records_from=None, finisher=None
 ) -> dict:
     """One ``mode="sweep"`` worker event — the single construction site.
 
@@ -5874,7 +5874,7 @@ def _build_sweep_event(
     :func:`zagg.sweep_fleet.families_record_name`, which is what the families
     barrier awaits.
     """
-    from zagg.sweep_partition import normalize_partition
+    from zagg.sweep_partition import normalize_partition, partition_split_order
 
     event: dict = {"mode": "sweep", "store_path": store_path}
     if output_creds_event is not None:
@@ -5884,6 +5884,16 @@ def _build_sweep_event(
         event["partition"] = {"index": index, "of": of}
     if records_from is not None:
         event["records_from"] = records_from
+    if finisher is not None:
+        # The pass after a fan-out (issue #610): which split, and the partition
+        # records (under the run's status prefix) it composes the root
+        # section from instead of reading the leaves (zagg.sweep.run_sweep).
+        partition_split_order(int(finisher["of"]))
+        event["finisher"] = {
+            "of": int(finisher["of"]),
+            "records_from": str(finisher["records_from"]),
+            "accumulators": [str(k) for k in finisher["accumulators"]],
+        }
     event["leaves"] = [[int(key), window] for key, window in leaves]
     if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
         del event["leaves"]

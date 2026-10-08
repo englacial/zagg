@@ -618,8 +618,19 @@ finisher, run_id, records_from, duration_s}`, with `finisher` `"ok"`,
 `"records_short"` (a partition's record never landed), `"timed_out"` (the
 finisher's did not) or `"dispatch_failed"` (an invoke raised after others
 fired; `error` says why), so a short root temporal section is reported
-rather than discovered later. The local backend sweeps in-process and needs
-none of this.
+rather than discovered later. **The finisher reads no leaf:** each
+partition's record carries, under `families.moc.accumulator`, the §10
+contributions it read — every visited shard's envelope word and counted cover
+per window leaf (the §10.3 block grammar), the uncounted set, the declared
+fields and the route tally — and when every record landed the finisher event
+names them (`finisher: {of, records_from, accumulators}`; `accumulators` in
+the outcome is how many), the worker folds the blocks, and its walk starts
+from the split-order rollups the partitions wrote, so the coarse levels, the
+root `coverage.moc` and `coverage.toc` compose from rollup reads and `n`
+record GETs, byte-identical to a single pass. A missing or unusable record
+sends it back to the leaf walk, which its own record says
+(`finisher.fallback`). The local backend sweeps in-process and needs none of
+this.
 
 On the Lambda backends the tail fires that finisher itself. For hand
 `--partitions` passes (the local CLI, or a tail whose finisher did not land),
