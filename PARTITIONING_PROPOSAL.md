@@ -1,5 +1,11 @@
 # Pyramid sweep partitioning proposal — batched cascade over the stage transport
 
+> **Status (2026-10-08, issue #560):** the live ATL03 store is now
+> `atl03_tdigest_o9_v3.zarr`, rebuilt with the dense ladder declared at init,
+> so the re-declaration and backfill legs below do not apply to it;
+> `atl03_tdigest_o9.zarr` here is the v1 store, retained as the comparison
+> store. `gedi_flux_o9.zarr` is unchanged.
+
 Store-track S1 artifact (plan of 2026-09-10, Track C). Scope: materializing the
 RULED dense every-order ladder (`[8..0]` above the o9 shard) on the two live
 stores — `atl03_tdigest_o9.zarr` and `gedi_flux_o9.zarr` — on **Lambda**, via

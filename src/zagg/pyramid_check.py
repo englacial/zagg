@@ -23,7 +23,7 @@ Two modes share every check:
   published stores::
 
       python -m zagg.pyramid_check \\
-          s3://us-west-2.opendata.source.coop/englacial/zagg/demo/atl03_tdigest_o9.zarr \\
+          s3://us-west-2.opendata.source.coop/englacial/zagg/demo/atl03_tdigest_o9_v3.zarr \\
           --anon
 
   Against a declared-but-unswept store this reports the pre-sweep baseline
