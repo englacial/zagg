@@ -1,6 +1,6 @@
 """Issue #548: the classifier-0.50 field upgrade for count-only pyramid columns.
 
-The live ATL03 store's leaf columns split by the classifier era that wrote
+The v1 ATL03 store's leaf columns split by the classifier era that wrote
 them: ~2,713 shards carry 08-19-era ``all.pyramid.zarr`` columns holding
 ``count`` only (the 0.48 classifiers rated every digest field ``none``),
 while ~204 shards touched by 0.52-era code carry the full 4-field set
@@ -15,11 +15,11 @@ three #548 claims against it, on fixture stores:
    RECORDED field set (``column_is_current``'s declaration term), never on
    column existence, so the 2,713 stale shards rewrite while the 204
    current ones skip — and the keying is bidirectional, which is why the
-   runbook re-declares BEFORE backfilling (the vendored live CA manifest
+   runbook re-declares BEFORE backfilling (the vendored v1 CA manifest
    yields a count-only plan that would downgrade a 4-field column);
 3. **the field list is derived from the classifiers at run time** —
    ``declare_pyramid`` replaces a 0.48-era count-only field map (the
-   digests demoted to ``none``, as the live manifest has them) wholesale
+   digests demoted to ``none``, as the v1 manifest has them) wholesale
    (``build_pyramid_block`` -> ``declared_fields`` -> the D24 classifiers),
    so the re-declaration inherits the upgrade with no frozen field list;
 
@@ -170,13 +170,13 @@ class TestCountOnlyUpgradeInPlace:
     """#548 (2): a count-only column is upgrade-in-place, never already-done."""
 
     def _era_048_store(self, tmp_path, monkeypatch):
-        """The live ATL03 state at test scale: full leaves, 0.48 artifacts.
+        """The v1 ATL03 state at test scale: full leaves, 0.48 artifacts.
 
         Both stores build pyramid-ON from identical inputs (the leaf arrays
         are classifier-independent); ``era`` is then demoted to what an
         08-19 build left behind — every column rewritten count-only, and the
         manifest's field map re-declared count-only (the digests demoted to
-        ``none``, ``count`` still ``exact``), which is the live CA
+        ``none``, ``count`` still ``exact``), which is the v1 CA
         manifest's shape. NOT an all-``none`` map: that one is REFUSED by
         ``manifest_column_plan`` (``test_column_backfill.py::
         test_all_none_class_fields_refuse``) and never reaches a backfill.
@@ -258,7 +258,7 @@ class TestCountOnlyUpgradeInPlace:
         assert again["current"] == len(tcb.SHARDS) and again["written"] == 0
 
     def test_a_mixed_store_rewrites_the_stale_shards_only(self, tmp_path, monkeypatch):
-        """The live mix — ~204 four-field + ~2,713 count-only — at test scale."""
+        """The v1 mix — ~204 four-field + ~2,713 count-only — at test scale."""
         root = tmp_path / "mixed"
         tcb._build_store(root, monkeypatch, kitchen_sink=True)
         plan = tcb._plan(root)
@@ -280,13 +280,13 @@ class TestCountOnlyUpgradeInPlace:
 
 
 class TestLiveCaManifestPlan:
-    """The vendored live CA manifest against the backfill's declaration gate."""
+    """The vendored v1 CA manifest against the backfill's declaration gate."""
 
     def test_the_live_manifest_yields_a_count_only_plan(self):
         """NOT refused: ``count`` is composable, so the gate passes it through.
 
         The refusal arm fires only when EVERY field is ``none`` — a
-        count-composable declaration is legal, so a backfill against the live
+        count-composable declaration is legal, so a backfill against the v1
         manifest as published would write count-only columns. That is why
         the #547 runbook's step 1 (re-declare) precedes step 2 uncondition-
         ally: the plan is the manifest's, and the manifest is 0.48's.
@@ -323,7 +323,7 @@ class TestLiveCaManifestPlan:
             False,
             "declaration-drift",
         )
-        # Now run it: the live manifest's count-only declaration over the
+        # Now run it: the v1 manifest's count-only declaration over the
         # 4-field exemplar column.
         block = tcb._twin_block(root)
         block["overview"]["fields"] = _era_048_fields(block)
