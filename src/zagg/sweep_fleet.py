@@ -1137,6 +1137,14 @@ def run_stage_sweep_fleet(
     # ladder recorded actuals for orders 8..3 and for the walled 2..0 alike.
     # Named per order, so the finisher withholds exactly the short levels and
     # leaves them for the re-run, keeping the complete ones.
+    #
+    # ``missing_unit_count`` sums BOTH fan-outs, so a tuple whose every window
+    # unit landed but whose all-time CLOSE record was lost withholds the whole
+    # tuple's span — including orders whose per-window actuals are complete
+    # (review finding). That is the safe direction: the close is a fold over
+    # the node's windows, so a lost close record leaves the level's all-time
+    # artifact unaccounted for, and a withheld level keeps the actuals it had
+    # until the next pass observes it.
     short_orders = sorted(
         {
             int(order)

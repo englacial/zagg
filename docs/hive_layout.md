@@ -743,7 +743,10 @@ wrote actuals complete for orders 8..3 and short for 2..0 with nothing to
 tell them apart. The dispatcher now names the short orders to the finisher
 (`short_orders`, from the tuples it is missing a unit record for), and their
 level entries are **left as they stood** while the orders that landed are
-recorded as usual. The finisher's record says which it withheld
+recorded as usual. A tuple is short on either fan-out, so a lost all-time
+**close** record withholds that tuple's window levels too, even where their
+per-window records all landed — the safe direction: a withheld level keeps
+the actuals it had until a pass observes it in full. The finisher's record says which it withheld
 (`short_orders`, `finisher.actuals_withheld`), the tail warns, and the next
 staged pass records them.
 
