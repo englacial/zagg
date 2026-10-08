@@ -1469,8 +1469,9 @@ produce the same leaves" wrongly (a relocated index cache read as a
 different product), and a wrong answer cannot be preserved for
 compatibility. No leaf byte moves; only the label is restated.
 
-**Who it hits.** Both live stores were built with an index block, so their
-frozen manifest hashes are pre-epoch:
+**Who it hits.** Both stores live at the epoch were built with an index block,
+so their frozen manifest hashes are pre-epoch (the ATL03 v3 rebuild of
+2026-10-08 was born post-epoch — see [The live stores](#the-live-stores-issue-560-cutover-2026-10-08)):
 
 | store | `data_source.index` | frozen `semantic_hash` today | migrates to |
 |---|---|---|---|
@@ -1531,7 +1532,7 @@ the config *is* the store's own before it writes.
 
 **Skip-gate consequence — deliberate, not fixed.** `zagg.dedup` compares the
 hash strings stamped in run records and leaf sidecars against the current
-digest, and those stamps on the two live stores are pre-epoch. After the
+digest, and those stamps on the two pre-epoch stores are pre-epoch. After the
 epoch they read as **stale**: a same-shard re-dispatch into either store
 **rewrites** the leaf instead of skipping it (the `semantic-mismatch`
 classification), exactly the D19 epoch's "first post-epoch run is a full
@@ -2261,6 +2262,43 @@ Incremental runs union with the existing object; concurrent runs race
 benignly (GET-union-PUT is not atomic: last writer wins, and its union may
 miss the loser's shards until the sweep or the next run re-unions — accepted
 under D9/O7). The §7 sweep remains the authoritative rebuilder.
+
+## The live stores (issue #560 cutover, 2026-10-08)
+
+The ATL03 demo store was rebuilt from scratch on the 0.57.0 fleet as
+`atl03_tdigest_o9_v3.zarr` and is the store every reader in this tree now
+names ([issue #560](https://github.com/englacial/zagg/issues/560); the
+runbook is `demo/15_rebuild_2026-10.ipynb`). It was built from the packaged
+`atl03_tdigest_strata_healpix` template (plus `output.pyramid: {overviews: 13}`)
+against the frozen shardmaps `demo/outputs/shardmap_california_o9.json`
+(2,726 shards) and `demo/outputs/shardmap_neon_aop_o9.json` (251 shards, 13
+overlapping), so its manifest is born at the epoch-2 digest
+`aacfe1e387d2…` (no [index-exclusion migration](#migration-the-index-exclusion-epoch-issue-499)
+applies) and carries: cell 19 / shard 9 / `chunk_inner` 13; the dense
+`zagg-pyramid/2` ladder 13..4 declared at init together with its
+`multiscales` mirror; versioned leaves (pointer roots, spec §1.5); four-field
+leaf columns from birth; and an Icechunk companion repo at
+`…/atl03_tdigest_o9_v3.zarr/icechunk` (`zagg-icechunk/2`, rows `["all"]`,
+tagged `run-9f01f911935a4b6184e3ac87ec843895` for the CA run and
+`run-9a12b233146049f399ae34cc66e7ec2f` for the NEON append). Its manifest
+is vendored as `tests/data/ca_atl03_tdigest_o9_v3_morton_hive.json` and is
+the anchor `tests/test_live_store_templates.py` pins the template to. Two
+gaps were known at cutover: the root temporal section is short (the run
+tail's families sweep dies at the 900 s wall on a store-scale run,
+[issue #610](https://github.com/englacial/zagg/issues/610)), and five NEON
+shards OOMed on the 4 GB tier and await a re-dispatch (coverage was 2,959
+shards; the ladder sweep was still running). `atl03_tdigest_o9_v2.zarr`
+was deleted on 2026-10-07 and is referenced nowhere. All stores below sit
+under `s3://us-west-2.opendata.source.coop/englacial/zagg/demo/` and are
+anonymously readable.
+
+| store | role | built | frozen `semantic_hash` |
+|---|---|---|---|
+| `atl03_tdigest_o9_v3.zarr` | **live ATL03** | 0.57.0 fleet, 2026-10-08 | `aacfe1e387d2…` (epoch-2) |
+| `gedi_flux_o9.zarr` | **live GEDI** — unchanged, no GEDI rebuild this round | 0.52.0, 2026-08 | `4f8287947a83…` (pre-epoch) |
+| `atl03_tdigest_o9.zarr` | v1 ATL03, retained as the comparison store | 2026-08-19 | `b9b15fdde78f…` (pre-epoch) |
+| `serc_atl03_v3.zarr` | current SERC canary (4 shards; ladder swept, `pyramid_check` PASS, tagged `run-e10d7d83f79d46d8913cd41d88ff54c3`) | 0.57.0 | — |
+| `serc_atl03_v2.zarr` | the 0.55.0 fleet's SERC canary | 0.55.0 | — |
 
 ## Status
 
