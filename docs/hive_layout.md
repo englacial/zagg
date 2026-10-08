@@ -716,7 +716,9 @@ store is dense — 21 at width 3, which is what walled the v3 ladder: the
 `[2,1,0]` tuple's base-cell-`3` invoke hit the 900 s wall after 12 of its 16
 order-2 nodes, no record landed, and the barrier was waited out. Capping the
 *nodes* an invoke is handed (`max_nodes_per_invoke`, already 1) does not help:
-the subtree is one node's work. So the Lambda tail asks for a **sized**
+the subtree is one node's work. (The two compose rather than substitute — `n`
+nodes on one invoke fold up to `n ×` a node's own subtree — so the schedule is
+sized against the target shared out per node.) So the Lambda tail asks for a **sized**
 schedule — each fixed-width tuple is subdivided inside its own span until its
 fattest dispatch node folds at most `STAGE_TARGET_NODES` (8) nodes. The tail
 hands the dispatcher no coverage MOC (a dispatcher may not read one itself,
@@ -724,11 +726,13 @@ D8), so the fold is the **dense bound** `(4^width − 1) / 3` — 21 at width 3,
 5 at width 2 — which never under-estimates; a caller that *does* hand a
 coverage MOC in gets the fold measured over the set the worker folds (the
 run's leaves ∪ that coverage), and may keep the full width where the store is
-genuinely sparse. Nothing is read from the store either way. A dense o9 ladder becomes five
-width-2 tuples folding 5 nodes an invoke rather than three width-3 tuples
-folding 21; a sparse store keeps the fixed-width schedule outright. Because a
-subtree's node count steps by powers of four, any target in `[5, 20]` picks
-the same schedule there. Such a tuple dispatches at an order no single width
+genuinely sparse. Nothing is read from the store either way. A dense o9
+ladder's three width-3 tuples folding 21 nodes an invoke become **six tuples
+— width 2 then width 1 inside each** — folding 5; a store that needs no
+narrowing keeps the fixed-width schedule outright, at every `shard_order`,
+because the sizing only ever adds a boundary inside a fixed tuple and never
+moves one. Because a subtree's node count steps by powers of four, any target
+in `[5, 20]` picks the same schedule there. Such a tuple dispatches at an order no single width
 lands on, so its events carry their span (`child_order`) outright; a worker
 deployed before this refuses one by name rather than folding the wrong span.
 The cadence still changes no bytes — a sized build's ladder overviews are the
