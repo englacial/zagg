@@ -1867,6 +1867,9 @@ class TestSummaryKeysByteIdentical:
         "worker_warm_starts",
         "worker_rss_start_max_by_gen",
         "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
+        # The tail's families-sweep outcome (issue #610); None when nothing
+        # was swept. LAMBDA-only — the local backend sweeps in-process.
+        "families_sweep",
     } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):

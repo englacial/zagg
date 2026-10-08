@@ -1678,22 +1678,23 @@ class RasterStrategy:
             finalize_error=finalize_error_str,
         )
         # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
-        # mirroring the aggregation lambda path — one fire-and-forget
-        # mode="sweep" Event invoke, fail-open (D9; the CLI backstops).
+        # mirroring the aggregation lambda path — partitioned from the leaf
+        # count and awaited (issue #610), fail-open (D9; the CLI backstops).
+        families_sweep = None
         if store_layout == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import leaves_from_stats_records
 
                 leaves = leaves_from_stats_records([b.get("stats") for _k, b in ok_units])
                 if leaves:
-                    _invoke_lambda_sweep(
+                    families_sweep = _invoke_lambda_families_sweep(
                         client,
                         function_name,
                         store_path,
                         leaves,
                         output_creds_event=output_creds_event,
+                        store_kwargs=_output_store_kwargs(output_creds_event, region),
                     )
-                    logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         # Precedence note (issue #335): the all-failed verdict still raises
@@ -1774,6 +1775,7 @@ class RasterStrategy:
                 )
             summary["worker_stage_max"] = stage_max
             summary["worker_stage_counts"] = stage_counts
+        summary["families_sweep"] = families_sweep
         logger.info(
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
@@ -4542,9 +4544,10 @@ def _run_lambda(
             icechunk_init=summary["icechunk"],
         )
         # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
-        # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
-        # worker Event invoke — async, retries-0, fail-open (D9: rollups are
-        # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
+        # (D8 standing rule), so the sweep rides mode="sweep" worker Event
+        # invokes — partitioned from the leaf count and awaited on their
+        # store-root records (issue #610), fail-open (D9: rollups are caches;
+        # `python -m zagg.sweep` is the regeneration backstop). Leaves
         # come from the envelope stats records; a stale deployed worker's
         # record-less envelope simply contributes no leaf. The RECORDS drive
         # the work set, each on its own ``success``, not the invoke's status
@@ -4553,6 +4556,7 @@ def _run_lambda(
         # _run_local's sweep does — and a failed leaf's record is unsuccessful
         # on every unit shape, so nothing that did not land gets in.
         stage_chained, staged = False, None
+        summary["families_sweep"] = None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -4560,14 +4564,14 @@ def _run_lambda(
                 bodies = [r.get("body") or {} for r in report.results]
                 leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
                 if leaves:
-                    _invoke_lambda_sweep(
+                    summary["families_sweep"] = _invoke_lambda_families_sweep(
                         state["lambda_client"],
                         function_name,
                         store_path,
                         leaves,
                         output_creds_event=output_creds_event,
+                        store_kwargs=_output_store_kwargs(output_creds_event, region),
                     )
-                    logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
                 # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
                 # `output.sweep: "stages"`, the same knob the local dispatcher
                 # reads. Unlike the families leg this one is not
@@ -6195,7 +6199,8 @@ def _invoke_lambda_sweep(
     — the D8 shape is unchanged, every store write is still worker-side. The
     partitions own no node above the split order, so the coarse levels and the
     store-root artifacts are left to the finisher. ``partitions=1`` (the
-    default, and what the runner tail keeps firing) is the single-invoke form,
+    default, and what the runner tail fired before issue #610 — the tails now
+    go through :func:`_invoke_lambda_families_sweep`) is the single-invoke form,
     byte-identical to the pre-feature event — it short-circuits past
     :func:`partition_leaves` precisely to keep that byte-identity, so the two
     branches differ on an EMPTY work set (one ``leaves: []`` invoke vs none).
@@ -6226,6 +6231,61 @@ def _invoke_lambda_sweep(
             ),
         )
     return len(work)
+
+
+def _invoke_lambda_families_sweep(
+    lambda_client,
+    function_name,
+    store_path,
+    leaves,
+    *,
+    output_creds_event=None,
+    store_kwargs=None,
+    barrier_timeout_s=None,
+) -> dict | None:
+    """The end-of-run families sweep over the fleet (issue #610); its outcome.
+
+    Replaces the tails' single fire-and-forget :func:`_invoke_lambda_sweep`
+    invoke, which on a store-scale run died at the 900 s wall with no record
+    and no report (the v3 California tail: 2,726 leaves, one invoke, a handle
+    that returned success). The orchestration is
+    :func:`zagg.sweep_fleet.run_families_sweep_fleet` — partitions sized from
+    the leaf count, a barrier on their store-root records, the finisher, a
+    barrier on its record — the same invoke-and-poll shape as
+    :func:`_invoke_lambda_stage_sweep`, and like it never a write (D8). So the
+    tail now BLOCKS on the families pass, two barriers of
+    :data:`zagg.sweep_fleet.DEFAULT_BARRIER_TIMEOUT_S` at most, before the
+    staged sweep and the finalize.
+
+    Fail-open (D9): a dispatch failure logs and returns ``None``; a short or
+    missing record is REPORTED in the outcome dict (``finisher``:
+    ``"timed_out"`` / ``"records_short"``, and ``landed < fired``), which the
+    run summary and the client handle carry as ``families_sweep``, never
+    swallowed. The local backend keeps its in-process single pass
+    (:func:`zagg.sweep.sweep_after_run`).
+    """
+    from zagg.sweep_fleet import run_families_sweep_fleet
+
+    knobs = {} if barrier_timeout_s is None else {"barrier_timeout_s": float(barrier_timeout_s)}
+    try:
+        outcome = run_families_sweep_fleet(
+            lambda_client,
+            function_name,
+            store_path,
+            leaves,
+            output_creds_event=output_creds_event,
+            store_kwargs=store_kwargs,
+            **knobs,
+        )
+    except Exception as e:
+        logger.warning(f"families sweep dispatch failed (fail-open, D9 — rollups are caches): {e}")
+        return None
+    logger.info(
+        f"Dispatched families sweep over {len(leaves)} leaves: {outcome['partitions']} "
+        f"partition(s), {outcome['landed']}/{outcome['fired']} record(s) landed, "
+        f"finisher {outcome['finisher']}"
+    )
+    return outcome
 
 
 def _invoke_lambda_stage_sweep(
