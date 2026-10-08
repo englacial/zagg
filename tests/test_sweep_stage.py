@@ -620,15 +620,44 @@ class TestCascade:
                 sum(v for dec, v in leaf_sum.items() if dec.startswith(c)) for c in cells
             ]
 
+    def test_every_merge_artifact_the_pass_writes_goes_through_the_engine(
+        self, tmp_path, monkeypatch
+    ):
+        from zagg.sweep_fold import cascade_fold
+
+        calls = []
+
+        def counting(*args, **kwargs):
+            calls.append(kwargs["k"])
+            return cascade_fold(*args, **kwargs)
+
+        monkeypatch.setattr(stage_mod, "cascade_fold", counting)
+        m = _stage_store(tmp_path / "s")
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        merges = sorted(
+            str(p.parent.relative_to(tmp_path / "s"))
+            for p in (tmp_path / "s").rglob("all.zarr")
+            if dict(_artifact(tmp_path / "s", p.relative_to(tmp_path / "s")).attrs)[
+                "zagg_overview"
+            ]["regime"]
+            == "stage-merge"
+        )
+        # '11' and '-21' at order 1, '1' and '-2' at order 0: one engine call
+        # each, and no merge artifact on disk that did not come from one.
+        assert merges == ["-2", "-2/1", "1", "1/1"]
+        assert sorted(calls) == [0, 0, 1, 1] and row["written"] == 7
+
     def test_the_pass_and_a_direct_stage_node_call_write_the_same_ladder(self, tmp_path):
         """One entry point: the local-backend pass is ``stage_node`` per dispatch node."""
+        import shutil
+
         from zagg.store import open_object_store
         from zagg.sweep_overview import _candidate_decimals
         from zagg.sweep_stage import _node_at, aggregate_actuals, stage_node
 
         passed, direct = tmp_path / "pass", tmp_path / "direct"
         m = _stage_store(passed)
-        _stage_store(direct)
+        shutil.copytree(passed, direct)  # the same leaf stamps, to the second
         summary = _sweep(passed, m, run_id="R")
         (stage,) = stage_tuples(3)
         candidates, _ = _candidate_decimals(str(direct), 3, _by_shard(), {})
