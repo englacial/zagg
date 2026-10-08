@@ -713,8 +713,8 @@ column carries only the members a coarser gather consumes — nothing for
 the merges, so a dispatch node below which nothing gathers writes none. The
 values are a fixed function of the ladder, so **the cadence changes no
 values**: `--tuple-width 1` and `--tuple-width 3` build the same ladder,
-and `merges_from_raw` records the fold depth (1 at a gather, one more than
-its children's at a merge).
+and `merges_from_raw` records the fold depth (at a gather, the depth of the
+column groups it concatenates; one more than its children's at a merge).
 
 **The run tail sizes the cadence itself** ([issue
 #610](https://github.com/englacial/zagg/issues/610)). A dispatch node folds

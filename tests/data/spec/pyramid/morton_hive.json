@@ -25,7 +25,7 @@
     "actuals": {
      "regime": "leaf-column",
      "merges_from_raw": 2,
-     "generated_at": "2026-10-08T21:12:47+00:00"
+     "generated_at": "2026-10-08T21:35:44+00:00"
     }
    },
    {
@@ -35,23 +35,6 @@
     ],
     "actuals": {
      "regime": "stage-gather",
-     "merges_from_raw": 1,
-     "source_children": {
-      "folded": 4,
-      "missing": 0,
-      "unreadable": 0
-     },
-     "run_id": "spec-fixture",
-     "generated_at": "2026-10-08T21:12:47+00:00"
-    }
-   },
-   {
-    "node": 1,
-    "cells": [
-     2
-    ],
-    "actuals": {
-     "regime": "stage-merge",
      "merges_from_raw": 2,
      "source_children": {
       "folded": 4,
@@ -59,13 +42,13 @@
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-10-08T21:12:47+00:00"
+     "generated_at": "2026-10-08T21:35:44+00:00"
     }
    },
    {
-    "node": 0,
+    "node": 1,
     "cells": [
-     1
+     2
     ],
     "actuals": {
      "regime": "stage-merge",
@@ -76,7 +59,24 @@
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-10-08T21:12:47+00:00"
+     "generated_at": "2026-10-08T21:35:44+00:00"
+    }
+   },
+   {
+    "node": 0,
+    "cells": [
+     1
+    ],
+    "actuals": {
+     "regime": "stage-merge",
+     "merges_from_raw": 4,
+     "source_children": {
+      "folded": 4,
+      "missing": 0,
+      "unreadable": 0
+     },
+     "run_id": "spec-fixture",
+     "generated_at": "2026-10-08T21:35:44+00:00"
     }
    }
   ],
@@ -122,11 +122,11 @@
      "1": "leaves",
      "0": "cascade"
     },
-    "generated_at": "2026-10-08T21:12:47+00:00"
+    "generated_at": "2026-10-08T21:35:44+00:00"
    }
   }
  },
- "generated_at": "2026-10-08T21:12:47+00:00",
+ "generated_at": "2026-10-08T21:35:44+00:00",
  "multiscales": [
   {
    "spec": "zagg-multiscales/1",

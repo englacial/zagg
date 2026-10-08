@@ -252,9 +252,9 @@ def close_node(
 
     - ``regime`` is ``stage-merge``; ``merges_from_raw`` is one more than its
       sources' (:func:`zagg.sweep_stage._source_depth`, the same rule a merge
-      level applies to its children) — **2** at a gather level, whose
-      per-window overviews are gen-1 content, one more than the cascade
-      depth at a merge level;
+      level applies to its children) — one more than the gathered groups'
+      depth at a gather level, one more than the cascade depth at a merge
+      level;
     - ``source_windows`` — ``{folded, missing, unreadable}`` over the window
       overviews: a window with a dirty leaf and no committed overview is
       ``missing``;

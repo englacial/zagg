@@ -21,8 +21,10 @@ spec §4.4/§4.6 make normative:
 - **read-back** — per ladder artifact, the ``zagg-overview/2`` attrs:
   ``regime`` must equal the DERIVED classification
   (:func:`zagg.sweep_stage.classify_level` — gather at/below the shard
-  resolution, merge above it), ``merges_from_raw`` 1 at a gather and one
-  more than its children's recorded depth at a merge (the cascade, issue
+  resolution, merge above it), ``merges_from_raw`` at a gather the depth
+  of the leaf-column groups it concatenates
+  (:func:`zagg.column.member_merges_from_raw`) and one more than its
+  children's recorded depth at a merge (the cascade, issue
   #620), ``source_children`` with its three counters, and the writing
   ``run_id``; per column, the ``zagg-column/1`` attrs and the declared
   group roster. Manifest per-entry ``actuals`` (the finisher's RMW) are
@@ -388,13 +390,15 @@ def _tier_checks(
     §3.3 half-pair poison this harness expects per contributor is the
     kernel's own span.
     """
-    from zagg.column import column_resolutions, raw_fold_boundary
+    from zagg.column import column_resolutions, member_merges_from_raw, raw_fold_boundary
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import STAGE_GATHER, classify_level, finer_levels
 
     count_meta, exact_fields, digest_fields, _wide_fields, packed_fields = groups
     s = harness.shard_order
     finer = finer_levels([{"node": k, "cells": [r]} for k, r in ladder])
+    resolutions = column_resolutions(entries, s)
+    boundary = raw_fold_boundary(s, harness.cell_order, resolutions)
 
     # -- the above-shard ladder: a gather reads the leaf columns' member at
     # its own resolution, a merge its children's artifacts (§4.4).
@@ -414,7 +418,11 @@ def _tier_checks(
         for node in nodes:
             attrs = probes[k][node]
             prov = attrs.get(OVERVIEW_ATTR)
-            depth = 1 if gather else _cascade_depth(node, roster, roster_probes)
+            depth = (
+                member_merges_from_raw(r, boundary)
+                if gather
+                else _cascade_depth(node, roster, roster_probes)
+            )
             errors["readback"].extend(_stage_provenance_errors(node, k, r, s, prov, gather, depth))
             sc = (prov or {}).get("source_children") if isinstance(prov, dict) else None
             sc = sc if isinstance(sc, dict) else {}
@@ -441,8 +449,6 @@ def _tier_checks(
     # -- the leaf-column tier (§4.6 parity): groups at or finer than the
     # raw-fold boundary from the leaves' own cell arrays, the coarser groups
     # from the column's boundary group — the flat fold they are (issue #538).
-    resolutions = column_resolutions(entries, s)
-    boundary = raw_fold_boundary(s, harness.cell_order, resolutions)
     leaf_tier = (s, harness.cell_order, leaves, harness.leaf_group)
     boundary_tier = (s, boundary, leaves, lambda dec: harness.column_group(dec, boundary))
     col_nodes = [d for d in leaves if col_probes.get(d) is not None]
@@ -578,8 +584,8 @@ def _stage_provenance_errors(node, k, r, s, prov, gather, depth) -> list:
     to a string satisfies it and would otherwise skip this whole contract
     silently (review finding). A present one must record the DERIVED regime —
     gather at/below the shard resolution, merge above — with its
-    merges-from-raw at ``depth`` (1 for a gather, one more than its
-    children's for a merge — :func:`_cascade_depth`), the
+    merges-from-raw at ``depth`` (the gathered groups' depth for a gather,
+    one more than its children's for a merge — :func:`_cascade_depth`), the
     ``source_children`` counters (present in BOTH stage regimes), and the
     writing ``run_id``. ``merges_from_raw`` is REQUIRED like its two siblings
     — §4.4 makes it normative on a ``/2`` stage artifact, and an absent key
@@ -614,7 +620,8 @@ def _stage_provenance_errors(node, k, r, s, prov, gather, depth) -> list:
         errs.append(
             f"{node}: merges_from_raw {prov.get('merges_from_raw')} != {depth} "
             f"for a {expected_regime} level "
-            f"({'gathers are 1' if gather else 'one more than its children record'}, §4.4)"
+            f"({'the depth of the groups it gathers' if gather else 'one more than its children record'}"
+            f", §4.4)"
         )
     sc = prov.get("source_children")
     if not isinstance(sc, dict) or not {"folded", "missing", "unreadable"} <= set(sc):
@@ -693,19 +700,27 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
     fully materialized, i.e. a sweep clearly ran but its finisher's record
     did not land. A PRESENT block must record the leaf-column law at the
     leaf entry and, above it, the derived stage regime with
-    ``merges_from_raw`` 1 at a gather and, at a merge, the deepest the
-    level's committed artifacts record (the finisher's maximum, §4.5).
+    ``merges_from_raw`` at a gather the gathered leaf-column groups' depth
+    (:func:`zagg.column.member_merges_from_raw`) and, at a merge, the
+    deepest the level's committed artifacts record (the finisher's maximum,
+    §4.5).
 
     §4.5 calls ``actuals`` an additive key a reader must TOLERATE, and this
     module's contract is a verdict on a malformed store, never a traceback
     (review finding): a block that is not a mapping, or whose counters do
     not read as integers, is a read-back error by name.
     """
-    from zagg.column import leaf_entry_merges_from_raw
+    from zagg.column import (
+        column_resolutions,
+        leaf_entry_merges_from_raw,
+        member_merges_from_raw,
+        raw_fold_boundary,
+    )
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import STAGE_GATHER, STAGE_MERGE, classify_level
 
     leaf_mfr = leaf_entry_merges_from_raw(entries, s, harness.cell_order)
+    boundary = raw_fold_boundary(s, harness.cell_order, column_resolutions(entries, s))
     for e in entries:
         node, a = int(e["node"]), e.get("actuals")
         if a is None:
@@ -741,7 +756,11 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
             for attrs in (probes.get(node) or {}).values()
             if isinstance(attrs, dict) and isinstance(attrs.get(OVERVIEW_ATTR), dict)
         ]
-        mfr = 1 if expected == STAGE_GATHER else max(recorded, default=2)
+        mfr = (
+            member_merges_from_raw(r, boundary)
+            if expected == STAGE_GATHER
+            else max(recorded, default=2)
+        )
         if a.get("regime") not in (STAGE_GATHER, STAGE_MERGE):
             errors["readback"].append(
                 f"manifest actuals for node {node}: unknown regime {a.get('regime')!r}"

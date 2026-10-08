@@ -370,17 +370,17 @@ class TestV2Provenance:
         assert any("regime" in m and "stage-merge" in m for m in entry["mismatches"])
 
     def test_a_depth_not_one_more_than_its_childrens_is_caught(self, tmp_path):
-        # The (0, [2]) merge cascades the (1, [3]) gathers, which record 1:
-        # its depth is 2, and a stamp of 3 disagrees with its own sources
-        # (§4.4, issue #620).
+        # The (0, [2]) merge cascades the (1, [3]) gathers, which record 2
+        # (member 3 is below the raw-fold boundary): its depth is 3, and a
+        # stamp of 5 disagrees with its own sources (§4.4, issue #620).
         _build_store(tmp_path)
         self._edit_node_attrs(
-            tmp_path, "-3", lambda a: a["zagg_overview"].update(merges_from_raw=3)
+            tmp_path, "-3", lambda a: a["zagg_overview"].update(merges_from_raw=5)
         )
         report = validate_pyramid(str(tmp_path), full=True)
         entry = report["checks"]["readback"]
         assert entry["status"] == "fail"
-        assert any("merges_from_raw 3" in m for m in entry["mismatches"])
+        assert any("merges_from_raw 5" in m for m in entry["mismatches"])
 
     def test_absent_merges_from_raw_is_caught(self, tmp_path):
         # §4.4 makes the key normative on a /2 stage artifact, alongside
@@ -391,7 +391,7 @@ class TestV2Provenance:
         report = validate_pyramid(str(tmp_path), full=True)
         entry = report["checks"]["readback"]
         assert entry["status"] == "fail"
-        assert any("merges_from_raw None != 2" in m for m in entry["mismatches"]), entry
+        assert any("merges_from_raw None != 3" in m for m in entry["mismatches"]), entry
 
     def test_missing_source_children_is_caught(self, tmp_path):
         _build_store(tmp_path)
