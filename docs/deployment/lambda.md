@@ -286,7 +286,9 @@ cannot (e.g. an AWS SSO "power user" set), have an admin run the standup itself.
 ### Dependency pins and how a lock bump reaches the fleet {#zip-pins}
 
 Both zips are built from `uv.lock`, not resolved against PyPI at build time
-(issue #613). `deployment/aws/lock_requirements.py` projects the lock onto two
+(issue #613), with one exception: `build_layer.sh` installs `mortie` at the
+latest release above its `[project.dependencies]` floor (`MORTIE_SPEC`, issue
+#322), so it is not in `layer-requirements.txt`. `deployment/aws/lock_requirements.py` projects the lock onto two
 committed files -- `function-requirements.txt` (the lock closure of `obstore`,
 `zarr`, `pydantic-zarr`, `pyyaml`) and `layer-requirements.txt` (the layer's
 closure minus the names the `lambda` extra pins exactly, which `build_layer.sh`
@@ -298,7 +300,7 @@ function-zip size tripwire (34 MiB, `test_function_build_size`)
 only moves on a zagg change or a deliberate lock bump.
 
 A lock bump reaches the fleet through a PR and a release, never by a rebuild
-alone:
+alone (only a new `mortie` release can change a rebuilt layer):
 
 1. Bump the lock where it lives (`uv.lock` is gitignored):
    `uv lock --upgrade-package zarr` (or `uv lock --upgrade`), then
