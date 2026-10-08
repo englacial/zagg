@@ -1469,7 +1469,7 @@ produce the same leaves" wrongly (a relocated index cache read as a
 different product), and a wrong answer cannot be preserved for
 compatibility. No leaf byte moves; only the label is restated.
 
-**Who it hits.** Both stores live at the epoch were built with an index block,
+**Who it hits.** Both stores that were live at the epoch were built with an index block,
 so their frozen manifest hashes are pre-epoch (the ATL03 v3 rebuild of
 2026-10-08 was born post-epoch — see [The live stores](#the-live-stores-issue-560-cutover-2026-10-08)):
 
