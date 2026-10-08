@@ -423,6 +423,7 @@ class TestDeclarePyramid:
         _write_manifest(root, grid)
         r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
         assert r["added"] == ["1", "2", "3", "4", "5"] and r["snapshot"]
+        assert r["multiscales"] is True
         group, _repo = _open(root)
         block = group.attrs[ICECHUNK_ATTR]
         assert sorted(block["levels"], key=int) == ["1", "2", "3", "4", "5", "6"]
