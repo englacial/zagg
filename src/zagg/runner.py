@@ -1694,6 +1694,7 @@ class RasterStrategy:
                         leaves,
                         output_creds_event=output_creds_event,
                         store_kwargs=_output_store_kwargs(output_creds_event, region),
+                        run_id=run_id,
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
@@ -4546,7 +4547,7 @@ def _run_lambda(
         # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
         # (D8 standing rule), so the sweep rides mode="sweep" worker Event
         # invokes — partitioned from the leaf count and awaited on their
-        # store-root records (issue #610), fail-open (D9: rollups are caches;
+        # records under the run's status prefix (issue #610), fail-open (D9: rollups are caches;
         # `python -m zagg.sweep` is the regeneration backstop). Leaves
         # come from the envelope stats records; a stale deployed worker's
         # record-less envelope simply contributes no leaf. The RECORDS drive
@@ -4571,6 +4572,7 @@ def _run_lambda(
                         leaves,
                         output_creds_event=output_creds_event,
                         store_kwargs=_output_store_kwargs(output_creds_event, region),
+                        run_id=run_id,
                     )
                 # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
                 # `output.sweep: "stages"`, the same knob the local dispatcher
@@ -5845,7 +5847,9 @@ def _invoke_lambda_coverage(
     )
 
 
-def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=None) -> dict:
+def _build_sweep_event(
+    store_path, leaves, output_creds_event=None, partition=None, records_from=None
+) -> dict:
     """One ``mode="sweep"`` worker event — the single construction site.
 
     Extracted from :func:`_invoke_lambda_sweep` (issue #377) so the fan-out
@@ -5864,6 +5868,11 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
     ``2^n`` morton-subtree partition this invoke owns; it is validated here
     (:func:`zagg.sweep_partition.normalize_partition`) rather than shipped
     unchecked. Absent -> the whole tree, exactly as before.
+
+    ``records_from`` (issue #610) is the run's status prefix: the worker PUTs a
+    copy of its sweep record there under
+    :func:`zagg.sweep_fleet.families_record_name`, which is what the families
+    barrier awaits.
     """
     from zagg.sweep_partition import normalize_partition
 
@@ -5873,6 +5882,8 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
     if partition is not None:
         index, of = normalize_partition(partition)
         event["partition"] = {"index": index, "of": of}
+    if records_from is not None:
+        event["records_from"] = records_from
     event["leaves"] = [[int(key), window] for key, window in leaves]
     if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
         del event["leaves"]
@@ -6241,6 +6252,7 @@ def _invoke_lambda_families_sweep(
     *,
     output_creds_event=None,
     store_kwargs=None,
+    run_id=None,
     barrier_timeout_s=None,
 ) -> dict | None:
     """The end-of-run families sweep over the fleet (issue #610); its outcome.
@@ -6250,7 +6262,8 @@ def _invoke_lambda_families_sweep(
     and no report (the v3 California tail: 2,726 leaves, one invoke, a handle
     that returned success). The orchestration is
     :func:`zagg.sweep_fleet.run_families_sweep_fleet` — partitions sized from
-    the leaf count, a barrier on their store-root records, the finisher, a
+    the leaf count, a barrier on their records under the run's status prefix
+    (``run_id``'s, the one the dispatcher already polls), the finisher, a
     barrier on its record — the same invoke-and-poll shape as
     :func:`_invoke_lambda_stage_sweep`, and like it never a write (D8). So the
     tail now BLOCKS on the families pass, two barriers of
@@ -6275,6 +6288,7 @@ def _invoke_lambda_families_sweep(
             leaves,
             output_creds_event=output_creds_event,
             store_kwargs=store_kwargs,
+            run_id=run_id,
             **knobs,
         )
     except Exception as e:
