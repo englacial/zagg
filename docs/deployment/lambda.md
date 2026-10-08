@@ -801,13 +801,16 @@ run and simply drops the finisher's reporting from the summary.
     every child on disk under each node it *is* handed, so untouched siblings
     are folded in, never dropped.
 
-!!! warning "The tail blocks while the sweep runs"
-    Unlike every other end-of-run invoke, the staged sweep is not
-    fire-and-forget: the tuple ordering has to be held by somebody, and the
-    dispatcher is the only party that sees each tuple finish. The barrier waits
-    are bounded by a total budget and the whole leg is fail-open (D9) — a
-    refused lease, a lost invoke or an expired barrier costs one later
-    `python -m zagg.sweep --stages` pass, never a wrong answer. A dispatcher
+!!! warning "The tail blocks while the sweeps run"
+    Unlike every other end-of-run invoke, the two sweep legs are not
+    fire-and-forget. The families leg ([issue #610](https://github.com/englacial/zagg/issues/610))
+    waits on two barriers — its partitions', then its finisher's — of up to
+    `DEFAULT_BARRIER_TIMEOUT_S` (2,700 s) each. The staged sweep's tuple
+    ordering has to be held by somebody, and the dispatcher is the only party
+    that sees each tuple finish; its barrier waits are bounded by a total
+    budget. Both legs are fail-open (D9) — a refused lease, a lost invoke or
+    an expired barrier costs one later `python -m zagg.sweep` (or
+    `--stages`) pass, never a wrong answer. A dispatcher
     killed mid-barrier leaves the run's lease held until its TTL expires into
     claimability, which is the lease's designed recovery.
 
@@ -875,7 +878,7 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 | End-of-run step | What lands | If the launcher dies before it |
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
-| 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher; each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
+| 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher; each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
 | 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 

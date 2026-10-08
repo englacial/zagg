@@ -611,15 +611,19 @@ invoke per non-empty partition, awaited on the copy of each one's record it
 drops as `families-p<i>of<n>.json` under the run's status prefix
 (`<store>.status/run-<run_id>/`; the `sweep_stats_<ts>_p<i>of<n>.json` at the
 store root still lands), and then finished by a partition-less invoke
-awaited on its own `families-finisher.json`; a run of at most 128 leaves is the one pass it
-always was. The outcome rides the run summary and the `zagg.client` handle as
-`families_sweep: {partitions, fired, landed, finisher}`, with `finisher`
-`"ok"`, `"records_short"` (a partition's record never landed) or
-`"timed_out"` (the finisher's did not), so a short root temporal section is
-reported rather than discovered later. The local backend sweeps in-process
-and needs none of this.
+awaited on its own `families-finisher.json`; a run of at most 128 leaves is
+the one pass it always was. The outcome rides the run summary and the
+`zagg.client` handle as `families_sweep: {partitions, fired, landed,
+finisher, run_id, records_from, duration_s}`, with `finisher` `"ok"`,
+`"records_short"` (a partition's record never landed), `"timed_out"` (the
+finisher's did not) or `"dispatch_failed"` (an invoke raised after others
+fired; `error` says why), so a short root temporal section is reported
+rather than discovered later. The local backend sweeps in-process and needs
+none of this.
 
-Until that finisher lands, the coarse levels of the **JSON rollup families**
+On the Lambda backends the tail fires that finisher itself. For hand
+`--partitions` passes (the local CLI, or a tail whose finisher did not land),
+until a finisher lands, the coarse levels of the **JSON rollup families**
 (`stats`, `moc`, `submap`) can be picked up by following a partitioned sweep
 with a plain `python -m zagg.sweep <root> --families stats,moc,submap`: the
 partitions' work is skip-if-current, and an interior fold reads its children's
