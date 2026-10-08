@@ -1138,12 +1138,12 @@ particular its single scalar `cell_order = c - (s - k)` — is specified for
 `cell_order` the entry's own `cells` member (`k + d`, not the constant-depth
 formula), the `fold_source`/`fold_from_order` pair replaced by the #381
 point (7) provenance — `regime` (`stage-gather` | `stage-merge`),
-`merges_from_raw` (the **fold depth**: 1 for a gather of gen-1 members, and
-for a merge **one more than the largest `merges_from_raw` among the
-children's artifacts it folded** — 2 for the first merge above the gather
-tier, 3 for the next, and so on down to the root; on the 19/13/9 reference
-geometry the ladder records 1 at orders 8–5 and 2, 3, 4, 5, 6 at orders
-4–0. A reader MUST tolerate any value and MUST NOT bind to a ceiling: the
+`merges_from_raw` (the **fold depth**: for a gather, the depth of the
+column groups it concatenates — 1 at or above the raw-fold boundary, 2
+below it (§4.6) — and for a merge **one more than the largest
+`merges_from_raw` among the children's artifacts it folded**, and so on
+down to the root; on the 19/13/9 reference geometry the ladder records 1,
+1, 2, 2 at orders 8–5 and 3, 4, 5, 6, 7 at orders 4–0. A reader MUST tolerate any value and MUST NOT bind to a ceiling: the
 value is a statement about the digest fold's generation, which `exact` and
 `packed` classes are indifferent to and `approximate` classes carry as
 their recorded accuracy — §4.4's accuracy doctrine below), and
@@ -1501,7 +1501,8 @@ staged sweep's finisher.
   of the §4.6 per-group value — 1 when every declared leaf resolution is at
   or above the raw-fold boundary, 2 when the entry declares a resolution
   below it; no `source_children` — its source is complete by construction),
-  `stage-gather` (a concatenation of gen-1 members, merges-from-raw 1) or
+  `stage-gather` (a concatenation of the child columns' members, whose
+  `merges_from_raw` is the gathered groups' depth, §4.4) or
   `stage-merge` (a cascade of the children's artifacts, §4.4, whose
   `merges_from_raw` is the **maximum** over the level's artifacts of their
   recorded depth — 2 at the first merge level, one more per level below it;
@@ -1790,7 +1791,8 @@ shape at its dispatch nodes (`{window}.pyramid.zarr` under an ancestor
 node's prefix, `zagg-column/1` attrs, D4 order, one commit stamp last, D20
 sidecar after): every group is a **pure gather** of the child columns'
 members at the same resolution — `groups` entries record `regime:
-"stage-gather"` with `merges_from_raw: 1` — and the artifact carries
+"stage-gather"` with the gathered member's `merges_from_raw` (the deepest
+the child columns record for that group) — and the artifact carries
 exactly the members some coarser **gather** level consumes (the cells at or
 above the shard order declared at orders below the dispatch node's). It
 carries no member for the merge levels: those cascade from the ladder

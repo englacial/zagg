@@ -29,9 +29,10 @@ node is four slabs, constant in the subtree's leaf count: the v3 ladder's
 order-0 node read 18.9M relay cells and the dense order-1 node could not
 finish inside 900 s; a cascaded node reads 1,024 and writes 256. The values
 are a fixed function of the ladder, so a build is the same at any tuple
-width; ``merges_from_raw`` records the true fold depth — 1 for a gather,
-one more than its sources' for a merge — which a reader tolerates at any
-value (spec §4.4/§4.5).
+width; ``merges_from_raw`` records the true fold depth — a gather the
+depth of the column groups it concatenates (1 at or above the raw-fold
+boundary, 2 below it), a merge one more than its sources' — which a reader
+tolerates at any value (spec §4.4/§4.5).
 
 **Source classification is derived, not hardcoded**: a level ``(node k,
 cells r)`` is a **gather** when ``r >= shard_order`` (its cells nest within
@@ -248,7 +249,7 @@ def column_members(levels: list, node_order: int, *, shard_order: int) -> list[i
     (``node < node_order``) will gather, and nothing else: a merge level
     folds its children's artifacts, never a column (issue #620). Each member
     is a pure gather of the child columns' member at the same resolution —
-    gen-1 content, untouched, ``merges_from_raw`` 1. Empty when no coarser
+    untouched, at the depth those members record. Empty when no coarser
     level gathers, in which case the dispatch node writes no column.
     """
     node_order, shard_order = int(node_order), int(shard_order)
@@ -598,6 +599,25 @@ def _dense_rows(readers: dict, node: str, *, depth: int) -> list:
     return rows
 
 
+def _gather_depth(rows: list, res: int) -> int:
+    """A gather's ``merges_from_raw``: the deepest its source columns record at ``res``.
+
+    A gather copies the child columns' group at ``res`` untouched, so it is at
+    their depth: 1 at or above the raw-fold boundary, 2 below it (issue #538,
+    :func:`zagg.column.member_merges_from_raw`) — every artifact records the
+    depth of what it consumed.
+    """
+    from zagg.column import COLUMN_ATTR
+
+    depths = []
+    for row in rows:
+        for reader in row or ():
+            if _is_reader(reader):
+                groups = (reader.attrs.get(COLUMN_ATTR) or {}).get("groups") or {}
+                depths.append(int((groups.get(str(res)) or {}).get("merges_from_raw") or 1))
+    return max(depths, default=1)
+
+
 def _source_depth(rows: list) -> int:
     """A merge's ``merges_from_raw``: one more than the deepest source folded."""
     depths = [
@@ -653,7 +673,7 @@ def _stage_fold(
         rows,
         slabs,
         regime=regime,
-        merges_from_raw=1 if regime == STAGE_GATHER else _source_depth(rows),
+        merges_from_raw=_gather_depth(rows, r) if regime == STAGE_GATHER else _source_depth(rows),
         source_children=(folded, missing, unreadable),
         demotions=demotions,
     )
@@ -882,8 +902,9 @@ def write_stage_column(
     The §4.6 column artifact shape (``zagg-column/1``) with the stage
     regime: every group is a PURE GATHER of the child columns' members at
     the same resolution — the gatherable members coarser tuples need — so
-    ``merges_from_raw`` stays 1 for every group and the artifact carries
-    gen-1 content only. Attrs additionally record the summed ``generation``
+    each group's ``merges_from_raw`` is the deepest the child columns record
+    for it (:func:`_gather_depth`), and nothing is merged here. Attrs
+    additionally record the summed ``generation``
     (the parent's skip-gate basis), ``source_children`` (a gather that
     under-covered says so in the artifact), and the run id; the commit stamp
     carries ``run_id`` too (lease backstop). D4 order throughout; the D20
@@ -998,7 +1019,7 @@ def write_stage_column(
                 "groups": {
                     str(res): {
                         "regime": STAGE_GATHER,
-                        "merges_from_raw": 1,
+                        "merges_from_raw": _gather_depth(rows, res),
                         "n_cells": 4 ** (res - node_order),
                     }
                     for res in resolutions
@@ -1227,7 +1248,7 @@ def stage_node(
         for target in sorted({_node_at(d, k) for d in candidates if d.startswith(node)}):
             rows = rows_of(target)
             fresh_gen = _summed_generation(rows)
-            depth = 1 if regime == STAGE_GATHER else _source_depth(rows)
+            depth = _gather_depth(rows, r) if regime == STAGE_GATHER else _source_depth(rows)
             mine = _open(target)
             if envelope:
                 stored = _read_envelope(store, target)

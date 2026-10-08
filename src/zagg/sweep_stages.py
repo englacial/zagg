@@ -330,9 +330,10 @@ def run_finisher(
        of ``pyramid.overviews`` (#381 point (7); readers MUST tolerate the
        added key). The leaf entry records the ``leaf-column`` law
        (merges-from-raw 1); ladder entries record what this run observed —
-       ``stage-gather`` at 1, ``stage-merge`` at the cascade depth, one more
-       than its sources' (issue #620). This re-PUT also refreshes the
-       manifest's ``LastModified``, satisfying the PR #397 lifecycle
+       ``stage-gather`` at the gathered groups' depth, ``stage-merge`` at
+       the cascade depth, one more than its sources' (issue #620). This
+       re-PUT also refreshes the manifest's ``LastModified``, satisfying
+       the PR #397 lifecycle
        root-touch for ``morton_hive.json`` (and step 1 for the root MOC)
        WITHOUT duplicating it — only ``aggregation.yaml`` still needs the
        explicit touch, step 3. The family dict's order-keyed

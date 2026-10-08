@@ -497,7 +497,7 @@ class TestCascade:
         # artifact's cells 0..3 ('1111'..'1114'), ONE k-way call, 4-to-one.
         level = _artifact(tmp_path / "s", "1/all.zarr")
         attrs = dict(level.attrs)["zagg_overview"]
-        assert attrs["regime"] == "stage-merge" and attrs["merges_from_raw"] == 2
+        assert attrs["regime"] == "stage-merge" and attrs["merges_from_raw"] == 3
         child = _artifact(tmp_path / "s", "1/1/all.zarr")["3"]
         parts = [decode_digest(p, "float32") for p in child["h_tdigest"][:4] if len(p)]
         assert bytes(level["2"]["h_tdigest"][:][0]) == fold_digests(
@@ -505,6 +505,27 @@ class TestCascade:
         )
         assert list(level["2"]["count"][:]) == [int(child["count"][:4].sum()), 2080 * 3] + [0] * 14
         assert attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 0}
+
+    def test_a_gather_records_the_depth_of_the_groups_it_concatenates(self, tmp_path):
+        # The leaf columns of ``_wide_store`` carry {5, 4, 3} with boundary 5,
+        # so members 4 and 3 are at depth 2 (issue #538): the gathers at
+        # cells 4 and 3 copy them untouched and record 2, the stage column
+        # relaying member 3 records 2 for it, and the one merge records 3.
+        m = _wide_store(tmp_path / "w")
+        summary = _sweep(tmp_path / "w", m, width=1)
+        assert all(s["failed"] == 0 for s in summary["stages"])
+        depths = {
+            rel: dict(_artifact(tmp_path / "w", rel).attrs)["zagg_overview"]["merges_from_raw"]
+            for rel in ("1/1/1/all.zarr", "1/1/all.zarr", "1/all.zarr")
+        }
+        assert depths == {"1/1/1/all.zarr": 2, "1/1/all.zarr": 2, "1/all.zarr": 3}
+        column = dict(_artifact(tmp_path / "w", "1/1/1/all.pyramid.zarr").attrs)["zagg_column"]
+        assert column["groups"]["3"]["merges_from_raw"] == 2
+        assert {k: v["merges_from_raw"] for k, v in summary["levels"].items()} == {
+            "2": 2,
+            "1": 2,
+            "0": 3,
+        }
 
     def test_the_depth_is_recorded_truthfully_at_every_level(self, tmp_path):
         m = _stage_store(tmp_path / "s")
@@ -724,7 +745,7 @@ class TestStagePass:
         g = _artifact(tmp_path / "w", "1/1/1/all.pyramid.zarr")
         attrs = dict(g.attrs)["zagg_column"]
         assert attrs["groups"] == {
-            "3": {"regime": "stage-gather", "merges_from_raw": 1, "n_cells": 4}
+            "3": {"regime": "stage-gather", "merges_from_raw": 2, "n_cells": 4}
         }
         assert attrs["generation"]["n_leaves"] == 2
         # '1111'/'1112' node members at ranks 0 and 1 of 4 (sum(1..64) = 2080).
