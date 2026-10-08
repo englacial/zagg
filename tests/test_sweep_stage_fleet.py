@@ -11,8 +11,8 @@ Standing claims:
   tuple, soft-barrier on the stage records, then the next tuple, finisher
   last (#381 point (6): under-coverage is loud and self-healing);
 - **the acceptance**: the fleet-built ladder is byte-identical to the
-  CLI-built ladder on the same store AND the same work set (the merge-source
-  law, espg ruling 2026-08-09, issue #384) — ``TestByteIdentityOracle`` below.
+  CLI-built ladder on the same store AND the same work set (the cascade,
+  issue #620: grouping changes no values) — ``TestByteIdentityOracle`` below.
   The work-set half of that precondition is the transport's one documented
   divergence: the dispatcher derives its nodes from the work set alone (D8),
   while the in-process pass unions it with the root ``coverage.moc``.
@@ -1803,7 +1803,7 @@ class TestFleetOrchestration:
         assert {morton_decimal(int(k)) for k, _w in finest[0]["leaves"]} == set(LEAVES)
 
     def test_a_multi_batch_tuple_partitions_its_leaves(self, tmp_path, monkeypatch):
-        # Merge-source-critical (review finding): across a fan-out, each
+        # Coverage-critical (review finding): across a fan-out, each
         # batch's leaves are exactly the work-set leaves under that batch's
         # nodes -- none dropped, none duplicated, none riding the wrong invoke.
         import zagg.runner
@@ -1996,9 +1996,8 @@ class TestRunnerSeam:
 # ---------------------------------------------------------------------------
 # Phase 3: THE ACCEPTANCE — the byte-identity oracle.
 #
-# The merge-source law (espg ruling 2026-08-09, issue #384) makes the /2 build
-# a fixed function of the store: independent of tuple grouping, of
-# partitioning, and of EXECUTOR. So the fleet-built ladder must be
+# The cascade (issue #620) makes the /2 build a fixed function of the store:
+# independent of tuple grouping, of partitioning, and of EXECUTOR. So the fleet-built ladder must be
 # byte-identical to the CLI-built ladder on the same store AND the same work
 # set, and that is the whole acceptance for this transport — any difference is
 # a transport bug, not a tolerance.
@@ -2134,12 +2133,10 @@ def _artifacts(snapshot, *, ladder_data_only=False):
     and their per-array metadata — dropping each artifact's own group
     ``zarr.json``. That is the cross-tuple-width comparison: the group attrs
     carry per-run PROVENANCE (``source_children``, the summed child
-    ``generation``) which is legitimately width-dependent, because a width-1
-    build folds an order-0 node from order-1 stage columns while a width-3
-    build folds it from the leaf columns three orders down. The merge-source
-    law is a claim about the CONTENT, and that is what this compares —
-    ``TestMergeSourceLaw`` in ``test_sweep_stage.py`` pins the same claim
-    in-process, the same way (arrays, not attrs).
+    ``generation``) which a cross-width comparison does not bind. The
+    cascade (issue #620) is a claim about the CONTENT, and that is what this
+    compares — ``TestCascadeLaw`` in ``test_sweep_stage.py`` pins the same
+    claim in-process, the same way (arrays, not attrs).
     """
     out = {}
     for rel, data in snapshot.items():
@@ -2439,7 +2436,7 @@ class TestByteIdentityOracle:
             # And within it, ONLY the per-run provenance tally. `generation`
             # is not on this list: with the run ids blanked its `n_leaves` and
             # `max_leaf_timestamp` are width-independent, which is the whole
-            # content of the merge-source law at the attrs level.
+            # content of the cascade's claim at the attrs level.
             x, y = a.get("zagg_overview", {}), b.get("zagg_overview", {})
             differing = {k for k in set(x) | set(y) if x.get(k) != y.get(k)}
             assert differing <= {"source_children"}, (rel, differing)

@@ -28,7 +28,7 @@ from zagg.sweep_overview import (
 )
 
 #: The stage-column geometry of ``tsc.TestStageMergeHalfPair``: order-3
-#: columns with a node-order relay member, folded by a (node 1, cells 2)
+#: columns with a node-order member, folded by a (node 1, cells 2)
 #: stage-merge level whose one populated output cell mixes both children.
 NODE_ORDER, CELL_ORDER, RES = 3, 5, 4
 

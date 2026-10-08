@@ -10,7 +10,7 @@ Standing claims:
   widest width whose fattest dispatch node stays within the target, and leaves
   a sparse ladder on the fixed-width schedule outright;
 - the grouping changes no bytes: a sized fleet build's ladder overviews are the
-  fixed-width build's (``TestSizedByteIdentity``, the merge-source law);
+  fixed-width build's (``TestSizedByteIdentity``, the cascade, issue #620);
 - a tuple missing a unit record names its ORDERS to the finisher, which then
   leaves their manifest actuals as they stood rather than stamping them from a
   run that did not observe them.
@@ -618,7 +618,7 @@ class TestShortOrders:
 
 class TestSizedByteIdentity:
     def test_a_sized_build_is_the_fixed_width_build(self, tmp_path):
-        # The merge-source law across GROUPINGS (#381 point (6)): the sized
+        # The cascade across GROUPINGS (issue #620; #381 point (6)): the sized
         # fleet walks two tuples where the CLI walks one width-3 tuple, so it
         # writes stage columns the CLI build never needs — which is why
         # this compares the ladder overviews, the product, exactly as

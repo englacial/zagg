@@ -161,7 +161,7 @@ def sweep_stage_pass(
     order — what a fleet stage worker runs (issue #519). The in-process driver
     leaves it ``None`` and walks every tuple finest-first; the fleet transport
     walks the same tuples, one invoke fan-out per tuple, so the two differ in
-    grouping alone (the merge-source law: grouping changes no bytes). An order
+    grouping alone (the cascade, issue #620: grouping changes no values). An order
     that dispatches no tuple refuses BY NAME rather than sweeping nothing — a
     mistyped dispatch order must not read as a clean no-op.
 
@@ -935,9 +935,9 @@ def run_stage_worker(
     ``nodes`` reaches the pass as the ordinary ``scope`` MOC, so a worker
     folds exactly the dispatch nodes it was handed and no others. Dispatch
     nodes at one order own disjoint subtrees and a tuple's folds read only
-    columns one tuple FINER, so the split across invokes is free of
+    what one tuple FINER wrote, so the split across invokes is free of
     cross-worker dependencies — the same disjointness the in-process pass
-    relies on, which is why the merge-source law makes the fleet build
+    relies on, which is why the cascade (issue #620) makes the fleet build
     byte-identical to the CLI build.
 
     The node set is validated BY NAME before anything is read or written: it
