@@ -20,13 +20,15 @@ REPO_ROOT = Path(__file__).parent.parent
 LAMBDA_UNZIPPED_LIMIT = 250 * 1024 * 1024  # 250MB combined (layer + function)
 
 # Budget allocation — layer gets most of the space, function code should be small
-# 32MB function-code budget (espg ruling 2026-08-24, PR #511 question 1): AWS's
-# hard limit for direct-upload zips is 50MB, so this is an early-warning
-# tripwire, not the platform cap — 30MB left ~19KB of headroom on main and any
-# source addition tripped it. Mirrored in deployment/aws/build_function.sh.
-# With the deps pinned from uv.lock (issue #613) it only moves on a zagg change
-# or a deliberate lock bump.
-FUNCTION_SIZE_BUDGET = 32 * 1024 * 1024
+# 34MB function-code budget (espg rulings 2026-08-24, PR #511 question 1, and
+# 2026-10-08, PR #611): AWS's hard limit for direct-upload zips is 50MB, so this
+# is an early-warning tripwire, not the platform cap — 30MB left ~19KB of
+# headroom on main and any source addition tripped it; 32MB tripped on
+# 2026-10-08 when pydantic 2.14.0 / pydantic-core 2.50.0 were released, because
+# the build resolved its deps from PyPI at build time, not from uv.lock. With
+# the deps pinned from uv.lock (issue #613) it only moves on a zagg change or a
+# deliberate lock bump. Mirrored in deployment/aws/build_function.sh.
+FUNCTION_SIZE_BUDGET = 34 * 1024 * 1024
 
 
 class TestLambdaImports:

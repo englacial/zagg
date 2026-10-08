@@ -11,6 +11,14 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-10-08
+
+### Merged pull requests
+
+- icechunk: hand icechunk a UTC expiry for refreshable credentials (issue #608) ([#609](https://github.com/englacial/zagg/pull/609)) by @espg
+- families sweep: one store handle per invoke, a leaf-count-sized partitioned tail, and a finisher that never reads a leaf (issue #610) ([#612](https://github.com/englacial/zagg/pull/612)) by @espg
+- cutover: the live ATL03 store is atl03_tdigest_o9_v3 (issue #560) ([#611](https://github.com/englacial/zagg/pull/611)) by @espg
+
 ## [0.57.0] - 2026-10-02
 
 ### Merged pull requests

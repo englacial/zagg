@@ -209,14 +209,14 @@ ITEM_COUNT=$(ls -1 "$BUILD_DIR" | wc -l)
 echo ""
 echo "Function code: ${UNZIPPED_SIZE} (${UNZIPPED_BYTES} bytes)"
 
-# Function code budget: 32MB (espg ruling 2026-08-24, PR #511 question 1) —
+# Function code budget: 34MB (espg rulings 2026-08-24 PR #511, 2026-10-08 PR #611) —
 # an early-warning tripwire under AWS's 50MB direct-upload zip limit, leaving
 # room for the ~220MB layer; mirrored in tests/test_lambda_build.py. With the
 # deps pinned from uv.lock (issue #613) it only moves on a zagg change or a
 # deliberate lock bump.
-FUNCTION_BUDGET=$((32 * 1024 * 1024))
+FUNCTION_BUDGET=$((34 * 1024 * 1024))
 if [ "$UNZIPPED_BYTES" -gt "$FUNCTION_BUDGET" ]; then
-    echo "WARNING: Function code exceeds 32MB budget!"
+    echo "WARNING: Function code exceeds 34MB budget!"
     echo "  Top directories by size:"
     du -sh "$BUILD_DIR"/*/ 2>/dev/null | sort -rh | head -10
 fi

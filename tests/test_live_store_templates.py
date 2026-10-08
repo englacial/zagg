@@ -1,18 +1,23 @@
 """The packaged templates that ARE the live stores' build configs (issue #547).
 
 ``atl03_tdigest_strata_healpix`` and ``gedi01b_waveform_healpix_hive`` carry,
-key for key, the configs that built ``atl03_tdigest_o9`` and ``gedi_flux_o9``
-(recovered from the stores' run records; espg ruling 2026-09-13: the packaged
-template matches what is live, so a default build APPENDS instead of refusing
-on the frozen ``semantic_hash``). The anchor is the store MANIFEST's frozen
-hash, vendored for ATL03 in
-``tests/data/ca_atl03_tdigest_o9_morton_hive.json``. Since the issue #499
-index epoch that anchor is the template's LEGACY digest: what
-``sweep_overview._semantic_guard`` and ``hive._frozen_matches`` compare is the
-current one, so each pin carries both columns and the append lands after
-``declare_pyramid`` migrates the store. A canonicalization change or a
-template edit that moves either hash surfaces here, not at the operator's
-console.
+key for key, the configs that built ``atl03_tdigest_o9_v3`` and
+``gedi_flux_o9`` (the GEDI one recovered from the store's run record, espg
+ruling 2026-09-13: the packaged template matches what is live, so a default
+build APPENDS instead of refusing on the frozen ``semantic_hash``; the ATL03
+store was rebuilt from the packaged template on the 0.57.0 fleet, issue
+#560). The anchor is the store MANIFEST's frozen hash, vendored for ATL03 in
+``tests/data/ca_atl03_tdigest_o9_v3_morton_hive.json``. The v3 store was born
+after the issue #499 index epoch, so its frozen hash is the template's
+CURRENT digest -- the one ``sweep_overview._semantic_guard`` and
+``hive._frozen_matches`` compare, so the append lands with no migration. The
+pre-epoch stores -- ``gedi_flux_o9``, and the v1 ``atl03_tdigest_o9``
+retained as the comparison store (its manifest stays vendored in
+``tests/data/ca_atl03_tdigest_o9_morton_hive.json``) -- are frozen at the
+templates' LEGACY digests, so each pin carries both columns and an append
+there lands after ``declare_pyramid`` migrates the store. A canonicalization
+change or a template edit that moves either hash surfaces here, not at the
+operator's console.
 
 The knob pins cover what the hash cannot see but the redeclare tool consumes
 (``overview_delta``, the orders) and the uniform-δ ruling across every
@@ -27,23 +32,25 @@ import pytest
 from zagg.config import default_config
 from zagg.semantics import semantic_hash, semantic_hash_legacy
 
-CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json"
+CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_v3_morton_hive.json"
+CA_V1_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json"
 
-#: (template, store manifest ``semantic_hash``, epoch-2 hash, build-time
-#: sidecar store) — the frozen-identity anchor, read across the issue #499
-#: index epoch. The stored column is what ``morton_hive.json`` carries on disk
-#: today and what the template's LEGACY digest reproduces; the second is what
-#: a default build hashes to now and what ``declare_pyramid`` migrates the
-#: store to. Same known-answer pairs ``tests/test_semantics.py`` pins from the
-#: run records — here they anchor the TEMPLATES rather than the vendored
-#: configs. The legacy digest hashed the sidecar ``store`` URL, so ATL03's is
-#: pinned under the location the store was BUILT from: the packaged template
-#: reads the source.coop copy instead (``SIDECAR_STORE``, moved 2026-09-17).
+#: (template, pre-epoch ``semantic_hash``, epoch-2 ``semantic_hash``,
+#: build-time sidecar store) — the frozen-identity anchor, read across the
+#: issue #499 index epoch. The epoch-2 column is what a default build hashes
+#: to now: the v3 ATL03 manifest carries it on disk, the pre-epoch stores
+#: (GEDI, the v1 ATL03 comparison store) carry the first column and
+#: ``declare_pyramid`` migrates them to the second. Same known-answer pairs
+#: ``tests/test_semantics.py`` pins from the run records — here they anchor
+#: the TEMPLATES rather than the vendored configs. The legacy digest hashed
+#: the sidecar ``store`` URL, so ATL03's is pinned under the location the v1
+#: store was BUILT from: the packaged template reads the source.coop copy
+#: instead (``SIDECAR_STORE``, moved 2026-09-17).
 SEMANTIC_PINS = [
     (
         "atl03_tdigest_strata_healpix",
+        json.loads(CA_V1_MANIFEST.read_text())["semantic_hash"],
         json.loads(CA_MANIFEST.read_text())["semantic_hash"],
-        "aacfe1e387d2289276572ac941449d4042a174ccc9976528af530d2993b2258a",
         "s3://sliderule-public-cors/zagg-index/ATL03/007",
     ),
     (
@@ -87,21 +94,22 @@ DIGEST_TEMPLATES = [
 ]
 
 
-@pytest.mark.parametrize(("name", "stored", "migrated", "build_store"), SEMANTIC_PINS)
-def test_template_reproduces_the_live_store_semantic_hash(name, stored, migrated, build_store):
-    # The template still IS the config that built the store: its pre-epoch
-    # digest is the hash the manifest carries on disk. Issue #499 moved the
-    # index block off the core, so a default build now hashes to the migration
-    # target instead -- the append lands once ``declare_pyramid`` has rewritten
-    # the frozen key, which is the one place that value moves. The relocated
-    # sidecar cache is invisible to the current digest and visible to the
-    # legacy one, which is the epoch's whole point.
+@pytest.mark.parametrize(("name", "legacy", "current", "build_store"), SEMANTIC_PINS)
+def test_template_reproduces_the_live_store_semantic_hash(name, legacy, current, build_store):
+    # The template still IS the config that built the store. The v3 ATL03
+    # manifest (born post-epoch) carries the current digest on disk; the
+    # pre-epoch stores carry the legacy one. Issue #499 moved the index block
+    # off the core, so a default build hashes to the current digest -- an
+    # append into a pre-epoch store lands once ``declare_pyramid`` has
+    # rewritten the frozen key, which is the one place that value moves. The
+    # relocated sidecar cache is invisible to the current digest and visible
+    # to the legacy one, which is the epoch's whole point.
     cfg = default_config(name)
-    assert semantic_hash(cfg) == migrated
+    assert semantic_hash(cfg) == current
     if build_store is not None:
-        assert semantic_hash_legacy(cfg) != stored
+        assert semantic_hash_legacy(cfg) != legacy
         cfg.data_source["index"]["store"] = build_store
-    assert semantic_hash_legacy(cfg) == stored
+    assert semantic_hash_legacy(cfg) == legacy
 
 
 @pytest.mark.parametrize(("name", "digests", "orders", "overview_delta"), DECLARED_PINS)

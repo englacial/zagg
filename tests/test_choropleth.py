@@ -2,7 +2,7 @@
 
 Pins the exporter's contract on local fixture stores (no live S3): rollup-
 preferred resolution with per-feature provenance, the leaf-sidecar fallback
-on a partial/stale rollup tree (the live ATL03 demo store has the stale-
+on a partial/stale rollup tree (the ATL03 v1 demo store has the stale-
 *interior* half of that shape), the freshness checks and their documented
 limit, the ``--order`` rollup-node mode, and GeoJSON validity — ``[lon,
 lat]`` order
@@ -317,7 +317,7 @@ LIVE_STORE = os.environ.get("ZAGG_CHOROPLETH_LIVE_STORE")
 @pytest.mark.skipif(
     not LIVE_STORE,
     reason="set ZAGG_CHOROPLETH_LIVE_STORE to a published store root, e.g. "
-    "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/atl03_tdigest_o9.zarr",
+    "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/atl03_tdigest_o9_v3.zarr",
 )
 class TestLiveSmoke:
     def test_leaf_and_coarse_exports_are_valid(self):
