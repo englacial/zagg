@@ -8,6 +8,7 @@ against real shard objects, never against a hand-built index.
 
 from __future__ import annotations
 
+import datetime
 import json
 import threading
 import time
@@ -2563,6 +2564,56 @@ class TestS3Kwargs:
         icechunk_refs._container("s3://minio", kw)
         store = captured["s3_store"]
         assert store["allow_http"] is True and store["force_path_style"] is True
+
+
+class TestBoto3Credentials:
+    """``_boto3_credentials`` hands icechunk the botocore chain's snapshot.
+
+    icechunk validates ``expires_after`` by identity against
+    ``datetime.timezone.utc``; botocore's refreshable credentials (an assumed
+    role, SSO) carry dateutil's ``tzutc()`` instead, so the construction
+    itself raised on every laptop-side repo open with a profile (issue #608).
+    """
+
+    @staticmethod
+    def _chain(monkeypatch, expiry):
+        import boto3
+
+        class Frozen:
+            access_key, secret_key, token = "AK", "SK", "TOK"
+
+        class Creds:
+            _expiry_time = expiry
+
+            def get_frozen_credentials(self):
+                return Frozen()
+
+        class Session:
+            def get_credentials(self):
+                return Creds()
+
+        monkeypatch.setattr(boto3, "Session", Session)
+
+    def test_tzutc_expiry_is_handed_over_as_timezone_utc(self, monkeypatch):
+        from dateutil.tz import tzutc
+
+        expiry = datetime.datetime(2026, 10, 8, 12, 30, tzinfo=tzutc())
+        self._chain(monkeypatch, expiry)
+        creds = icechunk_refs._boto3_credentials()
+        assert creds.access_key_id == "AK" and creds.secret_access_key == "SK"
+        assert creds.session_token == "TOK"
+        assert creds.expires_after.tzinfo is datetime.timezone.utc
+        assert creds.expires_after == expiry
+
+    def test_naive_expiry_is_read_as_utc(self, monkeypatch):
+        self._chain(monkeypatch, datetime.datetime(2026, 10, 8, 12, 30))
+        expires = icechunk_refs._boto3_credentials().expires_after
+        assert expires.tzinfo is datetime.timezone.utc
+        assert expires == datetime.datetime(2026, 10, 8, 12, 30, tzinfo=datetime.timezone.utc)
+
+    def test_static_keys_keep_no_expiry(self, monkeypatch):
+        self._chain(monkeypatch, None)
+        assert icechunk_refs._boto3_credentials().expires_after is None
 
 
 class TestS3Auth:

@@ -51,7 +51,7 @@ import logging
 import math
 import threading
 import time
-from datetime import timedelta
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -307,11 +307,20 @@ def _boto3_credentials():
     if creds is None:
         raise RuntimeError("no AWS credentials resolved for the icechunk repo")
     frozen = creds.get_frozen_credentials()
+    expiry = getattr(creds, "_expiry_time", None)
+    if expiry is not None:
+        # botocore's expiry carries dateutil's ``tzutc()``; icechunk checks for
+        # ``datetime.timezone.utc`` by identity (issue #608). A naive one is UTC.
+        expiry = (
+            expiry.replace(tzinfo=timezone.utc)
+            if expiry.tzinfo is None
+            else expiry.astimezone(timezone.utc)
+        )
     return S3StaticCredentials(
         access_key_id=frozen.access_key,
         secret_access_key=frozen.secret_key,
         session_token=frozen.token,
-        expires_after=getattr(creds, "_expiry_time", None),
+        expires_after=expiry,
     )
 
 
