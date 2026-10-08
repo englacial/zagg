@@ -1,0 +1,234 @@
+{
+ "attributes": {
+  "zagg_icechunk": {
+   "spec": "zagg-icechunk/2",
+   "shard_order": 3,
+   "chunk_order": 5,
+   "cell_order": 6,
+   "url_prefix": "s3://fixture/product/",
+   "rows": [
+    "all"
+   ],
+   "levels": {
+    "6": {
+     "node_order": 3,
+     "artifact": "leaf",
+     "chunk_order": 5,
+     "cell_order": 6,
+     "split": {
+      "chunks": 1024,
+      "order": 0
+     }
+    },
+    "5": {
+     "node_order": 3,
+     "artifact": "column",
+     "chunk_order": 3,
+     "cell_order": 5,
+     "split": {
+      "chunks": 64,
+      "order": 0
+     }
+    },
+    "4": {
+     "node_order": 3,
+     "artifact": "column",
+     "chunk_order": 3,
+     "cell_order": 4,
+     "split": {
+      "chunks": 64,
+      "order": 0
+     }
+    },
+    "3": {
+     "node_order": 2,
+     "artifact": "overview",
+     "chunk_order": 2,
+     "cell_order": 3,
+     "split": {
+      "chunks": 16,
+      "order": 0
+     }
+    },
+    "2": {
+     "node_order": 1,
+     "artifact": "overview",
+     "chunk_order": 1,
+     "cell_order": 2,
+     "split": {
+      "chunks": 4,
+      "order": 0
+     }
+    },
+    "1": {
+     "node_order": 0,
+     "artifact": "overview",
+     "chunk_order": 0,
+     "cell_order": 1,
+     "split": {
+      "chunks": 1,
+      "order": 0
+     }
+    }
+   },
+   "commit": "leaf",
+   "commit_order": 0,
+   "split_order": 0
+  },
+  "zarr_conventions": [
+   {
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/multiscales/blob/v0.1/README.md",
+    "uuid": "d35379db-88df-4056-af3a-620245f8e347",
+    "name": "multiscales",
+    "description": "Multiscale layout of zarr datasets"
+   }
+  ],
+  "multiscales": {
+   "spec": "zagg-multiscales/1",
+   "name": "SPEC_FIXTURE",
+   "base": {
+    "order": 3,
+    "cells": [
+     6
+    ]
+   },
+   "datasets": [
+    {
+     "order": 3,
+     "cells": [
+      5,
+      4
+     ],
+     "artifact": "column"
+    },
+    {
+     "order": 2,
+     "cells": [
+      3
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 1,
+     "cells": [
+      2
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 0,
+     "cells": [
+      1
+     ],
+     "artifact": "overview"
+    }
+   ],
+   "order2res": {
+    "3": [
+     5,
+     4
+    ],
+    "2": [
+     3
+    ],
+    "1": [
+     2
+    ],
+    "0": [
+     1
+    ]
+   },
+   "fields": {
+    "count": "exact",
+    "h_tdigest": "approximate",
+    "h_min": "exact",
+    "h_mean": "none"
+   },
+   "fold": {
+    "fold_source": "cascade",
+    "exact_levels": 1
+   },
+   "layout": [
+    {
+     "asset": "6",
+     "dggs": {
+      "name": "morton",
+      "refinement_level": 6,
+      "spatial_dimension": "cells",
+      "ellipsoid": {
+       "name": "WGS84",
+       "semimajor_axis": 6378137.0,
+       "inverse_flattening": 298.257223563
+      },
+      "compression": "none",
+      "latitude": "authalic-wgs84",
+      "coordinate": "morton"
+     }
+    },
+    {
+     "asset": "5",
+     "derived_from": "6",
+     "transform": {
+      "scale": [
+       4.0
+      ]
+     },
+     "dggs": {
+      "refinement_level": 5
+     }
+    },
+    {
+     "asset": "4",
+     "derived_from": "6",
+     "transform": {
+      "scale": [
+       16.0
+      ]
+     },
+     "dggs": {
+      "refinement_level": 4
+     }
+    },
+    {
+     "asset": "3",
+     "derived_from": "4",
+     "transform": {
+      "scale": [
+       4.0
+      ]
+     },
+     "dggs": {
+      "refinement_level": 3
+     }
+    },
+    {
+     "asset": "2",
+     "derived_from": "3",
+     "transform": {
+      "scale": [
+       4.0
+      ]
+     },
+     "dggs": {
+      "refinement_level": 2
+     }
+    },
+    {
+     "asset": "1",
+     "derived_from": "2",
+     "transform": {
+      "scale": [
+       4.0
+      ]
+     },
+     "dggs": {
+      "refinement_level": 1
+     }
+    }
+   ]
+  }
+ },
+ "zarr_format": 3,
+ "node_type": "group"
+}

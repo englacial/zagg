@@ -20,6 +20,7 @@ and spec text are pinned against each other through the committed bytes.
 import base64
 import hashlib
 import json
+import re
 import struct
 from pathlib import Path
 
@@ -1109,6 +1110,139 @@ class TestMultiscalesCompanion:
 #: explicit ``output.pyramid.overviews: 5`` knob, so the committed store holds
 #: a leaf AND the column its worker wrote beside it.
 COLUMN = "column"
+
+
+ICECHUNK = "icechunk"
+CONVENTIONS = Path(__file__).parent / "data" / "conventions"
+MULTISCALES_SCHEMA = "multiscales-v0.1.schema.json"
+DGGS_SCHEMA = "dggs-v1.schema.json"
+
+
+def _schema(name: str) -> dict:
+    return json.loads((CONVENTIONS / name).read_text())
+
+
+class TestIcechunkRootConventions:
+    """§11.1 — the Icechunk repo root as a conformant ``multiscales`` group (issue #615).
+
+    The committed documents are what the once-per-run init commits (the
+    production spec builder, written through stock zarr); expectations come
+    from the generator's INPUTS (the §11.1 rules over the ``pyramid/``
+    levels). The grammar checks are spelled from the vendored schemas by
+    hand — ``jsonschema`` is not a test dependency — and run against the
+    real validator when one is importable.
+    """
+
+    def _root(self) -> dict:
+        return json.loads((SPEC_DATA / ICECHUNK / "zarr.json").read_text())
+
+    def _level(self, name: str) -> dict:
+        return json.loads((SPEC_DATA / ICECHUNK / name / "zarr.json").read_text())
+
+    def test_metadata_only_group_documents(self):
+        # No repository, no arrays: the root document and one per level group.
+        exp = _expected(ICECHUNK)
+        objects = sorted(
+            str(p.relative_to(SPEC_DATA / ICECHUNK))
+            for p in (SPEC_DATA / ICECHUNK).rglob("*")
+            if p.is_file()
+        )
+        assert objects == sorted([f"{c}/zarr.json" for c in exp["levels"]] + ["zarr.json"])
+
+    def test_root_document(self):
+        exp = _expected(ICECHUNK)
+        doc = self._root()
+        assert doc["zarr_format"] == 3 and doc["node_type"] == "group"
+        attrs = doc["attributes"]
+        # Exactly the three root keys (§11.1).
+        assert set(attrs) == {"zagg_icechunk", "zarr_conventions", "multiscales"}
+        block = attrs["zagg_icechunk"]
+        assert block["spec"] == "zagg-icechunk/2" and block["url_prefix"] == exp["url_prefix"]
+        assert (
+            block["shard_order"] == exp["shard_order"] and block["cell_order"] == exp["cell_order"]
+        )
+        assert list(block["levels"]) == exp["levels"]
+        assert {k: v["artifact"] for k, v in block["levels"].items()} == exp["artifacts"]
+        # The manifest's /1 entry as an OBJECT, its keys verbatim, plus the layout.
+        multiscales = dict(attrs["multiscales"])
+        assert multiscales.pop("layout") == exp["layout"]
+        assert multiscales == exp["multiscales"]
+
+    def test_registration_is_the_convention_metadata_object(self):
+        # Every key is a schema ``const``: the entry is the README's, verbatim.
+        consts = _schema(MULTISCALES_SCHEMA)["$defs"]["conventionMetadata"]["properties"]
+        assert self._root()["attributes"]["zarr_conventions"] == [
+            {k: v["const"] for k, v in consts.items()}
+        ]
+
+    def test_layout_grammar_by_hand(self):
+        # multiscales v0.1 ``layoutObject`` + the dggs#25 composition rules,
+        # asserted from the spec text: ``asset`` per the schema's path
+        # pattern, ``transform`` iff ``derived_from``, a single-element
+        # ``scale`` of 4 ** (c_from - c) and no ``translation``, the base's
+        # ``dggs`` whole and the derived ones reduced to the level.
+        schema = _schema(MULTISCALES_SCHEMA)
+        pattern = re.compile(schema["$defs"]["layoutObject"]["properties"]["asset"]["pattern"])
+        attrs = self._root()["attributes"]
+        multiscales = attrs["multiscales"]
+        assert isinstance(multiscales, dict) and "resampling_method" not in multiscales
+        layout = multiscales["layout"]
+        assert len(layout) >= 1
+        assets = [e["asset"] for e in layout]
+        assert assets == list(attrs["zagg_icechunk"]["levels"])  # one per level group, finest first
+        assert all(pattern.match(a) for a in assets)
+        base, *derived = layout
+        assert not {"derived_from", "transform"} & set(base)
+        assert base["dggs"] == self._level(base["asset"])["attributes"]["dggs"]
+        for entry in derived:
+            source, cells = entry["derived_from"], entry["asset"]
+            assert source in assets[: assets.index(cells)]  # a finer level, already listed
+            assert set(entry["transform"]) == {"scale"}
+            assert entry["transform"]["scale"] == [4.0 ** (int(source) - int(cells))]
+            assert entry["dggs"] == {"refinement_level": int(cells)}
+            level = self._level(cells)["attributes"]["dggs"]
+            assert level["refinement_level"] == int(cells) and level["spatial_dimension"] == "cells"
+
+    def test_derived_from_is_the_fold_provenance(self):
+        # ``cascade`` with ``exact_levels: 1`` on the pyramid/ knob: the column
+        # members fold the leaves (base), each overview the next-finer level.
+        exp = _expected(ICECHUNK)
+        layout = self._root()["attributes"]["multiscales"]["layout"]
+        assert exp["multiscales"]["fold"] == {"fold_source": "cascade", "exact_levels": 1}
+        base = layout[0]["asset"]
+        chain = [(e["asset"], e["derived_from"]) for e in layout[1:]]
+        column = [c for c, a in exp["artifacts"].items() if a == "column"]
+        assert [s for c, s in chain if c in column] == [base] * len(column)
+        overviews = [(c, s) for c, s in chain if c not in column]
+        assert [s for _, s in overviews] == [column[-1]] + [c for c, _ in overviews[:-1]]
+
+    def test_level_groups_carry_the_dggs_convention(self):
+        # Each level group: the dggs registration entry and a ``dggs`` block
+        # with the schema's required keys, at that level's order.
+        consts = _schema(DGGS_SCHEMA)["$defs"]["conventionMetadata"]["properties"]
+        required = _schema(DGGS_SCHEMA)["$defs"]["dggsProperties"]["required"]
+        for cells in _expected(ICECHUNK)["levels"]:
+            attrs = self._level(cells)["attributes"]
+            assert {k: v["const"] for k, v in consts.items()} in attrs["zarr_conventions"]
+            assert set(required) <= set(attrs["dggs"])
+            assert attrs["dggs"]["refinement_level"] == int(cells)
+
+    def test_root_validates_against_the_multiscales_schema(self):
+        jsonschema = pytest.importorskip("jsonschema")
+        jsonschema.validate(self._root(), _schema(MULTISCALES_SCHEMA))
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="dggs v1 ellipsoidObject spells semi_major_axis; zagg writes semimajor_axis (issue #616)",
+    )
+    def test_levels_validate_against_the_dggs_schema(self):
+        jsonschema = pytest.importorskip("jsonschema")
+        schema = _schema(DGGS_SCHEMA)
+        for cells in _expected(ICECHUNK)["levels"]:
+            jsonschema.validate(self._level(cells), schema)
+        # The base layout entry's ``dggs`` is a full dggsProperties object.
+        base = self._root()["attributes"]["multiscales"]["layout"][0]["dggs"]
+        jsonschema.validate(base, {"$ref": "#/$defs/dggsProperties", "$defs": schema["$defs"]})
 
 
 def _column_dir(exp) -> Path:
