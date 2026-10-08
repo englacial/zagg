@@ -152,6 +152,26 @@ def manifest_multiscales(manifest: dict):
         return None
 
 
+def live_conventions(root, conventions: dict) -> dict:
+    """The Icechunk root's convention keys (spec §11.1) as the LIVE repo has them.
+
+    ``conventions`` are the keys as built from the grid; the base ``layout``
+    entry's ``dggs`` is replaced by the base level group's own ``dggs`` attrs
+    (``root`` is the repo's root group), since ``set-attrs`` on a level group
+    is how that block evolves (§11.4) and the layout copies it verbatim.
+    Derived entries carry only ``refinement_level``, so nothing else reads it.
+    """
+    mirror = conventions.get("multiscales")
+    if not mirror or mirror["layout"][0]["asset"] not in root:
+        return conventions
+    base = mirror["layout"][0]
+    dggs = root[base["asset"]].attrs.get("dggs")
+    if dggs is None or dggs == base["dggs"]:
+        return conventions
+    layout = [{**base, "dggs": dggs}, *mirror["layout"][1:]]
+    return {**conventions, "multiscales": {**mirror, "layout": layout}}
+
+
 #: Reserved store-root child carrying the companion group (issue #394, spec
 #: §4.10) — excluded from the D19 product-name grammar so a multi-product
 #: root walker can never classify it as a product.

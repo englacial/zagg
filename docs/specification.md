@@ -4318,8 +4318,10 @@ pins the documents.
   the same set in the same order.
   - The **base** entry carries that level group's `dggs` block **whole**
     (dggs#25: "specify the full `dggs` object for the original data") — a
-    verbatim copy, so whatever the leaf's `dggs` block says is what the
-    layout says.
+    verbatim copy of the **live** base level group's block, so whatever
+    that group's `dggs` says is what the layout says: a `set-attrs` on it
+    (§11.4) refreshes the entry in the same commit, and the init and
+    `declare-pyramid` rebuild it from the group, never from the grid.
   - Every **derived** entry carries the reduced `{"refinement_level": c}`,
     `derived_from` (another entry's `asset`) and
     `transform: {"scale": [4^(c_from − c)]}` — a **single-element** `scale`
@@ -4799,7 +4801,9 @@ that would write nothing commits nothing. The operations:
   `zarr_conventions` are `declare-pyramid`'s: all three are refused here.
   This is how a convention block evolves — the `dggs` `latitude` token, a
   spec marker — without a leaf rewrite; the leaf's own attrs stay as the
-  leaf was stamped, by design (the head of this section).
+  leaf was stamped, by design (the head of this section). A base level
+  group's `dggs` change also refreshes the root `multiscales` base `layout`
+  entry in the same commit (§11.1).
 - **`declare-pyramid <config>`** brings the repo's levels and its
   `multiscales` / `zarr_conventions` root attrs (§11.1) to the manifest's
   declaration (§4.9): every level of §11.1
