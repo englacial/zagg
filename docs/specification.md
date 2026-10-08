@@ -4351,8 +4351,10 @@ pins the documents.
   `declare-pyramid` (which refreshes `multiscales` and `zarr_conventions`
   together, and removes both when the manifest leaves `/2`); the manifest
   wins any disagreement. The `zagg-icechunk/2` marker is **not** bumped by
-  the object shape: no reader contracts on the mirror's shape (§4.9), and
-  the `zagg_icechunk` block the compatibility check vets is unchanged.
+  the object shape: no reader breaks on it — gridlook's `parseMultiscales`
+  accepts an object or a list and branches on `spec`, and moczarr reads
+  `pyramid` and passes the mirror through — and the `zagg_icechunk` block
+  the compatibility check vets is unchanged.
 
 ### 11.2 Array model
 
