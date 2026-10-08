@@ -4282,7 +4282,7 @@ self-describing:
     {"asset": "13", "derived_from": "19", "transform": {"scale": [4096.0]}, "dggs": {"refinement_level": 13}},
     {"asset": "12", "derived_from": "13", "transform": {"scale": [4.0]},    "dggs": {"refinement_level": 12}},
     {"asset": "11", "derived_from": "12", "transform": {"scale": [4.0]},    "dggs": {"refinement_level": 11}},
-    {"…": "one entry per level group, finest first, down to /4"}
+    {"…": "one entry per listed level, finest first, down to /4"}
   ]
 }
 ```
@@ -4336,8 +4336,10 @@ pins the documents.
   `additionalProperties: true` admits the `/1` keys — `spec`, `name`,
   `base`, `datasets`, `order2res`, `fields`, `fold` — which ride verbatim,
   and §4.9's tolerate-extra-keys rule already covers readers of the mirror)
-  plus **`layout`**: one entry per level group, **finest first** (the base,
-  then the manifest's `datasets` order), `asset` the level group's name
+  plus **`layout`**: one entry per **listed** level (a retired level's
+  surviving group has none), in **descending cell order** — which is the
+  base, then the manifest's `datasets` order, because §4.9 requires
+  `datasets` finest first — `asset` the level group's name
   (`str(cell_order)`), so `asset` keys and `zagg_icechunk.levels` keys are
   the same set in the same order.
   - The **base** entry carries that level group's `dggs` block **whole**
