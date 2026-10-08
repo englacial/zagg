@@ -171,7 +171,15 @@ def _run_fleet(monkeypatch, tmp_path, cfg, invocation, root=None):
 
     def stage(client, fn, store, leaves, **kw):
         seen["stage"] = list(leaves)
-        return real_stage(client, fn, store, leaves, **kw)
+        # The fixed-width cadence, so this module's oracles compare the two
+        # backends at ONE grouping. The tail's default sizes the schedule to
+        # the per-invoke fold (issue #610), and a narrower grouping writes
+        # relay stage columns the CLI's width-3 walk never needs — the ladder
+        # overviews are identical either way (the merge-source law, pinned by
+        # ``tests/test_sweep_ladder_sizing.py``), but the artifact NAMES are
+        # not, and that is what these arms assert. The sizing itself is
+        # exercised there and in ``tests/test_sweep_stage_fleet.py``.
+        return real_stage(client, fn, store, leaves, **{**kw, "stage_target_nodes": None})
 
     with monkeypatch.context() as patch:
         patch.setattr(boto3, "Session", lambda *a, **k: session)
