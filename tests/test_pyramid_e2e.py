@@ -666,7 +666,7 @@ class TestLadderGrammars:
         assert _ladder(manifest) == [(7, 17), (5, 15), (3, 13), (1, 11)]
 
     def test_v2_expanded_list_from_the_ca_fixture(self):
-        # The vendored live CA manifest (issue #515) declares the /2 dense
+        # The vendored v1 CA manifest (issue #515) declares the /2 dense
         # 9..0 ladder (fixed d = 13 - 9 = 4, the chunk-order default leaf
         # resolution); the above-shard read is the manifest list, never a
         # re-derivation — pinned against the published record.
