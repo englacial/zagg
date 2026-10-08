@@ -614,11 +614,14 @@ store root still lands), and then finished by a partition-less invoke
 awaited on its own `families-finisher.json`; a run of at most 128 leaves is
 the one pass it always was. The outcome rides the run summary and the
 `zagg.client` handle as `families_sweep: {partitions, fired, landed,
-finisher, run_id, records_from, duration_s}`, with `finisher` `"ok"`,
+finisher, accumulators, run_id, records_from, duration_s}`, with `finisher` `"ok"`,
 `"records_short"` (a partition's record never landed), `"timed_out"` (the
 finisher's did not) or `"dispatch_failed"` (an invoke raised after others
 fired; `error` says why), so a short root temporal section is reported
-rather than discovered later. **The finisher reads no leaf:** each
+rather than discovered later. **The finisher reads no leaf for the
+`stats`/`moc`/`submap` families** (the `overview` family's own fold on a
+`/1` store is unchanged and still opens its leaves; a `/2` store refuses it
+first): each
 partition's record carries, under `families.moc.accumulator`, the §10
 contributions it read — every visited shard's envelope word and counted cover
 per window leaf (the §10.3 block grammar), the uncounted set, the declared
@@ -627,9 +630,11 @@ names them (`finisher: {of, records_from, accumulators}`; `accumulators` in
 the outcome is how many), the worker folds the blocks, and its walk starts
 from the split-order rollups the partitions wrote, so the coarse levels, the
 root `coverage.moc` and `coverage.toc` compose from rollup reads and `n`
-record GETs, byte-identical to a single pass. A missing or unusable record
-sends it back to the leaf walk, which its own record says
-(`finisher.fallback`). The local backend sweeps in-process and needs none of
+record GETs, byte-identical to a single pass. A missing or unusable record,
+or a work set holding a shard no partition visited, sends it back to the
+leaf walk, which its own record says (`finisher.fallback`); an event too
+large to carry its leaves inline (`discover: true`) carries no `finisher`
+block at all, since the discovered work set is the store's, not this run's. The local backend sweeps in-process and needs none of
 this.
 
 On the Lambda backends the tail fires that finisher itself. For hand
