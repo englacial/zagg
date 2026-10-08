@@ -33,8 +33,11 @@ REPO_ROOT = HERE.parents[1]
 
 # Mirrors the package set build_function.sh installs into the zip.
 FUNCTION_ROOTS = ("obstore", "zarr", "pydantic-zarr", "pyyaml")
-# Mirrors build_layer.sh's resolved install (the lambda_pin'd names included,
-# for their transitive deps) plus obspec, async-tiff's one dep.
+# Mirrors build_layer.sh's installs (the lambda_pin'd names included, for their
+# transitive deps; render() drops the names themselves). Deliberately not roots:
+# h5coro (its boto3/earthaccess/requests/xarray deps are orchestrator-side, so
+# the script installs it --no-deps), icechunk (its one dep, zarr, ships in the
+# function zip) and mortie (floor-derived from pyproject, issue #322).
 LAYER_ROOTS = (
     "pandas",
     "arro3-core",
@@ -48,7 +51,8 @@ LAYER_ROOTS = (
     "odc-geo",
     "affine",
     "cachetools",
-    "obspec",
+    "async-tiff",
+    "h5coro-hidefix",
 )
 
 

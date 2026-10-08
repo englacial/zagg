@@ -340,8 +340,13 @@ class TestLockRequirements:
             f"layer-requirements.txt pins {sorted(exact & set(pins))}, which build_layer.sh "
             "installs itself from the lambda extra (lambda_pin) -- two declaration sites"
         )
-        floating = set(self._roots("LAYER_ROOTS")) - exact
-        assert floating >= {"fastparquet", "cramjam", "shapely", "pyproj", "odc-geo", "obspec"}
+        roots = set(self._roots("LAYER_ROOTS"))
+        # async-tiff installs --no-deps, so its deps reach the layer only as its
+        # closure here: it must be a root, and obspec (its dep today) pinned.
+        assert {"async-tiff", "h5coro-hidefix"} <= roots
+        assert "obspec" in pins, "async-tiff's dep obspec has no pin in layer-requirements.txt"
+        floating = roots - exact
+        assert floating >= {"fastparquet", "cramjam", "shapely", "pyproj", "odc-geo"}
         assert floating <= set(pins), (
             f"layer roots {sorted(floating - set(pins))} have no pin in layer-requirements.txt"
         )
