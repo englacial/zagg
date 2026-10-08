@@ -1532,7 +1532,8 @@ the config *is* the store's own before it writes.
 
 **Skip-gate consequence — deliberate, not fixed.** `zagg.dedup` compares the
 hash strings stamped in run records and leaf sidecars against the current
-digest, and those stamps on the two pre-epoch stores are pre-epoch. After the
+digest, and those stamps on the two stores in the table above
+(`atl03_tdigest_o9`, `gedi_flux_o9`) are pre-epoch. After the
 epoch they read as **stale**: a same-shard re-dispatch into either store
 **rewrites** the leaf instead of skipping it (the `semantic-mismatch`
 classification), exactly the D19 epoch's "first post-epoch run is a full
