@@ -229,6 +229,31 @@ class TestFunctionRequirements:
             "same PR as the lock bump (issue #613)"
         )
 
+    def test_closure_follows_extras_and_refuses_forks(self):
+        """An ``extra`` edge pulls the target's optional deps; a forked name fails loudly.
+
+        Missing either would drop a package from the file without error, and
+        ``--no-deps`` would then leave it out of the zip (review of PR #614).
+        """
+        import runpy
+
+        closure = runpy.run_path(str(self.GENERATOR))["closure"]
+        lock = {
+            "package": [
+                {"name": "a", "dependencies": [{"name": "b", "extra": ["x"]}]},
+                {
+                    "name": "b",
+                    "optional-dependencies": {"x": [{"name": "c"}], "y": [{"name": "d"}]},
+                },
+                {"name": "c", "dependencies": [{"name": "a"}]},
+                {"name": "d"},
+            ]
+        }
+        assert closure(lock, ("a",)) == {"a", "b", "c"}
+        lock["package"].append({"name": "c"})
+        with pytest.raises(SystemExit, match="forks c"):
+            closure(lock, ("a",))
+
     def test_requirements_pin_every_root_above_its_floor(self):
         """Each root build_function.sh installs is pinned, at or above its core floor.
 

@@ -28,16 +28,30 @@ FUNCTION_ROOTS = ("obstore", "zarr", "pydantic-zarr", "pyyaml")
 
 
 def closure(lock: dict, roots: tuple[str, ...]) -> set[str]:
-    """Every lock package reachable from ``roots`` (markers ignored: pip applies them)."""
-    graph = {p["name"]: [d["name"] for d in p.get("dependencies", [])] for p in lock["package"]}
+    """Every lock package reachable from ``roots`` (markers ignored: pip applies them).
+
+    An edge's ``extra = ["x"]`` also pulls the target's ``optional-dependencies.x``.
+    A name the lock forks into several entries (``resolution-markers``) stops the
+    walk: which entry the build host gets is not this script's call.
+    """
+    entries: dict[str, list[dict]] = {}
+    for pkg in lock["package"]:
+        entries.setdefault(pkg["name"], []).append(pkg)
     seen: set[str] = set()
-    todo = list(roots)
+    todo = [{"name": root} for root in roots]
     while todo:
-        name = todo.pop()
-        if name not in seen:
-            seen.add(name)
-            todo.extend(graph[name])
-    return seen
+        dep = todo.pop()
+        name = dep["name"]
+        if len(entries[name]) > 1:
+            raise SystemExit(f"uv.lock forks {name} into {len(entries[name])} entries")
+        pkg = entries[name][0]
+        groups = {name: pkg.get("dependencies", [])}
+        groups |= {f"{name}[{e}]": pkg["optional-dependencies"][e] for e in dep.get("extra", [])}
+        for key, edges in groups.items():
+            if key not in seen:
+                seen.add(key)
+                todo.extend(edges)
+    return {key for key in seen if "[" not in key}
 
 
 def export(repo_root: Path) -> list[str]:
