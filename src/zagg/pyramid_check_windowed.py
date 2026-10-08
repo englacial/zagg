@@ -21,8 +21,8 @@ unwindowed counterpart, and the harness holds it to what spec §4.2–§4.6 stat
   node has, and requires: every cell to equal the k-way fold across them
   under each field's law (:func:`zagg.pyramid_check_core._check_node`, the
   same value laws as every other level); ``regime: stage-merge`` with
-  ``merges_from_raw`` one more than its sources' — 2 at a gather level, 3 at
-  a merge level, derived from the geometry; ``source_windows`` equal to the
+  ``merges_from_raw`` one more than its sources' — the deepest its
+  per-window overviews record, plus one; ``source_windows`` equal to the
   windows actually there; ``source_children`` and ``generation`` equal to
   the consumed overviews' own blocks, summed. A fold that consumed fewer
   windows than the node now holds is STALE and fails by name. Undeclared, the
@@ -699,13 +699,14 @@ def _window_checks(
     # The finisher's per-entry actuals describe the per-window ladder (§4.4).
     orders = [k for k, _ in ladder]
     declared_any = {k: sorted({n for w in by_window for n in declared[w][k]}) for k in orders}
-    landed = {
-        k: {
-            n: all(probes[w].get(n) is not None for w in by_window if n in declared[w][k]) or None
-            for n in declared_any[k]
-        }
-        for k in orders
-    }
+    # A node counts as landed when every window declaring it committed its
+    # overview; the first window's attrs stand for it (the recorded depth is
+    # the ladder's, the same in every window).
+    landed: dict = {k: {} for k in orders}
+    for k in orders:
+        for n in declared_any[k]:
+            held = [probes[w].get(n) for w in by_window if n in declared[w][k]]
+            landed[k][n] = held[0] if held and all(a is not None for a in held) else None
     raw_entries = (harness.manifest.get("pyramid") or {}).get("overviews") or []
     _actuals_errors(
         raw_entries, harness.shard_order, harness, errors, counted, landed, declared_any
@@ -985,7 +986,7 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
     """
     from zagg.pyramid_check_v2 import _as_int
     from zagg.sweep_overview import OVERVIEW_ATTR
-    from zagg.sweep_stage import STAGE_GATHER, STAGE_MERGE, classify_level
+    from zagg.sweep_stage import STAGE_MERGE
 
     name = f"{node}[all]"
     if not isinstance(prov, dict):
@@ -1003,13 +1004,17 @@ def _all_time_provenance(sources, node, k, r, prov, held, n_expected, errors) ->
             f"{name}: regime {prov.get('regime')!r} != {STAGE_MERGE!r} — the all-time fold is a "
             f"merge across windows at every level (§4.4)"
         )
-    gather = classify_level(r, shard_order=sources.shard_order) == STAGE_GATHER
-    expected_mfr = 2 if gather else 3
+    source_depths = [
+        _as_int(attrs[OVERVIEW_ATTR].get("merges_from_raw")) or 1
+        for attrs in held.values()
+        if isinstance(attrs, dict) and isinstance(attrs.get(OVERVIEW_ATTR), dict)
+    ]
+    expected_mfr = 1 + max(source_depths, default=1)
     if _as_int(prov.get("merges_from_raw")) != expected_mfr:
         out.append(
             f"{name}: merges_from_raw {prov.get('merges_from_raw')} != {expected_mfr} — one more "
-            f"than its per-window sources', which are "
-            f"{'gathers (1)' if gather else 'merges (2)'} at cells {r} (§4.4)"
+            f"than the deepest of its per-window sources ({sorted(set(source_depths))}) at "
+            f"cells {r} (§4.4)"
         )
     if not prov.get("run_id"):
         out.append(f"{name}: no run_id in the zagg-overview/2 attrs (§4.4)")

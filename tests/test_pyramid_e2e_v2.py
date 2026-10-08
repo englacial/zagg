@@ -17,7 +17,8 @@ to CATCH each break — the acceptance gate must be able to fail.
 Geometry: shard order 3, cell order 6, declared leaf resolution [5]
 (``d = 2``), so the fixed ladder exercises all three level shapes —
 ``(2, [4])`` a stage-GATHER above the shard order, ``(1, [3])`` a gather of
-the node-order members, ``(0, [2])`` a stage-MERGE of the relayed partials.
+the node-order members, ``(0, [2])`` a stage-MERGE cascading the ``(1, [3])``
+artifacts (issue #620).
 """
 
 import json
@@ -193,20 +194,16 @@ class TestV2FixtureE2E:
         # 3/8 geometry, no group 5 — is refused at DECLARATION by name.
         with pytest.raises(ValueError, match=r"column tier must be contiguous.*missing \[5\]"):
             validate_overviews([6, 4], parent_order=SHARD_ORDER, child_order=8)
-        # A hand-built manifest bypasses that gate. Review finding (issue
-        # #538): such a store used to relay res 5, a group no leaf column
-        # holds, so ``_gather_slabs`` read nothing and every above-shard MERGE
-        # level silently stayed at fill. The relay comes from
-        # ``raw_fold_boundary`` itself, so the backstop still populates every
-        # merge level — and the harness's declaration leg names the gap.
-        from zagg.column import column_resolutions, relay_resolution
+        # A hand-built manifest bypasses that gate. The ladder's merges cascade
+        # from the gather above them (issue #620) and need no leaf member of
+        # their own, so every merge level is populated whatever the column
+        # tier carries — and the harness's declaration leg names the gap.
+        from zagg.column import column_resolutions
 
         manifest = _build_store(tmp_path, overviews=[6, 4], cell_order=8)
         levels = manifest["pyramid"]["overviews"]
         assert 5 not in column_resolutions(levels, SHARD_ORDER)
-        assert relay_resolution(levels, SHARD_ORDER, 8) == SHARD_ORDER
-        # ladder: (2, [3]) gathers, (1, [2]) and (0, [1]) MERGE the relay —
-        # the merge levels are the ones the absent relay left all-zero.
+        # ladder: (2, [3]) gathers, (1, [2]) and (0, [1]) cascade from it.
         for rel, order in (("-3/1/1", 3), ("-3/1", 2), ("-3", 1), ("-4", 1)):
             counts = _node_group(tmp_path, rel, order, mode="r")["count"][:]
             assert int(counts.sum()) > 0, (rel, order, counts)
@@ -372,9 +369,10 @@ class TestV2Provenance:
         assert entry["status"] == "fail"
         assert any("regime" in m and "stage-merge" in m for m in entry["mismatches"])
 
-    def test_gen3_merges_from_raw_is_caught(self, tmp_path):
-        # Never 3 for an upfront level (§4.4): gen 3 belongs only to the
-        # append-later cascade regime.
+    def test_a_depth_not_one_more_than_its_childrens_is_caught(self, tmp_path):
+        # The (0, [2]) merge cascades the (1, [3]) gathers, which record 1:
+        # its depth is 2, and a stamp of 3 disagrees with its own sources
+        # (§4.4, issue #620).
         _build_store(tmp_path)
         self._edit_node_attrs(
             tmp_path, "-3", lambda a: a["zagg_overview"].update(merges_from_raw=3)
@@ -682,9 +680,10 @@ class TestV2Corruption:
         assert report["partial_columns"] == ["-3111"]
 
     def test_broken_column_group_fails_leaf_parity(self, tmp_path):
-        # Corrupt a column's relay member (the res-5 boundary partial, issue
-        # #538): the §4.6 from-leaves parity catches it, and so does the merge
-        # level that consumed the original.
+        # Corrupt a column's res-5 boundary member: the §4.6 from-leaves
+        # parity catches it. No ladder level reads that member (the gathers
+        # read 4 and 3, the merge its children's artifacts), so the ladder
+        # stays clean — the column is the only artifact that moved.
         _build_store(tmp_path)
         group = _column_group(tmp_path, "-3/1/1/1", 5)
         counts = group["count"][:]
@@ -693,14 +692,30 @@ class TestV2Corruption:
         report = validate_pyramid(str(tmp_path), full=True)
         assert report["checks"]["counts"]["status"] == "fail"
         mismatches = report["checks"]["counts"]["mismatches"]
-        assert any(m.startswith("-3111[") for m in mismatches), mismatches  # column vs leaf
-        assert any(m.startswith("-3[") for m in mismatches), mismatches  # merge level vs column
+        assert {m.split("[")[0] for m in mismatches} == {"-3111"}, mismatches
+
+    def test_a_broken_child_artifact_fails_the_merge_above_it(self, tmp_path):
+        # The merge level's sources are its children's artifacts (issue #620):
+        # corrupt the (1, [3]) gather at -31 and the (0, [2]) merge at -3,
+        # re-folded from it, disagrees — as does the gather itself against
+        # the columns it concatenated.
+        _build_store(tmp_path)
+        group = _node_group(tmp_path, "-3/1", 3)
+        counts = group["count"][:]
+        j = int(np.flatnonzero(counts > 0)[0])
+        counts[j] += 5
+        group["count"][:] = counts
+        report = validate_pyramid(str(tmp_path), full=True)
+        assert report["checks"]["counts"]["status"] == "fail"
+        mismatches = report["checks"]["counts"]["mismatches"]
+        assert {m.split("[")[0] for m in mismatches} == {"-31", "-3"}, mismatches
 
     def test_broken_node_member_fails_parity_at_its_gather(self, tmp_path):
-        # The node-order member is a flat second merge now, consumed by the
+        # The node-order member is a flat second merge, consumed by the
         # cells-3 GATHER at order 2 — never by a merge: the column parity (vs
         # the boundary group) and that gather level catch it, and the merge
-        # level above, which reads the intact relay, stays clean.
+        # level above, which reads the gather's committed artifact, stays
+        # clean.
         _build_store(tmp_path)
         group = _column_group(tmp_path, "-3/1/1/1", 3)
         counts = group["count"][:]

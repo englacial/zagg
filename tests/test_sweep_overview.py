@@ -1968,26 +1968,6 @@ class TestLocatedDeclarationGate:
         assert result["families"]["overview"]["failed"] == 1
         assert result["families"]["overview"]["written"] == 0
 
-    def test_the_cascade_refuses_an_unimplemented_shape(self, tmp_path):
-        # Same check on the fold-of-folds path, which reads the OVERVIEW's own
-        # sibling. ``_cascade_node`` wraps this call in its per-child guard, so
-        # the raise becomes a loud skip there (``failed`` + ``unreadable``).
-        from zagg.sweep_overview import _fold_child
-
-        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
-        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0], 5: [9.0]})
-        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
-        store = open_store(f"{tmp_path}/-3/1/all.zarr")
-        fine = zarr.open_group(store, path="3", mode="r+", zarr_format=3)
-        assert _fold_child(fine, LOCATED_FIELDS_DECL, 4, 4, "fine") is not None
-        fine["h_tdigest_locations"].attrs["located"] = {
-            "spec": "zagg-located/1",
-            "shape": "per-cell",
-            "grammar": "mortie-morton/1",
-        }
-        with pytest.raises(ValueError, match="is not implemented"):
-            _fold_child(fine, LOCATED_FIELDS_DECL, 4, 4, "fine")
-
 
 class TestOverviewWriter:
     def test_folds_leaves_at_every_declared_order(self, tmp_path):

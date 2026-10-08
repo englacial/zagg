@@ -13,27 +13,30 @@ is not a multiple of the width. A worker owning an order-``D`` subtree is a
 :mod:`zagg.sweep_partition` partition with the split at ``D``: same prefix
 ownership, same disjointness.
 
-**The merge-source law (espg ruling, 2026-08-09, issue #384).** A stage
-worker reads exactly its ``4^width`` immediate child columns, ``width``
-orders down — nothing ever reads deeper. Each worker's own column carries,
-as a pure gather, the **leaf relay-member partial set for its whole
-subtree** (the relay: the leaf columns' res-``shard_order + 2`` member —
-:func:`zagg.column.relay_resolution`, the coarsest member still folded from
-raw since issue #538 moved the leaf tier's coarser members onto a flat
-second merge) alongside whatever gatherable members the parent tuple needs.
-Every merge, at every level, in every tuple, consumes **only the relayed
-gen-1 partials** — never the worker's own outputs, never a previously merged
-tier — so the merge tree is a fixed function of the store, independent of
-grouping: builds at ``tuple_width=1`` and ``tuple_width=3`` are
-byte-identical, and every upfront merge level records ``merges_from_raw: 2``
-uniformly (gather levels carry gen-1 content untouched, ``merges_from_raw:
-1``). Gen 3 belongs only to the append-later cascade regime (#381 point (7)),
-which is unchanged and remains the path for pre-column ``/1`` stores.
+**The cascade (espg ruling, 2026-10-08, issue #620).** A ladder level folds
+from the level below it, and nothing is ever re-read from the leaf tier
+above the first merge. A **gather** level (``cells >= shard_order``) is a
+concatenation of the child columns' members at its own resolution — the
+leaf columns' for the finest tuple, the stage columns' (which relay those
+members upward as a pure gather) for a coarser one. A **merge** level
+(``cells < shard_order``) folds its children's artifacts at the next finer
+declared level — four children, ``4^(r' - k')`` cells each, ``4^(r' - r)``-
+to-one — through :func:`zagg.sweep_fold.cascade_fold`, the one fold engine
+the ``/1`` sweep runs too. Inside a tuple the coarser orders fold from the
+nodes the same unit has just folded, in memory; the finest merge of a tuple
+reads the previous tuple's artifacts off the store. Either way the input per
+node is four slabs, constant in the subtree's leaf count: the v3 ladder's
+order-0 node read 18.9M relay cells and the dense order-1 node could not
+finish inside 900 s; a cascaded node reads 1,024 and writes 256. The values
+are a fixed function of the ladder, so a build is the same at any tuple
+width; ``merges_from_raw`` records the true fold depth — 1 for a gather,
+one more than its sources' for a merge — which a reader tolerates at any
+value (spec §4.4/§4.5).
 
 **Source classification is derived, not hardcoded**: a level ``(node k,
 cells r)`` is a **gather** when ``r >= shard_order`` (its cells nest within
 single child footprints — concatenation of child members) and a **merge**
-otherwise (its cells span leaves — a k-way fold of relayed partials).
+otherwise (its cells span leaves — the cascade).
 
 **Scope** (#381 point (11)) is an optional node-prefix set — a MOC, the same
 ownership predicate as partitions; a shardmap is sugar (its keys are already
@@ -93,7 +96,7 @@ import numpy as np
 from zagg.sweep_fold import (
     ColumnMovedError,
     _gather_slabs,
-    _merge_slabs,
+    cascade_fold,
     iter_gather,
     refold_on_move,
 )
@@ -182,8 +185,9 @@ def stage_tuples(shard_order: int, *, tuple_width: int = DEFAULT_TUPLE_WIDTH) ->
     ``{"dispatch": D, "orders": [finest..D], "child_order": C}`` where ``C``
     is the order of the child columns the tuple's workers read — the previous
     tuple's dispatch order, or ``shard_order`` (the leaf columns) for the
-    finest tuple. The grouping changes no bytes (#381 point (6) + the
-    merge-source law): it is a dispatch knob, never grammar.
+    finest tuple. The grouping changes no values (#381 point (6): the
+    cascade folds the same artifacts whether in memory or off the store): it
+    is a dispatch knob, never grammar.
     """
     shard_order, tuple_width = int(shard_order), int(tuple_width)
     if tuple_width < 1:
@@ -231,44 +235,51 @@ def classify_level(cells: int, *, shard_order: int) -> str:
 
     Derived, never hardcoded: cells at or finer than the shard order nest
     within single child footprints (leaf columns carry those members, stage
-    columns relay them) — concatenation. Coarser cells span leaves — a k-way
-    merge of the relayed gen-1 partials (:func:`zagg.column.relay_resolution`).
+    columns relay them) — concatenation. Coarser cells span leaves — the
+    cascade over the children's artifacts (:func:`zagg.sweep_fold.cascade_fold`).
     """
     return STAGE_GATHER if int(cells) >= int(shard_order) else STAGE_MERGE
 
 
-def column_members(
-    levels: list,
-    node_order: int,
-    *,
-    shard_order: int,
-    cell_order: int,
-    relay: int | None = None,
-) -> list[int]:
+def column_members(levels: list, node_order: int, *, shard_order: int) -> list[int]:
     """Resolutions a stage column at ``node_order`` carries, finest first.
 
-    The ``relay`` member (:func:`zagg.column.relay_resolution` — the
-    subtree's leaf res-``shard_order + 2`` partials, the ruled merge-source
-    tier; derived from ``levels`` and ``cell_order`` when the levels carry
-    the leaf entry that places the members, else passed by the sweep, whose
-    :func:`ladder_entries` exclude it)
-    unconditionally, plus every gatherable member (``cells >= shard_order``)
-    some coarser level (``node < node_order``) will gather. All members are
-    pure gathers of the child columns' members at the same resolution —
-    gen-1 content, untouched, so ``merges_from_raw`` stays 1 for every group
-    and a parent merge that consumes the relay is exactly 2 merges from raw.
+    Every gatherable member (``cells >= shard_order``) some coarser level
+    (``node < node_order``) will gather, and nothing else: a merge level
+    folds its children's artifacts, never a column (issue #620). Each member
+    is a pure gather of the child columns' member at the same resolution —
+    gen-1 content, untouched, ``merges_from_raw`` 1. Empty when no coarser
+    level gathers, in which case the dispatch node writes no column.
     """
-    from zagg.column import relay_resolution
-
     node_order, shard_order = int(node_order), int(shard_order)
-    relay = relay_resolution(levels, shard_order, cell_order) if relay is None else int(relay)
     gatherable = {
         int(c)
         for e in levels
         for c in e["cells"]
         if int(e["node"]) < node_order and int(c) >= shard_order
     }
-    return sorted(gatherable | {relay}, reverse=True)
+    return sorted(gatherable, reverse=True)
+
+
+def finer_levels(levels: list) -> dict:
+    """``{order: (source order, source cells)}`` — each ladder level's cascade source.
+
+    A level folds from the next FINER declared level (the every-order ladder
+    makes that ``k + 1``, §4.4; a hand-built ladder with gaps still folds
+    from its nearest finer entry). Only merge levels consult it; the finest
+    declared level is a gather by construction (``r = k + d >= shard_order``
+    at ``k = shard_order - 1``), so a merge always has a finer level to fold
+    from. A ladder without one for some merge level is refused by name at
+    :func:`stage_node`.
+    """
+    by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
+    out = {}
+    for k in by_order:
+        finer = [o for o in by_order if o > k]
+        if finer:
+            src = min(finer)
+            out[k] = (src, by_order[src])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +462,64 @@ class _ColumnReader:
         return self._read(res, name, slice(int(start), int(stop)))
 
 
+class _OverviewReader(_ColumnReader):
+    """Stamp-validated reads over one ladder overview — a cascade's source.
+
+    Everything :class:`_ColumnReader` gives a child column — one root GET for
+    stamp + attrs, optimistic re-validation around every read, the
+    foreign-fresh abort — over a ``zagg-overview/2`` artifact, whose
+    generation block and fold depth live in its own attrs key. What a merge
+    level folds (its children's artifacts at the next finer level) and what
+    the all-time fold folds (the node's per-window overviews).
+    """
+
+    @property
+    def provenance(self) -> dict:
+        from zagg.sweep_overview import OVERVIEW_ATTR
+
+        block = self.attrs.get(OVERVIEW_ATTR)
+        return block if isinstance(block, dict) else {}
+
+    def generation(self) -> tuple:
+        from zagg.column import stamped_generation_key
+
+        return stamped_generation_key(self.provenance.get("generation"), self.stamp)
+
+
+class _FoldedSource(_OverviewReader):
+    """A level this unit has just folded, served to the next coarser merge from memory.
+
+    The same reader surface over the fold's slabs, so a ``[2,1,0]`` unit
+    reads its order-3 children's artifacts once and folds order 1 from the
+    order-2 slabs it just wrote, order 0 from order 1's — byte-what a reader
+    opening those artifacts back off the store would serve, since the stamp
+    and attrs are the ones the writer has just recorded.
+    """
+
+    def __init__(self, path: str, res: int, fold: dict, run_id: str):
+        from zagg.sweep_overview import OVERVIEW_ATTR
+
+        self.path, self.revalidated, self.res, self.slabs = path, 0, int(res), fold["slabs"]
+        self.attrs = {
+            OVERVIEW_ATTR: {
+                "generation": fold["generation"],
+                "merges_from_raw": fold["merges_from_raw"],
+            }
+        }
+        self.stamp = {
+            "granule_count": fold["granule_count"],
+            "time_range": fold["time_range"],
+            "run_id": run_id,
+        }
+
+    def _array(self, res: int, name: str):
+        return self.slabs.get(name) if int(res) == self.res else None
+
+    def _read(self, res: int, name: str, cells: slice):
+        array = self._array(res, name)
+        return None if array is None else array[cells]
+
+
 def _readers_for(
     store,
     children: list,
@@ -504,7 +573,7 @@ def _summed_generation(rows: list) -> dict:
     """
     n, stamps, runs = 0, [], set()
     for row in rows:
-        for reader in row:
+        for reader in row or ():
             if _is_reader(reader):
                 count, timestamp, run_ids = reader.generation()
                 n += count
@@ -529,62 +598,53 @@ def _dense_rows(readers: dict, node: str, *, depth: int) -> list:
     return rows
 
 
+def _source_depth(rows: list) -> int:
+    """A merge's ``merges_from_raw``: one more than the deepest source folded."""
+    depths = [
+        int(reader.provenance.get("merges_from_raw") or 1)
+        for row in rows
+        if row is not None
+        for reader in row
+        if isinstance(reader, _OverviewReader)
+    ]
+    return 1 + max(depths, default=1)
+
+
 def _stage_fold(
     node: str,
     k: int,
     r: int,
-    readers: dict,
+    rows: list,
     fields: dict,
     *,
-    shard_order: int,
-    child_order: int,
-    relay: int,
+    regime: str,
+    src_order: int,
+    res_src: int,
     meter=None,
 ) -> dict | None:
-    """Fold one ``(artifact node, level)`` from the dispatch worker's readers.
+    """Fold one ``(artifact node, level)`` from its dense source rows.
 
-    ``readers`` is the dispatch node's ``{child decimal: [reader]}`` for ONE
-    window; this densifies to the rank range under ``node`` and folds per
-    the level's derived regime; ``relay`` is the member a merge reads
-    (:func:`zagg.column.relay_resolution`). Returns the fold dict (slabs +
-    generation + provenance) or ``None`` when no child contributed. Both
-    kernels stream their inputs block by block (:mod:`zagg.sweep_fold`,
-    issue #586 phase 4); ``meter`` accounts for what a block holds. The
-    all-time fold of a windowed store is not made here: it merges the node's
-    own per-window overviews (:func:`zagg.sweep_units.close_node`).
+    ``rows`` is the rank range of ``node``'s sources at ``src_order``, one
+    window: the child COLUMNS for a gather (concatenated at the level's own
+    resolution ``r == res_src``), the children's ARTIFACTS at the next finer
+    declared level for a merge (:func:`zagg.sweep_fold.cascade_fold` — the
+    one engine, issue #620). Returns the fold dict (slabs + generation +
+    provenance) or ``None`` when no child contributed. Both kernels stream
+    their inputs block by block (:mod:`zagg.sweep_fold`, issue #586 phase 4);
+    ``meter`` accounts for what a block holds. The all-time fold of a
+    windowed store is not made here: it merges the node's own per-window
+    overviews (:func:`zagg.sweep_units.close_node`).
     """
-    rows = _dense_rows(readers, node, depth=child_order - k)
-    n_out = 4 ** (r - k)
-    regime = classify_level(r, shard_order=shard_order)
     if regime == STAGE_GATHER:
         slabs, folded, missing, unreadable, demotions = _gather_slabs(
-            rows, fields, res=r, span=4 ** (r - child_order), n_out=n_out, meter=meter
+            rows, fields, res=r, span=4 ** (r - src_order), n_out=4 ** (r - k), meter=meter
         )
-        merges_from_raw = 1
     else:
-        slabs, folded, missing, unreadable, demotions = _merge_slabs(
-            rows,
-            fields,
-            res_src=int(relay),
-            src_per_child=4 ** (int(relay) - child_order),
-            factor=4 ** (int(relay) - r),
-            n_out=n_out,
-            meter=meter,
+        slabs, folded, missing, unreadable, demotions = cascade_fold(
+            rows, fields, k=k, r=r, src_order=src_order, res_src=res_src, meter=meter
         )
-        merges_from_raw = 2
     if folded == 0:
-        # No contributor folded cleanly — the level is not materialized, and
-        # any packed-rail record dies with it (issue #518, spec §4.3). That
-        # is load-bearing for the mis-declared-divisor shape, which fires on
-        # EVERY contributor: the `/2` level vanishes rather than landing with
-        # a `demotions` record, so the key's absence here is not evidence the
-        # rail stayed quiet. Pinned in
-        # ``tests/test_demotion_attrs.py::test_every_contributor_firing_drops_the_level``
-        # and standing for review — flipping it means making a packed-rail
-        # firing a per-field demotion rather than a whole-contributor verdict
-        # in ``_merge_slabs``'s ``broken`` set, which is committed
-        # ``source_children`` semantics predating #518.
-        return None
+        return None  # nothing contributed: the level is not materialized
     return _fold_result(
         node,
         k,
@@ -593,7 +653,7 @@ def _stage_fold(
         rows,
         slabs,
         regime=regime,
-        merges_from_raw=merges_from_raw,
+        merges_from_raw=1 if regime == STAGE_GATHER else _source_depth(rows),
         source_children=(folded, missing, unreadable),
         demotions=demotions,
     )
@@ -795,7 +855,6 @@ def write_stage_column(
     members: list,
     child_order: int,
     node_order: int,
-    relay: int,
     cell_order: int,
     generation: dict,
     window: str | None = None,
@@ -809,25 +868,22 @@ def write_stage_column(
 
     ``rows`` is the dispatch node's dense child range (reader rows, one
     window) and ``members`` the resolutions the column carries
-    (:func:`column_members`). Returns ``{"object", "source_children"}`` — the
-    basename and the relay member's coverage counters — or ``None`` when the
-    relay member folds nothing, in which case NOTHING is written and an
-    existing column is left as it was. Otherwise the committed column is
-    cleared BEFORE the streamed reads that feed it, so a read that fails
-    mid-stream leaves it cleared and unstamped: the next tuple reads the child
-    as missing (under-coverage, recorded) until a later pass rewrites it — the
-    column is a regenerable cache (spec §4.1). :func:`stage_node` therefore
-    retries a failed column once, from fresh readers, before counting it.
+    (:func:`column_members` — non-empty, refused by name otherwise). Returns
+    ``{"object", "source_children"}`` — the basename and the finest member's
+    coverage counters — or ``None`` when that member folds nothing, in which
+    case NOTHING is written and an existing column is left as it was.
+    Otherwise the committed column is cleared BEFORE the streamed reads that
+    feed it, so a read that fails mid-stream leaves it cleared and unstamped:
+    the next tuple reads the child as missing (under-coverage, recorded)
+    until a later pass rewrites it — the column is a regenerable cache (spec
+    §4.1). :func:`stage_node` therefore retries a failed column once, from
+    fresh readers, before counting it.
 
     The §4.6 column artifact shape (``zagg-column/1``) with the stage
     regime: every group is a PURE GATHER of the child columns' members at
-    the same resolution — the ``relay`` (:func:`zagg.column.relay_resolution`:
-    the subtree's leaf res-``shard_order + 2`` partials, the ruled
-    merge-source tier) plus the gatherable members coarser tuples need — so
+    the same resolution — the gatherable members coarser tuples need — so
     ``merges_from_raw`` stays 1 for every group and the artifact carries
-    gen-1 content only. The relay member is the one group a parent merge may
-    assume; ``members`` without it is refused by name. Attrs additionally
-    record the summed ``generation``
+    gen-1 content only. Attrs additionally record the summed ``generation``
     (the parent's skip-gate basis), ``source_children`` (a gather that
     under-covered says so in the artifact), and the run id; the commit stamp
     carries ``run_id`` too (lease backstop). D4 order throughout; the D20
@@ -840,7 +896,7 @@ def write_stage_column(
     the worker holds one block's inputs, not the level's. The §5 O11 record
     is accumulated across blocks (:func:`zagg.content_hash.update_hash`, one
     live digest per array) and written once, at the stamp; so are the
-    populated-cell count and the relay member's ``source_children``.
+    populated-cell count and the finest member's ``source_children``.
     """
     import hashlib
 
@@ -872,18 +928,16 @@ def write_stage_column(
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     store_kwargs = dict(store_kwargs or {})
-    node_order, child_order, relay = int(node_order), int(child_order), int(relay)
+    node_order, child_order = int(node_order), int(child_order)
     fields = composable_fields(fields)
     resolutions = sorted((int(r) for r in members), reverse=True)
-    if relay not in resolutions:
-        raise ValueError(
-            f"a stage column must carry the relay member ({relay} — the subtree's leaf "
-            f"raw-fold-boundary partials, the ruled merge-source tier); got {resolutions}"
-        )
+    if not resolutions:
+        raise ValueError(f"a stage column at node {node} with no members to carry")
     # Known BEFORE the prefix is cleared: presence alone decides which
-    # contributors the relay gather refuses, so a column whose relay member
-    # folds nothing is never started.
-    folded_n, missing, unreadable = _source_counts(rows, broken_groups(rows, fields, res=relay))
+    # contributors the gather refuses, so a column whose finest member folds
+    # nothing is never started.
+    finest = resolutions[0]
+    folded_n, missing, unreadable = _source_counts(rows, broken_groups(rows, fields, res=finest))
     if folded_n == 0:
         return None
     source_children = {
@@ -993,35 +1047,6 @@ def _node_rel(decimal: str) -> str:
     return rel(decimal)
 
 
-def _artifact_stamp(store, node, basename, run_id, run_started) -> dict | None:
-    """A stage artifact's commit stamp (``None`` when absent), foreign-gated.
-
-    The ruled backstop lives here: a skip-if-current read that encounters a
-    FOREIGN stamp written since this run started aborts loudly rather than
-    trusting or overwriting a live sibling sweep's output. One GET through
-    ``store``, the invoke's one handle at the store root (issue #610).
-    """
-    from zarr.storage import StorePath
-
-    from zagg.hive import read_commit
-    from zagg.store import zarr_view
-
-    if not basename:
-        return None
-    try:
-        stamp = read_commit(StorePath(zarr_view(store), f"{_node_rel(node)}/{basename}"))
-    except Exception as e:
-        logger.debug(f"stage sweep: cannot confirm {node}/{basename} ({e})")
-        return None
-    if _foreign_fresh(stamp, run_id, run_started):
-        raise ForeignSweepError(
-            f"stage artifact {node}/{basename} carries a fresh stamp from foreign sweep run "
-            f"{stamp.get('run_id')!r} (written {stamp.get('written_at')}); two sweeps are "
-            f"live on this store — aborting (lease backstop)"
-        )
-    return stamp
-
-
 def _artifact_entry(store, node, basename, run_id, run_started) -> dict | None:
     """A committed stage overview's skip-gate entry, read off its OWN attrs.
 
@@ -1032,8 +1057,9 @@ def _artifact_entry(store, node, basename, run_id, run_started) -> dict | None:
     written into the artifact's attrs first — so a ``(node, window)`` unit
     (issue #586 phase 4) decides skip-if-current from the one object it alone
     writes, and N concurrent window units of a node share no read-modify-write.
-    One GET, the one :func:`_artifact_stamp` already made, through the
-    invoke's one handle (issue #610); foreign-gated the same way.
+    One GET through the invoke's one handle (issue #610); foreign-gated. The
+    all-time close's gate; a window unit reads the same attrs through the
+    :class:`_OverviewReader` it keeps as the next coarser merge's source.
     """
     import zarr
 
@@ -1076,7 +1102,6 @@ def stage_node(
     windowed,
     shard_order,
     cell_order,
-    relay,
     candidates,
     run_id,
     run_started,
@@ -1088,29 +1113,37 @@ def stage_node(
 ) -> None:
     """One ``(node, window)`` stage unit: fold a dispatch node's tuple for one window.
 
-    ``window`` is the unit's window label (``None`` on an unwindowed store)
-    and ``key`` its overview key (the label, or the reserved ``all`` token of
-    an unwindowed store). ``relay`` is the merge-source member
-    (:func:`zagg.column.relay_resolution` over the manifest's FULL
-    ``overviews`` list — ``levels`` here are the above-shard
-    :func:`ladder_entries`, which exclude the leaf entry that places it).
+    The ONE entry point every ladder executor runs: the in-process pass
+    (:func:`zagg.sweep_stages.sweep_stage_pass` — the local backend and the
+    CLI), the fleet stage worker (the Lambda handler's ``stage`` role, through
+    the same pass restricted to its unit), and on a windowed store each
+    ``(node, window)`` unit; the all-time close that follows a node's window
+    units folds the node's own per-window overviews through the same kernel
+    (:func:`zagg.sweep_units.close_node`). ``window`` is the unit's window
+    label (``None`` on an unwindowed store) and ``key`` its overview key (the
+    label, or the reserved ``all`` token of an unwindowed store).
 
-    Reads the node's candidate child columns once (stamp-validated), then per
-    tuple order materializes every dirty artifact node beneath the dispatch
-    node — skip-if-current keyed on SUMMED CHILD GENERATIONS (the ratchet:
-    a healed or appended child moves the sum and forces the rewrite; a
-    content hash cannot be had without folding, so #417's count/timestamp/
-    run-id key is the gate) — and finally its own stage column (relay +
-    gatherables), unless this is the root tuple (no parent consumes it).
-    Every fold streams its inputs block by block (:mod:`zagg.sweep_fold`).
+    Per tuple order, finest first, materializes every dirty artifact node
+    beneath the dispatch node. A gather level concatenates the node's child
+    columns (read once, stamp-validated); a merge level cascades its
+    children's artifacts at the next finer declared level
+    (:func:`finer_levels`) — the ones this unit has just folded, served from
+    memory (:class:`_FoldedSource`), or read back off the store when that
+    level was current or belongs to the previous tuple. Skip-if-current keys
+    on the SUMMED SOURCE GENERATIONS (the ratchet: a healed or appended child
+    moves the sum and forces the rewrite; a content hash cannot be had
+    without folding, so #417's count/timestamp/run-id key is the gate) and on
+    the fold depth the sources imply, so an artifact folded under the relay
+    regime (``merges_from_raw`` 2 over sources at 2) is folded again once.
+    Finally its own stage column (the gatherable members coarser tuples
+    need), unless none are needed or this is the root tuple. Every fold
+    streams its inputs block by block (:mod:`zagg.sweep_fold`).
 
     ``envelope`` is whether this unit owns the node's sweep-internal envelope
     (``overview.rollup.json``). It does on an unwindowed store, where the unit
     is the node's only writer. A windowed store's window units run
     concurrently (issue #586 phase 4), so they pass ``False``: the gate reads
-    the artifact's own attrs (:func:`_artifact_entry`) and no shared object is
-    read-modify-written. The all-time fold across windows is not a window
-    unit's work (:func:`zagg.sweep_units.close_node`).
+    the artifact's own attrs and no shared object is read-modify-written.
     """
     from functools import partial
 
@@ -1119,11 +1152,27 @@ def stage_node(
     from zagg.windows import union_time_range
 
     dispatch, child_order = int(stage["dispatch"]), int(stage["child_order"])
-    relay = int(relay)
     level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
     orders = [k for k in stage["orders"] if k in level_by_order]
-    children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
+    finer = finer_levels(levels)
+    regimes = {k: classify_level(level_by_order[k], shard_order=shard_order) for k in orders}
+    for k in orders:
+        if regimes[k] == STAGE_MERGE and k not in finer:
+            raise ValueError(
+                f"ladder level {k} (cells {level_by_order[k]}) is a merge with no finer declared "
+                f"level to cascade from — a malformed declaration (§4.4)"
+            )
+    members = column_members(levels, dispatch, shard_order=shard_order) if dispatch else []
+    basename = _overview_basename(key)
     reader_args = dict(run_id=run_id, run_started=run_started, store_kwargs=store_kwargs)
+    # The child columns are read only where something gathers from them: a
+    # tuple of merge levels needing no column reads its children's artifacts
+    # alone (the [2,1,0] tuple of the reference geometry).
+    children = (
+        sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
+        if members or STAGE_GATHER in regimes.values()
+        else []
+    )
     readers = _readers_for(store, children, [window], counts=counts, **reader_args)
     retired: list = []
 
@@ -1133,30 +1182,68 @@ def stage_node(
         retired.extend(r for row in readers.values() for r in row if _is_reader(r))
         readers.update(_readers_for(store, children, [window], counts={"failed": 0}, **reader_args))
 
+    # Per order, the artifact source of each node at it: what this unit
+    # folded (in memory), opened for its skip gate, or read back for a merge.
+    sources: dict = {}
+
+    def _open(target):
+        try:
+            reader = _OverviewReader(f"{_node_rel(target)}/{basename}", store=store, **reader_args)
+        except ForeignSweepError:
+            raise
+        except Exception as e:
+            logger.warning(f"stage sweep: unreadable overview {target}/{basename} ({e})")
+            return UNREADABLE
+        return reader if reader.committed and reader.provenance else None
+
+    def _source_rows(target, k):
+        src_order = finer[k][0]
+        at = sources.setdefault(src_order, {})
+        for desc in {_node_at(d, src_order) for d in candidates if d.startswith(target)}:
+            if desc not in at:
+                at[desc] = _open(desc)
+        return _dense_rows({d: [s] for d, s in at.items()}, target, depth=src_order - k)
+
+    def _refresh_sources(k):
+        at = sources[finer[k][0]]
+        for desc, src in list(at.items()):
+            if _is_reader(src) and not isinstance(src, _FoldedSource):
+                at[desc] = _open(desc)
+
     dispatch_level_current = False
     for k in orders:
         r = level_by_order[k]
-        regime_plan = classify_level(r, shard_order=shard_order)
+        regime = regimes[k]
+        if regime == STAGE_GATHER:
+            src_order, res_src = child_order, r
+            rows_of, refresh = (
+                (lambda t: _dense_rows(readers, t, depth=child_order - k)),
+                _fresh_readers,
+            )
+        else:
+            src_order, res_src = finer[k]
+            rows_of, refresh = (lambda t: _source_rows(t, k)), partial(_refresh_sources, k)
+        at_k = sources.setdefault(k, {})
         for target in sorted({_node_at(d, k) for d in candidates if d.startswith(node)}):
-            rows = [row for c, row in readers.items() if c.startswith(target)]
+            rows = rows_of(target)
             fresh_gen = _summed_generation(rows)
+            depth = 1 if regime == STAGE_GATHER else _source_depth(rows)
+            mine = _open(target)
             if envelope:
                 stored = _read_envelope(store, target)
                 entries = dict((stored or {}).get("windows") or {})
                 entry = entries.get(key)
             else:
-                entry = _artifact_entry(store, target, _overview_basename(key), run_id, run_started)
+                entry = {"object": basename, **mine.provenance} if _is_reader(mine) else None
             if (
                 isinstance(entry, dict)
                 and generation_key(entry.get("generation")) == generation_key(fresh_gen)
-                and entry.get("regime") == regime_plan
+                and entry.get("regime") == regime
+                and entry.get("merges_from_raw") == depth
                 # An envelope entry is a claim about another object: confirm
-                # its stamp. An attrs entry was read off the committed artifact.
-                and (
-                    not envelope
-                    or _artifact_stamp(store, target, entry.get("object"), run_id, run_started)
-                    is not None
-                )
+                # the artifact is committed. An attrs entry was read off it.
+                and _is_reader(mine)
+                and (not envelope or entry.get("object") == basename)
             ):
                 counts["current"] += 1
                 _accumulate_actuals(
@@ -1169,30 +1256,31 @@ def stage_node(
                     entry.get("merges_from_raw"),
                     entry.get("source_children"),
                 )
+                at_k[target] = mine
                 if k == dispatch and target == node:
                     dispatch_level_current = True
                 continue
+            at_k[target] = None  # until written: a failed or empty level is missing
             try:
                 fold = refold_on_move(
-                    partial(
-                        _stage_fold,
+                    lambda: _stage_fold(
                         target,
                         k,
                         r,
-                        readers,
+                        rows_of(target),
                         fields,
-                        shard_order=shard_order,
-                        child_order=child_order,
-                        relay=relay,
+                        regime=regime,
+                        src_order=src_order,
+                        res_src=res_src,
                         meter=meter,
                     ),
-                    _fresh_readers,
+                    refresh,
                     f"node {target} window {key!r}",
                 )
             except ColumnMovedError as e:
                 logger.warning(f"stage sweep: fold failed at node {target} window {key!r} ({e})")
                 counts["failed"] += 1
-                _fresh_readers()  # the next artifact starts from unpinned readers
+                refresh()  # the next artifact starts from unpinned readers
                 continue
             if fold is None:
                 counts["empty"] += 1
@@ -1219,6 +1307,7 @@ def stage_node(
                 counts["failed"] += 1
                 continue
             counts["written"] += 1
+            at_k[target] = _FoldedSource(f"{_node_rel(target)}/{basename}", r, fold, run_id)
             _accumulate_actuals(
                 level_actuals,
                 k,
@@ -1258,11 +1347,8 @@ def stage_node(
     counts["revalidated"] += sum(r.revalidated for r in retired) + sum(
         r.revalidated for row in readers.values() for r in row if _is_reader(r)
     )
-    if dispatch == 0:
-        return
-    members = column_members(
-        levels, dispatch, shard_order=shard_order, cell_order=cell_order, relay=relay
-    )
+    if not members:
+        return  # the root tuple, or nothing coarser gathers from this node
     fresh_gen = _summed_generation(list(readers.values()))
     if dispatch_level_current and _stage_column_current(
         store_root, node, window, fresh_gen, run_id, run_started, store_kwargs
@@ -1286,7 +1372,6 @@ def stage_node(
             members=members,
             child_order=child_order,
             node_order=dispatch,
-            relay=relay,
             cell_order=cell_order,
             generation=_summed_generation(list(readers.values())),
             window=window,
@@ -1373,22 +1458,20 @@ def _accumulate_actuals(
     (skip-if-current makes that cheap), and summing per visit would inflate
     the manifest's coverage counts by the visit count (review finding).
     :func:`aggregate_actuals` sums the per-artifact rows once, at the end.
-    Per-window folds only — the all-time fold is a separate family of
-    artifacts whose regime rides their own attrs, and letting its
-    ``stage-merge`` override a gather level's recorded regime would
-    misdescribe the product declaration the entry stands for.
+    ``merges_from_raw`` is the level's MAXIMUM over its artifacts — the
+    leaf entry's convention (§4.5): a scoped pass can leave a level's
+    artifacts at different depths for a while. Per-window folds only — the
+    all-time fold is a separate family of artifacts whose regime rides their
+    own attrs, and letting its ``stage-merge`` override a gather level's
+    recorded regime would misdescribe the product declaration the entry
+    stands for.
     """
     if level_actuals is None:
         return
     entry = level_actuals.setdefault(
-        int(k),
-        {
-            "cells": int(r),
-            "regime": regime,
-            "merges_from_raw": int(merges_from_raw or 0),
-            "children": {},
-        },
+        int(k), {"cells": int(r), "regime": regime, "merges_from_raw": 0, "children": {}}
     )
+    entry["merges_from_raw"] = max(entry["merges_from_raw"], int(merges_from_raw or 0))
     entry["children"][f"{target}|{key}"] = {
         name: int((source_children or {}).get(name) or 0)
         for name in ("folded", "missing", "unreadable")

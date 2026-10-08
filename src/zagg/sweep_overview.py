@@ -130,9 +130,9 @@ def note_demotion(acc: dict, field: str, reason: str, of, *, cells=None) -> None
     Always the case in the ``word-missing`` direction (the fold blanks them);
     in the ``divisor-missing`` direction only where contributors own DISJOINT
     spans — the cascade, where a skipped child's span stays fill. At a leaf
-    fold (and a stage merge) many contributors share each output cell, so a
-    dropped one blanks nothing and the caller passes no ``cells``: its
-    absence is ordinary under-coverage for the one field.
+    fold (and the all-time fold across windows) many contributors share each
+    output cell, so a dropped one blanks nothing and the caller passes no
+    ``cells``: its absence is ordinary under-coverage for the one field.
     """
     entry = acc.setdefault((str(field), str(reason)), {"of": of, "contributors": 0, "cells": set()})
     entry["contributors"] += 1
@@ -2194,15 +2194,17 @@ def _cascade_node(
     not its subtree's leaves. Every overview slab in the tree holds the same
     ``4^(cell_order - shard_order)`` cells (constant tree depth, §4.4), so a
     child's slab folds ``4^gap``-to-one into the ``4^(cell_order-shard_order)
-    / 4^gap`` output cells the child owns — a **disjoint** span per child
-    (assignment, never accumulation). Two consequences, both the point of the
-    issue:
+    / 4^gap`` output cells the child owns — a **disjoint** span per child.
+    Two consequences, both the point of the issue:
 
-    * per-node resident memory is the output slab plus ONE child slab, whose
-      cells each hold at most delta centroids — constant in the subtree size,
-      where :func:`_fold_node` grows with it (it accumulates the whole
-      subtree's centroid lists per output cell before merging);
+    * per-node resident memory is one fold block's inputs — constant in the
+      subtree size, where :func:`_fold_node` grows with it (it accumulates
+      the whole subtree's centroid lists per output cell before merging);
     * each leaf is read once for the WHOLE pyramid, by the finest level only.
+
+    The fold itself is :func:`zagg.sweep_fold.cascade_fold` — the ONE engine
+    the staged ``/2`` ladder runs too (issue #620); this function only opens
+    the children and shapes the ``/1`` fold dict around it.
 
     The cost is accuracy: a cascaded digest is a merge of merges, so it
     inherits the documented order-dependence of the t-digest merge and drifts
@@ -2219,92 +2221,44 @@ def _cascade_node(
     those attrs BEFORE the commit stamp, so a stamped overview always carries
     them, and anything else at that path is not this fold's input.
     """
-    import zarr
-
-    from zagg.hive import read_commit
-    from zagg.store import open_store
+    from zagg.sweep_fold import cascade_fold
+    from zagg.sweep_stage import UNREADABLE, _ColumnReader, _is_reader
     from zagg.windows import union_time_range
 
     target_order = cell_order - (shard_order - k)
-    n_cells = 4 ** (target_order - k)
-    factor = 4 ** (source_order - k)
-    span = n_cells // factor
     source_cell_order = target_order + (source_order - k)
-    slabs = {name: _empty_slab(meta, n_cells) for name, meta in fields.items()}
-    # A located field's sibling gets its own output slab (ruling 4 on issue
-    # #410): ``_fold_child`` returns it beside the payload, and children own
-    # disjoint spans, so it assigns exactly as every other slab does.
-    for name, meta in fields.items():
-        if meta["class"] != "approximate":
-            continue
-        for _kwarg, sibling_name in field_companions(name, meta):
-            slabs[sibling_name] = np.full(n_cells, b"", dtype=object)
     basename = _overview_basename(key)
-    n_sources, n_leaves, timestamps, granules, ranges = 0, 0, [], 0, []
-    missing, unreadable = 0, 0
-    # The packed rail's artifact record (issue #518): each child the rail
-    # fired on, per field and direction, for the ``demotions`` attrs key.
-    demoted: dict = {}
     children = sorted({_node_at(d, source_order) for d in node_shards})
+    rows: list = [None] * 4 ** (source_order - k)
     for child in children:
         path = f"{store_root}/{_node_rel(child)}/{basename}"
         try:
-            child_store = open_store(path, read_only=True, **store_kwargs)
-            stamp = read_commit(child_store)
-        except Exception as e:
-            logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
-            counts["failed"] += 1
-            unreadable += 1
-            continue
-        if stamp is None:
-            missing += 1  # never generated, or unstamped debris (D4)
-            continue
-        # Fold the whole child BEFORE touching the slabs, so a corrupt child
-        # skips cleanly instead of half-applying (the leaf path's discipline).
-        try:
-            root = zarr.open_group(child_store, path="", mode="r", zarr_format=3)
-            provenance = root.attrs.get(OVERVIEW_ATTR)
+            # No run of its own: a /1 stamp carries no run id, so the
+            # foreign-fresh guard never fires here.
+            reader = _ColumnReader(path, run_id=None, run_started="", store_kwargs=store_kwargs)
+            provenance = reader.attrs.get(OVERVIEW_ATTR)
             provenance = dict(provenance) if isinstance(provenance, dict) else {}
-            if root.attrs.get(ROLE_ATTR) != "overview" or provenance.get("order") != source_order:
+            if reader.committed and (
+                reader.attrs.get(ROLE_ATTR) != "overview" or provenance.get("order") != source_order
+            ):
                 raise ValueError(
-                    f"role {root.attrs.get(ROLE_ATTR)!r} / declared order "
+                    f"role {reader.attrs.get(ROLE_ATTR)!r} / declared order "
                     f"{provenance.get('order')!r} is not an overview at order {source_order}"
                 )
-            group = zarr.open_group(
-                child_store, path=str(source_cell_order), mode="r", zarr_format=3
-            )
-            if group["morton"].shape != (n_cells,):
-                raise ValueError(
-                    f"morton shape {group['morton'].shape} is not the {n_cells}-cell "
-                    f"overview slab of order {source_order}"
-                )
-            partials, notes = _fold_child(group, fields, factor, span, path)
         except Exception as e:
             logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
             counts["failed"] += 1
-            unreadable += 1
+            rows[_rel_rank(child, node)] = [UNREADABLE]
             continue
-        start = _rel_rank(child, node) * span
-        for field, reason, of in notes:
-            # BOTH directions leave the child's whole span at the fill word,
-            # so the span is the record's ``cells`` either way — unlike the
-            # leaf fold, where a dropped contributor blanks nothing because
-            # SIBLING leaves' words cover the same output cells. Children own
-            # DISJOINT spans here (the assignment below), so a child skipped
-            # for the field leaves span cells nothing else can ever cover
-            # (review finding).
-            note_demotion(demoted, field, reason, of, cells=range(start, start + span))
-        for name, partial in partials.items():
-            # Children own disjoint spans of the parent slab, so this is an
-            # assignment — the accumulate-then-merge the leaf fold needs (and
-            # pays for in memory) has no counterpart here.
-            slabs[name][start : start + span] = partial
-        n_sources += 1
-        n_leaves += int((provenance.get("generation") or {}).get("n_leaves") or 0)
-        timestamps.append((provenance.get("generation") or {}).get("max_leaf_timestamp"))
-        granules += int(stamp.get("granule_count") or 0)
-        if stamp.get("time_range") is not None:
-            ranges.append(stamp["time_range"])
+        rows[_rel_rank(child, node)] = [reader if reader.committed else None]
+    slabs, n_sources, missing, unreadable, demotions = cascade_fold(
+        rows,
+        fields,
+        k=k,
+        r=target_order,
+        src_order=source_order,
+        res_src=source_cell_order,
+    )
     if missing or unreadable:
         # The cascade folds what is ON DISK, where the leaf fold folds every
         # leaf the MOC knows about: a child the fold could not use leaves its
@@ -2322,15 +2276,18 @@ def _cascade_node(
         )
     if n_sources == 0:
         return None
-    stamps = [t for t in timestamps if t is not None]
+    folded = [row[0] for row in rows if row is not None and _is_reader(row[0])]
+    generations = [reader.attrs.get(OVERVIEW_ATTR, {}).get("generation") or {} for reader in folded]
+    stamps = [g.get("max_leaf_timestamp") for g in generations if g.get("max_leaf_timestamp")]
+    ranges = [r.stamp["time_range"] for r in folded if r.stamp.get("time_range") is not None]
     fold = {
         "slabs": slabs,
         "generation": {
-            "n_leaves": int(n_leaves),
+            "n_leaves": sum(int(g.get("n_leaves") or 0) for g in generations),
             "max_leaf_timestamp": max(stamps) if stamps else None,
         },
         "content_hash": _content_hash(node, k, target_order, fields, slabs),
-        "granule_count": granules,
+        "granule_count": sum(int(r.stamp.get("granule_count") or 0) for r in folded),
         "time_range": union_time_range(*ranges) if ranges else None,
         "fold_source": "cascade",
         "fold_from_order": int(source_order),
@@ -2340,132 +2297,9 @@ def _cascade_node(
             "unreadable": int(unreadable),
         },
     }
-    if demoted:
-        fold["demotions"] = demotion_records(demoted)
+    if demotions:
+        fold["demotions"] = demotions
     return fold
-
-
-def _fold_child(group, fields, factor, span, path) -> tuple[dict, list]:
-    """One child overview's slabs, folded ``factor``-to-one into ``span`` cells.
-
-    Digest cells are merged group by group, so at most ``factor`` decoded
-    digests are ever resident — the bound that makes the cascade fold's
-    per-node memory independent of the subtree (issue #376). A field absent
-    from the child contributes nothing (schema evolution, as at the leaves).
-
-    A located field's ``{field}_locations`` sibling folds in the SAME group as
-    its payload (ruling 4 on issue #410): the merged words are keyed on the
-    centroid partition that merge produced, so the pair cannot be folded in two
-    passes. The cascade therefore reads and writes both arrays here, and its
-    words sit at heterogeneous orders exactly as the leaf fold's do (spec §9.1).
-
-    Returns ``(partials, notes)`` — ``notes`` a ``(field, reason, of)`` list,
-    one entry per packed field this child carried only half of, for the
-    caller's ``demotions`` record (issue #518): a half-paired child leaves
-    its span's word cells at fill, and the bytes alone cannot say why.
-    """
-    partials: dict = {}
-    notes: list = []
-    for name, meta in fields.items():
-        try:
-            arr = group[name]
-        except KeyError:
-            logger.debug(f"sweep[overview]: overview {path} lacks field {name!r}")
-            if meta["class"] == "packed" and (meta.get("of") or "") in group:
-                # The skew shape: this child's divisor digest folds below
-                # while its word span stays fill — record it (issue #518).
-                notes.append((name, DEMOTION_WORD_MISSING, meta.get("of")))
-            continue
-        if meta["class"] == "exact":
-            partials[name] = fold_dense(
-                arr[:], factor, meta.get("method"), meta.get("fill_value", "NaN")
-            )
-            continue
-        if meta["class"] == "packed":
-            # The cascade's ``n`` inputs are the child's ``of`` digest weights
-            # at the same rows (spec §3.3/§3.4); a child carrying the word
-            # without its divisor digest contributes nothing for the field —
-            # the schema-evolution posture above, never a guessed ``n``. That
-            # skip needs no poisoning counterpart (unlike ``_fold_node``'s and
-            # ``_merge_slabs``'): children own DISJOINT spans of the parent
-            # slab and ``_cascade_node`` ASSIGNS them, so a skipped child
-            # leaves its whole span at the fill word — no output cell can mix
-            # this child's absence with a sibling's contribution. Each
-            # level re-quantizes once (the k-way law), which is in the class's
-            # documented contract: presence exact, counts within one lane
-            # quantization per fold.
-            from zagg.stats.composition import merge_composition_kway
-
-            of_name = meta.get("of")
-            try:
-                of_values = group[of_name][:]
-            except (KeyError, TypeError):
-                logger.debug(f"sweep[overview]: overview {path} lacks {of_name!r} for {name!r}")
-                # The mis-declared-divisor shape (issue #518): a manifest
-                # still naming an ``of`` no overview materializes (e.g. a
-                # digest demoted to class ``none``) fires this on EVERY
-                # child, and composition silently never cascades — record it.
-                notes.append((name, DEMOTION_DIVISOR_MISSING, of_name))
-                continue
-            of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
-            words_arr = arr[:]
-            folded = _empty_slab(meta, span)
-            for j in range(span):
-                parts = [
-                    (int(words_arr[i]), n)
-                    for i in range(j * factor, min((j + 1) * factor, len(words_arr)))
-                    if (n := payload_weight(of_values[i], of_dtype)) > 0
-                ]
-                if parts:
-                    folded[j] = merge_composition_kway(parts)
-            partials[name] = folded
-            continue
-        # Mismatched §2.0 weights declarations refuse to merge (issue #424);
-        # the enclosing per-child guard skips the child loudly.
-        check_weights_match(dict(arr.attrs), meta, name)
-        values = arr[:]
-        dtype = meta.get("dtype") or "float32"
-        inner = tuple(meta.get("inner_shape") or (2,))
-        delta = overview_fold_delta(meta)
-        declared = field_companions(name, meta)
-        # A companion declaration this fold cannot join refuses beside the §2.0
-        # one — read in the same guarded block, so a child failing on one
-        # contributes neither.
-        raw: dict = {}
-        for kwarg, sibling_name in declared:
-            sib = group[sibling_name]
-            check_companion_match(dict(sib.attrs), name, kwarg)
-            raw[kwarg] = sib[:]
-        folded = np.full(span, b"", dtype=object)
-        sibling_slabs = {kwarg: np.full(span, b"", dtype=object) for kwarg, _ in declared}
-        for j in range(span):
-            rows = [
-                i
-                for i in range(j * factor, min((j + 1) * factor, len(values)))
-                if values[i] is not None and len(values[i])
-            ]
-            if not rows:
-                continue
-            cell = [decode_digest(values[i], dtype, inner) for i in rows]
-            if not declared:
-                folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
-                continue
-            payload, *words = fold_digests(
-                cell,
-                delta=delta,
-                dtype=dtype,
-                channels={
-                    kwarg: [decode_digest(raw[kwarg][i], "uint64", ()) for i in rows]
-                    for kwarg, _ in declared
-                },
-            )
-            folded[j] = payload
-            for (kwarg, _), encoded in zip(declared, words, strict=True):
-                sibling_slabs[kwarg][j] = encoded
-        partials[name] = folded
-        for kwarg, sibling_name in declared:
-            partials[sibling_name] = sibling_slabs[kwarg]
-    return partials, notes
 
 
 def _fold_sources(decl, orders, cell_order, shard_order) -> dict:
