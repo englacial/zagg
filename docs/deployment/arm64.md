@@ -52,9 +52,10 @@ Use `quay.io/pypa/manylinux_2_28_aarch64`:
 2. **Run the build inside the container** — `build_layer.sh` is not a bare-host
    command; it needs the manylinux cp312 toolchain and refuses to run on a
    non-`aarch64` machine. Its pins come from the `lambda` extra and, for
-   everything else, from `deployment/aws/layer-requirements.txt`, which is
-   generated from `uv.lock` (see [Dependency pins](lambda.md#zip-pins)). From
-   the repo root:
+   everything else except `mortie` (the latest release above its
+   `pyproject.toml` floor, issue #322), from
+   `deployment/aws/layer-requirements.txt`, which is generated from `uv.lock`
+   (see [Dependency pins](lambda.md#zip-pins)). From the repo root:
 
     ```bash
     podman run --rm \
