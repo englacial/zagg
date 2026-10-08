@@ -13,7 +13,7 @@ from test_icechunk_refs import _grid, _ladder_run, _open, _shards, _write_leaf
 
 from zagg import hive, icechunk_ops, icechunk_refs
 from zagg.config import default_config
-from zagg.icechunk_refs import ICECHUNK_ATTR, MULTISCALES_ATTR
+from zagg.icechunk_refs import ICECHUNK_ATTR, MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR
 
 RUN = "r1"
 
@@ -246,6 +246,26 @@ class TestValidation:
 
 
 class TestDeclarePyramid:
+    def test_init_upgrades_a_pre_615_root(self, cfg, tmp_path):
+        # A repo initialized before the §11.1 object shape: the list mirror,
+        # no registration. The next fleet init rewrites both (issue #615).
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        manifest = _write_manifest(root, grid)
+        icechunk_refs.init_repo(root, grid, cfg, run_id=RUN, store_kwargs={})
+        group, repo = _open(root)
+        want = {k: group.attrs[k] for k in (MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)}
+        session = repo.writable_session("main")
+        attrs = zarr.open_group(session.store, mode="r+").attrs
+        attrs[MULTISCALES_ATTR] = manifest[MULTISCALES_ATTR]
+        del attrs[ZARR_CONVENTIONS_ATTR]
+        session.commit("pre-615 init")
+        assert ZARR_CONVENTIONS_ATTR not in _open(root)[0].attrs
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r2", store_kwargs={})
+        assert {k: _open(root)[0].attrs[k] for k in want} == want
+        # The upgraded repo is current: the operator op has nothing to do.
+        assert icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})["unchanged"] is True
+
     def test_adds_the_declared_levels_and_the_mirror(self, monkeypatch, cfg, tmp_path):
         grid, root = _store(monkeypatch, cfg, tmp_path)
         cfg.output.pop("pyramid")  # the default declaration: overviews at every ancestor order
