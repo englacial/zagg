@@ -307,11 +307,13 @@ alone:
    runs the 250 MB combined gate; `test_function_build_size` catches
    function-zip growth in the same PR, which is where it gets reviewed.
 3. Merge, then tag. `publish.yml` builds the zips again through
-   `lambda-build-reusable.yml`, attaches them to the GitHub release,
-   distributes them to `s3://sliderule-public-cors/<minor>/`
-   ([standup](standup.md#updating-and-tearing-down)) and updates the
-   production function in place; `stand_up.sh` users pick the new minor up on
-   their next standup.
+   `lambda-build-reusable.yml` and attaches them to the GitHub release. Its
+   `distribute` job then copies them to
+   `s3://<LAMBDA_DIST_BUCKET>/<LAMBDA_DIST_PREFIX>/<minor>/` (Source
+   Cooperative, issue #497) and updates `versions.json` under the prefix, and
+   `deploy-prod`, after approval in the `production` environment, updates the
+   arm64 production function (and its worker-size variants) in place. Both
+   jobs are skipped unless the `LAMBDA_*` repository variables are set.
 
 ### Worker-size variants {#worker-size-variants}
 
