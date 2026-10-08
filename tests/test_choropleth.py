@@ -317,7 +317,7 @@ LIVE_STORE = os.environ.get("ZAGG_CHOROPLETH_LIVE_STORE")
 @pytest.mark.skipif(
     not LIVE_STORE,
     reason="set ZAGG_CHOROPLETH_LIVE_STORE to a published store root, e.g. "
-    "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/atl03_tdigest_o9.zarr",
+    "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/atl03_tdigest_o9_v3.zarr",
 )
 class TestLiveSmoke:
     def test_leaf_and_coarse_exports_are_valid(self):

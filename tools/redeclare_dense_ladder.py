@@ -5,8 +5,11 @@ record: **dense spacing-1** — every order ``[shard_order-1 .. 0]``, matching
 spec §4.4's every-order law). Two intended invocations, run by the operator
 (never by an agent — live-store writes are operator runs):
 
-    # atl03_tdigest_o9: replaces the v1 spacing-2 [7,5,3,1] block
-    # (declared 08-24, never materialized) with the dense ladder.
+    # atl03_tdigest_o9 (v1, retained as the comparison store): replaces the
+    # spacing-2 [7,5,3,1] block (declared 08-24, never materialized) with the
+    # dense ladder. The live ``atl03_tdigest_o9_v3.zarr`` (issue #560,
+    # 2026-10-08) declared this ladder at init, so the retrofit does not
+    # apply to it.
     uv run python tools/redeclare_dense_ladder.py \\
         s3://<bucket>/<prefix>/atl03_tdigest_o9.zarr \\
         --config src/zagg/configs/atl03_tdigest_strata_healpix.yaml \\
@@ -43,7 +46,7 @@ semantic-hash verdict and the leaf probe — are printed. ``--execute`` performs
 the real single-PUT RMW with full store-truth validation (the same two gates
 plus the frozen-key recheck) — that flag is the operator's.
 
-Version gate: the live stores were written by zagg 0.52.0, whose classifier
+Version gate: the stores this tool targets were written by zagg 0.52.0, whose classifier
 admits ``composition`` as ``packed``. A pre-0.52 environment silently drops
 ``composition`` from the declaration, so this script refuses to run there.
 """
