@@ -75,6 +75,7 @@ from zagg.icechunk_refs import (
     BRANCH,
     ICECHUNK_ATTR,
     MULTISCALES_ATTR,
+    ZARR_CONVENTIONS_ATTR,
     _check_block,
     _commit,
     _is_local,
@@ -90,8 +91,9 @@ from zagg.icechunk_rows import check_array_model
 
 logger = logging.getLogger(__name__)
 
-#: Root attrs no ``set-attrs`` may touch: the writer's block and the mirror.
-RESERVED_ROOT_KEYS = (ICECHUNK_ATTR, MULTISCALES_ATTR)
+#: Root attrs no ``set-attrs`` may touch: the writer's block, the mirror and
+#: its convention registration (§11.1).
+RESERVED_ROOT_KEYS = (ICECHUNK_ATTR, MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)
 
 #: Block keys an operation may never move (the array model and the container).
 _FIXED_BLOCK_KEYS = ("spec", "shard_order", "chunk_order", "cell_order", "url_prefix")
@@ -256,7 +258,8 @@ def declare_pyramid(
     # A newly declared level's arrays are built at the repo's rows (§11.2).
     spec = repo_group_spec(grid, store_root, options, manifest, block["rows"])
     levels = spec.attributes[ICECHUNK_ATTR]["levels"]
-    mirror = spec.attributes.get(MULTISCALES_ATTR)
+    conventions = {k: spec.attributes.get(k) for k in (MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)}
+    mirror = conventions[MULTISCALES_ATTR]
     recorded = dict(block.get("levels") or {})
     for order in levels.keys() & recorded.keys():
         if levels[order] != recorded[order]:
@@ -299,7 +302,7 @@ def declare_pyramid(
             new_block.pop("retired")
         unchanged = (
             new_block == attrs[ICECHUNK_ATTR]
-            and attrs.get(MULTISCALES_ATTR) == mirror
+            and all(attrs.get(k) == v for k, v in conventions.items())
             and not added
         )
         details = {
@@ -311,10 +314,11 @@ def declare_pyramid(
         if unchanged:
             return {**details, "unchanged": True}
         attrs[ICECHUNK_ATTR] = new_block
-        if mirror is None:
-            attrs.pop(MULTISCALES_ATTR, None)
-        else:
-            attrs[MULTISCALES_ATTR] = mirror
+        for key, value in conventions.items():
+            if value is None:
+                attrs.pop(key, None)
+            else:
+                attrs[key] = value
         root.attrs.put(attrs)
         return details
 

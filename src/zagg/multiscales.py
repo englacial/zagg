@@ -38,6 +38,19 @@ logger = logging.getLogger(__name__)
 #: revision.
 MULTISCALES_SPEC = "zagg-multiscales/1"
 
+#: The zarr-conventions ``multiscales`` v0.1 Convention Metadata Object
+#: (issue #615), verbatim from the convention's README — its schema pins every
+#: key as a ``const``, so this is the one registration entry a conformant
+#: reader matches. It rides the Icechunk repo root's ``zarr_conventions``
+#: (spec §11.1); the manifest mirror itself stays zagg-native.
+MULTISCALES_CONVENTION = {
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/multiscales/blob/v0.1/README.md",
+    "uuid": "d35379db-88df-4056-af3a-620245f8e347",
+    "name": "multiscales",
+    "description": "Multiscale layout of zarr datasets",
+}
+
 #: Artifact-kind tokens the mirror's dataset entries carry: the leaf entry's
 #: artifact is the §4.6 per-leaf column (``{window}.pyramid.zarr``), every
 #: ladder entry's is the §4.1 ancestor-node overview (``{window}.zarr``).
@@ -309,6 +322,7 @@ __all__ = [
     "GROUP_ATTR",
     "GROUP_NAME",
     "LEVEL_ATTR",
+    "MULTISCALES_CONVENTION",
     "MULTISCALES_SPEC",
     "manifest_multiscales",
     "multiscales_block",
