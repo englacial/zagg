@@ -265,7 +265,7 @@ def sized_stage_tuples(
     every byte, and the suite does not claim it (review finding): the group
     attrs carry per-run provenance that is legitimately grouping-dependent
     (``source_children``, the summed child ``generation``), and a sized arm
-    writes relay stage columns a fixed arm never needs.
+    writes stage columns a fixed arm never needs.
     """
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, _node_at, one_stage_tuple, stage_tuples
 

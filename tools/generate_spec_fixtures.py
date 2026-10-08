@@ -184,8 +184,9 @@ PYRAMID_GRID = {
 }
 #: The synthetic per-level stage actuals the ``pyramid/`` fixture's finisher
 #: RMW records (issue #384): the §4.5 regimes this geometry derives — d = 1,
-#: node 2 a gather of gen-1 members, nodes 1/0 merges of the relayed gen-1
-#: partials (merges-from-raw 2, never 3 for an upfront level).
+#: node 2 a gather of gen-1 members, node 1 a cascade of the node-2
+#: artifacts (merges-from-raw 2), node 0 a cascade of node 1's (3): the
+#: depth grows by one per merge level (issue #620).
 PYRAMID_STAGE_ACTUALS = {
     2: {
         "cells": 3,
@@ -202,7 +203,7 @@ PYRAMID_STAGE_ACTUALS = {
     0: {
         "cells": 1,
         "regime": "stage-merge",
-        "merges_from_raw": 2,
+        "merges_from_raw": 3,
         "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
     },
 }
@@ -829,8 +830,8 @@ def build_pyramid(out: Path) -> None:
     # Per-entry actuals (issue #384): the finisher's manifest RMW is the
     # production writer. The per-level inputs are synthetic (no leaves exist
     # here) but their regimes are the §4.5 law for this geometry — d = 1, so
-    # node 2 gathers (cells 3 == shard) and nodes 1/0 merge the relayed
-    # gen-1 partials at exactly 2 merges from raw.
+    # node 2 gathers (cells 3 == shard), node 1 cascades those artifacts at
+    # 2 merges from raw and node 0 cascades node 1's at 3 (issue #620).
     from zagg.sweep_stages import run_finisher
 
     run_finisher(

@@ -691,7 +691,7 @@ def run_stage_sweep_fleet(
     the MIRROR of :func:`zagg.sweep_stages.run_stage_sweep`, and a schedule
     this side chose on its own would no longer be the width the caller named
     (the byte-identity oracle compares the two arms AT a width, and a sized
-    arm writes the relay stage columns of a different grouping). The run TAIL
+    arm writes the stage columns of a different grouping). The run TAIL
     is what meets the 900 s wall, so the tail is what asks for the sizing —
     :func:`zagg.runner._invoke_lambda_stage_sweep` passes
     :data:`zagg.sweep_partition.STAGE_TARGET_NODES`. A narrowed tuple

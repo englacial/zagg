@@ -93,7 +93,7 @@
   },
   "0": {
    "regime": "stage-merge",
-   "merges_from_raw": 2,
+   "merges_from_raw": 3,
    "source_children": {
     "folded": 4,
     "missing": 0,
