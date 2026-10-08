@@ -712,10 +712,11 @@ class TestV2Corruption:
 
     def test_broken_node_member_fails_parity_at_its_gather(self, tmp_path):
         # The node-order member is a flat second merge, consumed by the
-        # cells-3 GATHER at order 2 — never by a merge: the column parity (vs
-        # the boundary group) and that gather level catch it, and the merge
-        # level above, which reads the gather's committed artifact, stays
-        # clean.
+        # cells-3 GATHER at order 2 — never by a merge's fold: the column
+        # parity (vs the boundary group) and that gather level catch it. The
+        # merge level above agrees with the gather's committed artifact, but
+        # its leaf anchor (count vs the leaf columns' node-order members)
+        # sees the ladder and the leaf tier disagree, and names it too.
         _build_store(tmp_path)
         group = _column_group(tmp_path, "-3/1/1/1", 3)
         counts = group["count"][:]
@@ -725,7 +726,7 @@ class TestV2Corruption:
         mismatches = report["checks"]["counts"]["mismatches"]
         assert any(m.startswith("-3111[") for m in mismatches), mismatches
         assert any(m.startswith("-31[") for m in mismatches), mismatches  # gather vs column
-        assert not any(m.startswith("-3[") for m in mismatches), mismatches
+        assert any(m.startswith("-3[") for m in mismatches), mismatches  # the leaf anchor
 
     def test_stale_column_after_leaf_rewrite(self, tmp_path):
         # Base data moved, the column did not (the repair is the idempotent

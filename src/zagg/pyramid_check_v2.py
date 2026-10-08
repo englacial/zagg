@@ -445,6 +445,35 @@ def _tier_checks(
                 gather=gather,
                 values=values,
             )
+            if gather:
+                continue
+            # The leaf anchor: a merge checked only against its children's
+            # artifacts passes a whole corrupt subtree whose ancestors were
+            # cascaded from it, unless this exact node is sampled at that
+            # order. ``count`` and every exact law are exact at any depth, so
+            # the node is also held to the leaf columns' node-order member —
+            # one cell per leaf — with the payload legs off (a digest or word
+            # is legitimately a cascade, not a flat fold of the leaves). When
+            # the node's columns are short the ``columns`` check carries it.
+            _check_node(
+                harness,
+                node,
+                k,
+                r,
+                (s, s, leaves, lambda dec: harness.column_group(dec, s)),
+                attrs,
+                count_meta,
+                exact_fields,
+                digest_fields,
+                packed_fields,
+                errors,
+                counted,
+                full=full,
+                compose_exact=True,
+                values=values
+                and all(col_probes.get(d) is not None for d in leaves if d.startswith(node)),
+                refold_payloads=False,
+            )
 
     # -- the leaf-column tier (§4.6 parity): groups at or finer than the
     # raw-fold boundary from the leaves' own cell arrays, the coarser groups
