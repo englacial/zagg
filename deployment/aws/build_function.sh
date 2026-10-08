@@ -132,9 +132,11 @@ rm -rf "$BUILD_DIR/bin"
 # nothing at build time and the worker runs the versions the test suite ran.
 # Handing pip the floors instead let every upstream release land in the zip
 # unreviewed (PR #611: a pydantic-core release alone tripped the size budget).
+# --only-binary: a fixed pin with no wheel for this host fails here instead of
+# building its sdist unseen (google-crc32c would fall back to pure Python).
 echo ""
 echo "Installing function dependencies (pinned from uv.lock, --no-deps)..."
-$PIP install --target "$BUILD_DIR" --no-cache-dir --no-deps \
+$PIP install --target "$BUILD_DIR" --no-cache-dir --no-deps --only-binary=:all: \
     -r "$SCRIPT_DIR/function-requirements.txt"
 
 # --- Remove packages already in the Lambda layer ---

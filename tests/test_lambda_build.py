@@ -304,6 +304,7 @@ class TestFunctionRequirements:
             "build_function.sh must install -r function-requirements.txt once"
         )
         assert "--no-deps" in installs[0], "the requirements install must pass --no-deps"
+        assert "--only-binary=:all:" in installs[0], "a pin with no wheel must fail, not build"
         floors = re.findall(r'"[A-Za-z0-9._-]+>=[0-9.]+"', script)
         assert not floors, (
             f"build_function.sh resolves {floors} from PyPI at build time -- pins come "
