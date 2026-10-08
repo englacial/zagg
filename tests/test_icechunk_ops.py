@@ -434,6 +434,26 @@ class TestDeclarePyramid:
         assert layout[0]["dggs"] == group["6"].attrs["dggs"]
         assert group.attrs["zarr_conventions"][0]["name"] == "multiscales"
 
+    def test_a_set_attrs_dggs_change_holds_in_the_layout(self, monkeypatch, cfg, tmp_path):
+        # The base layout entry copies the LIVE group's dggs (§11.1): set-attrs
+        # refreshes it in its own commit, and neither declare-pyramid nor the
+        # next init reverts it to the grid's block.
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)
+        icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
+        group, _repo = _open(root)
+        derived = group.attrs[MULTISCALES_ATTR]["layout"][1:]
+        dggs = {**group["6"].attrs["dggs"], "latitude": "geodetic"}
+        icechunk_ops.set_attrs(root, "/6", {"dggs": dggs}, store_kwargs={})
+        assert _messages(root)[0] == "set-attrs /6"
+        assert icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})["unchanged"] is True
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r2", store_kwargs={})
+        assert _messages(root)[:2] == ["init r2", "set-attrs /6"]
+        group, _repo = _open(root)
+        layout = group.attrs[MULTISCALES_ATTR]["layout"]
+        assert layout[0]["dggs"] == dggs and layout[1:] == derived
+
     def test_levels_follow_the_repos_rows(self, cfg, tmp_path):
         # A level declared after the repo's rows were allocated is built at
         # those rows, and a delisted level's surviving group grows with every
