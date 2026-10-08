@@ -2266,13 +2266,13 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
 ## The live stores (issue #560 cutover, 2026-10-08)
 
 The ATL03 demo store was rebuilt from scratch on the 0.57.0 fleet as
-`atl03_tdigest_o9_v3.zarr` and is the store every reader in this tree now
-names ([issue #560](https://github.com/englacial/zagg/issues/560); the
-runbook is `demo/15_rebuild_2026-10.ipynb`). It was built from the packaged
-`atl03_tdigest_strata_healpix` template (plus `output.pyramid: {overviews: 13}`)
-against the frozen shardmaps `demo/outputs/shardmap_california_o9.json`
-(2,726 shards) and `demo/outputs/shardmap_neon_aop_o9.json` (251 shards, 13
-overlapping), so its manifest is born at the epoch-2 digest
+`atl03_tdigest_o9_v3.zarr` and is the store every ATL03 reader in this tree
+now names ([issue #560](https://github.com/englacial/zagg/issues/560); the
+runbook is the operator's `demo/15_rebuild_2026-10.ipynb`, kept outside the
+tree). It was built from the packaged `atl03_tdigest_strata_healpix` template
+(plus `output.pyramid: {overviews: 13}`) against the frozen operator-local
+shardmaps `shardmap_california_o9.json` (2,726 shards) and
+`shardmap_neon_aop_o9.json` (251 shards, 13 overlapping), not in the tree, so its manifest is born at the epoch-2 digest
 `aacfe1e387d2…` (no [index-exclusion migration](#migration-the-index-exclusion-epoch-issue-499)
 applies) and carries: cell 19 / shard 9 / `chunk_inner` 13; the dense
 `zagg-pyramid/2` ladder 13..4 declared at init together with its
