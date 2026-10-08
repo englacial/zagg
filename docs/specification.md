@@ -2522,9 +2522,11 @@ never sharded, §8/#247):
   `layout`) plus one `{cells}/zarr.json` per level group (the artifact's
   `dggs` block and `zarr_conventions`, verbatim). No Icechunk repository,
   no arrays, no refs — the committed golden pins the documents a
-  conformant reader validates: the root against the multiscales v0.1
-  schema, every level group against the dggs v1 schema, both vendored
-  under `tests/data/conventions/`. `icechunk.expected.json` spells the
+  conformant reader validates: the root group document against the
+  multiscales v0.1 schema, and every level group against the dggs v1
+  schema once [#616](https://github.com/englacial/zagg/issues/616) lands
+  the `semi_major_axis` spelling (a strict `xfail` until then), both
+  vendored under `tests/data/conventions/`. `icechunk.expected.json` spells the
   `layout` from the generator's inputs (the §11.1 rules over `pyramid/`'s
   expanded levels), never read back through zagg.
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
@@ -4307,15 +4309,20 @@ Each **level group** mirrors its artifact's resolution-group attrs verbatim
 (the `dggs` block, `zarr_conventions`), and **never the commit stamp**.
 
 **The root is a conformant `multiscales` group composed with `dggs`**
-([#615](https://github.com/englacial/zagg/issues/615)). The root attrs
-validate against the [zarr-conventions `multiscales` v0.1
+([#615](https://github.com/englacial/zagg/issues/615)). The root group
+document validates against the [zarr-conventions `multiscales` v0.1
 schema](https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json)
-and compose with the [`dggs` convention](https://github.com/zarr-conventions/dggs)
+and composes with the [`dggs` convention](https://github.com/zarr-conventions/dggs)
 per the grammar of
-[zarr-conventions/dggs#25](https://github.com/zarr-conventions/dggs/pull/25);
-the level groups validate against the dggs v1 schema on their own. Both
-schemas are vendored under `tests/data/conventions/`, and the `icechunk/`
-fixture (§7) pins the documents.
+[zarr-conventions/dggs#25](https://github.com/zarr-conventions/dggs/pull/25).
+The level groups, and the base `layout` entry's `dggs` object, validate
+against the dggs v1 schema once
+[#616](https://github.com/englacial/zagg/issues/616) lands the
+`semi_major_axis` spelling (until then the `ellipsoid` key alone fails; the
+conformance test carries a strict `xfail` pinned to #616). Both schemas are
+vendored under `tests/data/conventions/` (in CI only the hand checker runs:
+`jsonschema` is not in the `test` extra), and the `icechunk/` fixture (§7)
+pins the documents.
 
 - **`zarr_conventions`** — the convention's registration: the `multiscales`
   v0.1 Convention Metadata Object, copied verbatim from the convention's
