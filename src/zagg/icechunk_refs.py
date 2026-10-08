@@ -541,18 +541,17 @@ def multiscales_layout(manifest: dict, dggs: dict) -> list[dict]:
     fold = block.get("fold") or {}
     cascade = fold.get("fold_source") == "cascade"
     exact = int(fold.get("exact_levels") or 0)
-    entry_of = {int(c): e for e in block["datasets"] for c in e["cells"]}
+    entry_of: dict = {}  # first entry wins a duplicated cell order, as in level_grids
+    for i, e in enumerate(block["datasets"]):
+        for c in e["cells"]:
+            entry_of.setdefault(int(c), (i, e))
     layout = [{"asset": str(base), "dggs": copy.deepcopy(dggs[base])}]
     finer = base
     for cells in sorted((int(c) for c in dggs), reverse=True):
         if cells == base:
             continue
-        entry = entry_of[cells]
-        from_leaves = (
-            not cascade
-            or entry["artifact"] == ARTIFACT_COLUMN
-            or block["datasets"].index(entry) < exact
-        )
+        i, entry = entry_of[cells]
+        from_leaves = not cascade or entry["artifact"] == ARTIFACT_COLUMN or i < exact
         source = base if from_leaves else finer
         layout.append(
             {
