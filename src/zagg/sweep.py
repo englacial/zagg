@@ -989,7 +989,9 @@ def run_sweep(
         summary["foreign_leaves"] = foreign
     above = 0
     if finisher is not None:
-        above, summary["finisher"] = _load_finisher(finisher, fams, shard_order, store_kwargs)
+        above, summary["finisher"] = _load_finisher(
+            finisher, fams, by_shard, shard_order, store_kwargs
+        )
         if not above:
             fams = [get_family(fam.name) for fam in fams]  # a half-loaded family folds twice
     for fam in fams:
@@ -1023,14 +1025,16 @@ def run_sweep(
     return summary
 
 
-def _load_finisher(finisher, fams, shard_order, store_kwargs) -> tuple[int, dict]:
+def _load_finisher(finisher, fams, by_shard, shard_order, store_kwargs) -> tuple[int, dict]:
     """Fold the partitions' accumulator blocks; ``(split order, summary block)``.
 
     The split order is 0 — the leaf walk — when any named record is absent,
-    unreadable, or lacks a block a family needs, logged once: a finisher that
-    cannot compose reads the leaves rather than publish a short section. The
-    records are the status-prefix copies the dispatcher awaited, read through
-    one handle on that prefix.
+    unreadable, or lacks a block a family needs, or when ``by_shard`` holds a
+    shard no partition's block says it visited (the blocks would not cover
+    the work set), logged once: a finisher that cannot compose reads the
+    leaves rather than publish a short section. The records are the
+    status-prefix copies the dispatcher awaited, read through one handle on
+    that prefix.
     """
     from zagg.hive import _read_json
     from zagg.store import open_object_store
@@ -1051,9 +1055,17 @@ def _load_finisher(finisher, fams, shard_order, store_kwargs) -> tuple[int, dict
                 raise ValueError(f"partition record {key} is absent or not an object")
             records.append(rec)
         for fam in fams:
-            fam.load_accumulators(
-                [(r.get("families") or {}).get(fam.name, {}).get("accumulator") for r in records]
-            )
+            blocks = [
+                (r.get("families") or {}).get(fam.name, {}).get("accumulator") for r in records
+            ]
+            visited: set = set()
+            for b in blocks:
+                if isinstance(b, dict):
+                    visited.update(b["visited"])
+            missing = set(by_shard) - visited
+            if missing and any(isinstance(b, dict) for b in blocks):
+                raise ValueError(f"{len(missing)} shard(s) in the work set no partition visited")
+            fam.load_accumulators(blocks)
     except (KeyError, TypeError, ValueError) as e:
         logger.warning(
             f"sweep: finisher cannot compose from {len(keys)} partition record(s) ({e}) — "
@@ -1192,6 +1204,9 @@ def _sweep_family(
         result["deferred_orders"] = list(range(min_order))
         block = fam.accumulator()
         if block is not None:
+            # The shards this pass walked, held or not: the finisher refuses a
+            # work set holding one no partition visited (issue #610).
+            block["visited"] = sorted(by_shard)
             result["accumulator"] = block  # what the finisher composes from
     else:
         result.update(fam.finish(store_root, tops, shard_order, store_kwargs))

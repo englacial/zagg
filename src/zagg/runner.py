@@ -5898,6 +5898,11 @@ def _build_sweep_event(
     if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
         del event["leaves"]
         event["discover"] = True
+        # The discovered work set is the STORE's (every run record's leaves);
+        # the partitions' accumulators cover this run's only, so a composed
+        # section would be short. Without the block the finisher walks the
+        # leaves, as before issue #610.
+        event.pop("finisher", None)
     return event
 
 

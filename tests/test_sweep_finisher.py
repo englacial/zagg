@@ -75,7 +75,15 @@ def _fan_out(root: str, leaves) -> list:
         for path in (Path(root) / summary["record"], Path(summary["status_record"])):
             record = json.loads(path.read_text())
             block = record["families"]["moc"]["accumulator"]
-            assert sorted(block) == ["cell_order", "fields", "routes", "shards", "uncounted"]
+            assert sorted(block) == [
+                "cell_order",
+                "fields",
+                "routes",
+                "shards",
+                "uncounted",
+                "visited",
+            ]
+            assert block["visited"] == sorted(block["shards"])  # every leaf here holds a row
             assert block["fields"] == ["h_tdigest"] and len(block["shards"]) == 4
             assert "accumulator" not in record["families"]["stats"]
         names.append(families_record_name(partition))
@@ -137,6 +145,18 @@ class TestComposedFinisher:
         assert "obs_total" in summary["finisher"]["fallback"]
         assert summary["families"]["moc"]["temporal_shards"] == 16
 
+    def test_a_shard_no_partition_visited_falls_back(self, tmp_path):
+        from zagg.grids.morton import morton_word
+
+        root, leaves = _store(tmp_path / "fan", 16)
+        names = _fan_out(root, leaves)
+        # A leaf outside every partition's work set (the store's ``discover``
+        # set is wider than this run's): the blocks do not cover it.
+        wider = [*leaves, (morton_word("12111"), None)]
+        summary = run_sweep(root, wider, families=FAMILIES, finisher=_finisher(root, names))
+        assert summary["finisher"]["fallback"] == "1 shard(s) in the work set no partition visited"
+        assert summary["families"]["moc"]["temporal_shards"] == 16
+
     def test_the_handler_forwards_the_finisher_block(self, tmp_path, monkeypatch):
         from test_sweep import _handler_module
 
@@ -169,3 +189,7 @@ class TestEventBuilder:
         with pytest.raises(ValueError, match="power"):
             _build_sweep_event("s3://b/s", [(7, None)], finisher={**block, "of": 3})
         assert "finisher" not in _build_sweep_event("s3://b/s", [(7, None)])
+        # Over the payload cap the worker discovers the STORE's work set, which
+        # the partitions' accumulators do not cover: the block is dropped too.
+        big = _build_sweep_event("s3://b/s", [(k, None) for k in range(20000)], finisher=block)
+        assert big["discover"] is True and "leaves" not in big and "finisher" not in big
