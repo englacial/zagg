@@ -1,4 +1,4 @@
-"""Re-declare a live store's pyramid to the dense ``/2`` every-order ladder.
+"""Re-declare a store's pyramid to the dense ``/2`` every-order ladder.
 
 The store-track S1 artifact (Track C of the 2026-09-10 plan; espg ruling of
 record: **dense spacing-1** — every order ``[shard_order-1 .. 0]``, matching
@@ -32,8 +32,8 @@ semantic guard blesses: ``output.pyramid`` is not in the semantic core, so the
 original config plus the pyramid knob hashes identically (the leaf-shaping
 ``output`` keys — ``aoi_mask``, ``windowing``, ``time_source``,
 ``grid.sharded`` — do move it). The config must be
-the store's ORIGINAL build config — for both live stores that is the packaged
-template itself: ``atl03_tdigest_strata_healpix`` and
+the store's ORIGINAL build config — for both stores this tool targets that is
+the packaged template itself: ``atl03_tdigest_strata_healpix`` and
 ``gedi01b_waveform_healpix_hive`` carry the run-record configs key for key
 (parent_order 9, delta 4096) and ``tests/test_live_store_templates.py`` pins
 their hashes to the store manifests (issue #547).
@@ -46,9 +46,10 @@ semantic-hash verdict and the leaf probe — are printed. ``--execute`` performs
 the real single-PUT RMW with full store-truth validation (the same two gates
 plus the frozen-key recheck) — that flag is the operator's.
 
-Version gate: the stores this tool targets were written by zagg 0.52.0, whose classifier
-admits ``composition`` as ``packed``. A pre-0.52 environment silently drops
-``composition`` from the declaration, so this script refuses to run there.
+Version gate: the stores this tool targets were written by zagg 0.52.0, whose
+classifier admits ``composition`` as ``packed``. A pre-0.52 environment
+silently drops ``composition`` from the declaration, so this script refuses to
+run there.
 """
 
 from __future__ import annotations
