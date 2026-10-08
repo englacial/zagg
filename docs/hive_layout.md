@@ -699,14 +699,22 @@ operator's steps are in
 
 **Cadence.** Ladder orders are grouped into dispatch tuples of
 `tuple_width` consecutive orders (default 3: `[8,7,6] → [5,4,3] → [2,1,0]`
-on an o9 store). Each stage worker reads exactly its `4^width` immediate
-child columns, emits its tuple's level artifacts, and writes its own column
-carrying — as a pure gather — the **relayed gen-1 leaf partials** for its
-subtree. Every merge, at every level, consumes only that relayed gen-1
-tier (the espg merge-source ruling), so **the cadence changes no bytes**:
-`--tuple-width 1` and `--tuple-width 3` build byte-identical ladders, and
-every upfront merge level is uniformly 2 merges from raw (gathers are 1;
-gen 3 is append-later cascade territory only).
+on an o9 store). A stage worker folds its tuple's levels finest first: a
+**gather** level (cells at or above the shard order) concatenates its
+children's column members, a **merge** level **cascades** its four
+children's artifacts at the level one order finer — the ones the same
+worker has just folded, from memory, or the previous tuple's, read back off
+the store ([issue #620](https://github.com/englacial/zagg/issues/620)). A
+merge node therefore reads four slabs whatever its subtree holds (1,024
+cells in, 256 out at the reference geometry), where it used to re-read its
+whole footprint at the leaf columns' relay resolution (18.9M cells at
+order 0, past the 900 s wall at the dense order-1 node). The worker's own
+column carries only the members a coarser gather consumes — nothing for
+the merges, so a dispatch node below which nothing gathers writes none. The
+values are a fixed function of the ladder, so **the cadence changes no
+values**: `--tuple-width 1` and `--tuple-width 3` build the same ladder,
+and `merges_from_raw` records the fold depth (1 at a gather, one more than
+its children's at a merge).
 
 **The run tail sizes the cadence itself** ([issue
 #610](https://github.com/englacial/zagg/issues/610)). A dispatch node folds
@@ -736,12 +744,12 @@ in `[5, 20]` picks the same schedule there. Such a tuple dispatches at an order 
 lands on, so its events carry their span (`child_order`) outright; a worker
 deployed before this refuses one by name rather than folding the wrong span.
 The cadence is still a dispatch knob like `--tuple-width` itself — a sized
-build's ladder **overviews** are the fixed-width build's, which is the
-merge-source law and what the oracle pins. Not every byte: the group attrs
-carry per-run provenance that is grouping-dependent by design
-(`source_children`, the summed child `generation`), and a sized build writes
-relay stage columns a wider grouping never needs. `python -m zagg.sweep
---stages` is unchanged (the CLI has no 900 s wall).
+build's ladder **overviews** are the fixed-width build's, which is what the
+oracle pins. Not every byte: the group attrs carry per-run provenance that
+is grouping-dependent by design (`source_children`, the summed child
+`generation`), and a sized build may write stage columns a wider grouping
+never needs. `python -m zagg.sweep --stages` is unchanged (the CLI has no
+900 s wall).
 
 **A short tuple does not stamp the manifest.** The finisher records per-level
 `actuals` from the run's stage records; a tuple whose unit record never landed
@@ -905,15 +913,16 @@ window's objects, and every finding names the node and the window
   on every artifact, not a sample — the all-time folds' `window: all` too,
   reported under `all_time`), plus the per-window regime, `merges_from_raw`
   and `source_children` of §4.4 on the sampled nodes.
-- `counts` / `digests` / `composition` — a window's overview re-folded from
-  **that window's** leaf columns, and its columns from **that window's**
-  leaves, for `--sample-windows` windows (default 3). An overview built
+- `counts` / `digests` / `composition` — a window's gather levels re-folded
+  from **that window's** leaf columns, its merge levels from their children's
+  artifacts in that window, and its columns from **that window's** leaves,
+  for `--sample-windows` windows (default 3). An overview built
   from another window's leaves fails here.
 - `all_time` — where the manifest declares `pyramid.overview.all_time`: a
   committed `all.zarr` at every ladder node, and for the sampled nodes its
   values against the k-way fold of the node's own `{window}.zarr` overviews,
-  `regime: stage-merge`, `merges_from_raw` 2 at a gather level and 3 at a
-  merge level, `source_windows` equal to the windows the node holds, and
+  `regime: stage-merge`, `merges_from_raw` one more than the deepest of
+  those overviews', `source_windows` equal to the windows the node holds, and
   `source_children` / `generation` equal to those overviews' blocks summed.
   A fold that consumed fewer windows than the node now holds is reported
   `STALE`. Where the store declares no all-time fold the check is reported

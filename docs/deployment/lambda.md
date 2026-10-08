@@ -844,11 +844,13 @@ run and simply drops the finisher's reporting from the summary.
 
 ### Why the fleet build is trusted
 
-Grouping is a dispatch knob, never grammar — the **merge-source law** (espg
-ruling 2026-08-09, issue #384) makes the build a fixed function of the store,
-independent of tuple width, partitioning, and executor. Splitting a tuple
-across invokes is therefore free: dispatch nodes at one order own disjoint
-subtrees, and a tuple's folds read only columns one tuple *finer*.
+Grouping is a dispatch knob, never grammar — every merge level cascades the
+same four child artifacts whether they were folded in the same invoke or the
+tuple before (the espg ruling of 2026-10-08, issue #620), so the build is a
+fixed function of the store, independent of tuple width, partitioning, and
+executor. Splitting a tuple across invokes is therefore free: dispatch nodes
+at one order own disjoint subtrees, and a tuple's folds read only columns and
+artifacts one tuple *finer*.
 
 That is not an argument, it is the test. `TestByteIdentityOracle` in
 `tests/test_sweep_stage_fleet.py` builds a column-bearing store, runs the CLI

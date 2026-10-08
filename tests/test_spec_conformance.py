@@ -786,22 +786,27 @@ class TestPyramidV2Declaration:
 
     def test_per_entry_actuals_decode_per_spec(self):
         # §4.5 (issue #384): materialization actuals nest inside the level
-        # entry that owns them — regime, merges-from-raw (2 for every
-        # upfront merge level, NEVER 3; 1 for gathers and the leaf column),
-        # `source_children` on the stage regimes only, and unpinned
-        # timestamp/run-id values a reader tolerates.
+        # entry that owns them — regime, merges-from-raw (1 for gathers and
+        # the leaf column, the cascade depth at a merge: one more per merge
+        # level, so 2 then 3 here — issue #620), `source_children` on the
+        # stage regimes only, and unpinned timestamp/run-id values a reader
+        # tolerates.
         exp = _expected(PYRAMID)
+        depths = {}
         for entry in _pyramid_block()["overviews"]:
             expected = exp["actuals"][str(entry["node"])]
             actuals = entry["actuals"]
             assert actuals["regime"] == expected["regime"]
             assert actuals["merges_from_raw"] == expected["merges_from_raw"]
-            assert actuals["merges_from_raw"] <= 2  # gen 3 is append-later only
+            depths[entry["node"]] = actuals["merges_from_raw"]
             if expected["regime"] == "leaf-column":
                 assert "source_children" not in actuals
             else:
                 assert actuals["source_children"] == expected["source_children"]
             assert "generated_at" in actuals
+        # The depth rule, decoded from the committed bytes: gathers 1, then
+        # one more per merge level down to the root.
+        assert depths == {3: 2, 2: 1, 1: 2, 0: 3}
 
     def test_fold_declaration_keys_ride_along(self):
         # PR #379's declaration keys are revision-independent (§4.5).
