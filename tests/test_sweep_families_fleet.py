@@ -331,15 +331,14 @@ class TestRunnerSeam:
             == "dispatch_failed"
         )
 
-    def test_both_lambda_tails_and_the_facade_go_through_the_seam(self):
+    def test_no_tail_fires_the_single_invoke_form(self):
+        """The tails reach the fleet through the seam; what they carry is pinned
+        behaviourally in ``test_runner.py`` and ``test_client.py``."""
         import inspect
 
         from zagg import client, runner
 
-        src = inspect.getsource(runner)
-        assert src.count("= _invoke_lambda_families_sweep(") == 2  # the raster and agg tails
-        assert "handle.families_sweep = runner._invoke_lambda_families_sweep(" in inspect.getsource(
-            client
-        )
-        # The single-invoke form is the fan-out primitive, no tail's call.
-        assert not re.search(r"^\s+_invoke_lambda_sweep\(", src, re.M)
+        for module in (runner, client):
+            assert not re.search(
+                r"^\s+(runner\.)?_invoke_lambda_sweep\(", inspect.getsource(module), re.M
+            )

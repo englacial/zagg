@@ -1513,11 +1513,30 @@ class TestStagedSweepTail:
         assert kwargs["touch_policy"] == get_touch_policy(run.config)
         assert kwargs["output_creds_event"] is None and "store_kwargs" in kwargs
         assert handle.stage_sweep is self._COMPLETE
+        # The families outcome rides the handle (issue #610): conftest's stub dict.
+        assert handle.families_sweep == {
+            "partitions": 1,
+            "fired": 1,
+            "landed": 1,
+            "finisher": "ok",
+        }
         # The finalize carries the init record and the pinned ladder config.
         assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
         (fin,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
         assert fin["icechunk_init"] == run._icechunk_init and "newest_only" not in fin
         assert fin["config"]["output"]["icechunk"]["commit"] == "ladder"
+
+    def test_the_families_seam_gets_the_run_id_and_output_store(self, catalog, monkeypatch):
+        from zagg import runner
+
+        seam: dict = {}
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_families_sweep", lambda *a, **k: seam.update(k) or {"x": 1}
+        )
+        run, handle, stub, _seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
+        (cell,) = {e["run_id"] for _, _, e in stub.cell_events()}
+        assert seam["run_id"] == cell and handle.families_sweep == {"x": 1}
+        assert seam["store_kwargs"]["region"] == run.region == "us-west-2"
 
     @pytest.mark.parametrize(
         "staged, reason",
