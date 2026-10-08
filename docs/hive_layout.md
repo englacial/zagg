@@ -2364,7 +2364,7 @@ runbook is the operator's `demo/15_rebuild_2026-10.ipynb`, kept outside the
 tree). It was built from the packaged `atl03_tdigest_strata_healpix` template
 (plus `output.pyramid: {overviews: 13}`) against the frozen operator-local
 shardmaps `shardmap_california_o9.json` (2,726 shards) and
-`shardmap_neon_aop_o9.json` (251 shards, 13 overlapping), not in the tree, so its manifest is born at the epoch-2 digest
+`shardmap_neon_aop_o9.json` (251 shards, 13 overlapping), not in the tree, so its manifest is born at the post-epoch digest
 `aacfe1e387d2…` (no [index-exclusion migration](#migration-the-index-exclusion-epoch-issue-499)
 applies) and carries: cell 19 / shard 9 / `chunk_inner` 13; the dense
 `zagg-pyramid/2` ladder 13..4 declared at init together with its
@@ -2386,7 +2386,7 @@ anonymously readable.
 
 | store | role | built | frozen `semantic_hash` |
 |---|---|---|---|
-| `atl03_tdigest_o9_v3.zarr` | **live ATL03** | 0.57.0 fleet, 2026-10-08 | `aacfe1e387d2…` (epoch-2) |
+| `atl03_tdigest_o9_v3.zarr` | **live ATL03** | 0.57.0 fleet, 2026-10-08 | `aacfe1e387d2…` (post-epoch) |
 | `gedi_flux_o9.zarr` | **live GEDI** — unchanged, no GEDI rebuild this round | 0.52.0, 2026-08 | `4f8287947a83…` (pre-epoch) |
 | `atl03_tdigest_o9.zarr` | v1 ATL03, retained as the comparison store | 2026-08-19 | `b9b15fdde78f…` (pre-epoch) |
 | `serc_atl03_v3.zarr` | current SERC canary (4 shards; ladder swept, `pyramid_check` PASS, tagged `run-e10d7d83f79d46d8913cd41d88ff54c3`) | 0.57.0 | — |
