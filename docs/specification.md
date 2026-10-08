@@ -2525,7 +2525,7 @@ never sharded, §8/#247):
   conformant reader validates: the root group document against the
   multiscales v0.1 schema, and every level group against the dggs v1
   schema once [#616](https://github.com/englacial/zagg/issues/616) lands
-  the `semi_major_axis` spelling (a strict `xfail` until then), both
+  the `semi_major_axis` spelling (a test pins that one gap until then), both
   vendored under `tests/data/conventions/`. `icechunk.expected.json` spells the
   `layout` from the generator's inputs (the §11.1 rules over `pyramid/`'s
   expanded levels), never read back through zagg.
@@ -4319,7 +4319,7 @@ The level groups, and the base `layout` entry's `dggs` object, validate
 against the dggs v1 schema once
 [#616](https://github.com/englacial/zagg/issues/616) lands the
 `semi_major_axis` spelling (until then the `ellipsoid` key alone fails; the
-conformance test carries a strict `xfail` pinned to #616). Both schemas are
+conformance test pins exactly that gap, pending #616). Both schemas are
 vendored under `tests/data/conventions/` (in CI only the hand checker runs:
 `jsonschema` is not in the `test` extra), and the `icechunk/` fixture (§7)
 pins the documents.
