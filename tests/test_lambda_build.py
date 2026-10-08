@@ -359,16 +359,19 @@ class TestLockRequirements:
         floats: a bare name or a ``"name>=x"`` floor (any quoting) on an install
         line, a second ``-r``, or ``--no-deps`` dropped puts pip's resolver back
         between the lock and the zip. A ``$VAR`` positional is a lambda_pin /
-        MORTIE_SPEC derivation (TestLayerExtraParity owns which) or the repo.
+        MORTIE_SPEC derivation in the layer script and the repo in the function's.
         """
         import shlex
 
+        text = (self.AWS / script).read_text()
         valued = ("--target", "-t", "-r", "-c", "--no-binary")
         reads, positional = [], []
-        for line in TestLayerExtraParity._install_lines((self.AWS / script).read_text()):
+        for line in TestLayerExtraParity._install_lines(text):
             args = shlex.split(line)
             args = args[args.index("install") + 1 :]
             assert "--no-deps" in args, f"{script} resolves deps: {line.strip()}"
+            joined = [a for a in args if a.startswith(("-r", "--requirement")) and a != "-r"]
+            assert not joined, f"{script} reads requirements as {joined}: spell it `-r <file>`"
             values = {i + 1 for i, arg in enumerate(args) if arg in valued}
             positional += [a for i, a in enumerate(args) if i not in values and a[0] != "-"]
             # `${SCRIPT_DIR}` and `$SCRIPT_DIR` are one path to the shell.
@@ -386,6 +389,14 @@ class TestLockRequirements:
         if script == "build_function.sh":
             # zagg itself and the lock file: nothing else goes into the zip.
             assert positional == ["$REPO_ROOT"], positional
+        else:
+            # The same derivation regex TestLayerExtraParity reads the pins with.
+            derived = re.findall(r"^([A-Z0-9_]+_PIN)=\$\(lambda_pin .+\)$", text, re.MULTILINE)
+            allowed = {f"${v}" for v in derived} | {"$MORTIE_SPEC"}
+            assert set(positional) <= allowed, (
+                f"{script} installs {sorted(set(positional) - allowed)}, neither a "
+                "lambda_pin derivation nor $MORTIE_SPEC (issue #613)"
+            )
 
 
 class TestLambdaHandlerSyntax:
