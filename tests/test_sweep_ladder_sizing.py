@@ -210,7 +210,28 @@ class TestSizedDispatch:
             for b in client.blocks()
             if b.get("role") == "stage"
         }
-        assert spans == {(1, 3, 2), (0, 1, 1)}
+        # The RUN's ``tuple_width`` on the wire, unchanged by the sizing: the
+        # span is what carries the tuple's own width (review finding).
+        assert spans == {(1, 3, 3), (0, 1, 3)}
+
+    def test_an_unsized_ragged_schedule_sends_the_runs_width(self, tmp_path):
+        # The wire's ``tuple_width`` is the RUN's on the unsized path too, so a
+        # fleet predating the span keeps working on a RAGGED ladder: it
+        # re-derives ``stage_tuples(shard_order, tuple_width)`` and filters by
+        # dispatch, which lands the right span only when the width it is handed
+        # is the one that built the schedule (review finding). At
+        # ``shard_order=3, tuple_width=2`` the finest tuple's own width is 1.
+        from test_sweep_stage_fleet import _FakeLambda, _fleet
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        summary = _fleet(root, client, barrier_timeout_s=0.01, tuple_width=2)
+        assert _spans_of(summary) == _spans(stage_tuples(3, tuple_width=2))
+        widths = {int(b["tuple_width"]) for b in client.blocks() if b.get("role") == "stage"}
+        assert widths == {2}
+        # The per-tuple width stays on the dispatcher's own row.
+        assert [int(st["width"]) for st in summary["stages"]] == [1, 2]
 
     def test_the_span_names_a_tuple_no_width_could_select(self, tmp_path):
         # The other half of the claim above, said as a refusal: ask the pass

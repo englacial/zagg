@@ -1013,10 +1013,17 @@ def run_stage_sweep_fleet(
             "run_id": run_id,
             "run_started": run_started,
             "dispatch": dispatch,
-            # The TUPLE's own width, and its span outright: a sized schedule
-            # dispatches at orders no single width lands on, so the worker
-            # takes the span rather than re-deriving it (issue #610).
-            "tuple_width": width,
+            # The RUN's width, as it has always been — and the tuple's span
+            # outright beside it: a sized schedule dispatches at orders no
+            # single width lands on, so the worker takes the span rather than
+            # re-deriving it (issue #610). Sending the TUPLE's own width here
+            # instead would change the unsized path's wire bytes too, and on a
+            # ragged ladder (``shard_order % tuple_width != 0``) the finest
+            # tuple's width then selects no tuple at all on a worker predating
+            # the span — losing the leaf-adjacent orders where they used to
+            # fold correctly (review finding). The per-tuple width stays on
+            # the dispatcher's own row (``width``).
+            "tuple_width": tuple_width,
             "child_order": int(stage["child_order"]),
             "records_from": records_from,
         }
