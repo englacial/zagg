@@ -75,7 +75,7 @@
   },
   "2": {
    "regime": "stage-gather",
-   "merges_from_raw": 1,
+   "merges_from_raw": 2,
    "source_children": {
     "folded": 4,
     "missing": 0,
@@ -84,7 +84,7 @@
   },
   "1": {
    "regime": "stage-merge",
-   "merges_from_raw": 2,
+   "merges_from_raw": 3,
    "source_children": {
     "folded": 4,
     "missing": 0,
@@ -93,7 +93,7 @@
   },
   "0": {
    "regime": "stage-merge",
-   "merges_from_raw": 2,
+   "merges_from_raw": 4,
    "source_children": {
     "folded": 4,
     "missing": 0,

@@ -21,19 +21,22 @@ spec §4.4/§4.6 make normative:
 - **read-back** — per ladder artifact, the ``zagg-overview/2`` attrs:
   ``regime`` must equal the DERIVED classification
   (:func:`zagg.sweep_stage.classify_level` — gather at/below the shard
-  resolution, merge above it), ``merges_from_raw`` 1/2 accordingly (never 3
-  upfront), ``source_children`` with its three counters, and the writing
+  resolution, merge above it), ``merges_from_raw`` at a gather the depth
+  of the leaf-column groups it concatenates
+  (:func:`zagg.column.member_merges_from_raw`) and one more than its
+  children's recorded depth at a merge (the cascade, issue
+  #620), ``source_children`` with its three counters, and the writing
   ``run_id``; per column, the ``zagg-column/1`` attrs and the declared
   group roster. Manifest per-entry ``actuals`` (the finisher's RMW) are
   held to the same regime law when present;
 - **counts / digests / composition** — the same value laws as the ``/1``
-  arm (shared ``_check_node``), re-folded from the LEAF COLUMNS: the level
-  at resolution ``r`` reads each contributing leaf's column group at ``r``
-  for a gather and at the relay member (:func:`zagg.column.relay_resolution`
-  — the res-``shard_order + 2`` partials, issue #538) for a merge — which
-  is byte-what the staged sweep consumed (the
-  merge-source law makes tuple grouping irrelevant *for the folded values*;
-  see :func:`_value_checks_v2` for the §3.3 poison-unit caveat). A gather level's
+  arm (shared ``_check_node``), re-folded from what the staged sweep
+  consumed: a gather level at resolution ``r`` reads each contributing
+  leaf's column group at ``r``; a merge level reads its children's
+  artifacts at the next finer declared level
+  (:func:`zagg.sweep_stage.finer_levels`), the cascade's own sources, so
+  its values are a fixed function of the ladder whatever tuple grouping the
+  sweep used. A gather level's
   packed word is compared as ASSIGNED gen-1 content, not re-merged (§3.4
   quantization drift is per merge). The column tier itself is validated
   against the leaf's own cell arrays at and above the raw-fold boundary
@@ -49,8 +52,9 @@ spec §4.4/§4.6 make normative:
 
 A level whose ``source_children`` records ``missing``/``unreadable``
 children claims to under-cover its subtree (§4.3). The claim is the artifact
-talking about itself, so it is CROSS-CHECKED against the committed leaf
-columns of that subtree (:func:`_coverage_verdict`): genuinely short sources
+talking about itself, so it is CROSS-CHECKED against the committed sources
+of that subtree — the leaf columns for a gather, the children's artifacts
+for a merge (:func:`_coverage_verdict`): genuinely short sources
 DECLINE the level's per-cell comparisons and are named — the fill cells
 there are not evidence, and the next sweep heals it — while a level stamped
 short whose sources are all committed is a STALE artifact and fails by name.
@@ -374,38 +378,39 @@ def _tier_checks(
     same, over that window's objects. ``groups`` is :func:`_field_groups`'s
     tuple.
 
-    Ladder levels re-fold from the LEAF COLUMNS (the gen-1 tier the staged
-    sweep itself consumes); the column tier re-folds from the leaf's own cell
-    arrays (§4.6 from-leaves parity). The composition compare is always exact
-    here: the /2 regime is DERIVED from the geometry
-    (:func:`zagg.sweep_stage.classify_level`), never guessed.
-
-    The merge-source law makes the FOLDED VALUES independent of the tuple
-    grouping the sweep happened to use, which is what licenses re-folding
-    per leaf. It does not extend to the §3.3 half-pair poison, whose unit is
-    the CHILD COLUMN at ``child_order`` (``sweep_stage._merge_slabs`` blanks
-    ``range(base // factor, ...)``, siblings included, left wide by design) —
-    so a contributor carrying an ``of`` digest without its word poisons a
-    span this harness, pairing per LEAF in
-    :meth:`zagg.pyramid_check_core._Harness.paired_contributions`, would
-    expect a k-way merge for. It needs a stage column skewed that way, so it
-    is not reachable from a sweep that wrote its pairs; the law is quoted
-    here for values only, not for the poison span (review finding).
+    A gather level re-folds from the LEAF COLUMNS at its own resolution; a
+    merge level from its CHILDREN'S ARTIFACTS at the next finer declared
+    level — the sources the staged sweep itself consumed (the cascade, issue
+    #620), so the expected values are a fixed function of the ladder
+    whatever tuple grouping the sweep used; the column tier re-folds from
+    the leaf's own cell arrays (§4.6 from-leaves parity). The composition
+    compare is always exact here: the /2 regime is DERIVED from the geometry
+    (:func:`zagg.sweep_stage.classify_level`), never guessed, and every
+    merge cell has exactly one contributor (its one child's cells), so the
+    §3.3 half-pair poison this harness expects per contributor is the
+    kernel's own span.
     """
-    from zagg.column import column_resolutions, raw_fold_boundary, relay_resolution
+    from zagg.column import column_resolutions, member_merges_from_raw, raw_fold_boundary
     from zagg.sweep_overview import OVERVIEW_ATTR
-    from zagg.sweep_stage import STAGE_GATHER, classify_level
+    from zagg.sweep_stage import STAGE_GATHER, classify_level, finer_levels
 
     count_meta, exact_fields, digest_fields, _wide_fields, packed_fields = groups
     s = harness.shard_order
-    relay = relay_resolution(entries, s, harness.cell_order)
+    finer = finer_levels([{"node": k, "cells": [r]} for k, r in ladder])
+    resolutions = column_resolutions(entries, s)
+    boundary = raw_fold_boundary(s, harness.cell_order, resolutions)
 
-    # -- the above-shard ladder, from the leaf-column tier: a gather reads
-    # its own member, a merge the relay member (§4.4, issue #538).
+    # -- the above-shard ladder: a gather reads the leaf columns' member at
+    # its own resolution, a merge its children's artifacts (§4.4).
     for k, r in ladder:
         gather = classify_level(r, shard_order=s) == STAGE_GATHER
-        q = r if gather else relay
-        tier = (s, q, leaves, lambda dec, q=q: harness.column_group(dec, q))
+        if gather:
+            tier = (s, r, leaves, lambda dec, r=r: harness.column_group(dec, r))
+            roster, roster_probes = leaves, col_probes
+        else:
+            src_k, src_r = finer[k]
+            roster, roster_probes = declared[src_k], probes[src_k]
+            tier = (src_k, src_r, roster, lambda dec, q=src_r: harness.node_group(dec, q))
         nodes = [n for n in declared[k] if probes[k].get(n) is not None]
         if not full and len(nodes) > harness.sample_nodes:
             picks = harness.rng.choice(len(nodes), harness.sample_nodes, replace=False)
@@ -413,10 +418,15 @@ def _tier_checks(
         for node in nodes:
             attrs = probes[k][node]
             prov = attrs.get(OVERVIEW_ATTR)
-            errors["readback"].extend(_stage_provenance_errors(node, k, r, s, prov, gather))
+            depth = (
+                member_merges_from_raw(r, boundary)
+                if gather
+                else _cascade_depth(node, roster, roster_probes)
+            )
+            errors["readback"].extend(_stage_provenance_errors(node, k, r, s, prov, gather, depth))
             sc = (prov or {}).get("source_children") if isinstance(prov, dict) else None
             sc = sc if isinstance(sc, dict) else {}
-            values = _coverage_verdict(node, sc, leaves, col_probes, harness, errors)
+            values = _coverage_verdict(node, sc, roster, roster_probes, harness, errors)
             _check_node(
                 harness,
                 node,
@@ -435,12 +445,39 @@ def _tier_checks(
                 gather=gather,
                 values=values,
             )
+            if gather:
+                continue
+            # The leaf anchor: a merge checked only against its children's
+            # artifacts passes a whole corrupt subtree whose ancestors were
+            # cascaded from it, unless this exact node is sampled at that
+            # order. ``count`` and every exact law are exact at any depth, so
+            # the node is also held to the leaf columns' node-order member —
+            # one cell per leaf — with the payload legs off (a digest or word
+            # is legitimately a cascade, not a flat fold of the leaves). When
+            # the node's columns are short the ``columns`` check carries it.
+            _check_node(
+                harness,
+                node,
+                k,
+                r,
+                (s, s, leaves, lambda dec: harness.column_group(dec, s)),
+                attrs,
+                count_meta,
+                exact_fields,
+                digest_fields,
+                packed_fields,
+                errors,
+                counted,
+                full=full,
+                compose_exact=True,
+                values=values
+                and all(col_probes.get(d) is not None for d in leaves if d.startswith(node)),
+                refold_payloads=False,
+            )
 
     # -- the leaf-column tier (§4.6 parity): groups at or finer than the
     # raw-fold boundary from the leaves' own cell arrays, the coarser groups
     # from the column's boundary group — the flat fold they are (issue #538).
-    resolutions = column_resolutions(entries, s)
-    boundary = raw_fold_boundary(s, harness.cell_order, resolutions)
     leaf_tier = (s, harness.cell_order, leaves, harness.leaf_group)
     boundary_tier = (s, boundary, leaves, lambda dec: harness.column_group(dec, boundary))
     col_nodes = [d for d in leaves if col_probes.get(d) is not None]
@@ -502,7 +539,27 @@ def _as_int(value) -> int | None:
         return None
 
 
-def _coverage_verdict(node, sc, leaves, col_probes, harness, errors) -> bool:
+def _cascade_depth(node, roster, probes) -> int:
+    """A merge level's expected ``merges_from_raw``: one more than its children's.
+
+    The children are the committed artifacts at the next finer declared
+    level beneath ``node`` (``roster`` names the declared ones, ``probes``
+    their attrs) — the rule the sweep records by
+    (:func:`zagg.sweep_stage._source_depth`), so a fold made over
+    relay-era children (2) and never re-folded reads as stale here.
+    """
+    from zagg.sweep_overview import OVERVIEW_ATTR
+
+    depths = []
+    for dec in roster:
+        attrs = probes.get(dec) if dec.startswith(node) else None
+        block = (attrs or {}).get(OVERVIEW_ATTR)
+        if isinstance(block, dict):
+            depths.append(_as_int(block.get("merges_from_raw")) or 1)
+    return 1 + max(depths, default=1)
+
+
+def _coverage_verdict(node, sc, roster, probes, harness, errors) -> bool:
     """Whether one ladder node's per-cell value comparisons may run (§4.3).
 
     A level's ``source_children`` counters are written by the ARTIFACT UNDER
@@ -510,16 +567,18 @@ def _coverage_verdict(node, sc, leaves, col_probes, harness, errors) -> bool:
     stamp ``missing: 1`` and decline its way past the gate (review finding:
     reproduced as a ``PASS`` on nine corrupted nodes). The claim is therefore
     CROSS-CHECKED against the roster the harness already holds: a node's
-    sources are the committed leaf columns of its subtree (the §4.6 gen-1
-    tier), which :func:`_columns_check` just probed.
+    sources are the committed members of ``roster`` beneath it — the leaf
+    columns of a gather's subtree (the §4.6 gen-1 tier, which
+    :func:`_columns_check` just probed), the children's artifacts of a merge
+    — with ``probes`` their committed attrs.
 
-    - stamped short **and** some source column is genuinely absent — the
-      benign case: decline the per-cell comparisons (a fill cell there is not
-      evidence) and name it; the ``columns`` check carries the failure;
-    - stamped short while EVERY source column is committed — a STALE
-      artifact whose sources have since healed: a read-back failure by name,
-      and the value checks run, because the tier they compare against is
-      complete;
+    - stamped short **and** some source is genuinely absent — the benign
+      case: decline the per-cell comparisons (a fill cell there is not
+      evidence) and name it; the ``columns``/``materialization`` check
+      carries the failure;
+    - stamped short while EVERY source is committed — a STALE artifact whose
+      sources have since healed: a read-back failure by name, and the value
+      checks run, because the tier they compare against is complete;
     - not stamped short — the ordinary path.
 
     Either way the structural read-back legs run (``values=False`` keeps
@@ -528,24 +587,24 @@ def _coverage_verdict(node, sc, leaves, col_probes, harness, errors) -> bool:
     """
     if not (int(sc.get("missing") or 0) or int(sc.get("unreadable") or 0)):
         return True
-    subtree = [d for d in leaves if d.startswith(node)]
-    uncommitted = [d for d in subtree if col_probes.get(d) is None]
+    subtree = [d for d in roster if d.startswith(node)]
+    uncommitted = [d for d in subtree if probes.get(d) is None]
     if not uncommitted:
         errors["readback"].append(
             f"{node}: records source_children {sc} — under-covers its subtree — while "
-            f"all {len(subtree)} of its source column(s) are committed: a STALE level "
+            f"all {len(subtree)} of its source(s) are committed: a STALE level "
             f"whose sources have since healed; re-sweep"
         )
         return True
     harness.warn(
         f"{node}: level under-covers its subtree ({sc}; {len(uncommitted)}/{len(subtree)} "
-        f"source column(s) uncommitted, e.g. {uncommitted[:3]}) — per-cell value checks "
+        f"source(s) uncommitted, e.g. {uncommitted[:3]}) — per-cell value checks "
         f"declined; a fill cell there is not evidence (§4.3), and the next sweep heals it"
     )
     return False
 
 
-def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
+def _stage_provenance_errors(node, k, r, s, prov, gather, depth) -> list:
     """One ladder artifact's ``zagg-overview/2`` attrs vs the §4.4 contract.
 
     An ABSENT block is left to :func:`_check_node`'s read-back leg (one
@@ -554,12 +613,13 @@ def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
     to a string satisfies it and would otherwise skip this whole contract
     silently (review finding). A present one must record the DERIVED regime —
     gather at/below the shard resolution, merge above — with its
-    merges-from-raw at 1/2 (never 3 upfront: gen 3 belongs only to the
-    append-later cascade regime), the ``source_children`` counters (present
-    in BOTH stage regimes), and the writing ``run_id``. ``merges_from_raw``
-    is REQUIRED like its two siblings — §4.4 makes it normative on a ``/2``
-    stage artifact, and an absent key is the one way to make no claim at all
-    (review finding: it used to pass, alone among the three).
+    merges-from-raw at ``depth`` (the gathered groups' depth for a gather,
+    one more than its children's for a merge — :func:`_cascade_depth`), the
+    ``source_children`` counters (present in BOTH stage regimes), and the
+    writing ``run_id``. ``merges_from_raw`` is REQUIRED like its two siblings
+    — §4.4 makes it normative on a ``/2`` stage artifact, and an absent key
+    is the one way to make no claim at all (review finding: it used to pass,
+    alone among the three).
     """
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import OVERVIEW_SPEC_V2, STAGE_GATHER, STAGE_MERGE
@@ -585,11 +645,12 @@ def _stage_provenance_errors(node, k, r, s, prov, gather) -> list:
             f"{node}: regime {prov.get('regime')!r} != derived {expected_regime!r} "
             f"(cells {r} vs shard order {s}, §4.4)"
         )
-    expected_mfr = 1 if gather else 2
-    if _as_int(prov.get("merges_from_raw")) != expected_mfr:
+    if _as_int(prov.get("merges_from_raw")) != int(depth):
         errs.append(
-            f"{node}: merges_from_raw {prov.get('merges_from_raw')} != {expected_mfr} "
-            f"for a {expected_regime} level (never 3 for an upfront level, §4.4)"
+            f"{node}: merges_from_raw {prov.get('merges_from_raw')} != {depth} "
+            f"for a {expected_regime} level "
+            f"({'the depth of the groups it gathers' if gather else 'one more than its children record'}"
+            f", §4.4)"
         )
     sc = prov.get("source_children")
     if not isinstance(sc, dict) or not {"folded", "missing", "unreadable"} <= set(sc):
@@ -667,17 +728,28 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
     block is at most a warning — flagged when the entry's ladder tier is
     fully materialized, i.e. a sweep clearly ran but its finisher's record
     did not land. A PRESENT block must record the leaf-column law at the
-    leaf entry and the derived stage regime at 1/2 merges-from-raw above it.
+    leaf entry and, above it, the derived stage regime with
+    ``merges_from_raw`` at a gather the gathered leaf-column groups' depth
+    (:func:`zagg.column.member_merges_from_raw`) and, at a merge, the
+    deepest the level's committed artifacts record (the finisher's maximum,
+    §4.5).
 
     §4.5 calls ``actuals`` an additive key a reader must TOLERATE, and this
     module's contract is a verdict on a malformed store, never a traceback
     (review finding): a block that is not a mapping, or whose counters do
     not read as integers, is a read-back error by name.
     """
-    from zagg.column import leaf_entry_merges_from_raw
+    from zagg.column import (
+        column_resolutions,
+        leaf_entry_merges_from_raw,
+        member_merges_from_raw,
+        raw_fold_boundary,
+    )
+    from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import STAGE_GATHER, STAGE_MERGE, classify_level
 
     leaf_mfr = leaf_entry_merges_from_raw(entries, s, harness.cell_order)
+    boundary = raw_fold_boundary(s, harness.cell_order, column_resolutions(entries, s))
     for e in entries:
         node, a = int(e["node"]), e.get("actuals")
         if a is None:
@@ -708,7 +780,16 @@ def _actuals_errors(entries, s, harness, errors, counted, probes, declared) -> N
             continue
         r = int(e["cells"][0])
         expected = classify_level(r, shard_order=s)
-        mfr = 1 if expected == STAGE_GATHER else 2
+        recorded = [
+            _as_int(attrs[OVERVIEW_ATTR].get("merges_from_raw")) or 0
+            for attrs in (probes.get(node) or {}).values()
+            if isinstance(attrs, dict) and isinstance(attrs.get(OVERVIEW_ATTR), dict)
+        ]
+        mfr = (
+            member_merges_from_raw(r, boundary)
+            if expected == STAGE_GATHER
+            else max(recorded, default=2)
+        )
         if a.get("regime") not in (STAGE_GATHER, STAGE_MERGE):
             errors["readback"].append(
                 f"manifest actuals for node {node}: unknown regime {a.get('regime')!r}"

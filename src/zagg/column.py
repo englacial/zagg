@@ -122,35 +122,6 @@ def leaf_entry_merges_from_raw(levels: list, shard_order: int, cell_order: int) 
     return max(member_merges_from_raw(c, boundary) for c in cells)
 
 
-def relay_resolution(levels: list, shard_order: int, cell_order: int) -> int:
-    """The member every above-shard merge folds from (spec §4.4, issue #538).
-
-    The leaf column's **coarsest member still folded from raw**, derived from
-    :func:`raw_fold_boundary` itself so the two can never disagree (review
-    finding): the boundary member when the column CARRIES one (every group
-    below it is a flat second merge, so a ladder merge consuming one would
-    sit at gen 3), else the node-order member — the one group every column
-    carries, and from raw whenever no boundary group exists. Either way a
-    stage merge consuming the relay is exactly 2 merges from raw.
-
-    Membership, not the finest declared resolution, is the predicate: a
-    list that straddles the boundary without carrying it (``overviews: [12,
-    10]`` on the 19/13/9 geometry — members {12, 10, 9}, finest 12, no group
-    11) is refused at declaration since the contiguity ruling (PR #567
-    thread, 2026-09-17), but a hand-built manifest can still carry it, and
-    relaying a member the leaf columns do not hold would leave every
-    above-shard merge level at fill. Stage columns relay this member for
-    their subtree
-    (:func:`zagg.sweep_stage.column_members`). The leaf entry (``node ==
-    shard_order``) places the members; a ``levels`` list without one (a
-    hand-built manifest — ``expand_overviews`` always emits it) has no
-    column resolutions at all and relays the node-order member.
-    """
-    shard_order = int(shard_order)
-    boundary = raw_fold_boundary(shard_order, cell_order, column_resolutions(levels, shard_order))
-    return shard_order if boundary is None else int(boundary)
-
-
 def generation_key(block) -> tuple:
     """The staged sweep's skip-gate key over a summed ``generation`` block.
 

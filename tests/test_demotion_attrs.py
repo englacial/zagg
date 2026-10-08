@@ -28,7 +28,7 @@ from zagg.sweep_overview import (
 )
 
 #: The stage-column geometry of ``tsc.TestStageMergeHalfPair``: order-3
-#: columns with a node-order relay member, folded by a (node 1, cells 2)
+#: columns with a node-order member, folded by a (node 1, cells 2)
 #: stage-merge level whose one populated output cell mixes both children.
 NODE_ORDER, CELL_ORDER, RES = 3, 5, 4
 
@@ -104,19 +104,19 @@ class TestStageArtifactDemotions:
         return _ColumnReader(path, run_id="A", run_started=_utcnow(), store_kwargs={})
 
     def _fold(self, paths):
-        """A (node 1, cells 2) stage merge over the two columns."""
-        from zagg.sweep_stage import _stage_fold
+        """A (node 1, cells 2) stage merge over the two columns' node members."""
+        from zagg.sweep_stage import STAGE_MERGE, _stage_fold
 
-        readers = {"1111": [self._reader(paths[0])], "1112": [self._reader(paths[1])]}
+        rows = [[self._reader(paths[0])], [self._reader(paths[1])], None, None]
         return _stage_fold(
             "11",
             1,
             2,
-            readers,
+            rows,
             tsc._STRATA_FIELDS,
-            shard_order=NODE_ORDER,
-            child_order=NODE_ORDER,
-            relay=NODE_ORDER,
+            regime=STAGE_MERGE,
+            src_order=NODE_ORDER,
+            res_src=NODE_ORDER,
         )
 
     def _fold_and_write(self, root, paths):
@@ -177,20 +177,18 @@ class TestStageArtifactDemotions:
                 "cells": 1,
             }
         ]
-        # The record sits with the coverage counters it refines — NOT a pinned
-        # equality: ``contributors`` counts per-read instances (here one
-        # (child, window) column) and ``source_children`` counts children, so
-        # the two coincide only in this single-window shape (spec §4.3).
-        assert attrs["source_children"]["unreadable"] == 1
+        # The rail is per FIELD (the one rule of both sweeps since issue
+        # #620): the contributor still folded its other fields and counts as
+        # folded; the record is what says composition folded short of it.
+        assert attrs["source_children"] == {"folded": 2, "missing": 0, "unreadable": 0}
 
     def test_a_missing_divisor_lands_in_the_artifact(self, tmp_path):
         """The drop direction — the issue's mis-declared-divisor shape.
 
         A column carrying the word but not its ``of`` digest — the shape a
         mis-declared divisor leaves behind — contributes nothing for the
-        field, and the artifact now says so. (One contributor only: the
-        packed rail counts a fired contributor ``unreadable``, and a level
-        where NO contributor folds cleanly returns no fold at all.)
+        field, and the artifact now says so. No ``cells``: the two
+        contributors share the one output cell, so the other's word covers it.
         """
         import shutil
 
@@ -208,27 +206,36 @@ class TestStageArtifactDemotions:
                 "of": "h_sig",
             }
         ]
+        assert attrs["source_children"] == {"folded": 2, "missing": 0, "unreadable": 0}
 
-    def test_every_contributor_firing_drops_the_level(self, tmp_path):
-        """Pinned, not fixed: the `/2` level vanishes instead of recording.
+    def test_every_contributor_firing_still_materializes_the_level(self, tmp_path):
+        """The mis-declared-divisor shape fires on every contributor: the level lands.
 
-        The rail's ``broken`` marking is a WHOLE-contributor verdict, so the
-        mis-declared-divisor shape — which fires on every contributor —
-        leaves ``folded == 0`` and ``_stage_fold`` returns ``None``: no
-        artifact, no ``demotions``, and the fields that folded cleanly are
-        dropped too. That is committed ``source_children`` semantics
-        predating issue #518, disclosed in spec §4.3 and standing for review
-        rather than changed here. The `/1` paths do not share it —
-        ``_fold_node`` returns ``None`` only on ``n_leaves == 0``
-        (``TestV1SweepArtifactDemotions`` above).
+        The `/1` rule, now the one rule (issue #620): a demoted contributor is
+        still a counted child, so the fields that folded cleanly are written,
+        the composition word stays fill, and the record names every
+        contributor — where the `/2` fold used to drop the whole level and
+        the evidence with it.
         """
         import shutil
 
         paths = self._columns(tmp_path)
         for path in paths:
             shutil.rmtree(f"{path}/{NODE_ORDER}/h_sig")
-        assert self._fold(paths) is None
-        assert not (tmp_path / "1" / "1" / "all.zarr").exists()
+        fold = self._fold_and_write(tmp_path, paths)
+        attrs = self._attrs(tmp_path)
+        assert attrs["source_children"] == {"folded": 2, "missing": 0, "unreadable": 0}
+        assert attrs["demotions"] == [
+            {
+                "field": "composition",
+                "class": "packed",
+                "reason": "divisor-missing",
+                "contributors": 2,
+                "of": "h_sig",
+            }
+        ]
+        assert int(fold["slabs"]["composition"].sum()) == 0
+        assert fold["slabs"]["h_noise"][0] is not None and len(fold["slabs"]["h_noise"][0])
 
 
 def _v1_manifest(root, fields):

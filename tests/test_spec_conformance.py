@@ -30,7 +30,9 @@ import zarr
 from numcodecs import Zstd
 from zarr.storage import LocalStore
 
+from zagg.config import default_config
 from zagg.coverage_toc import coverage_toc, coverage_toc_counts, coverage_toc_uncounted
+from zagg.grids import HealpixGrid
 from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
@@ -196,6 +198,39 @@ def _digest_expectations(exp):
             if field.startswith("h_tdigest") and not field.endswith(("_locations", "_times")):
                 want = np.array(cell[field], dtype=np.float32).reshape(-1, 2)
                 yield field, cell["index"], want
+
+
+class TestDggsEllipsoid:
+    """§1 — every committed ``dggs`` block is what the writer emits today."""
+
+    def test_every_committed_dggs_block_matches_the_writer(self):
+        # Issue #616: every committed ``zarr.json`` carrying a ``dggs`` block
+        # — leaves, columns, overviews — equals ``HealpixGrid._dggs_attrs()``
+        # modulo the per-group ``refinement_level``, so it spells the schema's
+        # ``semi_major_axis`` (``ellipsoidObject`` is
+        # ``additionalProperties: false``) and carries the mortie §9
+        # ``latitude`` token. The pre-fix ``semimajor_axis`` vintage survives
+        # only in stores written through 0.58.0, never in these fixtures.
+        grid = HealpixGrid(
+            parent_order=4, child_order=6, layout="fullsphere", config=default_config("atl06")
+        )
+        want = {k: v for k, v in grid._dggs_attrs()["dggs"].items() if k != "refinement_level"}
+        seen = set()
+        for meta in SPEC_DATA.rglob("zarr.json"):
+            attrs = json.loads(meta.read_text()).get("attributes", {})
+            if "dggs" not in attrs:
+                continue
+            seen.add(meta.relative_to(SPEC_DATA).parts[0])
+            got = {k: v for k, v in attrs["dggs"].items() if k != "refinement_level"}
+            assert got == want, meta.relative_to(SPEC_DATA)
+        # Every fixture tree with a leaf contributes at least one block, so a
+        # regen that drops a tree's ``dggs`` stamp fails here, not silently.
+        leafed = {
+            p.name.removesuffix(".expected.json")
+            for p in SPEC_DATA.glob("*.expected.json")
+            if "leaf" in json.loads(p.read_text())
+        }
+        assert leafed <= seen, leafed - seen
 
 
 class TestRaggedAttrs:
@@ -787,22 +822,29 @@ class TestPyramidV2Declaration:
 
     def test_per_entry_actuals_decode_per_spec(self):
         # §4.5 (issue #384): materialization actuals nest inside the level
-        # entry that owns them — regime, merges-from-raw (2 for every
-        # upfront merge level, NEVER 3; 1 for gathers and the leaf column),
-        # `source_children` on the stage regimes only, and unpinned
-        # timestamp/run-id values a reader tolerates.
+        # entry that owns them — regime, merges-from-raw (the gathered
+        # groups' depth at a gather and the leaf column, the cascade depth at
+        # a merge: one more per merge level, so 3 then 4 here — issue #620),
+        # `source_children` on the
+        # stage regimes only, and unpinned timestamp/run-id values a reader
+        # tolerates.
         exp = _expected(PYRAMID)
+        depths = {}
         for entry in _pyramid_block()["overviews"]:
             expected = exp["actuals"][str(entry["node"])]
             actuals = entry["actuals"]
             assert actuals["regime"] == expected["regime"]
             assert actuals["merges_from_raw"] == expected["merges_from_raw"]
-            assert actuals["merges_from_raw"] <= 2  # gen 3 is append-later only
+            depths[entry["node"]] = actuals["merges_from_raw"]
             if expected["regime"] == "leaf-column":
                 assert "source_children" not in actuals
             else:
                 assert actuals["source_children"] == expected["source_children"]
             assert "generated_at" in actuals
+        # The depth rule, decoded from the committed bytes: the gather at its
+        # gathered groups' depth (2, member 3 is below the boundary), then
+        # one more per merge level down to the root.
+        assert depths == {3: 2, 2: 2, 1: 3, 0: 4}
 
     def test_fold_declaration_keys_ride_along(self):
         # PR #379's declaration keys are revision-independent (§4.5).

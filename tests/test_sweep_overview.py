@@ -1968,26 +1968,6 @@ class TestLocatedDeclarationGate:
         assert result["families"]["overview"]["failed"] == 1
         assert result["families"]["overview"]["written"] == 0
 
-    def test_the_cascade_refuses_an_unimplemented_shape(self, tmp_path):
-        # Same check on the fold-of-folds path, which reads the OVERVIEW's own
-        # sibling. ``_cascade_node`` wraps this call in its per-child guard, so
-        # the raise becomes a loud skip there (``failed`` + ``unreadable``).
-        from zagg.sweep_overview import _fold_child
-
-        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
-        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0], 5: [9.0]})
-        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
-        store = open_store(f"{tmp_path}/-3/1/all.zarr")
-        fine = zarr.open_group(store, path="3", mode="r+", zarr_format=3)
-        assert _fold_child(fine, LOCATED_FIELDS_DECL, 4, 4, "fine") is not None
-        fine["h_tdigest_locations"].attrs["located"] = {
-            "spec": "zagg-located/1",
-            "shape": "per-cell",
-            "grammar": "mortie-morton/1",
-        }
-        with pytest.raises(ValueError, match="is not implemented"):
-            _fold_child(fine, LOCATED_FIELDS_DECL, 4, 4, "fine")
-
 
 class TestOverviewWriter:
     def test_folds_leaves_at_every_declared_order(self, tmp_path):
@@ -2443,6 +2423,60 @@ class TestCascadeFold:
         assert "fold_source 'sideways' is unknown" in caplog.text
         assert "exact_levels 'two' is unusable" in caplog.text
 
+    def test_the_1_and_2_sweeps_fold_a_node_through_the_one_engine(self, tmp_path, monkeypatch):
+        """Issue #620: ``/1`` and ``/2`` fold the same children to the same slabs, one way."""
+        import zagg.sweep_fold as fold_mod
+        import zagg.sweep_stage as stage_mod
+        from zagg.sweep import _node_rel
+        from zagg.sweep_overview import _cascade_node, _rel_rank
+        from zagg.sweep_stage import STAGE_MERGE, _OverviewReader, _stage_fold
+
+        _write_manifest(tmp_path, orders=(1, 0))
+        refs = self._two_leaves(tmp_path)
+        _make_leaf(tmp_path, "-321", {3: [7.0, 8.0]})
+        refs.append((morton_word("-321"), None))
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        calls, real = [], fold_mod.cascade_fold
+
+        def counting(*args, **kwargs):
+            calls.append(kwargs["k"])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(fold_mod, "cascade_fold", counting)
+        monkeypatch.setattr(stage_mod, "cascade_fold", counting)
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        node_shards = ["-311", "-312", "-321"]
+        one = _cascade_node(
+            str(tmp_path),
+            "-3",
+            0,
+            1,
+            "all",
+            node_shards,
+            COMPOSABLE,
+            CELL_ORDER,
+            SHARD_ORDER,
+            counts,
+            {},
+        )
+        rows: list = [None] * 4
+        for child in ("-31", "-32"):
+            path = f"{tmp_path}/{_node_rel(child)}/all.zarr"
+            reader = _OverviewReader(path, run_id=None, run_started="", store_kwargs={})
+            rows[_rel_rank(child, "-3")] = [reader]
+        two = _stage_fold("-3", 0, 2, rows, COMPOSABLE, regime=STAGE_MERGE, src_order=1, res_src=3)
+        assert calls == [0, 0] and counts["failed"] == 0
+        assert set(one["slabs"]) == set(two["slabs"]) and one["slabs"]
+        for name, slab in one["slabs"].items():
+            if slab.dtype == object:
+                assert all(
+                    bytes(p or b"") == bytes(q or b"")
+                    for p, q in zip(slab, two["slabs"][name], strict=True)
+                ), name
+            else:
+                assert np.array_equal(slab, two["slabs"][name], equal_nan=True), name
+        assert one["source_children"] == two["source_children"]
+
     def test_child_that_is_not_an_overview_is_skipped_loudly(self, tmp_path, caplog):
         from zagg.sweep_overview import _cascade_node
 
@@ -2470,6 +2504,34 @@ class TestCascadeFold:
         )
         assert fold is None and counts["failed"] == 1
         assert "is not an overview at order 1" in caplog.text
+
+    def test_child_at_another_cell_order_is_skipped_loudly(self, tmp_path, caplog):
+        from zagg.sweep_overview import _cascade_node
+
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        # An overview at the source order but another cell order has no
+        # group at the cells this fold reads: it would fold as all-fill.
+        store = open_store(str(tmp_path / "-3" / "1" / "all.zarr"))
+        g = zarr.open_group(store, mode="r+", zarr_format=3)
+        g.attrs[OVERVIEW_ATTR] = {**dict(g.attrs)[OVERVIEW_ATTR], "cell_order": 0}
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        fold = _cascade_node(
+            str(tmp_path),
+            "-3",
+            0,
+            1,
+            "all",
+            ["-311"],
+            COMPOSABLE,
+            CELL_ORDER,
+            SHARD_ORDER,
+            counts,
+            {},
+        )
+        assert fold is None and counts["failed"] == 1
+        assert "cell order 0" in caplog.text
 
     def test_cascade_without_a_materialized_child_is_empty(self, tmp_path, caplog):
         import logging

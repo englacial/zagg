@@ -259,13 +259,13 @@ def sized_stage_tuples(
     that chose it — measured when ``nodes_at`` was supplied, the dense bound
     otherwise.
 
-    The grouping is a dispatch knob, never grammar: by the merge-source law
-    (#381 point (6)) a sized schedule and a fixed one build the same ladder
+    The grouping is a dispatch knob, never grammar: by the cascade (issue
+    #620; #381 point (6)) a sized schedule and a fixed one build the same ladder
     OVERVIEWS, which is what the oracle compares and what a reader reads. Not
     every byte, and the suite does not claim it (review finding): the group
     attrs carry per-run provenance that is legitimately grouping-dependent
     (``source_children``, the summed child ``generation``), and a sized arm
-    writes relay stage columns a fixed arm never needs.
+    writes stage columns a fixed arm never needs.
     """
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, _node_at, one_stage_tuple, stage_tuples
 

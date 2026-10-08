@@ -51,7 +51,7 @@ them is meaningless (mortie spec §9 is where the prohibition binds). The
 token — `"latitude": "authalic-wgs84"`, mandatory for a writer at the current
 mortie spec version, since [#580](https://github.com/englacial/zagg/issues/580)
 (folding #549's resolution; `zagg.grids.morton.LATITUDE_CONVENTION`) —
-beside `ellipsoid: {name: WGS84, semimajor_axis: 6378137.0,
+beside `ellipsoid: {name: WGS84, semi_major_axis: 6378137.0,
 inverse_flattening: 298.257223563}` and no sphere radius: that entry is the
 **ingress datum** (the geodetic coordinates fed to `geo2mort`, equal-area on
 that ellipsoid by construction), not an instruction to compute cell geometry
@@ -66,6 +66,16 @@ rewritten, do not — and each artifact's own `dggs` block is authoritative for
 that artifact. A reader reproducing cell geometry
 (e.g. a viewer's boundary golden test) needs the geodetic ↔ authalic
 conversion at every geodetic seam, exactly as mortie spec §9 prescribes.
+
+The ellipsoid key spelling follows the same per-artifact vintage rule
+(issue [#616](https://github.com/englacial/zagg/issues/616)): artifacts
+written by zagg through 0.58.0 spell it `semimajor_axis`, which the
+[dggs v1 schema](https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json)
+rejects (its `ellipsoidObject` is `additionalProperties: false` and
+spells `semi_major_axis`); artifacts written or re-templated by zagg after
+0.58.0 carry `semi_major_axis`. No `spec` marker records the rename — the
+key belongs to the convention block the schema governs, and zagg readers
+never consult the ellipsoid.
 
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
@@ -1008,15 +1018,17 @@ regionally heterogeneous resolution).
     in any overview or column, so every contributor fires this arm and the
     field silently never folds upward.
 
-  On `zagg-overview/2` the record survives only a level that materializes.
-  The stage fold counts a contributor the rail fired on as `unreadable`, and
-  a level where **no** contributor folded cleanly is not written at all — so
-  the mis-declared-divisor shape above, which fires on *every* contributor,
-  leaves no artifact and therefore no `demotions`. A reader MUST NOT read the
-  key's absence at a `/2` level as evidence the rail did not fire there; the
-  absent level is the evidence. The `/1` fold paths do not share this: a
-  demoted contributor is still a counted leaf (or child), so the level
-  materializes and carries the record.
+  A demoted contributor is still a counted leaf (or child) on every fold
+  path (since [issue #620](https://github.com/englacial/zagg/issues/620),
+  which put the `/1` cascade and the `/2` ladder on one fold engine): its
+  other fields fold, the level materializes and carries the record, and
+  `source_children` counts the contributor as `folded`. The
+  mis-declared-divisor shape above therefore lands as a level whose packed
+  array is all fill beside a record naming every contributor. (Before #620
+  the `/2` stage fold counted a fired contributor `unreadable` and dropped a
+  level on which every contributor fired; a `/2` store swept before then may
+  lack such a level, and a reader MUST NOT read its absence as evidence the
+  rail stayed quiet.)
 
   `field`/`class`/`reason`/`contributors` are always present. A
   **contributor** is one *source read* the fold performed: a `(child,
@@ -1027,11 +1039,12 @@ regionally heterogeneous resolution).
   the §3.3 linkage; `cells` is keyed whenever the demotion left output cells
   at the fill word that no surviving contributor covers — always in the
   `word-missing` direction, and in the `divisor-missing` direction only where
-  contributors own **disjoint** spans of the level (the `/1` cascade of child
-  overviews, where a child skipped for the field leaves its whole span fill).
-  Where many contributors share each output cell — a `/1` fold from leaves, a
-  `/2` stage merge — a dropped contributor blanks nothing and the key is
-  absent. A reader MUST NOT read its absence as "nothing was blanked".
+  contributors own **disjoint** spans of the level (a cascade of child
+  overviews, `/1` or `/2`, where a child skipped for the field leaves its
+  whole span fill). Where many contributors share each output cell — a `/1`
+  fold from leaves, the all-time fold across windows — a dropped contributor
+  blanks nothing and the key is absent. A reader MUST NOT read its absence as
+  "nothing was blanked".
   Readers MUST tolerate additional keys, MUST tolerate the key's absence (a
   clean fold, or any pre-#518 artifact — a clean fold's attrs are
   byte-identical to a pre-#518 writer's), and MUST NOT read absence as "no
@@ -1103,13 +1116,16 @@ group. Concretely, for a member `r` at an order-`k` node:
   **level member** `r > k` always, by the window and ladder rules above;
   the one recorded `r == k` group is the §4.6 column's **node-order
   member** (the whole-footprint aggregate of #381 point (2)), which is a
-  recorded group of that artifact and still never a manifest member. Since
-  [issue #538](https://github.com/englacial/zagg/issues/538) it is not the
-  ladder's merge source: that is the **relay member** — the leaf column's
-  coarsest group still folded from raw: its group at `shard_order + 2`
-  (§4.6's raw-fold boundary) when the column CARRIES that group, else the
-  node-order member — so that every above-shard merge stays exactly 2
-  merges from raw. No separate partial grammar or `partial/` path exists anywhere;
+  recorded group of that artifact and still never a manifest member. It is
+  the source of the coarsest **gather** level only: every level whose cells
+  are below the shard order is a **cascade** of its children's artifacts at
+  the next finer declared level, four children folded `4^(r' - r)`-to-one,
+  and nothing above the first merge reads the leaf tier again
+  ([issue #620](https://github.com/englacial/zagg/issues/620) — before it,
+  every merge re-read the leaf columns' res-`shard_order + 2` member, an
+  input of `4^(shard_order + 2 - k)` cells per node that put an order-0 node
+  at 18.9M cells and the dense order-1 node past the 900 s wall). No
+  separate partial grammar or `partial/` path exists anywhere;
 - each **included** field is the same array kind as at the leaves: dense
   fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
   arrays — §1–§3 of this page apply to overview arrays unchanged, **including
@@ -1132,12 +1148,18 @@ particular its single scalar `cell_order = c - (s - k)` — is specified for
 `cell_order` the entry's own `cells` member (`k + d`, not the constant-depth
 formula), the `fold_source`/`fold_from_order` pair replaced by the #381
 point (7) provenance — `regime` (`stage-gather` | `stage-merge`),
-`merges_from_raw` (1 for a gather of gen-1 members, 2 for a merge of the
-relayed gen-1 relay-member partials — never 3 for an upfront level, which
-is why the relay is the boundary member and not the node-order one; gen 3
-belongs only to the append-later cascade regime), and `source_children`
-(present in both
-stage regimes: a gather that under-covers says so exactly like a merge) —
+`merges_from_raw` (the **fold depth**: for a gather, the depth of the
+column groups it concatenates — 1 at or above the raw-fold boundary, 2
+below it (§4.6) — and for a merge **one more than the largest
+`merges_from_raw` among the children's artifacts it folded**, and so on
+down to the root; on the 19/13/9 reference geometry the ladder records 1,
+1, 2, 2 at orders 8–5 and 3, 4, 5, 6, 7 at orders 4–0. A reader MUST tolerate any value and MUST NOT bind to a ceiling: the
+value is a statement about the digest fold's generation, which `exact` and
+`packed` classes are indifferent to and `approximate` classes carry as
+their recorded accuracy — §4.4's accuracy doctrine below), and
+`source_children` (present in both stage regimes: a gather that
+under-covers says so exactly like a merge; a merge's counters are over its
+**children's artifacts**, a gather's over the child columns) —
 plus `run_id`, the sweep run that wrote the artifact, and a `generation`
 block summing the consumed children (the stage skip gate's ratchet key —
 `{n_leaves, max_leaf_timestamp, run_ids}`, composition in §4.5). §4.3's
@@ -1162,11 +1184,10 @@ subtree. Its `zagg-overview/2` attrs record:
 
 - `regime: "stage-merge"` at every level, a gather level included;
 - `merges_from_raw` **one more than its sources'**: `2` where the level's
-  per-window overviews are gathers of gen-1 members, and **`3`** where they
-  are themselves merges. This is the one stage-written artifact at 3: the
-  per-window ladder — every `{window}.zarr`, and an unwindowed store's
-  `all.zarr` — keeps the never-3 law above, and §4.5's per-entry `actuals`
-  describe that ladder, not the all-time fold;
+  per-window overviews are gathers of gen-1 members, and one more than
+  their cascade depth where they are themselves merges — the same rule a
+  merge level applies to its children. §4.5's per-entry `actuals` describe
+  the per-window ladder, not the all-time fold;
 - **`source_windows`** — `{"folded", "missing", "unreadable"}` over the
   window overviews it consumed. `missing` counts a window known to have data
   beneath the node whose overview was not committed when the fold ran (its
@@ -1490,12 +1511,13 @@ staged sweep's finisher.
   of the §4.6 per-group value — 1 when every declared leaf resolution is at
   or above the raw-fold boundary, 2 when the entry declares a resolution
   below it; no `source_children` — its source is complete by construction),
-  `stage-gather` (a concatenation of gen-1 members, merges-from-raw 1) or
-  `stage-merge` (a k-way fold of the relayed gen-1 relay-member partials,
-  §4.4, merges-from-raw 2 — **never 3 for an upfront level**; gen 3 belongs
-  only to the append-later cascade regime, and to the all-time fold of a
-  windowed store, whose provenance rides its own attrs and never these
-  per-entry actuals — §4.4). `source_children`
+  `stage-gather` (a concatenation of the child columns' members, whose
+  `merges_from_raw` is the gathered groups' depth, §4.4) or
+  `stage-merge` (a cascade of the children's artifacts, §4.4, whose
+  `merges_from_raw` is the **maximum** over the level's artifacts of their
+  recorded depth — 2 at the first merge level, one more per level below it;
+  the all-time fold of a windowed store records its own depth in its own
+  attrs and never these per-entry actuals — §4.4). `source_children`
   accumulates the run's per-artifact coverage counts; `run_id` names the
   sweep run (stage entries only). The key is **additive**: a reader MUST
   tolerate additional keys on a level entry, and `actuals` says nothing
@@ -1615,8 +1637,8 @@ guessed at.
   (§4.4's contiguity rule; only the stage-merge levels below the shard
   order MAY gap). (There is no `partial/`
   grammar; a coarse level declared later never rewrites a leaf; the ladder's
-  merge source is the relay member named under **Fold laws**, not this
-  group). Each group holds the `morton`
+  merge levels cascade from the artifacts above them, §4.4, and read no
+  column group). Each group holds the `morton`
   coordinate (the node's order-`r` descendant words, ascending) and one
   array per **composable** field (§4.5 classes; `none` fields are absent),
   plus **every channel sibling** that field's §4.5 entry declares — the
@@ -1779,14 +1801,16 @@ shape at its dispatch nodes (`{window}.pyramid.zarr` under an ancestor
 node's prefix, `zagg-column/1` attrs, D4 order, one commit stamp last, D20
 sidecar after): every group is a **pure gather** of the child columns'
 members at the same resolution — `groups` entries record `regime:
-"stage-gather"` with `merges_from_raw: 1` — and the artifact MUST carry the
-**relay member** (the leaf columns' coarsest from-raw group for the whole
-subtree — `shard_order + 2`, the raw-fold-boundary partials, when the
-columns carry that group, else the node-order partials — the merge-source
-tier every coarser merge consumes: the espg
-merge-source ruling on the #384 thread, re-based onto the boundary member
-by issue #538 so that no upfront merge is ever 3 from raw). Stage-column
-attrs additionally
+"stage-gather"` with the gathered member's `merges_from_raw` (the deepest
+the child columns record for that group) — and the artifact carries
+exactly the members some coarser **gather** level consumes (the cells at or
+above the shard order declared at orders below the dispatch node's). It
+carries no member for the merge levels: those cascade from the ladder
+artifacts (§4.4), so a dispatch node below which nothing gathers writes no
+column at all. (Before [issue #620](https://github.com/englacial/zagg/issues/620)
+every stage column also relayed the leaf columns' res-`shard_order + 2`
+member upward for the merges; a `/2` store swept before then may still
+carry that group, which nothing reads.) Stage-column attrs additionally
 carry `generation` (`{n_leaves, max_leaf_timestamp, run_ids}` summed over
 the consumed children — the parent's skip-gate key, §4.5), `source_children` (a
 gather that under-covered says so in the artifact), and `run_id`; the

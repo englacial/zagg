@@ -161,7 +161,7 @@ def sweep_stage_pass(
     order — what a fleet stage worker runs (issue #519). The in-process driver
     leaves it ``None`` and walks every tuple finest-first; the fleet transport
     walks the same tuples, one invoke fan-out per tuple, so the two differ in
-    grouping alone (the merge-source law: grouping changes no bytes). An order
+    grouping alone (the cascade, issue #620: grouping changes no values). An order
     that dispatches no tuple refuses BY NAME rather than sweeping nothing — a
     mistyped dispatch order must not read as a clean no-op.
 
@@ -188,13 +188,7 @@ def sweep_stage_pass(
     run_started = run_started or _utcnow()
     pyramid = manifest.get("pyramid") or {}
     shard_order = int(manifest["shard_order"])
-    cell_order = int(manifest["cell_order"])
     levels = ladder_entries(pyramid, shard_order)
-    # The merge-source member (issue #538): placed by the LEAF entry, which
-    # ``ladder_entries`` excludes, so it is derived from the full list here.
-    from zagg.column import relay_resolution
-
-    relay = relay_resolution(pyramid["overviews"], shard_order, cell_order)
     # The schedule and the ``only_dispatch`` refusal come FIRST — before the
     # ``fields``/``candidates`` gates below, which both return a clean empty
     # summary. A mistyped dispatch order against a store with nothing to sweep
@@ -276,7 +270,6 @@ def sweep_stage_pass(
         "manifest": manifest,
         "levels": levels,
         "fields": fields,
-        "relay": relay,
         "scope": scope,
         "candidates": candidates,
         "by_shard": by_shard,
@@ -337,9 +330,10 @@ def run_finisher(
        of ``pyramid.overviews`` (#381 point (7); readers MUST tolerate the
        added key). The leaf entry records the ``leaf-column`` law
        (merges-from-raw 1); ladder entries record what this run observed —
-       ``stage-gather`` at 1, ``stage-merge`` at 2, never 3 (gen 3 is
-       append-later cascade territory only). This re-PUT also refreshes the
-       manifest's ``LastModified``, satisfying the PR #397 lifecycle
+       ``stage-gather`` at the gathered groups' depth, ``stage-merge`` at
+       the cascade depth, one more than its sources' (issue #620). This
+       re-PUT also refreshes the manifest's ``LastModified``, satisfying
+       the PR #397 lifecycle
        root-touch for ``morton_hive.json`` (and step 1 for the root MOC)
        WITHOUT duplicating it — only ``aggregation.yaml`` still needs the
        explicit touch, step 3. The family dict's order-keyed
@@ -801,10 +795,12 @@ def merge_level_actuals(target: dict, incoming: dict) -> dict:
     (:func:`zagg.sweep_stage._accumulate_actuals`), so merging across workers
     is a plain dict update: a coarse ancestor two batches both visited
     contributes its row ONCE, exactly as a partitioned in-process run
-    re-visiting it does. ``cells``/``regime``/``merges_from_raw`` are
-    first-wins per level, mirroring the in-process ``setdefault`` — they are
-    derived per level (:func:`zagg.sweep_stage.classify_level`), so every
-    worker computes the same values and the tie never has to be broken.
+    re-visiting it does. ``cells``/``regime`` are first-wins per level,
+    mirroring the in-process ``setdefault`` — they are derived per level
+    (:func:`zagg.sweep_stage.classify_level`), so every worker computes the
+    same values and the tie never has to be broken; ``merges_from_raw`` is
+    the level's maximum across workers, as it is across artifacts in process
+    (:func:`zagg.sweep_stage._accumulate_actuals`).
     """
     for k, entry in (incoming or {}).items():
         cur = target.setdefault(
@@ -812,10 +808,11 @@ def merge_level_actuals(target: dict, incoming: dict) -> dict:
             {
                 "cells": int(entry["cells"]),
                 "regime": entry["regime"],
-                "merges_from_raw": int(entry["merges_from_raw"]),
+                "merges_from_raw": 0,
                 "children": {},
             },
         )
+        cur["merges_from_raw"] = max(cur["merges_from_raw"], int(entry["merges_from_raw"]))
         for node_window, row in (entry.get("children") or {}).items():
             cur["children"][str(node_window)] = {
                 name: int(row.get(name) or 0) for name in ("folded", "missing", "unreadable")
@@ -938,9 +935,9 @@ def run_stage_worker(
     ``nodes`` reaches the pass as the ordinary ``scope`` MOC, so a worker
     folds exactly the dispatch nodes it was handed and no others. Dispatch
     nodes at one order own disjoint subtrees and a tuple's folds read only
-    columns one tuple FINER, so the split across invokes is free of
+    what one tuple FINER wrote, so the split across invokes is free of
     cross-worker dependencies — the same disjointness the in-process pass
-    relies on, which is why the merge-source law makes the fleet build
+    relies on, which is why the cascade (issue #620) makes the fleet build
     byte-identical to the CLI build.
 
     The node set is validated BY NAME before anything is read or written: it
