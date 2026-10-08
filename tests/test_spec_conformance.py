@@ -1189,18 +1189,26 @@ class TestIcechunkRootConventions:
         jsonschema = pytest.importorskip("jsonschema")
         jsonschema.validate(self._root(), _schema(MULTISCALES_SCHEMA))
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="dggs v1 ellipsoidObject spells semi_major_axis; zagg writes semimajor_axis (issue #616)",
-    )
-    def test_levels_validate_against_the_dggs_schema(self):
+    def test_levels_validate_against_the_dggs_schema_but_for_the_ellipsoid_key(self):
+        # The one known gap, pinned exactly: dggs v1's ellipsoidObject spells
+        # ``semi_major_axis``, zagg writes ``semimajor_axis`` (issue #616) —
+        # the ``ellipsoid`` fails its ``oneOf`` and the extra key, nothing else
+        # fails. When #616 lands, every document must validate clean.
         jsonschema = pytest.importorskip("jsonschema")
         schema = _schema(DGGS_SCHEMA)
-        for cells in _expected(ICECHUNK)["levels"]:
-            jsonschema.validate(self._level(cells), schema)
+        docs = [(self._level(c), schema) for c in _expected(ICECHUNK)["levels"]]
         # The base layout entry's ``dggs`` is a full dggsProperties object.
         base = self._root()["attributes"]["multiscales"]["layout"][0]["dggs"]
-        jsonschema.validate(base, {"$ref": "#/$defs/dggsProperties", "$defs": schema["$defs"]})
+        sub = {"$schema": schema["$schema"], "$ref": "#/$defs/dggsProperties"}
+        docs.append((base, {**sub, "$defs": schema["$defs"]}))
+        for doc, against in docs:
+            errors = list(jsonschema.Draft7Validator(against).iter_errors(doc))
+            got = sorted((e.absolute_path[-1], e.validator, e.message) for e in errors)
+            assert [g[:2] for g in got] == [
+                ("ellipsoid", "additionalProperties"),
+                ("ellipsoid", "oneOf"),
+            ]
+            assert "('semimajor_axis' was unexpected)" in got[0][2]
 
 
 def _column_dir(exp) -> Path:
