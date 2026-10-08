@@ -199,11 +199,12 @@ class RunHandle:
         #: ``{"skipped"}``).
         self.stage_sweep: dict | None = None
         #: The tail's families-sweep outcome (issue #610) — ``{"partitions",
-        #: "fired", "landed", "finisher"}`` from
+        #: "fired", "landed", "finisher", "run_id", "records_from",
+        #: "duration_s"}`` (plus ``"error"`` on ``"dispatch_failed"``) from
         #: ``runner._invoke_lambda_families_sweep``, the same dict
         #: ``runner._run_lambda`` reports as ``families_sweep``; ``None``
         #: while the tail is in flight, when the run had no leaf to sweep, or
-        #: when its dispatch failed (fail-open, D9). A ``finisher`` other than
+        #: when its dispatch failed before any invoke fired (fail-open, D9). A ``finisher`` other than
         #: ``"ok"`` means the root temporal section may be short.
         self.families_sweep: dict | None = None
         #: How the run's dispatch manifest went out (issue #588): ``"full"``;

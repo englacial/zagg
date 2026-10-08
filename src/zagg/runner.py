@@ -4576,9 +4576,9 @@ def _run_lambda(
                     )
                 # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
                 # `output.sweep: "stages"`, the same knob the local dispatcher
-                # reads. Unlike the families leg this one is not
-                # fire-and-forget: the staged sweep is a fan-out with a soft
-                # barrier between tuples, so the ordering has to be driven
+                # reads. Like the families leg this one blocks: the staged
+                # sweep is a fan-out with a soft barrier between tuples, so
+                # the ordering has to be driven
                 # from somewhere and the dispatcher is the only place that can
                 # see every tuple complete. It still never WRITES (D8) — it
                 # invokes and polls the workers' stage records. Fail-open (D9:
@@ -6329,8 +6329,9 @@ def _invoke_lambda_stage_sweep(
     chaining. The orchestration lives in :mod:`zagg.sweep_fleet`; this is the
     runner's seam onto it, so the tail keeps one call site per transport.
 
-    Not fire-and-forget, unlike every other tail invoke: a staged sweep is a
-    fan-out with a soft barrier between tuples (a tuple's workers read the
+    Not fire-and-forget — like the families leg
+    (:func:`_invoke_lambda_families_sweep`), unlike every other tail invoke: a
+    staged sweep is a fan-out with a soft barrier between tuples (a tuple's workers read the
     columns the previous tuple's workers wrote), so somebody has to hold the
     ordering, and the dispatcher is the only party that sees every tuple
     finish. It still never writes to the store — D8 is about WRITES, and every
