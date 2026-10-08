@@ -257,12 +257,21 @@ class TestDeclarePyramid:
         assert r["multiscales"] is True
         group, repo = _open(root)
         block = group.attrs[ICECHUNK_ATTR]
+        # The refreshed mirror is the conformant object: layout over the
+        # levels just added, registration beside it (§11.1).
+        assert [e["asset"] for e in group.attrs[MULTISCALES_ATTR]["layout"]] == list(
+            block["levels"]
+        )
+        assert group.attrs["zarr_conventions"][0]["name"] == "multiscales"
         # Exactly what a fresh init of the declared store would record.
         fresh = icechunk_refs.init_repo(
             str(tmp_path / "fresh"), grid, cfg, run_id=RUN, store_kwargs={}
         )
         assert block["levels"] == fresh["levels"] == r["levels"]
-        assert group.attrs[MULTISCALES_ATTR] == manifest[MULTISCALES_ATTR]
+        assert group.attrs[MULTISCALES_ATTR] == {
+            **manifest[MULTISCALES_ATTR][0],
+            "layout": group.attrs[MULTISCALES_ATTR]["layout"],
+        }
         assert {k for k, _ in group.groups()} == set(block["levels"])
         # Each new group carries the level's array model, and the repo's
         # persisted manifest splits cover it (a commit into it cuts at its
@@ -388,7 +397,7 @@ class TestDeclarePyramid:
         assert r["multiscales"] is False
         group, _repo = _open(root)
         assert list(group.attrs[ICECHUNK_ATTR]["levels"]) == ["6"]
-        assert MULTISCALES_ATTR not in group.attrs
+        assert MULTISCALES_ATTR not in group.attrs and "zarr_conventions" not in group.attrs
         assert {k for k, _ in group.groups()} == {"1", "2", "3", "4", "5", "6"}  # kept
         cfg.output.pop("pyramid")
         _write_manifest(root, grid)
@@ -557,7 +566,11 @@ class TestRetrofitFollowThrough:
         assert summary["icechunk"]["operation"] == "declare-pyramid"
         assert summary["icechunk"]["added"] == ["1", "2", "3", "4", "5"]
         group, _repo = _open(root)
-        assert group.attrs[MULTISCALES_ATTR] == hive.read_manifest(root)[MULTISCALES_ATTR]
+        (mirror,) = hive.read_manifest(root)[MULTISCALES_ATTR]
+        assert group.attrs[MULTISCALES_ATTR] == {
+            **mirror,
+            "layout": group.attrs[MULTISCALES_ATTR]["layout"],
+        }
         # An unchanged declaration writes neither plane, but still vets the repo.
         n = len(_messages(root))
         assert declare_pyramid(root, cfg, chunk_order=5)["icechunk"]["unchanged"] is True

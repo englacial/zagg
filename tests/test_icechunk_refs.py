@@ -23,6 +23,7 @@ from zagg import hive, icechunk_refs, icechunk_rows
 from zagg.config import default_config, get_data_vars
 from zagg.grids.healpix import HealpixGrid
 from zagg.grids.morton import morton_decimal, morton_word
+from zagg.multiscales import MULTISCALES_CONVENTION
 
 icechunk = pytest.importorskip("icechunk")
 
@@ -376,8 +377,15 @@ class TestInit:
             "2": {"chunks": 4, "order": 0},
             "1": {"chunks": 1, "order": 0},
         }
-        # The manifest's §4.9 multiscales mirror rides the root attrs.
-        assert group.attrs["multiscales"] == hive.build_manifest(grid)["multiscales"]
+        # The manifest's §4.9 multiscales mirror rides the root attrs as the
+        # conformant multiscales OBJECT: its keys verbatim plus the layout.
+        (mirror,) = hive.build_manifest(grid)["multiscales"]
+        assert group.attrs["multiscales"] == {
+            **mirror,
+            "layout": group.attrs["multiscales"]["layout"],
+        }
+        assert [e["asset"] for e in group.attrs["multiscales"]["layout"]] == list(block["levels"])
+        assert group.attrs["zarr_conventions"] == [MULTISCALES_CONVENTION]
         # The level groups plus the root row coordinate, nothing else.
         assert {str(o) for o in out["ladder"]} | set(icechunk_rows.ROW_COORDS) == {
             k for k, _ in group.members()
@@ -1907,7 +1915,10 @@ class TestLadder:
         # from the SAME repo, discoverable from its multiscales root attrs.
         manifest = hive.read_manifest(root)
         levels = {int(e["node"]): int(e["cells"][0]) for e in manifest["pyramid"]["overviews"]}
-        assert group.attrs["multiscales"] == manifest["multiscales"]
+        assert group.attrs["multiscales"] == {
+            **manifest["multiscales"][0],
+            "layout": group.attrs["multiscales"]["layout"],
+        }
         from pathlib import Path
 
         from mortie import mort2healpix
@@ -2672,6 +2683,101 @@ def test_container_prefix_forms():
 
 def test_repo_path():
     assert icechunk_refs.repo_path("s3://b/p/") == "s3://b/p/icechunk"
+
+
+def _mirror_manifest(datasets, fold, base=6):
+    """A manifest carrying just the ``zagg-multiscales/1`` keys the layout reads."""
+    block = {"spec": "zagg-multiscales/1", "base": {"order": 4, "cells": [base]}}
+    block["datasets"] = [
+        {"order": o, "cells": list(c), "artifact": "column" if o == 4 else "overview"}
+        for o, c in datasets
+    ]
+    return {"multiscales": [{**block, "fold": fold}]}
+
+
+_DGGS = {"name": "morton", "spatial_dimension": "cells", "coordinate": "morton"}
+
+
+def _dggs(*cells):
+    return {c: {**_DGGS, "refinement_level": c} for c in cells}
+
+
+class TestMultiscalesLayout:
+    """§11.1 — the zarr-conventions ``multiscales`` layout composed with ``dggs`` (issue #615)."""
+
+    def test_cascade_chains_from_the_column(self):
+        # Production shape: the column from the base, every overview from the
+        # next-finer level; scale = 4 ** (c_from - c) on the cells axis.
+        manifest = _mirror_manifest(
+            [(4, [5]), (3, [4]), (2, [3])], {"fold_source": "cascade", "exact_levels": 1}
+        )
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(6, 5, 4, 3))
+        assert layout[0] == {"asset": "6", "dggs": {**_DGGS, "refinement_level": 6}}
+        assert [(e["asset"], e["derived_from"], e["transform"]) for e in layout[1:]] == [
+            ("5", "6", {"scale": [4.0]}),
+            ("4", "5", {"scale": [4.0]}),
+            ("3", "4", {"scale": [4.0]}),
+        ]
+        assert [e["dggs"] for e in layout[1:]] == [{"refinement_level": c} for c in (5, 4, 3)]
+        assert all("translation" not in e["transform"] for e in layout[1:])
+
+    def test_leaves_regime_derives_every_level_from_the_base(self):
+        manifest = _mirror_manifest([(4, [5]), (3, [4]), (2, [3])], {"fold_source": "leaves"})
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(6, 5, 4, 3))
+        assert [(e["derived_from"], e["transform"]["scale"]) for e in layout[1:]] == [
+            ("6", [4.0]),
+            ("6", [16.0]),
+            ("6", [64.0]),
+        ]
+
+    def test_exact_levels_boundary_and_multi_member_column(self):
+        # Two exact entries: the column's members AND the first overview fold
+        # the leaves; the cascade starts past the boundary. The layout order
+        # is finest first regardless of the dggs map's order.
+        manifest = _mirror_manifest(
+            [(4, [5, 4]), (3, [3]), (2, [2])], {"fold_source": "cascade", "exact_levels": 2}
+        )
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(2, 3, 4, 5, 6))
+        assert [e["asset"] for e in layout] == ["6", "5", "4", "3", "2"]
+        assert [(e["derived_from"], e["transform"]["scale"]) for e in layout[1:]] == [
+            ("6", [4.0]),
+            ("6", [16.0]),
+            ("6", [64.0]),
+            ("3", [4.0]),
+        ]
+
+    def test_base_dggs_is_a_copy(self):
+        dggs = _dggs(6, 5)
+        layout = icechunk_refs.multiscales_layout(
+            _mirror_manifest([(4, [5])], {"fold_source": "cascade"}), dggs
+        )
+        layout[0]["dggs"]["name"] = "x"
+        assert dggs[6]["name"] == "morton"
+
+    def test_root_attrs_compose_the_mirror_and_the_registration(self, cfg, tmp_path):
+        grid = _grid(cfg)
+        manifest = hive.build_manifest(grid)
+        options = icechunk_refs.resolve_options(cfg, 4)
+        attrs = icechunk_refs.repo_group_spec(grid, str(tmp_path), options, manifest).attributes
+        assert set(attrs) == {"zagg_icechunk", "multiscales", "zarr_conventions"}
+        assert attrs["zarr_conventions"] == [MULTISCALES_CONVENTION]
+        (mirror,) = manifest["multiscales"]
+        layout = attrs["multiscales"].pop("layout")
+        assert attrs["multiscales"] == mirror  # the /1 keys verbatim, as an object
+        # The base entry IS the level group's dggs block; one entry per level.
+        spec = icechunk_refs.repo_group_spec(grid, str(tmp_path), options, manifest)
+        assert layout[0]["dggs"] == spec.members["6"].attributes["dggs"]
+        assert [e["asset"] for e in layout] == ["6", "5", "4", "3", "2", "1"]
+        assert layout[1]["dggs"] == {"refinement_level": 5}
+
+    def test_no_mirror_no_convention_keys(self, cfg, tmp_path):
+        cfg.output["pyramid"] = False
+        grid = _grid(cfg)
+        manifest = hive.build_manifest(grid)
+        assert "multiscales" not in manifest
+        options = icechunk_refs.resolve_options(cfg, 4)
+        attrs = icechunk_refs.repo_group_spec(grid, str(tmp_path), options, manifest).attributes
+        assert set(attrs) == {"zagg_icechunk"}
 
 
 def test_block_json_round_trips(cfg, tmp_path):
