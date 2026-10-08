@@ -115,13 +115,19 @@ class SweepFamily:
         """The family's per-node rollup object name."""
         return f"{self.name}.rollup.json"
 
-    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+    def read_leaf(self, store, decimal, window, spec):
         """One leaf's ``(payload, timestamp)`` contribution, or ``None``.
 
         ``None`` means the leaf carries no artifact for this family (e.g. a
         fail-open sidecar PUT that never landed) — it is skipped, not fatal.
         ``spec`` is the manifest's store spec string, threaded so spec-keyed
         sidecar naming (the PR #307 D23 seam) resolves per store.
+
+        ``store`` is the pass's ONE open obstore handle at the store root
+        (issue #610): every leaf object is read through it by its relative
+        key (:func:`_leaf_rel`), never by opening a store at the leaf's own
+        path — a walk over thousands of leaves would otherwise build a fresh
+        client, credential resolution included, per read.
         """
         raise NotImplementedError
 
@@ -163,13 +169,10 @@ class StatsFamily(SweepFamily):
 
     name = "stats"
 
-    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
-        from zagg.grids.morton import morton_word
-        from zagg.hive import shard_leaf_path
+    def read_leaf(self, store, decimal, window, spec):
         from zagg.telemetry import read_sidecar
 
-        leaf = shard_leaf_path(store_root, morton_word(decimal), window=window)
-        record = read_sidecar(leaf, spec, **store_kwargs)
+        record = read_sidecar(_leaf_rel(decimal, window), spec, store=store)
         if record is None:
             return None
         return record, record.get("timestamp")
@@ -237,14 +240,15 @@ class MocFamily(SweepFamily):
         self._temporal_fields: dict | None = None
         self._cell_order = 0
 
-    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs, stamp=None) -> None:
+    def _accumulate_temporal(self, store, decimal, leaf, stamp=None) -> None:
         """Read one leaf's §10 temporal contribution; fail-open per SHARD (D9).
 
-        ``stamp`` is the leaf's root stamp: a versioned leaf's record and
-        arrays are read from the version it names (spec §1.5), resolved inside
-        the fail-open. The read never writes: a leaf without a usable record
-        stays on the raw route — coverage only, its shard uncounted — until
-        its next replacement (§10.6).
+        ``leaf`` is the leaf root's key relative to ``store``, the pass's one
+        handle (issue #610). ``stamp`` is the leaf's root stamp: a versioned
+        leaf's record and arrays are read from the version it names (spec
+        §1.5), resolved inside the fail-open. The read never writes: a leaf
+        without a usable record stays on the raw route — coverage only, its
+        shard uncounted — until its next replacement (§10.6).
 
         A store declaring no temporal field short-circuits after one manifest
         read. An unreadable companion is logged and skipped rather than
@@ -264,15 +268,15 @@ class MocFamily(SweepFamily):
         from zagg.leaf_temporal import leaf_contribution
 
         if self._temporal_fields is None:
-            from zagg.hive import read_manifest
+            from zagg.hive import MANIFEST_NAME, _read_json
 
-            manifest = read_manifest(store_root, **store_kwargs) or {}
+            manifest = _read_json(store, MANIFEST_NAME) or {}
             self._temporal_fields = temporal_fields(manifest)
             cell_order = temporal_cell_order(manifest)
             if self._temporal_fields and cell_order is None:
                 logger.warning(
-                    f"sweep[moc]: {store_root} declares temporal fields but carries no "
-                    f"cell_order — publishing no §10 section rather than guessing a group"
+                    "sweep[moc]: the store declares temporal fields but carries no "
+                    "cell_order — publishing no §10 section rather than guessing a group"
                 )
                 self._temporal_fields = {}
             self._cell_order = cell_order or 0
@@ -280,7 +284,7 @@ class MocFamily(SweepFamily):
             return
         try:
             got, route = leaf_contribution(
-                leaf, self._cell_order, self._temporal_fields, stamp=stamp, **store_kwargs
+                leaf, self._cell_order, self._temporal_fields, stamp=stamp, store=store
             )
         except Exception as e:
             logger.warning(
@@ -327,19 +331,23 @@ class MocFamily(SweepFamily):
             },
         }
 
-    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+    def read_leaf(self, store, decimal, window, spec):
         # ``spec`` is unused here: leaf PATHS are the frozen /1-/2 grammar
         # (shard_leaf_path); the D23 /3 leaf naming has no writer yet, and
         # adopting it is the issue #299 flip, which lands in shard_leaf_path.
-        from zagg.grids.morton import morton_word
-        from zagg.hive import read_commit, shard_leaf_path
-        from zagg.store import open_store
+        from zarr.storage import StorePath
 
-        leaf = shard_leaf_path(store_root, morton_word(decimal), window=window)
-        stamp = read_commit(open_store(leaf, **store_kwargs))
+        from zagg.grids.morton import morton_word
+        from zagg.hive import read_commit
+        from zagg.store import zarr_view
+
+        leaf = _leaf_rel(decimal, window)
+        # The stamp GET goes through the pass's one handle, scoped to the
+        # leaf by ``StorePath`` — ``pyramid_check.leaf_group``'s pattern.
+        stamp = read_commit(StorePath(zarr_view(store), leaf))
         if stamp is None:
             return None  # absent leaf or unstamped debris (D4)
-        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs, stamp)
+        self._accumulate_temporal(store, decimal, leaf, stamp)
         payload = _moc_payload([morton_word(decimal)], stamp.get("time_range"))
         return payload, stamp.get("written_at")
 
@@ -601,20 +609,14 @@ class SubmapFamily(SweepFamily):
 
     name = "submap"
 
-    def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+    def read_leaf(self, store, decimal, window, spec):
         import obstore
         from obstore.exceptions import NotFoundError
 
-        from zagg.grids.morton import morton_word
-        from zagg.hive import shard_leaf_path
-        from zagg.store import open_object_store
-
-        leaf = shard_leaf_path(store_root, morton_word(decimal), window=window)
-        prefix, _, name = leaf.rstrip("/").rpartition("/")
+        leaf = _leaf_rel(decimal, window)
+        prefix, _, name = leaf.rpartition("/")
         try:
-            data = obstore.get(
-                open_object_store(prefix, **store_kwargs), submap_key(name, spec)
-            ).bytes()
+            data = obstore.get(store, f"{prefix}/{submap_key(name, spec)}").bytes()
         except (FileNotFoundError, NotFoundError):
             return None
         sub = json.loads(bytes(data))
@@ -856,6 +858,13 @@ def run_sweep(
 
     Unless ``record=False``, the summary is also PUT at the store root as the
     sweep's own run record (:func:`_write_sweep_record`, fail-open).
+
+    One store handle per pass (issue #610): the obstore handle opened at the
+    store root here is what every leaf and rollup read and every PUT goes
+    through — the families address leaves by relative key — so the pass's
+    client constructions are O(1), not one per leaf. On the v3 California
+    finisher the per-leaf opens were ~7 credential resolutions a second for
+    the whole invoke.
     """
     import time
 
@@ -991,15 +1000,7 @@ def _sweep_family(
     computed: dict[str, dict | None] = {}
     for decimal in sorted(by_shard):
         computed[decimal] = _rollup_shard_node(
-            store_root,
-            store,
-            fam,
-            decimal,
-            by_shard[decimal],
-            shard_order,
-            spec,
-            store_kwargs,
-            counts,
+            store, fam, decimal, by_shard[decimal], shard_order, spec, counts
         )
     frontier = [d for d in sorted(by_shard) if computed[d] is not None]
     for _order in range(shard_order - 1, min_order - 1, -1):
@@ -1025,14 +1026,13 @@ def _sweep_family(
     return result
 
 
-def _rollup_shard_node(
-    store_root, store, fam, decimal, windows, shard_order, spec, store_kwargs, counts
-) -> dict | None:
+def _rollup_shard_node(store, fam, decimal, windows, shard_order, spec, counts) -> dict | None:
     """Fold one shard node's window-leaf artifacts into its rollup.
 
     The window set is the union of the run's dirty windows and the windows the
     existing rollup already merged (recorded in its ``windows`` key), so an
-    append run that touches one window never drops its siblings.
+    append run that touches one window never drops its siblings. Every leaf
+    read goes through ``store``, the pass's one handle (issue #610).
     """
     existing = _read_rollup(store, fam, decimal)
     known = set(windows)
@@ -1041,7 +1041,7 @@ def _rollup_shard_node(
     parts = []
     for window in sorted(known, key=lambda w: (w is not None, w or "")):
         try:
-            got = fam.read_leaf(store_root, decimal, window, spec, store_kwargs)
+            got = fam.read_leaf(store, decimal, window, spec)
         except Exception as e:
             logger.warning(
                 f"sweep[{fam.name}]: leaf read failed at {decimal} window {window!r}; "
@@ -1166,6 +1166,19 @@ def _node_rel(decimal: str) -> str:
 
     base = _decimal_base(decimal)
     return "/".join([base, *decimal[len(base) :]])
+
+
+def _leaf_rel(decimal: str, window: str | None) -> str:
+    """A window leaf's key relative to the store root (issue #610).
+
+    :func:`zagg.hive.shard_leaf_path` with an empty root, as
+    ``pyramid_check.leaf_group`` derives it — the one leaf-path grammar,
+    read through the pass's single store handle rather than opened per leaf.
+    """
+    from zagg.grids.morton import morton_word
+    from zagg.hive import shard_leaf_path
+
+    return shard_leaf_path("", morton_word(decimal), window=window).lstrip("/")
 
 
 def _rollup_key(fam, decimal: str) -> str:

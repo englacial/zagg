@@ -956,22 +956,23 @@ def _node_rel(decimal: str) -> str:
     return rel(decimal)
 
 
-def _artifact_stamp(store_root, node, basename, run_id, run_started, store_kwargs) -> dict | None:
+def _artifact_stamp(store, node, basename, run_id, run_started) -> dict | None:
     """A stage artifact's commit stamp (``None`` when absent), foreign-gated.
 
     The ruled backstop lives here: a skip-if-current read that encounters a
     FOREIGN stamp written since this run started aborts loudly rather than
-    trusting or overwriting a live sibling sweep's output.
+    trusting or overwriting a live sibling sweep's output. One GET through
+    ``store``, the invoke's one handle at the store root (issue #610).
     """
+    from zarr.storage import StorePath
+
     from zagg.hive import read_commit
-    from zagg.store import open_store
+    from zagg.store import zarr_view
 
     if not basename:
         return None
     try:
-        stamp = read_commit(
-            open_store(f"{store_root}/{_node_rel(node)}/{basename}", **store_kwargs)
-        )
+        stamp = read_commit(StorePath(zarr_view(store), f"{_node_rel(node)}/{basename}"))
     except Exception as e:
         logger.debug(f"stage sweep: cannot confirm {node}/{basename} ({e})")
         return None
@@ -984,7 +985,7 @@ def _artifact_stamp(store_root, node, basename, run_id, run_started, store_kwarg
     return stamp
 
 
-def _artifact_entry(store_root, node, basename, run_id, run_started, store_kwargs) -> dict | None:
+def _artifact_entry(store, node, basename, run_id, run_started) -> dict | None:
     """A committed stage overview's skip-gate entry, read off its OWN attrs.
 
     ``None`` when the artifact is absent, unstamped or carries no
@@ -994,18 +995,20 @@ def _artifact_entry(store_root, node, basename, run_id, run_started, store_kwarg
     written into the artifact's attrs first — so a ``(node, window)`` unit
     (issue #586 phase 4) decides skip-if-current from the one object it alone
     writes, and N concurrent window units of a node share no read-modify-write.
-    One GET, the one :func:`_artifact_stamp` already made; foreign-gated the
-    same way.
+    One GET, the one :func:`_artifact_stamp` already made, through the
+    invoke's one handle (issue #610); foreign-gated the same way.
     """
     import zarr
 
     from zagg.hive import COMMIT_ATTR
-    from zagg.store import open_store
+    from zagg.store import zarr_view
     from zagg.sweep_overview import OVERVIEW_ATTR
 
     try:
-        store = open_store(f"{store_root}/{_node_rel(node)}/{basename}", **store_kwargs)
-        attrs = dict(zarr.open_group(store, path="", mode="r", zarr_format=3).attrs)
+        group = zarr.open_group(
+            zarr_view(store), path=f"{_node_rel(node)}/{basename}", mode="r", zarr_format=3
+        )
+        attrs = dict(group.attrs)
     except Exception as e:
         logger.debug(f"stage sweep: cannot confirm {node}/{basename} ({e})")
         return None
@@ -1107,9 +1110,7 @@ def stage_node(
                 entries = dict((stored or {}).get("windows") or {})
                 entry = entries.get(key)
             else:
-                entry = _artifact_entry(
-                    store_root, target, _overview_basename(key), run_id, run_started, store_kwargs
-                )
+                entry = _artifact_entry(store, target, _overview_basename(key), run_id, run_started)
             if (
                 isinstance(entry, dict)
                 and generation_key(entry.get("generation")) == generation_key(fresh_gen)
@@ -1118,9 +1119,7 @@ def stage_node(
                 # its stamp. An attrs entry was read off the committed artifact.
                 and (
                     not envelope
-                    or _artifact_stamp(
-                        store_root, target, entry.get("object"), run_id, run_started, store_kwargs
-                    )
+                    or _artifact_stamp(store, target, entry.get("object"), run_id, run_started)
                     is not None
                 )
             ):

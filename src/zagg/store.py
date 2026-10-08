@@ -317,6 +317,24 @@ def open_object_store(
     return ObstoreLocalStore(local)
 
 
+def zarr_view(obj_store) -> Store:
+    """A read-only Zarr ``Store`` over an obstore handle this process already holds.
+
+    The one-handle-per-invoke seam (issue #610). A pass that walks thousands
+    of leaves holds ONE obstore handle at the store root (the
+    :func:`open_object_store` it already uses for its JSON sidecars); the
+    stamp and array reads that need a Zarr ``Store`` get this view of that
+    same handle and address each leaf by its RELATIVE key —
+    ``read_commit(StorePath(zarr_view(store), rel))``, the pattern
+    ``pyramid_check``'s ``leaf_group`` proved — instead of
+    :func:`open_store` on each leaf's absolute path, which built a fresh
+    client (credential resolution included) per leaf. No I/O: the view is a
+    thin adapter, and nothing opened here can outlive the handle's own
+    credentials.
+    """
+    return ObjectStore(store=obj_store, read_only=True)
+
+
 def _open_s3_store(
     path: str,
     read_only: bool = False,
@@ -698,4 +716,11 @@ def parse_s3_path(path: str) -> tuple[str, str]:
     return bucket, prefix
 
 
-__all__ = ["acl_write_store", "open_object_store", "open_store", "parse_s3_path", "put_object"]
+__all__ = [
+    "acl_write_store",
+    "open_object_store",
+    "open_store",
+    "parse_s3_path",
+    "put_object",
+    "zarr_view",
+]

@@ -653,7 +653,7 @@ class TestMerge:
         class Family:
             name, rollup_name = "stats", "stats.rollup.json"
 
-            def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
+            def read_leaf(self, store, decimal, window, spec):
                 return rows[window], "2026-10-01T00:00:00+00:00"
 
             def merge(self, payloads, node, order):
@@ -662,15 +662,7 @@ class TestMerge:
 
         counts = dict.fromkeys(("written", "current", "empty", "failed"), 0)
         envelope = _rollup_shard_node(
-            str(tmp_path),
-            LocalStore(str(tmp_path)),
-            Family(),
-            "1111",
-            set(rows),
-            3,
-            None,
-            {},
-            counts,
+            LocalStore(str(tmp_path)), Family(), "1111", set(rows), 3, None, counts
         )
         assert calls == [3]
         assert envelope["payload"]["duration_total_s"] == pytest.approx(80.0)
