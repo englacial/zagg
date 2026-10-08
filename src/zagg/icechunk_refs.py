@@ -823,6 +823,10 @@ def init_repo(
             lambda s: _commit(
                 s, message, local=local, path=path, metadata={"run_id": run_id}, allow_empty=True
             )[0],
+            # A repo built before the §11.1 object shape upgrades on the fleet path.
+            root_attrs={
+                k: spec.attributes.get(k) for k in (MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)
+            },
         )
     return {
         "path": path,

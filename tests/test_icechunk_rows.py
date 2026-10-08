@@ -248,14 +248,14 @@ class TestAllocation:
         init(3, "run-0")
         real = icechunk_rows.commit_rows
 
-        def racing(repo, existing, updates, labels, temporal, commit):
+        def racing(repo, existing, updates, labels, temporal, commit, **kw):
             def commit_after_b(session):
                 if not raced:
                     raced.append(None)  # B's own init goes through here too
                     raced[0] = init(b_split, "run-B")
                 return commit(session)
 
-            return real(repo, existing, updates, labels, temporal, commit_after_b)
+            return real(repo, existing, updates, labels, temporal, commit_after_b, **kw)
 
         raced: list = []
         monkeypatch.setattr(icechunk_refs, "commit_rows", racing)
