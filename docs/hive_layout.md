@@ -735,9 +735,13 @@ moves one. Because a subtree's node count steps by powers of four, any target
 in `[5, 20]` picks the same schedule there. Such a tuple dispatches at an order no single width
 lands on, so its events carry their span (`child_order`) outright; a worker
 deployed before this refuses one by name rather than folding the wrong span.
-The cadence still changes no bytes — a sized build's ladder overviews are the
-fixed-width build's — so this is a dispatch knob like `--tuple-width` itself,
-and `python -m zagg.sweep --stages` is unchanged (the CLI has no 900 s wall).
+The cadence is still a dispatch knob like `--tuple-width` itself — a sized
+build's ladder **overviews** are the fixed-width build's, which is the
+merge-source law and what the oracle pins. Not every byte: the group attrs
+carry per-run provenance that is grouping-dependent by design
+(`source_children`, the summed child `generation`), and a sized build writes
+relay stage columns a wider grouping never needs. `python -m zagg.sweep
+--stages` is unchanged (the CLI has no 900 s wall).
 
 **A short tuple does not stamp the manifest.** The finisher records per-level
 `actuals` from the run's stage records; a tuple whose unit record never landed
