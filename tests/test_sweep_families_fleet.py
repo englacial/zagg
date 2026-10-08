@@ -299,6 +299,38 @@ class TestRunnerSeam:
             assert _invoke_lambda_families_sweep(Boom(), "fn", str(tmp_path), LEAVES) is None
         assert "families sweep dispatch failed" in caplog.text
 
+    def test_a_failure_after_an_invoke_fired_is_the_outcome(self, tmp_path, caplog):
+        import logging
+
+        from zagg.runner import _invoke_lambda_families_sweep
+
+        class SecondFails:
+            calls = 0
+
+            def invoke(self, **kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("TooManyRequestsException")
+                return {"StatusCode": 202}
+
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            out = run_families_sweep_fleet(
+                SecondFails(), "fn", str(tmp_path), LEAVES, store_kwargs={}, target=3
+            )
+        assert (out["partitions"], out["fired"], out["landed"]) == (4, 1, 0)
+        assert out["finisher"] == "dispatch_failed" and "TooManyRequests" in out["error"]
+        assert "dispatch_failed" in caplog.text
+        # Through the seam it is the outcome, not the "nothing was fired" None.
+        assert (
+            _invoke_lambda_families_sweep(
+                SecondFails(),
+                "fn",
+                str(tmp_path),
+                [(morton_word(_spread("1", i, 9)), None) for i in range(2959)],
+            )["finisher"]
+            == "dispatch_failed"
+        )
+
     def test_both_lambda_tails_and_the_facade_go_through_the_seam(self):
         import inspect
 
