@@ -6384,9 +6384,16 @@ def _invoke_lambda_stage_sweep(
     900 s after 12 of its 16 order-2 nodes, no record, and the finisher then
     stamped manifest actuals for orders 2..0 as if they were as complete as
     8..3). The tail therefore asks for the SIZED schedule
-    (:data:`zagg.sweep_partition.STAGE_TARGET_NODES`): each tuple narrows to
-    the widest width whose fattest dispatch node stays within the target,
-    computed from the per-order node sets the dispatcher already derives. The
+    (:data:`zagg.sweep_partition.STAGE_TARGET_NODES`): each fixed-width tuple
+    is subdivided inside its own span until its fattest dispatch node stays
+    within the target. This seam hands in no ``coverage`` MOC — a dispatcher
+    may not read one for itself (D8) — so the sizing takes the DENSE
+    ``(4 ** width - 1) // 3`` bound rather than measuring the store, which is
+    the conservative direction (a measurement over the run's own work set
+    would UNDER-estimate the fold on every append, review finding). At the
+    default target that is width 2 everywhere, which is what the v3 store
+    needed; an operator calling the dispatcher directly with ``coverage=``
+    gets the measurement. The
     dispatcher's own default is off, because it is documented as the mirror of
     the in-process pass at a given width; the wall is the tail's, so the ask
     is the tail's. ``"default"`` here takes the tail's default (sized);

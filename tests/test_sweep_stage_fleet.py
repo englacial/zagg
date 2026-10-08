@@ -1916,7 +1916,12 @@ class TestRunnerSeam:
             max_nodes_per_invoke=None,
         )
         fired = [e for e in client.events if e["stage"].get("role") == "stage"]
-        assert len(fired) == 1 and len(fired[0]["stage"]["nodes"]) > 1
+        # One invoke per TUPLE — the whole tuple's nodes on one worker. The
+        # tail also sizes the schedule (issue #610), and against the dense
+        # bound the o3 ladder's width-3 tuple refines into two, so there are
+        # two tuples to pack rather than one.
+        assert len(fired) == 2
+        assert all(len(e["stage"]["nodes"]) > 1 for e in fired)
 
     def test_the_seam_says_a_barrier_expired(self, tmp_path, caplog):
         # A partially covered staged sweep read like a clean one in the run log

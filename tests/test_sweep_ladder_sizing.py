@@ -56,8 +56,14 @@ class TestSizing:
         # The measured shape: at width 3 an order-0 dispatch node folds its
         # 1 + 4 + 16 covered descendants in one invoke. The sizing refuses
         # that and takes width 2, where a dispatch node folds 1 + 4.
+        #
+        # The schedule is a REFINEMENT of the fixed-width one, so each of the
+        # three width-3 tuples splits inside its own span — width 2 then the
+        # width-1 remainder — rather than the boundaries sliding down the
+        # ladder: 6 tuples, not 5 (review finding).
         schedule = sized_stage_tuples(9, nodes_at=_dense())
-        assert [int(st["width"]) for st in schedule] == [2, 2, 2, 2, 1]
+        assert [int(st["width"]) for st in schedule] == [2, 1, 2, 1, 2, 1]
+        assert _spans(schedule) == [(7, 9), (6, 7), (4, 6), (3, 4), (1, 3), (0, 1)]
         assert all(int(st["fold_max"]) <= STAGE_TARGET_NODES for st in schedule)
         assert max(int(st["fold_max"]) for st in schedule) == 5
         # And the width the run actually used would have folded 21.
@@ -177,25 +183,27 @@ class TestSizedDispatch:
         root = tmp_path / "s"
         _stage_store(root)
         client = _FakeLambda(None)
-        summary = _fleet(root, client, barrier_timeout_s=0.01, stage_target_nodes=2)
-        assert summary["stage_target_nodes"] == 2
-        assert _spans_of(summary) == [(2, 3), (0, 2)]
+        summary = _fleet(root, client, barrier_timeout_s=0.01, stage_target_nodes=5)
+        assert summary["stage_target_nodes"] == 5
+        assert _spans_of(summary) == [(1, 3), (0, 1)]
         rows = {int(st["dispatch_order"]): st for st in summary["stages"]}
-        assert (rows[2]["width"], rows[2]["fold_max"]) == (1, 1)
-        assert (rows[0]["width"], rows[0]["fold_max"]) == (2, 2)
+        # The dense bound, not a measurement of this four-leaf store: the
+        # dispatcher was handed no coverage MOC and may read none (D8).
+        assert (rows[1]["width"], rows[1]["fold_max"]) == (2, 5)
+        assert (rows[0]["width"], rows[0]["fold_max"]) == (1, 1)
 
     def test_every_stage_event_carries_its_own_span(self, tmp_path):
-        # At target 3 the schedule is ``[2,1]@1`` then ``[0]@0`` — a grouping
-        # NO fixed ``tuple_width`` produces, since dispatch 1 is not a
-        # multiple of its own width 2. That is why the span rides on the
-        # event: a worker re-deriving the tuple from the width would not find
-        # a tuple dispatching at order 1 at all.
+        # At target 5 the width-3 tuple refines into ``[2,1]@1`` then
+        # ``[0]@0`` — a grouping NO fixed ``tuple_width`` produces, since
+        # dispatch 1 is not a multiple of its own width 2. That is why the
+        # span rides on the event: a worker re-deriving the tuple from the
+        # width would not find a tuple dispatching at order 1 at all.
         from test_sweep_stage_fleet import _FakeLambda, _fleet
 
         root = tmp_path / "s"
         _stage_store(root)
         client = _FakeLambda(None)
-        summary = _fleet(root, client, barrier_timeout_s=0.01, stage_target_nodes=3)
+        summary = _fleet(root, client, barrier_timeout_s=0.01, stage_target_nodes=5)
         assert _spans_of(summary) == [(1, 3), (0, 1)]
         spans = {
             (int(b["dispatch"]), int(b["child_order"]), int(b["tuple_width"]))
@@ -230,7 +238,7 @@ class TestSizedDispatch:
         root = tmp_path / "s"
         _stage_store(root)
         client = _FakeLambda(_handler())
-        summary = _fleet(root, client, stage_target_nodes=3)
+        summary = _fleet(root, client, stage_target_nodes=5)
         assert _spans_of(summary) == [(1, 3), (0, 1)]
         assert summary["finisher"]["landed"] and not summary["short_orders"]
         for node in ("1", "-2", "11", "-21", "111", "112", "-211"):
@@ -268,7 +276,7 @@ class TestShortOrders:
         root = tmp_path / "s"
         _stage_store(root)
         client = _FakeLambda(_handler())
-        summary = _fleet(root, client, stage_target_nodes=2)
+        summary = _fleet(root, client, stage_target_nodes=5, tuple_width=2)
         assert summary["short_orders"] == []
         assert _finisher_block(client)["short_orders"] == []
 
@@ -282,7 +290,7 @@ class TestShortOrders:
         # The COARSE tuple's record is lost (its invoke never wrote one), so
         # orders 1 and 0 are short while order 2's record stands.
         client = _FakeLambda(_handler(), drop={stage_record_name(0, 0)})
-        summary = _fleet(root, client, stage_target_nodes=2, barrier_timeout_s=0.05)
+        summary = _fleet(root, client, stage_target_nodes=5, tuple_width=2, barrier_timeout_s=0.05)
         assert summary["short_orders"] == [1, 0]
         assert _finisher_block(client)["short_orders"] == [1, 0]
 
@@ -298,7 +306,7 @@ class TestShortOrders:
         # is visibly "left as it stood" rather than "never written".
         _stamp_prior_actuals(root, run_id="PRIOR")
         client = _FakeLambda(_handler(), drop={stage_record_name(0, 0)})
-        summary = _fleet(root, client, stage_target_nodes=2, barrier_timeout_s=0.05)
+        summary = _fleet(root, client, stage_target_nodes=5, tuple_width=2, barrier_timeout_s=0.05)
         assert summary["short_orders"] == [1, 0]
         entries = {
             int(e["node"]): e
@@ -379,7 +387,7 @@ class TestSizedByteIdentity:
         _cli_sweep(root, tuple_width=3)
         cli = _snapshot(root)
         _restore(root, base)
-        summary = _fleet(root, _FakeLambda(_handler()), stage_target_nodes=3)
+        summary = _fleet(root, _FakeLambda(_handler()), stage_target_nodes=5)
         # A grouping no fixed ``tuple_width`` produces, so this is not the
         # cross-width arm in another spelling.
         assert _spans_of(summary) == [(1, 3), (0, 1)], "the arm did not size the schedule"
@@ -460,8 +468,8 @@ class TestRunnerSeam:
     def test_an_explicit_target_rides_through(self, tmp_path):
         root = tmp_path / "s"
         _stage_store(root)
-        summary, _ = self._seam(root, stage_target_nodes=3)
-        assert summary["stage_target_nodes"] == 3
+        summary, _ = self._seam(root, stage_target_nodes=5)
+        assert summary["stage_target_nodes"] == 5
         assert _spans_of(summary) == [(1, 3), (0, 1)]
 
     def test_none_restores_the_fixed_width_schedule(self, tmp_path):
