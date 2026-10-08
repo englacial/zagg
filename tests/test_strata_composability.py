@@ -3,9 +3,9 @@
 Phase 1 — characterization. ``build_tdigest_where`` (the strata builder) and
 the packed composition word are both admitted by the SPILL fold gate
 (``_TDIGEST_SPILL_FUNCTIONS`` / the ``validate_spill_fold`` scalar branch,
-issues #370/#321) — the published CA store's 2,726 shards were built by k-way
+issues #370/#321) — the v1 CA store's 2,726 shards were built by k-way
 merging per-block strata partials under exactly those laws — yet D24
-classifies every one of their fields ``none``, so the live manifest promises
+classifies every one of their fields ``none``, so the v1 manifest promises
 no overview fold for the very payloads whose bytes rest on one. These tests
 pin that drift before the admission changes it:
 
@@ -39,7 +39,7 @@ from zagg.semantics import composability_classes, field_composability
 
 CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json"
 
-#: The live store's per-field declaration, exactly as published (issue #515):
+#: The v1 store's per-field declaration, exactly as published (issue #515):
 #: count folds, everything the store is FOR does not.
 CA_FIELDS_BEFORE = {
     "count": {
@@ -59,15 +59,15 @@ class TestLiveCaManifestFixture:
     """The vendored CA manifest is the historical BEFORE — never edited."""
 
     def test_fixture_pins_the_live_declaration(self):
-        # The known-answer half of the issue #515 before/after: the published
+        # The known-answer half of the issue #515 before/after: the v1
         # store declares its strata and composition non-composable while its
         # own bytes were built by their merge laws (spill fold, issue #370).
         manifest = json.loads(CA_MANIFEST.read_text())
         assert manifest["spec"] == "morton-hive/1"
         assert manifest["shard_order"] == 9
         assert manifest["cell_order"] == 19
-        # Identity of the RECORD: this hash names the store the issue is
-        # about. The shipped ``atl03_tdigest_strata_healpix`` template now
+        # Identity of the RECORD: this hash names the v1 store the issue
+        # is about. The shipped ``atl03_tdigest_strata_healpix`` template now
         # reproduces it (it IS the store's build config, recovered from the
         # run record — pinned in ``tests/test_live_store_templates.py``, issue
         # #547); the benchmark strata config (5ebf740f...) still does not. It
@@ -197,7 +197,7 @@ class TestD24Classification:
 
     def test_declared_fields_no_longer_reproduce_the_live_ca_declaration(self):
         # The before/after known-answer: phase 1 asserted ``fields ==
-        # CA_FIELDS_BEFORE`` (today's classifier reproduced the live store's
+        # CA_FIELDS_BEFORE`` (today's classifier reproduced the v1 store's
         # declaration exactly); the admissions change ONLY the ruled entries —
         # count is untouched, the strata declare the digest fold (phase 2),
         # composition the packed one (phase 3).
@@ -237,7 +237,7 @@ class TestD24Classification:
         # The class map is not just manifest text: ``column.composable_fields``
         # filters this same declaration to the composable classes, and
         # ``leaf_column_plan``/``fold_column`` carry only what survives. That
-        # is why the live CA store has no strata leaf COLUMNS to fold (class
+        # is why the v1 CA store has no strata leaf COLUMNS to fold (class
         # ``none`` at build time) and the retrofit must re-read leaves — and
         # it is the half phase 2 also flips: the admission turns worker-side
         # strata column writes ON for new runs.
