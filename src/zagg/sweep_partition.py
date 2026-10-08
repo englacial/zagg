@@ -194,6 +194,103 @@ def select_partition(by_shard: dict, partitions: int, index: int) -> tuple[dict,
     return kept, total - sum(len(w) for w in kept.values())
 
 
+#: How many ladder nodes one stage invoke should fold (issue #610). A tuple
+#: narrows until its fattest dispatch node is within this, so the per-invoke
+#: wall is bounded by the store's own density rather than by ``tuple_width``.
+#:
+#: Derived from the v3 run (``stage-20261008T054003Z-a47e28``): at width 3 the
+#: base-cell-``3`` invoke of the ``[2,1,0]`` tuple folded 21 nodes — 1 + 4 + 16
+#: covered — and hit the 900 s wall after 12 of its 16 order-2 nodes, ~75 s a
+#: node on 2,865 shards. The knob's granularity is coarse because a subtree's
+#: node count steps by powers of four (21, 5, 1 for widths 3, 2, 1), so any
+#: target in [5, 20] gives that run the same width-2 schedule, ~5 nodes and
+#: ~375 s an invoke. 8 sits in the middle of that plateau.
+STAGE_TARGET_NODES = 8
+
+
+def sized_stage_tuples(
+    shard_order: int,
+    *,
+    nodes_at,
+    tuple_width: int | None = None,
+    target: int = STAGE_TARGET_NODES,
+) -> list[dict]:
+    """:func:`zagg.sweep_stage.stage_tuples` with each width sized from the covered nodes.
+
+    The ladder's answer to the families pass's leaf-count sizing (issue #610,
+    espg 2026-10-08): a dispatch node folds its WHOLE subtree down to the
+    tuple's ``child_order`` inside one invoke, so a fixed ``tuple_width``
+    puts ``1 + 4 + ... + 4**(width-1)`` nodes on one worker wherever the
+    store is dense — 21 at width 3, which is what walled the v3 ladder's
+    coarsest tuple. Each tuple here takes the WIDEST width up to
+    ``tuple_width`` whose fattest dispatch node folds at most ``target``
+    nodes, and never narrower than 1 — where a dispatch node folds only
+    itself, so the search always terminates.
+
+    ``nodes_at(order)`` returns the covered nodes at ``order`` as decimals —
+    the dispatcher's own per-tuple derivation (:func:`zagg.sweep_fleet.dispatch_nodes`
+    or :func:`zagg.sweep_fleet.coverage_dispatch_nodes`), so the sizing reads
+    the store's density from the coverage MOC the dispatcher already holds and
+    reads nothing from the store (D8). It is called once per candidate order
+    and the results are reused across candidate widths.
+
+    Returns the :func:`zagg.sweep_stage.stage_tuples` items, finest first and spanning
+    ``[0, shard_order)`` without gap or overlap exactly as the fixed-width
+    schedule does, each with the ``width`` it was given and the ``fold_max``
+    that chose it. A store sparse enough for the full width everywhere yields
+    the fixed-width schedule itself. Grouping changes no bytes (#381 point
+    (6) + the merge-source law), so a sized schedule and a fixed one build the
+    same store — this is a dispatch knob, never grammar.
+    """
+    from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, _node_at, one_stage_tuple
+
+    shard_order = int(shard_order)
+    tuple_width = int(DEFAULT_TUPLE_WIDTH if tuple_width is None else tuple_width)
+    target = int(target)
+    if tuple_width < 1:
+        raise ValueError(f"tuple_width must be >= 1 (got {tuple_width})")
+    if target < 1:
+        raise ValueError(f"target must be >= 1 node per invoke (got {target})")
+    if shard_order < 1:
+        raise ValueError(f"shard_order {shard_order} has no above-shard ladder to sweep")
+
+    cache: dict = {}
+
+    def covered(order: int) -> list:
+        if order not in cache:
+            cache[order] = [str(n) for n in nodes_at(order)]
+        return cache[order]
+
+    def fold_max(dispatch: int, child_order: int) -> int:
+        """The fattest dispatch node's node count over ``[dispatch, child_order)``."""
+        counts: dict = {d: 0 for d in covered(dispatch)}
+        for order in range(dispatch, child_order):
+            for node in covered(order):
+                ancestor = _node_at(node, dispatch)
+                if ancestor in counts:
+                    counts[ancestor] += 1
+        return max(counts.values(), default=0)
+
+    tuples = []
+    child = shard_order
+    while child > 0:
+        # Widest first, so a store sparse enough keeps the fixed-width
+        # schedule. The last candidate is width 1, where a dispatch node folds
+        # itself alone (fold 1, or 0 where the order is uncovered) and so
+        # always clears a target of at least one node: the search cannot run
+        # off the end.
+        dispatch, fold = child - 1, 1
+        for candidate in range(max(0, child - tuple_width), child):
+            at = fold_max(candidate, child)
+            if at <= target:
+                dispatch, fold = candidate, at
+                break
+        stage = one_stage_tuple(shard_order, dispatch, child)
+        tuples.append({**stage, "width": child - dispatch, "fold_max": fold})
+        child = dispatch
+    return tuples
+
+
 def sweep_partitions(store_root: str, leaves, *, partitions: int, **kwargs) -> list[dict]:
     """Run every non-empty partition of one sweep pass IN-PROCESS, in index order.
 

@@ -543,6 +543,7 @@ def run_stage_sweep_fleet(
     scope=None,
     coverage=None,
     tuple_width: int | None = None,
+    stage_target_nodes: int | None = None,
     max_nodes_per_invoke: int | None = 1,
     run_id: str | None = None,
     output_creds_event=None,
@@ -605,6 +606,30 @@ def run_stage_sweep_fleet(
     per-invoke wall (or ``None``); the knob is reachable from the runner's
     seam too (:func:`zagg.runner._invoke_lambda_stage_sweep`).
 
+    ``stage_target_nodes`` sizes each tuple's WIDTH from the store's density
+    (issue #610, espg 2026-10-08), the way ``target`` sizes the families
+    pass's partitions: ``max_nodes_per_invoke`` caps how many dispatch NODES
+    an invoke is handed, but a dispatch node folds its whole subtree down to
+    the tuple's ``child_order``, so at width 3 one invoke folds up to 21 nodes
+    however small the cap. That is what walled the v3 ladder — the base-cell
+    ``3`` invoke of the ``[2,1,0]`` tuple folded 21 and died at 900 s after 12
+    of its 16 order-2 nodes. :func:`zagg.sweep_partition.sized_stage_tuples`
+    narrows each tuple to the widest width whose fattest dispatch node stays
+    within the target, computed from the same per-order node sets this
+    dispatcher already derives (so still nothing is read from the store, D8).
+    ``None`` — the default — sizes nothing: this dispatcher is documented as
+    the MIRROR of :func:`zagg.sweep_stages.run_stage_sweep`, and a schedule
+    this side chose on its own would no longer be the width the caller named
+    (the byte-identity oracle compares the two arms AT a width, and a sized
+    arm writes the relay stage columns of a different grouping). The run TAIL
+    is what meets the 900 s wall, so the tail is what asks for the sizing —
+    :func:`zagg.runner._invoke_lambda_stage_sweep` passes
+    :data:`zagg.sweep_partition.STAGE_TARGET_NODES`. A narrowed tuple
+    dispatches at an order no fixed width would land on, so its events carry
+    their own ``child_order`` — a worker predating issue #610 refuses such an
+    event BY NAME (``no stage tuple dispatches at order D``) rather than
+    folding the wrong span, which the barrier then reports short.
+
     ``run_id`` names the lease, the skip-key/foreign-stamp namespace AND the
     status prefix the stage records land under, so it is generated here (or
     supplied) and threaded verbatim into every invoke. ``run_started`` is
@@ -662,6 +687,7 @@ def run_stage_sweep_fleet(
     from zagg.client_transport import run_status_prefix
     from zagg.hive import _utcnow
     from zagg.sweep import _normalize_leaves
+    from zagg.sweep_partition import sized_stage_tuples
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
     from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
     from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW, stage_units
@@ -675,6 +701,12 @@ def run_stage_sweep_fleet(
     # records the EFFECTIVE value, so the run's own record cannot disagree
     # with what shipped.
     max_nodes_per_invoke = normalize_max_nodes(max_nodes_per_invoke)
+    stage_target_nodes = 0 if stage_target_nodes is None else int(stage_target_nodes)
+    if stage_target_nodes < 0:
+        raise ValueError(
+            f"stage_target_nodes must be >= 1 node per invoke, or None/0 to size by "
+            f"tuple_width alone (got {stage_target_nodes})"
+        )
     shard_order = int(shard_order)
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
@@ -698,6 +730,9 @@ def run_stage_sweep_fleet(
         "store_root": store_path,
         "shard_order": shard_order,
         "tuple_width": tuple_width,
+        # 0 when the schedule was the fixed-width mirror. The per-tuple widths
+        # the sizing chose are on the rows (``width``/``fold_max``).
+        "stage_target_nodes": stage_target_nodes,
         "max_nodes_per_invoke": max_nodes_per_invoke,
         "windowed": bool(windowed),
         "all_time": bool(all_time),
@@ -718,6 +753,10 @@ def run_stage_sweep_fleet(
         "invokes": 0,
         # True if ANY barrier expired: the run's actuals may under-report.
         "barrier_timed_out": False,
+        # The orders whose manifest actuals the finisher was told to withhold
+        # (issue #610). Always present, like ``skipped``: a caller reading the
+        # summary should not have to know which branch produced it.
+        "short_orders": [],
         "stages": [],
     }
 
@@ -825,17 +864,48 @@ def run_stage_sweep_fleet(
     # A tuple's close units (the all-time fold) are fired when its window
     # units are in and awaited with the NEXT fan-out: the next tuple reads
     # only the window units' stage columns, never an all-time artifact.
-    closing: tuple = ()
-    for stage in stage_tuples(shard_order, tuple_width=tuple_width):
-        dispatch = int(stage["dispatch"])
-        # The ruled computation when a coverage MOC was handed in, the work set
-        # alone otherwise. Both derive the nodes dispatcher-side, per tuple —
-        # neither reads the store (D8).
-        nodes = (
-            dispatch_nodes(work, dispatch, scope)
-            if coverage is None
-            else coverage_dispatch_nodes(work, dispatch, coverage, scope)
+    # The ruled computation when a coverage MOC was handed in, the work set
+    # alone otherwise. Both derive the nodes dispatcher-side, per order —
+    # neither reads the store (D8). Memoized because the sizing below asks for
+    # the same orders the tuple loop then asks for again.
+    node_sets: dict = {}
+
+    def _nodes_at(order: int) -> list:
+        order = int(order)
+        if order not in node_sets:
+            node_sets[order] = (
+                dispatch_nodes(work, order, scope)
+                if coverage is None
+                else coverage_dispatch_nodes(work, order, coverage, scope)
+            )
+        return node_sets[order]
+
+    if stage_target_nodes:
+        schedule = sized_stage_tuples(
+            shard_order,
+            nodes_at=_nodes_at,
+            tuple_width=tuple_width,
+            target=stage_target_nodes,
         )
+        narrowed = [st for st in schedule if int(st["width"]) < tuple_width]
+        if narrowed:
+            logger.info(
+                f"stage fleet: sized the schedule from the store's density — "
+                f"{len(narrowed)} of {len(schedule)} tuple(s) narrower than width "
+                f"{tuple_width} (target {stage_target_nodes} node(s) an invoke): "
+                + ", ".join(
+                    f"@{st['dispatch']} width {st['width']} folds {st['fold_max']}"
+                    for st in narrowed
+                )
+            )
+    else:
+        schedule = stage_tuples(shard_order, tuple_width=tuple_width)
+
+    closing: tuple = ()
+    for stage in schedule:
+        dispatch = int(stage["dispatch"])
+        width = int(stage.get("width") or (int(stage["child_order"]) - dispatch))
+        nodes = _nodes_at(dispatch)
         if not nodes:
             continue
         unit_args = dict(windowed=windowed, candidates=nodes, dirt_only=regather)
@@ -845,7 +915,11 @@ def run_stage_sweep_fleet(
             "run_id": run_id,
             "run_started": run_started,
             "dispatch": dispatch,
-            "tuple_width": tuple_width,
+            # The TUPLE's own width, and its span outright: a sized schedule
+            # dispatches at orders no single width lands on, so the worker
+            # takes the span rather than re-deriving it (issue #610).
+            "tuple_width": width,
+            "child_order": int(stage["child_order"]),
             "records_from": records_from,
         }
         if pipeline_run_id is not None:
@@ -878,6 +952,10 @@ def run_stage_sweep_fleet(
         row = {
             "dispatch_order": dispatch,
             "orders": list(stage["orders"]),
+            "width": width,
+            # The fattest dispatch node's fold, which chose the width above —
+            # absent on a fixed-width schedule, which measured nothing.
+            "fold_max": stage.get("fold_max"),
             "nodes": len(nodes),
             "batches": len(fired),
             "barrier_timed_out": False,
@@ -935,6 +1013,28 @@ def run_stage_sweep_fleet(
         return summary
     stages_timed_out = any(st["barrier_timed_out"] for st in summary["stages"])
     summary["barrier_timed_out"] = stages_timed_out
+    # The ORDERS whose actuals this run did not observe in full: every order of
+    # every tuple that is missing a unit record (issue #610, espg 2026-10-08).
+    # A bool alone made the finisher stamp the manifest as if complete — the v3
+    # ladder recorded actuals for orders 8..3 and for the walled 2..0 alike.
+    # Named per order, so the finisher withholds exactly the short levels and
+    # leaves them for the re-run, keeping the complete ones.
+    short_orders = sorted(
+        {
+            int(order)
+            for st in summary["stages"]
+            if st.get("missing_unit_count")
+            for order in st["orders"]
+        },
+        reverse=True,
+    )
+    summary["short_orders"] = short_orders
+    if short_orders:
+        logger.warning(
+            f"stage fleet: run {run_id} is short a unit record at order(s) "
+            f"{short_orders} — the finisher withholds their manifest actuals; "
+            "re-run the staged sweep to record them"
+        )
     finisher_block = {
         "role": "finisher",
         "run_id": run_id,
@@ -943,6 +1043,7 @@ def run_stage_sweep_fleet(
         # The finisher is aggregating a record set the dispatcher knows may be
         # short; it rides on the wire so the RUN record says so.
         "barrier_timed_out": stages_timed_out,
+        "short_orders": short_orders,
     }
     if pipeline_run_id is not None:
         finisher_block["pipeline_run_id"] = pipeline_run_id
