@@ -607,11 +607,12 @@ class TestHarnessHandles:
 
         Eight distinct leaves at ``workers=8``, each a root-stamp open then
         the cell-order group open (spec §1.5), every open sleeping 50 ms:
-        under a mutex that is 16 x 50 ms, concurrently it is two 50 ms
-        waits (review finding — the penalty was exactly ``workers``x, and
-        the roster it scales with is 2,918 leaves on CA, not the canary's
-        4). The bound asserted is the SERIAL floor, not the concurrent one,
-        so the test pins the lock rather than the scheduler.
+        a lock across either open costs >= 9 x 50 ms, concurrently it is two
+        50 ms waits (review finding — the penalty was exactly ``workers``x,
+        and the roster it scales with is 2,918 leaves on CA, not the
+        canary's 4). The bound sits halfway to the lightest lock, not near
+        the concurrent ideal, so the test pins the lock rather than the
+        scheduler.
         """
         import time
         from types import SimpleNamespace
@@ -632,7 +633,7 @@ class TestHarnessHandles:
         opened = _map_concurrent(harness.leaf_group, leaves, 8)
         elapsed = time.perf_counter() - start
         assert len({g.path for g in opened}) == len(leaves)  # eight distinct groups...
-        assert elapsed < 16 * 0.05 / 4  # ... opened concurrently, not one by one
+        assert elapsed < 9 * 0.05 / 2  # ... opened concurrently, not one by one
 
     def test_a_full_pass_opens_each_array_once(self, tmp_path, monkeypatch):
         """The property that matters at roster scale: no repeated handle opens."""
