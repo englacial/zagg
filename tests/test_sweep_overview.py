@@ -2451,6 +2451,34 @@ class TestCascadeFold:
         assert fold is None and counts["failed"] == 1
         assert "is not an overview at order 1" in caplog.text
 
+    def test_child_at_another_cell_order_is_skipped_loudly(self, tmp_path, caplog):
+        from zagg.sweep_overview import _cascade_node
+
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        # An overview at the source order but another cell order has no
+        # group at the cells this fold reads: it would fold as all-fill.
+        store = open_store(str(tmp_path / "-3" / "1" / "all.zarr"))
+        g = zarr.open_group(store, mode="r+", zarr_format=3)
+        g.attrs[OVERVIEW_ATTR] = {**dict(g.attrs)[OVERVIEW_ATTR], "cell_order": 0}
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        fold = _cascade_node(
+            str(tmp_path),
+            "-3",
+            0,
+            1,
+            "all",
+            ["-311"],
+            COMPOSABLE,
+            CELL_ORDER,
+            SHARD_ORDER,
+            counts,
+            {},
+        )
+        assert fold is None and counts["failed"] == 1
+        assert "cell order 0" in caplog.text
+
     def test_cascade_without_a_materialized_child_is_empty(self, tmp_path, caplog):
         import logging
 

@@ -2217,7 +2217,8 @@ def _cascade_node(
     (never a member enumeration), stamp-gated (an unstamped child is debris,
     D4), and skipped loudly — never fatally — when unreadable. A child whose
     ``role``/``zagg_overview`` attrs do not classify it as an overview at
-    ``source_order`` is skipped rather than folded blind: write order pins
+    ``source_order`` and the cells this fold reads is skipped rather than
+    folded blind: write order pins
     those attrs BEFORE the commit stamp, so a stamped overview always carries
     them, and anything else at that path is not this fold's input.
     """
@@ -2239,11 +2240,14 @@ def _cascade_node(
             provenance = reader.attrs.get(OVERVIEW_ATTR)
             provenance = dict(provenance) if isinstance(provenance, dict) else {}
             if reader.committed and (
-                reader.attrs.get(ROLE_ATTR) != "overview" or provenance.get("order") != source_order
+                reader.attrs.get(ROLE_ATTR) != "overview"
+                or provenance.get("order") != source_order
+                or provenance.get("cell_order") != source_cell_order
             ):
                 raise ValueError(
                     f"role {reader.attrs.get(ROLE_ATTR)!r} / declared order "
-                    f"{provenance.get('order')!r} is not an overview at order {source_order}"
+                    f"{provenance.get('order')!r} / cell order {provenance.get('cell_order')!r} "
+                    f"is not an overview at order {source_order}, cells {source_cell_order}"
                 )
         except Exception as e:
             logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
