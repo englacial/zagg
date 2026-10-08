@@ -2212,8 +2212,9 @@ class TestLadder:
         grid, root, _ = _ladder_run(monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards)
         # A leaf's directory holds its tree, sidecars and declared column.
         leaves = [str(Path(hive.shard_leaf_path(root, s)).parent) for s in shards]
-        # The node-level stage artifacts (overviews, stage columns, their
-        # stamps): everything under a node outside the leaf directories.
+        # The node-level stage artifacts (overviews and their stamps; this
+        # d = 1 ladder needs no stage column, issue #620): everything under a
+        # node outside the leaf directories.
         folded = {
             str(f): (f.stat().st_mtime_ns, f.read_bytes())
             for f in Path(root).rglob("*")
@@ -2221,7 +2222,7 @@ class TestLadder:
             and "all." in str(f.relative_to(root))
             and not any(str(f).startswith(leaf + "/") for leaf in leaves)
         }
-        assert any("all.zarr" in f for f in folded) and any("pyramid" in f for f in folded)
+        assert any("all.zarr" in f for f in folded)
         stats = {leaf: Path(leaf, "stats.json").read_bytes() for leaf in leaves}
         import zagg.sweep_stages as sweep_stages
 

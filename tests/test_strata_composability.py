@@ -870,15 +870,16 @@ class TestLeafFoldHalfPair:
 
 
 class TestStageMergeHalfPair:
-    """``_merge_slabs``' packed arm when a contributor carries half the pair.
+    """The k-way kernel's packed arm when a contributor carries half the pair.
 
-    The stage site's own behavior, which no other fold site has: the word and
-    its ``of`` divisor are DIFFERENT declared fields folded by different loops,
-    so skipping a half-paired contributor for the word alone would publish a
-    word whose lanes are over a strict subset of the level's ``N_signal``
-    (review finding: a ~29% skew). The covered output cells stay at the fill
-    word instead — absence over wrongness — and the contributor counts
-    unreadable.
+    The kernel under ``cascade_fold`` (``sweep_fold.merge_level``): the word
+    and its ``of`` divisor are DIFFERENT declared fields folded by different
+    loops, so skipping a half-paired contributor for the word alone would
+    publish a word whose lanes are over a strict subset of the level's
+    ``N_signal`` (review finding: a ~29% skew). The covered output cells stay
+    at the fill word instead — absence over wrongness — and the rail is per
+    FIELD: the contributor still folds its other fields and counts as folded
+    (the one rule of both sweeps since issue #620).
     """
 
     NODE_ORDER, CELL_ORDER, RES = 3, 5, 4
@@ -917,12 +918,13 @@ class TestStageMergeHalfPair:
         return _ColumnReader(path, run_id="A", run_started=_utcnow(), store_kwargs={})
 
     def _merge(self, paths):
-        from zagg.sweep_stage import _merge_slabs
+        from zagg.sweep_fold import _source_counts, merge_level
 
         rows = [[self._reader(p)] for p in paths]
         # One output cell over BOTH children: factor 8 == the two children's
-        # four source cells each, which is where a half-pair can mix.
-        return _merge_slabs(
+        # four source cells each, which is where a half-pair can mix (not a
+        # cascade shape, so the kernel is driven with its derived geometry).
+        slabs, broken, demotions = merge_level(
             rows,
             _STRATA_FIELDS,
             res_src=self.RES,
@@ -930,6 +932,7 @@ class TestStageMergeHalfPair:
             factor=8,
             n_out=1,
         )
+        return (slabs, *_source_counts(rows, broken), demotions)
 
     @staticmethod
     def _weight(slab, j):
@@ -979,7 +982,7 @@ class TestStageMergeHalfPair:
         # not be published over the surviving subset.
         shutil.rmtree(f"{paths[1]}/{self.RES}/composition")
         slabs, folded, missing, unreadable, demotions = self._merge(paths)
-        assert (folded, missing, unreadable) == (1, 0, 1)
+        assert (folded, missing, unreadable) == (2, 0, 0)  # per field: still a contributor
         assert int(slabs["composition"][0]) == 0, "the covered cell keeps the fill word"
         assert self._weight(slabs["h_sig"], 0) == pooled, "the divisor still folds both"
         # The rail's firing is returned for the artifact record (issue #518).
@@ -1012,10 +1015,11 @@ class TestStageMergeHalfPair:
         # itself and drops the child too, so the level's N_signal is 1111's
         # alone and 1111's word describes exactly those rows — consistent, so
         # nothing is poisoned and the shared cell keeps the surviving word.
-        # Still counted unreadable: the level did fold short.
+        # Still a folded contributor: the record is what says the field folded
+        # short of it.
         shutil.rmtree(f"{paths[1]}/{self.RES}/h_sig")
         slabs, folded, missing, unreadable, demotions = self._merge(paths)
-        assert (folded, missing, unreadable) == (1, 0, 1)
+        assert (folded, missing, unreadable) == (2, 0, 0)
         # Recorded without ``cells``: nothing was blanked, the contributor
         # simply folded short for the field (issue #518).
         assert demotions == [
