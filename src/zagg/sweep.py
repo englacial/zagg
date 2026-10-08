@@ -859,12 +859,15 @@ def run_sweep(
     Unless ``record=False``, the summary is also PUT at the store root as the
     sweep's own run record (:func:`_write_sweep_record`, fail-open).
 
-    One store handle per pass (issue #610): the obstore handle opened at the
-    store root here is what every leaf and rollup read and every PUT goes
-    through — the families address leaves by relative key — so the pass's
-    client constructions are O(1), not one per leaf. On the v3 California
-    finisher the per-leaf opens were ~7 credential resolutions a second for
-    the whole invoke.
+    One store handle per pass (issue #610): the JSON-rollup families
+    (``stats``, ``moc``, ``submap``) and the temporal route read every leaf
+    and rollup through the obstore handle opened at the store root here, by
+    relative key, so their client constructions are O(1), not one per leaf.
+    On the v3 California finisher the per-leaf opens were ~7 credential
+    resolutions a second for the whole invoke. Outside it: the ``overview``
+    family on a ``/1`` store still opens each leaf by path, and
+    :meth:`MocFamily.finish`'s root-object reads and writes open their own
+    stores.
     """
     import time
 
