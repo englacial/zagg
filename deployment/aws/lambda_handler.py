@@ -192,6 +192,14 @@ end of run, like coverage mode; also invocable ad hoc):
                                   #   literal here would give the fleet a different
                                   #   tuple grouping, hence a different set of
                                   #   stage columns, on the same store
+          "child_order": int,     # optional, role="stage" (issue #610): the
+                                  #   order of the child columns this tuple
+                                  #   reads -- its span outright, for a
+                                  #   dispatcher whose schedule was SIZED from
+                                  #   the store's density and whose dispatch
+                                  #   orders no single tuple_width lands on.
+                                  #   Absent -> the width selects the tuple out
+                                  #   of the fixed-width schedule, as before
           "partition": {"index": int, "of": int},  # optional, recorded only
           "lease_ttl_s": int,     # optional
           "records_from": str,    # REQUIRED, both roles. The run's status prefix
@@ -209,6 +217,13 @@ end of run, like coverage mode; also invocable ad hoc):
                                   #   barrier. Recorded in the store-root run
                                   #   record, so a run whose per-level actuals
                                   #   may be short says so durably
+          "short_orders": [int],  # optional, role="finisher" (issue #610):
+                                  #   WHICH ladder orders are short a unit
+                                  #   record. Their manifest actuals are left
+                                  #   as they stood instead of being stamped
+                                  #   from this run; the orders that landed are
+                                  #   recorded as usual. Absent -> nothing is
+                                  #   withheld, as before
         }
         All store writes stay worker-side (D8). The work set rides in the
         SAME "leaves"/"discover" keys the families arm uses -- a stage invoke
@@ -1530,6 +1545,11 @@ def _handle_stage_sweep(
                 # finisher cannot tell, and the run record is the only durable
                 # place that can say the per-level actuals may be short.
                 barrier_timed_out=bool(block.get("barrier_timed_out")),
+                # WHICH orders the barrier was short (issue #610): the finisher
+                # withholds their manifest actuals instead of stamping them as
+                # observed. Absent from an older dispatcher's event — then
+                # nothing is withheld, exactly as before.
+                short_orders=block.get("short_orders") or (),
                 store_kwargs=store_kwargs,
                 pipeline_run_id=block.get("pipeline_run_id"),
             )
@@ -1543,6 +1563,11 @@ def _handle_stage_sweep(
                 nodes=block.get("nodes") or [],
                 batch=int(block.get("batch", 0)),
                 tuple_width=int(block.get("tuple_width", DEFAULT_TUPLE_WIDTH)),
+                # This tuple's span, when the dispatcher sized its schedule
+                # (issue #610) and the width alone no longer names it. Absent
+                # from an older dispatcher's event — the width then selects the
+                # tuple out of the fixed-width schedule, as it always did.
+                child_order=block.get("child_order"),
                 partition=block.get("partition"),
                 records_from=block.get("records_from"),
                 lease_ttl_s=block.get("lease_ttl_s"),

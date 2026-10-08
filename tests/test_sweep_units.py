@@ -1057,8 +1057,12 @@ class TestFleetUnits:
             barrier_timeout_s=0.01,
         )
         stage_block = client.blocks()[0]
+        # No `unit`/`window` on an unwindowed event — the claim this pins.
+        # `child_order` joined the block in issue #610: the tuple's span, which
+        # every stage event carries now that the schedule can be sized.
         assert sorted(stage_block) == [
             "batch",
+            "child_order",
             "dispatch",
             "nodes",
             "records_from",

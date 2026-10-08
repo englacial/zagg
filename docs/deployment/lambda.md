@@ -553,12 +553,14 @@ staged arm, reusing that event's credential resolution and its
 | `unit` | stage | Optional ([issue #586](https://github.com/englacial/zagg/issues/586)). Which of the nodes' stage units this invoke runs: `"window"` — ONE window's fold, named by `window` — or `"close"`, the per-node step that follows a node's window units (the all-time fold). Absent, the worker runs the nodes whole — every window, then the close, serially — which is an unwindowed store's one unit per node and what a dispatcher predating the units sends. Refused by name against an unwindowed store |
 | `window` | stage | The window label. **Required** with `unit: "window"`, refused with anything else |
 | `pipeline_run_id` | both | Optional ([issue #593](https://github.com/englacial/zagg/issues/593)). The id of the aggregation run this sweep **completes** — distinct from `run_id`, the sweep's own. Recorded verbatim in every stage record, `finisher.json` and the store-root run record; absent, they record `null`, which vouches for no run |
-| `tuple_width` | stage | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH`. A finisher takes no tuple width — one on a finisher block is inert |
+| `tuple_width` | stage | Optional; defaults to `zagg.sweep_stage.DEFAULT_TUPLE_WIDTH`. Under a sized schedule it is *this tuple's* width, which may be narrower than the run's. A finisher takes no tuple width — one on a finisher block is inert |
+| `child_order` | stage | Optional ([issue #610](https://github.com/englacial/zagg/issues/610)). The order of the child columns this tuple reads — its span, `[dispatch, child_order)`, outright. A sized schedule dispatches at orders no single `tuple_width` lands on, so the span cannot be re-derived worker-side; absent, the width selects the tuple out of the fixed-width schedule as before. A worker predating #610 ignores it and refuses such a tuple by name (`no stage tuple dispatches at order D`) rather than folding the wrong span |
 | `partition` | stage | Optional `{"index", "of"}`; recorded on the stage rows |
 | `lease_ttl_s` | both | Optional lease TTL override |
 | `records_from` | both | **Required.** The run's status prefix — a store **sibling** (`<store>.status/run-<run_id>`, `zagg.client_transport.run_status_prefix`). Each invoke PUTs its record there; the finisher reads them back. Both roles refuse by name without it: a stage worker that wrote no record would fold correctly and then be indistinguishable from a lost invoke, and a finisher without the records has no per-level actuals at all. A finisher also refuses a prefix holding zero records (a *partial* set is fine — under-coverage is recorded and self-heals) |
 | `touch_policy` | finisher | Optional (defaults to `"auto"`); the `output.touch` declaration (issue #501) governing the `aggregation.yaml` touch |
 | `barrier_timed_out` | finisher | Optional, defaults `false`. Sent by the dispatcher when any tuple's barrier expired; the finisher records it in the store-root run record and in `finisher.json`, so the durable record says the per-level actuals may be short |
+| `short_orders` | finisher | Optional ([issue #610](https://github.com/englacial/zagg/issues/610)); the ladder orders of every tuple the dispatcher is missing a unit record for. The finisher **withholds** their manifest `actuals` — the entries keep whatever stood — and records the rest as usual, so a walled tuple's levels are no longer stamped as if observed. Reported back as `short_orders` and `finisher.actuals_withheld`; absent, nothing is withheld |
 
 Every store write stays worker-side. The dispatcher only invokes and polls.
 
@@ -567,6 +569,18 @@ Every store write stays worker-side. The dispatcher only invokes and polls.
 `zagg.sweep_fleet.run_stage_sweep_fleet` mirrors the in-process driver's tuple
 ordering exactly:
 
+0. **size the schedule** from the store's density, when the caller asked for
+   it — the run tail does, the dispatcher's own default does not
+   ([issue #610](https://github.com/englacial/zagg/issues/610)). Each tuple
+   takes the widest width up to `tuple_width` whose fattest dispatch node
+   folds at most `zagg.sweep_partition.STAGE_TARGET_NODES` nodes, counted
+   over the per-order node sets the dispatcher already derives (nothing is
+   read from the store). A dispatch node folds its whole subtree down to the
+   tuple's child order in one invoke, so this — not
+   `max_nodes_per_invoke` — is what bounds the per-invoke wall: at width 3 a
+   dense tuple folds 21 nodes however small the node cap, which is what
+   walled the v3 ladder's `[2,1,0]` tuple at 900 s. Each tuple's row reports
+   the `width` it was given and the `fold_max` that chose it;
 1. **fan out** one tuple's stage units, batched under `max_nodes_per_invoke`
    *and* the 250 KB async payload cap — whichever binds first closes a batch —
    with one `InvocationType="Event"` invoke per batch. On an unwindowed store
@@ -604,7 +618,12 @@ counts its window units (`batches` / `records_seen`) and its closes
 (`close_batches` / `close_records_seen`); a unit whose record never landed is
 **named** in `missing_units` (`{batch, nodes, unit, window}`, the first 50;
 `missing_unit_count` is exact), so a dead `(node, window)` is told apart from
-a late tuple. A window unit that *raises* is not one that died: on a windowed
+a late tuple. Those rows are also what the finisher is told to **withhold**:
+the orders of every tuple short a record ride the finisher event as
+`short_orders`, and their manifest `actuals` are left as they stood rather
+than stamped from a run that did not observe them (issue #610 — the v3 run
+recorded actuals for its walled `[2,1,0]` tuple exactly as it did for the
+complete orders 8..3). The dispatcher's summary carries the same list. A window unit that *raises* is not one that died: on a windowed
 store the worker counts it, names it in its record's `unit_errors`, and still
 writes the record, so the barrier is met at once. Either way the failure
 costs that window's artifacts and nothing else — the node's other windows
@@ -879,7 +898,7 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
 | 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
-| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits, over a schedule **sized from the store's density** so no invoke folds more than `STAGE_TARGET_NODES` nodes ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 
 Shards the launcher had not dispatched yet never run. Work through the steps

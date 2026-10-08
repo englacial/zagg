@@ -203,6 +203,29 @@ def stage_tuples(shard_order: int, *, tuple_width: int = DEFAULT_TUPLE_WIDTH) ->
     return list(reversed(tuples))
 
 
+def one_stage_tuple(shard_order: int, dispatch: int, child_order: int) -> dict:
+    """One dispatch tuple, named by its own ``[dispatch, child_order)`` span.
+
+    The same item :func:`stage_tuples` yields, built directly instead of
+    being selected out of a fixed-width schedule — what a worker needs when
+    the dispatcher SIZED the schedule (:func:`sized_stage_tuples`) and the
+    tuple's width is therefore not derivable from a single ``tuple_width``.
+    Refuses by name: a span must hold at least one order, start at or above
+    the root and end at or below the leaf columns.
+    """
+    shard_order, dispatch, child_order = int(shard_order), int(dispatch), int(child_order)
+    if not 0 <= dispatch < child_order <= shard_order:
+        raise ValueError(
+            f"stage tuple [{dispatch}, {child_order}) is not a span of this ladder — "
+            f"needs 0 <= dispatch < child_order <= shard_order ({shard_order})"
+        )
+    return {
+        "dispatch": dispatch,
+        "orders": list(range(child_order - 1, dispatch - 1, -1)),
+        "child_order": child_order,
+    }
+
+
 def classify_level(cells: int, *, shard_order: int) -> str:
     """``stage-gather`` or ``stage-merge`` for a ladder level's cell resolution.
 

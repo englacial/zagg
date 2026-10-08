@@ -708,6 +708,41 @@ tier (the espg merge-source ruling), so **the cadence changes no bytes**:
 every upfront merge level is uniformly 2 merges from raw (gathers are 1;
 gen 3 is append-later cascade territory only).
 
+**The run tail sizes the cadence itself** ([issue
+#610](https://github.com/englacial/zagg/issues/610)). A dispatch node folds
+its *whole* subtree down to its tuple's child order inside one invoke, so a
+fixed width puts `1 + 4 + … + 4^(width-1)` nodes on one worker wherever the
+store is dense — 21 at width 3, which is what walled the v3 ladder: the
+`[2,1,0]` tuple's base-cell-`3` invoke hit the 900 s wall after 12 of its 16
+order-2 nodes, no record landed, and the barrier was waited out. Capping the
+*nodes* an invoke is handed (`max_nodes_per_invoke`, already 1) does not help:
+the subtree is one node's work. So the Lambda tail asks for a **sized**
+schedule — each tuple takes the widest width up to `tuple_width` whose
+fattest dispatch node folds at most `STAGE_TARGET_NODES` (8) nodes, computed
+from the per-order node sets the dispatcher already derives out of the
+coverage MOC, reading nothing from the store. A dense o9 ladder becomes five
+width-2 tuples folding 5 nodes an invoke rather than three width-3 tuples
+folding 21; a sparse store keeps the fixed-width schedule outright. Because a
+subtree's node count steps by powers of four, any target in `[5, 20]` picks
+the same schedule there. Such a tuple dispatches at an order no single width
+lands on, so its events carry their span (`child_order`) outright; a worker
+deployed before this refuses one by name rather than folding the wrong span.
+The cadence still changes no bytes — a sized build's ladder overviews are the
+fixed-width build's — so this is a dispatch knob like `--tuple-width` itself,
+and `python -m zagg.sweep --stages` is unchanged (the CLI has no 900 s wall).
+
+**A short tuple does not stamp the manifest.** The finisher records per-level
+`actuals` from the run's stage records; a tuple whose unit record never landed
+has none, and before issue #610 the levels it owned were stamped from
+whatever the run *did* observe, exactly like the complete ones — the v3 run
+wrote actuals complete for orders 8..3 and short for 2..0 with nothing to
+tell them apart. The dispatcher now names the short orders to the finisher
+(`short_orders`, from the tuples it is missing a unit record for), and their
+level entries are **left as they stood** while the orders that landed are
+recorded as usual. The finisher's record says which it withheld
+(`short_orders`, `finisher.actuals_withheld`), the tail warns, and the next
+staged pass records them.
+
 **Units.** The unit of stage work is the dispatch node on an unwindowed
 store and the **`(node, window)` pair** on a windowed one
 ([issue #586](https://github.com/englacial/zagg/issues/586)): each window's

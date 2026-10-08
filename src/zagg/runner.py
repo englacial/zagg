@@ -6330,6 +6330,7 @@ def _invoke_lambda_stage_sweep(
     store_kwargs=None,
     touch_policy="auto",
     max_nodes_per_invoke="default",
+    stage_target_nodes="default",
     barrier_timeout_s=None,
     total_barrier_budget_s=None,
     dirt_only=(),
@@ -6375,6 +6376,22 @@ def _invoke_lambda_stage_sweep(
     ruled default is sized for a store whose finest tuple is ~110 nodes, and
     the tail runs against whatever store the config names.
 
+    **How much one invoke folds.** ``max_nodes_per_invoke`` caps the NODES an
+    invoke is handed, but a dispatch node folds its whole subtree down to the
+    tuple's child order, so at width 3 one invoke folds up to 21 nodes however
+    small that cap — which is what walled the v3 ladder (issue #610, espg
+    2026-10-08: the base-cell ``3`` invoke of the ``[2,1,0]`` tuple died at
+    900 s after 12 of its 16 order-2 nodes, no record, and the finisher then
+    stamped manifest actuals for orders 2..0 as if they were as complete as
+    8..3). The tail therefore asks for the SIZED schedule
+    (:data:`zagg.sweep_partition.STAGE_TARGET_NODES`): each tuple narrows to
+    the widest width whose fattest dispatch node stays within the target,
+    computed from the per-order node sets the dispatcher already derives. The
+    dispatcher's own default is off, because it is documented as the mirror of
+    the in-process pass at a given width; the wall is the tail's, so the ask
+    is the tail's. ``"default"`` here takes the tail's default (sized);
+    ``None`` restores the fixed-``tuple_width`` schedule.
+
     **If the dispatcher dies mid-barrier** (a CI timeout, Ctrl-C, a driving
     Lambda's own 900 s ceiling) the run's lease stays HELD, because the
     finisher is its only releaser and it never fired. That is the lease's
@@ -6409,6 +6426,14 @@ def _invoke_lambda_stage_sweep(
     # so it cannot double as the unset sentinel the barrier knobs use.
     if max_nodes_per_invoke != "default":
         knobs["max_nodes_per_invoke"] = max_nodes_per_invoke
+    # Same sentinel discipline: `None` MEANS the fixed-width schedule, so it
+    # cannot double as "unset". Unset takes the tail's default, which is sized.
+    if stage_target_nodes == "default":
+        from zagg.sweep_partition import STAGE_TARGET_NODES
+
+        knobs["stage_target_nodes"] = STAGE_TARGET_NODES
+    else:
+        knobs["stage_target_nodes"] = stage_target_nodes
     try:
         summary = run_stage_sweep_fleet(
             lambda_client,
@@ -6438,6 +6463,12 @@ def _invoke_lambda_stage_sweep(
             f"staged sweep {summary['run_id']}: at least one barrier expired — the ladder may "
             "be partially covered and the finisher's per-level actuals may under-report; "
             "under-coverage is recorded per artifact and heals on the next pass"
+        )
+    if summary.get("short_orders"):
+        logger.warning(
+            f"staged sweep {summary['run_id']}: order(s) {summary['short_orders']} are short "
+            "a unit record — the finisher withheld their manifest actuals rather than "
+            "stamping them from this run; re-run the staged sweep to record them"
         )
     return summary
 
