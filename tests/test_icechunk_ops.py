@@ -403,14 +403,16 @@ class TestDeclarePyramid:
         _write_manifest(root, grid)
         r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
         assert r["added"] == ["1", "2", "3", "4", "5"] and r["snapshot"]
-        assert sorted(_open(root)[0].attrs[ICECHUNK_ATTR]["levels"], key=int) == [
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-        ]
+        group, _repo = _open(root)
+        block = group.attrs[ICECHUNK_ATTR]
+        assert sorted(block["levels"], key=int) == ["1", "2", "3", "4", "5", "6"]
+        assert "retired" not in block
+        # The relist refreshes the whole convention surface (§11.1): the
+        # layout is exactly the listed levels again, the registration is back.
+        layout = group.attrs[MULTISCALES_ATTR]["layout"]
+        assert [e["asset"] for e in layout] == list(block["levels"])
+        assert layout[0]["dggs"] == group["6"].attrs["dggs"]
+        assert group.attrs["zarr_conventions"][0]["name"] == "multiscales"
 
     def test_levels_follow_the_repos_rows(self, cfg, tmp_path):
         # A level declared after the repo's rows were allocated is built at
