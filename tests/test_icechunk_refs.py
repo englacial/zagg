@@ -2729,6 +2729,13 @@ class TestMultiscalesLayout:
             ("6", [64.0]),
         ]
 
+    @pytest.mark.parametrize("fold", [{"fold_source": None, "exact_levels": 1}, {}])
+    def test_missing_fold_source_reads_as_leaves(self, fold):
+        # §4.5: no ``fold_source`` reads as ``leaves`` — every level from the base.
+        manifest = _mirror_manifest([(4, [5]), (3, [4]), (2, [3])], fold)
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(6, 5, 4, 3))
+        assert [e["derived_from"] for e in layout[1:]] == ["6", "6", "6"]
+
     def test_exact_levels_boundary_and_multi_member_column(self):
         # Two exact entries: the column's members AND the first overview fold
         # the leaves; the cascade starts past the boundary. The layout order
@@ -2777,6 +2784,16 @@ class TestMultiscalesLayout:
         assert layout[0]["dggs"] == spec.members["6"].attributes["dggs"]
         assert [e["asset"] for e in layout] == ["6", "5", "4", "3", "2", "1"]
         assert layout[1]["dggs"] == {"refinement_level": 5}
+        # The built manifest's default fold (cascade, exact_levels 1): the
+        # column from the base, every overview from the next-finer level.
+        assert manifest["multiscales"][0]["fold"]["fold_source"] == "cascade"
+        assert [(e["derived_from"], e["transform"]["scale"]) for e in layout[1:]] == [
+            ("6", [4.0]),
+            ("5", [4.0]),
+            ("4", [4.0]),
+            ("3", [4.0]),
+            ("2", [4.0]),
+        ]
 
     def test_no_mirror_no_convention_keys(self, cfg, tmp_path):
         cfg.output["pyramid"] = False
