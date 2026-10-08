@@ -761,7 +761,10 @@ channel), which is where the stage records land. The dispatcher needs
 record it reports (`stage_records`, `levels`, `lease`, `record`,
 `duration_s`). The v2 Event transport already both lists and gets that prefix,
 so a correctly scoped dispatcher role needs no new grant, and no
-CloudFormation, layer, or IAM template change ships with this transport.
+CloudFormation, layer, or IAM template change ships with this transport. The
+run tail's families barrier ([issue #610](https://github.com/englacial/zagg/issues/610))
+polls the same prefix — `<store>.status/run-<run_id>/` — so it needs no new
+grant either.
 
 Mind the shape if you are writing the policy by hand: `s3:ListBucket` is a
 **bucket-level** action, so its `Resource` is the bucket ARN and the prefix
@@ -872,7 +875,7 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 | End-of-run step | What lands | If the launcher dies before it |
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
-| 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, their `sweep_stats_<ts>_p<i>of<n>.json` records at the store root, then the finisher and its `sweep_stats_<ts>.json` — the dispatcher awaits each and reports `families_sweep: {partitions, fired, landed, finisher}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
+| 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher; each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
 | 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 

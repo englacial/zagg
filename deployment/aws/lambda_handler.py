@@ -1322,8 +1322,15 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     place, ``run_stage_sweep`` (the ``--stages`` CLI), so on the fleet **the
     partition-less follow-up invoke IS the finisher**. A partitioned "toc
     sweep" that stops after the fan-out produces no toc.
+
+    ``records_from`` (issue #610) is the run's status prefix, set by the run
+    tail's families fleet (:func:`zagg.sweep_fleet.run_families_sweep_fleet`):
+    the pass then PUTs a copy of its sweep record there as
+    :func:`zagg.sweep_fleet.families_record_name` of its partition block, which
+    is what the dispatcher's barrier awaits. Absent, nothing changes.
     """
     from zagg.sweep import discover_leaves, run_sweep
+    from zagg.sweep_fleet import families_record_name
     from zagg.sweep_partition import normalize_partition
 
     logger.info(f"Sweep mode: folding rollups at {event.get('store_path')}")
@@ -1371,6 +1378,11 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
             store_kwargs=store_kwargs,
             families=event.get("families"),
             partition=event.get("partition"),
+            status_record=(
+                (event["records_from"], families_record_name(event.get("partition")))
+                if event.get("records_from")
+                else None
+            ),
         )
         return {
             "statusCode": 200,
@@ -1390,6 +1402,7 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
                     "duration_s": summary["duration_s"],
                     "discover_s": discover_s,
                     "record": summary.get("record"),
+                    "status_record": summary.get("status_record"),
                 }
             ),
         }

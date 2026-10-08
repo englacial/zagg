@@ -607,9 +607,11 @@ families pass is split `4^k` ways from the run's own leaf count — `k` from
 `ceil(log4(leaves / 128))`, then refined until no partition holds more than
 128 leaves, because a regional store's leaves cluster (the 2,959-leaf
 California store's 64-way split held 1,050 in one) — fired one `mode="sweep"`
-invoke per non-empty partition, awaited on their `sweep_stats_<ts>_p<i>of<n>.json`
-records at the store root, and then finished by a partition-less invoke
-awaited on its own record; a run of at most 128 leaves is the one pass it
+invoke per non-empty partition, awaited on the copy of each one's record it
+drops as `families-p<i>of<n>.json` under the run's status prefix
+(`<store>.status/run-<run_id>/`; the `sweep_stats_<ts>_p<i>of<n>.json` at the
+store root still lands), and then finished by a partition-less invoke
+awaited on its own `families-finisher.json`; a run of at most 128 leaves is the one pass it
 always was. The outcome rides the run summary and the `zagg.client` handle as
 `families_sweep: {partitions, fired, landed, finisher}`, with `finisher`
 `"ok"`, `"records_short"` (a partition's record never landed) or

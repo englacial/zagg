@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 
 logger = logging.getLogger(__name__)
@@ -448,7 +447,6 @@ def await_records(
     timeout_s: float,
     interval_s: float,
     ignore=frozenset(),
-    key=None,
 ) -> tuple:
     """Poll until every expected record lands, or the budget runs out.
 
@@ -459,11 +457,6 @@ def await_records(
     after a dispatcher died mid-fan-out — would otherwise let every barrier
     pass instantly on the previous attempt's records, dropping the tuple
     ordering the byte-identity acceptance rests on.
-
-    ``key`` maps a listed basename to the name it is awaited under, or
-    ``None`` to ignore it (default: the basename itself). The families pass's
-    records carry a write-time timestamp the dispatcher cannot predict, so
-    they are awaited by their partition tag (:func:`run_families_sweep_fleet`).
 
     Returns ``(seen, timed_out)``. The SOFT barrier: a timeout is logged
     loudly and returned, never raised — the next tuple folding over a node
@@ -502,8 +495,7 @@ def await_records(
         names, listed_ok = _present(records_from, store_kwargs)
         if listed_ok:
             listed_ever, faults = True, 0
-            fresh = names - stale
-            seen = ({key(n) for n in fresh} - {None} if key else fresh) & expected
+            seen = (names - stale) & expected
         else:
             faults += 1
             if faults >= _LIST_FAULT_LIMIT:
@@ -961,18 +953,21 @@ def run_stage_sweep_fleet(
     return summary
 
 
-#: A families-pass record at the store root — ``sweep_stats_{ts}.json``, or
-#: ``sweep_stats_{ts}_p{index}of{of}.json`` from a partition
-#: (:func:`zagg.sweep._write_sweep_record`). The staged finisher's
-#: ``_stages`` record does not match.
-_FAMILIES_RECORD = re.compile(r"sweep_stats_\d{8}T\d{6}Z(?:_(p\d+of\d+))?\.json")
-#: What an unpartitioned families record is awaited as.
-FAMILIES_FINISHER = "finisher"
+def families_record_name(partition) -> str:
+    """One families invoke's status record basename (issue #610).
 
-
-def _families_record_key(name: str):
-    match = _FAMILIES_RECORD.fullmatch(name)
-    return None if match is None else (match.group(1) or FAMILIES_FINISHER)
+    ``families-p{index}of{of}.json`` for a partition's ``{"index", "of"}``
+    block, ``families-finisher.json`` for ``None`` — the finisher, and the
+    single pass of a run of at most the target. Deterministic like
+    :func:`zagg.sweep_stages.stage_record_name`: the dispatcher names every
+    object it will poll for before it fires, so the barrier needs no pattern
+    and no timestamp. The worker PUTs it under the run's status prefix
+    (``run_sweep(status_record=...)``), a copy of its store-root
+    ``sweep_stats_*.json`` record.
+    """
+    if partition is None:
+        return "families-finisher.json"
+    return f"families-p{int(partition['index'])}of{int(partition['of'])}.json"
 
 
 def run_families_sweep_fleet(
@@ -983,6 +978,7 @@ def run_families_sweep_fleet(
     *,
     output_creds_event=None,
     store_kwargs: dict | None = None,
+    run_id: str | None = None,
     target: int | None = None,
     barrier_timeout_s: float = DEFAULT_BARRIER_TIMEOUT_S,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
@@ -995,25 +991,33 @@ def run_families_sweep_fleet(
     record and a handle that returned success (the 2,726-leaf California
     tail). Here the split is sized from the leaves
     (:func:`zagg.sweep_partition.families_partitions`), one Event invoke per
-    non-empty partition is fired, their store-root records are awaited, then
-    the finisher — the partition-less pass that owes the coarse levels, the
-    root ``coverage.moc`` and its sibling — is fired and its record awaited.
-    A work set of at most ``target`` leaves is one pass and one barrier.
+    non-empty partition is fired, their records are awaited, then the
+    finisher — the partition-less pass that owes the coarse levels, the root
+    ``coverage.moc`` and its sibling — is fired and its record awaited. A
+    work set of at most ``target`` leaves is one pass and one barrier.
 
-    The barrier is the staged sweep's poller (:func:`await_records`) pointed
-    at the STORE ROOT, where the families records land, keyed on each
-    record's partition tag since its timestamp is the worker's. Records
-    standing before each fan-out fires are ignored, so an earlier pass's
-    records cannot satisfy this one's. Like the staged seam this never
-    writes (D8) and is fail-open (D9): a lost invoke costs one later
-    ``python -m zagg.sweep`` pass, never a wrong answer — but it is REPORTED,
-    never swallowed: ``{"partitions", "fired", "landed", "finisher"}``, where
+    The barrier is the staged sweep's poller (:func:`await_records`) on the
+    run's status prefix (``run_status_prefix(store_path, run_id)``), the one
+    the dispatcher already reads: every event carries it as
+    ``records_from``, and each worker PUTs a copy of its sweep record there
+    under :func:`families_record_name`. Records standing there before the
+    first fan-out fires are ignored, so a re-driven run's earlier records
+    cannot satisfy this one's barriers; if that one LIST fails, nothing is
+    ignored and the barrier's own LIST-fault posture reports the fault. Like
+    the staged seam this never writes (D8) and is fail-open (D9): a lost
+    invoke costs one later ``python -m zagg.sweep`` pass, never a wrong
+    answer — but it is REPORTED, never swallowed: ``{"partitions", "fired",
+    "landed", "finisher", "run_id", "records_from", "duration_s"}``, where
     ``finisher`` is ``"ok"`` (every record landed), ``"records_short"`` (the
     finisher's landed but a partition's did not — it folded from what was
     there) or ``"timed_out"`` (the finisher's own record never landed: the
     root section is whatever stood before). Anything but ``"ok"`` is also a
     warning.
     """
+    import uuid
+    from datetime import datetime, timezone
+
+    from zagg.client_transport import run_status_prefix
     from zagg.runner import _build_sweep_event
     from zagg.sweep_partition import families_partitions, partition_leaves
 
@@ -1021,50 +1025,61 @@ def run_families_sweep_fleet(
     store_kwargs = dict(store_kwargs or {})
     leaves = [tuple(r) if isinstance(r, (tuple, list)) else (r, None) for r in leaves]
     n = families_partitions(leaves, **({} if target is None else {"target": int(target)}))
+    run_id = run_id or (
+        f"families-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
+    )
+    records_from = run_status_prefix(store_path, run_id)
 
     def _fire(bucket, partition) -> None:
+        event = _build_sweep_event(
+            store_path, bucket, output_creds_event, partition, records_from=records_from
+        )
         lambda_client.invoke(
-            FunctionName=function_name,
-            InvocationType="Event",
-            Payload=json.dumps(
-                _build_sweep_event(store_path, bucket, output_creds_event, partition)
-            ),
+            FunctionName=function_name, InvocationType="Event", Payload=json.dumps(event)
         )
 
-    def _barrier(expected: set) -> tuple:
-        # Captured right before the fan-out: nothing standing counts.
-        stale, _listed = _present(store_path, store_kwargs)
-        return stale, (
-            lambda: await_records(
-                store_path,
-                expected,
-                store_kwargs=store_kwargs,
-                timeout_s=barrier_timeout_s,
-                interval_s=poll_interval_s,
-                ignore=stale,
-                key=_families_record_key,
-            )
+    def _wait(expected: set) -> set:
+        seen, _timed_out = await_records(
+            records_from,
+            expected,
+            store_kwargs=store_kwargs,
+            timeout_s=barrier_timeout_s,
+            interval_s=poll_interval_s,
+            ignore=stale,
         )
+        return seen
 
-    summary: dict = {"partitions": n, "fired": 0, "landed": 0, "finisher": None}
+    # ONE capture before the first fan-out: nothing standing counts. A failed
+    # LIST is not an empty prefix; it is logged, and the barrier reports it.
+    stale, listed = _present(records_from, store_kwargs)
+    if not listed:
+        logger.warning(
+            f"families sweep: cannot capture the records already under {records_from}; "
+            f"none is ignored"
+        )
+    summary: dict = {
+        "partitions": n,
+        "fired": 0,
+        "landed": 0,
+        "finisher": None,
+        "run_id": run_id,
+        "records_from": records_from,
+    }
+    finisher = {families_record_name(None)}
     if n == 1:
-        _stale, wait = _barrier({FAMILIES_FINISHER})
         _fire(leaves, None)
         summary["fired"] = 1
-        seen, _timed_out = wait()
-        summary["landed"] = len(seen)
-        summary["finisher"] = "ok" if seen else "timed_out"
+        summary["landed"] = len(_wait(finisher))
+        summary["finisher"] = "ok" if summary["landed"] else "timed_out"
     else:
         buckets = partition_leaves(leaves, n)
-        _stale, wait = _barrier({f"p{i}of{n}" for i in buckets})
         for index, bucket in buckets.items():
             _fire(bucket, {"index": index, "of": n})
-        summary["fired"] = len(buckets)
-        seen, _timed_out = wait()
+            summary["fired"] += 1
+        seen = _wait({families_record_name({"index": i, "of": n}) for i in buckets})
         summary["landed"] = len(seen)
-        _stale, wait = _barrier({FAMILIES_FINISHER})
         _fire(leaves, None)
-        landed, _timed_out = wait()
+        landed = _wait(finisher)
         summary["finisher"] = (
             "timed_out" if not landed else "records_short" if len(seen) < len(buckets) else "ok"
         )

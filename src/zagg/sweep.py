@@ -821,6 +821,7 @@ def run_sweep(
     store_kwargs: dict | None = None,
     record: bool = True,
     partition=None,
+    status_record: tuple[str, str] | None = None,
 ) -> dict:
     """One sweep pass: fold leaf artifacts up-tree for each family (D22).
 
@@ -858,6 +859,11 @@ def run_sweep(
 
     Unless ``record=False``, the summary is also PUT at the store root as the
     sweep's own run record (:func:`_write_sweep_record`, fail-open).
+    ``status_record`` (issue #610) is ``(records_from, name)``: the same bytes
+    are then also PUT as ``name`` under ``records_from`` — the run's status
+    prefix, where the fleet's families barrier awaits them — fail-open the
+    same way, and ``summary["status_record"]`` names the copy (``None`` if it
+    failed).
 
     One store handle per pass (issue #610): the JSON-rollup families
     (``stats``, ``moc``, ``submap``) and the temporal route read every leaf
@@ -924,11 +930,11 @@ def run_sweep(
         summary["families"][fam.name] = result
     summary["duration_s"] = time.perf_counter() - t0
     if record:
-        summary["record"] = _write_sweep_record(store, summary)
+        summary["record"] = _write_sweep_record(store, summary, status_record, store_kwargs)
     return summary
 
 
-def _write_sweep_record(store, summary: dict) -> str | None:
+def _write_sweep_record(store, summary: dict, status_record=None, store_kwargs=None) -> str | None:
     """PUT the sweep's run record at the store root; its key, or ``None`` (#353).
 
     The return is deliberately the bare store-root-relative key, NOT the joined
@@ -952,20 +958,35 @@ def _write_sweep_record(store, summary: dict) -> str | None:
     overwrites the first — acceptable for telemetry, which this is: fail-open
     (one warning, ``None``), never truth, exactly like every other sweep
     artifact (D9).
+
+    ``status_record`` is :func:`run_sweep`'s ``(records_from, name)``: after
+    the root PUT, the same bytes go to ``name`` under ``records_from``, and
+    ``summary["status_record"]`` is set to the joined path or ``None``.
     """
     from datetime import datetime, timezone
 
-    from zagg.store import put_object
+    from zagg.store import open_object_store, put_object
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     part = summary.get("partition")
     tag = "" if part is None else f"_p{part['index']}of{part['of']}"
     key = f"sweep_stats_{ts}{tag}.json"
+    body = json.dumps({"spec": SWEEP_SPEC, **summary}, indent=1).encode()
     try:
-        put_object(store, key, json.dumps({"spec": SWEEP_SPEC, **summary}, indent=1).encode())
+        put_object(store, key, body)
     except Exception as e:
         logger.warning(f"sweep: run record write failed (fail-open, D9 — telemetry): {e}")
-        return None
+        key = None
+    if status_record is not None:
+        # Written even when the root PUT failed: the pass DID complete, and
+        # this copy is what the dispatcher's barrier waits on.
+        records_from, name = status_record
+        summary["status_record"] = f"{records_from}/{name}"
+        try:
+            put_object(open_object_store(records_from, **(store_kwargs or {})), name, body)
+        except Exception as e:
+            logger.warning(f"sweep: status record write failed (fail-open, D9): {e}")
+            summary["status_record"] = None
     return key
 
 

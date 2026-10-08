@@ -1379,6 +1379,7 @@ class Run:
                         leaves,
                         output_creds_event=output_creds_event,
                         store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
+                        run_id=run_id,
                     )
                 # Post-fleet STAGED chaining (issues #384/#519, here #588) —
                 # the same opt-in and the same seam as ``_run_lambda``'s
