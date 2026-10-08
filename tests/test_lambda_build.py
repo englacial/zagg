@@ -209,12 +209,26 @@ class TestFunctionRequirements:
         here by name, so the worker's pins cannot silently fall behind what the
         suite ran. uv.lock is gitignored (since the repo's 2026-01-13 template),
         so where no lock exists -- CI today -- there is nothing to compare
-        against and the check is skipped, not faked.
+        against and the check is skipped, not faked; the skip reason still names
+        each pin the running env does not match, so a lock-less run shows which
+        pins the suite did not exercise.
         """
         import sys
+        from importlib.metadata import PackageNotFoundError, version
 
         if not (REPO_ROOT / "uv.lock").exists():
-            pytest.skip("no uv.lock in the checkout -- lock parity only runs where one exists")
+            gaps = []
+            for name, pin in self._pins(self.REQUIREMENTS.read_text()).items():
+                try:
+                    installed = version(name)
+                except PackageNotFoundError:
+                    installed = "not installed"
+                if installed != pin:
+                    gaps.append(f"{name}: {pin} vs {installed}")
+            pytest.skip(
+                "no uv.lock in the checkout -- lock parity only runs where one exists; "
+                f"pins this env does not run (pin vs installed): {gaps or 'none'}"
+            )
         run = subprocess.run(
             [sys.executable, str(self.GENERATOR), str(tmp_path)],
             capture_output=True,
