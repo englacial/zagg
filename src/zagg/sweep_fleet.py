@@ -34,10 +34,11 @@ The shape, per tuple, finest first:
    manifest actuals, ``aggregation.yaml`` touch, lease release.
 
 Why the split across invokes is free: dispatch nodes at one order own disjoint
-subtrees, and a tuple's folds read only columns one tuple FINER (a stage
-worker reads its children once at ``child_order`` and folds every order in the
-tuple from those same readers). Grouping is therefore a dispatch knob, never
-grammar — the merge-source law (espg ruling 2026-08-09, issue #384) — and the
+subtrees, and a tuple's folds read only what one tuple FINER wrote (the child
+columns for a gather, the children's artifacts for the tuple's finest merge;
+its coarser merges fold the levels the worker has just folded). Grouping is
+therefore a dispatch knob, never grammar — the cascade (issue #620): a merge
+folds its four children's artifacts, so grouping changes no values — and the
 fleet-built ladder is byte-identical to the CLI-built one on the same store.
 
 Dispatch nodes come from the WORK SET the dispatcher holds, not from the

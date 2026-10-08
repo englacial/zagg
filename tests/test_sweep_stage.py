@@ -896,8 +896,9 @@ class TestLocatedStageSweep:
 
         m = _stage_store(tmp_path / "s", fields=LOCATED_FIELDS)
         _sweep(tmp_path / "s", m)
-        # The root merge over node '1' folds the three '1***' leaves' relay
-        # partials into one cell; every output word must contain its sources'.
+        # The root merge over node '1' folds its children's artifacts, over
+        # the three '1***' leaves, into one cell; every output word must
+        # contain its sources'.
         merged = self._words(_artifact(tmp_path / "s", "1/all.zarr"), 1)[0][1]
         sources = []
         for dec in ("1111", "1112", "1121"):
@@ -1055,8 +1056,8 @@ class TestBothChannelsStageSweep:
         )
 
     def test_the_merge_satisfies_both_containment_claims(self, tmp_path):
-        # The root merge folds the three '1***' leaves' relay partials into one
-        # cell. Its located words must ENCLOSE their sources' (§9.1) and its toc
+        # The root merge folds its children's artifacts, over the three '1***'
+        # leaves, into one cell. Its located words must ENCLOSE their sources' (§9.1) and its toc
         # words must COVER their sources' instants (§8.3) — one partition, two
         # claims, and neither holds for the other channel's bytes.
         from mortie import common_ancestor
