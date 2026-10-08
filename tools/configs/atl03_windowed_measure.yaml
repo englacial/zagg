@@ -267,7 +267,7 @@ output:
     units: seconds
   sweep: stages                  # the staged sweep: per-window columns + overviews, the ladder
   pyramid:
-    overviews: 13                # the live store's dense ladder (tools/redeclare_dense_ladder.py)
+    overviews: 13                # the live v3 store's dense ladder, declared at init
     all_time: true               # the all-time overview pyramid: one close unit per node,
                                  # merging the node's per-window overviews (issue #586
                                  # phase 4). The default at the flip (phase 6), so the
