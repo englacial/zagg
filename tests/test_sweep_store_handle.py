@@ -45,18 +45,24 @@ def _decimals(n: int) -> list[str]:
 
 
 def _store(tmp_path, n: int) -> tuple[str, list]:
-    """The temporal fixture with its leaf cloned to ``n`` shards, each with every family's artifact."""
+    """The temporal fixture with its leaf cloned to ``n`` shards, each with every family's artifact.
+
+    Every other leaf loses its ``temporal.toc`` record, so the temporal pass
+    takes both routes: the record route and the raw route.
+    """
     root = tmp_path / "store"
     shutil.copytree(FIXTURE, root)
     for name in ("coverage.moc", "coverage.toc"):
         (root / name).unlink()
     source = Path(shard_leaf_path(str(root), morton_word(SHARD)))
     leaves = []
-    for decimal in _decimals(n):
+    for i, decimal in enumerate(_decimals(n)):
         word = morton_word(decimal)
         leaf = shard_leaf_path(str(root), word)
         if Path(leaf) != source:
             shutil.copytree(source, leaf)
+        if i % 2:
+            (Path(leaf) / "temporal.toc").unlink()  # the raw route
         write_sidecar(
             leaf,
             build_record(
@@ -79,11 +85,31 @@ def _store(tmp_path, n: int) -> tuple[str, list]:
 
 
 def _counting(monkeypatch) -> list:
-    """Every store construction the pass makes, by path, whichever factory built it."""
+    """Every store construction the pass makes, by path, whichever factory built it.
+
+    Counted at the factories and at the constructors under them, so a client
+    built directly — a ``LocalStore(...)``, or ``zarr.open_group`` on a
+    string path — is seen too (the local stand-in for one S3 client).
+    """
+    import obstore.store
+    import zarr.storage
+
     import zagg.hive as hive
     import zagg.store as store_mod
 
     opened = []
+    real_init = zarr.storage.LocalStore.__init__
+
+    def zarr_local(self, root, *a, **k):
+        opened.append(("zarr-local", str(root)))
+        real_init(self, root, *a, **k)
+
+    def object_local(self, prefix=None, *a, **k):
+        # obstore builds in ``__new__``; ``__init__`` only observes.
+        opened.append(("object-local", str(prefix)))
+
+    monkeypatch.setattr(zarr.storage.LocalStore, "__init__", zarr_local)
+    monkeypatch.setattr(obstore.store.LocalStore, "__init__", object_local)
     real_object, real_store = store_mod.open_object_store, store_mod.open_store
 
     def object_store(path, *a, **k):
@@ -111,7 +137,7 @@ class TestOneHandlePerPass:
             assert summary["families"][family]["failed"] == 0
             assert summary["families"][family]["empty"] == 0
         assert summary["families"]["moc"]["temporal_shards"] == n
-        assert summary["families"]["moc"]["temporal_routes"] == {"records": n, "raw": 0}
+        assert summary["families"]["moc"]["temporal_routes"] == {"records": n // 2, "raw": n // 2}
         monkeypatch.undo()
         return opened
 
@@ -128,7 +154,8 @@ class TestOneHandlePerPass:
         assert len(few) == len(many)
         assert {Path(p).name for _k, p in many} == {"store"}  # the root, never a leaf
         # Not by a leaf's path, and not by a leaf's zarr store either.
-        assert not [p for k, p in many if k == "zarr"]
+        assert not [p for k, p in many if k.startswith("zarr")]
+        assert ("object-local", str(tmp_path / "16" / "store")) in many  # the counter is live
 
     def test_the_readers_agree_with_their_path_form(self, tmp_path):
         """The relative-key reads return what the absolute-path wrappers return."""
