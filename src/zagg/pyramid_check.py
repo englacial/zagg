@@ -674,7 +674,8 @@ def main(argv=None) -> int:
         type=int,
         default=8,
         help="Concurrent reads for the independent legs — node/leaf probes and "
-        "sampled-cell reads (default: 8; 1 = sequential)",
+        "sampled-cell reads; the coordinates and records legs stay sequential "
+        "(default: 8; 1 = sequential)",
     )
     args = parser.parse_args(argv)
     if args.workers < 1:

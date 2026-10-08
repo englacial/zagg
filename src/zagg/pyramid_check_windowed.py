@@ -247,9 +247,10 @@ def validate_windowed(
 ) -> dict:
     """The windowed ``/2`` checklist spine; called with the shared prologue done.
 
-    ``workers`` is the read concurrency of every independent leg here — the
-    roster listing, the (node, window) and (leaf, window) probes, the
-    per-cell value reads and the all-time fold — as in the unwindowed arms.
+    ``workers`` is the read concurrency of the pooled legs — the ``--roster
+    moc`` shard listing, the (node, window) and (leaf, window) probes, the
+    per-cell value reads and the all-time fold — as in the unwindowed arms;
+    ``coordinates``, ``records`` and the roster cross-check stay sequential.
     """
     from zagg.pyramid_check_v2 import _declaration_grammar, _restage_check
 
