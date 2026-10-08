@@ -145,6 +145,31 @@ class TestComposedFinisher:
         assert "obs_total" in summary["finisher"]["fallback"]
         assert summary["families"]["moc"]["temporal_shards"] == 16
 
+    def test_a_failed_record_get_falls_back(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import obstore.exceptions
+
+        import zagg.hive as hive
+
+        root, leaves = _store(tmp_path / "fan", 16)
+        names = _fan_out(root, leaves)
+
+        read_json = hive._read_json
+
+        def throttled(store, key, *a, **k):
+            if key in names:  # the status-prefix records only, not the manifest
+                raise obstore.exceptions.GenericError("503 slow down")  # not a ValueError
+            return read_json(store, key, *a, **k)
+
+        monkeypatch.setattr(hive, "_read_json", throttled)
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep"):
+            summary = run_sweep(root, leaves, families=FAMILIES, finisher=_finisher(root, names))
+        monkeypatch.undo()
+        assert summary["finisher"]["fallback"] == "503 slow down"
+        assert "reading the leaves instead" in caplog.text
+        assert summary["families"]["moc"]["temporal_shards"] == 16
+
     def test_a_shard_no_partition_visited_falls_back(self, tmp_path):
         from zagg.grids.morton import morton_word
 

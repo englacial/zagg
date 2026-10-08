@@ -1066,7 +1066,9 @@ def _load_finisher(finisher, fams, by_shard, shard_order, store_kwargs) -> tuple
             if missing and any(isinstance(b, dict) for b in blocks):
                 raise ValueError(f"{len(missing)} shard(s) in the work set no partition visited")
             fam.load_accumulators(blocks)
-    except (KeyError, TypeError, ValueError) as e:
+    except Exception as e:
+        # Any failure — a throttled GET on the prefix, a malformed block —
+        # lands here: the fallback (the leaf walk) IS the handling.
         logger.warning(
             f"sweep: finisher cannot compose from {len(keys)} partition record(s) ({e}) — "
             f"reading the leaves instead (issue #610)"
