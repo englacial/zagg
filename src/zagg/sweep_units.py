@@ -320,7 +320,7 @@ def close_node(
             rows = [row]
             missing = sum(1 for reader in row if reader is None)
             fresh_gen = _summed_generation(rows)
-            entry = _artifact_entry(store_root, target, basename, run_id, run_started, store_kwargs)
+            entry = _artifact_entry(store, target, basename, run_id, run_started)
             if (
                 entry is not None
                 and generation_key(entry.get("generation")) == generation_key(fresh_gen)

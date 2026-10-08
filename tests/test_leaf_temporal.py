@@ -1040,19 +1040,20 @@ class TestSweepRoute:
         ``raw`` would report an uncounted leaf where there is nothing to
         count.
         """
+        from zagg.store import open_object_store
         from zagg.sweep import MocFamily
 
         root = _fixture_copy(tmp_path)
-        leaf = _leaf_of(root)
+        store, leaf = open_object_store(root), _leaf_of("").lstrip("/")
         empty = MocFamily()
         monkeypatch.setattr(leaf_temporal, "leaf_contribution", lambda *_a, **_k: (None, "raw"))
-        empty._accumulate_temporal(root, SHARD, leaf, {})
+        empty._accumulate_temporal(store, SHARD, leaf)
         assert empty._temporal_routes == {"record": 0, "raw": 0}
         assert empty._temporal == {} and empty._temporal_uncounted == set()
         # A leaf that does contribute is counted under the route it took.
         monkeypatch.undo()
         family = MocFamily()
-        family._accumulate_temporal(root, SHARD, leaf, {})
+        family._accumulate_temporal(store, SHARD, leaf)
         assert family._temporal_routes == {"record": 1, "raw": 0}
         assert list(family._temporal) == [SHARD] and family._temporal_uncounted == set()
 
