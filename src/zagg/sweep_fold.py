@@ -1,8 +1,9 @@
 """The chunk-streamed fold kernels (issue #586 phase 4; kernels from issue #384).
 
-:mod:`zagg.sweep_stage` owns one stage worker — the planner, the column
-reader, the writers; :mod:`zagg.sweep_overview` the ``/1`` retrofit sweep.
-This module owns the fold kernels BOTH run, in the form the 2026-09-26
+:mod:`zagg.sweep_stage` owns one stage worker — the planner and the
+writers; :mod:`zagg.sweep_overview` the ``/1`` retrofit sweep. This module
+owns the fold kernels BOTH run and the sources they fold from (the
+stamp-validated column and artifact readers), in the form the 2026-09-26
 amendment on issue #586 ruled: **block by block over the output range**.
 Every output cell's fold is independent — a gather assigns a child's span, a
 cascade k-way merges the children's cells that fold into it — so a level is
@@ -62,11 +63,379 @@ class ColumnMovedError(ValueError):
     A streamed fold reads a member block by block, so a rewrite landing
     between two blocks would hand it half of each write. The reader pins the
     stamp its first served read validated under
-    (:class:`zagg.sweep_stage._ColumnReader`); a later read under another
+    (:class:`_ColumnReader`); a later read under another
     stamp, or under none (a rewrite in flight), raises this instead of
     serving data. The ARTIFACT being folded is then folded again from fresh
     readers (:func:`refold_on_move`), never patched.
     """
+
+
+# ---------------------------------------------------------------------------
+# The fold's sources: stamp-validated readers over child columns and ladder
+# artifacts, and the levels a unit has just folded.
+# ---------------------------------------------------------------------------
+
+
+#: Row marker for a candidate child whose column could not be READ (open or
+#: root-metadata fault) — distinct from ``None`` (no committed column at all,
+#: i.e. missing): the two land in different ``source_children`` counters, and
+#: a log line in an exited process cannot make that distinction for a reader.
+UNREADABLE = object()
+
+
+def _is_reader(entry) -> bool:
+    return isinstance(entry, _ColumnReader)
+
+
+class ForeignSweepError(RuntimeError):
+    """A foreign run's FRESH stamp was seen mid-run: two sweeps are live.
+
+    The lease (:mod:`zagg.sweep_lease`) makes this unreachable in normal
+    operation; reaching it means a residual race (TTL-expiry clock skew, a
+    zombie worker from a crashed run) — abort loudly, never fold through it.
+    """
+
+
+def _same_stamp(a: dict | None, b: dict | None) -> bool:
+    """Whether two commit-stamp reads witness the same write."""
+    return (a or None) == (b or None)
+
+
+def _foreign_fresh(stamp: dict | None, run_id: str, run_started: str) -> bool:
+    """A stage stamp from ANOTHER run, written since this run started.
+
+    Fleet stamps carry no ``run_id`` and are never foreign (fleet ∥ sweep is
+    allowed by the concurrency matrix); a foreign STAGE stamp older than this
+    run is a completed prior sweep — ordinary input, not a conflict. The
+    comparison is STRICT: stamps resolve to whole seconds, so a prior run
+    that completed in the second this run started would otherwise read as
+    live. A true same-second race escapes the backstop — admission is the
+    LEASE's job; this predicate only has to catch the long-lived residuals
+    (zombie workers, TTL clock skew), which keep writing well past our start.
+    """
+    if not isinstance(stamp, dict):
+        return False
+    rid = stamp.get("run_id")
+    return rid is not None and rid != run_id and str(stamp.get("written_at") or "") > run_started
+
+
+class _ColumnReader:
+    """Stamp-validated reads over one child column (leaf or stage).
+
+    One root-metadata GET serves the D4 stamp gate, the provenance attrs, and
+    the generation basis together. Every group read is bracketed by the
+    **optimistic stamp validation** the lease ruling requires: stamp before,
+    read, stamp after — if the stamp moved (a fleet worker rewrote the leaf
+    mid-read, the allowed fleet ∥ sweep regime), the read retries against the
+    fresh stamp — but only until the reader has SERVED a read. The first
+    served read pins its stamp: the fold reads a member block by block (issue
+    #586 phase 4), so after that a moved stamp, or a vanished one (a rewrite
+    in flight), raises :class:`zagg.sweep_fold.ColumnMovedError` rather than
+    hand the fold half of each write, and a stamp that keeps moving raises it
+    too. The caller folds the artifact again from fresh readers. A stage
+    column stamped by a foreign run SINCE this run started raises
+    :class:`ForeignSweepError` (two live sweeps — the lease backstop).
+
+    Handed ``store`` (the invoke's obstore handle at the store root), ``path``
+    is the column's key RELATIVE to it and no client is built (issue #610);
+    without it, ``path`` is absolute and opened on its own.
+    """
+
+    def __init__(self, path: str, *, run_id: str, run_started: str, store_kwargs: dict, store=None):
+        from zarr.storage import StorePath
+
+        from zagg.store import open_store, zarr_view
+
+        self.path = path
+        self.revalidated = 0
+        self._served = False  # whether a read was handed out (pins self.stamp)
+        self._run_id, self._run_started = run_id, run_started
+        if store is None:
+            self._store = open_store(path, read_only=True, **store_kwargs)
+        else:
+            self._store = StorePath(zarr_view(store), path)
+        self._arrays: dict = {}
+        self.stamp, self.attrs = self._root()
+        self._foreign_guard(self.stamp)
+
+    def _foreign_guard(self, stamp: dict | None) -> None:
+        if _foreign_fresh(stamp, self._run_id, self._run_started):
+            raise ForeignSweepError(
+                f"column {self.path} carries a fresh stamp from foreign sweep run "
+                f"{stamp.get('run_id')!r} (written {stamp.get('written_at')}); "
+                f"two sweeps are live on this store — aborting (lease backstop)"
+            )
+
+    def _root(self) -> tuple[dict | None, dict]:
+        """Root attrs + stamp; absent reads ``(None, {})``, corrupt RAISES.
+
+        The distinction feeds ``source_children``: a cleanly absent column is
+        ``missing`` (never generated, or a fleet still in flight); a column
+        whose root metadata exists but cannot be read is ``unreadable``
+        (review finding — the two must not launder into one counter).
+        """
+        import zarr
+        from zarr.errors import GroupNotFoundError
+
+        from zagg.hive import COMMIT_ATTR
+
+        try:
+            attrs = dict(zarr.open_group(self._store, path="", mode="r", zarr_format=3).attrs)
+        except (FileNotFoundError, GroupNotFoundError):
+            return None, {}
+        stamp = attrs.get(COMMIT_ATTR)
+        return (dict(stamp) if isinstance(stamp, dict) else None), attrs
+
+    @property
+    def committed(self) -> bool:
+        return self.stamp is not None
+
+    def generation(self) -> tuple:
+        """This column's generation basis: its own, or the leaf identity.
+
+        :func:`zagg.column.stamped_generation_key`'s triple: a stage column's
+        recorded ``generation`` block (the summed ratchet) or a leaf column's
+        identity — one leaf at its stamp's timestamp — plus the run id THIS
+        column's own stamp carries (fleet-written ones carry none, review
+        finding). The parent's skip gate keys on the SUM of these.
+        """
+        from zagg.column import COLUMN_ATTR, stamped_generation_key
+
+        block = (self.attrs.get(COLUMN_ATTR) or {}).get("generation")
+        return stamped_generation_key(block, self.stamp)
+
+    def _array(self, res: int, name: str):
+        """The member's open array, or ``None`` when it is absent.
+
+        Handles are kept for the reader's life so a member read block by block
+        (issue #586 phase 4) pays its metadata opens once; absence is never
+        cached, and a moved stamp drops every handle (:meth:`_read`).
+        """
+        import zarr
+        from zarr.errors import GroupNotFoundError
+
+        key = (int(res), name)
+        if key not in self._arrays:
+            try:
+                group = zarr.open_group(self._store, path=str(res), mode="r", zarr_format=3)
+                self._arrays[key] = group[name]
+            except (KeyError, FileNotFoundError, GroupNotFoundError):
+                return None  # the member postdates this column: fill
+        return self._arrays[key]
+
+    def has(self, res: int, name: str) -> bool:
+        """Whether the column carries ``{res}/{name}`` (metadata only)."""
+        return self._array(res, name) is not None
+
+    def _read(self, res: int, name: str, cells: slice) -> np.ndarray | None:
+        for _attempt in range(3):
+            before = self.stamp
+            array = self._array(res, name)
+            values = None if array is None else array[cells]
+            after, attrs = self._root()
+            if after is not None and _same_stamp(before, after):
+                self._served = True
+                return values
+            self._foreign_guard(after)
+            if self._served:
+                raise ColumnMovedError(
+                    f"column {self.path} was rewritten after this fold read from it "
+                    f"(stamp {'gone' if after is None else 'moved'})"
+                )
+            logger.info(f"stage sweep: column {self.path} moved mid-read; re-reading")
+            self.stamp, self.attrs = after, attrs
+            self._arrays.clear()
+            self.revalidated += 1
+        raise ColumnMovedError(f"column {self.path} stamp kept moving across re-reads")
+
+    def read(self, res: int, name: str) -> np.ndarray | None:
+        """One group array, stamp-validated; ``None`` for an absent member.
+
+        An absent FIELD or an absent GROUP both read ``None`` — schema (or
+        declaration) evolution: the member postdates this column, and its
+        cells contribute fill until the leaf re-runs (review finding: a
+        deepened ``overviews`` declaration over existing columns must
+        under-cover, never abort the sweep). Every re-read re-runs the
+        foreign-fresh guard: a column rewritten mid-read by a FOREIGN sweep
+        is the exact race the backstop exists for (review finding).
+        """
+        return self._read(res, name, slice(None))
+
+    def read_range(self, res: int, name: str, start: int, stop: int) -> np.ndarray | None:
+        """Cells ``[start, stop)`` of one group array — :meth:`read`, for a block.
+
+        What the chunk-streamed fold reads (:mod:`zagg.sweep_fold`): only the
+        chunk objects covering the range are fetched, under the same stamp
+        validation and foreign-fresh guard as a whole-member read.
+        """
+        return self._read(res, name, slice(int(start), int(stop)))
+
+
+class _OverviewReader(_ColumnReader):
+    """Stamp-validated reads over one ladder overview — a cascade's source.
+
+    Everything :class:`_ColumnReader` gives a child column — one root GET for
+    stamp + attrs, optimistic re-validation around every read, the
+    foreign-fresh abort — over a ``zagg-overview/2`` artifact, whose
+    generation block and fold depth live in its own attrs key. What a merge
+    level folds (its children's artifacts at the next finer level) and what
+    the all-time fold folds (the node's per-window overviews).
+    """
+
+    @property
+    def provenance(self) -> dict:
+        from zagg.sweep_overview import OVERVIEW_ATTR
+
+        block = self.attrs.get(OVERVIEW_ATTR)
+        return block if isinstance(block, dict) else {}
+
+    def generation(self) -> tuple:
+        from zagg.column import stamped_generation_key
+
+        return stamped_generation_key(self.provenance.get("generation"), self.stamp)
+
+
+class _FoldedSource(_OverviewReader):
+    """A level this unit has just folded, served to the next coarser merge from memory.
+
+    The same reader surface over the fold's slabs, so a ``[2,1,0]`` unit
+    reads its order-3 children's artifacts once and folds order 1 from the
+    order-2 slabs it just wrote, order 0 from order 1's — byte-what a reader
+    opening those artifacts back off the store would serve, since the stamp
+    and attrs are the ones the writer has just recorded.
+    """
+
+    def __init__(self, path: str, res: int, fold: dict, run_id: str):
+        from zagg.sweep_overview import OVERVIEW_ATTR
+
+        self.path, self.revalidated, self.res, self.slabs = path, 0, int(res), fold["slabs"]
+        self.attrs = {
+            OVERVIEW_ATTR: {
+                "generation": fold["generation"],
+                "merges_from_raw": fold["merges_from_raw"],
+            }
+        }
+        self.stamp = {
+            "granule_count": fold["granule_count"],
+            "time_range": fold["time_range"],
+            "run_id": run_id,
+        }
+
+    def _array(self, res: int, name: str):
+        return self.slabs.get(name) if int(res) == self.res else None
+
+    def _read(self, res: int, name: str, cells: slice):
+        array = self._array(res, name)
+        return None if array is None else array[cells]
+
+
+def _readers_for(
+    store,
+    children: list,
+    windows: list,
+    *,
+    run_id: str,
+    run_started: str,
+    store_kwargs: dict,
+    counts: dict,
+) -> dict:
+    """``{child decimal: [reader-or-None per window]}``, stamp-gated.
+
+    An absent or unstamped column reads ``None`` — under-coverage, recorded
+    by the caller (the soft-barrier posture: fold what is on disk, loudly).
+    An unreadable one counts ``failed`` and also reads ``None``. Every column
+    is read through ``store``, the invoke's one handle (issue #610).
+    """
+    from zagg.column import column_name
+    from zagg.sweep import _node_rel
+
+    readers: dict = {}
+    for child in children:
+        row = []
+        for window in windows:
+            path = f"{_node_rel(child)}/{column_name(window)}"
+            try:
+                reader = _ColumnReader(
+                    path,
+                    run_id=run_id,
+                    run_started=run_started,
+                    store_kwargs=store_kwargs,
+                    store=store,
+                )
+            except ForeignSweepError:
+                raise
+            except Exception as e:
+                logger.warning(f"stage sweep: unreadable column {path} ({e})")
+                counts["failed"] += 1
+                row.append(UNREADABLE)
+                continue
+            row.append(reader if reader.committed else None)
+        readers[child] = row
+    return readers
+
+
+def _summed_generation(rows: list) -> dict:
+    """The ratchet key: child generations summed (skip-if-current basis).
+
+    ``run_ids`` is the union over the contributing children — issue #417's
+    term; see :func:`zagg.column.generation_key`.
+    """
+    n, stamps, runs = 0, [], set()
+    for row in rows:
+        for reader in row or ():
+            if _is_reader(reader):
+                count, timestamp, run_ids = reader.generation()
+                n += count
+                stamps.append(timestamp)
+                runs.update(run_ids)
+    stamps = [t for t in stamps if t is not None]
+    return {
+        "n_leaves": int(n),
+        "max_leaf_timestamp": max(stamps) if stamps else None,
+        "run_ids": sorted(runs),
+    }
+
+
+def _dense_rows(readers: dict, node: str, *, depth: int) -> list:
+    """The full rank range of ``node``'s children: reader rows or ``None``."""
+    from zagg.sweep_overview import _rel_rank
+
+    rows: list = [None] * (4**depth)
+    for child, row in readers.items():
+        if child.startswith(node) and len(child) == len(node) + depth:
+            rows[_rel_rank(child, node)] = row
+    return rows
+
+
+def _gather_depth(rows: list, res: int) -> int:
+    """A gather's ``merges_from_raw``: the deepest its source columns record at ``res``.
+
+    A gather copies the child columns' group at ``res`` untouched, so it is at
+    their depth: 1 at or above the raw-fold boundary, 2 below it (issue #538,
+    :func:`zagg.column.member_merges_from_raw`) — every artifact records the
+    depth of what it consumed.
+    """
+    from zagg.column import COLUMN_ATTR
+
+    depths = []
+    for row in rows:
+        for reader in row or ():
+            if _is_reader(reader):
+                groups = (reader.attrs.get(COLUMN_ATTR) or {}).get("groups") or {}
+                depths.append(int((groups.get(str(res)) or {}).get("merges_from_raw") or 1))
+    return max(depths, default=1)
+
+
+def _source_depth(rows: list) -> int:
+    """A merge's ``merges_from_raw``: one more than the deepest source folded."""
+    depths = [
+        int(reader.provenance.get("merges_from_raw") or 1)
+        for row in rows
+        if row is not None
+        for reader in row
+        if isinstance(reader, _OverviewReader)
+    ]
+    return 1 + max(depths, default=1)
 
 
 def refold_on_move(fold, refresh, what: str, *, retry_on=(ColumnMovedError,)):
@@ -75,10 +444,8 @@ def refold_on_move(fold, refresh, what: str, *, retry_on=(ColumnMovedError,)):
     ``refresh`` replaces the artifact's readers with fresh ones, so the second
     attempt reads every source from scratch, each under one stamp. A second
     failure propagates: the caller counts the artifact failed and moves on.
-    :class:`zagg.sweep_stage.ForeignSweepError` always propagates at once.
+    :class:`ForeignSweepError` always propagates at once.
     """
-    from zagg.sweep_stage import ForeignSweepError
-
     try:
         return fold()
     except ForeignSweepError:
@@ -185,8 +552,6 @@ def _source_counts(rows: list, broken=()) -> tuple:
     a clean fold — the counters are what ``source_children`` records, and an
     artifact folded without a contributor must say so (spec §4.5).
     """
-    from zagg.sweep_stage import _is_reader
-
     folded = missing = unreadable = 0
     for i, row in enumerate(rows):
         if row is None:
@@ -219,8 +584,6 @@ def broken_groups(rows: list, fields: dict, *, res: int) -> set:
     streams a single block (:func:`zagg.sweep_stage.write_stage_column` must
     not clear an existing column for a member that folds nothing).
     """
-    from zagg.sweep_stage import _is_reader
-
     broken: set = set()
     for i, row in enumerate(rows):
         reader = row[0] if row is not None else None
@@ -242,7 +605,6 @@ def broken_groups(rows: list, fields: dict, *, res: int) -> set:
 def _gather_block(rows, fields, companions, *, res, span, lo, hi, broken, meter) -> dict:
     """Output cells ``[lo, hi)`` of a gather: each covering child's own range."""
     from zagg.sweep_overview import _empty_slab
-    from zagg.sweep_stage import _is_reader
 
     slabs = {name: _empty_slab(meta, hi - lo) for name, meta in fields.items()}
     for declared in companions.values():
@@ -405,7 +767,6 @@ def _merge_block(
         overview_fold_delta,
         payload_weight,
     )
-    from zagg.sweep_stage import _is_reader
 
     broken, demoted, noted = state["broken"], state["demoted"], state["noted"]
     s_lo, s_hi = lo * factor, hi * factor
@@ -680,7 +1041,7 @@ def cascade_fold(
     src_order)`` cells at resolution ``res_src``, ``4^(res_src - r)``-to-one
     into the node's ``4^(r - k)`` output cells. ``rows`` is that DENSE
     rank-ordered child range (``None`` for an uninhabited child, else
-    ``[reader-or-None]`` — a :class:`zagg.sweep_stage._ColumnReader` over the
+    ``[reader-or-None]`` — a :class:`_ColumnReader` over the
     child's artifact, ``None`` when it is missing, ``UNREADABLE`` when it
     could not be read). Every output cell folds in ONE k-way call over the
     child cells it covers (``merge_tdigests_kway`` is order-independent by

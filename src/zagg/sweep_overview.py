@@ -2222,8 +2222,7 @@ def _cascade_node(
     those attrs BEFORE the commit stamp, so a stamped overview always carries
     them, and anything else at that path is not this fold's input.
     """
-    from zagg.sweep_fold import cascade_fold
-    from zagg.sweep_stage import UNREADABLE, _ColumnReader, _is_reader
+    from zagg.sweep_fold import UNREADABLE, _ColumnReader, _is_reader, cascade_fold
     from zagg.windows import union_time_range
 
     target_order = cell_order - (shard_order - k)
