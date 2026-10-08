@@ -179,18 +179,25 @@ class TestFunctionBuild:
         )
 
 
-class TestFunctionRequirements:
-    """The function zip's deps are pinned from uv.lock, not resolved from floors.
+class TestLockRequirements:
+    """Both zips' deps are pinned from uv.lock, not resolved from floors.
 
-    build_function.sh used to hand pip ``obstore>=0.8.2`` and friends, so the
+    build_function.sh used to hand pip ``obstore>=0.8.2`` and friends, and
+    build_layer.sh bare names (``fastparquet cramjam shapely`` ...), so the
     worker ran whatever PyPI served at build time -- never what pytest ran --
     and the size budget moved with upstream releases (issue #613: a pydantic
     release tripped it with no zagg change). deployment/aws/lock_requirements.py
-    derives function-requirements.txt from the lock; these pin the contract.
+    derives function-requirements.txt and layer-requirements.txt from the lock;
+    these pin the contract.
     """
 
-    REQUIREMENTS = REPO_ROOT / "deployment" / "aws" / "function-requirements.txt"
-    GENERATOR = REPO_ROOT / "deployment" / "aws" / "lock_requirements.py"
+    AWS = REPO_ROOT / "deployment" / "aws"
+    GENERATOR = AWS / "lock_requirements.py"
+    # build script -> the lock-derived file it must install with --no-deps
+    SCRIPTS = {
+        "build_function.sh": "function-requirements.txt",
+        "build_layer.sh": "layer-requirements.txt",
+    }
 
     @staticmethod
     def _pins(text):
@@ -202,11 +209,17 @@ class TestFunctionRequirements:
                 pins[name] = version
         return pins
 
+    def _roots(self, const):
+        """The names in the generator's ``<const> = (...)`` tuple."""
+        m = re.search(rf"^{const} = \((.*?)\)$", self.GENERATOR.read_text(), re.M | re.S)
+        assert m, f"{const} tuple missing from lock_requirements.py"
+        return re.findall(r'"([^"]+)"', m.group(1))
+
     def test_requirements_match_uv_lock(self, tmp_path):
-        """The committed file IS the generator's output for the current uv.lock.
+        """The committed files ARE the generator's output for the current uv.lock.
 
         A lock bump without ``uv run deployment/aws/lock_requirements.py`` fails
-        here by name, so the worker's pins cannot silently fall behind what the
+        here by name, so the zips' pins cannot silently fall behind what the
         suite ran. uv.lock is gitignored (since the repo's 2026-01-13 template),
         so where no lock exists -- CI today -- there is nothing to compare
         against and the check is skipped, not faked; the skip reason still names
@@ -218,13 +231,14 @@ class TestFunctionRequirements:
 
         if not (REPO_ROOT / "uv.lock").exists():
             gaps = []
-            for name, pin in self._pins(self.REQUIREMENTS.read_text()).items():
-                try:
-                    installed = version(name)
-                except PackageNotFoundError:
-                    installed = "not installed"
-                if installed != pin:
-                    gaps.append(f"{name}: {pin} vs {installed}")
+            for name in self.SCRIPTS.values():
+                for dist, pin in self._pins((self.AWS / name).read_text()).items():
+                    try:
+                        installed = version(dist)
+                    except PackageNotFoundError:
+                        installed = "not installed"
+                    if installed != pin:
+                        gaps.append(f"{dist}: {pin} vs {installed}")
             pytest.skip(
                 "no uv.lock in the checkout -- lock parity only runs where one exists; "
                 f"pins this env does not run (pin vs installed): {gaps or 'none'}"
@@ -236,12 +250,12 @@ class TestFunctionRequirements:
             cwd=REPO_ROOT,
         )
         assert run.returncode == 0, f"lock_requirements.py failed: {run.stderr}"
-        generated = (tmp_path / "function-requirements.txt").read_text()
-        assert self.REQUIREMENTS.read_text() == generated, (
-            "deployment/aws/function-requirements.txt is stale against uv.lock -- "
-            "regenerate it with `uv run deployment/aws/lock_requirements.py` in the "
-            "same PR as the lock bump (issue #613)"
-        )
+        for name in self.SCRIPTS.values():
+            assert (self.AWS / name).read_text() == (tmp_path / name).read_text(), (
+                f"deployment/aws/{name} is stale against uv.lock -- regenerate it with "
+                "`uv run deployment/aws/lock_requirements.py` in the same PR as the lock "
+                "bump (issue #613)"
+            )
 
     def test_closure_follows_extras_and_refuses_forks(self):
         """An ``extra`` edge pulls the target's optional deps; a forked name fails loudly.
@@ -282,10 +296,8 @@ class TestFunctionRequirements:
         from packaging.utils import canonicalize_name
         from packaging.version import Version
 
-        pins = self._pins(self.REQUIREMENTS.read_text())
-        roots = re.search(r"^FUNCTION_ROOTS = \((.*?)\)$", self.GENERATOR.read_text(), re.M)
-        assert roots, "FUNCTION_ROOTS tuple missing from lock_requirements.py"
-        roots = re.findall(r'"([^"]+)"', roots.group(1))
+        pins = self._pins((self.AWS / "function-requirements.txt").read_text())
+        roots = self._roots("FUNCTION_ROOTS")
         assert set(roots) == {"obstore", "zarr", "pydantic-zarr", "pyyaml"}
         # packaging parses any spelling (``Zarr >= 3.1.5, <4 ; marker``), so no
         # root's floor can drop out of the check unparsed.
@@ -307,32 +319,66 @@ class TestFunctionRequirements:
                     "the lock (issue #613)"
                 )
 
-    def test_build_script_installs_the_pins_without_resolving(self):
-        """build_function.sh installs zagg and ``-r function-requirements.txt``, both --no-deps.
+    def test_layer_requirements_carry_the_floating_names_only(self):
+        """layer-requirements.txt has every name build_layer.sh used to float, no extra pin.
 
-        The file is only the contract if the script reads it and nothing else: a
-        spec added to either install (any quoting), a third install, or
-        ``--no-deps`` dropped puts pip's resolver back between the lock and the zip.
+        Runs without a lock. The names the ``lambda`` extra pins exactly are
+        installed by the script itself via ``lambda_pin`` (PR #436), so a pin
+        for one of them in the file is a second declaration site; a floating
+        root missing from the file is a package the layer would ship without.
+        """
+        import tomllib
+
+        pins = self._pins((self.AWS / "layer-requirements.txt").read_text())
+        extra = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
+            "optional-dependencies"
+        ]["lambda"]
+        exact = {d.split("==")[0] for d in extra if "==" in d}
+        assert not exact & set(pins), (
+            f"layer-requirements.txt pins {sorted(exact & set(pins))}, which build_layer.sh "
+            "installs itself from the lambda extra (lambda_pin) -- two declaration sites"
+        )
+        floating = set(self._roots("LAYER_ROOTS")) - exact
+        assert floating >= {"fastparquet", "cramjam", "shapely", "pyproj", "odc-geo", "obspec"}
+        assert floating <= set(pins), (
+            f"layer roots {sorted(floating - set(pins))} have no pin in layer-requirements.txt"
+        )
+
+    @pytest.mark.parametrize("script,requirements", sorted(SCRIPTS.items()))
+    def test_build_script_installs_the_pins_without_resolving(self, script, requirements):
+        """Every ``$PIP install`` is ``--no-deps`` of derived ``$VAR``s or the lock file.
+
+        The file is only the contract if the script reads it and nothing else
+        floats: a bare name or a ``"name>=x"`` floor (any quoting) on an install
+        line, a second ``-r``, or ``--no-deps`` dropped puts pip's resolver back
+        between the lock and the zip. A ``$VAR`` positional is a lambda_pin /
+        MORTIE_SPEC derivation (TestLayerExtraParity owns which) or the repo.
         """
         import shlex
 
-        script = (REPO_ROOT / "deployment" / "aws" / "build_function.sh").read_text()
-        installs = []
-        for line in TestLayerExtraParity._install_lines(script):
+        valued = ("--target", "-t", "-r", "-c", "--no-binary")
+        reads, positional = [], []
+        for line in TestLayerExtraParity._install_lines((self.AWS / script).read_text()):
             args = shlex.split(line)
             args = args[args.index("install") + 1 :]
-            assert "--no-deps" in args, f"build_function.sh resolves deps: {line.strip()}"
-            valued = {i + 1 for i, arg in enumerate(args) if arg in ("--target", "-r")}
-            positional = [a for i, a in enumerate(args) if i not in valued and a[0] != "-"]
-            reqs = [args[i] for i in sorted(valued) if args[i - 1] == "-r"]
-            installs.append((" ".join(positional + reqs), args))
-        keys = sorted(key for key, _ in installs)
-        assert keys == ["$REPO_ROOT", "$SCRIPT_DIR/function-requirements.txt"], (
-            f"build_function.sh must install exactly zagg and -r function-requirements.txt, "
-            f"got {keys} (issue #613)"
+            assert "--no-deps" in args, f"{script} resolves deps: {line.strip()}"
+            values = {i + 1 for i, arg in enumerate(args) if arg in valued}
+            positional += [a for i, a in enumerate(args) if i not in values and a[0] != "-"]
+            # `${SCRIPT_DIR}` and `$SCRIPT_DIR` are one path to the shell.
+            reads += [
+                (args[i].replace("{", "").replace("}", ""), args)
+                for i in values
+                if args[i - 1] == "-r"
+            ]
+        loose = [a for a in positional if a[0] != "$"]
+        assert not loose, f"{script} resolves {loose} from PyPI at build time (issue #613)"
+        assert [r for r, _ in reads] == [f"$SCRIPT_DIR/{requirements}"], (
+            f"{script} must install -r {requirements} exactly once, got {[r for r, _ in reads]}"
         )
-        reqs_install = dict(installs)["$SCRIPT_DIR/function-requirements.txt"]
-        assert "--only-binary=:all:" in reqs_install, "a pin with no wheel must fail, not build"
+        assert "--only-binary=:all:" in reads[0][1], "a pin with no wheel must fail, not build"
+        if script == "build_function.sh":
+            # zagg itself and the lock file: nothing else goes into the zip.
+            assert positional == ["$REPO_ROOT"], positional
 
 
 class TestLambdaHandlerSyntax:
