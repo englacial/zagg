@@ -203,6 +203,29 @@ def stage_tuples(shard_order: int, *, tuple_width: int = DEFAULT_TUPLE_WIDTH) ->
     return list(reversed(tuples))
 
 
+def one_stage_tuple(shard_order: int, dispatch: int, child_order: int) -> dict:
+    """One dispatch tuple, named by its own ``[dispatch, child_order)`` span.
+
+    The same item :func:`stage_tuples` yields, built directly instead of
+    being selected out of a fixed-width schedule — what a worker needs when
+    the dispatcher SIZED the schedule (:func:`sized_stage_tuples`) and the
+    tuple's width is therefore not derivable from a single ``tuple_width``.
+    Refuses by name: a span must hold at least one order, start at or above
+    the root and end at or below the leaf columns.
+    """
+    shard_order, dispatch, child_order = int(shard_order), int(dispatch), int(child_order)
+    if not 0 <= dispatch < child_order <= shard_order:
+        raise ValueError(
+            f"stage tuple [{dispatch}, {child_order}) is not a span of this ladder — "
+            f"needs 0 <= dispatch < child_order <= shard_order ({shard_order})"
+        )
+    return {
+        "dispatch": dispatch,
+        "orders": list(range(child_order - 1, dispatch - 1, -1)),
+        "child_order": child_order,
+    }
+
+
 def classify_level(cells: int, *, shard_order: int) -> str:
     """``stage-gather`` or ``stage-merge`` for a ladder level's cell resolution.
 
@@ -292,16 +315,25 @@ class _ColumnReader:
     too. The caller folds the artifact again from fresh readers. A stage
     column stamped by a foreign run SINCE this run started raises
     :class:`ForeignSweepError` (two live sweeps — the lease backstop).
+
+    Handed ``store`` (the invoke's obstore handle at the store root), ``path``
+    is the column's key RELATIVE to it and no client is built (issue #610);
+    without it, ``path`` is absolute and opened on its own.
     """
 
-    def __init__(self, path: str, *, run_id: str, run_started: str, store_kwargs: dict):
-        from zagg.store import open_store
+    def __init__(self, path: str, *, run_id: str, run_started: str, store_kwargs: dict, store=None):
+        from zarr.storage import StorePath
+
+        from zagg.store import open_store, zarr_view
 
         self.path = path
         self.revalidated = 0
         self._served = False  # whether a read was handed out (pins self.stamp)
         self._run_id, self._run_started = run_id, run_started
-        self._store = open_store(path, read_only=True, **store_kwargs)
+        if store is None:
+            self._store = open_store(path, read_only=True, **store_kwargs)
+        else:
+            self._store = StorePath(zarr_view(store), path)
         self._arrays: dict = {}
         self.stamp, self.attrs = self._root()
         self._foreign_guard(self.stamp)
@@ -420,7 +452,7 @@ class _ColumnReader:
 
 
 def _readers_for(
-    store_root: str,
+    store,
     children: list,
     windows: list,
     *,
@@ -433,7 +465,8 @@ def _readers_for(
 
     An absent or unstamped column reads ``None`` — under-coverage, recorded
     by the caller (the soft-barrier posture: fold what is on disk, loudly).
-    An unreadable one counts ``failed`` and also reads ``None``.
+    An unreadable one counts ``failed`` and also reads ``None``. Every column
+    is read through ``store``, the invoke's one handle (issue #610).
     """
     from zagg.column import column_name
     from zagg.sweep import _node_rel
@@ -442,10 +475,14 @@ def _readers_for(
     for child in children:
         row = []
         for window in windows:
-            path = f"{store_root}/{_node_rel(child)}/{column_name(window)}"
+            path = f"{_node_rel(child)}/{column_name(window)}"
             try:
                 reader = _ColumnReader(
-                    path, run_id=run_id, run_started=run_started, store_kwargs=store_kwargs
+                    path,
+                    run_id=run_id,
+                    run_started=run_started,
+                    store_kwargs=store_kwargs,
+                    store=store,
                 )
             except ForeignSweepError:
                 raise
@@ -956,22 +993,23 @@ def _node_rel(decimal: str) -> str:
     return rel(decimal)
 
 
-def _artifact_stamp(store_root, node, basename, run_id, run_started, store_kwargs) -> dict | None:
+def _artifact_stamp(store, node, basename, run_id, run_started) -> dict | None:
     """A stage artifact's commit stamp (``None`` when absent), foreign-gated.
 
     The ruled backstop lives here: a skip-if-current read that encounters a
     FOREIGN stamp written since this run started aborts loudly rather than
-    trusting or overwriting a live sibling sweep's output.
+    trusting or overwriting a live sibling sweep's output. One GET through
+    ``store``, the invoke's one handle at the store root (issue #610).
     """
+    from zarr.storage import StorePath
+
     from zagg.hive import read_commit
-    from zagg.store import open_store
+    from zagg.store import zarr_view
 
     if not basename:
         return None
     try:
-        stamp = read_commit(
-            open_store(f"{store_root}/{_node_rel(node)}/{basename}", **store_kwargs)
-        )
+        stamp = read_commit(StorePath(zarr_view(store), f"{_node_rel(node)}/{basename}"))
     except Exception as e:
         logger.debug(f"stage sweep: cannot confirm {node}/{basename} ({e})")
         return None
@@ -984,7 +1022,7 @@ def _artifact_stamp(store_root, node, basename, run_id, run_started, store_kwarg
     return stamp
 
 
-def _artifact_entry(store_root, node, basename, run_id, run_started, store_kwargs) -> dict | None:
+def _artifact_entry(store, node, basename, run_id, run_started) -> dict | None:
     """A committed stage overview's skip-gate entry, read off its OWN attrs.
 
     ``None`` when the artifact is absent, unstamped or carries no
@@ -994,18 +1032,20 @@ def _artifact_entry(store_root, node, basename, run_id, run_started, store_kwarg
     written into the artifact's attrs first — so a ``(node, window)`` unit
     (issue #586 phase 4) decides skip-if-current from the one object it alone
     writes, and N concurrent window units of a node share no read-modify-write.
-    One GET, the one :func:`_artifact_stamp` already made; foreign-gated the
-    same way.
+    One GET, the one :func:`_artifact_stamp` already made, through the
+    invoke's one handle (issue #610); foreign-gated the same way.
     """
     import zarr
 
     from zagg.hive import COMMIT_ATTR
-    from zagg.store import open_store
+    from zagg.store import zarr_view
     from zagg.sweep_overview import OVERVIEW_ATTR
 
     try:
-        store = open_store(f"{store_root}/{_node_rel(node)}/{basename}", **store_kwargs)
-        attrs = dict(zarr.open_group(store, path="", mode="r", zarr_format=3).attrs)
+        group = zarr.open_group(
+            zarr_view(store), path=f"{_node_rel(node)}/{basename}", mode="r", zarr_format=3
+        )
+        attrs = dict(group.attrs)
     except Exception as e:
         logger.debug(f"stage sweep: cannot confirm {node}/{basename} ({e})")
         return None
@@ -1084,16 +1124,14 @@ def stage_node(
     orders = [k for k in stage["orders"] if k in level_by_order]
     children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
     reader_args = dict(run_id=run_id, run_started=run_started, store_kwargs=store_kwargs)
-    readers = _readers_for(store_root, children, [window], counts=counts, **reader_args)
+    readers = _readers_for(store, children, [window], counts=counts, **reader_args)
     retired: list = []
 
     def _fresh_readers():
         # In place: every fold below holds this dict. An unreadable column was
         # counted the first time; its UNREADABLE marker still says so.
         retired.extend(r for row in readers.values() for r in row if _is_reader(r))
-        readers.update(
-            _readers_for(store_root, children, [window], counts={"failed": 0}, **reader_args)
-        )
+        readers.update(_readers_for(store, children, [window], counts={"failed": 0}, **reader_args))
 
     dispatch_level_current = False
     for k in orders:
@@ -1107,9 +1145,7 @@ def stage_node(
                 entries = dict((stored or {}).get("windows") or {})
                 entry = entries.get(key)
             else:
-                entry = _artifact_entry(
-                    store_root, target, _overview_basename(key), run_id, run_started, store_kwargs
-                )
+                entry = _artifact_entry(store, target, _overview_basename(key), run_id, run_started)
             if (
                 isinstance(entry, dict)
                 and generation_key(entry.get("generation")) == generation_key(fresh_gen)
@@ -1118,9 +1154,7 @@ def stage_node(
                 # its stamp. An attrs entry was read off the committed artifact.
                 and (
                     not envelope
-                    or _artifact_stamp(
-                        store_root, target, entry.get("object"), run_id, run_started, store_kwargs
-                    )
+                    or _artifact_stamp(store, target, entry.get("object"), run_id, run_started)
                     is not None
                 )
             ):

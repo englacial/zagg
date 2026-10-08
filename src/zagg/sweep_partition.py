@@ -39,6 +39,40 @@ window) invokes decompose further. Noted, not implemented (issue #377 v1).
 
 from __future__ import annotations
 
+#: Leaves one partition of the run tail's families pass is sized to hold
+#: (issue #610). The v3 California pass folded about a leaf a second per
+#: invoke — the rollup PUTs dominate (~2.5 objects a leaf) — so 128 leaves is
+#: minutes against the 900 s wall, with room for a queued start.
+FAMILIES_TARGET_LEAVES = 128
+
+
+def families_partitions(leaves, target: int = FAMILIES_TARGET_LEAVES) -> int:
+    """The ``4^k`` the run tail splits a families pass into (issue #610).
+
+    Sized from the LEAVES, not a fixed width: ``k`` starts at
+    ``ceil(log4(ceil(n / target)))`` — the width that holds ``target`` leaves
+    per partition if the keys spread evenly — and is refined upward while the
+    largest partition :func:`partition_leaves` actually produces is over
+    ``target``, up to the leaves' own order (one shard per partition, the
+    finest split :func:`zagg.sweep.run_sweep` admits). Regional stores
+    cluster: the 2,959-leaf California store's 64-way split held 1,050 leaves
+    in one partition, past the wall at the observed rate, which is why the
+    count alone cannot size it (espg, issue #610). ``1`` for a work set of at
+    most ``target`` leaves — the single pass the tail fired before.
+    """
+    from zagg.grids.morton import morton_decimal
+    from zagg.hive import _decimal_order
+
+    refs = [tuple(r) if isinstance(r, (tuple, list)) else (r, None) for r in leaves]
+    finest = min((_decimal_order(morton_decimal(int(key))) for key, _w in refs), default=0)
+    k = 0
+    while k < finest and (
+        4**k * int(target) < len(refs)
+        or max(len(b) for b in partition_leaves(refs, 4**k).values()) > int(target)
+    ):
+        k += 1
+    return 4**k
+
 
 def partition_split_order(partitions: int) -> int:
     """Morton order a ``partitions``-way split lands on (``2^(2k)`` -> ``k``).
@@ -158,6 +192,131 @@ def select_partition(by_shard: dict, partitions: int, index: int) -> tuple[dict,
     kept = {d: w for d, w in by_shard.items() if partition_index(d, partitions) == index}
     total = sum(len(w) for w in by_shard.values())
     return kept, total - sum(len(w) for w in kept.values())
+
+
+#: How many ladder nodes one stage invoke should fold (issue #610). A tuple
+#: narrows until its fattest dispatch node is within this, so the per-invoke
+#: wall is bounded by the store's own density rather than by ``tuple_width``.
+#:
+#: Derived from the v3 run (``stage-20261008T054003Z-a47e28``): at width 3 the
+#: base-cell-``3`` invoke of the ``[2,1,0]`` tuple folded 21 nodes — 1 + 4 + 16
+#: covered — and hit the 900 s wall after 12 of its 16 order-2 nodes, ~75 s a
+#: node on 2,865 shards. The knob's granularity is coarse because a subtree's
+#: node count steps by powers of four (21, 5, 1 for widths 3, 2, 1), so any
+#: target in [5, 20] gives that run the same width-2 schedule, ~5 nodes and
+#: ~375 s an invoke. 8 sits in the middle of that plateau.
+STAGE_TARGET_NODES = 8
+
+
+def sized_stage_tuples(
+    shard_order: int,
+    *,
+    nodes_at=None,
+    tuple_width: int | None = None,
+    target: int = STAGE_TARGET_NODES,
+) -> list[dict]:
+    """:func:`zagg.sweep_stage.stage_tuples` with each width sized to the per-invoke fold.
+
+    The ladder's answer to the families pass's leaf-count sizing (issue #610,
+    espg 2026-10-08): a dispatch node folds its WHOLE subtree down to the
+    tuple's ``child_order`` inside one invoke, so a fixed ``tuple_width``
+    puts ``1 + 4 + ... + 4**(width-1)`` nodes on one worker wherever the
+    store is dense — 21 at width 3, which is what walled the v3 ladder's
+    coarsest tuple.
+
+    A REFINEMENT of the fixed-width schedule, not a second schedule beside
+    it: each :func:`zagg.sweep_stage.stage_tuples` tuple is subdivided inside
+    its OWN ``[dispatch, child_order)`` span, taking the widest sub-width
+    whose fattest dispatch node folds at most ``target`` nodes. Narrowing
+    therefore only ever ADDS a boundary inside a fixed tuple and never moves
+    one, so a store needing no narrowing yields ``stage_tuples`` exactly —
+    for every ``shard_order``, the ragged finest tuple included. (A walk that
+    took full widths down from ``shard_order`` instead put its ragged tuple
+    at the COARSE end and so reshaped every boundary of a ragged ladder that
+    needed no narrowing at all — review finding.)
+
+    ``nodes_at(order)`` returns the covered nodes at ``order`` as decimals:
+    what a stage WORKER folds there, which is its candidate set
+    (:func:`zagg.sweep_overview._candidate_decimals` — the run's leaves UNION
+    the store's root ``coverage.moc``), NOT the run's work set alone. The work
+    set's ancestors are a subset of that — a sibling shard an earlier run
+    committed is folded although no leaf of this run names it — so sizing
+    from them can only UNDER-estimate the fold, which is the unsafe direction
+    (review finding); :func:`zagg.sweep_fleet.candidate_dispatch_nodes` is
+    the dispatcher-side spelling of the worker's set.
+
+    ``None`` — a dispatcher holding no coverage MOC, which it may not read for
+    itself (D8) — sizes against the DENSE bound ``(4 ** width - 1) // 3`` (1,
+    5, 21, 85 for widths 1..4): the fold a dispatcher that cannot see the
+    store's density must assume. It never under-estimates, and at
+    :data:`STAGE_TARGET_NODES` it picks width 2 everywhere — the width the v3
+    store needed. ``nodes_at`` is called once per candidate order and the
+    results are reused across candidate widths.
+
+    Returns the :func:`zagg.sweep_stage.stage_tuples` items, finest first and spanning
+    ``[0, shard_order)`` without gap or overlap exactly as the fixed-width
+    schedule does, each with the ``width`` it was given and the ``fold_max``
+    that chose it — measured when ``nodes_at`` was supplied, the dense bound
+    otherwise.
+
+    The grouping is a dispatch knob, never grammar: by the merge-source law
+    (#381 point (6)) a sized schedule and a fixed one build the same ladder
+    OVERVIEWS, which is what the oracle compares and what a reader reads. Not
+    every byte, and the suite does not claim it (review finding): the group
+    attrs carry per-run provenance that is legitimately grouping-dependent
+    (``source_children``, the summed child ``generation``), and a sized arm
+    writes relay stage columns a fixed arm never needs.
+    """
+    from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, _node_at, one_stage_tuple, stage_tuples
+
+    shard_order = int(shard_order)
+    tuple_width = int(DEFAULT_TUPLE_WIDTH if tuple_width is None else tuple_width)
+    target = int(target)
+    if tuple_width < 1:
+        raise ValueError(f"tuple_width must be >= 1 (got {tuple_width})")
+    if target < 1:
+        raise ValueError(f"target must be >= 1 node per invoke (got {target})")
+    if shard_order < 1:
+        raise ValueError(f"shard_order {shard_order} has no above-shard ladder to sweep")
+
+    cache: dict = {}
+
+    def covered(order: int) -> list:
+        if order not in cache:
+            cache[order] = [str(n) for n in nodes_at(order)]
+        return cache[order]
+
+    def fold_max(dispatch: int, child_order: int) -> int:
+        """The fattest dispatch node's node count over ``[dispatch, child_order)``."""
+        if nodes_at is None:
+            # 1 + 4 + ... + 4**(width-1): the bound a dispatcher that cannot
+            # see the store's density must assume.
+            return (4 ** (child_order - dispatch) - 1) // 3
+        counts: dict = {d: 0 for d in covered(dispatch)}
+        for order in range(dispatch, child_order):
+            for node in covered(order):
+                ancestor = _node_at(node, dispatch)
+                if ancestor in counts:
+                    counts[ancestor] += 1
+        return max(counts.values(), default=0)
+
+    tuples = []
+    for fixed in stage_tuples(shard_order, tuple_width=tuple_width):
+        base, child = int(fixed["dispatch"]), int(fixed["child_order"])
+        while child > base:
+            # Widest first and INSIDE this fixed tuple's own span, so the
+            # result is a refinement of the fixed-width schedule: a store that
+            # needs no narrowing keeps that schedule, ragged tuple included.
+            # The last candidate is width 1, where a dispatch node folds itself
+            # alone (bound 1; measured 1, or 0 where the order is uncovered),
+            # so it clears every ``target >= 1`` the refusal above admits —
+            # the generator is never empty and ``next`` cannot raise.
+            spans = ((d, fold_max(d, child)) for d in range(base, child))
+            dispatch, fold = next((d, at) for d, at in spans if at <= target)
+            stage = one_stage_tuple(shard_order, dispatch, child)
+            tuples.append({**stage, "width": child - dispatch, "fold_max": fold})
+            child = dispatch
+    return tuples
 
 
 def sweep_partitions(store_root: str, leaves, *, partitions: int, **kwargs) -> list[dict]:

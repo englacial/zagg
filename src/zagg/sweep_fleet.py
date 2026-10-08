@@ -162,6 +162,48 @@ def coverage_dispatch_nodes(by_shard, dispatch: int, coverage, scope=None) -> li
     return dispatch_nodes(by_shard, int(dispatch), filter_moc)
 
 
+def candidate_dispatch_nodes(by_shard, dispatch: int, coverage, scope=None) -> list:
+    """The nodes a stage WORKER folds at ``dispatch`` — its candidate set (issue #610).
+
+    Not the tuple's dispatch nodes (:func:`dispatch_nodes` /
+    :func:`coverage_dispatch_nodes`, which are the invoke TARGETS) but the
+    nodes those invokes fold: a worker's candidates are the run's leaves
+    UNION the store's root ``coverage.moc``
+    (:func:`zagg.sweep_overview._candidate_decimals`, which
+    :func:`zagg.sweep_stages.sweep_stage_pass` folds from), coarsened to the
+    dispatch order. The work set's own ancestors are a strict subset wherever
+    the run appends to a store — a sibling shard an earlier run committed is
+    folded although no leaf of this run names it, and
+    :func:`coverage_dispatch_nodes` only FILTERS those ancestors by the
+    coverage, never widens them — so a schedule sized from either can only
+    UNDER-estimate what one invoke folds (review finding). This is the set
+    :func:`zagg.sweep_partition.sized_stage_tuples` measures.
+
+    ``coverage`` is the MOC the caller already HOLDS, exactly as
+    :func:`coverage_dispatch_nodes` takes it: the union is mirrored
+    dispatcher-side from those words, so nothing is read from the store (D8),
+    and ``None`` is refused rather than read as "no coverage". ``scope``
+    filters by subtree intersection (:func:`zagg.sweep_stages.scope_admits`),
+    the containment the worker's own fold applies.
+    """
+    from zagg.grids.morton import morton_decimal
+    from zagg.sweep_overview import _node_at
+    from zagg.sweep_stages import normalize_scope, scope_admits
+
+    if coverage is None:
+        raise ValueError(
+            "candidate_dispatch_nodes needs the store's coverage MOC — None is not "
+            "'no coverage' here, because a sizing that silently narrowed to the work "
+            "set would under-estimate the fold; size against the dense bound instead "
+            "(zagg.sweep_partition.sized_stage_tuples without nodes_at)"
+        )
+    words = list(coverage.keys() if isinstance(coverage, dict) else coverage)
+    decimals = set(by_shard) | {morton_decimal(int(w)) for w in words}
+    moc = normalize_scope(scope)
+    nodes = {_node_at(d, int(dispatch)) for d in decimals}
+    return sorted(n for n in nodes if scope_admits(n, moc))
+
+
 def _leaf_refs(by_shard, nodes=None) -> list:
     """``[[shard_key, window], ...]`` for the whole work set, or one node slice."""
     from zagg.grids.morton import morton_word
@@ -301,28 +343,33 @@ def _fit_batch(
     return _fit_batch(nodes[:mid], buckets, **kw) + _fit_batch(nodes[mid:], buckets, **kw)
 
 
-def normalize_max_nodes(max_nodes):
-    """``max_nodes`` as an int >= 1, or ``None`` — refused by name, once.
+def normalize_knob(value, *, name: str, hint: str, floor: int = 1):
+    """One dispatcher knob as an int >= ``floor``, or ``None`` — refused by name.
 
-    Validated where the value ENTERS rather than where it is used, so a run
-    whose tuples all filter out still records a value it could have honored.
-    ``int()`` on its own is not validation: it truncates ``2.9`` to 2 and reads
-    ``True`` as 1 (both silently, so the summary's record would disagree with
-    what shipped), and it raises ``invalid literal for int()`` on a string —
-    not a message naming this knob (review finding).
+    The shared validation, so the dispatcher's knobs cannot disagree about
+    what a bad value is (review finding: ``stage_target_nodes`` reintroduced
+    exactly what this removed from ``max_nodes``). ``int()`` on its own is not
+    validation: it truncates ``2.9`` to 2 and reads ``True`` as 1 (both
+    silently, so the summary's record would disagree with what shipped), and
+    it raises ``invalid literal for int()`` on a string — not a message naming
+    the knob. Validated where the value ENTERS rather than where it is used,
+    so a run whose tuples all filter out still records a value it could have
+    honored.
     """
-    if max_nodes is None:
+    if value is None:
         return None
     try:
-        value = int(max_nodes)
+        whole = int(value)
     except (TypeError, ValueError):
-        value = None
-    if value is None or isinstance(max_nodes, bool) or value != max_nodes or value < 1:
-        raise ValueError(
-            f"max_nodes must be a whole number >= 1, got {max_nodes!r} — "
-            "pass None for payload-only packing"
-        )
-    return value
+        whole = None
+    if whole is None or isinstance(value, bool) or whole != value or whole < floor:
+        raise ValueError(f"{name} must be a whole number >= {floor}, got {value!r} — {hint}")
+    return whole
+
+
+def normalize_max_nodes(max_nodes):
+    """``max_nodes`` as an int >= 1, or ``None`` — refused by name, once."""
+    return normalize_knob(max_nodes, name="max_nodes", hint="pass None for payload-only packing")
 
 
 def pack_batches(
@@ -447,6 +494,7 @@ def await_records(
     timeout_s: float,
     interval_s: float,
     ignore=frozenset(),
+    label: str = "stage",
 ) -> tuple:
     """Poll until every expected record lands, or the budget runs out.
 
@@ -485,6 +533,9 @@ def await_records(
     prefix cannot be LISTED ``_LIST_FAULT_LIMIT`` times running: that is a
     dispatcher-side fault, and polling out the budget would buy nothing while
     reporting it as slow workers.
+
+    ``label`` names the leg in those warnings (``"families"`` from
+    :func:`run_families_sweep_fleet`).
     """
     deadline = time.monotonic() + float(timeout_s)
     stale = set(ignore)
@@ -500,8 +551,8 @@ def await_records(
             faults += 1
             if faults >= _LIST_FAULT_LIMIT:
                 logger.warning(
-                    f"stage fleet: abandoning the barrier on {records_from} after {faults} "
-                    f"consecutive LIST failures — the dispatcher cannot SEE the run's stage "
+                    f"{label} fleet: abandoning the barrier on {records_from} after {faults} "
+                    f"consecutive LIST failures — the dispatcher cannot SEE the run's {label} "
                     f"records (a permissions, region or endpoint fault, not slow workers), "
                     f"so waiting out the budget would buy nothing; proceeding fail-open with "
                     f"{len(seen)}/{len(expected)} record(s) seen"
@@ -512,12 +563,16 @@ def await_records(
         if time.monotonic() >= deadline:
             missing = sorted(expected - seen)
             logger.warning(
-                f"stage fleet: barrier timed out after {timeout_s:.0f}s with "
-                f"{len(missing)}/{len(expected)} stage record(s) missing ({missing[:5]}"
+                f"{label} fleet: barrier timed out after {timeout_s:.0f}s with "
+                f"{len(missing)}/{len(expected)} {label} record(s) missing ({missing[:5]}"
                 f"{' ...' if len(missing) > 5 else ''})"
                 f"{'' if listed_ever else ' — and the status prefix never listed successfully'}"
-                f" — proceeding: under-coverage is "
-                f"recorded per artifact and heals on the next pass (#381 point (6))"
+                + (
+                    " — proceeding: under-coverage is recorded per artifact and heals on the "
+                    "next pass (#381 point (6))"
+                    if label == "stage"
+                    else " — proceeding"
+                )
             )
             return seen, True
         # Clamped to the deadline: a poll interval longer than what is left
@@ -535,6 +590,7 @@ def run_stage_sweep_fleet(
     scope=None,
     coverage=None,
     tuple_width: int | None = None,
+    stage_target_nodes: int | None = None,
     max_nodes_per_invoke: int | None = 1,
     run_id: str | None = None,
     output_creds_event=None,
@@ -597,6 +653,53 @@ def run_stage_sweep_fleet(
     per-invoke wall (or ``None``); the knob is reachable from the runner's
     seam too (:func:`zagg.runner._invoke_lambda_stage_sweep`).
 
+    ``stage_target_nodes`` sizes each tuple's WIDTH to the per-invoke fold
+    (issue #610, espg 2026-10-08), the way ``target`` sizes the families
+    pass's partitions: ``max_nodes_per_invoke`` caps how many dispatch NODES
+    an invoke is handed, but a dispatch node folds its whole subtree down to
+    the tuple's ``child_order``, so at width 3 one invoke folds up to 21 nodes
+    however small the cap. It is a target per dispatch NODE, so it bounds the
+    invoke only once the two are composed: ``max_nodes_per_invoke`` nodes ride
+    one invoke and each folds its own subtree, so the schedule is sized
+    against ``stage_target_nodes // max_nodes_per_invoke`` (review finding).
+    Under payload-only packing (``max_nodes_per_invoke=None``) the count is
+    unknown — a whole tuple may land on one worker — so the target bounds
+    nothing per invoke; that is logged as a WARNING and the sizing proceeds as
+    if one node an invoke. That is what walled the v3 ladder — the base-cell
+    ``3`` invoke of the ``[2,1,0]`` tuple folded 21 and died at 900 s after 12
+    of its 16 order-2 nodes. :func:`zagg.sweep_partition.sized_stage_tuples`
+    refines the fixed-width schedule, subdividing each tuple inside its own
+    span until its fattest dispatch node stays within the target (so a store
+    needing no narrowing keeps that schedule outright). Nothing is read from
+    the store either way (D8).
+    What it narrows AGAINST depends on what the caller handed in. With a
+    ``coverage`` MOC the fold is MEASURED, over the set the worker itself
+    folds — the run's leaves union that coverage, coarsened per order
+    (:func:`candidate_dispatch_nodes`); the dispatch nodes above are a subset
+    of it, so sizing from them would under-estimate every run that appends to
+    a store (review finding). Without one the dispatcher cannot see the
+    store's density and may not read it (D8), so the sizing takes the DENSE
+    bound ``(4 ** width - 1) // 3`` — 21 at width 3, 5 at width 2 — which
+    never under-estimates. The runner's tail passes no coverage, so the tail
+    sizes by that bound: at :data:`zagg.sweep_partition.STAGE_TARGET_NODES`
+    it takes width 2 everywhere, which is what the v3 store needed. An
+    operator who hands ``coverage=`` in gets the measurement instead, and may
+    keep the full width where the store is genuinely sparse. Either way the
+    chosen fold rides on the tuple's row (``fold_max``), beside its ``width``.
+
+    ``None`` — the default — sizes nothing: this dispatcher is documented as
+    the MIRROR of :func:`zagg.sweep_stages.run_stage_sweep`, and a schedule
+    this side chose on its own would no longer be the width the caller named
+    (the byte-identity oracle compares the two arms AT a width, and a sized
+    arm writes the relay stage columns of a different grouping). The run TAIL
+    is what meets the 900 s wall, so the tail is what asks for the sizing —
+    :func:`zagg.runner._invoke_lambda_stage_sweep` passes
+    :data:`zagg.sweep_partition.STAGE_TARGET_NODES`. A narrowed tuple
+    dispatches at an order no fixed width would land on, so its events carry
+    their own ``child_order`` — a worker predating issue #610 refuses such an
+    event BY NAME (``no stage tuple dispatches at order D``) rather than
+    folding the wrong span, which the barrier then reports short.
+
     ``run_id`` names the lease, the skip-key/foreign-stamp namespace AND the
     status prefix the stage records land under, so it is generated here (or
     supplied) and threaded verbatim into every invoke. ``run_started`` is
@@ -654,6 +757,7 @@ def run_stage_sweep_fleet(
     from zagg.client_transport import run_status_prefix
     from zagg.hive import _utcnow
     from zagg.sweep import _normalize_leaves
+    from zagg.sweep_partition import sized_stage_tuples
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
     from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
     from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW, stage_units
@@ -667,6 +771,20 @@ def run_stage_sweep_fleet(
     # records the EFFECTIVE value, so the run's own record cannot disagree
     # with what shipped.
     max_nodes_per_invoke = normalize_max_nodes(max_nodes_per_invoke)
+    # The same validation, for the same reason (review finding): a bare
+    # ``int()`` here would read ``True`` as 1, truncate ``2.9`` to 2 and
+    # accept ``"8"``, while the summary below claims the coerced value. 0
+    # keeps its documented meaning — size by ``tuple_width`` alone, like
+    # ``None`` — hence the floor of 0 rather than 1.
+    stage_target_nodes = (
+        normalize_knob(
+            stage_target_nodes,
+            name="stage_target_nodes",
+            hint="0 and None both size by tuple_width alone",
+            floor=0,
+        )
+        or 0
+    )
     shard_order = int(shard_order)
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
@@ -690,6 +808,9 @@ def run_stage_sweep_fleet(
         "store_root": store_path,
         "shard_order": shard_order,
         "tuple_width": tuple_width,
+        # 0 when the schedule was the fixed-width mirror. The per-tuple widths
+        # the sizing chose are on the rows (``width``/``fold_max``).
+        "stage_target_nodes": stage_target_nodes,
         "max_nodes_per_invoke": max_nodes_per_invoke,
         "windowed": bool(windowed),
         "all_time": bool(all_time),
@@ -710,6 +831,10 @@ def run_stage_sweep_fleet(
         "invokes": 0,
         # True if ANY barrier expired: the run's actuals may under-report.
         "barrier_timed_out": False,
+        # The orders whose manifest actuals the finisher was told to withhold
+        # (issue #610). Always present, like ``skipped``: a caller reading the
+        # summary should not have to know which branch produced it.
+        "short_orders": [],
         "stages": [],
     }
 
@@ -817,17 +942,81 @@ def run_stage_sweep_fleet(
     # A tuple's close units (the all-time fold) are fired when its window
     # units are in and awaited with the NEXT fan-out: the next tuple reads
     # only the window units' stage columns, never an all-time artifact.
-    closing: tuple = ()
-    for stage in stage_tuples(shard_order, tuple_width=tuple_width):
-        dispatch = int(stage["dispatch"])
-        # The ruled computation when a coverage MOC was handed in, the work set
-        # alone otherwise. Both derive the nodes dispatcher-side, per tuple —
-        # neither reads the store (D8).
-        nodes = (
-            dispatch_nodes(work, dispatch, scope)
-            if coverage is None
-            else coverage_dispatch_nodes(work, dispatch, coverage, scope)
+    # The ruled computation when a coverage MOC was handed in, the work set
+    # alone otherwise. Both derive the nodes dispatcher-side, per order —
+    # neither reads the store (D8). Memoized because the sizing below asks for
+    # the same orders the tuple loop then asks for again.
+    node_sets: dict = {}
+
+    def _nodes_at(order: int) -> list:
+        order = int(order)
+        if order not in node_sets:
+            node_sets[order] = (
+                dispatch_nodes(work, order, scope)
+                if coverage is None
+                else coverage_dispatch_nodes(work, order, coverage, scope)
+            )
+        return node_sets[order]
+
+    # The invoke TARGETS above; what one invoke FOLDS here. A worker folds its
+    # candidate set — the run's leaves union the store's root coverage — so a
+    # schedule sized from the dispatch nodes above under-estimates every run
+    # whose work set is a subset of the store (review finding). Separate
+    # memo: these two sets are deliberately different sets.
+    fold_sets: dict = {}
+
+    def _fold_nodes_at(order: int) -> list:
+        order = int(order)
+        if order not in fold_sets:
+            fold_sets[order] = candidate_dispatch_nodes(work, order, coverage, scope)
+        return fold_sets[order]
+
+    if stage_target_nodes:
+        # ``max_nodes_per_invoke`` dispatch nodes ride ONE invoke and each
+        # folds its own subtree, so that invoke's fold is up to ``n x
+        # fold_max``: the target is shared out per node, or it bounds nothing
+        # (review finding). With payload-only packing (``None``) the count is
+        # not known here at all — a whole tuple may land on one worker — so
+        # the sizing says so and falls back to one node an invoke.
+        per_invoke = max_nodes_per_invoke or 1
+        if max_nodes_per_invoke is None:
+            logger.warning(
+                "stage fleet: max_nodes_per_invoke is None (payload-only packing puts a "
+                f"whole tuple on one worker), so stage_target_nodes={stage_target_nodes} "
+                "cannot bound what ONE invoke folds — sizing as if one dispatch node an "
+                "invoke; pass a node cap to make the target a per-invoke bound"
+            )
+        schedule = sized_stage_tuples(
+            shard_order,
+            # Measured only when a coverage MOC was handed in; without one the
+            # dispatcher cannot see the store's density and may not read it
+            # (D8), so the sizing takes the DENSE bound, which never
+            # under-estimates.
+            nodes_at=None if coverage is None else _fold_nodes_at,
+            tuple_width=tuple_width,
+            target=max(1, stage_target_nodes // per_invoke),
         )
+        narrowed = [st for st in schedule if int(st["width"]) < tuple_width]
+        if narrowed:
+            logger.info(
+                f"stage fleet: sized the schedule from "
+                f"{'the coverage MOC handed in' if coverage is not None else 'the dense bound'}"
+                f" — {len(narrowed)} of {len(schedule)} tuple(s) narrower than width "
+                f"{tuple_width} (target {stage_target_nodes} node(s) an invoke over "
+                f"{per_invoke} dispatch node(s)): "
+                + ", ".join(
+                    f"@{st['dispatch']} width {st['width']} folds {st['fold_max']}"
+                    for st in narrowed
+                )
+            )
+    else:
+        schedule = stage_tuples(shard_order, tuple_width=tuple_width)
+
+    closing: tuple = ()
+    for stage in schedule:
+        dispatch = int(stage["dispatch"])
+        width = int(stage.get("width") or (int(stage["child_order"]) - dispatch))
+        nodes = _nodes_at(dispatch)
         if not nodes:
             continue
         unit_args = dict(windowed=windowed, candidates=nodes, dirt_only=regather)
@@ -837,7 +1026,18 @@ def run_stage_sweep_fleet(
             "run_id": run_id,
             "run_started": run_started,
             "dispatch": dispatch,
+            # The RUN's width, as it has always been — and the tuple's span
+            # outright beside it: a sized schedule dispatches at orders no
+            # single width lands on, so the worker takes the span rather than
+            # re-deriving it (issue #610). Sending the TUPLE's own width here
+            # instead would change the unsized path's wire bytes too, and on a
+            # ragged ladder (``shard_order % tuple_width != 0``) the finest
+            # tuple's width then selects no tuple at all on a worker predating
+            # the span — losing the leaf-adjacent orders where they used to
+            # fold correctly (review finding). The per-tuple width stays on
+            # the dispatcher's own row (``width``).
             "tuple_width": tuple_width,
+            "child_order": int(stage["child_order"]),
             "records_from": records_from,
         }
         if pipeline_run_id is not None:
@@ -870,6 +1070,10 @@ def run_stage_sweep_fleet(
         row = {
             "dispatch_order": dispatch,
             "orders": list(stage["orders"]),
+            "width": width,
+            # The fattest dispatch node's fold, which chose the width above —
+            # absent on a fixed-width schedule, which measured nothing.
+            "fold_max": stage.get("fold_max"),
             "nodes": len(nodes),
             "batches": len(fired),
             "barrier_timed_out": False,
@@ -927,6 +1131,36 @@ def run_stage_sweep_fleet(
         return summary
     stages_timed_out = any(st["barrier_timed_out"] for st in summary["stages"])
     summary["barrier_timed_out"] = stages_timed_out
+    # The ORDERS whose actuals this run did not observe in full: every order of
+    # every tuple that is missing a unit record (issue #610, espg 2026-10-08).
+    # A bool alone made the finisher stamp the manifest as if complete — the v3
+    # ladder recorded actuals for orders 8..3 and for the walled 2..0 alike.
+    # Named per order, so the finisher withholds exactly the short levels and
+    # leaves them for the re-run, keeping the complete ones.
+    #
+    # ``missing_unit_count`` sums BOTH fan-outs, so a tuple whose every window
+    # unit landed but whose all-time CLOSE record was lost withholds the whole
+    # tuple's span — including orders whose per-window actuals are complete
+    # (review finding). That is the safe direction: the close is a fold over
+    # the node's windows, so a lost close record leaves the level's all-time
+    # artifact unaccounted for, and a withheld level keeps the actuals it had
+    # until the next pass observes it.
+    short_orders = sorted(
+        {
+            int(order)
+            for st in summary["stages"]
+            if st.get("missing_unit_count")
+            for order in st["orders"]
+        },
+        reverse=True,
+    )
+    summary["short_orders"] = short_orders
+    if short_orders:
+        logger.warning(
+            f"stage fleet: run {run_id} is short a unit record at order(s) "
+            f"{short_orders} — the finisher withholds their manifest actuals; "
+            "re-run the staged sweep to record them"
+        )
     finisher_block = {
         "role": "finisher",
         "run_id": run_id,
@@ -935,6 +1169,7 @@ def run_stage_sweep_fleet(
         # The finisher is aggregating a record set the dispatcher knows may be
         # short; it rides on the wire so the RUN record says so.
         "barrier_timed_out": stages_timed_out,
+        "short_orders": short_orders,
     }
     if pipeline_run_id is not None:
         finisher_block["pipeline_run_id"] = pipeline_run_id
@@ -950,6 +1185,171 @@ def run_stage_sweep_fleet(
     if seen:
         summary["finisher"].update(_read_finisher_record(records_from, store_kwargs))
     summary["duration_s"] = time.perf_counter() - t0
+    return summary
+
+
+def families_record_name(partition) -> str:
+    """One families invoke's status record basename (issue #610).
+
+    ``families-p{index}of{of}.json`` for a partition's ``{"index", "of"}``
+    block, ``families-finisher.json`` for ``None`` — the finisher, and the
+    single pass of a run of at most the target. Deterministic like
+    :func:`zagg.sweep_stages.stage_record_name`: the dispatcher names every
+    object it will poll for before it fires, so the barrier needs no pattern
+    and no timestamp. The worker PUTs it under the run's status prefix
+    (``run_sweep(status_record=...)``), a copy of its store-root
+    ``sweep_stats_*.json`` record.
+    """
+    if partition is None:
+        return "families-finisher.json"
+    return f"families-p{int(partition['index'])}of{int(partition['of'])}.json"
+
+
+def run_families_sweep_fleet(
+    lambda_client,
+    function_name: str,
+    store_path: str,
+    leaves,
+    *,
+    output_creds_event=None,
+    store_kwargs: dict | None = None,
+    run_id: str | None = None,
+    target: int | None = None,
+    barrier_timeout_s: float = DEFAULT_BARRIER_TIMEOUT_S,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+) -> dict:
+    """The run tail's families pass over the fleet (issue #610): partitions, finisher, two barriers.
+
+    Before, the tail fired the families pass as ONE fire-and-forget
+    ``mode="sweep"`` invoke whatever the run's size, and a run with more
+    leaves than one invoke folds inside the 900 s wall got a dead invoke, no
+    record and a handle that returned success (the 2,726-leaf California
+    tail). Here the split is sized from the leaves
+    (:func:`zagg.sweep_partition.families_partitions`), one Event invoke per
+    non-empty partition is fired, their records are awaited, then the
+    finisher — the partition-less pass that owes the coarse levels, the root
+    ``coverage.moc`` and its sibling — is fired and its record awaited. A
+    work set of at most ``target`` leaves is one pass and one barrier.
+
+    The barrier is the staged sweep's poller (:func:`await_records`) on the
+    run's status prefix (``run_status_prefix(store_path, run_id)``), the one
+    the dispatcher already reads: every event carries it as
+    ``records_from``, and each worker PUTs a copy of its sweep record there
+    under :func:`families_record_name`. Records standing there before the
+    first fan-out fires are ignored, so a re-driven run's earlier records
+    cannot satisfy this one's barriers; if that one LIST fails, nothing is
+    ignored and the barrier's own LIST-fault posture reports the fault. Like
+    the staged seam this never writes (D8) and is fail-open (D9): a lost
+    invoke costs one later ``python -m zagg.sweep`` pass, never a wrong
+    answer — but it is REPORTED, never swallowed: ``{"partitions", "fired",
+    "landed", "finisher", "run_id", "records_from", "duration_s"}``, where
+    ``finisher`` is ``"ok"`` (every record landed), ``"records_short"`` (the
+    finisher's landed but a partition's did not — it folded from what was
+    there), ``"timed_out"`` (the finisher's own record never landed: the
+    root section is whatever stood before) or ``"dispatch_failed"`` (an
+    invoke raised after others were fired; ``error`` says why, and nothing
+    further is fired or awaited). Anything but ``"ok"`` is also a warning. An
+    invoke that raises before anything was fired propagates.
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    from zagg.client_transport import run_status_prefix
+    from zagg.runner import _build_sweep_event
+    from zagg.sweep_partition import families_partitions, partition_leaves
+
+    t0 = time.perf_counter()
+    store_kwargs = dict(store_kwargs or {})
+    leaves = [tuple(r) if isinstance(r, (tuple, list)) else (r, None) for r in leaves]
+    n = families_partitions(leaves, **({} if target is None else {"target": int(target)}))
+    run_id = run_id or (
+        f"families-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
+    )
+    records_from = run_status_prefix(store_path, run_id)
+
+    def _fire(bucket, partition, finisher=None) -> None:
+        event = _build_sweep_event(
+            store_path,
+            bucket,
+            output_creds_event,
+            partition,
+            records_from=records_from,
+            finisher=finisher,
+        )
+        lambda_client.invoke(
+            FunctionName=function_name, InvocationType="Event", Payload=json.dumps(event)
+        )
+
+    def _wait(expected: set) -> set:
+        seen, _timed_out = await_records(
+            records_from,
+            expected,
+            store_kwargs=store_kwargs,
+            timeout_s=barrier_timeout_s,
+            interval_s=poll_interval_s,
+            ignore=stale,
+            label="families",
+        )
+        return seen
+
+    # ONE capture before the first fan-out: nothing standing counts. A failed
+    # LIST is not an empty prefix; it is logged, and the barrier reports it.
+    stale, listed = _present(records_from, store_kwargs)
+    if not listed:
+        logger.warning(
+            f"families sweep: cannot capture the records already under {records_from}; "
+            f"none is ignored"
+        )
+    summary: dict = {
+        "partitions": n,
+        "fired": 0,
+        "landed": 0,
+        "finisher": None,
+        "accumulators": None,
+        "run_id": run_id,
+        "records_from": records_from,
+    }
+    finisher = {families_record_name(None)}
+    try:
+        if n == 1:
+            _fire(leaves, None)
+            summary["fired"] = 1
+            summary["landed"] = len(_wait(finisher))
+            summary["finisher"] = "ok" if summary["landed"] else "timed_out"
+        else:
+            buckets = partition_leaves(leaves, n)
+            for index, bucket in buckets.items():
+                _fire(bucket, {"index": index, "of": n})
+                summary["fired"] += 1
+            seen = _wait({families_record_name({"index": i, "of": n}) for i in buckets})
+            summary["landed"] = len(seen)
+            compose = None
+            if len(seen) == len(buckets):
+                # Every partition's record stood: hand the finisher their
+                # names, so it composes the root section from the accumulators
+                # they carry and reads no leaf. A short fan-out leaves it on
+                # the leaf walk, which its own record then says.
+                compose = {"of": n, "records_from": records_from, "accumulators": sorted(seen)}
+                summary["accumulators"] = len(seen)
+            _fire(leaves, None, compose)
+            landed = _wait(finisher)
+            summary["finisher"] = (
+                "timed_out" if not landed else "records_short" if len(seen) < len(buckets) else "ok"
+            )
+    except Exception as e:
+        # Invokes are in flight: the outcome, not None ("nothing was fired").
+        if not summary["fired"]:
+            raise
+        logger.warning(f"families sweep: an invoke failed after {summary['fired']} fired: {e}")
+        summary.update(finisher="dispatch_failed", error=str(e))
+    summary["duration_s"] = time.perf_counter() - t0
+    if summary["finisher"] != "ok":
+        logger.warning(
+            f"families sweep over {len(leaves)} leaves at {store_path}: {summary['finisher']} — "
+            f"{summary['landed']}/{summary['fired']} partition record(s) landed in "
+            f"{summary['partitions']} partition(s); the root temporal section and coverage.toc "
+            f"may be short (python -m zagg.sweep regenerates them)"
+        )
     return summary
 
 

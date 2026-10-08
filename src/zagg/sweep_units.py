@@ -211,17 +211,24 @@ def node_windows(store, node: str) -> set:
     return labels
 
 
-def _window_readers(store_root, node, labels, *, run_id, run_started, store_kwargs, counts) -> list:
-    """One reader per window overview at ``node``: reader, ``None``, or unreadable."""
+def _window_readers(store, node, labels, *, run_id, run_started, store_kwargs, counts) -> list:
+    """One reader per window overview at ``node``: reader, ``None``, or unreadable.
+
+    Read through ``store``, the invoke's one handle, by relative key (issue #610).
+    """
     from zagg.sweep_overview import _overview_basename
     from zagg.sweep_stage import ForeignSweepError, _node_rel
 
     row = []
     for label in labels:
-        path = f"{store_root}/{_node_rel(node)}/{_overview_basename(label)}"
+        path = f"{_node_rel(node)}/{_overview_basename(label)}"
         try:
             reader = _OverviewReader(
-                path, run_id=run_id, run_started=run_started, store_kwargs=store_kwargs
+                path,
+                run_id=run_id,
+                run_started=run_started,
+                store_kwargs=store_kwargs,
+                store=store,
             )
         except ForeignSweepError:
             raise
@@ -312,7 +319,7 @@ def close_node(
                 counts["failed"] += 1
                 continue
             reader_args = dict(run_id=run_id, run_started=run_started, store_kwargs=store_kwargs)
-            row = _window_readers(store_root, target, labels, counts=counts, **reader_args)
+            row = _window_readers(store, target, labels, counts=counts, **reader_args)
             sources = [reader for reader in row if _is_reader(reader)]
             if not sources:
                 counts["empty"] += 1  # no window overview at this node yet
@@ -320,7 +327,7 @@ def close_node(
             rows = [row]
             missing = sum(1 for reader in row if reader is None)
             fresh_gen = _summed_generation(rows)
-            entry = _artifact_entry(store_root, target, basename, run_id, run_started, store_kwargs)
+            entry = _artifact_entry(store, target, basename, run_id, run_started)
             if (
                 entry is not None
                 and generation_key(entry.get("generation")) == generation_key(fresh_gen)
@@ -334,7 +341,7 @@ def close_node(
 
             def _fresh_readers(target=target, labels=labels, row=row, args=reader_args):
                 # In place: ``rows`` holds this list (the unreadable were counted once).
-                row[:] = _window_readers(store_root, target, labels, counts={"failed": 0}, **args)
+                row[:] = _window_readers(store, target, labels, counts={"failed": 0}, **args)
 
             try:
                 slabs, broken, demotions = refold_on_move(

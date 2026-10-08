@@ -31,6 +31,7 @@ from zagg.sweep_stage import (
     DEFAULT_TUPLE_WIDTH,
     aggregate_actuals,
     ladder_entries,
+    one_stage_tuple,
     stage_node,
     stage_tuples,
 )
@@ -135,6 +136,7 @@ def sweep_stage_pass(
     on_node=None,
     level_actuals: dict | None = None,
     only_dispatch: int | None = None,
+    only_child_order: int | None = None,
     dirt_only: dict | None = None,
     only_unit: str | None = None,
     only_window: str | None = None,
@@ -200,7 +202,16 @@ def sweep_stage_pass(
     # stages, which the dispatcher's barrier accepts (review finding). It is a
     # pure function of shard_order and tuple_width and needs nothing on disk.
     schedule = stage_tuples(shard_order, tuple_width=tuple_width)
-    if only_dispatch is not None:
+    if only_dispatch is not None and only_child_order is not None:
+        # The dispatcher named this tuple's SPAN (issue #610). It has to:
+        # under a sized schedule the span is not derivable from one
+        # ``tuple_width``, since the dispatch orders are not multiples of it.
+        # ``one_stage_tuple`` carries the range refusal, and the node-order
+        # check in :func:`run_stage_worker` carries the rest of what the
+        # schedule filter below was guarding — a node that does not sit at
+        # ``dispatch`` is refused there whatever the span says.
+        schedule = [one_stage_tuple(shard_order, int(only_dispatch), int(only_child_order))]
+    elif only_dispatch is not None:
         picked = [t for t in schedule if int(t["dispatch"]) == int(only_dispatch)]
         if not picked:
             raise ValueError(
@@ -209,6 +220,11 @@ def sweep_stage_pass(
                 f"{[t['dispatch'] for t in schedule]}"
             )
         schedule = picked
+    elif only_child_order is not None:
+        raise ValueError(
+            f"a stage tuple span was named (child_order {only_child_order}) without the "
+            "dispatch order it starts at — send both or neither"
+        )
     decl = pyramid.get("overview") if isinstance(pyramid.get("overview"), dict) else {}
     # THE shared admission predicate (:func:`zagg.column._is_composable`), not a
     # literal class list: this map goes to ``stage_node`` unfiltered and reaches
@@ -306,6 +322,7 @@ def run_finisher(
     store_kwargs: dict | None = None,
     release=None,
     touch_policy: str = "auto",
+    withhold_levels=(),
 ) -> dict:
     """The designated finisher-worker (espg ruling): root singletons, once.
 
@@ -328,7 +345,10 @@ def run_finisher(
        explicit touch, step 3. The family dict's order-keyed
        ``materialized`` is deliberately NOT written on ``/2`` stores: the
        per-entry actuals are the one source of truth (the flatten-ruling
-       principle; any /1-era inventory is preserved verbatim);
+       principle; any /1-era inventory is preserved verbatim). A level in
+       ``withhold_levels`` is SKIPPED — its entry keeps whatever actuals
+       stood: the orders a run did not observe in full must not be stamped as
+       if it had (issue #610), and the next pass records them;
     2b. the issue #394 multiscales companion refresh
         (:func:`zagg.multiscales.write_multiscales_group`, spec §4.10) —
         gated on ``by_shard`` like step 1, fail-open like step 3 (the
@@ -355,12 +375,14 @@ def run_finisher(
     from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
+    withheld = {int(node) for node in withhold_levels or ()}
     out = {
         "root_moc": False,
         "manifest_updated": False,
         "objects_touched": 0,
         "touch_failures": 0,
         "lease_released": False,
+        "actuals_withheld": sorted(withheld, reverse=True),
     }
     shard_order = int(manifest["shard_order"])
     if by_shard:
@@ -389,6 +411,12 @@ def run_finisher(
                 ),
                 "generated_at": now,
             }
+        elif node in withheld:
+            # Short, by the dispatcher's own count of the records it awaited.
+            # The entry keeps the actuals it had: a stale observation is a
+            # recoverable under-report, a fresh one claiming this run saw the
+            # level is not (issue #610).
+            continue
         elif node in level_actuals:
             a = level_actuals[node]
             actuals = {
@@ -880,6 +908,7 @@ def run_stage_worker(
     nodes,
     batch: int = 0,
     tuple_width: int = DEFAULT_TUPLE_WIDTH,
+    child_order: int | None = None,
     partition: dict | None = None,
     records_from: str,
     lease_ttl_s: int | None = None,
@@ -897,6 +926,14 @@ def run_stage_worker(
     every store write (D8 intact: the dispatcher only invokes and polls) —
     restricted to ``nodes`` (this invoke's share of the tuple's dispatch
     nodes, spelled as decimals) at the ``dispatch`` order.
+
+    ``child_order`` is this tuple's SPAN — the order of the child columns it
+    reads — and is what the worker folds between, with ``dispatch``
+    (``zagg.sweep_stage.one_stage_tuple``). A sized schedule (issue #610)
+    dispatches at orders no single ``tuple_width`` lands on, so the span
+    cannot be re-derived here; ``None`` keeps the old derivation, where
+    ``tuple_width`` selects this tuple out of the fixed-width schedule and a
+    dispatch order that schedule does not hold is refused by name.
 
     ``nodes`` reaches the pass as the ordinary ``scope`` MOC, so a worker
     folds exactly the dispatch nodes it was handed and no others. Dispatch
@@ -1010,6 +1047,7 @@ def run_stage_worker(
         on_node=_maybe_beat,
         level_actuals=level_actuals,
         only_dispatch=int(dispatch),
+        only_child_order=None if child_order is None else int(child_order),
         dirt_only=regather,
         only_unit=unit,
         only_window=window,
@@ -1055,6 +1093,7 @@ def run_stage_finisher(
     records_from: str | None = None,
     touch_policy: str = "auto",
     barrier_timed_out: bool = False,
+    short_orders=(),
     lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
     record: bool = True,
@@ -1074,7 +1113,15 @@ def run_stage_finisher(
 
     ``barrier_timed_out`` is the dispatcher's verdict on its own soft barrier,
     threaded in so the RUN RECORD says the per-level actuals may be short — see
-    where it is recorded below. ``pipeline_run_id`` (issue #593) is the
+    where it is recorded below. ``short_orders`` says WHICH, and is the half
+    that keeps the manifest honest (issue #610, espg 2026-10-08): the orders
+    of every tuple the dispatcher is missing a unit record for. Their level
+    entries are left alone (``run_finisher(withhold_levels=...)``) while the
+    orders that did land are recorded as usual — the v3 ladder stamped actuals
+    for its walled ``[2,1,0]`` tuple exactly as it did for the complete
+    ``8..3``, so a reader could not tell the short levels from the whole ones.
+    Empty (an older dispatcher, or a run with every record in) records
+    everything, as before. ``pipeline_run_id`` (issue #593) is the
     pipeline run this sweep completes, recorded in the run record and the
     finisher record under its own key (``null`` when the dispatcher named none).
 
@@ -1168,11 +1215,19 @@ def run_stage_finisher(
     # only witness is the dispatcher's log, which does not outlive the process
     # — and the manifest would claim coverage it did not observe.
     summary["barrier_timed_out"] = bool(barrier_timed_out)
+    withheld = sorted({int(order) for order in short_orders or ()}, reverse=True)
+    summary["short_orders"] = withheld
     if barrier_timed_out:
         logger.warning(
             f"stage sweep {run_id}: the dispatcher reported an expired barrier — the "
             f"per-level actuals recorded from {len(records)} stage record(s) may "
             "under-report; the next pass heals them"
+        )
+    if withheld:
+        logger.warning(
+            f"stage sweep {run_id}: order(s) {withheld} are short a unit record — "
+            "their manifest actuals are left as they stood rather than stamped from "
+            "this run; re-run the staged sweep to record them"
         )
     summary["finisher"] = run_finisher(
         store_root,
@@ -1183,6 +1238,7 @@ def run_stage_finisher(
         store_kwargs=store_kwargs,
         release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
         touch_policy=touch_policy,
+        withhold_levels=withheld,
     )
     summary["lease"] = {"released": bool(summary["finisher"].get("lease_released"))}
     summary["duration_s"] = time.perf_counter() - t0

@@ -680,7 +680,7 @@ class TestStreamedFold:
         clean = self._swept_column(tmp_path / "clean", monkeypatch).parents[2]
         root = tmp_path / "torn" / "s"
         manifest = _wide_store(root)
-        moved = _move_after_first_read(monkeypatch, times=1)
+        moved = _move_after_first_read(monkeypatch, root, times=1)
         with caplog.at_level("INFO", logger="zagg.sweep_fold"):
             summary = sweep_stage_pass(
                 str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
@@ -698,7 +698,7 @@ class TestStreamedFold:
         monkeypatch.setattr(fold_mod, "STAGE_BLOCK_ORDER", 1)
         root = tmp_path / "s"
         manifest = _wide_store(root)
-        moved = _move_after_first_read(monkeypatch, times=2)
+        moved = _move_after_first_read(monkeypatch, root, times=2)
         summary = sweep_stage_pass(
             str(root), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
         )
@@ -793,7 +793,7 @@ def _restamp(column, written_at):
         group.attrs["morton_hive_commit"] = {**stamp, "written_at": written_at}
 
 
-def _move_after_first_read(monkeypatch, *, times):
+def _move_after_first_read(monkeypatch, root, *, times):
     """Restamp the source an overview fold read first, ``times`` folds in a row.
 
     Hooks the first overview fold of the pass (``_stage_fold``): its first
@@ -818,7 +818,7 @@ def _move_after_first_read(monkeypatch, *, times):
         values = real_fetch(reader, *args, **kwargs)
         if state["armed"]:
             state["armed"] = False
-            _restamp(reader.path, f"203{len(moved) + 1}-01-01T00:00:00+00:00")
+            _restamp(root / reader.path, f"203{len(moved) + 1}-01-01T00:00:00+00:00")
             moved.append(True)
         return values
 
@@ -1057,8 +1057,12 @@ class TestFleetUnits:
             barrier_timeout_s=0.01,
         )
         stage_block = client.blocks()[0]
+        # No `unit`/`window` on an unwindowed event — the claim this pins.
+        # `child_order` joined the block in issue #610: the tuple's span, which
+        # every stage event carries now that the schedule can be sized.
         assert sorted(stage_block) == [
             "batch",
+            "child_order",
             "dispatch",
             "nodes",
             "records_from",

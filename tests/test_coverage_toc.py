@@ -363,15 +363,15 @@ class TestPartialReadsDropTheShard:
         monkeypatch.setattr(leaf_temporal_module, "leaf_contribution", _route(reader))
         family = MocFamily()
         family._temporal_fields = {"h_tdigest": {"sibling": "h_tdigest_times"}}
-        family._accumulate_temporal("root", "11213", "root/11213_2019.zarr", {})
+        family._accumulate_temporal(None, "11213", "1/1/2/1/3/11213_2019.zarr")
         assert "11213" in family._temporal
-        family._accumulate_temporal("root", "11213", "root/11213_2020.zarr", {})
+        family._accumulate_temporal(None, "11213", "1/1/2/1/3/11213_2020.zarr")
         assert "11213" not in family._temporal
         # A later window that DOES read cannot resurrect a half-read shard.
-        family._accumulate_temporal("root", "11213", "root/11213_2021.zarr", {})
+        family._accumulate_temporal(None, "11213", "1/1/2/1/3/11213_2021.zarr")
         assert "11213" not in family._temporal
         # ... and the failure is scoped to its own shard.
-        family._accumulate_temporal("root", "11214", "root/11214_2019.zarr", {})
+        family._accumulate_temporal(None, "11214", "1/1/2/1/4/11214_2019.zarr")
         assert "11214" in family._temporal
 
 

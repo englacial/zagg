@@ -1678,22 +1678,24 @@ class RasterStrategy:
             finalize_error=finalize_error_str,
         )
         # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
-        # mirroring the aggregation lambda path — one fire-and-forget
-        # mode="sweep" Event invoke, fail-open (D9; the CLI backstops).
+        # mirroring the aggregation lambda path — partitioned from the leaf
+        # count and awaited (issue #610), fail-open (D9; the CLI backstops).
+        families_sweep = None
         if store_layout == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import leaves_from_stats_records
 
                 leaves = leaves_from_stats_records([b.get("stats") for _k, b in ok_units])
                 if leaves:
-                    _invoke_lambda_sweep(
+                    families_sweep = _invoke_lambda_families_sweep(
                         client,
                         function_name,
                         store_path,
                         leaves,
                         output_creds_event=output_creds_event,
+                        store_kwargs=_output_store_kwargs(output_creds_event, region),
+                        run_id=run_id,
                     )
-                    logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         # Precedence note (issue #335): the all-failed verdict still raises
@@ -1774,6 +1776,7 @@ class RasterStrategy:
                 )
             summary["worker_stage_max"] = stage_max
             summary["worker_stage_counts"] = stage_counts
+        summary["families_sweep"] = families_sweep
         logger.info(
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
@@ -4542,9 +4545,10 @@ def _run_lambda(
             icechunk_init=summary["icechunk"],
         )
         # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
-        # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
-        # worker Event invoke — async, retries-0, fail-open (D9: rollups are
-        # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
+        # (D8 standing rule), so the sweep rides mode="sweep" worker Event
+        # invokes — partitioned from the leaf count and awaited on their
+        # records under the run's status prefix (issue #610), fail-open (D9: rollups are caches;
+        # `python -m zagg.sweep` is the regeneration backstop). Leaves
         # come from the envelope stats records; a stale deployed worker's
         # record-less envelope simply contributes no leaf. The RECORDS drive
         # the work set, each on its own ``success``, not the invoke's status
@@ -4553,6 +4557,7 @@ def _run_lambda(
         # _run_local's sweep does — and a failed leaf's record is unsuccessful
         # on every unit shape, so nothing that did not land gets in.
         stage_chained, staged = False, None
+        summary["families_sweep"] = None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -4560,19 +4565,20 @@ def _run_lambda(
                 bodies = [r.get("body") or {} for r in report.results]
                 leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
                 if leaves:
-                    _invoke_lambda_sweep(
+                    summary["families_sweep"] = _invoke_lambda_families_sweep(
                         state["lambda_client"],
                         function_name,
                         store_path,
                         leaves,
                         output_creds_event=output_creds_event,
+                        store_kwargs=_output_store_kwargs(output_creds_event, region),
+                        run_id=run_id,
                     )
-                    logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
                 # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
                 # `output.sweep: "stages"`, the same knob the local dispatcher
-                # reads. Unlike the families leg this one is not
-                # fire-and-forget: the staged sweep is a fan-out with a soft
-                # barrier between tuples, so the ordering has to be driven
+                # reads. Like the families leg this one blocks: the staged
+                # sweep is a fan-out with a soft barrier between tuples, so
+                # the ordering has to be driven
                 # from somewhere and the dispatcher is the only place that can
                 # see every tuple complete. It still never WRITES (D8) — it
                 # invokes and polls the workers' stage records. Fail-open (D9:
@@ -5841,7 +5847,9 @@ def _invoke_lambda_coverage(
     )
 
 
-def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=None) -> dict:
+def _build_sweep_event(
+    store_path, leaves, output_creds_event=None, partition=None, records_from=None, finisher=None
+) -> dict:
     """One ``mode="sweep"`` worker event — the single construction site.
 
     Extracted from :func:`_invoke_lambda_sweep` (issue #377) so the fan-out
@@ -5860,8 +5868,13 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
     ``2^n`` morton-subtree partition this invoke owns; it is validated here
     (:func:`zagg.sweep_partition.normalize_partition`) rather than shipped
     unchecked. Absent -> the whole tree, exactly as before.
+
+    ``records_from`` (issue #610) is the run's status prefix: the worker PUTs a
+    copy of its sweep record there under
+    :func:`zagg.sweep_fleet.families_record_name`, which is what the families
+    barrier awaits.
     """
-    from zagg.sweep_partition import normalize_partition
+    from zagg.sweep_partition import normalize_partition, partition_split_order
 
     event: dict = {"mode": "sweep", "store_path": store_path}
     if output_creds_event is not None:
@@ -5869,10 +5882,27 @@ def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=No
     if partition is not None:
         index, of = normalize_partition(partition)
         event["partition"] = {"index": index, "of": of}
+    if records_from is not None:
+        event["records_from"] = records_from
+    if finisher is not None:
+        # The pass after a fan-out (issue #610): which split, and the partition
+        # records (under the run's status prefix) it composes the root
+        # section from instead of reading the leaves (zagg.sweep.run_sweep).
+        partition_split_order(int(finisher["of"]))
+        event["finisher"] = {
+            "of": int(finisher["of"]),
+            "records_from": str(finisher["records_from"]),
+            "accumulators": [str(k) for k in finisher["accumulators"]],
+        }
     event["leaves"] = [[int(key), window] for key, window in leaves]
     if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
         del event["leaves"]
         event["discover"] = True
+        # The discovered work set is the STORE's (every run record's leaves);
+        # the partitions' accumulators cover this run's only, so a composed
+        # section would be short. Without the block the finisher walks the
+        # leaves, as before issue #610.
+        event.pop("finisher", None)
     return event
 
 
@@ -6195,7 +6225,8 @@ def _invoke_lambda_sweep(
     — the D8 shape is unchanged, every store write is still worker-side. The
     partitions own no node above the split order, so the coarse levels and the
     store-root artifacts are left to the finisher. ``partitions=1`` (the
-    default, and what the runner tail keeps firing) is the single-invoke form,
+    default, and what the runner tail fired before issue #610 — the tails now
+    go through :func:`_invoke_lambda_families_sweep`) is the single-invoke form,
     byte-identical to the pre-feature event — it short-circuits past
     :func:`partition_leaves` precisely to keep that byte-identity, so the two
     branches differ on an EMPTY work set (one ``leaves: []`` invoke vs none).
@@ -6228,6 +6259,66 @@ def _invoke_lambda_sweep(
     return len(work)
 
 
+def _invoke_lambda_families_sweep(
+    lambda_client,
+    function_name,
+    store_path,
+    leaves,
+    *,
+    output_creds_event=None,
+    store_kwargs=None,
+    run_id=None,
+    barrier_timeout_s=None,
+) -> dict | None:
+    """The end-of-run families sweep over the fleet (issue #610); its outcome.
+
+    Replaces the tails' single fire-and-forget :func:`_invoke_lambda_sweep`
+    invoke, which on a store-scale run died at the 900 s wall with no record
+    and no report (the v3 California tail: 2,726 leaves, one invoke, a handle
+    that returned success). The orchestration is
+    :func:`zagg.sweep_fleet.run_families_sweep_fleet` — partitions sized from
+    the leaf count, a barrier on their records under the run's status prefix
+    (``run_id``'s, the one the dispatcher already polls), the finisher, a
+    barrier on its record — the same invoke-and-poll shape as
+    :func:`_invoke_lambda_stage_sweep`, and like it never a write (D8). So the
+    tail now BLOCKS on the families pass, two barriers of
+    :data:`zagg.sweep_fleet.DEFAULT_BARRIER_TIMEOUT_S` at most, before the
+    staged sweep and the finalize.
+
+    Fail-open (D9): a dispatch failure before anything was fired logs and
+    returns ``None``, so ``None`` means nothing is in flight; one after is the
+    outcome's ``finisher: "dispatch_failed"``. A short or missing record is
+    REPORTED in the outcome dict (``finisher``: ``"timed_out"`` /
+    ``"records_short"``, and ``landed < fired``), which the
+    run summary and the client handle carry as ``families_sweep``, never
+    swallowed. The local backend keeps its in-process single pass
+    (:func:`zagg.sweep.sweep_after_run`).
+    """
+    from zagg.sweep_fleet import run_families_sweep_fleet
+
+    knobs = {} if barrier_timeout_s is None else {"barrier_timeout_s": float(barrier_timeout_s)}
+    try:
+        outcome = run_families_sweep_fleet(
+            lambda_client,
+            function_name,
+            store_path,
+            leaves,
+            output_creds_event=output_creds_event,
+            store_kwargs=store_kwargs,
+            run_id=run_id,
+            **knobs,
+        )
+    except Exception as e:
+        logger.warning(f"families sweep dispatch failed (fail-open, D9 — rollups are caches): {e}")
+        return None
+    logger.info(
+        f"Dispatched families sweep over {len(leaves)} leaves: {outcome['partitions']} "
+        f"partition(s), {outcome['landed']}/{outcome['fired']} record(s) landed, "
+        f"finisher {outcome['finisher']}"
+    )
+    return outcome
+
+
 def _invoke_lambda_stage_sweep(
     lambda_client,
     function_name,
@@ -6239,6 +6330,7 @@ def _invoke_lambda_stage_sweep(
     store_kwargs=None,
     touch_policy="auto",
     max_nodes_per_invoke="default",
+    stage_target_nodes="default",
     barrier_timeout_s=None,
     total_barrier_budget_s=None,
     dirt_only=(),
@@ -6253,8 +6345,9 @@ def _invoke_lambda_stage_sweep(
     chaining. The orchestration lives in :mod:`zagg.sweep_fleet`; this is the
     runner's seam onto it, so the tail keeps one call site per transport.
 
-    Not fire-and-forget, unlike every other tail invoke: a staged sweep is a
-    fan-out with a soft barrier between tuples (a tuple's workers read the
+    Not fire-and-forget — like the families leg
+    (:func:`_invoke_lambda_families_sweep`), unlike every other tail invoke: a
+    staged sweep is a fan-out with a soft barrier between tuples (a tuple's workers read the
     columns the previous tuple's workers wrote), so somebody has to hold the
     ordering, and the dispatcher is the only party that sees every tuple
     finish. It still never writes to the store — D8 is about WRITES, and every
@@ -6282,6 +6375,34 @@ def _invoke_lambda_stage_sweep(
     subtrees, so no store byte moves with it. It is reachable HERE because the
     ruled default is sized for a store whose finest tuple is ~110 nodes, and
     the tail runs against whatever store the config names.
+
+    **How much one invoke folds.** ``max_nodes_per_invoke`` caps the NODES an
+    invoke is handed, but a dispatch node folds its whole subtree down to the
+    tuple's child order, so ONE node at width 3 folds up to 21 nodes however
+    small that cap — which is what walled the v3 ladder (issue #610, espg
+    2026-10-08: the base-cell ``3`` invoke of the ``[2,1,0]`` tuple died at
+    900 s after 12 of its 16 order-2 nodes, no record, and the finisher then
+    stamped manifest actuals for orders 2..0 as if they were as complete as
+    8..3). ``n`` nodes on one invoke fold up to ``n x`` that, so the target
+    bounds an INVOKE only once the two are composed: the dispatcher sizes
+    against the target shared out per node, and warns that it bounds nothing
+    when payload-only packing leaves the count unknown (review finding). At
+    this seam's default cap — one node an invoke — the two are one number.
+    The tail therefore asks for the SIZED schedule
+    (:data:`zagg.sweep_partition.STAGE_TARGET_NODES`): each fixed-width tuple
+    is subdivided inside its own span until its fattest dispatch node stays
+    within the target. This seam hands in no ``coverage`` MOC — a dispatcher
+    may not read one for itself (D8) — so the sizing takes the DENSE
+    ``(4 ** width - 1) // 3`` bound rather than measuring the store, which is
+    the conservative direction (a measurement over the run's own work set
+    would UNDER-estimate the fold on every append, review finding). At the
+    default target that is width 2 everywhere, which is what the v3 store
+    needed; an operator calling the dispatcher directly with ``coverage=``
+    gets the measurement. The
+    dispatcher's own default is off, because it is documented as the mirror of
+    the in-process pass at a given width; the wall is the tail's, so the ask
+    is the tail's. ``"default"`` here takes the tail's default (sized);
+    ``None`` restores the fixed-``tuple_width`` schedule.
 
     **If the dispatcher dies mid-barrier** (a CI timeout, Ctrl-C, a driving
     Lambda's own 900 s ceiling) the run's lease stays HELD, because the
@@ -6317,6 +6438,14 @@ def _invoke_lambda_stage_sweep(
     # so it cannot double as the unset sentinel the barrier knobs use.
     if max_nodes_per_invoke != "default":
         knobs["max_nodes_per_invoke"] = max_nodes_per_invoke
+    # Same sentinel discipline: `None` MEANS the fixed-width schedule, so it
+    # cannot double as "unset". Unset takes the tail's default, which is sized.
+    if stage_target_nodes == "default":
+        from zagg.sweep_partition import STAGE_TARGET_NODES
+
+        knobs["stage_target_nodes"] = STAGE_TARGET_NODES
+    else:
+        knobs["stage_target_nodes"] = stage_target_nodes
     try:
         summary = run_stage_sweep_fleet(
             lambda_client,
@@ -6346,6 +6475,12 @@ def _invoke_lambda_stage_sweep(
             f"staged sweep {summary['run_id']}: at least one barrier expired — the ladder may "
             "be partially covered and the finisher's per-level actuals may under-report; "
             "under-coverage is recorded per artifact and heals on the next pass"
+        )
+    if summary.get("short_orders"):
+        logger.warning(
+            f"staged sweep {summary['run_id']}: order(s) {summary['short_orders']} are short "
+            "a unit record — the finisher withheld their manifest actuals rather than "
+            "stamping them from this run; re-run the staged sweep to record them"
         )
     return summary
 

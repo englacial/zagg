@@ -1534,10 +1534,13 @@ def build_temporal(out: Path) -> None:
         quantize_words,
         read_cover,
     )
+    from zagg.store import open_object_store
     from zagg.sweep import MocFamily
 
     family = MocFamily()
-    contribution, _written_at = family.read_leaf(root, SHARD_KEY, None, "morton-hive/1", {})
+    contribution, _written_at = family.read_leaf(
+        open_object_store(root), SHARD_KEY, None, "morton-hive/1"
+    )
     family.finish(root, [{"payload": contribution}], 4, {})
     envelope = hive.read_root_coverage(root)
     # The shard envelope word is DERIVED from the generator's inputs — the
@@ -1769,6 +1772,7 @@ def build_uncounted(out: Path) -> None:
         read_cover,
     )
     from zagg.leaf_temporal import LEAF_TEMPORAL_NAME, count_words, cover_from_counts
+    from zagg.store import open_object_store
     from zagg.sweep import MocFamily
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1781,7 +1785,7 @@ def build_uncounted(out: Path) -> None:
             (scratch / name).unlink()
         family = MocFamily()
         contribution, _written_at = family.read_leaf(
-            str(scratch), SHARD_KEY, None, "morton-hive/1", {}
+            open_object_store(str(scratch)), SHARD_KEY, None, "morton-hive/1"
         )
         family.finish(str(scratch), [{"payload": contribution}], 4, {})
         assert family.summary()["temporal_routes"] == {"records": 0, "raw": 1}

@@ -198,6 +198,15 @@ class RunHandle:
         #: dispatch failed (fail-open, D9 — ``icechunk_finalize`` then says
         #: ``{"skipped"}``).
         self.stage_sweep: dict | None = None
+        #: The tail's families-sweep outcome (issue #610) — ``{"partitions",
+        #: "fired", "landed", "finisher", "run_id", "records_from",
+        #: "duration_s"}`` (plus ``"error"`` on ``"dispatch_failed"``) from
+        #: ``runner._invoke_lambda_families_sweep``, the same dict
+        #: ``runner._run_lambda`` reports as ``families_sweep``; ``None``
+        #: while the tail is in flight, when the run had no leaf to sweep, or
+        #: when its dispatch failed before any invoke fired (fail-open, D9). A ``finisher`` other than
+        #: ``"ok"`` means the root temporal section may be short.
+        self.families_sweep: dict | None = None
         #: How the run's dispatch manifest went out (issue #588): ``"full"``;
         #: ``"slim"`` — the block did not fit the hive setup Event, so it
         #: rode without its shard list (the config is kept: :meth:`Run.attach`
@@ -1363,12 +1372,15 @@ class Run:
                 bodies = [r.get("body") or {} for r in results]
                 leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
                 if leaves:
-                    runner._invoke_lambda_sweep(
+                    # Partitioned from the leaf count and awaited (issue #610).
+                    handle.families_sweep = runner._invoke_lambda_families_sweep(
                         client,
                         self.function_name,
                         self.store,
                         leaves,
                         output_creds_event=output_creds_event,
+                        store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
+                        run_id=run_id,
                     )
                 # Post-fleet STAGED chaining (issues #384/#519, here #588) —
                 # the same opt-in and the same seam as ``_run_lambda``'s

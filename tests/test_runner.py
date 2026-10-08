@@ -1867,6 +1867,9 @@ class TestSummaryKeysByteIdentical:
         "worker_warm_starts",
         "worker_rss_start_max_by_gen",
         "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
+        # The tail's families-sweep outcome (issue #610); None when nothing
+        # was swept. LAMBDA-only — the local backend sweeps in-process.
+        "families_sweep",
     } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -2265,6 +2268,7 @@ class TestSummaryKeysByteIdentical:
             function_name="process-shard",
         )
         assert set(summary.keys()) == self._LAMBDA_KEYS
+        assert summary["families_sweep"] is None  # flat: nothing was swept
         assert summary["backend"] == "lambda"
         assert summary["cells_with_data"] == 4
         assert summary["total_obs"] == 12
@@ -4884,6 +4888,28 @@ class TestFinalizeGuard:
         assert summary["finalize_error"] is None  # always-present, None on success
         assert captured["stats_finalize_error"] is None  # ... and on the wire too
         assert not [w for w in caught if "finalize" in str(w.message)]
+        # The tail carries the families outcome (issue #610): conftest's stub dict.
+        assert summary["families_sweep"] == {
+            "partitions": 1,
+            "fired": 1,
+            "landed": 1,
+            "finisher": "ok",
+        }
+
+    def test_the_families_seam_gets_the_run_id_and_output_store(self, monkeypatch, atl06_config):
+        from zagg import runner
+
+        run, _events, _sleeps, _captured = self._drive(
+            monkeypatch, atl06_config, finalize=lambda: None
+        )
+        seam, stats = {}, {}
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_families_sweep", lambda *a, **k: seam.update(k) or {"x": 1}
+        )
+        monkeypatch.setattr(runner, "_dispatch_run_stats", lambda *a, **k: stats.update(k))
+        assert run()["families_sweep"] == {"x": 1}
+        assert seam["run_id"] == stats["run_id"] and seam["run_id"]
+        assert seam["store_kwargs"]["region"] == "us-west-2"
 
     def test_retry_succeeds_warns_sleeps_no_raise(self, monkeypatch, atl06_config):
         outcomes = iter([RuntimeError("throttled"), None])

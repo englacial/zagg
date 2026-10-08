@@ -70,6 +70,7 @@ from zagg.icechunk_rows import (
     store_rows,
     write_bounds,
 )
+from zagg.windows import parse_utc
 
 logger = logging.getLogger(__name__)
 
@@ -307,11 +308,14 @@ def _boto3_credentials():
     if creds is None:
         raise RuntimeError("no AWS credentials resolved for the icechunk repo")
     frozen = creds.get_frozen_credentials()
+    expiry = getattr(creds, "_expiry_time", None)
     return S3StaticCredentials(
         access_key_id=frozen.access_key,
         secret_access_key=frozen.secret_key,
         session_token=frozen.token,
-        expires_after=getattr(creds, "_expiry_time", None),
+        # icechunk requires tzinfo to be ``datetime.timezone.utc`` itself; botocore's
+        # is a dateutil ``tzutc()``/``tzoffset``, so normalize it (issue #608).
+        expires_after=None if expiry is None else parse_utc(expiry),
     )
 
 
