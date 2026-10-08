@@ -62,9 +62,6 @@ echo "============================================================"
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/python"
 
-CONSTRAINTS="$OUTPUT_DIR/constraints.txt"
-echo "numpy<2.3" > "$CONSTRAINTS"
-
 # numpy: arm64 Lambda requires 64KB page alignment, so build from source with
 # the right LDFLAGS; x86_64 uses the prebuilt wheel. Both arches install the
 # extra's exact pin, so the two layers carry the same numpy.
@@ -72,9 +69,9 @@ echo "Installing numpy ($NUMPY_PIN)..."
 if [[ "$ARCH" == "arm64" ]]; then
     export LDFLAGS="-Wl,-z,max-page-size=0x10000"
     export NPY_BLAS_ORDER=openblas
-    $PIP install "$NUMPY_PIN" --no-binary numpy -t "$OUTPUT_DIR/python" --no-cache-dir
+    $PIP install "$NUMPY_PIN" --no-binary numpy --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 else
-    $PIP install "$NUMPY_PIN" -t "$OUTPUT_DIR/python" --no-cache-dir
+    $PIP install "$NUMPY_PIN" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 fi
 
 # Core processing deps. pyproj + odc-geo (and affine/cachetools) are required:
@@ -90,12 +87,17 @@ echo "Installing processing deps..."
 # reads collections/masks as xarray datasets and opens NetCDF4/HDF5 bytes
 # in-memory through the h5netcdf engine (h5coro is a byte-range reader, not
 # an xarray engine). All exact pins here come from the `lambda` extra
-# (lambda_pin above).
+# (lambda_pin above); everything else -- fastparquet, cramjam, shapely, pyproj,
+# odc-geo, affine, cachetools, obspec and the transitive deps of all of the
+# above -- comes pinned from uv.lock via layer-requirements.txt
+# (deployment/aws/lock_requirements.py, issue #613). --no-deps: pip resolves
+# nothing at build time, so the layer carries the versions the test suite ran
+# instead of whatever PyPI served that minute. --only-binary: a pin with no
+# wheel for this arch fails here instead of building its sdist unseen.
 $PIP install \
-    "$PANDAS_PIN" "$ARRO3_PIN" fastparquet cramjam \
-    "$XARRAY_PIN" "$H5NETCDF_PIN" "$H5PY_PIN" \
-    shapely pyproj odc-geo affine cachetools \
-    -c "$CONSTRAINTS" \
+    "$PANDAS_PIN" "$ARRO3_PIN" "$XARRAY_PIN" "$H5NETCDF_PIN" "$H5PY_PIN" \
+    -r "${SCRIPT_DIR}/layer-requirements.txt" \
+    --no-deps --only-binary=:all: \
     -t "$OUTPUT_DIR/python" \
     --no-cache-dir
 
@@ -130,10 +132,10 @@ fi
 
 # async-tiff (issue #218): the raster worker's GeoTIFF/COG decode engine
 # (mode="process_raster"). abi3 manylinux_2_28 wheel (~4 MB) on both arches;
-# its only dep is obspec (pure-python, tiny). The pin comes from the `lambda`
-# extra (lambda_pin above).
-echo "Installing async-tiff ($ASYNC_TIFF_PIN, +obspec)..."
-$PIP install "$ASYNC_TIFF_PIN" obspec -t "$OUTPUT_DIR/python" --no-cache-dir
+# its only dep, obspec (pure-python, tiny), is in layer-requirements.txt above.
+# The pin comes from the `lambda` extra (lambda_pin above).
+echo "Installing async-tiff ($ASYNC_TIFF_PIN, --no-deps)..."
+$PIP install "$ASYNC_TIFF_PIN" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # icechunk (issue #580): the worker-side Icechunk companion-repo writer
 # (mode="icechunk_init" + the per-leaf refs commit). cp312-abi3 manylinux

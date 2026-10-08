@@ -42,6 +42,8 @@ The Lambda function processes a single morton cell (order 6) by:
 | `src/zagg/catalog/` | CMR/STAC shard-map (granule catalog) builder (`python -m zagg.catalog`) |
 | `deployment/aws/invoke_lambda.py` | Orchestration script |
 | `deployment/aws/build_layer.sh` | Lambda layer build script (`x86_64`/`arm64`) |
+| `deployment/aws/build_function.sh` | Lambda function zip build script (handler + zagg + the non-layer deps) |
+| `deployment/aws/lock_requirements.py` | Writes `function-requirements.txt` / `layer-requirements.txt` from `uv.lock` (see [below](#zip-pins)) |
 
 ## Event Payload
 
@@ -280,6 +282,46 @@ script does, the parameter/environment-variable reference, cross-region staging,
 and teardown. The stack always creates the IAM execution role, so the identity
 running the standup needs `iam:CreateRole` — in an account whose deploy identity
 cannot (e.g. an AWS SSO "power user" set), have an admin run the standup itself.
+
+### Dependency pins and how a lock bump reaches the fleet {#zip-pins}
+
+Both zips are built from `uv.lock`, not resolved against PyPI at build time
+(issue #613), with one exception: `build_layer.sh` installs `mortie` at the
+latest release above its `[project.dependencies]` floor (`MORTIE_SPEC`, issue
+#322), so it is not in `layer-requirements.txt`. `deployment/aws/lock_requirements.py` projects the lock onto two
+committed files -- `function-requirements.txt` (the lock closure of `obstore`,
+`zarr`, `pydantic-zarr`, `pyyaml`) and `layer-requirements.txt` (the layer's
+closure minus the names the `lambda` extra pins exactly, which `build_layer.sh`
+installs itself) -- and the build scripts install them with
+`pip install -r ... --no-deps`. A worker therefore runs the versions a
+checkout synced from that lock tests; CI's `uv sync --extra test` is not
+lock-driven while `uv.lock` stays gitignored, so it resolves its own env. The
+function-zip size tripwire (34 MiB, `test_function_build_size`)
+only moves on a zagg change or a deliberate lock bump.
+
+A lock bump reaches the fleet through a PR and a release, never by a rebuild
+alone (only a new `mortie` release can change a rebuilt layer):
+
+1. Bump the lock where it lives (`uv.lock` is gitignored):
+   `uv lock --upgrade-package zarr` (or `uv lock --upgrade`), then
+   `uv run deployment/aws/lock_requirements.py`. Commit only the two
+   regenerated requirement files -- the lock itself stays gitignored, so their
+   diff is the bump. `test_requirements_match_uv_lock` in
+   `tests/test_lambda_build.py` fails until they match the lock on the
+   maintainer's checkout (an untracked `uv.lock` off CI); on CI, `uv sync`
+   writes a fresh resolution into the checkout, so there the test skips and
+   names the pins its env does not run.
+2. Open the PR. `lambda-build.yml` rebuilds both arches on the new pins and
+   runs the 250 MB combined gate; `test_function_build_size` catches
+   function-zip growth in the same PR, which is where it gets reviewed.
+3. Merge, then tag. `publish.yml` builds the zips again through
+   `lambda-build-reusable.yml` and attaches them to the GitHub release. Its
+   `distribute` job then copies them to
+   `s3://<LAMBDA_DIST_BUCKET>/<LAMBDA_DIST_PREFIX>/<minor>/` (Source
+   Cooperative, issue #497) and updates `versions.json` under the prefix, and
+   `deploy-prod`, after approval in the `production` environment, updates the
+   arm64 production function (and its worker-size variants) in place. Both
+   jobs are skipped unless the `LAMBDA_*` repository variables are set.
 
 ### Worker-size variants {#worker-size-variants}
 
