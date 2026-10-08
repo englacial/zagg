@@ -316,11 +316,13 @@ class _Harness:
     every leaf, column and overview it opens is then that window's.
 
     ``workers`` is the read concurrency of the per-cell value legs
-    (:func:`_run_cells`); the handle caches and the warning list are safe to
-    share across those threads (race-tolerant publishing, a per-thread
-    warning buffer so the merge keeps cell order). No lock is ever held
-    across a store open: a duplicate open is harmless, a serialized one
-    costs ``workers``x (:meth:`_open`, :meth:`array`, :meth:`leaf_group`).
+    (:func:`_run_cells`) and of any probe a leg issues through this harness
+    (the windowed arm's all-time probes); the handle caches and the warning
+    list are safe to share across those threads (race-tolerant publishing,
+    a per-thread warning buffer so the merge keeps cell order). No lock is
+    ever held across a store open: a duplicate open is harmless, a
+    serialized one costs ``workers``x (:meth:`_open`, :meth:`array`,
+    :meth:`leaf_group`).
     """
 
     def __init__(
