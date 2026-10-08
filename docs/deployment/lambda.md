@@ -569,18 +569,27 @@ Every store write stays worker-side. The dispatcher only invokes and polls.
 `zagg.sweep_fleet.run_stage_sweep_fleet` mirrors the in-process driver's tuple
 ordering exactly:
 
-0. **size the schedule** from the store's density, when the caller asked for
+0. **size the schedule** to the per-invoke fold, when the caller asked for
    it — the run tail does, the dispatcher's own default does not
-   ([issue #610](https://github.com/englacial/zagg/issues/610)). Each tuple
-   takes the widest width up to `tuple_width` whose fattest dispatch node
-   folds at most `zagg.sweep_partition.STAGE_TARGET_NODES` nodes, counted
-   over the per-order node sets the dispatcher already derives (nothing is
-   read from the store). A dispatch node folds its whole subtree down to the
-   tuple's child order in one invoke, so this — not
-   `max_nodes_per_invoke` — is what bounds the per-invoke wall: at width 3 a
-   dense tuple folds 21 nodes however small the node cap, which is what
-   walled the v3 ladder's `[2,1,0]` tuple at 900 s. Each tuple's row reports
-   the `width` it was given and the `fold_max` that chose it;
+   ([issue #610](https://github.com/englacial/zagg/issues/610)). Each
+   fixed-width tuple is subdivided inside its own `[dispatch, child_order)`
+   span until its fattest dispatch node folds at most
+   `zagg.sweep_partition.STAGE_TARGET_NODES` nodes, so a store that needs no
+   narrowing keeps the fixed-width schedule itself. The fold is the **dense
+   bound** `(4^width − 1) / 3` unless a `coverage` MOC was handed in, in
+   which case it is measured over the set a worker folds (the run's leaves ∪
+   that coverage); nothing is read from the store either way. A dispatch node
+   folds its whole subtree down to the tuple's child order in one invoke, so
+   this — not `max_nodes_per_invoke` — is what bounds a *node's* fold: at
+   width 3 a dense tuple folds 21 nodes however small the node cap, which is
+   what walled the v3 ladder's `[2,1,0]` tuple at 900 s. The two compose:
+   `max_nodes_per_invoke` nodes ride one invoke and each folds its own
+   subtree, so the schedule is sized against
+   `STAGE_TARGET_NODES / max_nodes_per_invoke`, and under payload-only
+   packing (`None`, a whole tuple on one worker) the target bounds no invoke
+   at all — the dispatcher logs that and sizes as if one node an invoke. Each
+   tuple's row reports the `width` it was given and the `fold_max` that chose
+   it;
 1. **fan out** one tuple's stage units, batched under `max_nodes_per_invoke`
    *and* the 250 KB async payload cap — whichever binds first closes a batch —
    with one `InvocationType="Event"` invoke per batch. On an unwindowed store
@@ -898,7 +907,7 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
 | 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
-| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits, over a schedule **sized from the store's density** so no invoke folds more than `STAGE_TARGET_NODES` nodes ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits, over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 
 Shards the launcher had not dispatched yet never run. Work through the steps
