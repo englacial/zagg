@@ -2753,6 +2753,15 @@ class TestMultiscalesLayout:
         layout[0]["dggs"]["name"] = "x"
         assert dggs[6]["name"] == "morton"
 
+    def test_root_conventions_take_the_dggs_map(self):
+        manifest = _mirror_manifest([(4, [5])], {"fold_source": "cascade"})
+        attrs = icechunk_refs.root_conventions(manifest, _dggs(6, 5))
+        assert attrs["zarr_conventions"] == [MULTISCALES_CONVENTION]
+        assert attrs["multiscales"]["layout"] == icechunk_refs.multiscales_layout(
+            manifest, _dggs(6, 5)
+        )
+        assert icechunk_refs.root_conventions({}, _dggs(6, 5)) == {}
+
     def test_root_attrs_compose_the_mirror_and_the_registration(self, cfg, tmp_path):
         grid = _grid(cfg)
         manifest = hive.build_manifest(grid)

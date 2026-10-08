@@ -565,10 +565,11 @@ def multiscales_layout(manifest: dict, dggs: dict) -> list[dict]:
     return layout
 
 
-def root_conventions(manifest: dict, members: dict) -> dict:
+def root_conventions(manifest: dict, dggs: dict) -> dict:
     """The root's convention attrs (§11.1): ``{}`` on a store with no mirror.
 
-    ``members`` are the level groups' specs keyed by name. The manifest's
+    ``dggs`` maps each level's cell order to its group's ``dggs`` attrs
+    block (as :func:`multiscales_layout` takes it). The manifest's
     single ``zagg-multiscales/1`` entry becomes the root ``multiscales``
     OBJECT (its keys verbatim — the v0.1 schema's ``additionalProperties``)
     plus :func:`multiscales_layout`; ``zarr_conventions`` registers the
@@ -579,7 +580,6 @@ def root_conventions(manifest: dict, members: dict) -> dict:
     mirror = manifest.get(MULTISCALES_ATTR)
     if not mirror:
         return {}
-    dggs = {int(name): spec.attributes["dggs"] for name, spec in members.items()}
     return {
         ZARR_CONVENTIONS_ATTR: [dict(MULTISCALES_CONVENTION)],
         MULTISCALES_ATTR: {**mirror[0], "layout": multiscales_layout(manifest, dggs)},
@@ -624,7 +624,8 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(
     }
     # The §4.9 discovery mirror as a conformant multiscales group (§11.1):
     # one repo, every level findable from its root attrs.
-    attributes: dict = {ICECHUNK_ATTR: block, **root_conventions(manifest, members)}
+    dggs = {int(name): spec.attributes["dggs"] for name, spec in members.items()}
+    attributes: dict = {ICECHUNK_ATTR: block, **root_conventions(manifest, dggs)}
     members.update(coordinate_specs(len(rows), manifest.get("temporal")))
     return GroupSpec(members=members, attributes=attributes)
 
