@@ -144,6 +144,25 @@ class SweepFamily:
         """Post-walk hook over the base-node artifacts; extra summary keys."""
         return {}
 
+    def accumulator(self) -> dict | None:
+        """What a PARTITION hands the finisher so it reads no leaf (issue #610).
+
+        Emitted on a partitioned pass as ``families.{name}.accumulator`` of
+        the partition's run record; the finisher is handed the records' keys
+        and :meth:`load_accumulators` folds the blocks before its walk. The
+        default ``None`` is a family whose finisher needs nothing from the
+        leaves: the JSON families' coarse levels fold from the split-order
+        rollups the partitions already wrote.
+        """
+        return None
+
+    def load_accumulators(self, blocks: list) -> None:
+        """Fold the partitions' :meth:`accumulator` blocks, one per record, before a finisher walk.
+
+        Raises ``ValueError`` (or ``KeyError``/``TypeError``) on a block it
+        cannot use; :func:`run_sweep` then falls back to the leaf walk.
+        """
+
     def summary(self) -> dict:
         """Per-pass telemetry keys, reported whether or not ``finish`` ran.
 
@@ -299,6 +318,50 @@ class MocFamily(SweepFamily):
             if route == "raw":
                 self._temporal_uncounted.add(decimal)
             self._temporal.setdefault(decimal, []).append(got)
+
+    def accumulator(self) -> dict:
+        """The partition's §10 contributions, in the record's own currency (issue #610).
+
+        Each visited shard's ``(word, counts)`` per window leaf, the
+        uncounted set, the declared field names and cell order, and the
+        route tally — everything :meth:`finish` and :meth:`summary` read off
+        the instance, so a finisher that loads every partition's block
+        composes the root section and the ``coverage.toc`` sibling
+        byte-for-byte as the single pass would, without a leaf GET. The
+        counts ride :func:`zagg.leaf_temporal.encode_counts`, the §10.3
+        block grammar, so each leaf's share is bounded by the §10.5 cap.
+        """
+        from zagg.leaf_temporal import encode_counts
+
+        return {
+            "fields": sorted(self._temporal_fields or {}),
+            "cell_order": int(self._cell_order),
+            "shards": {
+                decimal: [{"word": str(int(w)), "counts": encode_counts(c)} for w, c in parts]
+                for decimal, parts in sorted(self._temporal.items())
+            },
+            "uncounted": sorted(self._temporal_uncounted),
+            "routes": dict(self._temporal_routes),
+        }
+
+    def load_accumulators(self, blocks: list) -> None:
+        # docstring inherited
+        from zagg.leaf_temporal import decode_counts
+
+        fields: dict = {}
+        for block in blocks:
+            if not isinstance(block, dict):
+                raise ValueError("a partition record carries no moc accumulator (issue #610)")
+            fields.update(dict.fromkeys(block["fields"], {}))
+            self._cell_order = int(block["cell_order"]) or self._cell_order
+            for decimal, parts in block["shards"].items():
+                self._temporal.setdefault(decimal, []).extend(
+                    (int(p["word"]), decode_counts(p["counts"])) for p in parts
+                )
+            self._temporal_uncounted.update(block["uncounted"])
+            for route, n in block["routes"].items():
+                self._temporal_routes[route] = self._temporal_routes.get(route, 0) + int(n)
+        self._temporal_fields = fields
 
     def summary(self) -> dict:
         # ``temporal_routes: {records, raw}`` (issue #575): how this pass
@@ -822,6 +885,7 @@ def run_sweep(
     record: bool = True,
     partition=None,
     status_record: tuple[str, str] | None = None,
+    finisher=None,
 ) -> dict:
     """One sweep pass: fold leaf artifacts up-tree for each family (D22).
 
@@ -864,6 +928,19 @@ def run_sweep(
     prefix, where the fleet's families barrier awaits them — fail-open the
     same way, and ``summary["status_record"]`` names the copy (``None`` if it
     failed).
+
+    ``finisher`` (issue #610) is the pass that follows a ``4^k`` fan-out of
+    partitions: ``{"of": the split count, "records_from": the run's status
+    prefix, "accumulators": [record names under it]}`` — the partitions'
+    records, as the dispatcher awaited them. Each family folds the blocks
+    its partitions left there (:meth:`SweepFamily.load_accumulators`) and
+    its walk STARTS from the split-order rollups the partitions wrote, so
+    the finisher reads no leaf: the coarse levels, the root ``coverage.moc``
+    and its sibling compose in seconds where the leaf reads were minutes.
+    Byte-identical to the unpartitioned pass over the same work set when
+    every partition ran. When a record is missing or unusable the pass
+    falls back to the leaf walk — the finisher as it was — and the summary's
+    ``finisher`` block says so (``fallback``).
 
     One store handle per pass (issue #610): the JSON-rollup families
     (``stats``, ``moc``, ``submap``) and the temporal route read every leaf
@@ -910,6 +987,11 @@ def run_sweep(
     if part is not None:
         summary["partition"] = {"index": part[0], "of": part[1], "split_order": split}
         summary["foreign_leaves"] = foreign
+    above = 0
+    if finisher is not None:
+        above, summary["finisher"] = _load_finisher(finisher, fams, shard_order, store_kwargs)
+        if not above:
+            fams = [get_family(fam.name) for fam in fams]  # a half-loaded family folds twice
     for fam in fams:
         fam_t0 = time.perf_counter()
         runner = getattr(fam, "sweep_store", None)
@@ -925,13 +1007,60 @@ def run_sweep(
                 manifest.get("spec"),
                 store_kwargs,
                 split,
+                above,
             )
         result["duration_s"] = time.perf_counter() - fam_t0
         summary["families"][fam.name] = result
     summary["duration_s"] = time.perf_counter() - t0
     if record:
         summary["record"] = _write_sweep_record(store, summary, status_record, store_kwargs)
+        for result in summary["families"].values():
+            if "accumulator" in result:
+                # The RECORD carries the block, for the finisher; the returned
+                # summary — the CLI's print, a synchronous invoke's response —
+                # carries its size.
+                result["accumulator"] = {"shards": len(result["accumulator"]["shards"])}
     return summary
+
+
+def _load_finisher(finisher, fams, shard_order, store_kwargs) -> tuple[int, dict]:
+    """Fold the partitions' accumulator blocks; ``(split order, summary block)``.
+
+    The split order is 0 — the leaf walk — when any named record is absent,
+    unreadable, or lacks a block a family needs, logged once: a finisher that
+    cannot compose reads the leaves rather than publish a short section. The
+    records are the status-prefix copies the dispatcher awaited, read through
+    one handle on that prefix.
+    """
+    from zagg.hive import _read_json
+    from zagg.store import open_object_store
+    from zagg.sweep_partition import partition_split_order
+
+    of = int(finisher["of"])
+    split = partition_split_order(of)
+    keys = [str(k) for k in finisher.get("accumulators") or ()]
+    block = {"of": of, "accumulators": len(keys)}
+    if split > shard_order:
+        raise ValueError(f"finisher of={of} splits at order {split}, finer than shard_order")
+    try:
+        store = open_object_store(str(finisher["records_from"]), **store_kwargs)
+        records = []
+        for key in keys:
+            rec = _read_json(store, key)
+            if not isinstance(rec, dict):
+                raise ValueError(f"partition record {key} is absent or not an object")
+            records.append(rec)
+        for fam in fams:
+            fam.load_accumulators(
+                [(r.get("families") or {}).get(fam.name, {}).get("accumulator") for r in records]
+            )
+    except (KeyError, TypeError, ValueError) as e:
+        logger.warning(
+            f"sweep: finisher cannot compose from {len(keys)} partition record(s) ({e}) — "
+            f"reading the leaves instead (issue #610)"
+        )
+        return 0, {**block, "fallback": str(e)}
+    return split, block
 
 
 def _write_sweep_record(store, summary: dict, status_record=None, store_kwargs=None) -> str | None:
@@ -1012,22 +1141,38 @@ def _normalize_leaves(leaves, shard_order: int):
 
 
 def _sweep_family(
-    store_root, store, fam, by_shard, shard_order, spec, store_kwargs, min_order=0
+    store_root, store, fam, by_shard, shard_order, spec, store_kwargs, min_order=0, above=0
 ) -> dict:
     """Bottom-up fold of one family over the dirty ancestor paths.
 
     ``min_order`` (issue #377) is the partition's split order: the walk writes
     no node above it and the post-walk ``finish`` hook is deferred, because
     both span partitions. Zero — an unpartitioned pass — is the whole tree.
+
+    ``above`` (issue #610) is the FINISHER's floor: the partitions wrote
+    every rollup at and below their split order, so the walk starts from
+    those stored rollups instead of the leaves, and no leaf is read. A
+    rollup missing there (a partition that never ran) contributes nothing,
+    exactly as an emptied child does.
     """
+    from zagg.hive import _decimal_base
+
     counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
     computed: dict[str, dict | None] = {}
-    for decimal in sorted(by_shard):
-        computed[decimal] = _rollup_shard_node(
-            store, fam, decimal, by_shard[decimal], shard_order, spec, counts
-        )
-    frontier = [d for d in sorted(by_shard) if computed[d] is not None]
-    for _order in range(shard_order - 1, min_order - 1, -1):
+    if above:
+        for node in sorted({d[: len(_decimal_base(d)) + above] for d in by_shard}):
+            computed[node] = _read_rollup(store, fam, node)
+            if computed[node] is None:
+                counts["empty"] += 1
+        top = above - 1
+    else:
+        for decimal in sorted(by_shard):
+            computed[decimal] = _rollup_shard_node(
+                store, fam, decimal, by_shard[decimal], shard_order, spec, counts
+            )
+        top = shard_order - 1
+    frontier = [d for d in sorted(computed) if computed[d] is not None]
+    for _order in range(top, min_order - 1, -1):
         parents = sorted({a for d in frontier if (a := _ancestor(d)) is not None})
         frontier = []
         for node in parents:
@@ -1045,6 +1190,9 @@ def _sweep_family(
         # and then every node above the leaves is owed, not just the base ones.
         result["finish_deferred"] = True  # spans partitions -> the finisher's
         result["deferred_orders"] = list(range(min_order))
+        block = fam.accumulator()
+        if block is not None:
+            result["accumulator"] = block  # what the finisher composes from
     else:
         result.update(fam.finish(store_root, tops, shard_order, store_kwargs))
     return result

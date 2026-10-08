@@ -1040,9 +1040,14 @@ def run_families_sweep_fleet(
     )
     records_from = run_status_prefix(store_path, run_id)
 
-    def _fire(bucket, partition) -> None:
+    def _fire(bucket, partition, finisher=None) -> None:
         event = _build_sweep_event(
-            store_path, bucket, output_creds_event, partition, records_from=records_from
+            store_path,
+            bucket,
+            output_creds_event,
+            partition,
+            records_from=records_from,
+            finisher=finisher,
         )
         lambda_client.invoke(
             FunctionName=function_name, InvocationType="Event", Payload=json.dumps(event)
@@ -1073,6 +1078,7 @@ def run_families_sweep_fleet(
         "fired": 0,
         "landed": 0,
         "finisher": None,
+        "accumulators": None,
         "run_id": run_id,
         "records_from": records_from,
     }
@@ -1090,7 +1096,15 @@ def run_families_sweep_fleet(
                 summary["fired"] += 1
             seen = _wait({families_record_name({"index": i, "of": n}) for i in buckets})
             summary["landed"] = len(seen)
-            _fire(leaves, None)
+            compose = None
+            if len(seen) == len(buckets):
+                # Every partition's record stood: hand the finisher their
+                # names, so it composes the root section from the accumulators
+                # they carry and reads no leaf. A short fan-out leaves it on
+                # the leaf walk, which its own record then says.
+                compose = {"of": n, "records_from": records_from, "accumulators": sorted(seen)}
+                summary["accumulators"] = len(seen)
+            _fire(leaves, None, compose)
             landed = _wait(finisher)
             summary["finisher"] = (
                 "timed_out" if not landed else "records_short" if len(seen) < len(buckets) else "ok"

@@ -189,11 +189,21 @@ class TestTail:
         assert {e["records_from"] for e in client.events} == {prefix}
         finisher = client.events[-1]
         assert "partition" not in finisher and len(finisher["leaves"]) == len(LEAVES)
+        # Every partition record stood, so the finisher is told to compose
+        # from them (issue #610 phase 3) rather than read the leaves.
+        assert finisher["finisher"] == {
+            "of": 4,
+            "records_from": prefix,
+            "accumulators": sorted(
+                families_record_name({"index": i, "of": 4}) for i in partition_leaves(LEAVES, 4)
+            ),
+        }
         assert out == {
             "partitions": 4,
             "fired": 4,
             "landed": 4,
             "finisher": "ok",
+            "accumulators": 4,
             "run_id": RUN_ID,
             "records_from": prefix,
             "duration_s": out["duration_s"],
@@ -215,8 +225,10 @@ class TestTail:
         with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
             out = _fleet(client, root, LEAVES, target=3, barrier_timeout_s=0.2)
         assert (out["fired"], out["landed"], out["finisher"]) == (4, 3, "records_short")
-        # The finisher still fired (it folds what is there) and its record landed.
+        # The finisher still fired (it folds what is there) and its record landed
+        # — on the leaf walk: a short fan-out hands it no accumulators.
         assert "partition" not in client.events[-1] and len(client.events) == 5
+        assert "finisher" not in client.events[-1] and out["accumulators"] is None
         assert "families sweep" in caplog.text and "records_short" in caplog.text
 
     def test_a_finisher_that_never_lands_is_timed_out(self, tmp_path, monkeypatch, caplog):

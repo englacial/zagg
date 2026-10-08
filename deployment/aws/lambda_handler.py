@@ -1378,6 +1378,7 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
             store_kwargs=store_kwargs,
             families=event.get("families"),
             partition=event.get("partition"),
+            finisher=event.get("finisher"),
             status_record=(
                 (event["records_from"], families_record_name(event.get("partition")))
                 if event.get("records_from")

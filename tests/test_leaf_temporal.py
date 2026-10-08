@@ -918,6 +918,10 @@ class TestSweepRoute:
             assert moc["finish_deferred"] is True and "uncounted_shards" not in moc
             assert summary["record"].endswith(f"_p{index}of4.json")
             durable = json.loads((Path(root) / summary["record"]).read_text())
+            # The durable record carries the partition's accumulator block
+            # (issue #610); the returned summary, its size.
+            block = durable["families"]["moc"].pop("accumulator")
+            assert moc.pop("accumulator") == {"shards": len(block["shards"])}
             assert durable["families"]["moc"] == moc
             if index == 0:
                 assert moc["pass_uncounted"] == {
