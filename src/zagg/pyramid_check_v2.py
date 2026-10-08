@@ -108,6 +108,7 @@ def validate_v2(
     full: bool,
     resweep: bool,
     roster: str,
+    workers: int = 8,
 ) -> dict:
     """The ``/2`` checklist spine; called with the shared prologue done.
 
@@ -164,7 +165,7 @@ def validate_v2(
 
     # -- [2] materialization: the above-shard ladder (shared leg).
     probes, declared, state = _ladder_materialization(
-        store_root, ladder, leaves, store_kwargs, checks, report
+        store_root, ladder, leaves, store_kwargs, checks, report, workers=workers
     )
     if state == "errors":
         skip_rest("node probes failed", after="materialization")
@@ -173,7 +174,9 @@ def validate_v2(
     # -- [3] the §4.6 leaf-column tier — probed even at the pre-sweep
     # baseline: the campaign sequence is declare -> backfill -> sweep, so
     # "ladder 0/N, columns N/N" is exactly the post-backfill gate reading.
-    col_probes, col_state = _columns_check(store_root, leaves, store_kwargs, checks, report)
+    col_probes, col_state = _columns_check(
+        store_root, leaves, store_kwargs, checks, report, workers=workers
+    )
     if state == "baseline":
         skip_rest("no materialized ladder nodes (pre-sweep baseline)", after="columns")
         return _finish(report, CHECKS_V2)
@@ -190,6 +193,7 @@ def validate_v2(
         rng=rng,
         sample_nodes=sample_nodes,
         sample_cells=sample_cells,
+        workers=workers,
     )
     _value_checks_v2(
         harness,
@@ -269,19 +273,24 @@ def _declaration_grammar(manifest: dict) -> tuple[list, list, list]:
     return entries, leaf_cells, problems
 
 
-def _columns_check(store_root, leaves, store_kwargs, checks, report) -> tuple[dict, str]:
+def _columns_check(
+    store_root, leaves, store_kwargs, checks, report, *, workers: int = 8
+) -> tuple[dict, str]:
     """The §4.6 leaf-column roster: one committed column per roster leaf.
 
-    One ``zarr.json`` GET per leaf (the tier is part of the declared roster —
-    the ``/2`` leaf entry's artifact — and its completeness is the backfill
-    acceptance: ``docs/pyramid_upgrade.md`` requires ``failed == 0`` before
-    the staged sweep). Returns ``({leaf: committed attrs | None}, state)``
-    with the same three-way state as the ladder leg — and the same probe-error
-    discipline: a transport failure is UNKNOWN state, never a baseline.
+    One ``zarr.json`` GET per leaf, ``workers`` at a time (the tier is part
+    of the declared roster — the ``/2`` leaf entry's artifact — and its
+    completeness is the backfill acceptance: ``docs/pyramid_upgrade.md``
+    requires ``failed == 0`` before the staged sweep). Returns ``({leaf:
+    committed attrs | None}, state)`` with the same three-way state as the
+    ladder leg — and the same probe-error discipline: a transport failure
+    is UNKNOWN state, never a baseline.
     """
     from zagg.column import COLUMN_ROLE
 
-    probed, errored = _probe_nodes(store_root, leaves, store_kwargs, rel=_column_object_rel)
+    probed, errored = _probe_nodes(
+        store_root, leaves, store_kwargs, rel=_column_object_rel, workers=workers
+    )
     committed = {
         d: attrs if _committed(attrs, role=COLUMN_ROLE) else None for d, attrs in probed.items()
     }

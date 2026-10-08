@@ -214,6 +214,43 @@ class TestACorrectStore:
         assert main([str(built[0])]) == 0
         assert "VERDICT: PASS" in capsys.readouterr().out
 
+    def test_the_report_is_identical_at_any_pool_size(self, built):
+        # The windowed arm's independent reads — the roster listing, the
+        # (node, window) and (leaf, window) probes, the per-cell legs of each
+        # window and of the all-time fold — run ``workers`` at a time (issue
+        # #434); the report, warnings included, cannot tell. ``--roster moc``
+        # is the listed roster, the one leg that pools per shard.
+        for kwargs in (
+            {"sample_windows": 2, "sample_nodes": 1, "sample_cells": 2, "roster": "moc"},
+            {"full": True},
+        ):
+            sequential = validate_pyramid(str(built[0]), workers=1, **kwargs)
+            assert sequential["passed"], format_report(sequential)
+            pooled = validate_pyramid(str(built[0]), workers=8, **kwargs)
+            assert json.dumps(pooled) == json.dumps(sequential), kwargs
+
+    def test_a_damaged_report_is_identical_at_any_pool_size(self, store):
+        # The clean twin above carries no mismatch lists and warns only outside
+        # the pool. Here every 2018 overview is 2019's under 2018's name, and a
+        # leaf's 2020 column is gone: the per-window and all-time cell legs
+        # fail by cell, and ``_WindowSources`` warns from inside them — the
+        # lists and heads a pool must keep in order, sampled and full.
+        for target in store.rglob("2018.zarr"):
+            shutil.rmtree(target)
+            shutil.copytree(target.parent / "2019.zarr", target)
+            _set_attrs(target, lambda a: a["zagg_overview"].update(window="2018"))
+        leaf = SHARDS[0]
+        shutil.rmtree(store / _rel(leaf[:-1], f"{leaf[-1]}/2020.pyramid.zarr"))
+        for kwargs in ({"sample_windows": 2, "sample_nodes": 2, "sample_cells": 3}, {"full": True}):
+            sequential = validate_pyramid(str(store), workers=1, **kwargs)
+            checks = sequential["checks"]
+            assert len(checks["all_time"]["mismatches"]) > 1
+            assert any("contributor" in w and "unreadable" in w for w in sequential["warnings"])
+            if kwargs.get("full"):  # the sample may not reach a 2018 window; full does
+                assert len(checks["counts"]["mismatches"]) > 1
+            pooled = validate_pyramid(str(store), workers=8, **kwargs)
+            assert json.dumps(pooled) == json.dumps(sequential), kwargs
+
     def test_a_nodes_windows_are_its_window_overviews_only(self, store):
         from zagg.pyramid_check_windowed import _node_window_labels
         from zagg.store import open_object_store

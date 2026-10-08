@@ -74,6 +74,7 @@ from zagg.pyramid_check_core import (
     _finish,
     _Harness,
     _leaf_roster,
+    _map_concurrent,
     _node_object_rel,
     _probe_nodes,
     _rank,
@@ -102,7 +103,7 @@ _VALUE_CHECKS = ("readback", "counts", "digests", "composition")
 _COUNTERS = ("folded", "missing", "unreadable")
 
 
-def window_roster(store_root, manifest, store_kwargs, mode) -> tuple[list, str]:
+def window_roster(store_root, manifest, store_kwargs, mode, *, workers=8) -> tuple[list, str]:
     """``(shard decimal, window)`` leaf refs + the source used.
 
     ``auto`` reads the run records (:func:`zagg.sweep.discover_leaves` — the
@@ -126,14 +127,13 @@ def window_roster(store_root, manifest, store_kwargs, mode) -> tuple[list, str]:
             return sorted(refs), "run records"
     if mode == "moc":
         shards, _source = _leaf_roster(store_root, manifest, store_kwargs, "moc")
-        return _listed_refs(store_root, shards, store_kwargs), "coverage.moc + shard lists"
+        refs = _listed_refs(store_root, shards, store_kwargs, workers=workers)
+        return refs, "coverage.moc + shard lists"
     return _listed_refs(store_root, None, store_kwargs, int(manifest["shard_order"])), "list"
 
 
-def _listed_refs(store_root, shards, store_kwargs, shard_order=None) -> list:
-    """Windowed leaf refs by listing: the whole store, or each shard's node."""
-    import concurrent.futures
-
+def _listed_refs(store_root, shards, store_kwargs, shard_order=None, *, workers=8) -> list:
+    """Windowed leaf refs by listing: the whole store, or each shard's node (``workers`` at a time)."""
     import obstore
 
     from zagg.grids.morton import morton_word
@@ -165,8 +165,7 @@ def _listed_refs(store_root, shards, store_kwargs, shard_order=None) -> list:
         names = [str(p).rstrip("/").rsplit("/", 1)[-1] for p in listing["common_prefixes"]]
         return [r for r in (ref(name, decimal) for name in names) if r is not None]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        return sorted(r for refs in pool.map(windows_of, shards) for r in refs)
+    return sorted(r for refs in _map_concurrent(windows_of, shards, workers) for r in refs)
 
 
 def _roster_gaps(store_root, manifest, store_kwargs, declared, refs, source) -> tuple:
@@ -244,8 +243,15 @@ def validate_windowed(
     full: bool,
     resweep: bool,
     roster: str,
+    workers: int = 8,
 ) -> dict:
-    """The windowed ``/2`` checklist spine; called with the shared prologue done."""
+    """The windowed ``/2`` checklist spine; called with the shared prologue done.
+
+    ``workers`` is the read concurrency of the pooled legs — the ``--roster
+    moc`` shard listing, the (node, window) and (leaf, window) probes, the
+    per-cell value reads and the all-time fold — as in the unwindowed arms;
+    ``coordinates``, ``records`` and the roster cross-check stay sequential.
+    """
     from zagg.pyramid_check_v2 import _declaration_grammar, _restage_check
 
     checks = report["checks"]
@@ -278,7 +284,9 @@ def validate_windowed(
 
     # -- roster: (shard, window) leaves — what every declared artifact derives from.
     try:
-        refs, roster_source = window_roster(store_root, manifest, store_kwargs, roster)
+        refs, roster_source = window_roster(
+            store_root, manifest, store_kwargs, roster, workers=workers
+        )
     except Exception as exc:
         checks["materialization"] = _entry("fail", f"no leaf roster: {exc}")
         skip_rest("no roster", after="materialization")
@@ -329,6 +337,7 @@ def validate_windowed(
         baseline="pre-sweep baseline",
         checks=checks,
         report=report,
+        workers=workers,
     )
     if state == "errors":
         skip_rest("node probes failed", after="materialization")
@@ -361,6 +370,7 @@ def validate_windowed(
         baseline="pre-backfill baseline",
         checks=checks,
         report=report,
+        workers=workers,
     )
     if state == "baseline":
         skip_rest("no materialized ladder nodes (pre-sweep baseline)", after="columns")
@@ -378,6 +388,7 @@ def validate_windowed(
         rng=rng,
         sample_nodes=sample_nodes,
         sample_cells=sample_cells,
+        workers=workers,
     )
     groups = _field_groups(harness, report)
     errors: dict = {name: [] for name in _VALUE_CHECKS}
@@ -526,13 +537,24 @@ def _window_envelope(temporal: dict, label: str) -> tuple[int, int]:
 
 
 def _artifact_probes(
-    store_root, names_by_window, store_kwargs, *, rel, role, what, check, baseline, checks, report
+    store_root,
+    names_by_window,
+    store_kwargs,
+    *,
+    rel,
+    role,
+    what,
+    check,
+    baseline,
+    checks,
+    report,
+    workers=8,
 ) -> tuple[dict, str]:
     """Probe one artifact per ``(name, window)`` and settle ``check``.
 
     ``names_by_window`` maps each window to the node (or leaf) decimals that
     must carry its artifact; ``rel`` maps ``(decimal, window)`` to the
-    artifact's zarr root. One ``zarr.json`` GET each. Returns ``({window:
+    artifact's zarr root. One ``zarr.json`` GET each, ``workers`` at a time. Returns ``({window:
     {decimal: committed attrs | None}}, state)`` with the unwindowed legs'
     three-way state: ``"errors"`` (a transport failure — UNKNOWN, never a
     verdict), ``"baseline"`` (none committed) or ``"ok"``. A missing or
@@ -543,7 +565,7 @@ def _artifact_probes(
     n_declared = 0
     for window, names in sorted(names_by_window.items()):
         probed, errored = _probe_nodes(
-            store_root, names, store_kwargs, rel=partial(rel, window=window)
+            store_root, names, store_kwargs, rel=partial(rel, window=window), workers=workers
         )
         probe_errors.extend(f"{n}[{window}]: {e}" for n, e in sorted(errored.items()))
         committed[window] = {
@@ -650,6 +672,7 @@ def _window_checks(
             sample_nodes=harness.sample_nodes,
             sample_cells=harness.sample_cells,
             window=window,
+            workers=harness.workers,
         )
         found: dict = {name: [] for name in _VALUE_CHECKS}
         by_order = {
@@ -712,10 +735,12 @@ class _WindowSources(_Harness):
         for window, group, j in self._cell(cell_dec, source):
             if group is None:
                 complete = False
-            elif field in group:
-                out.append(np.asarray(group[field][j : j + 1]))
-            else:
+                continue
+            arr = self.array(group, field)
+            if arr is None:
                 self.warn(f"{source[0]}[{window}] lacks field {field!r} — contributes fill")
+                continue
+            out.append(np.asarray(arr[j : j + 1]))
         return out, complete
 
     def paired_contributions(self, cell_dec, source, word_field, of_field):
@@ -724,16 +749,11 @@ class _WindowSources(_Harness):
             if group is None:
                 complete = False
                 continue
-            has_word, has_of = word_field in group, of_field in group
-            if has_of and not has_word:
+            word_arr, of_arr = self.array(group, word_field), self.array(group, of_field)
+            if of_arr is not None and word_arr is None:
                 poisoned = True
-            elif has_of:
-                parts.append(
-                    (
-                        np.asarray(group[word_field][j : j + 1]),
-                        np.asarray(group[of_field][j : j + 1]),
-                    )
-                )
+            elif of_arr is not None:
+                parts.append((np.asarray(word_arr[j : j + 1]), np.asarray(of_arr[j : j + 1])))
         return parts, poisoned, complete
 
 
@@ -781,7 +801,10 @@ def _all_time_check(
 
     orders = {k: sorted({n for w in declared for n in declared[w][k]}) for k, _ in ladder}
     probed, errored = _probe_nodes(
-        harness.store_root, [n for k in orders for n in orders[k]], harness.store_kwargs
+        harness.store_root,
+        [n for k in orders for n in orders[k]],
+        harness.store_kwargs,
+        workers=harness.workers,
     )
     if errored:
         checks["all_time"] = _entry(
@@ -829,6 +852,7 @@ def _all_time_check(
         rng=harness.rng,
         sample_nodes=harness.sample_nodes,
         sample_cells=harness.sample_cells,
+        workers=harness.workers,
     )
     store = open_object_store(harness.store_root, **harness.store_kwargs)
     errors: dict = {name: [] for name in _VALUE_CHECKS}
@@ -922,6 +946,7 @@ def _all_time_node(
                 [node],
                 sources.store_kwargs,
                 rel=partial(_node_object_rel, window=window),
+                workers=sources.workers,
             )
             if errored:
                 errors["readback"].append(f"{node}[{window}]: probe failed ({errored[node]})")
