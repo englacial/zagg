@@ -197,6 +197,30 @@ def _digest_expectations(exp):
                 yield field, cell["index"], want
 
 
+class TestDggsEllipsoid:
+    """§1 — the ``dggs`` block's ellipsoid spells the v1 schema's keys."""
+
+    def test_every_committed_dggs_block_spells_semi_major_axis(self):
+        # Issue #616: every committed ``zarr.json`` carrying a ``dggs`` block
+        # — leaves, columns, overviews, pyramid declarations — is a
+        # re-templated artifact and so spells the schema's ``semi_major_axis``
+        # (``ellipsoidObject`` is ``additionalProperties: false``). The
+        # pre-fix ``semimajor_axis`` vintage survives only in stores written
+        # through 0.58.0, never in these fixtures.
+        seen = 0
+        for meta in SPEC_DATA.rglob("zarr.json"):
+            attrs = json.loads(meta.read_text()).get("attributes", {})
+            if "dggs" not in attrs:
+                continue
+            seen += 1
+            assert set(attrs["dggs"]["ellipsoid"]) == {
+                "name",
+                "semi_major_axis",
+                "inverse_flattening",
+            }, meta.relative_to(SPEC_DATA)
+        assert seen > 0
+
+
 class TestRaggedAttrs:
     """§1.2 — the self-describing ``ragged`` attrs block."""
 
