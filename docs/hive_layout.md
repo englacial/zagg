@@ -601,6 +601,22 @@ coarse rollup levels, the root `coverage.moc` refresh, and the manifest's
 `pyramid.materialized` bookkeeping all span partitions and are left to a
 coarse-level finisher (issue #377).
 
+**The run tail partitions this itself** on the Lambda backends ([issue
+#610](https://github.com/englacial/zagg/issues/610)): the end-of-run
+families pass is split `4^k` ways from the run's own leaf count — `k` from
+`ceil(log4(leaves / 128))`, then refined until no partition holds more than
+128 leaves, because a regional store's leaves cluster (the 2,959-leaf
+California store's 64-way split held 1,050 in one) — fired one `mode="sweep"`
+invoke per non-empty partition, awaited on their `sweep_stats_<ts>_p<i>of<n>.json`
+records at the store root, and then finished by a partition-less invoke
+awaited on its own record; a run of at most 128 leaves is the one pass it
+always was. The outcome rides the run summary and the `zagg.client` handle as
+`families_sweep: {partitions, fired, landed, finisher}`, with `finisher`
+`"ok"`, `"records_short"` (a partition's record never landed) or
+`"timed_out"` (the finisher's did not), so a short root temporal section is
+reported rather than discovered later. The local backend sweeps in-process
+and needs none of this.
+
 Until that finisher lands, the coarse levels of the **JSON rollup families**
 (`stats`, `moc`, `submap`) can be picked up by following a partitioned sweep
 with a plain `python -m zagg.sweep <root> --families stats,moc,submap`: the

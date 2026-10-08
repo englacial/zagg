@@ -39,6 +39,40 @@ window) invokes decompose further. Noted, not implemented (issue #377 v1).
 
 from __future__ import annotations
 
+#: Leaves one partition of the run tail's families pass is sized to hold
+#: (issue #610). The v3 California pass folded about a leaf a second per
+#: invoke — the rollup PUTs dominate (~2.5 objects a leaf) — so 128 leaves is
+#: minutes against the 900 s wall, with room for a queued start.
+FAMILIES_TARGET_LEAVES = 128
+
+
+def families_partitions(leaves, target: int = FAMILIES_TARGET_LEAVES) -> int:
+    """The ``4^k`` the run tail splits a families pass into (issue #610).
+
+    Sized from the LEAVES, not a fixed width: ``k`` starts at
+    ``ceil(log4(ceil(n / target)))`` — the width that holds ``target`` leaves
+    per partition if the keys spread evenly — and is refined upward while the
+    largest partition :func:`partition_leaves` actually produces is over
+    ``target``, up to the leaves' own order (one shard per partition, the
+    finest split :func:`zagg.sweep.run_sweep` admits). Regional stores
+    cluster: the 2,959-leaf California store's 64-way split held 1,050 leaves
+    in one partition, past the wall at the observed rate, which is why the
+    count alone cannot size it (espg, issue #610). ``1`` for a work set of at
+    most ``target`` leaves — the single pass the tail fired before.
+    """
+    from zagg.grids.morton import morton_decimal
+    from zagg.hive import _decimal_order
+
+    refs = [tuple(r) if isinstance(r, (tuple, list)) else (r, None) for r in leaves]
+    finest = min((_decimal_order(morton_decimal(int(key))) for key, _w in refs), default=0)
+    k = 0
+    while k < finest and (
+        4**k * int(target) < len(refs)
+        or max(len(b) for b in partition_leaves(refs, 4**k).values()) > int(target)
+    ):
+        k += 1
+    return 4**k
+
 
 def partition_split_order(partitions: int) -> int:
     """Morton order a ``partitions``-way split lands on (``2^(2k)`` -> ``k``).

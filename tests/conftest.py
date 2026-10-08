@@ -127,6 +127,29 @@ def _no_s3_run_stats(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _tail_families_sweep_lands_nothing(monkeypatch):
+    """Stub the tail's families-sweep barrier (issue #610): one invoke, no wait.
+
+    The Lambda tails fire the families pass partitioned and BLOCK on the
+    workers' store-root records; the stub clients the dispatcher harnesses
+    use land none, so the real seam would poll out its budget. The stub fires
+    the one ``mode="sweep"`` Event invoke those harnesses have always
+    observed (through ``runner._invoke_lambda_sweep``, so a test's own patch
+    of it still intercepts) and reports it landed. The seam's own tests
+    override this fixture by name (``tests/test_sweep_families_fleet.py``).
+    """
+    from zagg import runner
+
+    def one_invoke(client, function_name, store_path, leaves, *, output_creds_event=None, **_kw):
+        runner._invoke_lambda_sweep(
+            client, function_name, store_path, leaves, output_creds_event=output_creds_event
+        )
+        return {"partitions": 1, "fired": 1, "landed": 1, "finisher": "ok"}
+
+    monkeypatch.setattr(runner, "_invoke_lambda_families_sweep", one_invoke)
+
+
+@pytest.fixture(autouse=True)
 def _no_run_stats_verify(monkeypatch):
     """Disable the issue #313 fire->verify->re-fire poll by default in tests.
 
