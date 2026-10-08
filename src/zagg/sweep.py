@@ -329,7 +329,10 @@ class MocFamily(SweepFamily):
         composes the root section and the ``coverage.toc`` sibling
         byte-for-byte as the single pass would, without a leaf GET. The
         counts ride :func:`zagg.leaf_temporal.encode_counts`, the §10.3
-        block grammar, so each leaf's share is bounded by the §10.5 cap.
+        block grammar. A record-route leaf's share is §10.5-capped (the
+        record was capped when written); a raw-route leaf's is its
+        un-coalesced order-24 bucket set, uncapped, exactly as the single
+        pass holds it — capping it here would change the composed bytes.
         """
         from zagg.leaf_temporal import encode_counts
 
