@@ -7,7 +7,7 @@
 #
 # The Lambda layer provides heavy deps (numpy, pandas, pyproj, etc).
 # This script builds the function code with lighter deps (zarr, obstore, etc)
-# that pip resolves transitively — no more manual dep discovery.
+# pinned from uv.lock (function-requirements.txt, issue #613).
 
 set -e
 
@@ -126,15 +126,16 @@ esac
 rm -rf "$BUILD_DIR/bin"
 
 # --- Install function-level dependencies ---
-# These are packages NOT in the Lambda layer.
-# pip resolves transitive deps automatically — no manual dep hunting.
+# These are packages NOT in the Lambda layer. The pins come from uv.lock via
+# deployment/aws/lock_requirements.py (issue #613): the lock closure of
+# obstore, zarr, pydantic-zarr and pyyaml, installed --no-deps so pip resolves
+# nothing at build time and the worker runs the versions the test suite ran.
+# Handing pip the floors instead let every upstream release land in the zip
+# unreviewed (PR #611: a pydantic-core release alone tripped the size budget).
 echo ""
-echo "Installing function dependencies (pip resolves transitive deps)..."
-$PIP install --target "$BUILD_DIR" --no-cache-dir \
-    "obstore>=0.8.2" \
-    "zarr>=3.1.5" \
-    "pydantic-zarr>=0.9.1" \
-    "pyyaml"
+echo "Installing function dependencies (pinned from uv.lock, --no-deps)..."
+$PIP install --target "$BUILD_DIR" --no-cache-dir --no-deps \
+    -r "$SCRIPT_DIR/function-requirements.txt"
 
 # --- Remove packages already in the Lambda layer ---
 # The layer provides these (plus their transitive deps). Removing them from
@@ -208,7 +209,9 @@ echo "Function code: ${UNZIPPED_SIZE} (${UNZIPPED_BYTES} bytes)"
 
 # Function code budget: 32MB (espg ruling 2026-08-24, PR #511 question 1) —
 # an early-warning tripwire under AWS's 50MB direct-upload zip limit, leaving
-# room for the ~220MB layer; mirrored in tests/test_lambda_build.py.
+# room for the ~220MB layer; mirrored in tests/test_lambda_build.py. With the
+# deps pinned from uv.lock (issue #613) it only moves on a zagg change or a
+# deliberate lock bump.
 FUNCTION_BUDGET=$((32 * 1024 * 1024))
 if [ "$UNZIPPED_BYTES" -gt "$FUNCTION_BUDGET" ]; then
     echo "WARNING: Function code exceeds 32MB budget!"

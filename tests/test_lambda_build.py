@@ -24,6 +24,8 @@ LAMBDA_UNZIPPED_LIMIT = 250 * 1024 * 1024  # 250MB combined (layer + function)
 # hard limit for direct-upload zips is 50MB, so this is an early-warning
 # tripwire, not the platform cap — 30MB left ~19KB of headroom on main and any
 # source addition tripped it. Mirrored in deployment/aws/build_function.sh.
+# With the deps pinned from uv.lock (issue #613) it only moves on a zagg change
+# or a deliberate lock bump.
 FUNCTION_SIZE_BUDGET = 32 * 1024 * 1024
 
 
@@ -174,6 +176,113 @@ class TestFunctionBuild:
         assert total < FUNCTION_SIZE_BUDGET, (
             f"Function code {total / 1024 / 1024:.1f}MB exceeds "
             f"{FUNCTION_SIZE_BUDGET / 1024 / 1024:.0f}MB budget"
+        )
+
+
+class TestFunctionRequirements:
+    """The function zip's deps are pinned from uv.lock, not resolved from floors.
+
+    build_function.sh used to hand pip ``obstore>=0.8.2`` and friends, so the
+    worker ran whatever PyPI served at build time -- never what pytest ran --
+    and the size budget moved with upstream releases (issue #613: a pydantic
+    release tripped it with no zagg change). deployment/aws/lock_requirements.py
+    derives function-requirements.txt from the lock; these pin the contract.
+    """
+
+    REQUIREMENTS = REPO_ROOT / "deployment" / "aws" / "function-requirements.txt"
+    GENERATOR = REPO_ROOT / "deployment" / "aws" / "lock_requirements.py"
+
+    @staticmethod
+    def _pins(text):
+        """``{"zarr": "3.2.1", ...}`` from ``name==version[ ; marker]`` lines."""
+        pins = {}
+        for line in text.splitlines():
+            if line and not line.startswith("#"):
+                name, version = line.split(" ;")[0].split("==")
+                pins[name] = version
+        return pins
+
+    def test_requirements_match_uv_lock(self, tmp_path):
+        """The committed file IS the generator's output for the current uv.lock.
+
+        A lock bump without ``uv run deployment/aws/lock_requirements.py`` fails
+        here by name, so the worker's pins cannot silently fall behind what the
+        suite ran. uv.lock is gitignored (since the repo's 2026-01-13 template),
+        so where no lock exists -- CI today -- there is nothing to compare
+        against and the check is skipped, not faked.
+        """
+        import sys
+
+        if not (REPO_ROOT / "uv.lock").exists():
+            pytest.skip("no uv.lock in the checkout -- lock parity only runs where one exists")
+        run = subprocess.run(
+            [sys.executable, str(self.GENERATOR), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+        assert run.returncode == 0, f"lock_requirements.py failed: {run.stderr}"
+        generated = (tmp_path / "function-requirements.txt").read_text()
+        assert self.REQUIREMENTS.read_text() == generated, (
+            "deployment/aws/function-requirements.txt is stale against uv.lock -- "
+            "regenerate it with `uv run deployment/aws/lock_requirements.py` in the "
+            "same PR as the lock bump (issue #613)"
+        )
+
+    def test_requirements_pin_every_root_above_its_floor(self):
+        """Each root build_function.sh installs is pinned, at or above its core floor.
+
+        Runs without a lock: a ``[project.dependencies]`` floor bumped past the
+        committed pin (``zarr>=3.5`` against ``zarr==3.2.1``) means the lock was
+        re-resolved and the file not regenerated -- the gap the lock-parity test
+        above cannot see on a lock-less checkout.
+        """
+        import tomllib
+
+        pins = self._pins(self.REQUIREMENTS.read_text())
+        roots = re.search(r"^FUNCTION_ROOTS = \((.*?)\)$", self.GENERATOR.read_text(), re.M)
+        assert roots, "FUNCTION_ROOTS tuple missing from lock_requirements.py"
+        roots = re.findall(r'"([^"]+)"', roots.group(1))
+        assert set(roots) == {"obstore", "zarr", "pydantic-zarr", "pyyaml"}
+        floors = {}
+        for dep in tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
+            "dependencies"
+        ]:
+            m = re.match(r"([A-Za-z0-9._-]+)>=([0-9][0-9.]*)$", dep)
+            if m:
+                floors[m.group(1)] = m.group(2)
+        for name in roots:
+            assert name in pins, f"{name} is a root but function-requirements.txt has no pin"
+            if name in floors:
+                assert TestLayerExtraParity._release(pins[name]) >= TestLayerExtraParity._release(
+                    floors[name]
+                ), (
+                    f"function-requirements.txt pins {name}=={pins[name]}, below the "
+                    f"[project.dependencies] floor >={floors[name]} -- regenerate it from "
+                    "the lock (issue #613)"
+                )
+
+    def test_build_script_installs_the_pins_without_resolving(self):
+        """build_function.sh installs ``-r function-requirements.txt --no-deps``, no floors.
+
+        The file is only the contract if the script reads it: a floor spec
+        reintroduced on the install line, or ``--no-deps`` dropped, puts pip's
+        resolver back between the lock and the zip.
+        """
+        script = (REPO_ROOT / "deployment" / "aws" / "build_function.sh").read_text()
+        installs = [
+            line
+            for line in TestLayerExtraParity._install_lines(script)
+            if "function-requirements.txt" in line
+        ]
+        assert len(installs) == 1, (
+            "build_function.sh must install -r function-requirements.txt once"
+        )
+        assert "--no-deps" in installs[0], "the requirements install must pass --no-deps"
+        floors = re.findall(r'"[A-Za-z0-9._-]+>=[0-9.]+"', script)
+        assert not floors, (
+            f"build_function.sh resolves {floors} from PyPI at build time -- pins come "
+            "from function-requirements.txt (issue #613)"
         )
 
 
