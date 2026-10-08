@@ -234,6 +234,9 @@ class TestTail:
             out = _fleet(client, root, LEAVES, target=3, barrier_timeout_s=0.2)
         assert (out["fired"], out["landed"], out["finisher"]) == (4, 3, "timed_out")
         assert "timed_out" in caplog.text
+        # The shared poller names this leg, not the staged sweep's.
+        assert "families fleet: barrier timed out" in caplog.text
+        assert "stage record" not in caplog.text and "#381" not in caplog.text
 
     def test_a_single_pass_that_never_lands_is_timed_out(self, tmp_path, monkeypatch):
         root = _root(tmp_path)
