@@ -162,6 +162,48 @@ def coverage_dispatch_nodes(by_shard, dispatch: int, coverage, scope=None) -> li
     return dispatch_nodes(by_shard, int(dispatch), filter_moc)
 
 
+def candidate_dispatch_nodes(by_shard, dispatch: int, coverage, scope=None) -> list:
+    """The nodes a stage WORKER folds at ``dispatch`` — its candidate set (issue #610).
+
+    Not the tuple's dispatch nodes (:func:`dispatch_nodes` /
+    :func:`coverage_dispatch_nodes`, which are the invoke TARGETS) but the
+    nodes those invokes fold: a worker's candidates are the run's leaves
+    UNION the store's root ``coverage.moc``
+    (:func:`zagg.sweep_overview._candidate_decimals`, which
+    :func:`zagg.sweep_stages.sweep_stage_pass` folds from), coarsened to the
+    dispatch order. The work set's own ancestors are a strict subset wherever
+    the run appends to a store — a sibling shard an earlier run committed is
+    folded although no leaf of this run names it, and
+    :func:`coverage_dispatch_nodes` only FILTERS those ancestors by the
+    coverage, never widens them — so a schedule sized from either can only
+    UNDER-estimate what one invoke folds (review finding). This is the set
+    :func:`zagg.sweep_partition.sized_stage_tuples` measures.
+
+    ``coverage`` is the MOC the caller already HOLDS, exactly as
+    :func:`coverage_dispatch_nodes` takes it: the union is mirrored
+    dispatcher-side from those words, so nothing is read from the store (D8),
+    and ``None`` is refused rather than read as "no coverage". ``scope``
+    filters by subtree intersection (:func:`zagg.sweep_stages.scope_admits`),
+    the containment the worker's own fold applies.
+    """
+    from zagg.grids.morton import morton_decimal
+    from zagg.sweep_overview import _node_at
+    from zagg.sweep_stages import normalize_scope, scope_admits
+
+    if coverage is None:
+        raise ValueError(
+            "candidate_dispatch_nodes needs the store's coverage MOC — None is not "
+            "'no coverage' here, because a sizing that silently narrowed to the work "
+            "set would under-estimate the fold; size against the dense bound instead "
+            "(zagg.sweep_partition.sized_stage_tuples without nodes_at)"
+        )
+    words = list(coverage.keys() if isinstance(coverage, dict) else coverage)
+    decimals = set(by_shard) | {morton_decimal(int(w)) for w in words}
+    moc = normalize_scope(scope)
+    nodes = {_node_at(d, int(dispatch)) for d in decimals}
+    return sorted(n for n in nodes if scope_admits(n, moc))
+
+
 def _leaf_refs(by_shard, nodes=None) -> list:
     """``[[shard_key, window], ...]`` for the whole work set, or one node slice."""
     from zagg.grids.morton import morton_word
@@ -614,9 +656,25 @@ def run_stage_sweep_fleet(
     however small the cap. That is what walled the v3 ladder — the base-cell
     ``3`` invoke of the ``[2,1,0]`` tuple folded 21 and died at 900 s after 12
     of its 16 order-2 nodes. :func:`zagg.sweep_partition.sized_stage_tuples`
-    narrows each tuple to the widest width whose fattest dispatch node stays
-    within the target, computed from the same per-order node sets this
-    dispatcher already derives (so still nothing is read from the store, D8).
+    refines the fixed-width schedule, subdividing each tuple inside its own
+    span until its fattest dispatch node stays within the target (so a store
+    needing no narrowing keeps that schedule outright). Nothing is read from
+    the store either way (D8).
+    What it narrows AGAINST depends on what the caller handed in. With a
+    ``coverage`` MOC the fold is MEASURED, over the set the worker itself
+    folds — the run's leaves union that coverage, coarsened per order
+    (:func:`candidate_dispatch_nodes`); the dispatch nodes above are a subset
+    of it, so sizing from them would under-estimate every run that appends to
+    a store (review finding). Without one the dispatcher cannot see the
+    store's density and may not read it (D8), so the sizing takes the DENSE
+    bound ``(4 ** width - 1) // 3`` — 21 at width 3, 5 at width 2 — which
+    never under-estimates. The runner's tail passes no coverage, so the tail
+    sizes by that bound: at :data:`zagg.sweep_partition.STAGE_TARGET_NODES`
+    it takes width 2 everywhere, which is what the v3 store needed. An
+    operator who hands ``coverage=`` in gets the measurement instead, and may
+    keep the full width where the store is genuinely sparse. Either way the
+    chosen fold rides on the tuple's row (``fold_max``), beside its ``width``.
+
     ``None`` — the default — sizes nothing: this dispatcher is documented as
     the MIRROR of :func:`zagg.sweep_stages.run_stage_sweep`, and a schedule
     this side chose on its own would no longer be the width the caller named
@@ -880,18 +938,36 @@ def run_stage_sweep_fleet(
             )
         return node_sets[order]
 
+    # The invoke TARGETS above; what one invoke FOLDS here. A worker folds its
+    # candidate set — the run's leaves union the store's root coverage — so a
+    # schedule sized from the dispatch nodes above under-estimates every run
+    # whose work set is a subset of the store (review finding). Separate
+    # memo: these two sets are deliberately different sets.
+    fold_sets: dict = {}
+
+    def _fold_nodes_at(order: int) -> list:
+        order = int(order)
+        if order not in fold_sets:
+            fold_sets[order] = candidate_dispatch_nodes(work, order, coverage, scope)
+        return fold_sets[order]
+
     if stage_target_nodes:
         schedule = sized_stage_tuples(
             shard_order,
-            nodes_at=_nodes_at,
+            # Measured only when a coverage MOC was handed in; without one the
+            # dispatcher cannot see the store's density and may not read it
+            # (D8), so the sizing takes the DENSE bound, which never
+            # under-estimates.
+            nodes_at=None if coverage is None else _fold_nodes_at,
             tuple_width=tuple_width,
             target=stage_target_nodes,
         )
         narrowed = [st for st in schedule if int(st["width"]) < tuple_width]
         if narrowed:
             logger.info(
-                f"stage fleet: sized the schedule from the store's density — "
-                f"{len(narrowed)} of {len(schedule)} tuple(s) narrower than width "
+                f"stage fleet: sized the schedule from "
+                f"{'the coverage MOC handed in' if coverage is not None else 'the dense bound'}"
+                f" — {len(narrowed)} of {len(schedule)} tuple(s) narrower than width "
                 f"{tuple_width} (target {stage_target_nodes} node(s) an invoke): "
                 + ", ".join(
                     f"@{st['dispatch']} width {st['width']} folds {st['fold_max']}"
