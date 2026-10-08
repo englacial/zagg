@@ -2,7 +2,7 @@
 
 Pins the exporter's contract on local fixture stores (no live S3): rollup-
 preferred resolution with per-feature provenance, the leaf-sidecar fallback
-on a partial/stale rollup tree (the live ATL03 demo store has the stale-
+on a partial/stale rollup tree (the ATL03 v1 demo store has the stale-
 *interior* half of that shape), the freshness checks and their documented
 limit, the ``--order`` rollup-node mode, and GeoJSON validity — ``[lon,
 lat]`` order

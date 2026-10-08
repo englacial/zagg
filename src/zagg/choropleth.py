@@ -9,8 +9,8 @@ code: the layer is property-driven, so this file IS the integration.
 
 Reads are anonymous-capable object GETs (``skip_signature=True`` for
 published buckets) and degrade gracefully on a partial or stale rollup tree —
-the live demo stores make that ladder load-bearing, not theoretical: every
-covered ATL03 shard carries its own shard-node rollup, but its *interior*
+the demo stores make that ladder load-bearing, not theoretical: every
+covered ATL03 v1 shard carries its own shard-node rollup, but its *interior*
 rollups lag well behind the leaves beneath them (node ``3``: a generation
 stamp of 1,054 leaves against 2,819 covered shards), so the fold-from-below
 arm runs for real on every one of them, while GEDI's tree is complete:
