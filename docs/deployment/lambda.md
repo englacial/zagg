@@ -291,8 +291,10 @@ committed files -- `function-requirements.txt` (the lock closure of `obstore`,
 `zarr`, `pydantic-zarr`, `pyyaml`) and `layer-requirements.txt` (the layer's
 closure minus the names the `lambda` extra pins exactly, which `build_layer.sh`
 installs itself) -- and the build scripts install them with
-`pip install -r ... --no-deps`. A worker therefore runs the versions the test
-suite ran, and the function-zip size tripwire (34 MiB, `test_function_build_size`)
+`pip install -r ... --no-deps`. A worker therefore runs the versions a
+checkout synced from that lock tests; CI's `uv sync --extra test` is not
+lock-driven while `uv.lock` stays gitignored, so it resolves its own env. The
+function-zip size tripwire (34 MiB, `test_function_build_size`)
 only moves on a zagg change or a deliberate lock bump.
 
 A lock bump reaches the fleet through a PR and a release, never by a rebuild
