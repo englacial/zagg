@@ -9,10 +9,13 @@ classifies every one of their fields ``none``, so the live manifest promises
 no overview fold for the very payloads whose bytes rest on one. These tests
 pin that drift before the admission changes it:
 
-- the LIVE CA-manifest declaration, vendored byte-for-byte as an in-tree
-  fixture (``tests/data/ca_atl03_tdigest_o9_morton_hive.json``, fetched from
-  ``atl03_tdigest_o9.zarr/morton_hive.json`` on 2026-08-24) — the permanent
-  BEFORE record no later phase edits;
+- the then-LIVE CA-manifest declaration, vendored byte-for-byte as an
+  in-tree fixture (``tests/data/ca_atl03_tdigest_o9_morton_hive.json``,
+  fetched from ``atl03_tdigest_o9.zarr/morton_hive.json`` on 2026-08-24; that
+  v1 store is the comparison store since the issue #560 cutover to
+  ``atl03_tdigest_o9_v3.zarr``, whose manifest is vendored beside it as
+  ``ca_atl03_tdigest_o9_v3_morton_hive.json``) — the permanent BEFORE record
+  no later phase edits;
 - today's classifier verdicts and the spill-gate admissions — the pins later
   phases flip deliberately, one per admission.
 
