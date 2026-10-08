@@ -223,15 +223,25 @@ class TestLockRequirements:
         A lock bump without ``uv run deployment/aws/lock_requirements.py`` fails
         here by name, so the zips' pins cannot silently fall behind what the
         suite ran. uv.lock is gitignored (since the repo's 2026-01-13 template),
-        so where no lock exists -- CI today -- there is nothing to compare
-        against and the check is skipped, not faked; the skip reason still names
-        each pin the running env does not match, so a lock-less run shows which
-        pins the suite did not exercise.
+        and on CI ``uv sync`` writes a FRESH resolution into the checkout -- a
+        lock that is untracked under ``CI`` is that minute's PyPI, not a pin
+        source -- so there the check is skipped, not faked; the skip reason still
+        names each pin the running env does not match, so a CI run shows which
+        pins the suite did not exercise. A tracked lock would turn it on.
         """
+        import os
         import sys
         from importlib.metadata import PackageNotFoundError, version
 
-        if not (REPO_ROOT / "uv.lock").exists():
+        tracked = (
+            subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "uv.lock"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+        if not (REPO_ROOT / "uv.lock").exists() or (os.environ.get("CI") and not tracked):
             gaps = []
             for name in self.SCRIPTS.values():
                 for dist, pin in self._pins((self.AWS / name).read_text()).items():
@@ -242,8 +252,9 @@ class TestLockRequirements:
                     if installed != pin:
                         gaps.append(f"{dist}: {pin} vs {installed}")
             pytest.skip(
-                "no uv.lock in the checkout -- lock parity only runs where one exists; "
-                f"pins this env does not run (pin vs installed): {gaps or 'none'}"
+                "no committed uv.lock -- lock parity runs against a tracked lock, or an "
+                "untracked one off CI (the maintainer's); pins this env does not run "
+                f"(pin vs installed): {gaps or 'none'}"
             )
         run = subprocess.run(
             [sys.executable, str(self.GENERATOR), str(tmp_path)],
