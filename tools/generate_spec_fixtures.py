@@ -1046,13 +1046,23 @@ def build_icechunk(out: Path) -> None:
         doc = root[name].metadata.to_dict()
         (out / name / "zarr.json").write_text(json.dumps(doc, indent=1) + "\n")
     # Expectations from the inputs: the expanded levels (§4.5/§4.4), the
-    # base's dggs block from the grid's own attrs, the layout by §11.1.
+    # base's dggs block spelled out (§11.1 copies it whole), the layout by §11.1.
     s, base = PYRAMID_GRID["parent_order"], PYRAMID_GRID["child_order"]
     resolutions = list(PYRAMID_KNOB["overviews"])
     d = resolutions[-1] - s
     expanded = [(base, "leaf")] + [(c, "column") for c in resolutions]
     expanded += [(k + d, "overview") for k in range(s - 1, -1, -1)]
-    layout = [{"asset": str(base), "dggs": grid.shard_spec().attributes["dggs"]}]
+    ellipsoid = {"name": "WGS84", "semimajor_axis": 6378137.0, "inverse_flattening": 298.257223563}
+    base_dggs = {
+        "name": "morton",
+        "refinement_level": base,
+        "spatial_dimension": "cells",
+        "ellipsoid": ellipsoid,
+        "compression": "none",
+        "latitude": "authalic-wgs84",
+        "coordinate": "morton",
+    }
+    layout = [{"asset": str(base), "dggs": base_dggs}]
     for (cells, artifact), (finer, _) in zip(expanded[1:], expanded):
         source = base if artifact == "column" else finer  # cascade, exact_levels 1
         layout.append(
