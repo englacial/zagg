@@ -264,26 +264,32 @@ class TestFunctionRequirements:
         """
         import tomllib
 
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+        from packaging.version import Version
+
         pins = self._pins(self.REQUIREMENTS.read_text())
         roots = re.search(r"^FUNCTION_ROOTS = \((.*?)\)$", self.GENERATOR.read_text(), re.M)
         assert roots, "FUNCTION_ROOTS tuple missing from lock_requirements.py"
         roots = re.findall(r'"([^"]+)"', roots.group(1))
         assert set(roots) == {"obstore", "zarr", "pydantic-zarr", "pyyaml"}
+        # packaging parses any spelling (``Zarr >= 3.1.5, <4 ; marker``), so no
+        # root's floor can drop out of the check unparsed.
         floors = {}
         for dep in tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
             "dependencies"
         ]:
-            m = re.match(r"([A-Za-z0-9._-]+)>=([0-9][0-9.]*)$", dep)
-            if m:
-                floors[m.group(1)] = m.group(2)
+            req = Requirement(dep)
+            floors[canonicalize_name(req.name)] = [
+                s.version for s in req.specifier if s.operator == ">="
+            ]
         for name in roots:
             assert name in pins, f"{name} is a root but function-requirements.txt has no pin"
-            if name in floors:
-                assert TestLayerExtraParity._release(pins[name]) >= TestLayerExtraParity._release(
-                    floors[name]
-                ), (
+            assert name in floors, f"{name} is a root but not in [project.dependencies]"
+            for floor in floors[name]:
+                assert Version(pins[name]) >= Version(floor), (
                     f"function-requirements.txt pins {name}=={pins[name]}, below the "
-                    f"[project.dependencies] floor >={floors[name]} -- regenerate it from "
+                    f"[project.dependencies] floor >={floor} -- regenerate it from "
                     "the lock (issue #613)"
                 )
 
