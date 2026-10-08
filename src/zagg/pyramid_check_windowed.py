@@ -700,17 +700,31 @@ def _window_checks(
     orders = [k for k, _ in ladder]
     declared_any = {k: sorted({n for w in by_window for n in declared[w][k]}) for k in orders}
     # A node counts as landed when every window declaring it committed its
-    # overview; the first window's attrs stand for it (the recorded depth is
-    # the ladder's, the same in every window).
+    # overview. The window recording the deepest ``merges_from_raw`` stands
+    # for it: the finisher's actuals take the maximum across every window's
+    # artifacts, and after a partial re-sweep the windows can differ.
     landed: dict = {k: {} for k in orders}
     for k in orders:
         for n in declared_any[k]:
             held = [probes[w].get(n) for w in by_window if n in declared[w][k]]
-            landed[k][n] = held[0] if held and all(a is not None for a in held) else None
+            landed[k][n] = (
+                max(held, key=_recorded_depth)
+                if held and all(a is not None for a in held)
+                else None
+            )
     raw_entries = (harness.manifest.get("pyramid") or {}).get("overviews") or []
     _actuals_errors(
         raw_entries, harness.shard_order, harness, errors, counted, landed, declared_any
     )
+
+
+def _recorded_depth(attrs) -> int:
+    """One window artifact's recorded ``merges_from_raw`` (0 when unreadable)."""
+    from zagg.pyramid_check_v2 import _as_int
+    from zagg.sweep_overview import OVERVIEW_ATTR
+
+    block = attrs.get(OVERVIEW_ATTR)
+    return (_as_int(block.get("merges_from_raw")) or 0) if isinstance(block, dict) else 0
 
 
 class _WindowSources(_Harness):
