@@ -1932,14 +1932,18 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   single-chunk column array, whose ref is the whole object) and writes the plan as a JSON sibling beside the leaf's stats
   sidecar (`icechunk_refs.json`, ≈40 KB at production geometry). No
   Icechunk session on the leaf path. The outcome rides the leaf's stats sidecar as `icechunk` —
-  `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "windowed" |
-  "empty"}`, or `{error}` — and the run parquet as `icechunk_*` columns. Its
+  `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "empty"}`, or
+  `{error}` — and the run parquet as `icechunk_*` columns. A windowed leaf
+  is indexed like any other, at its window's row (spec §11.2). Its
   cost is its own `phase_timings["icechunk"]`, not `write`.
 - **The ladder commits** (`zagg.icechunk_ladder`, hooked into every node of
   the [staged sweep](#the-staged-sweep-issue-384)): a stage node gathers its
-  subtree's carriers — leaf sidecars at the finest tuple, its children's
+  subtree's carriers — leaf sidecars at the finest tuple (one per
+  `(leaf, window)` on a windowed store, each naming its own row), its children's
   node ref columns above — adds the refs of the overview objects at its
-  tuple's orders, and either writes its own node column or **commits**. The
+  tuple's orders, and either writes its own node column or **commits**. On a
+  windowed store the hook runs once per node, after that node's window units
+  and its close, so each row's refs are gathered and committed together. The
   tuple whose order range contains `commit_order` commits everything
   gathered in **one commit per node** covering every order in its subtree
   (`node {decimal}`, refs into `/19/…`, `/13/…`, `/12/…`, … of the one repo); coarser
@@ -2151,15 +2155,16 @@ either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `url_prefix` and the paths above, which is what makes the same two calls
 writable in icechunk-js.
 
-The manifest split (spec §11.5) is on the cell axis alone — one manifest
-spans every row of its cell run, so the manifest count does not grow with
-the rows — at one base manifest per order-`split_order`
-cell — at the defaults an order-6 cell, 16,384 chunks, 64 leaves — and the
-same number of chunks per manifest at every coarser level (so a coarse
-manifest spans a coarser cell: order 2 at `/13`, a base cell at `/11` and
-above), recorded in the repo root's `zagg_icechunk` block as `split_order`,
-and per order group as `levels.{order}.split` (`chunks`, `order`), so a
-reader never assumes it.
+The manifest split (spec §11.5) cuts **both** axes: the cell axis at one
+base manifest per order-`split_order` cell — at the defaults an order-6
+cell, 16,384 chunks, 64 leaves — and the same number of chunks per manifest
+at every coarser level (so a coarse manifest spans a coarser cell: order 2
+at `/13`, a base cell at `/11` and above); and the row axis at
+`rows_per_manifest` rows, **one row per manifest** by default, so an append
+adds manifest files and rewrites none of the rows already written. Both are
+recorded in the repo root's `zagg_icechunk` block (`split_order`,
+`rows_per_manifest`) and per order group as `levels.{order}.split`
+(`chunks`, `order`, `rows`), so a reader never assumes them.
 
 ## Raster hive stores (issue #247)
 

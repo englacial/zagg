@@ -59,15 +59,20 @@ import numpy as np
 
 from zagg.icechunk_rows import (
     ALL_ROW,
-    cell_axis_split,
+    DEFAULT_ROWS_PER_MANIFEST,
+    LEGACY_ROW_SPLIT,
+    adopt_row_cut,
     check_revision,
     commit_rows,
     coordinate_specs,
     level_group_spec,
+    resolve_rows_per_manifest,
     row_index,
     row_key,
     splits_follow_block,
     store_rows,
+    stored_rows_per_manifest,
+    unit_row,
     write_bounds,
 )
 
@@ -165,15 +170,24 @@ def split_exponent(base_chunk_order: int, split_order: int, chunk_order: int | N
     return min(m, int(base_chunk_order if chunk_order is None else chunk_order))
 
 
-def split_block(grid, split_order: int, *, base_chunk_order: int | None = None) -> dict:
+def split_block(
+    grid,
+    split_order: int,
+    *,
+    base_chunk_order: int | None = None,
+    rows: int = DEFAULT_ROWS_PER_MANIFEST,
+) -> dict:
     """The per-level ``split`` block for ``grid`` at ``split_order`` (§11.5).
 
     ``base_chunk_order`` is the BASE level's chunk axis (the store's
     ``chunk_order``); ``grid`` is this level's. Absent, ``grid`` is the base.
+    ``rows`` is the row-axis cut, store-wide (the block's
+    ``rows_per_manifest``) and recorded per level because the split names
+    BOTH axes.
     """
     base = grid.chunk_order if base_chunk_order is None else base_chunk_order
     m = split_exponent(base, split_order, grid.chunk_order)
-    return {"chunks": 4**m, "order": int(grid.chunk_order) - m}
+    return {"chunks": 4**m, "order": int(grid.chunk_order) - m, "rows": int(rows)}
 
 
 def block_splits(block: dict) -> dict:
@@ -183,13 +197,18 @@ def block_splits(block: dict) -> dict:
 
     :func:`split_block`'s rule from each entry's recorded chunk axis, so the
     splits follow the block as it stands (a ratchet included), not the one a
-    caller read earlier.
+    caller read earlier. The row cut is the block's own
+    (:func:`~zagg.icechunk_rows.stored_rows_per_manifest`): what this
+    function persists through ``_save_splits`` is what the block records,
+    and an absent key is the legacy every-row-in-one cut — never the
+    default, which would silently flip a pre-ruling repo to the new cut.
     """
     base, split_order = int(block["chunk_order"]), int(block["split_order"])
+    rows = stored_rows_per_manifest(block)
     splits = {}
     for order, level in {**(block.get("retired") or {}), **(block.get("levels") or {})}.items():
         m = split_exponent(base, split_order, int(level["chunk_order"]))
-        splits[order] = {"chunks": 4**m, "order": int(level["chunk_order"]) - m}
+        splits[order] = {"chunks": 4**m, "order": int(level["chunk_order"]) - m, "rows": rows}
     return splits
 
 
@@ -232,13 +251,15 @@ def ladder_walks(config, grid) -> bool:
 
 
 def resolve_options(config, shard_order: int, *, tuple_width: int | None = None, grid=None) -> dict:
-    """``{"commit", "commit_order", "split_order"}`` for this run, defaults applied.
+    """``{"commit", "commit_order", "split_order", "rows_per_manifest"}``, defaults applied.
 
     Defaults: ``commit: "ladder"`` when the run walks the ladder
     (:func:`ladder_walks` on ``grid``), else ``"leaf"`` — never a mode whose
     commits no step of the run makes; without a ``grid`` an unset ``commit``
     is ``"leaf"``. ``commit_order`` the finest dispatch node;
-    ``split_order = commit_order``. Validation (§11.5): a commit must write
+    ``split_order = commit_order``; ``rows_per_manifest`` one row per
+    manifest (:data:`~zagg.icechunk_rows.DEFAULT_ROWS_PER_MANIFEST`).
+    Validation (§11.5): a commit must write
     whole manifests, so ``split_order >= commit_order``; both at most the
     shard order (a leaf is the finest thing a commit or a manifest can be
     keyed to); ``commit_order`` non-negative. Under ``commit: "ladder"`` the
@@ -283,7 +304,12 @@ def resolve_options(config, shard_order: int, *, tuple_width: int | None = None,
             f"output.icechunk.split_order {split_order} must lie in [commit_order {commit_order}, "
             f"shard_order {shard_order}] — a commit must write whole manifests (spec §11.5)"
         )
-    return {"commit": commit, "commit_order": commit_order, "split_order": split_order}
+    return {
+        "commit": commit,
+        "commit_order": commit_order,
+        "split_order": split_order,
+        "rows_per_manifest": resolve_rows_per_manifest(raw),
+    }
 
 
 # ── storage and credentials ─────────────────────────────────────────────────
@@ -396,11 +422,19 @@ def _repo_config(store_root: str, splits: dict, store_kwargs: dict):
     from icechunk import ManifestSplitCondition as C
     from icechunk import ManifestSplitDimCondition as D
 
+    from zagg.icechunk_rows import level_split
+
     config = icechunk.RepositoryConfig.default()
     container, _creds = _container(store_root, store_kwargs)
     config.set_virtual_chunk_container(container)
     sizes = {
-        C.path_matches(regex=rf"^/{int(order)}/.*"): cell_axis_split(split["chunks"])
+        C.path_matches(regex=rf"^/{int(order)}/.*"): level_split(
+            # A ``split`` block recorded before the row split names no
+            # ``rows``, and means the legacy cut — the same reading
+            # ``stored_rows_per_manifest`` gives the block's own key.
+            split["chunks"],
+            int(split.get("rows") or LEGACY_ROW_SPLIT),
+        )
         for order, split in sorted(splits.items(), key=lambda kv: -int(kv[0]))
     }
     sizes[C.AnyArray()] = {D.Axis(0): 1}
@@ -435,12 +469,23 @@ def _auth(store_root: str, store_kwargs: dict) -> dict:
     return {container_prefix(store_root): creds}
 
 
-def _save_splits(repo, store_root: str, splits: dict, store_kwargs: dict):
-    """Persist a new per-level split config on the repo (the §11.5 ratchet); the reopened repo."""
-    repo = repo.reopen(
+def _reopen_splits(repo, store_root: str, splits: dict, store_kwargs: dict):
+    """``repo`` reopened so THIS handle cuts manifests at ``splits``; nothing is persisted.
+
+    A config handed to ``Repository.open_or_create`` / ``reopen`` takes
+    precedence over the repo's saved one for that handle, and is saved only
+    by :func:`_save_splits`. So a run that must follow the store's cut
+    rather than its own config's reopens here — a local call, no request.
+    """
+    return repo.reopen(
         config=_repo_config(store_root, splits, store_kwargs),
         authorize_virtual_chunk_access=_auth(store_root, store_kwargs),
     )
+
+
+def _save_splits(repo, store_root: str, splits: dict, store_kwargs: dict):
+    """Persist a new per-level split config on the repo (the §11.5 ratchet); the reopened repo."""
+    repo = _reopen_splits(repo, store_root, splits, store_kwargs)
     repo.save_config()
     return repo
 
@@ -520,7 +565,10 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(
             "artifact": level["artifact"],
             **level_geometry(level["grid"]),
             "split": split_block(
-                level["grid"], options["split_order"], base_chunk_order=grid.chunk_order
+                level["grid"],
+                options["split_order"],
+                base_chunk_order=grid.chunk_order,
+                rows=options["rows_per_manifest"],
             ),
         }
         for cells, level in sorted(grids.items(), reverse=True)
@@ -536,10 +584,11 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(
         "rows": rows,
         "levels": levels,
         # The ladder's knobs (§11.4/§11.5), read back by every stage node.
-        # ``split_order`` is the store's authoritative, ratcheting value;
-        # ``commit`` / ``commit_order`` are per-run — recorded so this run's
-        # stage nodes can read them, never a compatibility key.
-        **{k: options[k] for k in ("commit", "commit_order", "split_order")},
+        # ``split_order`` and ``rows_per_manifest`` are the store's
+        # authoritative, ratcheting values; ``commit`` / ``commit_order`` are
+        # per-run — recorded so this run's stage nodes can read them, never a
+        # compatibility key.
+        **{k: options[k] for k in ("commit", "commit_order", "split_order", "rows_per_manifest")},
     }
     attributes: dict = {ICECHUNK_ATTR: block}
     mirror = manifest.get(MULTISCALES_ATTR)
@@ -715,7 +764,22 @@ def init_repo(
                 f"output.icechunk.commit_order {options['commit_order']} exceeds the store's "
                 f"recorded split_order {stored}: a commit must write whole manifests (§11.5)"
             )
-    elif wanted < stored:
+    config_rows = int(options["rows_per_manifest"])
+    options = adopt_row_cut(existing, options, path)
+    if int(options["rows_per_manifest"]) != config_rows:
+        # The handle above was opened with the CONFIG's row cut, and a config
+        # passed at open beats the repo's saved one (``open_or_create``), so
+        # without this the run would cut its manifests at a value the block
+        # does not record. Reopen at the cut just adopted — the block and the
+        # handle then agree whatever the config said, and the repo's saved
+        # config is untouched (the cut does not ratchet, §11.5).
+        repo = _reopen_splits(
+            repo,
+            store_root,
+            block_splits({**existing, "rows_per_manifest": options["rows_per_manifest"]}),
+            store_kwargs,
+        )
+    if wanted < stored:
         ratchet = {"from": stored, "to": wanted}
         block = repo_group_spec(grid, store_root, options, manifest).attributes[ICECHUNK_ATTR]
         retired = existing.get("retired") or {}
@@ -771,7 +835,13 @@ def _leaf_rel(store_root: str, leaf_path: str) -> str:
 
 
 def leaf_ref_plan(
-    grid, shard_key, store_root: str, *, store_kwargs: dict, version: str | None = None
+    grid,
+    shard_key,
+    store_root: str,
+    *,
+    store_kwargs: dict,
+    version: str | None = None,
+    window: str | None = None,
 ) -> list[dict]:
     """Per-array virtual refs for one committed leaf (§11.3), read off its objects.
 
@@ -785,11 +855,13 @@ def leaf_ref_plan(
     emit no entry. ``version`` is a versioned leaf's version subgroup (spec
     §1.5, issue #582): the refs then point into ``{leaf}/{version}/…``, the
     objects a replacement never rewrites; ``None`` plans a legacy leaf.
+    ``window`` is the window label of a windowed leaf (``{id}_{window}.zarr``,
+    issue #584 phase 2); ``None`` the unwindowed ``{id}.zarr``.
     """
     from zagg.hive import shard_leaf_path
 
     (rank,) = grid.block_index(int(shard_key))
-    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
+    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key, window=window))
     if version:
         leaf_rel = f"{leaf_rel}/{version}"
     return object_ref_plan(grid, leaf_rel, rank, store_root, store_kwargs=store_kwargs)
@@ -1070,14 +1142,23 @@ def leaf_units(
     from zagg.sweep_overview import _overview_config
 
     (rank,) = grid.block_index(int(shard_key))
-    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key))
+    # The row IS the window: a windowed leaf is ``{id}_{row}.zarr`` and its
+    # column artifact ``{column}`` already carries the window in its name
+    # (the caller passes the windowed basename), issue #584 phase 2.
+    window = None if row == ALL_ROW else str(row)
+    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key, window=window))
     node_rel = leaf_rel.rsplit("/", 1)[0]
     units = [
         {
             "level": int(grid.child_order),
             "row": row,
             "entries": leaf_ref_plan(
-                grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
+                grid,
+                shard_key,
+                store_root,
+                store_kwargs=store_kwargs,
+                version=version,
+                window=window,
             ),
         }
     ]
@@ -1138,24 +1219,37 @@ def record_leaf(
     the leaf's stats sidecar: ``{"path", "snapshot", "arrays", "refs",
     "levels", "rebases", "commit_s", "checksum"}`` (``checksum`` the form the
     refs carry: ``"etag"`` or ``"last_modified"``, §11.3), or ``{"skipped":
-    reason}`` for a unit stage 1 does not index (a windowed leaf, §11.6; a
-    leaf with no chunk objects). Raises on failure — the caller is fail-open.
-    ``repo`` is a handle :func:`vet_leaf_repo` already returned (the worker
-    seam vets before it plans); ``None`` opens and vets here, still BEFORE
-    the plan.
+    reason}`` for a leaf with no chunk objects. Raises on failure — the
+    caller is fail-open. ``repo`` is a handle :func:`vet_leaf_repo` already
+    returned (the worker seam vets before it plans); ``None`` opens and vets
+    here, still BEFORE the plan. ``window`` is the leaf's window label (or
+    the dispatcher's unit dict), used only when ``units`` is ``None`` (the
+    caller's units already name their row); a windowed leaf is indexed as of
+    issue #584 phase 2, and on a windowed store a unit naming no label is
+    refused rather than written to the reserved ``all`` row
+    (:func:`~zagg.icechunk_rows.unit_row`).
     """
     from zagg.grids.morton import morton_decimal
 
-    if window is not None:
-        return {"skipped": "windowed"}
     checksum = "etag" if container_prefix(store_root).startswith("s3://") else "last_modified"
     if repo is None:
         repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs)
     if units is None:
+        # ``window`` is the dispatcher's unit dict, or just its label. The
+        # store is windowed when its repo holds a row other than ``all``:
+        # an unwindowed store's init allocates that one row and no other
+        # (:func:`~zagg.icechunk_rows.store_rows`).
+        rows = (_session_block(repo.readonly_session(BRANCH)) or {}).get("rows") or [ALL_ROW]
+        row = unit_row(window, windowed=list(rows) != [ALL_ROW])
         plan = leaf_ref_plan(
-            grid, shard_key, store_root, store_kwargs=store_kwargs, version=version
+            grid,
+            shard_key,
+            store_root,
+            store_kwargs=store_kwargs,
+            version=version,
+            window=None if row == ALL_ROW else row,
         )
-        units = [{"level": int(grid.child_order), "row": ALL_ROW, "entries": plan}]
+        units = [{"level": int(grid.child_order), "row": row, "entries": plan}]
     if not any(entry["refs"] for unit in units for entry in unit["entries"]):
         return {"skipped": "empty"}
     outcome = commit_units(

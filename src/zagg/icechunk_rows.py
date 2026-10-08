@@ -49,20 +49,86 @@ ROW_COORDS = (ROW_START, ROW_END)
 ROW_FILL = int(np.iinfo(np.int64).min)
 #: Rows per coordinate chunk: one small chunk holds every window of a mission.
 ROW_COORD_CHUNK = 1024
-#: The manifest-split run length on the row axis (§11.5). Icechunk splits an
-#: axis the config does not name at ONE chunk, which would cut a manifest per
-#: row; naming it at a length no row count reaches is what makes the split
-#: "the cell axis alone" (issue #584 phase 0).
-ROW_SPLIT = 2**31 - 1
+#: Rows per manifest: the default cut on the row axis (§11.5, espg's ruling of
+#: 2026-10-02 on issue #584). ONE manifest per row, so an append only ADDS
+#: manifest files — the earlier rows' manifests are never rewritten, and a
+#: reader after one window downloads that window's refs alone. The knob
+#: ratchets the way ``split_order`` does, toward coarser (blocks of rows); a
+#: store at one row per manifest is the finest cut it can ever carry, which is
+#: the side the ratchet can still move from.
+DEFAULT_ROWS_PER_MANIFEST = 1
+#: The row cut a ``/2`` repo written BEFORE the 2026-10-02 ruling carries —
+#: every row in one manifest, a run length no row count reaches. Such a repo
+#: is recognized by the absent ``rows_per_manifest`` block key and keeps this
+#: cut: it is baked into the manifests it has already written. No published
+#: store has one (issue #584 question (1): interim repos are disposable).
+LEGACY_ROW_SPLIT = 2**31 - 1
 #: Fresh-session retries of an init whose row allocation lost to another run's.
 ROW_ALLOC_TRIES = 5
 
 
-def cell_axis_split(chunks: int) -> dict:
-    """A level's manifest-split sizes: ``chunks`` on the cell axis, every row in one (§11.5)."""
+def level_split(chunks: int, rows: int = DEFAULT_ROWS_PER_MANIFEST) -> dict:
+    """A level's manifest-split sizes: ``chunks`` on the cell axis, ``rows`` on the row axis (§11.5).
+
+    Both axes are named. Icechunk splits an axis its config does not name at
+    ONE chunk, so an unnamed cell axis would cut a manifest per chunk; the row
+    axis is named at ``rows`` because that cut is now a declared knob rather
+    than the "every row in one manifest" of ``zagg-icechunk/2``'s first cut.
+    """
     from icechunk import ManifestSplitDimCondition as D
 
-    return {D.Axis(0): ROW_SPLIT, D.Axis(1): int(chunks)}
+    return {D.Axis(0): int(rows), D.Axis(1): int(chunks)}
+
+
+def resolve_rows_per_manifest(raw: Mapping) -> int:
+    """``output.icechunk.rows_per_manifest``, defaulted and vetted (§11.5).
+
+    One manifest per row unless the store asks for blocks; at least 1, a
+    manifest spanning whole rows.
+    """
+    value = raw.get("rows_per_manifest")
+    value = DEFAULT_ROWS_PER_MANIFEST if value is None else int(value)
+    if value < 1:
+        raise ValueError(
+            f"output.icechunk.rows_per_manifest {value} must be at least 1 — "
+            f"a manifest spans whole rows (spec §11.5)"
+        )
+    return value
+
+
+def stored_rows_per_manifest(block: Mapping) -> int:
+    """The row cut a RECORDED block carries — the ONE reading of an absent key (§11.5).
+
+    A block that names ``rows_per_manifest`` carries that cut; one that does
+    not predates the 2026-10-02 ruling and keeps its every-row-in-one cut
+    (:data:`LEGACY_ROW_SPLIT`), which is baked into the manifests it has
+    already written. Every reader of a recorded block goes through here —
+    :func:`adopt_row_cut`, ``icechunk_refs.block_splits`` and
+    ``icechunk_ops.declare_pyramid`` — so the absence cannot mean one thing
+    to the value a run adopts and another to the config it persists.
+    """
+    return int(block.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
+
+
+def adopt_row_cut(existing: Mapping, options: dict, path: str) -> dict:
+    """``options`` with the STORE's row cut, warning when the config's differs (§11.5).
+
+    The cut is fixed at the repo's creation: it is baked into every manifest
+    already written, so a later config value is adopted the way a finer
+    ``split_order`` is, and moving it on an existing repo is an operator
+    ``rewrite_manifests`` pass. Unlike ``split_order`` it does NOT ratchet.
+    An absent key is a repo written before the row split: it keeps its
+    every-row-in-one cut (:data:`LEGACY_ROW_SPLIT`).
+    """
+    stored = stored_rows_per_manifest(existing)
+    if int(options["rows_per_manifest"]) == stored:
+        return options
+    logger.warning(
+        f"output.icechunk.rows_per_manifest {options['rows_per_manifest']} differs from the "
+        f"store's recorded {stored} at {path}; the row cut is fixed at creation — "
+        f"using {stored} (spec §11.5)"
+    )
+    return {**options, "rows_per_manifest": stored}
 
 
 def check_revision(have, want: str, path: str) -> None:
@@ -110,6 +176,42 @@ def store_rows(temporal: dict | None, rows: Iterable[str] | None) -> list[str]:
     for label in labels:
         row_bounds(label, temporal)
     return labels
+
+
+def unit_row(window, *, windowed: bool) -> str:
+    """The repo row one LEAF unit's refs land in (§11.2): its window label, or ``all``.
+
+    ``window`` is the dispatcher's unit payload — the unit dict
+    (``{"label", …}``), its label alone, or ``None`` for an unwindowed
+    leaf. The derivation lives here and not in each caller so the worker
+    seam and the per-leaf commit cannot drift.
+
+    On a WINDOWED store ``all`` is not a neutral default: §11.2 reserves it
+    for the cross-window fold maintained at the overview levels, so a unit
+    that names no label is REFUSED rather than written over it. Nothing
+    downstream would catch that — ``all`` IS an allocated row whenever
+    ``pyramid.overview.all_time`` is on — and it would surface much later
+    as an all-time overview disagreeing with the k-way merge of its
+    windows. A payload of some other shape is refused here too, instead of
+    raising ``AttributeError`` inside a ``.get`` (issue #584 review).
+    """
+    if window is None or isinstance(window, str):
+        label = window
+    elif isinstance(window, Mapping):
+        label = window.get("label")
+    else:
+        raise ValueError(
+            f"window {window!r} ({type(window).__name__}) is not a window label, a "
+            f"dispatcher unit dict or None (spec §11.2)"
+        )
+    label = str(label) if label else None
+    if label is None and windowed:
+        raise ValueError(
+            f"a leaf unit of a windowed store names no window label (window={window!r}): "
+            f"its refs would land on the reserved {ALL_ROW!r} row, which is the "
+            f"cross-window fold's own (spec §11.2, issue #584)"
+        )
+    return ALL_ROW if label is None else label
 
 
 def row_bounds(label: str, temporal: dict | None) -> tuple[int, int] | None:
@@ -422,10 +524,13 @@ __all__ = [
     "ROW_DIM",
     "ROW_END",
     "ROW_FILL",
-    "ROW_SPLIT",
+    "DEFAULT_ROWS_PER_MANIFEST",
+    "LEGACY_ROW_SPLIT",
     "ROW_START",
     "array_model",
-    "cell_axis_split",
+    "level_split",
+    "resolve_rows_per_manifest",
+    "adopt_row_cut",
     "check_array_model",
     "check_revision",
     "commit_rows",
@@ -439,5 +544,7 @@ __all__ = [
     "run_rows",
     "splits_follow_block",
     "store_rows",
+    "stored_rows_per_manifest",
+    "unit_row",
     "write_bounds",
 ]
