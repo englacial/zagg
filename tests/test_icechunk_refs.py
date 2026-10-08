@@ -2610,6 +2610,17 @@ class TestBoto3Credentials:
             2026, 10, 8, utc_hour, 30, tzinfo=datetime.timezone.utc
         )
 
+    @pytest.fixture
+    def non_utc_host(self, monkeypatch):
+        # Pin local time off UTC so the naive case cannot pass on a UTC host by
+        # luck; ``time.tzset`` is Unix-only, as are CI and the dev machines.
+        monkeypatch.setenv("TZ", "EST+05")
+        time.tzset()
+        yield
+        monkeypatch.undo()
+        time.tzset()
+
+    @pytest.mark.usefixtures("non_utc_host")
     def test_naive_expiry_is_read_as_utc(self, monkeypatch):
         self._chain(monkeypatch, datetime.datetime(2026, 10, 8, 12, 30))
         expires = icechunk_refs._boto3_credentials().expires_after
