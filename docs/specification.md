@@ -63,17 +63,19 @@ not per store: a partially rewritten store legitimately carries both vintages
 — a sweep, stage or column backfill re-templates the overviews and columns it
 writes, so those pick up the token while the leaves beside them, never
 rewritten, do not — and each artifact's own `dggs` block is authoritative for
-that artifact. The ellipsoid key spelling follows the same per-artifact
-vintage rule (issue [#616](https://github.com/englacial/zagg/issues/616)):
-artifacts written by zagg through 0.58.0 spell it `semimajor_axis`, which the
-[dggs v1 schema](https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json)
-rejects (its `ellipsoidObject` is `additionalProperties: false` and
-spells `semi_major_axis`); re-templated artifacts carry
-`semi_major_axis`. No `spec` marker records the rename — the key belongs
-to the convention block the schema governs, and zagg readers never
-consult the ellipsoid. A reader reproducing cell geometry
+that artifact. A reader reproducing cell geometry
 (e.g. a viewer's boundary golden test) needs the geodetic ↔ authalic
 conversion at every geodetic seam, exactly as mortie spec §9 prescribes.
+
+The ellipsoid key spelling follows the same per-artifact vintage rule
+(issue [#616](https://github.com/englacial/zagg/issues/616)): artifacts
+written by zagg through 0.58.0 spell it `semimajor_axis`, which the
+[dggs v1 schema](https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json)
+rejects (its `ellipsoidObject` is `additionalProperties: false` and
+spells `semi_major_axis`); artifacts written or re-templated by zagg after
+0.58.0 carry `semi_major_axis`. No `spec` marker records the rename — the
+key belongs to the convention block the schema governs, and zagg readers
+never consult the ellipsoid.
 
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
