@@ -546,6 +546,23 @@ class TestStagePass:
         root_attrs = dict(_artifact(tmp_path / "s", "1/all.zarr").attrs)["zagg_overview"]
         assert root_attrs["regime"] == "stage-merge" and root_attrs["merges_from_raw"] == 2
 
+    def test_child_columns_read_through_the_invoke_handle(self, tmp_path, monkeypatch):
+        """Issue #610: no stage unit opens a store per child column it reads."""
+        import zagg.store as store_mod
+
+        m = _stage_store(tmp_path / "s")
+        opened, real = [], store_mod.open_store
+
+        def counting(path, *a, **k):
+            if k.get("read_only"):  # a read; the stage-column writes open their own
+                opened.append(path)
+            return real(path, *a, **k)
+
+        monkeypatch.setattr(store_mod, "open_store", counting)
+        summary = _sweep(tmp_path / "s", m, width=1)  # every tuple reads child columns
+        assert all(s["failed"] == 0 and s["written"] for s in summary["stages"])
+        assert not [p for p in opened if p.endswith(".pyramid.zarr")]
+
     def test_exact_fold_math(self, tmp_path):
         m = _stage_store(tmp_path / "s")
         _sweep(tmp_path / "s", m)
@@ -1000,7 +1017,7 @@ class TestMergeSourceLaw:
         orig = stage_mod._ColumnReader.read
 
         def spy(self, res, name):
-            reads.append((self.path.rsplit("/store/", 1)[-1], res, name))
+            reads.append((self.path, res, name))  # the store-relative key
             return orig(self, res, name)
 
         monkeypatch.setattr(stage_mod._ColumnReader, "read", spy)
@@ -1009,7 +1026,7 @@ class TestMergeSourceLaw:
 
         stage_reads = []
         for p, r, _name in reads:
-            rel = Path(p).relative_to(tmp_path / "s")
+            rel = Path(p)
             if rel.name.endswith("all.pyramid.zarr") and len(rel.parts) - 1 < 3:
                 stage_reads.append((str(rel), r))  # a STAGE column (order < shard)
         # Stage columns (orders 2 and 1) are read at the relay resolution only:
