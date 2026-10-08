@@ -304,9 +304,12 @@ alone (only a new `mortie` release can change a rebuilt layer):
 
 1. Bump the lock where it lives (`uv.lock` is gitignored):
    `uv lock --upgrade-package zarr` (or `uv lock --upgrade`), then
-   `uv run deployment/aws/lock_requirements.py`. Commit the regenerated
-   requirement files with the bump -- `TestLockRequirements` in
-   `tests/test_lambda_build.py` fails until they match the lock.
+   `uv run deployment/aws/lock_requirements.py`. Commit only the two
+   regenerated requirement files -- the lock itself stays gitignored, so their
+   diff is the bump. `test_requirements_match_uv_lock` in
+   `tests/test_lambda_build.py` fails until they match the lock wherever a
+   `uv.lock` exists (the maintainer's checkout); CI has none, so it skips and
+   names the pins its env does not run.
 2. Open the PR. `lambda-build.yml` rebuilds both arches on the new pins and
    runs the 250 MB combined gate; `test_function_build_size` catches
    function-zip growth in the same PR, which is where it gets reviewed.
