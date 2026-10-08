@@ -57,7 +57,7 @@ def closure(lock: dict, roots: tuple[str, ...]) -> set[str]:
 def export(repo_root: Path) -> list[str]:
     """The locked requirement lines, one package each, as ``uv export`` prints them."""
     flags = (
-        "--frozen --no-dev --no-hashes --no-emit-project --extra lambda --format requirements-txt"
+        "--locked --no-dev --no-hashes --no-emit-project --extra lambda --format requirements-txt"
     )
     out = subprocess.run(
         ["uv", "export", "--project", str(repo_root), *flags.split()],
