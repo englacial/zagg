@@ -648,12 +648,19 @@ def run_stage_sweep_fleet(
     per-invoke wall (or ``None``); the knob is reachable from the runner's
     seam too (:func:`zagg.runner._invoke_lambda_stage_sweep`).
 
-    ``stage_target_nodes`` sizes each tuple's WIDTH from the store's density
+    ``stage_target_nodes`` sizes each tuple's WIDTH to the per-invoke fold
     (issue #610, espg 2026-10-08), the way ``target`` sizes the families
     pass's partitions: ``max_nodes_per_invoke`` caps how many dispatch NODES
     an invoke is handed, but a dispatch node folds its whole subtree down to
     the tuple's ``child_order``, so at width 3 one invoke folds up to 21 nodes
-    however small the cap. That is what walled the v3 ladder — the base-cell
+    however small the cap. It is a target per dispatch NODE, so it bounds the
+    invoke only once the two are composed: ``max_nodes_per_invoke`` nodes ride
+    one invoke and each folds its own subtree, so the schedule is sized
+    against ``stage_target_nodes // max_nodes_per_invoke`` (review finding).
+    Under payload-only packing (``max_nodes_per_invoke=None``) the count is
+    unknown — a whole tuple may land on one worker — so the target bounds
+    nothing per invoke; that is logged as a WARNING and the sizing proceeds as
+    if one node an invoke. That is what walled the v3 ladder — the base-cell
     ``3`` invoke of the ``[2,1,0]`` tuple folded 21 and died at 900 s after 12
     of its 16 order-2 nodes. :func:`zagg.sweep_partition.sized_stage_tuples`
     refines the fixed-width schedule, subdividing each tuple inside its own
@@ -952,6 +959,20 @@ def run_stage_sweep_fleet(
         return fold_sets[order]
 
     if stage_target_nodes:
+        # ``max_nodes_per_invoke`` dispatch nodes ride ONE invoke and each
+        # folds its own subtree, so that invoke's fold is up to ``n x
+        # fold_max``: the target is shared out per node, or it bounds nothing
+        # (review finding). With payload-only packing (``None``) the count is
+        # not known here at all — a whole tuple may land on one worker — so
+        # the sizing says so and falls back to one node an invoke.
+        per_invoke = max_nodes_per_invoke or 1
+        if max_nodes_per_invoke is None:
+            logger.warning(
+                "stage fleet: max_nodes_per_invoke is None (payload-only packing puts a "
+                f"whole tuple on one worker), so stage_target_nodes={stage_target_nodes} "
+                "cannot bound what ONE invoke folds — sizing as if one dispatch node an "
+                "invoke; pass a node cap to make the target a per-invoke bound"
+            )
         schedule = sized_stage_tuples(
             shard_order,
             # Measured only when a coverage MOC was handed in; without one the
@@ -960,7 +981,7 @@ def run_stage_sweep_fleet(
             # under-estimates.
             nodes_at=None if coverage is None else _fold_nodes_at,
             tuple_width=tuple_width,
-            target=stage_target_nodes,
+            target=max(1, stage_target_nodes // per_invoke),
         )
         narrowed = [st for st in schedule if int(st["width"]) < tuple_width]
         if narrowed:
@@ -968,7 +989,8 @@ def run_stage_sweep_fleet(
                 f"stage fleet: sized the schedule from "
                 f"{'the coverage MOC handed in' if coverage is not None else 'the dense bound'}"
                 f" — {len(narrowed)} of {len(schedule)} tuple(s) narrower than width "
-                f"{tuple_width} (target {stage_target_nodes} node(s) an invoke): "
+                f"{tuple_width} (target {stage_target_nodes} node(s) an invoke over "
+                f"{per_invoke} dispatch node(s)): "
                 + ", ".join(
                     f"@{st['dispatch']} width {st['width']} folds {st['fold_max']}"
                     for st in narrowed

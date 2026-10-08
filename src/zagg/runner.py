@@ -6378,12 +6378,17 @@ def _invoke_lambda_stage_sweep(
 
     **How much one invoke folds.** ``max_nodes_per_invoke`` caps the NODES an
     invoke is handed, but a dispatch node folds its whole subtree down to the
-    tuple's child order, so at width 3 one invoke folds up to 21 nodes however
+    tuple's child order, so ONE node at width 3 folds up to 21 nodes however
     small that cap — which is what walled the v3 ladder (issue #610, espg
     2026-10-08: the base-cell ``3`` invoke of the ``[2,1,0]`` tuple died at
     900 s after 12 of its 16 order-2 nodes, no record, and the finisher then
     stamped manifest actuals for orders 2..0 as if they were as complete as
-    8..3). The tail therefore asks for the SIZED schedule
+    8..3). ``n`` nodes on one invoke fold up to ``n x`` that, so the target
+    bounds an INVOKE only once the two are composed: the dispatcher sizes
+    against the target shared out per node, and warns that it bounds nothing
+    when payload-only packing leaves the count unknown (review finding). At
+    this seam's default cap — one node an invoke — the two are one number.
+    The tail therefore asks for the SIZED schedule
     (:data:`zagg.sweep_partition.STAGE_TARGET_NODES`): each fixed-width tuple
     is subdivided inside its own span until its fattest dispatch node stays
     within the target. This seam hands in no ``coverage`` MOC — a dispatcher
