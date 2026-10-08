@@ -4796,10 +4796,10 @@ that would write nothing commits nothing. The operations:
   root group (`/`), a level group (`/{cells}`) or an array
   (`/{cells}/{array}`); a `null` value deletes the key. The root's
   `zagg_icechunk` block is the writer's and `multiscales` /
-  `zarr_conventions` are `declare-pyramid`'s: all three are refused here. This is how a convention block
-  evolves — the `dggs` `latitude` token, a spec marker — without a leaf
-  rewrite; the leaf's own attrs stay as the leaf was stamped, by design
-  (the head of this section).
+  `zarr_conventions` are `declare-pyramid`'s: all three are refused here.
+  This is how a convention block evolves — the `dggs` `latitude` token, a
+  spec marker — without a leaf rewrite; the leaf's own attrs stay as the
+  leaf was stamped, by design (the head of this section).
 - **`declare-pyramid <config>`** brings the repo's levels and its
   `multiscales` / `zarr_conventions` root attrs (§11.1) to the manifest's
   declaration (§4.9): every level of §11.1
