@@ -42,6 +42,8 @@ The Lambda function processes a single morton cell (order 6) by:
 | `src/zagg/catalog/` | CMR/STAC shard-map (granule catalog) builder (`python -m zagg.catalog`) |
 | `deployment/aws/invoke_lambda.py` | Orchestration script |
 | `deployment/aws/build_layer.sh` | Lambda layer build script (`x86_64`/`arm64`) |
+| `deployment/aws/build_function.sh` | Lambda function zip build script (handler + zagg + the non-layer deps) |
+| `deployment/aws/lock_requirements.py` | Writes `function-requirements.txt` / `layer-requirements.txt` from `uv.lock` (see [below](#zip-pins)) |
 
 ## Event Payload
 
@@ -280,6 +282,36 @@ script does, the parameter/environment-variable reference, cross-region staging,
 and teardown. The stack always creates the IAM execution role, so the identity
 running the standup needs `iam:CreateRole` — in an account whose deploy identity
 cannot (e.g. an AWS SSO "power user" set), have an admin run the standup itself.
+
+### Dependency pins and how a lock bump reaches the fleet {#zip-pins}
+
+Both zips are built from `uv.lock`, not resolved against PyPI at build time
+(issue #613). `deployment/aws/lock_requirements.py` projects the lock onto two
+committed files -- `function-requirements.txt` (the lock closure of `obstore`,
+`zarr`, `pydantic-zarr`, `pyyaml`) and `layer-requirements.txt` (the layer's
+closure minus the names the `lambda` extra pins exactly, which `build_layer.sh`
+installs itself) -- and the build scripts install them with
+`pip install -r ... --no-deps`. A worker therefore runs the versions the test
+suite ran, and the function-zip size tripwire (34 MiB, `test_function_build_size`)
+only moves on a zagg change or a deliberate lock bump.
+
+A lock bump reaches the fleet through a PR and a release, never by a rebuild
+alone:
+
+1. Bump the lock where it lives (`uv.lock` is gitignored):
+   `uv lock --upgrade-package zarr` (or `uv lock --upgrade`), then
+   `uv run deployment/aws/lock_requirements.py`. Commit the regenerated
+   requirement files with the bump -- `TestLockRequirements` in
+   `tests/test_lambda_build.py` fails until they match the lock.
+2. Open the PR. `lambda-build.yml` rebuilds both arches on the new pins and
+   runs the 250 MB combined gate; `test_function_build_size` catches
+   function-zip growth in the same PR, which is where it gets reviewed.
+3. Merge, then tag. `publish.yml` builds the zips again through
+   `lambda-build-reusable.yml`, attaches them to the GitHub release,
+   distributes them to `s3://sliderule-public-cors/<minor>/`
+   ([standup](standup.md#updating-and-tearing-down)) and updates the
+   production function in place; `stand_up.sh` users pick the new minor up on
+   their next standup.
 
 ### Worker-size variants {#worker-size-variants}
 
