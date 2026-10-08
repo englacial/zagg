@@ -2308,7 +2308,11 @@ class TestLadder:
         )
         assert summary["finisher"]["landed"] and summary["n_dirt_only"] == 2
         rows = _stage_rows(root)
-        assert [(r["icechunk_regathered"], r["written"]) for r in rows] == [(1, 0), (1, 0)]
+        # One row per tuple, each regathering its dirt-only node and writing
+        # nothing. Three tuples, not two: the tail sizes its schedule to the
+        # per-invoke fold (issue #610), which refines this shard-order-4
+        # ladder's coarse width-3 tuple into width 2 + width 1.
+        assert [(r["icechunk_regathered"], r["written"]) for r in rows] == [(1, 0)] * 3
         group, _repo = _open(root)
         group["5"]["count"][:]  # the touched column's level reads (no stale checksum)
         for shard in shards:
