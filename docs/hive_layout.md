@@ -2145,7 +2145,10 @@ reader in a browser takes. A private store swaps `anonymous=True` for
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` **environment variables only** —
 not the botocore chain, so an `AWS_PROFILE` reader wants `get_credentials=`
 and `icechunk.s3_refreshable_credentials(...)` instead (which is what the
-writer itself does, `icechunk_refs._boto3_credentials`). Pass `region=`
+writer itself does, `icechunk_refs._boto3_credentials`). That callable must
+hand icechunk an expiry whose tzinfo is `datetime.timezone.utc` — botocore's
+`_expiry_time` carries dateutil's `tzutc()`, which icechunk rejects — so
+normalise it as `_boto3_credentials` does. Pass `region=`
 either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `us-west-2`. Nothing here imports zagg — the repo opens from its own recorded
 `url_prefix` and the paths above, which is what makes the same two calls
