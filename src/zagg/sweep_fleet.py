@@ -343,28 +343,33 @@ def _fit_batch(
     return _fit_batch(nodes[:mid], buckets, **kw) + _fit_batch(nodes[mid:], buckets, **kw)
 
 
-def normalize_max_nodes(max_nodes):
-    """``max_nodes`` as an int >= 1, or ``None`` — refused by name, once.
+def normalize_knob(value, *, name: str, hint: str, floor: int = 1):
+    """One dispatcher knob as an int >= ``floor``, or ``None`` — refused by name.
 
-    Validated where the value ENTERS rather than where it is used, so a run
-    whose tuples all filter out still records a value it could have honored.
-    ``int()`` on its own is not validation: it truncates ``2.9`` to 2 and reads
-    ``True`` as 1 (both silently, so the summary's record would disagree with
-    what shipped), and it raises ``invalid literal for int()`` on a string —
-    not a message naming this knob (review finding).
+    The shared validation, so the dispatcher's knobs cannot disagree about
+    what a bad value is (review finding: ``stage_target_nodes`` reintroduced
+    exactly what this removed from ``max_nodes``). ``int()`` on its own is not
+    validation: it truncates ``2.9`` to 2 and reads ``True`` as 1 (both
+    silently, so the summary's record would disagree with what shipped), and
+    it raises ``invalid literal for int()`` on a string — not a message naming
+    the knob. Validated where the value ENTERS rather than where it is used,
+    so a run whose tuples all filter out still records a value it could have
+    honored.
     """
-    if max_nodes is None:
+    if value is None:
         return None
     try:
-        value = int(max_nodes)
+        whole = int(value)
     except (TypeError, ValueError):
-        value = None
-    if value is None or isinstance(max_nodes, bool) or value != max_nodes or value < 1:
-        raise ValueError(
-            f"max_nodes must be a whole number >= 1, got {max_nodes!r} — "
-            "pass None for payload-only packing"
-        )
-    return value
+        whole = None
+    if whole is None or isinstance(value, bool) or whole != value or whole < floor:
+        raise ValueError(f"{name} must be a whole number >= {floor}, got {value!r} — {hint}")
+    return whole
+
+
+def normalize_max_nodes(max_nodes):
+    """``max_nodes`` as an int >= 1, or ``None`` — refused by name, once."""
+    return normalize_knob(max_nodes, name="max_nodes", hint="pass None for payload-only packing")
 
 
 def pack_batches(
@@ -766,12 +771,20 @@ def run_stage_sweep_fleet(
     # records the EFFECTIVE value, so the run's own record cannot disagree
     # with what shipped.
     max_nodes_per_invoke = normalize_max_nodes(max_nodes_per_invoke)
-    stage_target_nodes = 0 if stage_target_nodes is None else int(stage_target_nodes)
-    if stage_target_nodes < 0:
-        raise ValueError(
-            f"stage_target_nodes must be >= 1 node per invoke, or None/0 to size by "
-            f"tuple_width alone (got {stage_target_nodes})"
+    # The same validation, for the same reason (review finding): a bare
+    # ``int()`` here would read ``True`` as 1, truncate ``2.9`` to 2 and
+    # accept ``"8"``, while the summary below claims the coerced value. 0
+    # keeps its documented meaning — size by ``tuple_width`` alone, like
+    # ``None`` — hence the floor of 0 rather than 1.
+    stage_target_nodes = (
+        normalize_knob(
+            stage_target_nodes,
+            name="stage_target_nodes",
+            hint="0 and None both size by tuple_width alone",
+            floor=0,
         )
+        or 0
+    )
     shard_order = int(shard_order)
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys

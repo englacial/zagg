@@ -276,13 +276,27 @@ class TestSizedDispatch:
             )
             assert _spans_of(summary) == _spans(stage_tuples(3, tuple_width=3))
 
-    def test_a_negative_target_is_refused_by_name(self, tmp_path):
+    @pytest.mark.parametrize("bad", (-1, True, 2.9, "8", "eight"))
+    def test_a_nonsense_target_is_refused_by_name(self, tmp_path, bad):
+        # The validation the knob three lines above it in the module already
+        # had (review finding): a bool, a non-integral float and a string are
+        # refused rather than coerced into a schedule the summary then reports
+        # as the caller's.
         from test_sweep_stage_fleet import _FakeLambda, _fleet
 
         root = tmp_path / "s"
         _stage_store(root)
-        with pytest.raises(ValueError, match="stage_target_nodes must be >= 1"):
-            _fleet(root, _FakeLambda(None), stage_target_nodes=-1)
+        with pytest.raises(ValueError, match="stage_target_nodes must be a whole number"):
+            # The barrier knobs are pinned low so a knob that is NOT refused
+            # ends the run rather than driving its barriers to the default
+            # 2700 s — the failure mode this test's own regression check hit.
+            _fleet(
+                root,
+                _FakeLambda(None),
+                stage_target_nodes=bad,
+                barrier_timeout_s=0.01,
+                total_barrier_budget_s=0.01,
+            )
 
 
 class TestShortOrders:
