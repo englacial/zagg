@@ -75,6 +75,13 @@ conformance tests assert decoded values, never object bytes.
   group per coarse ladder order, member refs by store-root-relative path,
   no arrays and no data bytes. No leaves or overview artifacts on purpose
   (§4.10: references claim ownership, never presence).
+- ``icechunk/`` — the §11.1 Icechunk repo-root surface (issue #615):
+  METADATA ONLY — the group documents the once-per-run init commits on
+  ``pyramid/``'s grid and knob: the root (``zagg_icechunk`` block, the
+  ``zarr_conventions`` registration, the ``multiscales`` object with its
+  dggs-composed ``layout``) plus one document per level group. No
+  repository, no arrays, no refs; validated against the vendored
+  multiscales v0.1 / dggs v1 schemas (``tests/data/conventions/``).
 - ``raster_toc/`` — the §8 temporal-declaration surface (issue #443): a
   RASTER ``(time, cells)`` hive leaf (two bands + ``morton`` + ``time``, the
   one unsharded fixture — raster never shards) whose ``time`` coordinate is
@@ -223,6 +230,10 @@ PYRAMID_V1_ACTUALS = {1: "leaves", 0: "cascade"}
 #: the §4.10 ancestor sets collapse (one node per coarse order — "-311",
 #: "-31", "-3") and the member maps stay one entry each.
 MULTISCALES_SHARDS = ("-3111", "-3112")
+
+#: The ``icechunk/`` fixture's store root: the virtual chunk container's
+#: ``url_prefix`` is that root with a trailing slash (§11.3).
+ICECHUNK_STORE_ROOT = "s3://fixture/product"
 
 #: The ``flux/`` fixture's §2.0 calibration provenance (issue #424): flux
 #: weights are meaningless without the gain constant that produced them, so
@@ -980,6 +991,90 @@ def build_multiscales(out: Path) -> None:
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     n = sum(len(v["members"]) for v in companion.values())
     print(f"{out.name}: companion group, {len(companion)} coarse orders, {n} member refs")
+
+
+def build_icechunk(out: Path) -> None:
+    """The §11.1 Icechunk repo-root fixture: the group documents, no repository.
+
+    A ``/2`` store on the ``pyramid/`` fixture's grid and knob
+    (:data:`PYRAMID_GRID`, :data:`PYRAMID_KNOB`), its repo hierarchy built
+    by the production spec builder (``icechunk_refs.repo_group_spec`` —
+    what the once-per-run init commits, §11.4) and written to a plain zarr
+    store so the committed documents are exactly what zarr serializes: the
+    root ``zarr.json`` (the ``zagg_icechunk`` block, the ``zarr_conventions``
+    registration, the ``multiscales`` object with its ``layout``) and one
+    ``{cells}/zarr.json`` per level group (the artifact's ``dggs`` block and
+    ``zarr_conventions``, verbatim). No Icechunk repository, no arrays, no
+    refs — the golden pins the documents a conformant reader validates
+    against the vendored multiscales v0.1 / dggs v1 schemas
+    (``tests/data/conventions/``), issue #615.
+
+    The expected ``layout`` is spelled HERE from the generator's INPUTS by
+    the §11.1 rules over the expanded levels — the column members fold the
+    leaves (base), every cascaded overview folds the next-finer level,
+    ``scale = 4 ** (c_from - c)`` — never read back out of the store.
+    """
+    import zarr
+    from zarr.storage import MemoryStore
+
+    from zagg import hive
+    from zagg.grids import HealpixGrid
+    from zagg.grids.base import vlen_dtype_warning_suppressed
+    from zagg.icechunk_refs import repo_group_spec, resolve_options
+
+    cfg = _config(False, pyramid=PYRAMID_KNOB)
+    cfg.aggregation["variables"].update(PYRAMID_EXTRA_VARIABLES)
+    cfg.output["grid"] = dict(PYRAMID_GRID)
+    grid = HealpixGrid(3, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    manifest = hive.build_manifest(grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"})
+    options = resolve_options(cfg, grid.parent_order, grid=grid)
+    spec = repo_group_spec(grid, ICECHUNK_STORE_ROOT, options, manifest)
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        spec.to_zarr(store, "", overwrite=False)
+    root = zarr.open_group(store, mode="r")
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    (out / "zarr.json").write_text(json.dumps(root.metadata.to_dict(), indent=1) + "\n")
+    levels = sorted((name for name, m in root.members() if isinstance(m, zarr.Group)), key=int)
+    for name in levels:
+        (out / name).mkdir()
+        doc = root[name].metadata.to_dict()
+        (out / name / "zarr.json").write_text(json.dumps(doc, indent=1) + "\n")
+    # Expectations from the inputs: the expanded levels (§4.5/§4.4), the
+    # base's dggs block from the grid's own attrs, the layout by §11.1.
+    s, base = PYRAMID_GRID["parent_order"], PYRAMID_GRID["child_order"]
+    resolutions = list(PYRAMID_KNOB["overviews"])
+    d = resolutions[-1] - s
+    expanded = [(base, "leaf")] + [(c, "column") for c in resolutions]
+    expanded += [(k + d, "overview") for k in range(s - 1, -1, -1)]
+    layout = [{"asset": str(base), "dggs": grid.shard_spec().attributes["dggs"]}]
+    for (cells, artifact), (finer, _) in zip(expanded[1:], expanded):
+        source = base if artifact == "column" else finer  # cascade, exact_levels 1
+        layout.append(
+            {
+                "asset": str(cells),
+                "derived_from": str(source),
+                "transform": {"scale": [float(4 ** (source - cells))]},
+                "dggs": {"refinement_level": cells},
+            }
+        )
+    expected = {
+        "shard_order": s,
+        "cell_order": base,
+        "url_prefix": ICECHUNK_STORE_ROOT + "/",
+        "levels": [str(c) for c, _ in expanded],
+        "artifacts": {str(c): a for c, a in expanded},
+        "multiscales": _expected_multiscales(
+            [{"node": s, "cells": resolutions}]
+            + [{"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)],
+            s,
+        )[0],
+        "layout": layout,
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(f"{out.name}: repo root + {len(levels)} level group documents")
 
 
 #: The ``raster_toc/`` fixture's acquisition groups (§8, issue #443). Three
@@ -2128,6 +2223,7 @@ def main() -> None:
         "column": lambda: build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5}),
         "pyramid": lambda: build_pyramid(args.out / "pyramid"),
         "multiscales": lambda: build_multiscales(args.out / "multiscales"),
+        "icechunk": lambda: build_icechunk(args.out / "icechunk"),
         "demoted": lambda: build_demoted(args.out / "demoted"),
         "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
         "versioned": lambda: build(

@@ -1,0 +1,165 @@
+{
+ "shard_order": 3,
+ "cell_order": 6,
+ "url_prefix": "s3://fixture/product/",
+ "levels": [
+  "6",
+  "5",
+  "4",
+  "3",
+  "2",
+  "1"
+ ],
+ "artifacts": {
+  "6": "leaf",
+  "5": "column",
+  "4": "column",
+  "3": "overview",
+  "2": "overview",
+  "1": "overview"
+ },
+ "multiscales": {
+  "spec": "zagg-multiscales/1",
+  "name": "SPEC_FIXTURE",
+  "base": {
+   "order": 3,
+   "cells": [
+    6
+   ]
+  },
+  "datasets": [
+   {
+    "order": 3,
+    "cells": [
+     5,
+     4
+    ],
+    "artifact": "column"
+   },
+   {
+    "order": 2,
+    "cells": [
+     3
+    ],
+    "artifact": "overview"
+   },
+   {
+    "order": 1,
+    "cells": [
+     2
+    ],
+    "artifact": "overview"
+   },
+   {
+    "order": 0,
+    "cells": [
+     1
+    ],
+    "artifact": "overview"
+   }
+  ],
+  "order2res": {
+   "3": [
+    5,
+    4
+   ],
+   "2": [
+    3
+   ],
+   "1": [
+    2
+   ],
+   "0": [
+    1
+   ]
+  },
+  "fields": {
+   "count": "exact",
+   "h_tdigest": "approximate",
+   "h_min": "exact",
+   "h_mean": "none"
+  },
+  "fold": {
+   "fold_source": "cascade",
+   "exact_levels": 1
+  }
+ },
+ "layout": [
+  {
+   "asset": "6",
+   "dggs": {
+    "name": "morton",
+    "refinement_level": 6,
+    "spatial_dimension": "cells",
+    "ellipsoid": {
+     "name": "WGS84",
+     "semimajor_axis": 6378137.0,
+     "inverse_flattening": 298.257223563
+    },
+    "compression": "none",
+    "latitude": "authalic-wgs84",
+    "coordinate": "morton"
+   }
+  },
+  {
+   "asset": "5",
+   "derived_from": "6",
+   "transform": {
+    "scale": [
+     4.0
+    ]
+   },
+   "dggs": {
+    "refinement_level": 5
+   }
+  },
+  {
+   "asset": "4",
+   "derived_from": "6",
+   "transform": {
+    "scale": [
+     16.0
+    ]
+   },
+   "dggs": {
+    "refinement_level": 4
+   }
+  },
+  {
+   "asset": "3",
+   "derived_from": "4",
+   "transform": {
+    "scale": [
+     4.0
+    ]
+   },
+   "dggs": {
+    "refinement_level": 3
+   }
+  },
+  {
+   "asset": "2",
+   "derived_from": "3",
+   "transform": {
+    "scale": [
+     4.0
+    ]
+   },
+   "dggs": {
+    "refinement_level": 2
+   }
+  },
+  {
+   "asset": "1",
+   "derived_from": "2",
+   "transform": {
+    "scale": [
+     4.0
+    ]
+   },
+   "dggs": {
+    "refinement_level": 1
+   }
+  }
+ ]
+}

@@ -2406,9 +2406,9 @@ Regeneration of those is deferred because it would
 also install the §4.9 `multiscales` mirror that `column/` pins the
 **absence** of, retiring an unrelated pin.
 
-Nine tiny single-shard hive stores plus three metadata-only ones (the
-`pyramid/` declaration, the `multiscales/` companion and the `uncounted/`
-root objects), all on the same
+Nine tiny single-shard hive stores plus four metadata-only ones (the
+`pyramid/` declaration, the `multiscales/` companion, the `icechunk/` repo
+root and the `uncounted/` root objects), all on the same
 deliberately small geometry — shard order 4, inner-chunk order 5, cell
 order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
 default; `raster_toc/` is the one exception — a `(time, cells)` product is
@@ -2489,6 +2489,20 @@ never sharded, §8/#247):
   arrays, no leaves, no overview artifacts — the committed golden pins
   that §4.10 references claim ownership, never presence, and that the
   tree opens with stock zarr alone.
+- **`icechunk/`** — the §11.1 Icechunk repo-root surface
+  ([#615](https://github.com/englacial/zagg/issues/615)): METADATA ONLY —
+  the group documents the once-per-run init commits, written by the
+  production spec builder (`icechunk_refs.repo_group_spec`) on `pyramid/`'s
+  grid and knob: the root `zarr.json` (the `zagg_icechunk` block, the
+  `zarr_conventions` registration and the `multiscales` object with its
+  `layout`) plus one `{cells}/zarr.json` per level group (the artifact's
+  `dggs` block and `zarr_conventions`, verbatim). No Icechunk repository,
+  no arrays, no refs — the committed golden pins the documents a
+  conformant reader validates: the root against the multiscales v0.1
+  schema, every level group against the dggs v1 schema, both vendored
+  under `tests/data/conventions/`. `icechunk.expected.json` spells the
+  `layout` from the generator's inputs (the §11.1 rules over `pyramid/`'s
+  expanded levels), never read back through zagg.
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
   `(time, cells)` hive leaf whose `time` coordinate is `uint64` toc words
   carrying `temporal: {"spec": "zagg-toc/1", "shape": "coordinate", …}` and no CF
@@ -4198,12 +4212,12 @@ level whose artifact a node never wrote (a column exists only under a `/2`
 declaration with composable fields; an overview only once swept) simply has
 no refs there and reads as fill. Every group is created by the once-per-run
 init (§11.4) from the manifest's declaration, and the repo's **root attrs
-mirror the manifest's `zagg-multiscales/1` block** verbatim as
-`multiscales`, so a reader opens one repo and discovers every level — its
-node order, cell order and artifact kind — from its root (the
-GeoZarr/OME-NGFF-style multiscales convention;
-earth-mover/icechunk-multiscales-demo; what gridlook's level resolver
-reads). `icechunk/` is a **reserved store-root child name** on the same
+carry the manifest's `zagg-multiscales/1` block** as the root `multiscales`
+object — its keys verbatim, plus the zarr-conventions `layout` below — so a
+reader opens one repo and discovers every level — its node order, cell order
+and artifact kind — from its root (the GeoZarr/OME-NGFF-style multiscales
+convention; earth-mover/icechunk-multiscales-demo; what gridlook's level
+resolver reads). `icechunk/` is a **reserved store-root child name** on the same
 footing as the §4.10 `multiscales/` companion: it is excluded from the **D19
 product-name grammar** (like the base-component exclusion), so a
 multi-product root walker can never classify it as a product, and
@@ -4228,7 +4242,23 @@ self-describing:
     "4":  {"node_order": 0, "artifact": "overview", "chunk_order": 0,  "cell_order": 4,  "split": {"chunks": 1,     "order": 0}}
   }
 },
-"multiscales": [ … the manifest's zagg-multiscales/1 block, verbatim … ]
+"zarr_conventions": [
+  {"schema_url": "https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json",
+   "spec_url": "https://github.com/zarr-conventions/multiscales/blob/v0.1/README.md",
+   "uuid": "d35379db-88df-4056-af3a-620245f8e347",
+   "name": "multiscales", "description": "Multiscale layout of zarr datasets"}
+],
+"multiscales": {
+  "spec": "zagg-multiscales/1",
+  "name": "…", "base": {"…": "…"}, "datasets": ["…"], "order2res": {"…": "…"}, "fields": {"…": "…"}, "fold": {"…": "…"},
+  "layout": [
+    {"asset": "19", "dggs": {"… the /19 level group's dggs block, verbatim …": "…"}},
+    {"asset": "13", "derived_from": "19", "transform": {"scale": [4096.0]}, "dggs": {"refinement_level": 13}},
+    {"asset": "12", "derived_from": "13", "transform": {"scale": [4.0]},    "dggs": {"refinement_level": 12}},
+    {"asset": "11", "derived_from": "12", "transform": {"scale": [4.0]},    "dggs": {"refinement_level": 11}},
+    {"…": "one entry per level group, finest first, down to /4"}
+  ]
+}
 ```
 
 `shard_order` / `chunk_order` / `cell_order` mirror the manifest and the
@@ -4243,15 +4273,75 @@ operation has delisted a level (§11.4 **Operations**), maps each delisted
 level's cell order to its last `levels` entry, so its surviving group keeps
 its manifest split; `commit`, `commit_order` and `split_order` are
 the ladder's knobs (§11.4, §11.5), read back by every stage node so the
-sweep needs no config. The repo root group's attrs are exactly these two
-keys: `zagg_icechunk` and the `multiscales` mirror (the mirror is absent
-only on a store whose manifest declares no `zagg-multiscales/1` block), and
-its members exactly the level groups and the two row-coordinate arrays
-(§11.2). A
-leaf root group carries only its own commit stamp, which is a per-leaf fact
-and so has nothing to mirror. Each **level group** mirrors its artifact's
-resolution-group attrs verbatim (the `dggs` block, `zarr_conventions`), and
-**never the commit stamp**.
+sweep needs no config. The repo root group's attrs are exactly these three
+keys — `zagg_icechunk`, `zarr_conventions` and `multiscales` (the latter two
+are absent, together, only on a store whose manifest declares no
+`zagg-multiscales/1` block) — and its members exactly the level groups and
+the two row-coordinate arrays (§11.2). A leaf root group carries only its
+own commit stamp, which is a per-leaf fact and so has nothing to mirror.
+Each **level group** mirrors its artifact's resolution-group attrs verbatim
+(the `dggs` block, `zarr_conventions`), and **never the commit stamp**.
+
+**The root is a conformant `multiscales` group composed with `dggs`**
+([#615](https://github.com/englacial/zagg/issues/615)). The root attrs
+validate against the [zarr-conventions `multiscales` v0.1
+schema](https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json)
+and compose with the [`dggs` convention](https://github.com/zarr-conventions/dggs)
+per the grammar of
+[zarr-conventions/dggs#25](https://github.com/zarr-conventions/dggs/pull/25);
+the level groups validate against the dggs v1 schema on their own. Both
+schemas are vendored under `tests/data/conventions/`, and the `icechunk/`
+fixture (§7) pins the documents.
+
+- **`zarr_conventions`** — the convention's registration: the `multiscales`
+  v0.1 Convention Metadata Object, copied verbatim from the convention's
+  README (the schema pins every key as a `const`; the UUID
+  `d35379db-88df-4056-af3a-620245f8e347` is permanent across versions).
+  Only the `multiscales` entry rides the root: the tagged dggs v1 schema
+  requires a top-level `dggs` wherever its own entry is claimed, and the
+  root has none — the per-level `dggs` blocks live on the level groups.
+- **`multiscales`** — the manifest's single `zagg-multiscales/1` entry **as
+  an object** (the v0.1 schema requires an object with `layout`; its
+  `additionalProperties: true` admits the `/1` keys — `spec`, `name`,
+  `base`, `datasets`, `order2res`, `fields`, `fold` — which ride verbatim,
+  and §4.9's tolerate-extra-keys rule already covers readers of the mirror)
+  plus **`layout`**: one entry per level group, **finest first** (the base,
+  then the manifest's `datasets` order), `asset` the level group's name
+  (`str(cell_order)`), so `asset` keys and `zagg_icechunk.levels` keys are
+  the same set in the same order.
+  - The **base** entry carries that level group's `dggs` block **whole**
+    (dggs#25: "specify the full `dggs` object for the original data") — a
+    verbatim copy, so whatever the leaf's `dggs` block says is what the
+    layout says.
+  - Every **derived** entry carries the reduced `{"refinement_level": c}`,
+    `derived_from` (another entry's `asset`) and
+    `transform: {"scale": [4^(c_from − c)]}` — a **single-element** `scale`
+    on the `cells` axis (nested order: four contiguous children per parent),
+    and **never** a `translation` (dggs#25: rotations are not representable).
+    The level arrays are `(window, cells)` (§11.2): `dggs.spatial_dimension`
+    names the spatial axis, and the one `scale` element indexes **that**
+    axis, not the leading row axis, whose extent every level shares.
+  - **`derived_from` is the declared fold provenance** (§4.5's `fold`
+    block, mirrored in the object's `fold` key): the column level folds the
+    base's own leaves within each leaf's footprint, so it derives from the
+    base; so does every level entry inside the `exact_levels` boundary and
+    every level under the `leaves` regime; a cascaded level derives from
+    the **next-finer level** (its `scale` is then `4.0` on the every-order
+    ladder). dggs#25's example derives every level from the base; a reader
+    resolving a level's absolute resolution needs only
+    `dggs.refinement_level` either way.
+  - No top-level `resampling_method`: it is one string, and zagg's
+    resampling is per field (`fields` is the class map — `count` an exact
+    sum, digests merged, `none`-class fields absent) — the `/1` keys carry
+    the per-field truth.
+- **Derived, never authoritative** — the same precedence as §4.9: the
+  object is computed from the manifest's `pyramid` block (through its
+  mirror) and the level groups' attrs at the init (§11.4) and by
+  `declare-pyramid` (which refreshes `multiscales` and `zarr_conventions`
+  together, and removes both when the manifest leaves `/2`); the manifest
+  wins any disagreement. The `zagg-icechunk/2` marker is **not** bumped by
+  the object shape: no reader contracts on the mirror's shape (§4.9), and
+  the `zagg_icechunk` block the compatibility check vets is unchanged.
 
 ### 11.2 Array model
 
@@ -4698,13 +4788,14 @@ that would write nothing commits nothing. The operations:
 - **`set-attrs <path> <json>`** merges the JSON object into the attrs of the
   root group (`/`), a level group (`/{cells}`) or an array
   (`/{cells}/{array}`); a `null` value deletes the key. The root's
-  `zagg_icechunk` block is the writer's and `multiscales` is
-  `declare-pyramid`'s: both are refused here. This is how a convention block
+  `zagg_icechunk` block is the writer's and `multiscales` /
+  `zarr_conventions` are `declare-pyramid`'s: all three are refused here. This is how a convention block
   evolves — the `dggs` `latitude` token, a spec marker — without a leaf
   rewrite; the leaf's own attrs stay as the leaf was stamped, by design
   (the head of this section).
-- **`declare-pyramid <config>`** brings the repo's levels and `multiscales`
-  root attrs to the manifest's declaration (§4.9): every level of §11.1
+- **`declare-pyramid <config>`** brings the repo's levels and its
+  `multiscales` / `zarr_conventions` root attrs (§11.1) to the manifest's
+  declaration (§4.9): every level of §11.1
   (`level_grids` of the manifest — the base plus the `/2` block's datasets)
   that the block does not list gains its group, written from the same spec
   the init writes at the repo's rows (§11.2), and its manifest split (§11.5) is persisted with the
