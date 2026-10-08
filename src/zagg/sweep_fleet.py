@@ -447,6 +447,7 @@ def await_records(
     timeout_s: float,
     interval_s: float,
     ignore=frozenset(),
+    label: str = "stage",
 ) -> tuple:
     """Poll until every expected record lands, or the budget runs out.
 
@@ -485,6 +486,9 @@ def await_records(
     prefix cannot be LISTED ``_LIST_FAULT_LIMIT`` times running: that is a
     dispatcher-side fault, and polling out the budget would buy nothing while
     reporting it as slow workers.
+
+    ``label`` names the leg in those warnings (``"families"`` from
+    :func:`run_families_sweep_fleet`).
     """
     deadline = time.monotonic() + float(timeout_s)
     stale = set(ignore)
@@ -500,8 +504,8 @@ def await_records(
             faults += 1
             if faults >= _LIST_FAULT_LIMIT:
                 logger.warning(
-                    f"stage fleet: abandoning the barrier on {records_from} after {faults} "
-                    f"consecutive LIST failures — the dispatcher cannot SEE the run's stage "
+                    f"{label} fleet: abandoning the barrier on {records_from} after {faults} "
+                    f"consecutive LIST failures — the dispatcher cannot SEE the run's {label} "
                     f"records (a permissions, region or endpoint fault, not slow workers), "
                     f"so waiting out the budget would buy nothing; proceeding fail-open with "
                     f"{len(seen)}/{len(expected)} record(s) seen"
@@ -512,12 +516,16 @@ def await_records(
         if time.monotonic() >= deadline:
             missing = sorted(expected - seen)
             logger.warning(
-                f"stage fleet: barrier timed out after {timeout_s:.0f}s with "
-                f"{len(missing)}/{len(expected)} stage record(s) missing ({missing[:5]}"
+                f"{label} fleet: barrier timed out after {timeout_s:.0f}s with "
+                f"{len(missing)}/{len(expected)} {label} record(s) missing ({missing[:5]}"
                 f"{' ...' if len(missing) > 5 else ''})"
                 f"{'' if listed_ever else ' — and the status prefix never listed successfully'}"
-                f" — proceeding: under-coverage is "
-                f"recorded per artifact and heals on the next pass (#381 point (6))"
+                + (
+                    " — proceeding: under-coverage is recorded per artifact and heals on the "
+                    "next pass (#381 point (6))"
+                    if label == "stage"
+                    else " — proceeding"
+                )
             )
             return seen, True
         # Clamped to the deadline: a poll interval longer than what is left
@@ -1048,6 +1056,7 @@ def run_families_sweep_fleet(
             timeout_s=barrier_timeout_s,
             interval_s=poll_interval_s,
             ignore=stale,
+            label="families",
         )
         return seen
 
