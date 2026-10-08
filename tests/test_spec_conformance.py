@@ -214,15 +214,22 @@ class TestDggsEllipsoid:
             parent_order=4, child_order=6, layout="fullsphere", config=default_config("atl06")
         )
         want = {k: v for k, v in grid._dggs_attrs()["dggs"].items() if k != "refinement_level"}
-        seen = 0
+        seen = set()
         for meta in SPEC_DATA.rglob("zarr.json"):
             attrs = json.loads(meta.read_text()).get("attributes", {})
             if "dggs" not in attrs:
                 continue
-            seen += 1
+            seen.add(meta.relative_to(SPEC_DATA).parts[0])
             got = {k: v for k, v in attrs["dggs"].items() if k != "refinement_level"}
             assert got == want, meta.relative_to(SPEC_DATA)
-        assert seen > 0
+        # Every fixture tree with a leaf contributes at least one block, so a
+        # regen that drops a tree's ``dggs`` stamp fails here, not silently.
+        leafed = {
+            p.name.removesuffix(".expected.json")
+            for p in SPEC_DATA.glob("*.expected.json")
+            if "leaf" in json.loads(p.read_text())
+        }
+        assert leafed <= seen, leafed - seen
 
 
 class TestRaggedAttrs:
