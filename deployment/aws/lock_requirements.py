@@ -14,9 +14,8 @@ environment marker on the build host. The builds then install with
 
 The layer file leaves out every name the ``lambda`` extra pins exactly:
 build_layer.sh installs those itself from the extra (``lambda_pin``, PR #436;
-numpy from source on arm64). The lock is resolved from the same pyproject, so
-it must agree with each such pin, and this script refuses to write when it
-does not (a stale lock).
+numpy from source on arm64). A lock that disagrees with such a pin (stale)
+needs no check here: ``uv export --locked`` refuses it.
 
 Regenerate after a lock bump (tests/test_lambda_build.py fails until it is):
 
@@ -27,6 +26,9 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
@@ -83,14 +85,15 @@ def closure(lock: dict, roots: tuple[str, ...]) -> set[str]:
     return {key for key in seen if "[" not in key}
 
 
-def lambda_extra_pins(pyproject: dict) -> dict[str, str]:
-    """``{"numpy": "2.2.6", ...}``: the exact pins build_layer.sh installs on its own."""
-    pins = {}
-    for dep in pyproject["project"]["optional-dependencies"]["lambda"]:
-        name, eq, version = dep.partition("==")
-        if eq:
-            pins[name.strip()] = version.strip()
-    return pins
+def lambda_extra_pins(pyproject: dict) -> frozenset[str]:
+    """``{"numpy", ...}``: the names the extra pins exactly (one ``==``), which
+    build_layer.sh installs on its own."""
+    reqs = map(Requirement, pyproject["project"]["optional-dependencies"]["lambda"])
+    return frozenset(
+        canonicalize_name(r.name)
+        for r in reqs
+        if len(r.specifier) == 1 and next(iter(r.specifier)).operator == "=="
+    )
 
 
 def export(repo_root: Path) -> list[str]:
@@ -124,17 +127,9 @@ def render(
 def main(out_dir: Path) -> None:
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text())
     pins = lambda_extra_pins(tomllib.loads((REPO_ROOT / "pyproject.toml").read_text()))
-    locked = {p["name"]: p.get("version") for p in lock["package"]}
-    stale = {name: (pin, locked.get(name)) for name, pin in pins.items() if locked.get(name) != pin}
-    if stale:
-        raise SystemExit(
-            f"uv.lock disagrees with the lambda extra (extra, lock): {stale} -- run uv lock"
-        )
     lines = export(REPO_ROOT)
     (out_dir / "function-requirements.txt").write_text(render(lines, lock, FUNCTION_ROOTS))
-    (out_dir / "layer-requirements.txt").write_text(
-        render(lines, lock, LAYER_ROOTS, frozenset(pins))
-    )
+    (out_dir / "layer-requirements.txt").write_text(render(lines, lock, LAYER_ROOTS, pins))
 
 
 if __name__ == "__main__":

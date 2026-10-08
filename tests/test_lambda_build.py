@@ -329,13 +329,13 @@ class TestLockRequirements:
         for one of them in the file is a second declaration site; a floating
         root missing from the file is a package the layer would ship without.
         """
+        import runpy
         import tomllib
 
         pins = self._pins((self.AWS / "layer-requirements.txt").read_text())
-        extra = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
-            "optional-dependencies"
-        ]["lambda"]
-        exact = {d.split("==")[0] for d in extra if "==" in d}
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        # The generator's own reader, so the two agree on what counts as exact.
+        exact = runpy.run_path(str(self.GENERATOR))["lambda_extra_pins"](pyproject)
         assert not exact & set(pins), (
             f"layer-requirements.txt pins {sorted(exact & set(pins))}, which build_layer.sh "
             "installs itself from the lambda extra (lambda_pin) -- two declaration sites"
