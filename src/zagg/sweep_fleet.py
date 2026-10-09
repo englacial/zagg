@@ -1124,6 +1124,20 @@ def run_stage_sweep_fleet(
                         f"stage fleet: the store {'declares' if told else 'does not declare'} "
                         f"the all-time fold, unlike the caller's config — following the store"
                     )
+                if family_names and not told:
+                    # The gate above read the CALLER's all_time, which this
+                    # function documents as only a first guess; the store has
+                    # now contradicted it, so no close invoke will fire and
+                    # the families fold nowhere. Loud rather than silent
+                    # (review finding) — the artifacts are regenerable, so the
+                    # run goes on and a families pass heals them.
+                    summary["families_unswept"] = True
+                    logger.warning(
+                        f"stage fleet: run {run_id} asked families {list(family_names)} to ride "
+                        "a store that does not declare the all-time fold, so no close invoke "
+                        "carries them — their rollups are NOT folded by this run; sweep them "
+                        "with 'python -m zagg.sweep <store>' (issue #610)"
+                    )
                 declared["closes"], declared["from"] = told, "store"
                 units = stage_units(by_shard, dispatch, all_time=told, **unit_args)
                 close_nodes = [unit["node"] for unit in units if unit["close"]]

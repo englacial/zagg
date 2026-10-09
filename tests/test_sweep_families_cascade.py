@@ -809,3 +809,68 @@ class TestMalformedRecord:
         assert composed["families"]["moc"]["accumulator_error"]
         assert "no usable" in caplog.text
         assert composed["families"]["moc"]["base_rollups"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review fold: the store can contradict the caller's all_time mid-run.
+# ---------------------------------------------------------------------------
+
+
+class TestStoreContradictsTheCaller:
+    def test_a_store_that_declares_no_close_is_reported_not_swallowed(self, tmp_path, caplog):
+        """The gate reads the CALLER's ``all_time``; the store overrides it from a record.
+
+        The worker arm is stubbed down to the one thing the dispatcher reads
+        back — a window-unit record saying ``closes: false`` — because that is
+        the whole mechanism: a caller may guess ``all_time=True`` against a
+        store that does not declare the fold, pass the dispatcher's gate, and
+        then have every close invoke withdrawn under it.
+        """
+        from test_sweep_stage_fleet import _FakeLambda, _fleet
+
+        from zagg.sweep_stages import STAGE_RECORD_SPEC, _put_stage_record, stage_record_name
+
+        root = tmp_path / "s"
+        _store(root)
+
+        def worker(event, _context):
+            block = event["stage"]
+            if block.get("role") == "finisher":
+                return {"statusCode": 200}
+            _put_stage_record(
+                block["records_from"],
+                stage_record_name(block["dispatch"], block["batch"]),
+                {
+                    "spec": STAGE_RECORD_SPEC,
+                    "role": "stage",
+                    "run_id": block["run_id"],
+                    "unit": block.get("unit"),
+                    "closes": False,  # what the STORE declares
+                    "stages": [],
+                    "level_actuals": {},
+                },
+                {},
+            )
+            return {"statusCode": 200}
+
+        with caplog.at_level("WARNING"):
+            summary = _fleet(
+                root,
+                _FakeLambda(handler=worker),
+                families=None,
+                windowed=True,
+                all_time=True,  # the caller's guess, which the store contradicts
+                leaves=[(morton_word(d), "2019") for d in LEAVES],
+                barrier_timeout_s=5,
+            )
+        assert summary["all_time_from"] == "store" and summary["all_time"] is False
+        assert summary["families_unswept"] is True
+        assert "their rollups are NOT folded by this run" in caplog.text
+
+    def test_a_complete_run_says_nothing_of_the_kind(self, tmp_path):
+        from test_sweep_stage_fleet import _FakeLambda, _fleet
+
+        root = tmp_path / "s"
+        _store(root)
+        summary = _fleet(root, _FakeLambda(), families=None, barrier_timeout_s=0.01)
+        assert "families_unswept" not in summary
