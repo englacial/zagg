@@ -3540,6 +3540,30 @@ def get_sweep_mode(config: PipelineConfig, grid=None) -> str:
     return mode
 
 
+def chains_stages(config: PipelineConfig, grid=None) -> bool:
+    """Whether the run tail chains the STAGED ladder — fail-open (D9).
+
+    The chaining gate :func:`get_sweep_mode` ``== SWEEP_STAGES``, wrapped,
+    because every tail it sits in is deliberately fail-open: the gate replaced
+    a dict lookup (``config.output.get("sweep") == "stages"``) that could not
+    fail, and the resolver reaches ``leaf_column_plan`` →
+    ``declared_fields`` → ``composability_classes`` + ``agg[name]``, which a
+    hand-built or worker-built aggregation block can raise ``KeyError`` or
+    ``TypeError`` from (and the resolver itself refuses an unknown mode word).
+    Unwrapped it would land AFTER every leaf is written and before the
+    Icechunk finalize, failing a run whose data is complete — where its
+    neighbours (``sweep_after_run``, ``stage_sweep_after_run``,
+    ``_finalize_icechunk_local``) all swallow and warn. An unconfirmable
+    declaration is NO chained pass, never a guessed one; the loud refusal is
+    :func:`validate_config`'s, up front.
+    """
+    try:
+        return get_sweep_mode(config, grid) == SWEEP_STAGES
+    except Exception as e:
+        logger.warning(f"staged sweep not chained, sweep mode unresolved (fail-open, D9): {e}")
+        return False
+
+
 def get_sweep(config: PipelineConfig) -> bool:
     """Whether the end-of-run rollup sweep trigger is on (issue #300).
 

@@ -62,8 +62,8 @@ from dataclasses import asdict
 from typing import Any, Iterator
 
 from zagg.config import (
-    SWEEP_STAGES,
     PipelineConfig,
+    chains_stages,
     get_child_order,
     get_consolidate_metadata,
     get_coverage_moc,
@@ -79,7 +79,6 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_sweep,
-    get_sweep_mode,
     get_touch_policy,
     get_windowing,
     load_config,
@@ -1362,9 +1361,7 @@ class Run:
         # rather than tagging a tip the staged sweep never reached. Cleared
         # only on the explicit no-work branch below.
         sweeps = layout == "hive" and get_sweep(self.config)
-        stage_chained = (
-            sweeps and get_sweep_mode(self.config, self.grid) == SWEEP_STAGES and not self._attached
-        )
+        stage_chained = sweeps and chains_stages(self.config, self.grid) and not self._attached
         if sweeps:
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -1471,9 +1468,8 @@ class Run:
         if self._icechunk_init is None:
             if not (self._attached and get_icechunk(self.config)):
                 return
-            if (
-                get_icechunk_options(self.config)["commit"] != "leaf"
-                or get_sweep_mode(self.config, self.grid) == SWEEP_STAGES
+            if get_icechunk_options(self.config)["commit"] != "leaf" or chains_stages(
+                self.config, self.grid
             ):
                 handle.icechunk_finalize = {
                     "skipped": 'attached sweep: "stages" run; its dispatcher finalizes '
