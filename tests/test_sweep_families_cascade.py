@@ -372,6 +372,9 @@ class TestFinisherReadsNoLeaf:
         # The spatial fold still happened: the base rollup was read, and the
         # standing §10 section rides the GET-union-PUT seam (§10.4).
         assert composed["families"]["moc"]["base_rollups"] == 1
+        # ...but this finish published none of THIS run's §10 words, so it is
+        # not the authority to stand step 1 down on (review finding).
+        assert composed["owns_root_moc"] is False
 
     def test_a_shard_no_record_visited_is_recorded_not_refused(self, tmp_path, caplog):
         from zagg.hive import read_manifest
@@ -400,8 +403,13 @@ class TestRecordPlumbing:
         records = [{"families": {"submap": {}, "moc": {"accumulator": {"shards": {}}}}}, {}]
         assert families_in_records(records) == ("moc", "submap")
         assert families_in_records([{"families": {"overview": {}}}]) == ()
-        assert accumulator_blocks(records, "moc") == [{"shards": {}}, None]
-        assert accumulator_blocks(records, "stats") == [None, None]
+        # Only the records that RODE the family contribute. The second record
+        # rode none — a windowed run's window units are exactly that — so it
+        # is skipped, not counted as a missing accumulator; a record that rode
+        # the family and carries none still contributes the loud ``None``.
+        assert accumulator_blocks(records, "moc") == [{"shards": {}}]
+        assert accumulator_blocks(records, "submap") == [None]
+        assert accumulator_blocks(records, "stats") == []
 
     def test_no_family_composes_nothing(self, tmp_path):
         from zagg.hive import read_manifest
@@ -810,6 +818,96 @@ class TestMalformedRecord:
         assert composed["families"]["moc"]["accumulator_error"]
         assert "no usable" in caplog.text
         assert composed["families"]["moc"]["base_rollups"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review fold: a windowed run's record set is MIXED — close units rode the
+# families, window units did not, and both land under the status prefix.
+# ---------------------------------------------------------------------------
+
+
+class TestMixedRecordSet:
+    @staticmethod
+    def _close_record(root, manifest, by_shard):
+        """One close unit's record, as a windowed run's close invoke writes it."""
+        from zagg.sweep_stages import sweep_stage_pass
+
+        rider = rider_for(None)
+        sweep_stage_pass(root, manifest, by_shard, run_id="M", tuple_width=3, families=rider)
+        return {"unit": "close", "families": rider.summary()}
+
+    def test_a_windowed_record_set_keeps_its_section(self, tmp_path, caplog):
+        """The window units' records carry no ``families`` — and are not a short fan-out.
+
+        ``read_stage_records`` returns every record of the run, and the
+        dispatcher sends ``families`` only on the invokes that close a node,
+        so a windowed run's list is one block per close unit beside a ``None``
+        for every window unit. Counting those as missing accumulators lost
+        the whole §10 section (review finding).
+        """
+        from zagg.hive import read_manifest
+        from zagg.sweep_families import finish_families
+
+        _pass, root, leaves = _temporal_pair(tmp_path)
+        manifest = read_manifest(root)
+        by_shard = _by_shard_of(leaves)
+        records = [
+            {"unit": "window", "window": "2019"},
+            self._close_record(root, manifest, by_shard),
+            {"unit": "window", "window": "2020"},
+        ]
+        with caplog.at_level("WARNING"):
+            composed = finish_families(root, manifest, by_shard, records=records)
+        assert composed["stage_records"] == 3
+        assert composed["families"]["moc"]["temporal_shards"] == TEMPORAL_LEAVES
+        assert "accumulator_error" not in composed["families"]["moc"]
+        assert "stage records carry no usable" not in caplog.text
+        assert "shards_unvisited" not in composed
+        assert composed["owns_root_moc"] is True
+
+    def test_a_record_that_rode_the_family_with_no_block_still_refuses(self, tmp_path, caplog):
+        """The loud signal survives: silence is skipped, an empty claim is not."""
+        from zagg.hive import read_manifest
+        from zagg.sweep_families import finish_families
+
+        _pass, root, leaves = _temporal_pair(tmp_path, 4)
+        manifest = read_manifest(root)
+        by_shard = _by_shard_of(leaves)
+        run_stage_sweep(root, leaves, families=None, record=False)
+        with caplog.at_level("WARNING"):
+            composed = finish_families(
+                root,
+                manifest,
+                by_shard,
+                records=[{"unit": "window"}, {"unit": "close", "families": {"moc": {}}}],
+            )
+        assert composed["families"]["moc"]["accumulator_error"]
+        assert "no usable" in caplog.text
+        assert composed["owns_root_moc"] is False
+
+    def test_a_full_claim_with_a_lost_section_does_not_stand_step_1_down(self, tmp_path, caplog):
+        """Full ``visited`` coverage is not enough: the §10 section has to have survived.
+
+        The block claims every shard of the work set — so ``shards_unvisited``
+        cannot fire — and is then unusable, so this finish published the
+        STANDING section and none of this run's words (review finding).
+        """
+        from zagg.hive import read_manifest
+        from zagg.sweep_families import finish_families
+
+        _pass, root, leaves = _temporal_pair(tmp_path, 4)
+        manifest = read_manifest(root)
+        by_shard = _by_shard_of(leaves)
+        run_stage_sweep(root, leaves, families=None, record=False)
+        acc = {"visited": sorted(by_shard)}  # a full claim, and no §10 currency
+        with caplog.at_level("WARNING"):
+            composed = finish_families(
+                root, manifest, by_shard, records=[{"families": {"moc": {"accumulator": acc}}}]
+            )
+        assert composed["families"]["moc"]["accumulator_error"]
+        assert composed["families"]["moc"]["base_rollups"] == 1
+        assert "shards_unvisited" not in composed
+        assert composed["owns_root_moc"] is False
 
 
 # ---------------------------------------------------------------------------
