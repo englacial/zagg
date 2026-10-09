@@ -66,6 +66,7 @@ __all__ = [
     "densest_shard",
     "joint_cells",
     "paired_blocks",
+    "tensor_dtype",
     "viewer_stats",
     "load",
     "view3d",
@@ -80,6 +81,18 @@ def _si(n) -> str:
         if n >= cut:
             return f"{n / cut:.3g}{suffix}"
     return f"{n:,.0f}"
+
+
+def tensor_dtype(store, field) -> str:
+    """The ``read_tensors`` dtype a field's own §2.0 ``weights`` declaration allows.
+
+    A ``counts`` field (ATL03 photons) bins to exact ``uint32``. A ``flux``
+    field (GEDI) bins to a calibrated float, and moczarr >= 0.9 refuses to
+    round it into an integer dtype -- so it is read as ``float32``. One
+    metadata open per field; the array itself is untouched.
+    """
+    _, element = mz.open_ragged(store, field)
+    return "float32" if element.weights == "flux" else "uint32"
 
 
 def paired_blocks(handles, block_order: int = BLOCK_ORDER, n_bins: int = 256, res: float = 1.0):
@@ -111,6 +124,7 @@ def paired_blocks(handles, block_order: int = BLOCK_ORDER, n_bins: int = 256, re
             resolution=res,
             block_order=block_order,
             fit="degrade_resolution",
+            dtype=tensor_dtype(store, field),
         ):
             gains[name][w] = window
             cols[name][w] = tensor.sum(axis=2)  # the tensor is dropped here
@@ -429,12 +443,15 @@ def view3d(
     # One block per read, cached. Sweeping the shard up front cost ~1.3 GiB
     # resident (Binder caps at 2 GB) and ~148 s before the first frame.
     voxels: dict = {n: {} for n in names}
+    dtypes: dict = {}  # per sensor, from the field's weights declaration, on first read
 
     def _voxels(name, block):
         """This sensor's drawable voxels for one block, read once and cached."""
         hit = voxels[name].get(block)
         if hit is None:
             store, field = handles[name]
+            if name not in dtypes:
+                dtypes[name] = tensor_dtype(store, field)
             t0 = time.perf_counter()
             got = next(
                 iter(
@@ -445,6 +462,7 @@ def view3d(
                         resolution=resolution,
                         block_order=block_order,
                         fit="degrade_resolution",
+                        dtype=dtypes[name],
                         subtree=mz.morton_decimal(block),
                     )
                 ),
