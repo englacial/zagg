@@ -632,13 +632,33 @@ def run_stage_sweep_fleet(
     done.
 
     Supplying it therefore makes the pass the STORE's rather than the run's,
-    which is the hand-driven recovery form — so it now requires ``scope=`` to
-    be spelled (:func:`zagg.sweep_stages.operator_scope`, issue #620): the
-    failed subtree's prefixes, or ``scope="all"`` for the whole store on
-    purpose. An unscoped full-coverage pass is what billed ~1,300 no-op
-    invokes for zero writes twice in one week
+    which is the hand-driven recovery form — so a non-empty ``coverage=``
+    requires ``scope=`` to be spelled
+    (:func:`zagg.sweep_stages.operator_scope`, issue #620): the failed
+    subtree's prefixes, or ``scope="all"`` for the whole store on purpose.
+    An unscoped full-coverage pass is what billed ~1,300 no-op invokes for
+    zero writes twice in one week
     (https://github.com/englacial/zagg/issues/610#issuecomment-6067171538).
     The tail passes no coverage and is unaffected.
+
+    **What that gate does NOT close** (review finding, issue #620). It is
+    exactly "a ``coverage=`` pass must name its scope", not "no unscoped
+    whole-store fan-out is possible here": ``coverage`` is one of two ways to
+    a whole-store NODE set, and the other is a whole-store WORK set —
+
+    .. code-block:: python
+
+        leaves = zagg.sweep.discover_leaves(root, store_kwargs=…)
+        run_stage_sweep_fleet(client, fn, root, leaves, shard_order=9)
+
+    which passes ``coverage=None``, ``scope=None`` and bills the identical
+    fan-out, because the node set is every leaf's ancestors. It is the shape
+    the CLI backstop has (which is why ``--scope`` had to be added there) and
+    the one ``docs/deployment/lambda.md`` documents. Closing it is a
+    signature change (``scope`` required here, the tail passing its own shard
+    decimals the way :func:`zagg.sweep_stages.stage_sweep_after_run` already
+    does) and is standing for espg on PR #622 — so this docstring claims only
+    what the code enforces.
 
     ``max_nodes_per_invoke`` caps how many dispatch nodes one invoke folds
     (:func:`pack_batches`, where it composes with the async payload cap). The
