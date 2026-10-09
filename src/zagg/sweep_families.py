@@ -291,16 +291,34 @@ class FamiliesRider:
 
 
 def accumulator_blocks(records, name: str) -> list:
-    """One family's accumulator blocks, as the run's stage records carry them.
+    """One family's accumulator blocks, from the records that RODE that family.
 
-    ``records`` is :func:`zagg.sweep_stages.read_stage_records`' list. A
-    record that rode no family, or a family that declares no accumulator,
-    contributes ``None`` — which
+    ``records`` is :func:`zagg.sweep_stages.read_stage_records`' list. Only
+    the records whose ``families`` names this family contribute: a record that
+    rode it and carries no accumulator contributes ``None`` — which
     :meth:`zagg.sweep.SweepFamily.load_accumulators` refuses, so a short
     fan-out degrades loudly in :func:`finish_families` rather than publishing
     a section composed from a subset without saying so.
+
+    A record that rode NO family is skipped rather than contributing ``None``,
+    because it is not evidence of a short fan-out. A windowed run makes that
+    the normal case: the fleet dispatcher sends ``families`` only on the
+    invokes that CLOSE a node (``closing_block`` in
+    :mod:`zagg.sweep_fleet`), while every window unit still writes a stage
+    record that :func:`zagg.sweep_stages.read_stage_records` returns — so
+    counting those as missing accumulators lost the whole §10 section of the
+    one windowed shape this phase serves (review finding). The distinction is
+    the one :func:`families_in_records` already draws.
     """
-    return [((r.get("families") or {}).get(name) or {}).get("accumulator") for r in records]
+    out = []
+    for r in records:
+        block = r.get("families") or {}
+        if isinstance(block, dict) and name in block:
+            # ``(block[name] or {}).get`` and not a guarded read: a record
+            # whose per-family value is not a mapping must raise here, inside
+            # :func:`finish_families`' ``try``, and degrade like a lost one.
+            out.append((block[name] or {}).get("accumulator"))
+    return out
 
 
 def families_in_records(records) -> tuple:
@@ -383,7 +401,7 @@ def finish_families(
     store = open_object_store(store_root, **store_kwargs)
     bases = sorted({_decimal_base(d) for d in by_shard})
     told_visited = rider is not None
-    moc_composed = False
+    moc_composed = moc_section_lost = False
     for fam in families:
         block: dict = {}
         # A family declaring no accumulator needs none loaded: its coarse
@@ -421,6 +439,7 @@ def finish_families(
             out["root_moc_written"] = True
         if fam.name == "moc":
             moc_composed = bool(tops)
+            moc_section_lost = "accumulator_error" in block
     unvisited = sorted(set(by_shard) - visited) if told_visited else []
     if unvisited:
         logger.warning(
@@ -440,8 +459,14 @@ def finish_families(
     #     leaves them out, and then the work-set envelope is the only thing
     #     that would list them);
     #   * some record SAID what it visited at all — an older worker's did
-    #     not, and an unverifiable claim is not one to stand down on.
+    #     not, and an unverifiable claim is not one to stand down on;
+    #   * and the §10 section survived: an ``accumulator_error`` means this
+    #     finish published the standing section and none of this run's, so it
+    #     is not the authority to stand step 1 down on either (review
+    #     finding).
     # Otherwise step 1 runs too: one extra PUT of a subset, which
     # ``write_root_coverage`` unions (review findings).
-    out["owns_root_moc"] = bool(moc_composed and told_visited and not unvisited)
+    out["owns_root_moc"] = bool(
+        moc_composed and told_visited and not unvisited and not moc_section_lost
+    )
     return out
