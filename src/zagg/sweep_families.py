@@ -348,7 +348,14 @@ def finish_families(
         visited = set()
     if not names:
         return None
-    out: dict = {"source": source, "families": {}, "root_moc_written": False}
+    out: dict = {
+        "source": source,
+        "families": {},
+        "root_moc_written": False,
+        # Whether the ``moc`` family's own finish took over the root
+        # ``coverage.moc`` refresh — see where it is set.
+        "owns_root_moc": False,
+    }
     if source == "records":
         out["stage_records"] = len(records)
     store = open_object_store(store_root, **store_kwargs)
@@ -382,6 +389,15 @@ def finish_families(
         out["families"][fam.name] = {**block, "base_rollups": len(tops), **result}
         if result.get("root_moc_written"):
             out["root_moc_written"] = True
+        if fam.name == "moc" and tops:
+            # The caller stands :func:`zagg.sweep_stages.run_finisher`'s own
+            # root refresh down on THIS, not on "a family rode": only the
+            # ``moc`` family writes that object, and only when it had
+            # base-node rollups to compose from — with none (every leaf
+            # unstamped, or the rider's spans failed) ``MocFamily.finish``
+            # returns early and writes nothing, and the work-set envelope is
+            # then the only thing that would land (review finding).
+            out["owns_root_moc"] = True
     unvisited = sorted(set(by_shard) - visited) if told_visited else []
     if unvisited:
         logger.warning(
