@@ -844,8 +844,12 @@ def run_stage_sweep_fleet(
         "all_time": bool(all_time),
         # The rollup families riding this run's closes (issue #610 phase 4) —
         # empty when the ladder sweeps alone and the families keep their own
-        # fan-out.
+        # fan-out — and whether the store withdrew the close they ride, which
+        # leaves them unswept. Both always present, like ``skipped`` and
+        # ``short_orders``: a caller reading the summary should not have to
+        # know which branch produced it.
         "families": list(family_names),
+        "families_unswept": False,
         "scope": None if scope is None else [str(int(w)) for w in scope],
         # Whether the per-tuple node sets were computed from the store's own
         # coverage (issue #547) or from the work set alone. The words
