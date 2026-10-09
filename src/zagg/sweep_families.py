@@ -227,7 +227,7 @@ class FamiliesRider:
         if not work:
             return
         self.folded.add(span)
-        self.visited.update(work)
+        clean = True
         for fam in self.families:
             try:
                 fold_span(
@@ -249,6 +249,13 @@ class FamiliesRider:
                     f"{node} failed ({e}) — leaving its rollups as they stood (D9)"
                 )
                 self.node_failures.append({"node": node, "family": fam.name, "error": str(e)})
+                clean = False
+        if clean:
+            # Claimed only when EVERY family folded the span: a span that
+            # raised left its rollups as they stood, so they do not account
+            # for these shards and the finisher must not stand the work-set
+            # root refresh down on them (review finding).
+            self.visited.update(work)
 
     def summary(self) -> dict:
         """The pass's per-family block: counts, the family summaries, the accumulators.
@@ -368,6 +375,7 @@ def finish_families(
     store = open_object_store(store_root, **store_kwargs)
     bases = sorted({_decimal_base(d) for d in by_shard})
     told_visited = rider is not None
+    moc_composed = False
     for fam in families:
         block: dict = {}
         # A family declaring no accumulator needs none loaded: its coarse
@@ -381,8 +389,11 @@ def finish_families(
                 # :func:`zagg.sweep._load_finisher` wraps for the same reason).
                 blocks = accumulator_blocks(records, fam.name)
                 for b in blocks:
-                    if isinstance(b, dict):
-                        visited.update(b.get("visited") or ())
+                    # ``told_visited`` keys on the KEY, not on the block: a
+                    # worker predating it says nothing about what it walked,
+                    # and silence is not a claim of full coverage.
+                    if isinstance(b, dict) and "visited" in b:
+                        visited.update(b["visited"] or ())
                         told_visited = True
                 fam.load_accumulators(blocks)
             except Exception as e:
@@ -400,15 +411,8 @@ def finish_families(
         out["families"][fam.name] = {**block, "base_rollups": len(tops), **result}
         if result.get("root_moc_written"):
             out["root_moc_written"] = True
-        if fam.name == "moc" and tops:
-            # The caller stands :func:`zagg.sweep_stages.run_finisher`'s own
-            # root refresh down on THIS, not on "a family rode": only the
-            # ``moc`` family writes that object, and only when it had
-            # base-node rollups to compose from — with none (every leaf
-            # unstamped, or the rider's spans failed) ``MocFamily.finish``
-            # returns early and writes nothing, and the work-set envelope is
-            # then the only thing that would land (review finding).
-            out["owns_root_moc"] = True
+        if fam.name == "moc":
+            moc_composed = bool(tops)
     unvisited = sorted(set(by_shard) - visited) if told_visited else []
     if unvisited:
         logger.warning(
@@ -417,4 +421,19 @@ def finish_families(
             f"heals it (§10.4, issue #610 phase 4)"
         )
         out["shards_unvisited"] = len(unvisited)
+    # What the caller stands :func:`zagg.sweep_stages.run_finisher`'s own root
+    # refresh down on. Not "a family rode": only the ``moc`` family writes
+    # that object, and its words are this run's only when all three hold —
+    #   * ``moc`` had base-node rollups to compose from (with none,
+    #     ``MocFamily.finish`` returns early and writes nothing);
+    #   * every shard of the work set is in some record's ``visited``, so the
+    #     rollups it composed actually account for this run's leaves (a lost
+    #     close invoke, a scoped fan-out, or a rider whose spans all raised
+    #     leaves them out, and then the work-set envelope is the only thing
+    #     that would list them);
+    #   * some record SAID what it visited at all — an older worker's did
+    #     not, and an unverifiable claim is not one to stand down on.
+    # Otherwise step 1 runs too: one extra PUT of a subset, which
+    # ``write_root_coverage`` unions (review findings).
+    out["owns_root_moc"] = bool(moc_composed and told_visited and not unvisited)
     return out

@@ -923,3 +923,63 @@ class TestVisitedIsWhatWasFolded:
             str(root), manifest, by_shard, records=[{"families": rider.summary()}]
         )
         assert "shards_unvisited" not in composed
+
+
+# ---------------------------------------------------------------------------
+# Review fold: standing step 1 down needs the rollups to account for THIS run.
+# ---------------------------------------------------------------------------
+
+
+class TestOwnsRootMocNeedsCoverage:
+    def test_a_run_whose_spans_all_raised_does_not_stand_step_1_down(self, tmp_path, monkeypatch):
+        """Prior rollups make ``tops`` non-empty even when this run folded nothing.
+
+        ``MocFamily.finish`` would then publish the PRIOR run's words and the
+        new leaves would reach the root listing only on the next sweep — which
+        is the silently-short root this issue is about, from the other side.
+        """
+        import zagg.sweep as sweep_mod
+
+        root = tmp_path / "s"
+        _store(root)
+        run_stage_sweep(str(root), _refs(), families=None, record=False)  # lay the rollups
+        (root / "coverage.moc").unlink()
+        monkeypatch.setattr(sweep_mod, "_rollup_shard_node", _explode)
+        summary = run_stage_sweep(str(root), _refs(), families=None, record=False)
+        composed = summary["families"]["finish"]
+        assert composed["families"]["moc"]["base_rollups"] == 2  # the prior run's
+        assert composed["shards_unvisited"] == len(LEAVES)
+        assert composed["owns_root_moc"] is False
+        assert summary["finisher"]["root_moc_from"] == "work-set"
+        assert (root / "coverage.moc").exists()
+
+    def test_a_record_that_claims_nothing_does_not_stand_step_1_down(self, tmp_path):
+        """An older worker's record carries no ``visited``: the claim is unverifiable."""
+        from zagg.sweep_families import finish_families
+
+        root = tmp_path / "s"
+        manifest = _store(root)
+        by_shard = {d: {None} for d in LEAVES}
+        run_stage_sweep(str(root), _refs(), families=None, record=False)
+        composed = finish_families(
+            str(root),
+            manifest,
+            by_shard,
+            records=[
+                {
+                    "families": {
+                        "moc": {
+                            "accumulator": {
+                                "fields": [],
+                                "cell_order": 0,
+                                "shards": {},
+                                "uncounted": [],
+                                "routes": {},
+                            }
+                        }
+                    }
+                }
+            ],
+        )
+        assert "shards_unvisited" not in composed  # nothing said what it visited
+        assert composed["owns_root_moc"] is False
