@@ -168,12 +168,26 @@ class TestOneWalk:
 
         monkeypatch.setattr(fam_mod, "fold_span", spy)
         run_stage_sweep(str(root), _refs(), families=None, tuple_width=1, record=False)
-        # Every rollup on the store came out of a span of this engine, and the
-        # spans are exactly the width-1 ladder's three tuples: [2,3), [1,2),
-        # [0,1). Nothing folded outside it.
+        # The spans are exactly the width-1 ladder's three tuples: [2,3),
+        # [1,2), [0,1).
         assert {sp[1:] for sp in spans} == {(3, 2), (2, 1), (1, 0)}
         assert {s[0] for s in spans} == set(CASCADE_FAMILIES)
         assert _families_only(_rollups(root))
+        # ...and every rollup on the store came out of one of them. The span
+        # set alone cannot say that: a second walk reaching
+        # ``_rollup_shard_node`` / ``_rollup_interior`` directly would leave
+        # it untouched and this test green, which is the case espg's "must
+        # not grow a second cascade" criterion is about
+        # (https://github.com/englacial/zagg/issues/620#issuecomment-6068583904).
+        # Standing the engine down is the complement: with it folding
+        # nothing, nothing may land (review finding). Compare
+        # ``test_the_1_and_2_sweeps_fold_a_node_through_the_one_engine`` in
+        # ``tests/test_sweep_overview.py``.
+        bare = tmp_path / "bare"
+        _store(bare)
+        monkeypatch.setattr(fam_mod, "fold_span", lambda *a, **kw: [])
+        run_stage_sweep(str(bare), _refs(), families=None, tuple_width=1, record=False)
+        assert _families_only(_rollups(bare)) == {}
 
 
 class TestWhereItRuns:
