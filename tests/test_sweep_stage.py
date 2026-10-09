@@ -433,8 +433,17 @@ def _payload_equal(x, y):
 WIDE_CELL_ORDER = 6
 
 
-def _wide_store(root, leaves=LEAVES, fields=FIELDS, cell_order=WIDE_CELL_ORDER, overviews=(5,)):
-    """A deeper leaf (``4 ** (cell_order - 3)`` cells) under a sized ladder."""
+def _wide_store(
+    root, leaves=LEAVES, fields=FIELDS, cell_order=WIDE_CELL_ORDER, overviews=(5,), windows=None
+):
+    """A deeper leaf (``4 ** (cell_order - 3)`` cells) under a sized ladder.
+
+    ``windows`` makes it WINDOWED — the manifest grows the temporal block and
+    the all-time close, and every leaf's column is written once per window.
+    This geometry is the one whose ladder writes a dispatch-node stage column
+    (the ``(2, 4)`` gather), so it is the only fixture that reaches
+    ``_stage_column_current``'s ``window`` argument (issue #620 review).
+    """
     from zagg.column import column_resolutions, fold_column, write_column
     from zagg.pyramid import expand_overviews
 
@@ -442,22 +451,35 @@ def _wide_store(root, leaves=LEAVES, fields=FIELDS, cell_order=WIDE_CELL_ORDER, 
     manifest["cell_order"] = cell_order
     levels = expand_overviews(list(overviews), parent_order=3)
     manifest["pyramid"]["overviews"] = levels
+    if windows:
+        manifest["spec"] = "morton-hive/2"
+        manifest["temporal"] = {
+            "schedule": "yearly",
+            "time_field": "t",
+            "epoch": "2018-01-01T00:00:00Z",
+        }
+        manifest["pyramid"]["overview"]["all_time"] = True
     (root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=1))
     res = column_resolutions(levels, 3)
     n = 4 ** (cell_order - 3)
     companioned = any(_companion_kwargs(m) for m in fields.values())
     for i, dec in enumerate(leaves):
-        slabs = _located_leaf_slabs(i, fields, n) if companioned else _leaf_slabs(i, n)
-        folded = fold_column(slabs, fields, cell_order=cell_order, resolutions=res, node_order=3)
-        write_column(
-            str(root),
-            morton_word(dec),
-            folded,
-            fields,
-            node_order=3,
-            cell_order=cell_order,
-            granule_count=1,
-        )
+        for w, window in enumerate(windows or (None,)):
+            j = i + 10 * w
+            slabs = _located_leaf_slabs(j, fields, n) if companioned else _leaf_slabs(j, n)
+            folded = fold_column(
+                slabs, fields, cell_order=cell_order, resolutions=res, node_order=3
+            )
+            write_column(
+                str(root),
+                morton_word(dec),
+                folded,
+                fields,
+                node_order=3,
+                cell_order=cell_order,
+                window=window,
+                granule_count=1,
+            )
     write_root_coverage(str(root), build_root_coverage([morton_word(d) for d in leaves], 3))
     return manifest
 
@@ -1772,7 +1794,7 @@ class TestChainingAndCli:
         root = tmp_path / "s"
         _stage_store(root)
         _write_run_record(root, LEAVES)
-        assert main([str(root), "--stages"]) == 0
+        assert main([str(root), "--stages", "--scope", "all"]) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["mode" if "mode" in out else "run_id"]  # summary printed
         assert out["lease"]["released"] is True
@@ -1795,7 +1817,7 @@ class TestChainingAndCli:
         )
         validate_config(cfg)  # must not raise
         cfg.output["sweep"] = "bogus"
-        with pytest.raises(ValueError, match="boolean or 'stages'"):
+        with pytest.raises(ValueError, match="'none', 'families', 'stages'"):
             validate_config(cfg)
 
 

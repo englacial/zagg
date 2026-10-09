@@ -226,6 +226,15 @@ def ladder_walks(config, grid) -> bool:
     chains the staged sweep under ``stages`` (the CLI, the local backend and
     the ``client`` facade alike, issue #588); one that does not would pin
     ``commit: "leaf"`` in the config it ships instead.
+
+    Deliberately the EXPLICIT key, not :func:`zagg.config.get_sweep_mode`
+    (issue #620): the sweep's own default moved to ``"stages"`` for a
+    ladder-declaring hive store, but the commit REGIME is what objects a leaf
+    worker writes, and moving that by default is a second behaviour change
+    riding the first. ``commit: "leaf"`` composes with a chained ladder
+    already — those nodes commit their overview refs under ``"leaf"`` too —
+    so the default staying per-leaf is coherent, not a gap. Standing for
+    espg on the PR.
     """
     if config.output.get("sweep") != "stages":
         return False

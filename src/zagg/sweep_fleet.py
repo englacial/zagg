@@ -631,6 +631,35 @@ def run_stage_sweep_fleet(
     the runner's auto-scoped tail passes and what this transport has always
     done.
 
+    Supplying it therefore makes the pass the STORE's rather than the run's,
+    which is the hand-driven recovery form — so a non-empty ``coverage=``
+    requires ``scope=`` to be spelled
+    (:func:`zagg.sweep_stages.operator_scope`, issue #620): the failed
+    subtree's prefixes, or ``scope="all"`` for the whole store on purpose.
+    An unscoped full-coverage pass is what billed ~1,300 no-op invokes for
+    zero writes twice in one week
+    (https://github.com/englacial/zagg/issues/610#issuecomment-6067171538).
+    The tail passes no coverage and is unaffected.
+
+    **What that gate does NOT close** (review finding, issue #620). It is
+    exactly "a ``coverage=`` pass must name its scope", not "no unscoped
+    whole-store fan-out is possible here": ``coverage`` is one of two ways to
+    a whole-store NODE set, and the other is a whole-store WORK set —
+
+    .. code-block:: python
+
+        leaves = zagg.sweep.discover_leaves(root, store_kwargs=…)
+        run_stage_sweep_fleet(client, fn, root, leaves, shard_order=9)
+
+    which passes ``coverage=None``, ``scope=None`` and bills the identical
+    fan-out, because the node set is every leaf's ancestors. It is the shape
+    the CLI backstop has (which is why ``--scope`` had to be added there) and
+    the one ``docs/deployment/lambda.md`` documents. Closing it is a
+    signature change (``scope`` required here, the tail passing its own shard
+    decimals the way :func:`zagg.sweep_stages.stage_sweep_after_run` already
+    does) and is standing for espg on PR #622 — so this docstring claims only
+    what the code enforces.
+
     ``max_nodes_per_invoke`` caps how many dispatch nodes one invoke folds
     (:func:`pack_batches`, where it composes with the async payload cap). The
     default is 1 — one dispatch node per invoke. Orchestration only, like
@@ -760,7 +789,12 @@ def run_stage_sweep_fleet(
     from zagg.sweep import _normalize_leaves
     from zagg.sweep_partition import sized_stage_tuples
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
-    from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
+    from zagg.sweep_stages import (
+        FINISHER_RECORD_NAME,
+        normalize_scope,
+        operator_scope,
+        stage_record_name,
+    )
     from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW, stage_units
 
     t0 = time.perf_counter()
@@ -791,7 +825,18 @@ def run_stage_sweep_fleet(
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
     # — filters identically here. `stage_sweep_after_run`, the local chaining
     # this transport mirrors, passes decimal strings.
-    scope = normalize_scope(scope)
+    #
+    # ``coverage=`` is the OPERATOR's knob (the tail passes none), and it is
+    # what makes a pass the store's rather than the run's — so under it the
+    # scope has to be spelled, ``"all"`` included (issue #620). The tail's
+    # unscoped call is untouched: its node set is its work set's ancestors.
+    # Truthiness, not ``is not None``: an EMPTY coverage is the documented
+    # "fires nothing" no-op, which widens nothing and so needs no scope.
+    scope = (
+        operator_scope(scope, what="run_stage_sweep_fleet(coverage=…)")
+        if coverage is not None and len(coverage)
+        else normalize_scope(scope)
+    )
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
     regather, _ = _normalize_leaves(dirt_only, shard_order)
     regather = {d: w for d, w in regather.items() if d not in by_shard}

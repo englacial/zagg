@@ -670,18 +670,28 @@ A `zagg-pyramid/2` store's above-shard ladder is materialized by **stage
 workers over the leaf columns** — a raw leaf is never read above the shard:
 
 ```
-python -m zagg.sweep s3://bucket/store --stages            # CLI backstop
-python -m zagg.sweep s3://bucket/store --stages --partitions 16
-python -m zagg.sweep s3://bucket/store --stages --pipeline-run-id <run id>
+python -m zagg.sweep s3://bucket/store --stages --scope 3111,3112   # CLI backstop
+python -m zagg.sweep s3://bucket/store --stages --scope all --partitions 16
+python -m zagg.sweep s3://bucket/store --stages --scope all --pipeline-run-id <run id>
 ```
 
+`--scope` is **required** under `--stages` ([issue
+#620](https://github.com/englacial/zagg/issues/620)): this CLI is the recovery
+form, so it names the subtree being recovered, and the whole store is asked
+for by name (`--scope all`). An unscoped pass re-visits every node, and a node
+that is already current still costs its visit.
+
 or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
-chained immediately after a fleet run with the opt-in `output.sweep:
-"stages"` (auto-scoped to the run's own footprint) — from `python -m zagg`
+chained immediately after a fleet run by `output.sweep: "stages"`
+(auto-scoped to the run's own footprint) — from `python -m zagg`
 and from the `client` facade's `Run.dispatch` alike ([issue
 #588](https://github.com/englacial/zagg/issues/588); the facade's post-run
 tail chains it after the run record and the rollup sweep, and the summary
-rides the handle as `handle.stage_sweep`). Work is discovered from
+rides the handle as `handle.stage_sweep`). That chaining is **the default**
+for a hive store that declares a ladder since [issue
+#620](https://github.com/englacial/zagg/issues/620) — the sweep belongs to
+the append, not to an operator call; `sweep: true` (or `"families"`) keeps
+the families pass alone and `false` (or `"none"`) keeps neither. Work is discovered from
 the **run records** (listing-based; the root `coverage.moc` is an
 accelerator for sibling candidates, never the source of truth — a fleet
 append with no subsequent sweep leaves it stale, and discovery still finds
@@ -2122,7 +2132,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   run's sweep or an unnamed `--stages` pass landing after this run opened
   cannot tag it, and a later unnamed pass does not block the run's own
   record either. No `--force`: an incomplete sweep is completed with
-  `python -m zagg.sweep <store> --stages --pipeline-run-id <run_id>` first.
+  `python -m zagg.sweep <store> --stages --scope all --pipeline-run-id <run_id>`
+  first.
   **Where it runs.** On an `s3://` store all of that is the worker's: the
   command fires one synchronous `mode: "icechunk_finalize"` invoke —
   `{mode, store_path, run_id, newest_only: true, operator_checks: true}`,

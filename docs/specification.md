@@ -4901,7 +4901,7 @@ that would write nothing commits nothing. The operations:
   `retain_runs` > 0 it runs the retention (tag deletion, expiry,
   collection). There is no `--force`
   (a run whose sweep did not complete has no tip that means "this run":
-  `python -m zagg.sweep <store> --stages --pipeline-run-id <run_id>`
+  `python -m zagg.sweep <store> --stages --scope … --pipeline-run-id <run_id>`
   completes the ladder first) and
   no retention override. The record is tied to the run by **both** conditions:
   the name and the time. A record naming another run — a sibling run's sweep

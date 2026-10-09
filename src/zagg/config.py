@@ -1298,11 +1298,22 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     # coverage_moc: boolean when present, default ON for hive (get_sweep
     # resolves it), explicit true on a non-hive store is a config mistake.
     # "stages" (issue #384) additionally chains the STAGED pyramid sweep
-    # after the families pass — the recorded opt-in for /2 stores.
+    # after the families pass — the DEFAULT for a hive store that declares a
+    # ladder since issue #620 ("the sweep belongs to the append"). The
+    # booleans and the mode words are the same two answers spelled twice:
+    # get_sweep_mode owns the mapping.
     sweep = config.output.get("sweep")
-    if sweep is not None and not isinstance(sweep, bool) and sweep != "stages":
-        raise ValueError(f"output.sweep must be a boolean or 'stages' (got {sweep!r})")
-    if sweep and get_store_layout(config) != "hive":
+    if sweep is not None and not isinstance(sweep, bool) and sweep not in SWEEP_MODES:
+        raise ValueError(
+            f"output.sweep must be a boolean or one of {list(SWEEP_MODES)} (got {sweep!r})"
+        )
+    # Resolved, not truthy: ``"none"`` is a truthy string that means OFF, so
+    # spelling the opt-out in words on a flat store must not be refused.
+    if (
+        sweep is not None
+        and get_sweep_mode(config) != SWEEP_NONE
+        and get_store_layout(config) != "hive"
+    ):
         raise ValueError(
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
@@ -3414,6 +3425,145 @@ def get_coverage_moc(config: PipelineConfig) -> bool:
     return bool(flag)
 
 
+#: The three ``output.sweep`` modes, resolved by :func:`get_sweep_mode`.
+#: ``"none"`` is no tail sweep at all, ``"families"`` the D22 families pass
+#: alone, ``"stages"`` that pass plus the staged ladder chained after it.
+SWEEP_NONE = "none"
+SWEEP_FAMILIES = "families"
+SWEEP_STAGES = "stages"
+SWEEP_MODES = (SWEEP_NONE, SWEEP_FAMILIES, SWEEP_STAGES)
+
+
+def _declares_ladder(config: PipelineConfig, grid) -> bool:
+    """Whether this config declares a ``/2`` ladder a staged sweep can walk.
+
+    :func:`zagg.column.leaf_column_plan`'s gate PLUS
+    ``build_pyramid_block``'s raster exemption, because the gate alone is not
+    that function's manifest default: the issue #384 flip condition carries
+    ``(config.data_source or {}).get("reader") != "raster"``
+    (``sweep_overview.py``) and ``column._leaf_levels`` does not, so a
+    ``reader: raster`` hive config with a strictly-interior ``chunk_inner``
+    has a column gate of True against a ``zagg-pyramid/1`` manifest. Raster
+    hive products have NO ladder (espg's inventory,
+    https://github.com/englacial/zagg/issues/620#issuecomment-6068583904;
+    ``declare_pyramid`` refuses ``reader: raster``), so the sweep default
+    must not claim one — it would refuse at ``ladder_entries``' ``/2`` gate
+    once per invoke. Unreachable today (``runner.agg`` re-routes raster to
+    ``RasterStrategy`` and ``client.Run`` refuses it outright), pinned so the
+    next tail that chains cannot reach it either.
+
+    It needs the GRID: the issue #384 default flip is ``/2`` only where the
+    grid's resolved chunk order is strictly interior, and a ``K == 1`` grid
+    (no ``chunk_inner``) stays ``/1`` with no column to gather. Without a
+    grid the ladder cannot be confirmed, so the answer is no and the default
+    stays on the families pass rather than chaining a pass that would refuse
+    at the ``/2`` gate once per run.
+
+    One narrower divergence remains and cannot be reached from here:
+    ``build_pyramid_block`` bounds the flip by ``output.grid.child_order``
+    only WHEN PRESENT, where ``_leaf_levels`` always bounds by the grid's
+    resolved ``child_order``. A config spelling no ``child_order`` is the
+    grid-less ``declare_pyramid`` retrofit shape — ``grids.from_config``
+    refuses it ("output.grid.child_order is required") — so this predicate
+    has no grid for it and already answers no.
+    """
+    if grid is None:
+        return False
+    if (config.data_source or {}).get("reader") == "raster":
+        return False  # build_pyramid_block's raster exemption, same flip condition
+    from zagg.column import leaf_column_plan
+
+    try:
+        return leaf_column_plan(config, grid) is not None
+    except ValueError:
+        return False  # a declaration the sweep would refuse walks no ladder either
+
+
+def get_sweep_mode(config: PipelineConfig, grid=None) -> str:
+    """Which end-of-run sweep the tail chains: one of :data:`SWEEP_MODES`.
+
+    THE resolver for ``output.sweep`` (issue #620 section 2, espg's ruling
+    "the sweep belongs to the append"). Every call site asks this rather than
+    reading the raw key, so the default and its spellings live in one place.
+
+    The resolution, with the raw key's legacy spellings mapped onto the modes:
+
+    =========================  =========================================
+    ``output.sweep``           mode
+    =========================  =========================================
+    absent / null, hive        ``"stages"`` when ``grid`` is given and the
+                               config declares a ``/2`` ladder, else
+                               ``"families"``
+    absent / null, non-hive    ``"none"``
+    ``true`` / ``"families"``  ``"families"`` — the pass alone, no ladder
+    ``false`` / ``"none"``     ``"none"``
+    ``"stages"``               ``"stages"``
+    =========================  =========================================
+
+    **What changed, and the way out.** The ladder used to be opt-in: a hive
+    store defaulted to the families pass and a ``/2`` store's ladder was
+    walked by hand or by ``sweep: "stages"``. It is now the default, because
+    the sweep is the append's — a run that leaves its ladder for an operator
+    call is how the unscoped full-store sweep got run twice (issue #610's
+    cost comment,
+    https://github.com/englacial/zagg/issues/610#issuecomment-6067171538).
+    An existing caller that wants the old behaviour spells it: ``sweep:
+    true`` (or ``"families"``) keeps the families pass alone, ``false`` (or
+    ``"none"``) keeps nothing. ``true`` deliberately does NOT mean the
+    ladder — it is the spelling existing configs already carry, and promoting
+    it would change what they do without anyone writing it down.
+
+    "Declares a ladder" is :func:`_declares_ladder` — the leaf column gate,
+    which needs the ``grid``. A caller that holds one (every chaining site
+    does) passes it; one that does not gets ``"families"``, never a chained
+    pass the ``/2`` gate would refuse.
+    """
+    raw = config.output.get("sweep")
+    if raw is None:
+        if get_store_layout(config) != "hive":
+            return SWEEP_NONE
+        return SWEEP_STAGES if _declares_ladder(config, grid) else SWEEP_FAMILIES
+    if isinstance(raw, bool):
+        return SWEEP_FAMILIES if raw else SWEEP_NONE
+    mode = str(raw)
+    if mode not in SWEEP_MODES:
+        # The declared return type, enforced at the only place it CAN be for a
+        # worker-built config: the Lambda worker builds its config with
+        # ``load_config_from_dict``, which never calls ``validate_config``
+        # (``build_pyramid_block``'s docstring records the same gap), so
+        # ``sweep: "Stages"`` or ``"ladder"`` would otherwise resolve to that
+        # literal, compare False against every mode, and silently give the run
+        # the families-only tail with no refusal anywhere.
+        raise ValueError(
+            f"output.sweep must be a boolean or one of {list(SWEEP_MODES)} (got {raw!r})"
+        )
+    return mode
+
+
+def chains_stages(config: PipelineConfig, grid=None) -> bool:
+    """Whether the run tail chains the STAGED ladder — fail-open (D9).
+
+    The chaining gate :func:`get_sweep_mode` ``== SWEEP_STAGES``, wrapped,
+    because every tail it sits in is deliberately fail-open: the gate replaced
+    a dict lookup (``config.output.get("sweep") == "stages"``) that could not
+    fail, and the resolver reaches ``leaf_column_plan`` →
+    ``declared_fields`` → ``composability_classes`` + ``agg[name]``, which a
+    hand-built or worker-built aggregation block can raise ``KeyError`` or
+    ``TypeError`` from (and the resolver itself refuses an unknown mode word).
+    Unwrapped it would land AFTER every leaf is written and before the
+    Icechunk finalize, failing a run whose data is complete — where its
+    neighbours (``sweep_after_run``, ``stage_sweep_after_run``,
+    ``_finalize_icechunk_local``) all swallow and warn. An unconfirmable
+    declaration is NO chained pass, never a guessed one; the loud refusal is
+    :func:`validate_config`'s, up front.
+    """
+    try:
+        return get_sweep_mode(config, grid) == SWEEP_STAGES
+    except Exception as e:
+        logger.warning(f"staged sweep not chained, sweep mode unresolved (fail-open, D9): {e}")
+        return False
+
+
 def get_sweep(config: PipelineConfig) -> bool:
     """Whether the end-of-run rollup sweep trigger is on (issue #300).
 
@@ -3425,11 +3575,11 @@ def get_sweep(config: PipelineConfig) -> bool:
     default. The trigger transport is backend-shaped (D8): the local
     dispatchers run the sweep in-process; the Lambda dispatchers post a
     fire-and-forget ``mode="sweep"`` worker Event invoke.
+
+    The families pass's own gate: true for every mode but ``"none"``
+    (:func:`get_sweep_mode`, which says whether the ladder chains too).
     """
-    flag = config.output.get("sweep")
-    if flag is None:
-        return get_store_layout(config) == "hive"
-    return bool(flag)
+    return get_sweep_mode(config) != SWEEP_NONE
 
 
 def get_leaf_versions(config: PipelineConfig) -> bool:

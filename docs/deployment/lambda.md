@@ -753,16 +753,20 @@ intent, not an open store.
 
 ### Running it
 
-Opt in with `output.sweep: "stages"` — the same knob the spatial local
-dispatcher reads — and both **spatial** Lambda tails chain the fleet sweep
-after the rollup-families leg, auto-scoped to the run's own footprint:
+`output.sweep: "stages"` — the same knob the spatial local dispatcher
+reads, and **the default** for a hive store that declares a ladder since
+[issue #620](https://github.com/englacial/zagg/issues/620) — makes both
+**spatial** Lambda tails chain the fleet sweep after the rollup-families leg,
+auto-scoped to the run's own footprint. The pre-#620 behaviour is spelled
+rather than implied: `sweep: true` / `"families"` is the families pass alone,
+`false` / `"none"` is neither. The chaining tails are:
 `runner._run_lambda` (`python -m zagg` / `agg`) and the `client` facade's
 `Run.dispatch` (issue #588, either transport), through the one seam
 `runner._invoke_lambda_stage_sweep`.
 
 !!! warning "Only the spatial Lambda tails chain it"
     `output.sweep: "stages"` validates on any hive config, and every tail
-    reads it as truthy and runs the rollup-families sweep — but only the
+    runs the rollup-families sweep under it — but only the
     spatial Lambda tails go on to dispatch the staged one. Two tails do not:
 
     * **raster** (`data_source.reader: raster`) does not chain, and is right
@@ -816,8 +820,16 @@ written down anywhere:
 from zagg.hive import read_root_coverage, root_coverage_words
 
 coverage = root_coverage_words(read_root_coverage("s3://bucket/prefix.zarr"))
-summary = run_stage_sweep_fleet(..., coverage=coverage)   # composes with scope=
+summary = run_stage_sweep_fleet(..., coverage=coverage, scope=["3111", "3112"])
+summary = run_stage_sweep_fleet(..., coverage=coverage, scope="all")   # the whole store
 ```
+
+Under `coverage=` the `scope=` is **required** ([issue
+#620](https://github.com/englacial/zagg/issues/620)): the coverage resolves
+the node set from the *store* rather than the work set, which is the
+hand-driven recovery form, and the whole store has to be asked for by name.
+The two compose by intersection, so a scoped pass cannot widen. The tail
+passes no coverage and stays unscoped.
 
 The read happens **operator-side**, like `shard_order`: the dispatcher itself
 never touches the store (D8). The run summary records `coverage_computed` so
@@ -1033,7 +1045,7 @@ succeeds over other runs' leaves, and a pass you NAME for this run is one
 
 ```
 python -m zagg.sweep s3://bucket/store.zarr             # the rollup families
-python -m zagg.sweep s3://bucket/store.zarr --stages --pipeline-run-id <run_id>   # sweep: "stages" only
+python -m zagg.sweep s3://bucket/store.zarr --stages --scope all --pipeline-run-id <run_id>
 python -m zagg.icechunk_ops s3://bucket/store.zarr finalize <run_id>   # ditto
 ```
 
@@ -1061,8 +1073,9 @@ window)` pairs, which keeps it to the run's footprint as the chained sweep is
 (`zagg.sweep.discover_leaves(store, store_kwargs=…)` gives every run's), and
 `shard_order` the store manifest's, and `pipeline_run_id="<run_id>"` (the
 fleet form's spelling of the flag). The CLI `--stages` pass covers every leaf
-the run records name, not only this run's: a whole-store re-fold on one host
-(`--partitions` bounds its memory, not its scope). On success it prints its
+the run records name, not only this run's: `--scope all` is a whole-store
+re-fold on one host (`--partitions` bounds its memory, not its scope), and
+`--scope <prefixes>` holds it to the subtree being recovered. On success it prints its
 summary: `record`, the `sweep_stats_<ts>_stages.json` it wrote, and a
 `finisher` block with `lease_released: true`. Skip that pass when step 1
 found a completed staged sweep newer than the run whose `pipeline_run_id` is
@@ -1104,7 +1117,7 @@ the store root.** An untagged run's commits stay on `main`, and the next
 run's tag covers them. What waits is the ladder — and, for a ladder-committed
 run, the repo's refs — over leaves no sweep has reached: a later run's
 chained sweep is scoped to its own footprint, so those leaves are folded by
-the next sweep that includes them, such as the unscoped `--stages` pass
+the next sweep that includes them, such as the `--stages --scope all` pass
 above. Without that record no sweep ever finds the run's leaves (discovery
 reads the run records only): re-dispatch its shards (step 2).
 

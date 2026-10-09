@@ -1618,8 +1618,19 @@ def _sidecar_window(name: str, spec: str | None):
     return _NO_SIDECAR
 
 
+def _scope_prefixes(raw: str) -> list[str]:
+    """``--scope`` as a node-prefix list; empty when it names none."""
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def main(argv=None) -> int:
     """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22).
+
+    ``--stages`` requires ``--scope`` (issue #620): the ladder is chained by
+    the run tail, scoped to the run's footprint, and this CLI is the RECOVERY
+    form — the subtree being recovered is named, or ``--scope all`` asks for
+    the whole store on purpose. ``--scope`` is a staged-pass flag only; the
+    families pass has none to apply.
 
     ``--partitions 2^n`` (issue #377) folds one partition at a time instead of
     the whole tree — the single-process half of the parallel sweep: no
@@ -1647,6 +1658,16 @@ def main(argv=None) -> int:
         "tuple-grouped stage workers over the leaf columns, lease-admitted, with the "
         "designated finisher. Composes with --partitions (swept under one lease). "
         "The families sweep does not run in this mode.",
+    )
+    parser.add_argument(
+        "--scope",
+        default=None,
+        metavar="NODES",
+        help="With --stages (REQUIRED there, issue #620): the node prefixes this pass "
+        "folds — comma-separated morton decimals (3111,3112) or morton words — or the "
+        "literal `all` for the whole store. The ladder belongs to the append (it chains "
+        "in the run tail, scoped to the run's footprint); this CLI is the RECOVERY form, "
+        "so the subtree being recovered is named and the whole store is asked for",
     )
     parser.add_argument(
         "--pipeline-run-id",
@@ -1707,6 +1728,35 @@ def main(argv=None) -> int:
         "to /2 must not get. Validated against the manifest's own shard/cell orders",
     )
     args = parser.parse_args(argv)
+    from zagg.sweep_stages import SCOPE_ALL, SCOPE_REQUIRED_HINT, operator_scope
+
+    if args.scope is not None and not args.stages:
+        # Same posture as --pipeline-run-id below: the families pass has no
+        # scope to apply, and ignoring one silently would read as applied.
+        parser.error("--scope only applies to --stages")
+    if args.stages and args.scope is None:
+        parser.error(f"--stages needs --scope — {SCOPE_REQUIRED_HINT}")
+    stage_scope = None
+    if args.stages:
+        # Resolve the scope from argv alone, BEFORE anything touches the store
+        # — the partition_split_order precedent below. Left where it was used,
+        # inside the run_stage_sweep call, every bad token but the empty one
+        # reached normalize_scope AFTER discover_leaves had listed the store:
+        # --scope ALL, --scope 9111 and a typo'd prefix each paid a full LIST
+        # plus a parquet read per run record and then died on an uncaught
+        # ValueError ("malformed decimal Morton id") instead of this exit-2.
+        if args.scope != SCOPE_ALL and not _scope_prefixes(args.scope):
+            # An unset shell variable expanding to --scope="" names no prefix,
+            # which normalize_scope would read as a scope of nothing rather
+            # than refuse (the same guard --declare-pyramid carries below).
+            parser.error(f"--scope {args.scope!r} names no node prefix — {SCOPE_REQUIRED_HINT}")
+        try:
+            stage_scope = operator_scope(
+                args.scope if args.scope == SCOPE_ALL else _scope_prefixes(args.scope),
+                what="python -m zagg.sweep --stages",
+            )
+        except ValueError as e:
+            parser.error(str(e))  # keep the CLI's exit-2 contract
     if args.pipeline_run_id is not None and not args.stages:
         # The key lives in the STAGED run record; a families pass has nowhere
         # to put it, and dropping it silently would look like it was recorded.
@@ -1767,6 +1817,7 @@ def main(argv=None) -> int:
         summary = run_stage_sweep(
             args.store_root,
             leaves,
+            scope=stage_scope,
             tuple_width=args.tuple_width,
             partitions=args.partitions if args.partitions != 1 else None,
             store_kwargs=store_kwargs,

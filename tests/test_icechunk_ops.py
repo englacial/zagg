@@ -885,7 +885,8 @@ class TestFinalizeOperation(_FinalizeFixtures):
             icechunk_ops.finalize(root, RUN, store_kwargs={})
         message = str(refused.value)
         assert f"names this run: the newest, {key}, records pipeline_run_id {recorded!r}" in message
-        assert f"--stages --pipeline-run-id {RUN}" in message  # the remedy, runnable as written
+        # The remedy, runnable as written — `--scope` is required under --stages (issue #620).
+        assert f"--stages --scope all --pipeline-run-id {RUN}" in message
         assert not _open(root)[1].list_tags() and len(_messages(root)) == n
 
     def test_the_runs_own_record_tags_whatever_landed_after_it(self, monkeypatch, cfg, tmp_path):
@@ -949,12 +950,12 @@ class TestFinalizeOperation(_FinalizeFixtures):
         self._manifest(root, run_id, runner._pin_icechunk_commit(cfg, _grid_, stages=True))
         with pytest.raises(icechunk_ops.FinalizeRefusedError, match="no staged-sweep record"):
             icechunk_ops.finalize(root, run_id, store_kwargs={})
-        assert sweep_main([root, "--stages"]) == 0
+        assert sweep_main([root, "--stages", "--scope", "all"]) == 0
         with pytest.raises(icechunk_ops.FinalizeRefusedError, match="pipeline_run_id None"):
             icechunk_ops.finalize(root, run_id, store_kwargs={})
         assert not _open(root)[1].list_tags()
         time.sleep(1.1)  # record keys resolve to one second
-        assert sweep_main([root, "--stages", "--pipeline-run-id", run_id]) == 0
+        assert sweep_main([root, "--stages", "--scope", "all", "--pipeline-run-id", run_id]) == 0
         out = icechunk_ops.finalize(root, run_id, store_kwargs={})
         assert out["tagged"] is True and out["tag"] == f"run-{run_id}"
         record = json.loads(open(f"{root}/{out['stage_record']}").read())
