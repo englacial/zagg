@@ -231,9 +231,13 @@ class TestFailOpen:
         with caplog.at_level("WARNING"):
             summary = run_stage_sweep(str(root), _refs(), families=None, record=False)
         assert not _families_only(_rollups(root))  # nothing written, nothing crashed
-        failures = summary["families"]["node_failures"]
-        assert {f["node"] for f in failures} == {"1", "-2"}
-        assert {f["family"] for f in failures} == set(CASCADE_FAMILIES)
+        # One entry per family, inside that family's own block: the record's
+        # ``families`` key stays a mapping of family name to block (§4.7).
+        assert "node_failures" not in summary["families"]
+        for name in CASCADE_FAMILIES:
+            failures = summary["families"][name]["node_failures"]
+            assert {f["node"] for f in failures} == {"1", "-2"}
+            assert {f["family"] for f in failures} == {name}
         assert "leaf read exploded" in caplog.text
         # The ladder folded regardless: its own artifacts are there.
         assert summary["levels"]

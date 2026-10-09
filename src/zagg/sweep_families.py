@@ -266,7 +266,7 @@ class FamiliesRider:
             self.visited.update(work)
 
     def summary(self) -> dict:
-        """The pass's per-family block: counts, the family summaries, the accumulators.
+        """The pass's per-family block: counts, summaries, accumulators, failures.
 
         The ``accumulator`` is the same §10 block a families PARTITION record
         carries (:meth:`zagg.sweep.SweepFamily.accumulator`, issue #610 phase
@@ -284,9 +284,15 @@ class FamiliesRider:
             if acc is not None:
                 acc["visited"] = sorted(self.visited)
                 block["accumulator"] = acc
+            # Per FAMILY, not a sibling key of the family names: this block
+            # becomes the stage record's ``families`` verbatim, which the
+            # spec describes as a mapping of family name to that family's
+            # per-pass counts (§4.7) — a reader walking ``families.items()``
+            # has no way to know one entry is not a family (review finding).
+            fails = [f for f in self.node_failures if f["family"] == fam.name]
+            if fails:
+                block["node_failures"] = fails
             out[fam.name] = block
-        if self.node_failures:
-            out["node_failures"] = self.node_failures
         return out
 
 
