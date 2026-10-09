@@ -873,4 +873,4 @@ class TestStoreContradictsTheCaller:
         root = tmp_path / "s"
         _store(root)
         summary = _fleet(root, _FakeLambda(), families=None, barrier_timeout_s=0.01)
-        assert "families_unswept" not in summary
+        assert summary["families_unswept"] is False
