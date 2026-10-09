@@ -1621,6 +1621,12 @@ def _sidecar_window(name: str, spec: str | None):
 def main(argv=None) -> int:
     """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22).
 
+    ``--stages`` requires ``--scope`` (issue #620): the ladder is chained by
+    the run tail, scoped to the run's footprint, and this CLI is the RECOVERY
+    form — the subtree being recovered is named, or ``--scope all`` asks for
+    the whole store on purpose. ``--scope`` is a staged-pass flag only; the
+    families pass has none to apply.
+
     ``--partitions 2^n`` (issue #377) folds one partition at a time instead of
     the whole tree — the single-process half of the parallel sweep: no
     speed-up, but peak memory is bounded by the partition, which is what lets
@@ -1647,6 +1653,16 @@ def main(argv=None) -> int:
         "tuple-grouped stage workers over the leaf columns, lease-admitted, with the "
         "designated finisher. Composes with --partitions (swept under one lease). "
         "The families sweep does not run in this mode.",
+    )
+    parser.add_argument(
+        "--scope",
+        default=None,
+        metavar="NODES",
+        help="With --stages (REQUIRED there, issue #620): the node prefixes this pass "
+        "folds — comma-separated morton decimals (3111,3112) or morton words — or the "
+        "literal `all` for the whole store. The ladder belongs to the append (it chains "
+        "in the run tail, scoped to the run's footprint); this CLI is the RECOVERY form, "
+        "so the subtree being recovered is named and the whole store is asked for",
     )
     parser.add_argument(
         "--pipeline-run-id",
@@ -1707,6 +1723,14 @@ def main(argv=None) -> int:
         "to /2 must not get. Validated against the manifest's own shard/cell orders",
     )
     args = parser.parse_args(argv)
+    from zagg.sweep_stages import SCOPE_ALL, SCOPE_REQUIRED_HINT, operator_scope
+
+    if args.scope is not None and not args.stages:
+        # Same posture as --pipeline-run-id below: the families pass has no
+        # scope to apply, and ignoring one silently would read as applied.
+        parser.error("--scope only applies to --stages")
+    if args.stages and args.scope is None:
+        parser.error(f"--stages needs --scope — {SCOPE_REQUIRED_HINT}")
     if args.pipeline_run_id is not None and not args.stages:
         # The key lives in the STAGED run record; a families pass has nowhere
         # to put it, and dropping it silently would look like it was recorded.
@@ -1767,6 +1791,12 @@ def main(argv=None) -> int:
         summary = run_stage_sweep(
             args.store_root,
             leaves,
+            scope=operator_scope(
+                args.scope
+                if args.scope == SCOPE_ALL
+                else [s.strip() for s in args.scope.split(",") if s.strip()],
+                what="python -m zagg.sweep --stages",
+            ),
             tuple_width=args.tuple_width,
             partitions=args.partitions if args.partitions != 1 else None,
             store_kwargs=store_kwargs,

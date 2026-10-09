@@ -11,7 +11,8 @@ fold kernels, the writers); this module owns a whole run of them:
   (listing-based — the run records via :func:`zagg.sweep.discover_leaves`;
   the root ``coverage.moc`` is an accelerator, never truth), ``partitions=``
   composition, the run record, and the post-fleet chaining seam
-  (``output.sweep: "stages"``, opt-in per the recorded lean).
+  (``output.sweep: "stages"`` — the DEFAULT for a ladder-declaring hive
+  store since issue #620, resolved by :func:`zagg.config.get_sweep_mode`).
 
 The CLI backstop is ``python -m zagg.sweep <root> --stages``
 (:mod:`zagg.sweep` routes here). Raster hive stores are column-less by
@@ -67,6 +68,39 @@ def normalize_scope(scope) -> np.ndarray | None:
     if not words:
         raise ValueError("an empty sweep scope selects nothing — pass None for whole-store")
     return np.unique(np.asarray(words, dtype=np.uint64))
+
+
+#: Asks for the WHOLE store on purpose at an operator entry point
+#: (``scope="all"``, ``--scope all``); ``None`` there is a refusal, not a
+#: default (issue #620). The hint is shared so the fleet dispatcher and the
+#: CLI say one thing from their two front doors.
+SCOPE_ALL = "all"
+SCOPE_REQUIRED_HINT = (
+    'pass scope="all" to sweep the whole store on purpose, or the node prefixes the '
+    "recovery actually needs (issue #620: the ladder belongs to the append, and every "
+    "current node a whole-store pass re-visits still costs one invoke — the unscoped "
+    "form billed ~1,300 of them twice for zero writes)"
+)
+
+
+def operator_scope(scope, *, what: str) -> np.ndarray | None:
+    """An operator entry point's ``scope=``, with the implicit whole store refused.
+
+    Issue #620 section 2: the sweep is the append's, and the hand-driven forms
+    are RECOVERY. A recovery pass is scoped to what failed, so ``None`` —
+    "whatever the work set and the store happen to say" — refuses by name and
+    the whole store is spelled :data:`SCOPE_ALL`, which returns the ``None``
+    the pass already reads as whole-store. The run TAIL never comes through
+    here: its scope is the run's own footprint by construction
+    (:func:`stage_sweep_after_run`; the fleet twin's node set is its work
+    set's ancestors), so it has no implicit whole store to fall into.
+    """
+    if scope is None:
+        raise ValueError(f"{what} needs an explicit scope — {SCOPE_REQUIRED_HINT}")
+    # Before ``normalize_scope``, which would iterate the token's characters.
+    if isinstance(scope, str) and scope == SCOPE_ALL:
+        return None
+    return normalize_scope(scope)
 
 
 def partition_words(partitions: int, index: int) -> np.ndarray:

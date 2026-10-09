@@ -631,6 +631,15 @@ def run_stage_sweep_fleet(
     the runner's auto-scoped tail passes and what this transport has always
     done.
 
+    Supplying it therefore makes the pass the STORE's rather than the run's,
+    which is the hand-driven recovery form — so it now requires ``scope=`` to
+    be spelled (:func:`zagg.sweep_stages.operator_scope`, issue #620): the
+    failed subtree's prefixes, or ``scope="all"`` for the whole store on
+    purpose. An unscoped full-coverage pass is what billed ~1,300 no-op
+    invokes for zero writes twice in one week
+    (https://github.com/englacial/zagg/issues/610#issuecomment-6067171538).
+    The tail passes no coverage and is unaffected.
+
     ``max_nodes_per_invoke`` caps how many dispatch nodes one invoke folds
     (:func:`pack_batches`, where it composes with the async payload cap). The
     default is 1 — one dispatch node per invoke. Orchestration only, like
@@ -760,7 +769,12 @@ def run_stage_sweep_fleet(
     from zagg.sweep import _normalize_leaves
     from zagg.sweep_partition import sized_stage_tuples
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
-    from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
+    from zagg.sweep_stages import (
+        FINISHER_RECORD_NAME,
+        normalize_scope,
+        operator_scope,
+        stage_record_name,
+    )
     from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW, stage_units
 
     t0 = time.perf_counter()
@@ -791,7 +805,16 @@ def run_stage_sweep_fleet(
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
     # — filters identically here. `stage_sweep_after_run`, the local chaining
     # this transport mirrors, passes decimal strings.
-    scope = normalize_scope(scope)
+    #
+    # ``coverage=`` is the OPERATOR's knob (the tail passes none), and it is
+    # what makes a pass the store's rather than the run's — so under it the
+    # scope has to be spelled, ``"all"`` included (issue #620). The tail's
+    # unscoped call is untouched: its node set is its work set's ancestors.
+    scope = (
+        normalize_scope(scope)
+        if coverage is None
+        else operator_scope(scope, what="run_stage_sweep_fleet(coverage=…)")
+    )
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
     regather, _ = _normalize_leaves(dirt_only, shard_order)
     regather = {d: w for d, w in regather.items() if d not in by_shard}
