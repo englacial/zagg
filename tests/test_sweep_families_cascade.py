@@ -260,6 +260,21 @@ class TestKnob:
         with pytest.raises(ValueError, match="cannot ride the staged cascade"):
             normalize_families(["stat"])
 
+    def test_the_help_names_the_families_that_can_ride(self, capsys):
+        """``--families``' advertised default includes ``overview``, which --stages refuses.
+
+        Spelling that default explicitly under ``--stages`` raises, so both
+        help strings have to name the three that CAN ride rather than leaving
+        an operator to read ``CASCADE_FAMILIES`` (review finding).
+        """
+        from zagg.sweep import main
+
+        with pytest.raises(SystemExit):
+            main(["store", "--help"])
+        text = " ".join(capsys.readouterr().out.split())
+        assert "only stats, moc, submap may ride" in text
+        assert "must name only stats, moc, submap" in text
+
 
 class TestDenseStore:
     def test_a_sixteen_leaf_store_matches_the_families_pass(self, tmp_path):

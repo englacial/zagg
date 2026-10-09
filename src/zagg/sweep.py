@@ -1619,6 +1619,8 @@ def main(argv=None) -> int:
     """
     import argparse
 
+    from zagg.sweep_families import CASCADE_FAMILIES
+
     parser = argparse.ArgumentParser(
         description="zagg unified rollup sweep: fold leaf artifacts into interior-node "
         "rollups (issue #300). Work is discovered from the store's run records."
@@ -1628,7 +1630,9 @@ def main(argv=None) -> int:
         "--families",
         default=None,
         help=f"Comma-separated families (default: {','.join(DEFAULT_FAMILIES)}; "
-        f"registered: {', '.join(sorted(FAMILIES))})",
+        f"registered: {', '.join(sorted(FAMILIES))}). With --stages, only "
+        f"{', '.join(CASCADE_FAMILIES)} may ride (issue #610 phase 4) and any other "
+        f"name is refused",
     )
     parser.add_argument(
         "--stages",
@@ -1636,9 +1640,11 @@ def main(argv=None) -> int:
         help="Run the STAGED pyramid sweep for zagg-pyramid/2 stores (issue #384): "
         "tuple-grouped stage workers over the leaf columns, lease-admitted, with the "
         "designated finisher. Composes with --partitions (swept under one lease). "
-        "The rollup families do not ride this mode unless --families names them "
-        "(issue #610 phase 4: they then fold in each dispatch node's close, in the "
-        "one cascade, instead of needing a pass of their own).",
+        "The rollup families do not ride this mode unless --families names them, and "
+        f"then it must name only {', '.join(CASCADE_FAMILIES)} — the overview family IS "
+        "the cascade here, so it is refused by name (issue #610 phase 4: the named "
+        "families fold in each dispatch node's close, in the one cascade, instead of "
+        "needing a pass of their own).",
     )
     parser.add_argument(
         "--pipeline-run-id",
