@@ -594,6 +594,11 @@ def run_stage_sweep(
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
+    # Argv-only, BEFORE the lease: a misspelled family refuses by name, and a
+    # refusal below ``acquire_lease`` would leave the store admitted to a run
+    # that cannot start (review finding; the same discipline the partition
+    # width and the /2 gate already follow).
+    rider = rider_for(families)
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
@@ -647,7 +652,6 @@ def run_stage_sweep(
         "levels": {},
     }
     level_actuals: dict = {}
-    rider = rider_for(families)
     try:
         indexes = [None] if not partitions or partitions == 1 else list(range(int(partitions)))
         for index in indexes:
@@ -1056,6 +1060,7 @@ def run_stage_worker(
             "the manifest; refusing rather than folding invisibly"
         )
     check_unit(unit, window, f"run {run_id!r}, dispatch order {dispatch}, batch {batch}")
+    rider = rider_for(families)  # argv-only, before the lease (review finding)
     nodes = [str(n) for n in nodes]
     if not nodes:
         raise ValueError(
@@ -1092,7 +1097,6 @@ def run_stage_worker(
             last_beat[0] = time.monotonic()
 
     level_actuals: dict = {}
-    rider = rider_for(families)
     summary = sweep_stage_pass(
         store_root,
         manifest,
