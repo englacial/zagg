@@ -885,7 +885,8 @@ class TestFinalizeOperation(_FinalizeFixtures):
             icechunk_ops.finalize(root, RUN, store_kwargs={})
         message = str(refused.value)
         assert f"names this run: the newest, {key}, records pipeline_run_id {recorded!r}" in message
-        assert f"--stages --pipeline-run-id {RUN}" in message  # the remedy, runnable as written
+        # The remedy, runnable as written — `--scope` is required under --stages (issue #620).
+        assert f"--stages --scope all --pipeline-run-id {RUN}" in message
         assert not _open(root)[1].list_tags() and len(_messages(root)) == n
 
     def test_the_runs_own_record_tags_whatever_landed_after_it(self, monkeypatch, cfg, tmp_path):
