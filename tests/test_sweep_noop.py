@@ -14,6 +14,8 @@ Two things this pins, both about a staged pass that has nothing to do:
   have to name their scope.
 """
 
+from pathlib import Path
+
 import pytest
 from test_sweep_stage import (
     DENSE_16,
@@ -98,6 +100,34 @@ def swept_windowed(tmp_path):
     assert [r["written"] for r in warm["stages"]] == [12, 3, 3]
     assert warm["stages"][0]["columns_written"] == 8  # one per (node, window)
     return root, manifest, by_shard
+
+
+@pytest.fixture
+def swept_companioned(monkeypatch, tmp_path):
+    """A folded ladder WITH its Icechunk companion — the PRODUCTION no-op path.
+
+    ``_wide_store`` writes no companion, so ``ladder_context`` is ``None``
+    there and every node's ref hook is skipped — which excludes the one
+    O(subtree) thing a current node still does, and the PR's leading
+    candidate for the unexplained ~28 s (review finding, issue #620). The v3
+    store HAS a companion, so the counts above describe a path production
+    does not take. Built by the same local run the ladder suite uses, which
+    chains the staged sweep and commits the refs.
+    """
+    pytest.importorskip("icechunk")
+    from test_icechunk_refs import _grid, _ladder_run, _shards
+
+    from zagg import hive
+    from zagg.config import default_config
+    from zagg.grids.morton import morton_decimal
+
+    cfg = default_config("atl06", validate=False)
+    shards = _shards(_grid(cfg), 2)
+    _grid_obj, root, _summary = _ladder_run(
+        monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards
+    )
+    manifest = hive.read_manifest(root)
+    return Path(root), manifest, {morton_decimal(s): {None} for s in shards}
 
 
 class TestNoOpVisit:
@@ -239,6 +269,29 @@ class TestNoOpVisit:
             "all.zarr": 16,  # the node's own artifact: the skip gate's target
             "all.pyramid.zarr": 32,  # its child's column (gather source) + its own
         }
+
+    @pytest.mark.parametrize("dispatch", [3, 0])
+    def test_the_companioned_arm_still_folds_nothing_but_still_commits(
+        self, swept_companioned, monkeypatch, dispatch
+    ):
+        # With the companion present the fold bound is unchanged — and the
+        # ref hook RUNS anyway, because its gate is
+        # `dirty = any(d.startswith(node) for d in by_shard)`, the work set,
+        # not "did anything change". So a full-coverage re-run pays one
+        # commit per current node: `icechunk_refs` and `icechunk_s` are the
+        # cost the read-set table above does not contain, and the stage
+        # records carry them per tuple (PR body question (3)).
+        from zagg.icechunk_ladder import ladder_context
+
+        root, manifest, by_shard = swept_companioned
+        assert ladder_context(str(root), manifest, store_kwargs={}) is not None
+        row, seen = self._reread(root, manifest, by_shard, monkeypatch, dispatch=dispatch)
+        assert row["written"] == 0 and row["current"] == row["nodes"]
+        assert (row["fold_cells_read"], row["fold_blocks"]) == (0, 0)
+        assert seen["arrays"] == []
+        # The hook, on a node with nothing to fold:
+        assert row["icechunk_commits"] == row["nodes"] and row["icechunk_refs"] > 0
+        assert row["icechunk_clean"] == 0  # not the "nothing to do" arm
 
 
 class TestOperatorScope:
