@@ -3525,7 +3525,19 @@ def get_sweep_mode(config: PipelineConfig, grid=None) -> str:
         return SWEEP_STAGES if _declares_ladder(config, grid) else SWEEP_FAMILIES
     if isinstance(raw, bool):
         return SWEEP_FAMILIES if raw else SWEEP_NONE
-    return str(raw)
+    mode = str(raw)
+    if mode not in SWEEP_MODES:
+        # The declared return type, enforced at the only place it CAN be for a
+        # worker-built config: the Lambda worker builds its config with
+        # ``load_config_from_dict``, which never calls ``validate_config``
+        # (``build_pyramid_block``'s docstring records the same gap), so
+        # ``sweep: "Stages"`` or ``"ladder"`` would otherwise resolve to that
+        # literal, compare False against every mode, and silently give the run
+        # the families-only tail with no refusal anywhere.
+        raise ValueError(
+            f"output.sweep must be a boolean or one of {list(SWEEP_MODES)} (got {raw!r})"
+        )
+    return mode
 
 
 def get_sweep(config: PipelineConfig) -> bool:

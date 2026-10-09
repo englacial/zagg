@@ -1247,6 +1247,26 @@ class TestSweepMode:
         with pytest.raises(ValueError, match="'none', 'families', 'stages'"):
             validate_config(self._cfg(store_layout="hive", sweep="ladder"))
 
+    @pytest.mark.parametrize("raw", ["ladder", "Stages", "STAGES", "all"])
+    def test_the_resolver_refuses_an_unknown_mode_without_the_validator(self, raw):
+        # The resolver's declared return is "one of SWEEP_MODES", and the
+        # validator is not always in the path: the Lambda worker builds its
+        # config with `load_config_from_dict`, which never calls
+        # `validate_config`. Unvalidated, "Stages" resolved to that literal,
+        # compared False against every mode and silently gave the run the
+        # families-only tail (review finding, issue #620).
+        from zagg.config import get_sweep, get_sweep_mode, load_config_from_dict
+
+        cfg, grid = self._ladder(sweep=raw)
+        worker = load_config_from_dict(
+            {"data_source": cfg.data_source, "aggregation": cfg.aggregation, "output": cfg.output}
+        )
+        for probe in (cfg, worker):
+            with pytest.raises(ValueError, match="'none', 'families', 'stages'"):
+                get_sweep_mode(probe, grid)
+            with pytest.raises(ValueError, match="'none', 'families', 'stages'"):
+                get_sweep(probe)
+
     def test_the_packaged_windowed_measure_config_resolves_to_stages(self):
         # Issue #610 phase 5: the measurement config carries the ladder, so
         # a run tag snapshots the ladder and not leaves alone.
