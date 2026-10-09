@@ -419,7 +419,9 @@ def run_tuple(
 
     **The node close** is everything that runs ONCE per node after its window
     units have landed: the all-time fold (:func:`close_node`) where the unit
-    list says so, then the Icechunk ref hook
+    list says so, then the families rollup span
+    (:meth:`zagg.sweep_families.FamiliesRider.fold_node`, issue #610 phase 4
+    — present only when the pass rides them), then the Icechunk ref hook
     (:func:`zagg.icechunk_ladder.stage_hook`). An unwindowed node's one unit
     closes inline, right after it; a window-only invoke closes nothing.
 
@@ -553,6 +555,16 @@ def run_tuple(
                     ),
                     node,
                     UNIT_CLOSE,
+                )
+            # The families rollups (issue #610 phase 4): the node's own
+            # ``stats``/``moc``/``submap`` rollups and its §10 TOC
+            # contribution, folded over this tuple's span. Here, in the
+            # close, because a rollup object merges every window of its node
+            # — concurrent window units would read-modify-write one object.
+            rider = context.get("families")
+            if rider is not None:
+                rider.fold_node(
+                    node, dispatch=int(stage["dispatch"]), child_order=int(stage["child_order"])
                 )
             hooked = stage_hook(
                 context["store_root"],

@@ -605,6 +605,7 @@ def run_stage_sweep_fleet(
     windowed: bool = False,
     all_time: bool = False,
     pipeline_run_id: str | None = None,
+    families=(),
 ) -> dict:
     """One staged sweep run over the fleet: tuples, barriers, finisher last.
 
@@ -748,6 +749,20 @@ def run_stage_sweep_fleet(
     completes. It rides every stage event and the finisher's, and the
     workers record it beside the sweep's own ``run_id``.
 
+    ``families`` (issue #610 phase 4) is which rollup families ride this
+    run's units — ``()``, the default, is the ladder alone, as it has always
+    been. Riding them is what makes the end-of-run ONE fan-out instead of
+    two: the ``stats``/``moc``/``submap`` rollups fold in each dispatch
+    node's close and the §10 root section composes in this run's finisher,
+    so no separate families fan-out is fired. It rides only the invokes that
+    CLOSE a node — the unwindowed whole-node invoke and, on a windowed
+    store, the close invoke — because a rollup object merges every window of
+    its node; the finisher needs no key for it, since it takes which
+    families rode from the records. A windowed store that declares no
+    all-time fold has no close invoke, and this dispatcher refuses the
+    combination BY NAME rather than firing a fan-out that would fold no
+    rollup at all.
+
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
     store root, worker-written); it is read back here when it lands.
@@ -758,6 +773,7 @@ def run_stage_sweep_fleet(
     from zagg.client_transport import run_status_prefix
     from zagg.hive import _utcnow
     from zagg.sweep import _normalize_leaves
+    from zagg.sweep_families import normalize_families
     from zagg.sweep_partition import sized_stage_tuples
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
     from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
@@ -787,6 +803,17 @@ def run_stage_sweep_fleet(
         or 0
     )
     shard_order = int(shard_order)
+    # The families that ride this run's closes (issue #610 phase 4), refused
+    # by name here — before anything fires — so a misspelled family is not a
+    # fan-out that quietly folds no rollup.
+    family_names = normalize_families(families)
+    if family_names and windowed and not all_time:
+        raise ValueError(
+            f"families {list(family_names)} were asked to ride a windowed store that "
+            "declares no all-time fold: the rollups fold in a node's CLOSE (one object per "
+            "node, every window), and such a store fires no close invoke — sweep them "
+            "with their own pass, or declare pyramid.overview.all_time (issue #610)"
+        )
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
     # — filters identically here. `stage_sweep_after_run`, the local chaining
@@ -815,6 +842,10 @@ def run_stage_sweep_fleet(
         "max_nodes_per_invoke": max_nodes_per_invoke,
         "windowed": bool(windowed),
         "all_time": bool(all_time),
+        # The rollup families riding this run's closes (issue #610 phase 4) —
+        # empty when the ladder sweeps alone and the families keep their own
+        # fan-out.
+        "families": list(family_names),
         "scope": None if scope is None else [str(int(w)) for w in scope],
         # Whether the per-tuple node sets were computed from the store's own
         # coverage (issue #547) or from the work set alone. The words
@@ -1046,8 +1077,12 @@ def run_stage_sweep_fleet(
         if lease_ttl_s is not None:
             block["lease_ttl_s"] = int(lease_ttl_s)
         fired: dict = {}
+        # The families ride the invokes that CLOSE a node, and only those: a
+        # rollup object merges every window of its node, so the node's one
+        # writer owns it (issue #610 phase 4).
+        closing_block = {**block, **({"families": list(family_names)} if family_names else {})}
         if not windowed:
-            fired.update(_fan_out(nodes, by_shard, block, dispatch, 0, dirt=True))
+            fired.update(_fan_out(nodes, by_shard, closing_block, dispatch, 0, dirt=True))
         else:
             # One fan-out per window: an event carries the leaf refs of its
             # own window alone, 1/N of the node's slice.
@@ -1104,7 +1139,7 @@ def run_stage_sweep_fleet(
             closed = _fan_out(
                 close_nodes,
                 by_shard,
-                {**block, "unit": UNIT_CLOSE},
+                {**closing_block, "unit": UNIT_CLOSE},
                 dispatch,
                 len(fired),
                 dirt=True,
