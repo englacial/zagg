@@ -1736,12 +1736,27 @@ def main(argv=None) -> int:
         parser.error("--scope only applies to --stages")
     if args.stages and args.scope is None:
         parser.error(f"--stages needs --scope — {SCOPE_REQUIRED_HINT}")
-    if args.stages and args.scope != SCOPE_ALL and not _scope_prefixes(args.scope):
-        # An unset shell variable expanding to --scope="" would otherwise
-        # reach normalize_scope AFTER discover_leaves has listed the store,
-        # and raise an uncaught ValueError instead of this exit-2 (the same
-        # guard --declare-pyramid carries below).
-        parser.error(f"--scope {args.scope!r} names no node prefix — {SCOPE_REQUIRED_HINT}")
+    stage_scope = None
+    if args.stages:
+        # Resolve the scope from argv alone, BEFORE anything touches the store
+        # — the partition_split_order precedent below. Left where it was used,
+        # inside the run_stage_sweep call, every bad token but the empty one
+        # reached normalize_scope AFTER discover_leaves had listed the store:
+        # --scope ALL, --scope 9111 and a typo'd prefix each paid a full LIST
+        # plus a parquet read per run record and then died on an uncaught
+        # ValueError ("malformed decimal Morton id") instead of this exit-2.
+        if args.scope != SCOPE_ALL and not _scope_prefixes(args.scope):
+            # An unset shell variable expanding to --scope="" names no prefix,
+            # which normalize_scope would read as a scope of nothing rather
+            # than refuse (the same guard --declare-pyramid carries below).
+            parser.error(f"--scope {args.scope!r} names no node prefix — {SCOPE_REQUIRED_HINT}")
+        try:
+            stage_scope = operator_scope(
+                args.scope if args.scope == SCOPE_ALL else _scope_prefixes(args.scope),
+                what="python -m zagg.sweep --stages",
+            )
+        except ValueError as e:
+            parser.error(str(e))  # keep the CLI's exit-2 contract
     if args.pipeline_run_id is not None and not args.stages:
         # The key lives in the STAGED run record; a families pass has nowhere
         # to put it, and dropping it silently would look like it was recorded.
@@ -1802,10 +1817,7 @@ def main(argv=None) -> int:
         summary = run_stage_sweep(
             args.store_root,
             leaves,
-            scope=operator_scope(
-                args.scope if args.scope == SCOPE_ALL else _scope_prefixes(args.scope),
-                what="python -m zagg.sweep --stages",
-            ),
+            scope=stage_scope,
             tuple_width=args.tuple_width,
             partitions=args.partitions if args.partitions != 1 else None,
             store_kwargs=store_kwargs,

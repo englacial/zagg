@@ -184,6 +184,24 @@ class TestStagesCliScope:
         assert exc.value.code == 2
         assert "--scope only applies to --stages" in capsys.readouterr().err
 
+    @pytest.mark.parametrize("bad", ["ALL", "9111", "abc", ""])
+    def test_a_malformed_scope_refuses_before_the_store_is_listed(self, bad, capsys, monkeypatch):
+        # The guard is argv-only (issue #620 review): a bad token must not pay
+        # discover_leaves' LIST plus a parquet read per run record and then die
+        # on an uncaught ValueError from morton_word. `--scope ALL` is the
+        # likely operator typo — SCOPE_ALL is lowercase.
+        from zagg import sweep as sweep_mod
+        from zagg.sweep import main
+
+        def listed(*a, **k):
+            raise AssertionError("discover_leaves must not run for a malformed --scope")
+
+        monkeypatch.setattr(sweep_mod, "discover_leaves", listed)
+        with pytest.raises(SystemExit) as exc:
+            main(["/nowhere", "--stages", "--scope", bad])
+        assert exc.value.code == 2
+        assert "scope" in capsys.readouterr().err
+
     def test_a_scoped_pass_reaches_the_driver_with_its_moc(self, swept, monkeypatch):
         from zagg import sweep as sweep_mod
         from zagg.grids.morton import morton_word
