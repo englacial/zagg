@@ -603,6 +603,7 @@ staged arm, reusing that event's credential resolution and its
 | `touch_policy` | finisher | Optional (defaults to `"auto"`); the `output.touch` declaration (issue #501) governing the `aggregation.yaml` touch |
 | `barrier_timed_out` | finisher | Optional, defaults `false`. Sent by the dispatcher when any tuple's barrier expired; the finisher records it in the store-root run record and in `finisher.json`, so the durable record says the per-level actuals may be short |
 | `short_orders` | finisher | Optional ([issue #610](https://github.com/englacial/zagg/issues/610)); the ladder orders of every tuple the dispatcher is missing a unit record for. The finisher **withholds** their manifest `actuals` — the entries keep whatever stood — and records the rest as usual, so a walled tuple's levels are no longer stamped as if observed. Reported back as `short_orders` and `finisher.actuals_withheld`; absent, nothing is withheld |
+| `families` | stage | Optional ([issue #610](https://github.com/englacial/zagg/issues/610) phase 4); the rollup families riding this invoke's nodes (`zagg.sweep_families.CASCADE_FAMILIES` — `stats`, `moc`, `submap`). Sent **only on the invokes that close a node** — the unwindowed whole-node invoke, or `unit: "close"` — because a rollup object merges every window of its node, so the node's one writer owns it. The worker folds each node's rollups over that tuple's own span and puts the §10 accumulator in its record; the finisher takes which families rode from the **records**, so its own block carries no such key. Absent, the invoke folds the ladder alone, as before |
 
 Every store write stays worker-side. The dispatcher only invokes and polls.
 
@@ -652,8 +653,11 @@ ordering exactly:
    same moment and the two share one barrier; the last tuple's closes get
    their own before the finisher. A store that does not declare the fold
    fires no close and waits for nothing;
-4. next tuple; then the **finisher** invoke last — root `coverage.moc`,
-   manifest per-level actuals, `aggregation.yaml` touch, lease release —
+4. next tuple; then the **finisher** invoke last — root `coverage.moc`
+   (the `moc` family's own finish when the families rode, otherwise the work
+   set's), the families' §10 section and `coverage.toc` sibling composed from
+   the records' accumulator blocks and the base-node rollups with no leaf
+   read, manifest per-level actuals, `aggregation.yaml` touch, lease release —
    **unless no tuple produced a dispatch node at all** (every leaf skipped as
    mixed-order, or filtered out by scope), in which case nothing fires, there
    is no finisher and no barrier, and the summary says so:
@@ -951,7 +955,7 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
 | 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
-| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits, over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits — and, where the dispatcher is given `families=` ([issue #610](https://github.com/englacial/zagg/issues/610) phase 4), the rollup families riding the same walk, folded in each node's close and composed into the §10 root section by this run's own finisher, so step 2 is not needed at all — over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 
 Shards the launcher had not dispatched yet never run. Work through the steps
