@@ -34,7 +34,7 @@ from test_sweep_stage import DENSE_16, LEAVES, _stage_store
 import zagg.sweep_families as fam_mod
 from zagg.grids.morton import morton_word
 from zagg.hive import COMMIT_ATTR, shard_leaf_path
-from zagg.store import open_store
+from zagg.store import open_object_store, open_store
 from zagg.sweep import run_sweep, write_leaf_submap
 from zagg.sweep_families import CASCADE_FAMILIES, normalize_families, rider_for
 from zagg.sweep_stages import run_stage_sweep
@@ -558,3 +558,102 @@ class TestHandlerForwarding:
         seen.clear()
         mod.lambda_handler(_event(root, block), None)
         assert seen["families"] == ()
+
+
+# ---------------------------------------------------------------------------
+# Review fold: where a span STARTS is a source, not an order.
+# ---------------------------------------------------------------------------
+
+
+class TestSpanSource:
+    """``from_order == shard_order`` means the leaves to one caller and the rollups to the other.
+
+    The cascade's finest tuple has ``child_order == shard_order`` and must
+    read the LEAVES there; the families finisher whose partitions split at
+    the shard order must read the shard nodes' own ROLLUPS and no leaf
+    (``run_sweep``: "split == shard_order is permitted, and then every node
+    above the leaves is owed"). ``from_leaves`` is what tells them apart.
+    """
+
+    def test_reading_the_leaves_anywhere_but_the_leaf_order_refuses(self, tmp_path):
+        from zagg.sweep import get_family
+        from zagg.sweep_families import fold_span
+
+        root = tmp_path / "s"
+        _store(root)
+        store = open_object_store(str(root))
+        with pytest.raises(ValueError, match="leaves of this store are at 3"):
+            fold_span(
+                store,
+                get_family("stats"),
+                {d: {None} for d in LEAVES},
+                shard_order=SHARD_ORDER,
+                spec=None,
+                counts={"written": 0, "current": 0, "empty": 0, "failed": 0},
+                from_order=2,
+                from_leaves=True,
+            )
+
+    def test_a_span_at_the_shard_order_folds_the_stored_rollups(self, tmp_path, monkeypatch):
+        import zagg.sweep as sweep_mod
+        from zagg.sweep import get_family, run_sweep
+        from zagg.sweep_families import fold_span
+
+        root = tmp_path / "s"
+        _store(root)
+        run_sweep(str(root), _refs(), families=("stats",), record=False)
+        before = _families_only(_rollups(root))
+        monkeypatch.setattr(sweep_mod, "_rollup_shard_node", _explode)
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        tops = fold_span(
+            open_object_store(str(root)),
+            get_family("stats"),
+            {d: {None} for d in LEAVES},
+            shard_order=SHARD_ORDER,
+            spec=None,
+            counts=counts,
+            from_order=SHARD_ORDER,
+            to_order=0,
+        )
+        assert [t["node"] for t in tops] == ["-2", "1"]
+        assert counts["current"] == 7 and counts["written"] == 0  # nothing moved
+        assert _families_only(_rollups(root)) == before
+
+    def test_the_families_finisher_at_the_leaf_split_reads_no_leaf(self, tmp_path, monkeypatch):
+        """The regression: a ``4^shard_order`` fan-out's finisher walked the leaves again."""
+        from test_sweep_finisher import _no_leaf_reads, _objects
+        from test_sweep_store_handle import _store as temporal_store
+
+        from zagg.client_transport import run_status_prefix
+        from zagg.sweep import run_sweep
+        from zagg.sweep_fleet import families_record_name
+        from zagg.sweep_partition import partition_leaves
+
+        root, leaves = temporal_store(tmp_path / "fan", 8)
+        single = str(_twin(Path(root), tmp_path / "single"))
+        of = 4**4  # the fixture's shard_order: the finest split run_sweep admits
+        prefix, names = run_status_prefix(root, "r610p4"), []
+        for index, _mine in partition_leaves(leaves, of).items():
+            partition = {"index": index, "of": of}
+            summary = run_sweep(
+                root,
+                leaves,
+                families=CASCADE_FAMILIES,
+                partition=partition,
+                status_record=(prefix, families_record_name(partition)),
+            )
+            assert summary["partition"]["split_order"] == 4
+            names.append(families_record_name(partition))
+        hits = _no_leaf_reads(monkeypatch)
+        summary = run_sweep(
+            root,
+            leaves,
+            families=CASCADE_FAMILIES,
+            finisher={"of": of, "records_from": prefix, "accumulators": names},
+        )
+        monkeypatch.undo()
+        assert hits == []
+        assert "fallback" not in summary["finisher"]
+        assert summary["families"]["moc"]["temporal_shards"] == 8
+        run_sweep(single, leaves, families=CASCADE_FAMILIES, record=False)
+        assert _objects(root) == _objects(single)
