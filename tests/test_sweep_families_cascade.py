@@ -712,3 +712,45 @@ class TestFoldOnce:
         for node, dispatch, child_order in sorted(rider.folded):
             rider.fold_node(node, dispatch=dispatch, child_order=child_order)
         assert rider.counts["stats"]["written"] == written  # nothing re-folded
+
+
+# ---------------------------------------------------------------------------
+# Review fold: only the moc family's own finish stands step 1 down.
+# ---------------------------------------------------------------------------
+
+
+class TestWhoOwnsTheRootMoc:
+    def test_a_run_without_the_moc_family_still_refreshes_the_root(self, tmp_path):
+        root = tmp_path / "s"
+        _store(root)
+        (root / "coverage.moc").unlink()
+        summary = run_stage_sweep(str(root), _refs(), families=["stats"], record=False)
+        assert summary["families"]["finish"]["owns_root_moc"] is False
+        assert summary["finisher"]["root_moc_from"] == "work-set"
+        assert summary["finisher"]["root_moc"] is True
+        assert (root / "coverage.moc").exists()
+
+    def test_a_moc_run_with_no_base_rollup_still_refreshes_the_root(self, tmp_path, monkeypatch):
+        """No base-node rollup to compose from: ``MocFamily.finish`` writes nothing."""
+        import zagg.sweep as sweep_mod
+
+        root = tmp_path / "s"
+        _store(root)
+        (root / "coverage.moc").unlink()
+        # Every leaf read fails, so no rollup lands and ``tops`` is empty.
+        monkeypatch.setattr(sweep_mod, "_rollup_shard_node", _explode)
+        summary = run_stage_sweep(str(root), _refs(), families=None, record=False)
+        composed = summary["families"]["finish"]
+        assert composed["families"]["moc"]["base_rollups"] == 0
+        assert composed["owns_root_moc"] is False
+        assert summary["finisher"]["root_moc_from"] == "work-set"
+        assert (root / "coverage.moc").exists()
+
+    def test_the_moc_family_owns_it_when_it_composed(self, tmp_path):
+        root = tmp_path / "s"
+        _store(root)
+        summary = run_stage_sweep(str(root), _refs(), families=None, record=False)
+        composed = summary["families"]["finish"]
+        assert composed["owns_root_moc"] is True
+        assert composed["families"]["moc"]["base_rollups"] == 2  # two base cells
+        assert summary["finisher"]["root_moc_from"] == "families"

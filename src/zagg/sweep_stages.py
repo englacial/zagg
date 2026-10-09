@@ -385,8 +385,11 @@ def run_finisher(
     writes the same object from the base-node rollups plus the §10 temporal
     section this run accumulated. Its word set is a superset of step 1's (the
     rollups cover every shard the tree holds, not just this run's work set),
-    so re-doing step 1 afterwards would be a second PUT of a subset.
-    ``out["root_moc_from"]`` names whichever wrote it.
+    so re-doing step 1 afterwards would be a second PUT of a subset. Both
+    callers key it on that block's ``owns_root_moc`` and nothing else: a run
+    riding only ``stats``/``submap``, or one whose ``moc`` finish found no
+    base-node rollup to compose from, needs step 1 as much as a ladder-only
+    run does. ``out["root_moc_from"]`` names whichever wrote it.
     """
 
     from zagg.grids.morton import morton_word
@@ -699,7 +702,7 @@ def run_stage_sweep(
             store_kwargs=store_kwargs,
             release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
             touch_policy=touch_policy,
-            root_moc=composed is None,
+            root_moc=not (composed or {}).get("owns_root_moc"),
         )
         summary["lease"]["released"] = bool(summary["finisher"].get("lease_released"))
     except BaseException as e:
@@ -1318,7 +1321,7 @@ def run_stage_finisher(
         release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
         touch_policy=touch_policy,
         withhold_levels=withheld,
-        root_moc=composed is None,
+        root_moc=not (composed or {}).get("owns_root_moc"),
     )
     summary["lease"] = {"released": bool(summary["finisher"].get("lease_released"))}
     summary["duration_s"] = time.perf_counter() - t0
