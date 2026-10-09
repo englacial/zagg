@@ -759,9 +759,11 @@ def run_stage_sweep_fleet(
     store, the close invoke — because a rollup object merges every window of
     its node; the finisher needs no key for it, since it takes which
     families rode from the records. A windowed store that declares no
-    all-time fold has no close invoke, and this dispatcher refuses the
-    combination BY NAME rather than firing a fan-out that would fold no
-    rollup at all.
+    all-time fold has no close invoke and folds no rollup; since ``all_time``
+    here is only the caller's first guess, that is WARNED and reported
+    (``families_unswept``) rather than refused, and the store's own answer —
+    read back off the first landed window record, below — settles it in
+    either drift direction.
 
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
@@ -807,12 +809,22 @@ def run_stage_sweep_fleet(
     # by name here — before anything fires — so a misspelled family is not a
     # fan-out that quietly folds no rollup.
     family_names = normalize_families(families)
-    if family_names and windowed and not all_time:
-        raise ValueError(
-            f"families {list(family_names)} were asked to ride a windowed store that "
-            "declares no all-time fold: the rollups fold in a node's CLOSE (one object per "
-            "node, every window), and such a store fires no close invoke — sweep them "
-            "with their own pass, or declare pyramid.overview.all_time (issue #610)"
+    # Reported, not refused. This reads the CALLER's ``all_time``, which is
+    # only the first guess (see the docstring): a store that DOES declare the
+    # fold would fire its close invokes and fold the families fine, so
+    # refusing here refused a run that works. The outcome therefore starts
+    # pessimistic on the summary and the store's own answer — the per-tuple
+    # ``told`` check below, where the store has actually spoken — settles it
+    # in both drift directions (review finding).
+    families_closeless = bool(family_names and windowed and not all_time)
+    if families_closeless:
+        logger.warning(
+            f"stage fleet: families {list(family_names)} were asked to ride a windowed store "
+            "whose config declares no all-time fold: the rollups fold in a node's CLOSE (one "
+            "object per node, every window), and such a store fires no close invoke — unless "
+            "the store itself declares pyramid.overview.all_time, their rollups are NOT folded "
+            "by this run (reported as families_unswept); sweep them with their own pass, or "
+            "declare the fold (issue #610)"
         )
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
@@ -849,7 +861,11 @@ def run_stage_sweep_fleet(
         # ``short_orders``: a caller reading the summary should not have to
         # know which branch produced it.
         "families": list(family_names),
-        "families_unswept": False,
+        # Pessimistic until the store says otherwise: a windowed run whose
+        # config declares no close fires none, and no landed record ever
+        # arrives to correct the guess, so False here would be a silent claim
+        # that the rollups were folded (review finding).
+        "families_unswept": families_closeless,
         "scope": None if scope is None else [str(int(w)) for w in scope],
         # Whether the per-tuple node sets were computed from the store's own
         # coverage (issue #547) or from the work set alone. The words
@@ -1128,14 +1144,17 @@ def run_stage_sweep_fleet(
                         f"stage fleet: the store {'declares' if told else 'does not declare'} "
                         f"the all-time fold, unlike the caller's config — following the store"
                     )
+                if family_names:
+                    # The STORE has now spoken, so this — not the caller's
+                    # config — is what the run reports. Both directions: a
+                    # store that declares the fold clears a pessimistic guess
+                    # (its close invokes fire from the recomputed units just
+                    # below), and one that withdraws it sets the flag (review
+                    # findings).
+                    summary["families_unswept"] = not told
                 if family_names and not told:
-                    # The gate above read the CALLER's all_time, which this
-                    # function documents as only a first guess; the store has
-                    # now contradicted it, so no close invoke will fire and
-                    # the families fold nowhere. Loud rather than silent
-                    # (review finding) — the artifacts are regenerable, so the
-                    # run goes on and a families pass heals them.
-                    summary["families_unswept"] = True
+                    # Loud rather than silent — the artifacts are regenerable,
+                    # so the run goes on and a families pass heals them.
                     logger.warning(
                         f"stage fleet: run {run_id} asked families {list(family_names)} to ride "
                         "a store that does not declare the all-time fold, so no close invoke "

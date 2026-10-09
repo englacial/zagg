@@ -536,19 +536,35 @@ class TestFleetDispatch:
         assert all("families" not in b for b in by_unit["window"])
         assert all(b["families"] == list(CASCADE_FAMILIES) for b in by_unit["close"])
 
-    def test_a_windowed_store_with_no_close_is_refused_by_name(self, tmp_path):
+    def test_a_windowed_config_with_no_close_is_reported_not_refused(self, tmp_path, caplog):
+        """The caller's ``all_time`` is a guess, so the up-front check cannot refuse.
+
+        A store that DOES declare the fold would fire its close invokes and
+        fold the families fine, and the dispatcher cannot read the manifest to
+        tell (D8) — so the combination is warned and carried on the summary,
+        and the store's own answer settles it (review finding). No record
+        lands here, so the pessimistic guess stands.
+        """
         from test_sweep_stage_fleet import _FakeLambda
 
         root = tmp_path / "s"
         _store(root)
-        with pytest.raises(ValueError, match="declares no all-time fold"):
-            self._fleet(
+        client = _FakeLambda()
+        with caplog.at_level("WARNING"):
+            summary = self._fleet(
                 root,
-                _FakeLambda(),
+                client,
                 families=None,
                 windowed=True,
                 all_time=False,
+                leaves=[(morton_word(d), "2019") for d in LEAVES],
             )
+        assert summary["families_unswept"] is True
+        assert "their rollups are NOT folded" in caplog.text
+        # ...and the run went on: window invokes fired, none of them closing.
+        staged = [b for b in client.blocks() if b.get("role", "stage") == "stage"]
+        assert staged and {b.get("unit") for b in staged} == {"window"}
+        assert all("families" not in b for b in staged)
 
     def test_an_unknown_family_is_refused_before_anything_fires(self, tmp_path):
         from test_sweep_stage_fleet import _FakeLambda
@@ -1024,6 +1040,56 @@ class TestStoreContradictsTheCaller:
         assert summary["all_time_from"] == "store" and summary["all_time"] is False
         assert summary["families_unswept"] is True
         assert "their rollups are NOT folded by this run" in caplog.text
+
+    def test_a_store_that_declares_the_close_clears_the_guess(self, tmp_path):
+        """The other drift direction, which the old up-front refusal refused outright.
+
+        The caller's config says no all-time fold; the store declares it. The
+        close invokes therefore fire and carry the families, so the
+        pessimistic ``families_unswept`` the config earned is cleared by the
+        store's own answer (review finding).
+        """
+        from test_sweep_stage_fleet import _FakeLambda, _fleet
+
+        from zagg.sweep_stages import STAGE_RECORD_SPEC, _put_stage_record, stage_record_name
+
+        root = tmp_path / "s"
+        _store(root)
+
+        def worker(event, _context):
+            block = event["stage"]
+            if block.get("role") == "finisher":
+                return {"statusCode": 200}
+            _put_stage_record(
+                block["records_from"],
+                stage_record_name(block["dispatch"], block["batch"]),
+                {
+                    "spec": STAGE_RECORD_SPEC,
+                    "role": "stage",
+                    "run_id": block["run_id"],
+                    "unit": block.get("unit"),
+                    "closes": True,  # what the STORE declares
+                    "stages": [],
+                    "level_actuals": {},
+                },
+                {},
+            )
+            return {"statusCode": 200}
+
+        client = _FakeLambda(handler=worker)
+        summary = _fleet(
+            root,
+            client,
+            families=None,
+            windowed=True,
+            all_time=False,  # the caller's guess, which the store contradicts
+            leaves=[(morton_word(d), "2019") for d in LEAVES],
+            barrier_timeout_s=5,
+        )
+        assert summary["all_time_from"] == "store" and summary["all_time"] is True
+        assert summary["families_unswept"] is False
+        closes = [b for b in client.blocks() if b.get("unit") == "close"]
+        assert closes and all(b["families"] == list(CASCADE_FAMILIES) for b in closes)
 
     def test_a_complete_run_says_nothing_of_the_kind(self, tmp_path):
         from test_sweep_stage_fleet import _FakeLambda, _fleet

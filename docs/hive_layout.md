@@ -806,8 +806,11 @@ whole-tree `python -m zagg.sweep` pass at any `tuple_width`. The close is
 where they ride because a rollup object merges **every window** of its node
 (its `windows` key): the node's window units run concurrently and would
 read-modify-write one object. A windowed store that declares no all-time
-fold therefore has nowhere to put them, and the fleet dispatcher refuses
-that combination by name rather than firing a fan-out that folds no rollup.
+fold therefore has nowhere to put them. The fleet dispatcher's `all_time` is
+only the caller's first guess, so it *warns* up front and reports the outcome
+(`families_unswept`) from the store's own answer, read back off the first
+landed window record — which settles both drift directions rather than
+refusing a store that does declare the fold.
 The run's finisher then composes the families' store-root singletons once —
 the §10 temporal section inside `coverage.moc` and its `coverage.toc`
 sibling — from the base-node rollups (≤ 1 GET per base cell) plus the
