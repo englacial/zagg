@@ -15,7 +15,36 @@ Two things this pins, both about a staged pass that has nothing to do:
 """
 
 import pytest
-from test_sweep_stage import DENSE_16, _wide_store
+from test_sweep_stage import DENSE_16, LEAVES, _stage_store, _wide_store
+from test_sweep_stage_fleet import _FakeLambda
+
+
+def _tail_fleet(root, client, **kwargs):
+    """``run_stage_sweep_fleet`` over a real work set, nothing executed."""
+    from zagg.grids.morton import morton_word
+    from zagg.sweep_fleet import run_stage_sweep_fleet
+
+    return run_stage_sweep_fleet(
+        client,
+        "fn",
+        str(root),
+        [(morton_word(d), None) for d in LEAVES],
+        shard_order=3,
+        store_kwargs={},
+        tuple_width=1,
+        poll_interval_s=0.01,
+        barrier_timeout_s=0.01,
+        **kwargs,
+    )
+
+
+def _fired(client):
+    """The stage node sets the dispatcher actually invoked, by dispatch order."""
+    fired: dict = {}
+    for block in client.blocks():
+        if block["role"] == "stage":
+            fired.setdefault(block["dispatch"], []).extend(block["nodes"])
+    return {d: sorted(n) for d, n in fired.items()}
 
 
 @pytest.fixture
@@ -151,20 +180,43 @@ class TestOperatorScope:
             )
 
     def test_the_fleet_dispatcher_takes_the_tail_unscoped(self, tmp_path):
-        # No coverage: the tail's own call, whose node set IS its work set's
-        # ancestors. It must stay unscoped-legal.
-        from zagg.sweep_fleet import run_stage_sweep_fleet
+        # Issue #620 ruled item (2): the tail needed no change because its
+        # node set is already its work set's ancestors. REAL leaves, because
+        # `leaves=[]` bails at "no dispatch nodes" before any scope logic and
+        # `scope is None` is then equally true of the tail and of the
+        # whole-store form (review finding) — what pins the item is the fired
+        # node set, tuple by tuple, against `dispatch_nodes` over the work set.
+        from zagg.sweep_fleet import dispatch_nodes
 
-        summary = run_stage_sweep_fleet(None, "fn", str(tmp_path), [], shard_order=3)
-        assert summary["skipped"] == "no dispatch nodes" and summary["scope"] is None
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert summary["scope"] is None
+        by_shard = {d: {None} for d in LEAVES}
+        assert _fired(client) == {d: dispatch_nodes(by_shard, d) for d in (2, 1, 0)}
+        # And nothing wider: every node fired is an ancestor of a work leaf.
+        assert all(
+            any(leaf.startswith(node) for leaf in LEAVES)
+            for nodes in _fired(client).values()
+            for node in nodes
+        )
 
     def test_the_fleet_dispatcher_records_an_explicit_all(self, tmp_path):
-        from zagg.sweep_fleet import run_stage_sweep_fleet
+        # `scope="all"` is the operator's explicit whole store: it records as
+        # unscoped AND fans out the coverage's own assignment, which on this
+        # store is wider than nothing. Same real-leaves reasoning as above.
+        from zagg.hive import read_root_coverage, root_coverage_words
+        from zagg.sweep_fleet import coverage_dispatch_nodes
 
-        summary = run_stage_sweep_fleet(
-            None, "fn", str(tmp_path), [], shard_order=3, coverage=[1], scope="all"
-        )
-        assert summary["skipped"] == "no dispatch nodes" and summary["scope"] is None
+        root = tmp_path / "s"
+        _stage_store(root)
+        words = root_coverage_words(read_root_coverage(str(root)))
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client, coverage=words, scope="all")
+        assert summary["scope"] is None and summary["coverage_computed"] is True
+        by_shard = {d: {None} for d in LEAVES}
+        assert _fired(client) == {d: coverage_dispatch_nodes(by_shard, d, words) for d in (2, 1, 0)}
 
 
 class TestStagesCliScope:
