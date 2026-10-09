@@ -11,6 +11,15 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-10-08
+
+### Merged pull requests
+
+- Staged ladder: merge levels cascade from their children's artifacts through one fold engine (issue #620) ([#621](https://github.com/englacial/zagg/pull/621)) by @espg
+- dggs attrs: ellipsoid key is semi_major_axis per the dggs v1 schema (issue #616) ([#619](https://github.com/englacial/zagg/pull/619)) by @espg
+- Build the Lambda zips from uv.lock, not from PyPI floors (issue #613) ([#614](https://github.com/englacial/zagg/pull/614)) by @espg
+- Icechunk repo root: conformant multiscales layout composed with dggs (issue #615) ([#618](https://github.com/englacial/zagg/pull/618)) by @espg
+
 ## [0.58.0] - 2026-10-08
 
 ### Merged pull requests
