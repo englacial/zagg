@@ -37,6 +37,7 @@ from zagg.hive import COMMIT_ATTR, shard_leaf_path
 from zagg.store import open_object_store, open_store
 from zagg.sweep import run_sweep, write_leaf_submap
 from zagg.sweep_families import CASCADE_FAMILIES, normalize_families, rider_for
+from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH
 from zagg.sweep_stages import run_stage_sweep
 from zagg.telemetry import build_record, write_sidecar
 
@@ -924,6 +925,26 @@ class TestVisitedIsWhatWasFolded:
         )
         assert "shards_unvisited" not in composed
 
+    def test_a_coarse_span_claims_nothing(self, tmp_path):
+        """Only the span at ``shard_order`` reads leaves; a coarser one folds rollups.
+
+        The claim is "I read these leaves", so a span that read none must make
+        no claim — otherwise the rollups standing on the store from an earlier
+        run read as this run's coverage (review finding).
+        """
+        root = tmp_path / "s"
+        manifest = _store(root)
+        by_shard = {d: {None} for d in LEAVES}
+        run_stage_sweep(str(root), _refs(), families=None, record=False)  # rollups to fold from
+        rider = rider_for(None)
+        rider.bind(open_object_store(str(root)), manifest, by_shard)
+        rider.fold_node("1", dispatch=1, child_order=2)  # [1, 2): no leaf
+        rider.fold_node("1", dispatch=0, child_order=1)  # [0, 1): no leaf
+        assert rider.visited == set()
+        assert rider.node_failures == []  # both folded cleanly; neither read a leaf
+        rider.fold_node("1", dispatch=2, child_order=SHARD_ORDER)  # [2, 3): the leaves
+        assert sorted(rider.visited) == ["1111", "1112", "1121"]
+
 
 # ---------------------------------------------------------------------------
 # Review fold: standing step 1 down needs the rollups to account for THIS run.
@@ -931,7 +952,15 @@ class TestVisitedIsWhatWasFolded:
 
 
 class TestOwnsRootMocNeedsCoverage:
-    def test_a_run_whose_spans_all_raised_does_not_stand_step_1_down(self, tmp_path, monkeypatch):
+    # Every width, not just the default: ``DEFAULT_TUPLE_WIDTH`` collapses
+    # this fixture's three-order ladder into ONE tuple whose span reads the
+    # leaves, so the default hid a ``visited`` claimed by coarse spans that
+    # read nothing. 1 is the width this PR measures at and the one issue #610
+    # recommends for California (review finding).
+    @pytest.mark.parametrize("width", [DEFAULT_TUPLE_WIDTH, 1, 2])
+    def test_a_run_whose_spans_all_raised_does_not_stand_step_1_down(
+        self, tmp_path, monkeypatch, width
+    ):
         """Prior rollups make ``tops`` non-empty even when this run folded nothing.
 
         ``MocFamily.finish`` would then publish the PRIOR run's words and the
@@ -945,7 +974,9 @@ class TestOwnsRootMocNeedsCoverage:
         run_stage_sweep(str(root), _refs(), families=None, record=False)  # lay the rollups
         (root / "coverage.moc").unlink()
         monkeypatch.setattr(sweep_mod, "_rollup_shard_node", _explode)
-        summary = run_stage_sweep(str(root), _refs(), families=None, record=False)
+        summary = run_stage_sweep(
+            str(root), _refs(), families=None, tuple_width=width, record=False
+        )
         composed = summary["families"]["finish"]
         assert composed["families"]["moc"]["base_rollups"] == 2  # the prior run's
         assert composed["shards_unvisited"] == len(LEAVES)

@@ -175,14 +175,20 @@ class FamiliesRider:
         self.shard_order = 0
         self.spec = None
         self.by_shard: dict = {}
-        #: Every shard this invoke actually FOLDED, across the passes bound
-        #: to it — what the accumulator's ``visited`` names. Not the work set
-        #: it was handed: a fleet invoke's scope is its own dispatch nodes,
-        #: and an event that overflowed into ``discover: true`` derives the
-        #: whole store's work set worker-side, so ``by_shard`` would claim
-        #: coverage no unit of this invoke produced and the finisher's
-        #: ``shards_unvisited`` check — the signal that a close invoke was
-        #: lost — would never fire.
+        #: Every shard whose LEAVES this invoke actually read, across the
+        #: passes bound to it — what the accumulator's ``visited`` names. Not
+        #: the work set it was handed: a fleet invoke's scope is its own
+        #: dispatch nodes, and an event that overflowed into ``discover: true``
+        #: derives the whole store's work set worker-side, so ``by_shard``
+        #: would claim coverage no unit of this invoke produced and the
+        #: finisher's ``shards_unvisited`` check — the signal that a close
+        #: invoke was lost — would never fire. Nor the work set of every span:
+        #: only the span at ``shard_order`` reads leaves, and a coarser span
+        #: folds from rollups that account for this run's leaves ONLY if that
+        #: span already ran — so claiming its work set would say "these
+        #: shards are accounted for" on the strength of whatever stood on the
+        #: store, which at ``tuple_width`` 1 or 2 is every shard (review
+        #: finding).
         self.visited: set = set()
         #: The ``(node, dispatch, child_order)`` spans already folded. The
         #: rollup fold is idempotent, so a repeat would write nothing — but
@@ -250,11 +256,13 @@ class FamiliesRider:
                 )
                 self.node_failures.append({"node": node, "family": fam.name, "error": str(e)})
                 clean = False
-        if clean:
-            # Claimed only when EVERY family folded the span: a span that
-            # raised left its rollups as they stood, so they do not account
-            # for these shards and the finisher must not stand the work-set
-            # root refresh down on them (review finding).
+        if clean and int(child_order) == self.shard_order:
+            # Claimed only when EVERY family folded the span AND the span is
+            # the one that reads the leaves. A span that raised left its
+            # rollups as they stood; a coarser span never looked at a leaf.
+            # Either way they do not account for these shards, and the
+            # finisher must not stand the work-set root refresh down on them
+            # (review findings).
             self.visited.update(work)
 
     def summary(self) -> dict:
@@ -264,9 +272,9 @@ class FamiliesRider:
         carries (:meth:`zagg.sweep.SweepFamily.accumulator`, issue #610 phase
         3), so the ladder's finisher composes the root section from the stage
         records exactly as the families finisher composed it from the
-        partition records. ``visited`` is the shards this invoke actually
-        FOLDED (see the attribute), which is what lets the finisher tell a
-        work set short of a close invoke from one it covered.
+        partition records. ``visited`` is the shards whose leaves this invoke
+        actually READ (see the attribute), which is what lets the finisher
+        tell a work set short of a close invoke from one it covered.
         """
         out: dict = {}
         for fam in self.families:
