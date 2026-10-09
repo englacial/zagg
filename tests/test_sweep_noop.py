@@ -15,8 +15,18 @@ Two things this pins, both about a staged pass that has nothing to do:
 """
 
 import pytest
-from test_sweep_stage import DENSE_16, LEAVES, _stage_store, _wide_store
+from test_sweep_stage import (
+    DENSE_16,
+    LEAVES,
+    TestWindowedStageSweep,
+    _stage_store,
+    _wide_store,
+)
 from test_sweep_stage_fleet import _FakeLambda
+
+from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW
+
+WINDOWS = TestWindowedStageSweep.WINDOWS
 
 
 def _tail_fleet(root, client, **kwargs):
@@ -60,9 +70,44 @@ def swept(tmp_path):
     return root, manifest, by_shard
 
 
+#: The windowed arm's work set: four of the dense leaves, two yearly windows.
+#: Four is enough — the gate fires once per order-2 dispatch node — and the
+#: fixture is rebuilt per test.
+WINDOWED_LEAVES = DENSE_16[:4]
+
+
+@pytest.fixture
+def swept_windowed(tmp_path):
+    """A WINDOWED store's folded ladder: its ``(node, window)`` units and close.
+
+    ``_stage_column_current``'s ``window`` argument is what picks the key
+    (``column_name(window)``), and the config phase 1 pins to ``"stages"``
+    (``tools/configs/atl03_windowed_measure.yaml``) is a windowed store — so
+    the windowed arm is the production arm, and espg's acceptance wording
+    asks for the per-node read bound on windowed units too
+    (https://github.com/englacial/zagg/issues/620#issuecomment-6068583904).
+    The wide geometry, because it is the one whose ladder writes a
+    dispatch-node stage column at all.
+    """
+    from zagg.sweep_stages import sweep_stage_pass
+
+    root = tmp_path / "windowed"
+    manifest = _wide_store(root, leaves=WINDOWED_LEAVES, windows=WINDOWS)
+    by_shard = {d: set(WINDOWS) for d in WINDOWED_LEAVES}
+    warm = sweep_stage_pass(str(root), manifest, by_shard, run_id="warm", tuple_width=1)
+    assert [r["written"] for r in warm["stages"]] == [12, 3, 3]
+    assert warm["stages"][0]["columns_written"] == 8  # one per (node, window)
+    return root, manifest, by_shard
+
+
 class TestNoOpVisit:
-    def _reread(self, root, manifest, by_shard, monkeypatch, *, dispatch):
-        """One tuple re-run with every artifact current; the keys it read."""
+    def _reread(self, root, manifest, by_shard, monkeypatch, *, dispatch, **kwargs):
+        """One tuple re-run with every artifact current; the keys it read.
+
+        ``kwargs`` reach :func:`sweep_stage_pass` — ``only_unit`` /
+        ``only_window`` are how a windowed store's units are driven one at a
+        time, the way a fleet stage invoke runs them.
+        """
         import zarr.storage._obstore as zo
 
         import zagg.store as store_mod
@@ -101,6 +146,7 @@ class TestNoOpVisit:
             run_id="noop",
             tuple_width=1,
             only_dispatch=dispatch,
+            **kwargs,
         )["stages"][0]
         return row, seen
 
@@ -116,6 +162,54 @@ class TestNoOpVisit:
         # stamps. It reads the stamps: `_ColumnReader._array` is the one door
         # to a member, and the skip gate never goes through it.
         assert seen["arrays"] == []
+
+    @pytest.mark.parametrize("dispatch", [2, 1, 0])
+    @pytest.mark.parametrize("unit", [UNIT_WINDOW, UNIT_CLOSE])
+    def test_a_current_windowed_unit_costs_the_same(
+        self, swept_windowed, monkeypatch, dispatch, unit
+    ):
+        # The same bound on the arms a fleet stage invoke runs on a WINDOWED
+        # store: `unit: "window"` (one unit per dirty window) and
+        # `unit: "close"` (the all-time one). espg's acceptance wording asks
+        # for the per-node read bound on windowed units too.
+        extra = {"only_window": WINDOWS[0]} if unit == UNIT_WINDOW else {}
+        row, seen = self._reread(
+            *swept_windowed, monkeypatch, dispatch=dispatch, only_unit=unit, **extra
+        )
+        assert row["written"] == 0 and row["current"] == row["nodes"]
+        assert (row["fold_cells_read"], row["fold_blocks"]) == (0, 0)
+        assert seen["arrays"] == []
+        assert seen["opens"] == 0  # no per-dispatch-node store client, either
+
+    def test_the_column_gate_reads_the_units_own_window_key(self, swept_windowed, monkeypatch):
+        # `_stage_column_current(..., window, ...)` is the function phase 3
+        # changed, and `window` is what picks the key (`column_name(window)`).
+        # It is reached only at the gather tuple, which is the one that writes
+        # a dispatch-node column — so this pins that a windowed unit asks
+        # about ITS OWN window and finds it current.
+        import zagg.sweep_stage as stage_mod
+
+        gate = []
+        inner = stage_mod._stage_column_current
+
+        def spy(store, store_root, node, window, *args, **kwargs):
+            answer = inner(store, store_root, node, window, *args, **kwargs)
+            gate.append((node, window, answer))
+            return answer
+
+        monkeypatch.setattr(stage_mod, "_stage_column_current", spy)
+        self._reread(
+            *swept_windowed,
+            monkeypatch,
+            dispatch=2,
+            only_unit=UNIT_WINDOW,
+            only_window=WINDOWS[0],
+        )
+        assert gate == [(d[:3], WINDOWS[0], True) for d in WINDOWED_LEAVES]
+        # The close unit writes no stage column, so it never reaches the gate.
+        gate.clear()
+        self._reread(*swept_windowed, monkeypatch, dispatch=2, only_unit=UNIT_CLOSE)
+        assert gate == []
 
     @pytest.mark.parametrize("dispatch", [2, 1, 0])
     def test_a_current_node_builds_no_store_client(self, swept, monkeypatch, dispatch):
