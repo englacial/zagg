@@ -1143,29 +1143,43 @@ class TestSweepMode:
         assert get_sweep_mode(cfg, grid) == SWEEP_STAGES
         assert get_sweep(cfg) is True  # the families pass runs under every mode but none
 
-    def test_the_predicate_is_the_leaf_column_gate(self):
-        # The default must claim a ladder only where the MANIFEST declares
-        # one: `_declares_ladder` is `leaf_column_plan`'s gate, which mirrors
-        # `build_pyramid_block`. The shipped hive default has `chunk_order ==
-        # parent_order` (no `chunk_inner`), so it declares /1 and no column —
-        # chaining a staged sweep there would refuse at the /2 gate once per
-        # run and bill the fleet for invokes that fold nothing.
+    @pytest.mark.parametrize(
+        "knob,reader,spec,plan,mode",
+        [
+            # The shipped hive default has `chunk_order == parent_order` (no
+            # `chunk_inner`), so it declares /1 and no column: the gates agree.
+            ({}, None, "zagg-pyramid/1", False, "families"),
+            ({"chunk_inner": 8}, None, "zagg-pyramid/2", True, "stages"),
+            # Where the two gates DISAGREE: `build_pyramid_block` carries
+            # `reader != "raster"` inside the #384 flip condition and
+            # `column._leaf_levels` does not, so the column gate is True
+            # against a /1 manifest. Raster hive products have no ladder
+            # (espg's inventory, issue #620), so the resolver must say
+            # families — a /2 claim here bills a stage invoke per node that
+            # dies in `ladder_entries`.
+            ({"chunk_inner": 8}, "raster", "zagg-pyramid/1", True, "families"),
+        ],
+    )
+    def test_the_predicate_is_the_leaf_column_gate(self, knob, reader, spec, plan, mode):
+        # The load-bearing invariant: the default claims a ladder ONLY where
+        # the MANIFEST declares one, so the resolver and `build_pyramid_block`
+        # cannot drift. The column gate is one leg of that, not the whole of
+        # it, and the rows below include a shape where the two legs differ.
         from zagg.column import leaf_column_plan
-        from zagg.config import SWEEP_FAMILIES, SWEEP_STAGES, get_sweep_mode
+        from zagg.config import SWEEP_STAGES, get_sweep_mode
         from zagg.grids import from_config
         from zagg.sweep_overview import build_pyramid_block
 
-        for knob, spec, mode in (
-            ({}, "zagg-pyramid/1", SWEEP_FAMILIES),
-            ({"chunk_inner": 8}, "zagg-pyramid/2", SWEEP_STAGES),
-        ):
-            cfg = self._cfg(store_layout="hive")
-            cfg.output["grid"] = {**cfg.output["grid"], **knob}
-            grid = from_config(cfg)
-            block = build_pyramid_block(cfg, grid.parent_order, chunk_order=grid.chunk_order)
-            assert block["spec"] == spec
-            assert (leaf_column_plan(cfg, grid) is not None) == (mode == SWEEP_STAGES)
-            assert get_sweep_mode(cfg, grid) == mode
+        cfg = self._cfg(store_layout="hive")
+        cfg.output["grid"] = {**cfg.output["grid"], **knob}
+        if reader is not None:
+            cfg.data_source = {**(cfg.data_source or {}), "reader": reader}
+        grid = from_config(cfg)
+        block = build_pyramid_block(cfg, grid.parent_order, chunk_order=grid.chunk_order)
+        assert block["spec"] == spec
+        assert (leaf_column_plan(cfg, grid) is not None) is plan
+        assert get_sweep_mode(cfg, grid) == mode
+        assert (get_sweep_mode(cfg, grid) == SWEEP_STAGES) == (block["spec"] == "zagg-pyramid/2")
 
     def test_without_a_grid_the_ladder_cannot_be_confirmed(self):
         # `get_sweep` and any caller holding no grid must not chain: the

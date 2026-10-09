@@ -3437,18 +3437,40 @@ SWEEP_MODES = (SWEEP_NONE, SWEEP_FAMILIES, SWEEP_STAGES)
 def _declares_ladder(config: PipelineConfig, grid) -> bool:
     """Whether this config declares a ``/2`` ladder a staged sweep can walk.
 
-    :func:`zagg.column.leaf_column_plan`'s gate verbatim — the one that
-    "mirrors ``build_pyramid_block``'s manifest default EXACTLY" — so the
-    sweep default cannot claim a ladder the manifest does not declare. It
-    needs the GRID: the issue #384 default flip is ``/2`` only where the
+    :func:`zagg.column.leaf_column_plan`'s gate PLUS
+    ``build_pyramid_block``'s raster exemption, because the gate alone is not
+    that function's manifest default: the issue #384 flip condition carries
+    ``(config.data_source or {}).get("reader") != "raster"``
+    (``sweep_overview.py``) and ``column._leaf_levels`` does not, so a
+    ``reader: raster`` hive config with a strictly-interior ``chunk_inner``
+    has a column gate of True against a ``zagg-pyramid/1`` manifest. Raster
+    hive products have NO ladder (espg's inventory,
+    https://github.com/englacial/zagg/issues/620#issuecomment-6068583904;
+    ``declare_pyramid`` refuses ``reader: raster``), so the sweep default
+    must not claim one — it would refuse at ``ladder_entries``' ``/2`` gate
+    once per invoke. Unreachable today (``runner.agg`` re-routes raster to
+    ``RasterStrategy`` and ``client.Run`` refuses it outright), pinned so the
+    next tail that chains cannot reach it either.
+
+    It needs the GRID: the issue #384 default flip is ``/2`` only where the
     grid's resolved chunk order is strictly interior, and a ``K == 1`` grid
     (no ``chunk_inner``) stays ``/1`` with no column to gather. Without a
     grid the ladder cannot be confirmed, so the answer is no and the default
     stays on the families pass rather than chaining a pass that would refuse
     at the ``/2`` gate once per run.
+
+    One narrower divergence remains and cannot be reached from here:
+    ``build_pyramid_block`` bounds the flip by ``output.grid.child_order``
+    only WHEN PRESENT, where ``_leaf_levels`` always bounds by the grid's
+    resolved ``child_order``. A config spelling no ``child_order`` is the
+    grid-less ``declare_pyramid`` retrofit shape — ``grids.from_config``
+    refuses it ("output.grid.child_order is required") — so this predicate
+    has no grid for it and already answers no.
     """
     if grid is None:
         return False
+    if (config.data_source or {}).get("reader") == "raster":
+        return False  # build_pyramid_block's raster exemption, same flip condition
     from zagg.column import leaf_column_plan
 
     try:
