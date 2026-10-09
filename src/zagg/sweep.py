@@ -1618,6 +1618,11 @@ def _sidecar_window(name: str, spec: str | None):
     return _NO_SIDECAR
 
 
+def _scope_prefixes(raw: str) -> list[str]:
+    """``--scope`` as a node-prefix list; empty when it names none."""
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def main(argv=None) -> int:
     """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22).
 
@@ -1731,6 +1736,12 @@ def main(argv=None) -> int:
         parser.error("--scope only applies to --stages")
     if args.stages and args.scope is None:
         parser.error(f"--stages needs --scope — {SCOPE_REQUIRED_HINT}")
+    if args.stages and args.scope != SCOPE_ALL and not _scope_prefixes(args.scope):
+        # An unset shell variable expanding to --scope="" would otherwise
+        # reach normalize_scope AFTER discover_leaves has listed the store,
+        # and raise an uncaught ValueError instead of this exit-2 (the same
+        # guard --declare-pyramid carries below).
+        parser.error(f"--scope {args.scope!r} names no node prefix — {SCOPE_REQUIRED_HINT}")
     if args.pipeline_run_id is not None and not args.stages:
         # The key lives in the STAGED run record; a families pass has nowhere
         # to put it, and dropping it silently would look like it was recorded.
@@ -1792,9 +1803,7 @@ def main(argv=None) -> int:
             args.store_root,
             leaves,
             scope=operator_scope(
-                args.scope
-                if args.scope == SCOPE_ALL
-                else [s.strip() for s in args.scope.split(",") if s.strip()],
+                args.scope if args.scope == SCOPE_ALL else _scope_prefixes(args.scope),
                 what="python -m zagg.sweep --stages",
             ),
             tuple_width=args.tuple_width,

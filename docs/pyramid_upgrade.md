@@ -155,7 +155,7 @@ The gate is the **manifest's** declaration, and every refusal names itself:
 ### 3. Build the ladder with the staged sweep
 
 ```bash
-python -m zagg.sweep s3://bucket/prefix/product --stages
+python -m zagg.sweep s3://bucket/prefix/product --stages --scope all
 ```
 
 Nothing about this step is upgrade-specific — it is the ordinary `/2` staged

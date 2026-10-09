@@ -1034,7 +1034,7 @@ def stage_node(
         return  # the root tuple, or nothing coarser gathers from this node
     fresh_gen = _summed_generation(list(readers.values()))
     if dispatch_level_current and _stage_column_current(
-        store, node, window, fresh_gen, run_id, run_started
+        store, store_root, node, window, fresh_gen, run_id, run_started
     ):
         counts["columns_current"] += 1
         return
@@ -1088,7 +1088,7 @@ def stage_node(
         counts["under_covered"] += 1
 
 
-def _stage_column_current(store, node, window, fresh_gen, run_id, run_started) -> bool:
+def _stage_column_current(store, store_root, node, window, fresh_gen, run_id, run_started) -> bool:
     """Whether the dispatch node's column is committed at the fresh generation.
 
     Read through the invoke's ONE obstore handle by relative key — the issue
@@ -1116,8 +1116,8 @@ def _stage_column_current(store, node, window, fresh_gen, run_id, run_started) -
         return False
     if _foreign_fresh(stamp, run_id, run_started):
         raise ForeignSweepError(
-            f"stage column {path} carries a fresh stamp from foreign sweep run "
-            f"{stamp.get('run_id')!r}; two sweeps are live on this store — aborting"
+            f"stage column {store_root}/{path} carries a fresh stamp from foreign sweep "
+            f"run {stamp.get('run_id')!r}; two sweeps are live on this store — aborting"
         )
     stored = (attrs.get(COLUMN_ATTR) or {}).get("generation")
     return generation_key(stored) == generation_key(fresh_gen)

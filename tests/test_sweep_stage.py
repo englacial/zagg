@@ -1772,7 +1772,7 @@ class TestChainingAndCli:
         root = tmp_path / "s"
         _stage_store(root)
         _write_run_record(root, LEAVES)
-        assert main([str(root), "--stages"]) == 0
+        assert main([str(root), "--stages", "--scope", "all"]) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["mode" if "mode" in out else "run_id"]  # summary printed
         assert out["lease"]["released"] is True
@@ -1795,7 +1795,7 @@ class TestChainingAndCli:
         )
         validate_config(cfg)  # must not raise
         cfg.output["sweep"] = "bogus"
-        with pytest.raises(ValueError, match="boolean or 'stages'"):
+        with pytest.raises(ValueError, match="'none', 'families', 'stages'"):
             validate_config(cfg)
 
 

@@ -35,7 +35,7 @@ mutation that fails is discarded, nothing lands), and no leaf touched.
   only ever tag the repo's newest run (an older untagged run stays covered
   by the next run's tag; tagging it would name later commits). No
   ``--force``: a run whose sweep did not complete has no tip that means
-  "this run" — ``python -m zagg.sweep <store> --stages`` completes the
+  "this run" — ``python -m zagg.sweep <store> --stages --scope all`` completes the
   ladder first. Retention is the run config's ``retain_runs``; no override.
   The record is tied to the run by time only (it names the sweep's own run
   id): with overlapping runs on one store (§11.4's documented casualty
@@ -424,7 +424,7 @@ def newest_stage_record(
 
     ``pipeline_run_id`` (issue #593) narrows it to the newest record that
     NAMES that run — the ``pipeline_run_id`` the dispatcher (or
-    ``python -m zagg.sweep --stages --pipeline-run-id``) stamped into the
+    ``python -m zagg.sweep --stages --scope … --pipeline-run-id``) stamped into the
     sweep it chained, spec §4.7. Records are read newest first until one
     matches; a record naming another run, or none (``null``: the pass
     vouches for no run), is passed over, and so is one that is not a JSON
@@ -538,7 +538,7 @@ def finalize_run(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
 
     Two conditions tie the record to the run (issue #593). It must carry
     ``pipeline_run_id == run_id`` — stamped by the dispatcher that chained
-    the sweep, or by ``python -m zagg.sweep --stages --pipeline-run-id`` for
+    the sweep, or by ``python -m zagg.sweep --stages --scope … --pipeline-run-id`` for
     a pass completing a run whose dispatcher died — and it must be written
     since the run opened. Time alone let a sibling run's sweep, or an
     unrelated ``--stages`` pass, vouch for a ladder this run never built;
@@ -559,6 +559,7 @@ def finalize_run(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     if found is None:
         remedy = (
             f"complete this run's ladder with `python -m zagg.sweep {store_root} --stages "
+            f"--scope all "
             f"--pipeline-run-id {run_id}`, then finalize"
         )
         other = newest_stage_record(store_root, store_kwargs=store_kwargs, since=opened)
@@ -579,7 +580,8 @@ def finalize_run(store_root: str, run_id: str, *, store_kwargs: dict) -> dict:
     if reason is not None:
         raise FinalizeRefusedError(
             f"staged-sweep record {name} does not show a completed sweep ({reason}); "
-            f"re-run `python -m zagg.sweep {store_root} --stages --pipeline-run-id {run_id}`, "
+            f"re-run `python -m zagg.sweep {store_root} --stages --scope all "
+            f"--pipeline-run-id {run_id}`, "
             f"then finalize"
         )
     out = finalize_repo(

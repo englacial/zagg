@@ -810,10 +810,12 @@ def run_stage_sweep_fleet(
     # what makes a pass the store's rather than the run's — so under it the
     # scope has to be spelled, ``"all"`` included (issue #620). The tail's
     # unscoped call is untouched: its node set is its work set's ancestors.
+    # Truthiness, not ``is not None``: an EMPTY coverage is the documented
+    # "fires nothing" no-op, which widens nothing and so needs no scope.
     scope = (
-        normalize_scope(scope)
-        if coverage is None
-        else operator_scope(scope, what="run_stage_sweep_fleet(coverage=…)")
+        operator_scope(scope, what="run_stage_sweep_fleet(coverage=…)")
+        if coverage is not None and len(coverage)
+        else normalize_scope(scope)
     )
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
     regather, _ = _normalize_leaves(dirt_only, shard_order)

@@ -3639,7 +3639,7 @@ def _run_local(
         # #580): their nodes re-gather the rewritten ref sidecars, nothing is
         # re-folded.
         dirt_only = dirt_only_leaves(report.results)
-        if (leaves or dirt_only) and get_sweep_mode(config) == SWEEP_STAGES:
+        if (leaves or dirt_only) and get_sweep_mode(config, grid) == SWEEP_STAGES:
             from zagg.sweep_stages import stage_sweep_after_run
 
             stage_sweep_after_run(
@@ -4592,7 +4592,7 @@ def _run_lambda(
                 # current units ride as dirt-only (issue #580), as on
                 # _run_local: their nodes re-gather refs, nothing is re-folded.
                 dirt_only = dirt_only_leaves(bodies)
-                if (leaves or dirt_only) and get_sweep_mode(config) == SWEEP_STAGES:
+                if (leaves or dirt_only) and get_sweep_mode(config, grid) == SWEEP_STAGES:
                     stage_chained = True
                     staged = _invoke_lambda_stage_sweep(
                         state["lambda_client"],

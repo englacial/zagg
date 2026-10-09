@@ -1079,7 +1079,9 @@ class TestCoverageComputedAssignment:
         _stage_store(root)
         words = root_coverage_words(read_root_coverage(str(root)))
         client = _FakeLambda(None)
-        summary = _fleet(root, client, tuple_width=1, coverage=words, barrier_timeout_s=0.01)
+        summary = _fleet(
+            root, client, tuple_width=1, coverage=words, scope="all", barrier_timeout_s=0.01
+        )
         assert summary["coverage_computed"] is True
         # One invoke per dispatch node at the default, so the fired node sets
         # ARE the computed assignment, tuple by tuple:
@@ -2121,7 +2123,7 @@ def _write_discovery_record(root, leaves=LEAVES, windows=(None,)):
 def _cli_sweep(root, *, tuple_width=3):
     from zagg.sweep import main
 
-    argv = [str(root), "--stages"]
+    argv = [str(root), "--stages", "--scope", "all"]
     if tuple_width != 3:
         argv += ["--tuple-width", str(tuple_width)]
     assert main(argv) == 0

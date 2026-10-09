@@ -1363,7 +1363,7 @@ class Run:
         # only on the explicit no-work branch below.
         sweeps = layout == "hive" and get_sweep(self.config)
         stage_chained = (
-            sweeps and get_sweep_mode(self.config) == SWEEP_STAGES and not self._attached
+            sweeps and get_sweep_mode(self.config, self.grid) == SWEEP_STAGES and not self._attached
         )
         if sweeps:
             try:
@@ -1473,7 +1473,7 @@ class Run:
                 return
             if (
                 get_icechunk_options(self.config)["commit"] != "leaf"
-                or get_sweep_mode(self.config) == SWEEP_STAGES
+                or get_sweep_mode(self.config, self.grid) == SWEEP_STAGES
             ):
                 handle.icechunk_finalize = {
                     "skipped": 'attached sweep: "stages" run; its dispatcher finalizes '

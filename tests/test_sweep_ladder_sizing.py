@@ -434,6 +434,7 @@ class TestFoldsWhatTheWorkerFolds:
             _FakeLambda(None),
             leaves=[(morton_word("1111"), None)],
             coverage=[morton_word(d) for d in LEAVES],
+            scope="all",
             stage_target_nodes=3,
             barrier_timeout_s=0.01,
             total_barrier_budget_s=0.01,

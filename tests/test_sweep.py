@@ -1117,7 +1117,7 @@ class TestSweepMode:
     """``get_sweep_mode`` (issue #620 section 2): the ladder is the append's.
 
     The ONE resolver every chaining site reads. The default flipped to
-    ``"stages"`` for a hive store that declares a ladder; the pre-#620
+    ``"stages"`` for a hive store that declares a ``/2`` ladder; the pre-#620
     behaviour is now spelled, not implied.
     """
 
@@ -1128,28 +1128,70 @@ class TestSweepMode:
         cfg.output.update(output)
         return cfg
 
+    def _ladder(self, **output):
+        """A hive config that really declares a ``/2`` ladder, and its grid."""
+        from zagg.grids import from_config
+
+        cfg = self._cfg(store_layout="hive", pyramid={"overviews": 8}, **output)
+        return cfg, from_config(cfg)
+
     def test_hive_with_a_ladder_defaults_to_stages(self):
         from zagg.config import SWEEP_STAGES, get_sweep, get_sweep_mode, validate_config
 
-        cfg = self._cfg(store_layout="hive")
+        cfg, grid = self._ladder()
         validate_config(cfg)
-        assert get_sweep_mode(cfg) == SWEEP_STAGES
+        assert get_sweep_mode(cfg, grid) == SWEEP_STAGES
         assert get_sweep(cfg) is True  # the families pass runs under every mode but none
 
-    def test_a_pyramid_less_hive_store_defaults_to_families(self):
-        # `output.pyramid: false` declares the overview family OFF, so there
-        # is no ladder to chain and the default must not try once per run.
+    def test_the_predicate_is_the_leaf_column_gate(self):
+        # The default must claim a ladder only where the MANIFEST declares
+        # one: `_declares_ladder` is `leaf_column_plan`'s gate, which mirrors
+        # `build_pyramid_block`. The shipped hive default has `chunk_order ==
+        # parent_order` (no `chunk_inner`), so it declares /1 and no column —
+        # chaining a staged sweep there would refuse at the /2 gate once per
+        # run and bill the fleet for invokes that fold nothing.
+        from zagg.column import leaf_column_plan
+        from zagg.config import SWEEP_FAMILIES, SWEEP_STAGES, get_sweep_mode
+        from zagg.grids import from_config
+        from zagg.sweep_overview import build_pyramid_block
+
+        for knob, spec, mode in (
+            ({}, "zagg-pyramid/1", SWEEP_FAMILIES),
+            ({"chunk_inner": 8}, "zagg-pyramid/2", SWEEP_STAGES),
+        ):
+            cfg = self._cfg(store_layout="hive")
+            cfg.output["grid"] = {**cfg.output["grid"], **knob}
+            grid = from_config(cfg)
+            block = build_pyramid_block(cfg, grid.parent_order, chunk_order=grid.chunk_order)
+            assert block["spec"] == spec
+            assert (leaf_column_plan(cfg, grid) is not None) == (mode == SWEEP_STAGES)
+            assert get_sweep_mode(cfg, grid) == mode
+
+    def test_without_a_grid_the_ladder_cannot_be_confirmed(self):
+        # `get_sweep` and any caller holding no grid must not chain: the
+        # answer is the families pass, never a guess at the declaration.
         from zagg.config import SWEEP_FAMILIES, get_sweep_mode
 
-        assert get_sweep_mode(self._cfg(store_layout="hive", pyramid=False)) == SWEEP_FAMILIES
+        cfg, _grid = self._ladder()
+        assert get_sweep_mode(cfg) == SWEEP_FAMILIES
+
+    def test_a_pyramid_less_hive_store_defaults_to_families(self):
+        # `output.pyramid: false` declares the overview family OFF.
+        from zagg.config import SWEEP_FAMILIES, get_sweep_mode
+        from zagg.grids import from_config
+
+        cfg = self._cfg(store_layout="hive", pyramid=False)
+        assert get_sweep_mode(cfg, from_config(cfg)) == SWEEP_FAMILIES
 
     def test_a_one_grammar_schedule_defaults_to_families(self):
-        # An explicit orders/spacing schedule stays on the /1 grammar
-        # (`build_pyramid_block`), which the staged sweep refuses at its gate.
+        # An explicit orders/spacing schedule stays on the /1 grammar, which
+        # the staged sweep refuses at its gate.
         from zagg.config import SWEEP_FAMILIES, get_sweep_mode
+        from zagg.grids import from_config
 
         for knob in ({"orders": [4, 2]}, {"spacing": 2}):
-            assert get_sweep_mode(self._cfg(store_layout="hive", pyramid=knob)) == SWEEP_FAMILIES
+            cfg = self._cfg(store_layout="hive", pyramid=knob)
+            assert get_sweep_mode(cfg, from_config(cfg)) == SWEEP_FAMILIES
 
     def test_flat_defaults_to_none(self):
         from zagg.config import SWEEP_NONE, get_sweep_mode
@@ -1170,12 +1212,13 @@ class TestSweepMode:
     def test_explicit_spellings(self, raw, mode):
         # `true` keeps meaning the families pass ALONE: it is the spelling
         # existing configs carry, and promoting it to the ladder would change
-        # what they do without anyone writing it down.
+        # what they do without anyone writing it down. An explicit spelling
+        # needs no grid — only the DEFAULT consults the declaration.
         from zagg.config import get_sweep_mode, validate_config
 
-        cfg = self._cfg(store_layout="hive", sweep=raw)
+        cfg, grid = self._ladder(sweep=raw)
         validate_config(cfg)
-        assert get_sweep_mode(cfg) == mode
+        assert get_sweep_mode(cfg) == get_sweep_mode(cfg, grid) == mode
 
     def test_none_spelled_in_words_is_legal_on_a_flat_store(self):
         # "none" is a truthy string: the hive-only check must read the
@@ -1196,9 +1239,11 @@ class TestSweepMode:
         from pathlib import Path
 
         from zagg.config import SWEEP_STAGES, get_sweep_mode, load_config
+        from zagg.grids import from_config
 
         path = Path(__file__).resolve().parents[1] / "tools/configs/atl03_windowed_measure.yaml"
-        assert get_sweep_mode(load_config(str(path))) == SWEEP_STAGES
+        cfg = load_config(str(path))
+        assert get_sweep_mode(cfg, from_config(cfg)) == SWEEP_STAGES
 
 
 class TestSweepHook:

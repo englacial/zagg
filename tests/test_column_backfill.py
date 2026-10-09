@@ -1368,7 +1368,7 @@ class TestUpgradeEndToEnd:
         """The EXISTING CLI staged sweep — `python -m zagg.sweep <root> --stages`."""
         from zagg.sweep import main
 
-        assert main([str(root), "--stages"]) == 0
+        assert main([str(root), "--stages", "--scope", "all"]) == 0
 
     @pytest.mark.parametrize("kitchen_sink", [False, True])
     def test_upgraded_store_matches_the_pyramid_on_twin(self, tmp_path, monkeypatch, kitchen_sink):

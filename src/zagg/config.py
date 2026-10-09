@@ -3434,7 +3434,30 @@ SWEEP_STAGES = "stages"
 SWEEP_MODES = (SWEEP_NONE, SWEEP_FAMILIES, SWEEP_STAGES)
 
 
-def get_sweep_mode(config: PipelineConfig) -> str:
+def _declares_ladder(config: PipelineConfig, grid) -> bool:
+    """Whether this config declares a ``/2`` ladder a staged sweep can walk.
+
+    :func:`zagg.column.leaf_column_plan`'s gate verbatim — the one that
+    "mirrors ``build_pyramid_block``'s manifest default EXACTLY" — so the
+    sweep default cannot claim a ladder the manifest does not declare. It
+    needs the GRID: the issue #384 default flip is ``/2`` only where the
+    grid's resolved chunk order is strictly interior, and a ``K == 1`` grid
+    (no ``chunk_inner``) stays ``/1`` with no column to gather. Without a
+    grid the ladder cannot be confirmed, so the answer is no and the default
+    stays on the families pass rather than chaining a pass that would refuse
+    at the ``/2`` gate once per run.
+    """
+    if grid is None:
+        return False
+    from zagg.column import leaf_column_plan
+
+    try:
+        return leaf_column_plan(config, grid) is not None
+    except ValueError:
+        return False  # a declaration the sweep would refuse walks no ladder either
+
+
+def get_sweep_mode(config: PipelineConfig, grid=None) -> str:
     """Which end-of-run sweep the tail chains: one of :data:`SWEEP_MODES`.
 
     THE resolver for ``output.sweep`` (issue #620 section 2, espg's ruling
@@ -3446,8 +3469,9 @@ def get_sweep_mode(config: PipelineConfig) -> str:
     =========================  =========================================
     ``output.sweep``           mode
     =========================  =========================================
-    absent / null, hive        ``"stages"`` when the config declares a
-                               ladder, else ``"families"``
+    absent / null, hive        ``"stages"`` when ``grid`` is given and the
+                               config declares a ``/2`` ladder, else
+                               ``"families"``
     absent / null, non-hive    ``"none"``
     ``true`` / ``"families"``  ``"families"`` — the pass alone, no ladder
     ``false`` / ``"none"``     ``"none"``
@@ -3467,23 +3491,16 @@ def get_sweep_mode(config: PipelineConfig) -> str:
     ladder — it is the spelling existing configs already carry, and promoting
     it would change what they do without anyone writing it down.
 
-    "Declares a ladder" is the one predicate the default rests on:
-    :func:`get_pyramid` is not ``None`` (``output.pyramid: false`` declares
-    the overview family off) and the knob spells no ``/1`` ``orders``/
-    ``spacing`` schedule, which :func:`zagg.sweep_overview.build_pyramid_block`
-    keeps on the ``/1`` grammar the staged sweep refuses. A store with no
-    ladder therefore defaults to ``"families"`` instead of chaining a pass
-    that would decline at the ``/2`` gate once per run.
+    "Declares a ladder" is :func:`_declares_ladder` — the leaf column gate,
+    which needs the ``grid``. A caller that holds one (every chaining site
+    does) passes it; one that does not gets ``"families"``, never a chained
+    pass the ``/2`` gate would refuse.
     """
     raw = config.output.get("sweep")
     if raw is None:
         if get_store_layout(config) != "hive":
             return SWEEP_NONE
-        knob = get_pyramid(config)
-        declares_ladder = (
-            knob is not None and knob.get("orders") is None and knob.get("spacing") is None
-        )
-        return SWEEP_STAGES if declares_ladder else SWEEP_FAMILIES
+        return SWEEP_STAGES if _declares_ladder(config, grid) else SWEEP_FAMILIES
     if isinstance(raw, bool):
         return SWEEP_FAMILIES if raw else SWEEP_NONE
     return str(raw)
