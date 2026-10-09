@@ -1987,12 +1987,14 @@ class TestRunnerSeam:
         # The seam is reached only in the "stages" mode — resolved through
         # the ONE resolver the local dispatcher also reads (issue #620:
         # `get_sweep_mode`, default-on for a ladder-declaring hive store).
+        # The GRID is passed: the default claims a ladder only where the leaf
+        # column gate does, and that gate needs the grid's chunk order.
         import inspect
 
         from zagg import runner
 
         src = inspect.getsource(runner._run_lambda)
-        assert "get_sweep_mode(config) == SWEEP_STAGES" in src
+        assert "get_sweep_mode(config, grid) == SWEEP_STAGES" in src
         assert "_invoke_lambda_stage_sweep(" in src
 
 
