@@ -178,6 +178,15 @@ class FamiliesRider:
         #: Every shard any bound pass handed this invoke, across the
         #: ``partitions=`` loop — what the accumulator's ``visited`` names.
         self.visited: set = set()
+        #: The ``(node, dispatch, child_order)`` spans already folded. The
+        #: rollup fold is idempotent, so a repeat would write nothing — but
+        #: the §10 accumulation is ADDITIVE (``MocFamily._accumulate_temporal``
+        #: appends one entry per leaf read), so a node folded twice publishes
+        #: doubled counts. ``run_stage_sweep(partitions=N)`` does exactly
+        #: that: it narrows ``scope`` per partition and ``scope_admits``
+        #: resolves containment in BOTH directions, so a coarse dispatch node
+        #: is admitted by every partition beneath it (review finding).
+        self.folded: set = set()
 
     def bind(self, store, manifest: dict, by_shard: dict) -> None:
         """Adopt one pass's store handle, manifest and work set.
@@ -206,9 +215,13 @@ class FamiliesRider:
         """
         if self.store is None:
             raise ValueError("the families rider was never bound to a pass (FamiliesRider.bind)")
+        span = (node, int(dispatch), int(child_order))
+        if span in self.folded:
+            return  # see ``folded``: a repeat would double the §10 counts
         work = {d: w for d, w in self.by_shard.items() if d.startswith(node)}
         if not work:
             return
+        self.folded.add(span)
         for fam in self.families:
             try:
                 fold_span(
