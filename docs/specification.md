@@ -1875,6 +1875,16 @@ stated here:
   `pyramid.overview.all_time`). The fleet dispatcher fires the close units
   from it, not from its run config: `pyramid` is not a frozen manifest key,
   so the two can disagree, and the store is the source of truth.
+- A stage record's **`families`**
+  ([issue #610](https://github.com/englacial/zagg/issues/610)) is present
+  when the rollup families rode the same walk as the ladder (§4.7's first
+  paragraph: they add no byte layouts). It carries each family's per-pass
+  counts and, for `moc`, the §10 accumulator block the run's finisher
+  composes the root §10.2/§10.3 section and its §10.5 sibling from — the
+  same block a families-pass partition record carries, in the same currency.
+  Still telemetry: the objects it composes are normative, this record is not,
+  and the finisher reads which families rode off these records rather than
+  off its own invoke.
 
 ### 4.8 The sweep-admission lease (`zagg-sweep-lease/1`)
 
