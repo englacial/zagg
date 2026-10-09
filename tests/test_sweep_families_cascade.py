@@ -911,6 +911,51 @@ class TestMixedRecordSet:
 
 
 # ---------------------------------------------------------------------------
+# Review fold: a duplicate stage record must not double the §10 counts.
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicateRecords:
+    def test_the_same_record_twice_publishes_the_same_bytes(self, tmp_path, caplog):
+        """A re-drive under one run id leaves the dead attempt's records readable.
+
+        ``read_stage_records`` filters on ``run_id``, which still matches, and
+        the fleet only snapshots the stale records so the barriers ignore
+        them. The §10 fold extends per shard, so the duplicate used to double
+        ``.temporal.counts.obs_total`` with every reported number unchanged
+        (review finding).
+        """
+        from zagg.hive import read_manifest
+        from zagg.sweep_families import finish_families
+        from zagg.sweep_stages import sweep_stage_pass
+
+        one_root, twice_root, leaves = _temporal_pair(tmp_path)
+        manifest = read_manifest(one_root)
+        by_shard = _by_shard_of(leaves)
+        rider = rider_for(None)
+        sweep_stage_pass(one_root, manifest, by_shard, run_id="D", tuple_width=3, families=rider)
+        record = {"families": rider.summary()}
+        # The twin gets the identical fold, so only the record set differs.
+        sweep_stage_pass(
+            twice_root, manifest, by_shard, run_id="D", tuple_width=3, families=rider_for(None)
+        )
+        one = finish_families(one_root, manifest, by_shard, records=[record])
+        with caplog.at_level("WARNING"):
+            twice = finish_families(
+                twice_root, manifest, by_shard, records=[record, json.loads(json.dumps(record))]
+            )
+        # The reported numbers always agreed; the BYTES are what moved, so
+        # they are asserted first.
+        for name in ("coverage.moc", "coverage.toc"):
+            assert _stable_root(twice_root, name) == _stable_root(one_root, name)
+        assert twice["families"]["moc"]["temporal_shards"] == TEMPORAL_LEAVES
+        # ...and the collision is reported rather than absorbed in silence.
+        assert "duplicate_shards" not in one["families"]["moc"]
+        assert twice["families"]["moc"]["duplicate_shards"] == TEMPORAL_LEAVES
+        assert "claimed by more than one" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Review fold: the store can contradict the caller's all_time mid-run.
 # ---------------------------------------------------------------------------
 

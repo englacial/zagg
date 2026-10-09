@@ -414,14 +414,52 @@ def finish_families(
                 # malformed record has to degrade like a lost one (the shape
                 # :func:`zagg.sweep._load_finisher` wraps for the same reason).
                 blocks = accumulator_blocks(records, fam.name)
+                taken: set = set()
+                kept: list = []
+                repeats = 0
                 for b in blocks:
+                    if not isinstance(b, dict):
+                        kept.append(b)  # rode the family, carries nothing: loud
+                        continue
                     # ``told_visited`` keys on the KEY, not on the block: a
                     # worker predating it says nothing about what it walked,
                     # and silence is not a claim of full coverage.
-                    if isinstance(b, dict) and "visited" in b:
+                    if "visited" in b:
                         visited.update(b["visited"] or ())
                         told_visited = True
-                fam.load_accumulators(blocks)
+                    shards = b.get("shards")
+                    if not isinstance(shards, dict):
+                        kept.append(b)  # malformed: ``load_accumulators`` refuses it
+                        continue
+                    # A shard's share is taken ONCE. The §10 fold is additive
+                    # per shard (``load_accumulators`` EXTENDS the shard's
+                    # parts), so feeding one twice doubles its published
+                    # observation counts while every number this finisher
+                    # reports stays put — silently wrong temporal coverage,
+                    # the defect class issue #610 was filed about. It is
+                    # reachable without a new API: a run re-driven under the
+                    # same id at a different batch numbering leaves the dead
+                    # attempt's records in place (``read_stage_records``' own
+                    # docstring), and the fleet only SNAPSHOTS them so the
+                    # barriers ignore them — it never removes them, and the
+                    # ``run_id`` filter still matches. The drop keys on the
+                    # SHARD rather than on the block's ``visited`` claim, so a
+                    # re-split whose records only PARTLY overlap still
+                    # contributes the shards it alone read (review finding).
+                    if again := taken & set(shards):
+                        repeats += len(again)
+                        b = {**b, "shards": {k: v for k, v in shards.items() if k not in taken}}
+                    taken |= set(shards)
+                    kept.append(b)
+                if repeats:
+                    logger.warning(
+                        f"stage sweep[{fam.name}]: {repeats} shard(s) are claimed by more than "
+                        "one of the run's stage records — a re-drive under this run id leaves "
+                        "the dead attempt's records in place; each share is folded ONCE, so "
+                        "the §10 counts are this run's (issue #610 phase 4)"
+                    )
+                    block["duplicate_shards"] = repeats
+                fam.load_accumulators(kept)
             except Exception as e:
                 logger.warning(
                     f"stage sweep[{fam.name}]: the run's stage records carry no usable "
