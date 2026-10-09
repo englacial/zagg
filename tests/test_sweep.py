@@ -1113,6 +1113,94 @@ class TestSweepConfig:
             validate_config(self._cfg(store_layout="hive", sweep="yes"))
 
 
+class TestSweepMode:
+    """``get_sweep_mode`` (issue #620 section 2): the ladder is the append's.
+
+    The ONE resolver every chaining site reads. The default flipped to
+    ``"stages"`` for a hive store that declares a ladder; the pre-#620
+    behaviour is now spelled, not implied.
+    """
+
+    def _cfg(self, **output):
+        from zagg.config import default_config
+
+        cfg = default_config("atl06")
+        cfg.output.update(output)
+        return cfg
+
+    def test_hive_with_a_ladder_defaults_to_stages(self):
+        from zagg.config import SWEEP_STAGES, get_sweep, get_sweep_mode, validate_config
+
+        cfg = self._cfg(store_layout="hive")
+        validate_config(cfg)
+        assert get_sweep_mode(cfg) == SWEEP_STAGES
+        assert get_sweep(cfg) is True  # the families pass runs under every mode but none
+
+    def test_a_pyramid_less_hive_store_defaults_to_families(self):
+        # `output.pyramid: false` declares the overview family OFF, so there
+        # is no ladder to chain and the default must not try once per run.
+        from zagg.config import SWEEP_FAMILIES, get_sweep_mode
+
+        assert get_sweep_mode(self._cfg(store_layout="hive", pyramid=False)) == SWEEP_FAMILIES
+
+    def test_a_one_grammar_schedule_defaults_to_families(self):
+        # An explicit orders/spacing schedule stays on the /1 grammar
+        # (`build_pyramid_block`), which the staged sweep refuses at its gate.
+        from zagg.config import SWEEP_FAMILIES, get_sweep_mode
+
+        for knob in ({"orders": [4, 2]}, {"spacing": 2}):
+            assert get_sweep_mode(self._cfg(store_layout="hive", pyramid=knob)) == SWEEP_FAMILIES
+
+    def test_flat_defaults_to_none(self):
+        from zagg.config import SWEEP_NONE, get_sweep_mode
+
+        cfg = self._cfg(store_layout="flat", coverage_moc=False)
+        assert get_sweep_mode(cfg) == SWEEP_NONE
+
+    @pytest.mark.parametrize(
+        "raw,mode",
+        [
+            (True, "families"),
+            ("families", "families"),
+            (False, "none"),
+            ("none", "none"),
+            ("stages", "stages"),
+        ],
+    )
+    def test_explicit_spellings(self, raw, mode):
+        # `true` keeps meaning the families pass ALONE: it is the spelling
+        # existing configs carry, and promoting it to the ladder would change
+        # what they do without anyone writing it down.
+        from zagg.config import get_sweep_mode, validate_config
+
+        cfg = self._cfg(store_layout="hive", sweep=raw)
+        validate_config(cfg)
+        assert get_sweep_mode(cfg) == mode
+
+    def test_none_spelled_in_words_is_legal_on_a_flat_store(self):
+        # "none" is a truthy string: the hive-only check must read the
+        # resolved mode, not the raw key's truthiness.
+        from zagg.config import validate_config
+
+        validate_config(self._cfg(store_layout="flat", coverage_moc=False, sweep="none"))
+
+    def test_an_unknown_mode_word_is_refused_by_name(self):
+        from zagg.config import validate_config
+
+        with pytest.raises(ValueError, match="'none', 'families', 'stages'"):
+            validate_config(self._cfg(store_layout="hive", sweep="ladder"))
+
+    def test_the_packaged_windowed_measure_config_resolves_to_stages(self):
+        # Issue #610 phase 5: the measurement config carries the ladder, so
+        # a run tag snapshots the ladder and not leaves alone.
+        from pathlib import Path
+
+        from zagg.config import SWEEP_STAGES, get_sweep_mode, load_config
+
+        path = Path(__file__).resolve().parents[1] / "tools/configs/atl03_windowed_measure.yaml"
+        assert get_sweep_mode(load_config(str(path))) == SWEEP_STAGES
+
+
 class TestSweepHook:
     def test_sweep_after_run_is_fail_open(self, monkeypatch, caplog):
         from zagg import sweep as sm

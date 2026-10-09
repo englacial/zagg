@@ -34,6 +34,7 @@ from zagg.concurrency import (
     raise_for_fd_exhaustion,
 )
 from zagg.config import (
+    SWEEP_STAGES,
     PipelineConfig,
     get_child_order,
     get_consolidate_metadata,
@@ -49,6 +50,7 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_sweep,
+    get_sweep_mode,
     get_touch_policy,
     get_windowing,
     get_windowing_unit,
@@ -3628,14 +3630,16 @@ def _run_local(
         leaves = leaves_from_stats_records([m.get("stats") for m in report.results])
         if leaves:
             sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
-        # Post-fleet staged chaining (issue #384) — OPT-IN via
-        # `output.sweep: "stages"` (the recorded lean for open question
-        # (c); flipping it to the default is espg's call). Runs AFTER the
-        # families sweep, auto-scoped to this run's footprint; fail-open.
-        # Touched current units ride as dirt-only (issue #580): their nodes
-        # re-gather the rewritten ref sidecars, nothing is re-folded.
+        # Post-fleet staged chaining (issue #384), the DEFAULT for a hive
+        # store that declares a ladder since issue #620 ("the sweep belongs
+        # to the append"); `output.sweep: true`/`"families"` keeps the pass
+        # alone. Runs AFTER the families sweep, auto-scoped to this run's
+        # footprint — the scoping that makes it an append's cost and not the
+        # store's; fail-open. Touched current units ride as dirt-only (issue
+        # #580): their nodes re-gather the rewritten ref sidecars, nothing is
+        # re-folded.
         dirt_only = dirt_only_leaves(report.results)
-        if (leaves or dirt_only) and config.output.get("sweep") == "stages":
+        if (leaves or dirt_only) and get_sweep_mode(config) == SWEEP_STAGES:
             from zagg.sweep_stages import stage_sweep_after_run
 
             stage_sweep_after_run(
@@ -4574,9 +4578,10 @@ def _run_lambda(
                         store_kwargs=_output_store_kwargs(output_creds_event, region),
                         run_id=run_id,
                     )
-                # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
-                # `output.sweep: "stages"`, the same knob the local dispatcher
-                # reads. Like the families leg this one blocks: the staged
+                # Post-fleet STAGED chaining (issues #384/#519) — the
+                # DEFAULT for a ladder-declaring hive store since issue #620,
+                # resolved from the same knob the local dispatcher reads
+                # (`zagg.config.get_sweep_mode`). Like the families leg this one blocks: the staged
                 # sweep is a fan-out with a soft barrier between tuples, so
                 # the ordering has to be driven
                 # from somewhere and the dispatcher is the only place that can
@@ -4587,7 +4592,7 @@ def _run_lambda(
                 # current units ride as dirt-only (issue #580), as on
                 # _run_local: their nodes re-gather refs, nothing is re-folded.
                 dirt_only = dirt_only_leaves(bodies)
-                if (leaves or dirt_only) and config.output.get("sweep") == "stages":
+                if (leaves or dirt_only) and get_sweep_mode(config) == SWEEP_STAGES:
                     stage_chained = True
                     staged = _invoke_lambda_stage_sweep(
                         state["lambda_client"],

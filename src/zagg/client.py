@@ -62,6 +62,7 @@ from dataclasses import asdict
 from typing import Any, Iterator
 
 from zagg.config import (
+    SWEEP_STAGES,
     PipelineConfig,
     get_child_order,
     get_consolidate_metadata,
@@ -78,6 +79,7 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_sweep,
+    get_sweep_mode,
     get_touch_policy,
     get_windowing,
     load_config,
@@ -1361,7 +1363,7 @@ class Run:
         # only on the explicit no-work branch below.
         sweeps = layout == "hive" and get_sweep(self.config)
         stage_chained = (
-            sweeps and self.config.output.get("sweep") == "stages" and not self._attached
+            sweeps and get_sweep_mode(self.config) == SWEEP_STAGES and not self._attached
         )
         if sweeps:
             try:
@@ -1471,7 +1473,7 @@ class Run:
                 return
             if (
                 get_icechunk_options(self.config)["commit"] != "leaf"
-                or self.config.output.get("sweep") == "stages"
+                or get_sweep_mode(self.config) == SWEEP_STAGES
             ):
                 handle.icechunk_finalize = {
                     "skipped": 'attached sweep: "stages" run; its dispatcher finalizes '

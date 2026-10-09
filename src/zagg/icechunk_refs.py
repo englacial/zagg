@@ -227,7 +227,9 @@ def ladder_walks(config, grid) -> bool:
     the ``client`` facade alike, issue #588); one that does not would pin
     ``commit: "leaf"`` in the config it ships instead.
     """
-    if config.output.get("sweep") != "stages":
+    from zagg.config import SWEEP_STAGES, get_sweep_mode
+
+    if get_sweep_mode(config) != SWEEP_STAGES:
         return False
     from zagg.column import leaf_column_plan
 

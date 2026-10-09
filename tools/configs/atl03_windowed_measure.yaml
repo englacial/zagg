@@ -265,7 +265,10 @@ output:
     epoch: "2018-01-01T00:00:00"
     scale: gps
     units: seconds
-  sweep: stages                  # the staged sweep: per-window columns + overviews, the ladder
+  sweep: stages                  # the staged sweep: per-window columns + overviews, the ladder.
+                                 # Spelled out, though it is also what this config resolves to
+                                 # by default since issue #620 (hive + a declared ladder); the
+                                 # opt-outs are `true`/`families` (pass only) and `false`/`none`
   pyramid:
     overviews: 13                # the live v3 store's dense ladder, declared at init
     all_time: true               # the all-time overview pyramid: one close unit per node,

@@ -1982,14 +1982,15 @@ class TestRunnerSeam:
         assert "staged sweep dispatch failed" in caplog.text
 
     def test_the_tail_gate_is_the_stages_knob(self):
-        # The seam is reached only under `output.sweep: "stages"` — the same
-        # opt-in the local dispatcher reads (issue #384's recorded lean).
+        # The seam is reached only in the "stages" mode — resolved through
+        # the ONE resolver the local dispatcher also reads (issue #620:
+        # `get_sweep_mode`, default-on for a ladder-declaring hive store).
         import inspect
 
         from zagg import runner
 
         src = inspect.getsource(runner._run_lambda)
-        assert 'config.output.get("sweep") == "stages"' in src
+        assert "get_sweep_mode(config) == SWEEP_STAGES" in src
         assert "_invoke_lambda_stage_sweep(" in src
 
 
