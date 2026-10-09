@@ -790,6 +790,40 @@ fleet dispatcher reads it back from the first window unit's stage record
 config omits or contradicts `all_time` still closes exactly the nodes the
 CLI would.
 
+**The rollup families ride the same walk** ([issue
+#610](https://github.com/englacial/zagg/issues/610) phase 4). The
+`stats` / `moc` / `submap` rollups and the §10 per-shard TOC contribution
+are the *same* bottom-up walk the ladder does — a `(node, window)` unit
+already reads the leaves under its node — so they no longer need a fan-out
+of their own. Named with `--families` on `--stages` (or `families=` on
+`run_stage_sweep` / `run_stage_sweep_fleet`), they fold in each dispatch
+node's **close**, over that tuple's own span: the finest tuple's span starts
+at the leaves (the stats sidecar, the D4 stamp, the leaf sub-map, the §10
+`temporal.toc` record — all through the invoke's one store handle), and
+every coarser tuple's starts from the rollups the tuple below it wrote. The
+span decomposition is exact, so the rollups are byte-identical to a
+whole-tree `python -m zagg.sweep` pass at any `tuple_width`. The close is
+where they ride because a rollup object merges **every window** of its node
+(its `windows` key): the node's window units run concurrently and would
+read-modify-write one object. A windowed store that declares no all-time
+fold therefore has nowhere to put them. The fleet dispatcher's `all_time` is
+only the caller's first guess, so it *warns* up front and reports the outcome
+(`families_unswept`) from the store's own answer, read back off the first
+landed window record — which settles both drift directions rather than
+refusing a store that does declare the fold.
+The run's finisher then composes the families' store-root singletons once —
+the §10 temporal section inside `coverage.moc` and its `coverage.toc`
+sibling — from the base-node rollups (≤ 1 GET per base cell) plus the
+accumulator blocks the stage records carry, reading **no leaf**. Where the
+`moc` family rode *and* found base-node rollups to compose from, its own
+finish owns the root `coverage.moc` refresh and the finisher's step 1 stands
+down (`root_moc_from: "families"`); otherwise step 1 runs from the work set
+as it always has, because only that family writes the object. Which families rode is
+taken from the *records*, like `closes`, never from the finisher's event. On
+the 64-leaf local fixture the reads are the same 192 leaf reads either way:
+192 in the one families invoke before, ≤ 12 per close unit across 16 units
+after, and two fewer end-of-run invokes.
+
 **Memory.** A stage worker folds a level **one block of output cells at a
 time** — read the child members covering the block, fold, write, drop — and
 never holds a level whole (`zagg.sweep_fold`). A block is `4^5` cells; a

@@ -605,6 +605,7 @@ def run_stage_sweep_fleet(
     windowed: bool = False,
     all_time: bool = False,
     pipeline_run_id: str | None = None,
+    families=(),
 ) -> dict:
     """One staged sweep run over the fleet: tuples, barriers, finisher last.
 
@@ -748,6 +749,22 @@ def run_stage_sweep_fleet(
     completes. It rides every stage event and the finisher's, and the
     workers record it beside the sweep's own ``run_id``.
 
+    ``families`` (issue #610 phase 4) is which rollup families ride this
+    run's units — ``()``, the default, is the ladder alone, as it has always
+    been. Riding them is what makes the end-of-run ONE fan-out instead of
+    two: the ``stats``/``moc``/``submap`` rollups fold in each dispatch
+    node's close and the §10 root section composes in this run's finisher,
+    so no separate families fan-out is fired. It rides only the invokes that
+    CLOSE a node — the unwindowed whole-node invoke and, on a windowed
+    store, the close invoke — because a rollup object merges every window of
+    its node; the finisher needs no key for it, since it takes which
+    families rode from the records. A windowed store that declares no
+    all-time fold has no close invoke and folds no rollup; since ``all_time``
+    here is only the caller's first guess, that is WARNED and reported
+    (``families_unswept``) rather than refused, and the store's own answer —
+    read back off the first landed window record, below — settles it in
+    either drift direction.
+
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
     store root, worker-written); it is read back here when it lands.
@@ -758,6 +775,7 @@ def run_stage_sweep_fleet(
     from zagg.client_transport import run_status_prefix
     from zagg.hive import _utcnow
     from zagg.sweep import _normalize_leaves
+    from zagg.sweep_families import normalize_families
     from zagg.sweep_partition import sized_stage_tuples
     from zagg.sweep_stage import DEFAULT_TUPLE_WIDTH, stage_tuples
     from zagg.sweep_stages import FINISHER_RECORD_NAME, normalize_scope, stage_record_name
@@ -787,6 +805,27 @@ def run_stage_sweep_fleet(
         or 0
     )
     shard_order = int(shard_order)
+    # The families that ride this run's closes (issue #610 phase 4), refused
+    # by name here — before anything fires — so a misspelled family is not a
+    # fan-out that quietly folds no rollup.
+    family_names = normalize_families(families)
+    # Reported, not refused. This reads the CALLER's ``all_time``, which is
+    # only the first guess (see the docstring): a store that DOES declare the
+    # fold would fire its close invokes and fold the families fine, so
+    # refusing here refused a run that works. The outcome therefore starts
+    # pessimistic on the summary and the store's own answer — the per-tuple
+    # ``told`` check below, where the store has actually spoken — settles it
+    # in both drift directions (review finding).
+    families_closeless = bool(family_names and windowed and not all_time)
+    if families_closeless:
+        logger.warning(
+            f"stage fleet: families {list(family_names)} were asked to ride a windowed store "
+            "whose config declares no all-time fold: the rollups fold in a node's CLOSE (one "
+            "object per node, every window), and such a store fires no close invoke — unless "
+            "the store itself declares pyramid.overview.all_time, their rollups are NOT folded "
+            "by this run (reported as families_unswept); sweep them with their own pass, or "
+            "declare the fold (issue #610)"
+        )
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
     # — filters identically here. `stage_sweep_after_run`, the local chaining
@@ -815,6 +854,18 @@ def run_stage_sweep_fleet(
         "max_nodes_per_invoke": max_nodes_per_invoke,
         "windowed": bool(windowed),
         "all_time": bool(all_time),
+        # The rollup families riding this run's closes (issue #610 phase 4) —
+        # empty when the ladder sweeps alone and the families keep their own
+        # fan-out — and whether the store withdrew the close they ride, which
+        # leaves them unswept. Both always present, like ``skipped`` and
+        # ``short_orders``: a caller reading the summary should not have to
+        # know which branch produced it.
+        "families": list(family_names),
+        # Pessimistic until the store says otherwise: a windowed run whose
+        # config declares no close fires none, and no landed record ever
+        # arrives to correct the guess, so False here would be a silent claim
+        # that the rollups were folded (review finding).
+        "families_unswept": families_closeless,
         "scope": None if scope is None else [str(int(w)) for w in scope],
         # Whether the per-tuple node sets were computed from the store's own
         # coverage (issue #547) or from the work set alone. The words
@@ -1046,8 +1097,12 @@ def run_stage_sweep_fleet(
         if lease_ttl_s is not None:
             block["lease_ttl_s"] = int(lease_ttl_s)
         fired: dict = {}
+        # The families ride the invokes that CLOSE a node, and only those: a
+        # rollup object merges every window of its node, so the node's one
+        # writer owns it (issue #610 phase 4).
+        closing_block = {**block, **({"families": list(family_names)} if family_names else {})}
         if not windowed:
-            fired.update(_fan_out(nodes, by_shard, block, dispatch, 0, dirt=True))
+            fired.update(_fan_out(nodes, by_shard, closing_block, dispatch, 0, dirt=True))
         else:
             # One fan-out per window: an event carries the leaf refs of its
             # own window alone, 1/N of the node's slice.
@@ -1089,6 +1144,23 @@ def run_stage_sweep_fleet(
                         f"stage fleet: the store {'declares' if told else 'does not declare'} "
                         f"the all-time fold, unlike the caller's config — following the store"
                     )
+                if family_names:
+                    # The STORE has now spoken, so this — not the caller's
+                    # config — is what the run reports. Both directions: a
+                    # store that declares the fold clears a pessimistic guess
+                    # (its close invokes fire from the recomputed units just
+                    # below), and one that withdraws it sets the flag (review
+                    # findings).
+                    summary["families_unswept"] = not told
+                if family_names and not told:
+                    # Loud rather than silent — the artifacts are regenerable,
+                    # so the run goes on and a families pass heals them.
+                    logger.warning(
+                        f"stage fleet: run {run_id} asked families {list(family_names)} to ride "
+                        "a store that does not declare the all-time fold, so no close invoke "
+                        "carries them — their rollups are NOT folded by this run; sweep them "
+                        "with 'python -m zagg.sweep <store>' (issue #610)"
+                    )
                 declared["closes"], declared["from"] = told, "store"
                 units = stage_units(by_shard, dispatch, all_time=told, **unit_args)
                 close_nodes = [unit["node"] for unit in units if unit["close"]]
@@ -1104,7 +1176,7 @@ def run_stage_sweep_fleet(
             closed = _fan_out(
                 close_nodes,
                 by_shard,
-                {**block, "unit": UNIT_CLOSE},
+                {**closing_block, "unit": UNIT_CLOSE},
                 dispatch,
                 len(fired),
                 dirt=True,

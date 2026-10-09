@@ -224,6 +224,17 @@ end of run, like coverage mode; also invocable ad hoc):
                                   #   from this run; the orders that landed are
                                   #   recorded as usual. Absent -> nothing is
                                   #   withheld, as before
+          "families": [str],      # optional, role="stage" (issue #610 phase
+                                  #   4): the rollup families riding this
+                                  #   invoke's nodes
+                                  #   (zagg.sweep_families.CASCADE_FAMILIES).
+                                  #   Sent only on the invokes that CLOSE a
+                                  #   node -- a rollup object merges every
+                                  #   window of its node, so the node's one
+                                  #   writer owns it. The finisher takes which
+                                  #   families rode from the RECORDS, never
+                                  #   from its own event. Absent -> the ladder
+                                  #   alone, as before
         }
         All store writes stay worker-side (D8). The work set rides in the
         SAME "leaves"/"discover" keys the families arm uses -- a stage invoke
@@ -1578,6 +1589,13 @@ def _handle_stage_sweep(
                 unit=block.get("unit"),
                 window=block.get("window"),
                 pipeline_run_id=block.get("pipeline_run_id"),
+                # Which rollup families ride this invoke's nodes (issue #610
+                # phase 4). The dispatcher sends it only on the invokes that
+                # close a node, since a rollup object merges every window of
+                # its node; absent — an older dispatcher, or the families
+                # still on their own fan-out — the invoke folds the ladder
+                # alone, exactly as before.
+                families=block.get("families") or (),
             )
         else:
             raise ValueError(f"unknown stage role {role!r} (expected 'stage' or 'finisher')")

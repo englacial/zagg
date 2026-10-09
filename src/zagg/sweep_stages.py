@@ -140,6 +140,7 @@ def sweep_stage_pass(
     dirt_only: dict | None = None,
     only_unit: str | None = None,
     only_window: str | None = None,
+    families=None,
 ) -> dict:
     """One staged pass over the dirty set: every tuple, finest first.
 
@@ -176,11 +177,20 @@ def sweep_stage_pass(
     ``"window"`` (with ``only_window`` naming the window) or ``"close"`` —
     which is what a fleet stage invoke runs, so the fleet differs from this
     driver in concurrency alone.
+
+    ``families`` (issue #610 phase 4) is the invoke's
+    :class:`zagg.sweep_families.FamiliesRider`, or ``None`` for a ladder-only
+    pass. Bound here to this pass's store handle and work set, it folds the
+    ``stats``/``moc``/``submap`` rollups and the §10 TOC contribution over
+    each dispatch node's own tuple span, in the node's close — so the
+    families need no fan-out of their own. Accumulated across the passes a
+    driver runs, the way ``level_actuals`` is, and reported as
+    ``summary["families"]``.
     """
     from zagg.hive import _utcnow
     from zagg.store import open_object_store
     from zagg.sweep_overview import _candidate_decimals
-    from zagg.sweep_units import UNIT_KINDS, run_tuple
+    from zagg.sweep_units import UNIT_KINDS, manifest_closes, run_tuple
 
     if only_unit is not None and only_unit not in UNIT_KINDS:
         raise ValueError(f"unknown stage unit {only_unit!r} (expected one of {UNIT_KINDS})")
@@ -264,10 +274,20 @@ def sweep_stage_pass(
             f"stage unit {only_unit!r} was named against an unwindowed store — its nodes "
             "have one unit each, which closes inline; send the node without a unit"
         )
+    if families is not None:
+        families.bind(store, manifest, by_shard)
+        if windowed and not manifest_closes(manifest):
+            logger.warning(
+                "stage sweep: the families ride each node's CLOSE, which this windowed "
+                "store does not declare (pyramid.overview.all_time) — the in-process pass "
+                "still folds them per node, but a FLEET run fires no close invoke and "
+                "would leave the rollups unswept (issue #610 phase 4)"
+            )
     context = {
         "store": store,
         "store_root": store_root,
         "manifest": manifest,
+        "families": families,
         "levels": levels,
         "fields": fields,
         "scope": scope,
@@ -297,6 +317,8 @@ def sweep_stage_pass(
     summary["levels"] = {
         str(k): v for k, v in sorted(aggregate_actuals(level_actuals).items(), reverse=True)
     }
+    if families is not None:
+        summary["families"] = families.summary()
     return summary
 
 
@@ -316,6 +338,7 @@ def run_finisher(
     release=None,
     touch_policy: str = "auto",
     withhold_levels=(),
+    root_moc: bool = True,
 ) -> dict:
     """The designated finisher-worker (espg ruling): root singletons, once.
 
@@ -354,6 +377,19 @@ def run_finisher(
 
     Failures in steps 1-2 RAISE (the orchestrator records the incomplete
     finish and leaves the lease for recovery); steps 2b and 3 are fail-open.
+
+    ``root_moc=False`` (issue #610 phase 4) says ANOTHER producer in this same
+    finisher owns step 1 — the ``moc`` family's own
+    :meth:`zagg.sweep.MocFamily.finish`, run from
+    :func:`zagg.sweep_families.finish_families` just before this call, which
+    writes the same object from the base-node rollups plus the §10 temporal
+    section this run accumulated. Its word set is a superset of step 1's (the
+    rollups cover every shard the tree holds, not just this run's work set),
+    so re-doing step 1 afterwards would be a second PUT of a subset. Both
+    callers key it on that block's ``owns_root_moc`` and nothing else: a run
+    riding only ``stats``/``submap``, or one whose ``moc`` finish found no
+    base-node rollup to compose from, needs step 1 as much as a ladder-only
+    run does. ``out["root_moc_from"]`` names whichever wrote it.
     """
 
     from zagg.grids.morton import morton_word
@@ -377,9 +413,10 @@ def run_finisher(
         "touch_failures": 0,
         "lease_released": False,
         "actuals_withheld": sorted(withheld, reverse=True),
+        "root_moc_from": "work-set" if root_moc else "families",
     }
     shard_order = int(manifest["shard_order"])
-    if by_shard:
+    if by_shard and root_moc:
         envelope = build_root_coverage(
             [morton_word(d) for d in by_shard], shard_order, source="sweep"
         )
@@ -492,6 +529,7 @@ def run_stage_sweep(
     touch_policy: str = "auto",
     dirt_only=None,
     pipeline_run_id: str | None = None,
+    families=(),
 ) -> dict:
     """One admitted staged sweep, end to end: lease -> stages -> finisher.
 
@@ -533,12 +571,20 @@ def run_stage_sweep(
     completes — distinct from ``run_id``, the sweep's own — and is recorded
     under its own key, so the record vouches for that run by name rather than
     by time. A standalone pass that names none records ``null``: no run.
+
+    ``families`` (issue #610 phase 4) is which rollup families ride this
+    sweep — ``()``, the default, is the ladder alone, as it has always been;
+    ``None`` is :data:`zagg.sweep_families.CASCADE_FAMILIES`. Riding them
+    folds the ``stats``/``moc``/``submap`` rollups in each dispatch node's
+    close and composes the §10 root section in the finisher, so the families
+    need no fan-out of their own. Reported as ``summary["families"]``.
     """
     import uuid
     from datetime import datetime, timezone
 
     from zagg.hive import MANIFEST_NAME, _utcnow, read_manifest
     from zagg.sweep import _normalize_leaves, discover_leaves
+    from zagg.sweep_families import finish_families, rider_for
     from zagg.sweep_lease import (
         DEFAULT_TTL_S,
         acquire_lease,
@@ -548,6 +594,11 @@ def run_stage_sweep(
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
+    # Argv-only, BEFORE the lease: a misspelled family refuses by name, and a
+    # refusal below ``acquire_lease`` would leave the store admitted to a run
+    # that cannot start (review finding; the same discipline the partition
+    # width and the /2 gate already follow).
+    rider = rider_for(families)
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
@@ -624,6 +675,7 @@ def run_stage_sweep(
                 on_node=_maybe_beat,
                 level_actuals=level_actuals,
                 dirt_only=regather,
+                families=rider,
             )
             rows = part["stages"]
             if index is not None:
@@ -635,6 +687,16 @@ def run_stage_sweep(
         aggregated = aggregate_actuals(level_actuals)
         summary["levels"] = {str(k): v for k, v in sorted(aggregated.items(), reverse=True)}
         _maybe_beat()  # the finisher's RMW must not start on a stale beat
+        composed = (
+            None
+            if rider is None
+            else finish_families(
+                store_root, manifest, by_shard, rider=rider, store_kwargs=store_kwargs
+            )
+        )
+        if rider is not None:
+            summary["families"] = {**rider.summary(), "finish": composed}
+            _maybe_beat()  # ...nor on the beat the families compose spent
         summary["finisher"] = run_finisher(
             store_root,
             manifest,
@@ -644,6 +706,7 @@ def run_stage_sweep(
             store_kwargs=store_kwargs,
             release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
             touch_policy=touch_policy,
+            root_moc=not (composed or {}).get("owns_root_moc"),
         )
         summary["lease"]["released"] = bool(summary["finisher"].get("lease_released"))
     except BaseException as e:
@@ -914,6 +977,7 @@ def run_stage_worker(
     unit: str | None = None,
     window: str | None = None,
     pipeline_run_id: str | None = None,
+    families=(),
 ) -> dict:
     """One fleet stage worker: this invoke's dispatch nodes, one tuple.
 
@@ -982,6 +1046,7 @@ def run_stage_worker(
     """
     from zagg.hive import MANIFEST_NAME, _decimal_order, read_manifest
     from zagg.sweep import _normalize_leaves
+    from zagg.sweep_families import rider_for
     from zagg.sweep_lease import DEFAULT_TTL_S, acquire_lease, heartbeat_lease
     from zagg.sweep_units import check_unit, manifest_closes
 
@@ -995,6 +1060,7 @@ def run_stage_worker(
             "the manifest; refusing rather than folding invisibly"
         )
     check_unit(unit, window, f"run {run_id!r}, dispatch order {dispatch}, batch {batch}")
+    rider = rider_for(families)  # argv-only, before the lease (review finding)
     nodes = [str(n) for n in nodes]
     if not nodes:
         raise ValueError(
@@ -1048,6 +1114,7 @@ def run_stage_worker(
         dirt_only=regather,
         only_unit=unit,
         only_window=window,
+        families=rider,
     )
     rows = summary["stages"]
     if partition is not None:
@@ -1076,6 +1143,8 @@ def run_stage_worker(
     }
     if summary.get("root_moc_stale"):
         record["root_moc_stale"] = True
+    if "families" in summary:
+        record["families"] = summary["families"]
     record["record"] = _put_stage_record(
         records_from, stage_record_name(dispatch, batch), record, store_kwargs
     )
@@ -1132,6 +1201,16 @@ def run_stage_finisher(
     coverage, which is recorded and self-heals on the next run (#381 point
     (6)); only zero is indistinguishable from "nothing ran".
 
+    The FAMILIES' store-root singletons compose here too when the run's units
+    rode them (issue #610 phase 4): the §10 temporal section inside the root
+    ``coverage.moc`` and its ``coverage.toc`` sibling, built by
+    :func:`zagg.sweep_families.finish_families` from the accumulator blocks
+    the stage records carry plus the base-node rollups on the store — no leaf
+    is read. Which families rode is taken from the records, like ``closes``,
+    never from this invoke's event; the ``moc`` family's own finish then owns
+    the root ``coverage.moc`` refresh and step 1 below stands down
+    (``root_moc=False``).
+
     Admission is the ordinary per-store lease, acquired as this invoke's FIRST
     act — the finisher is the one invoke that touches the store-root
     singletons (the root ``coverage.moc`` and the manifest RMW), so it is the
@@ -1153,6 +1232,7 @@ def run_stage_finisher(
     """
     from zagg.hive import MANIFEST_NAME, read_manifest
     from zagg.sweep import _normalize_leaves
+    from zagg.sweep_families import finish_families
     from zagg.sweep_lease import DEFAULT_TTL_S, acquire_lease, release_lease
 
     t0 = time.perf_counter()
@@ -1226,6 +1306,15 @@ def run_stage_finisher(
             "their manifest actuals are left as they stood rather than stamped from "
             "this run; re-run the staged sweep to record them"
         )
+    # The families' store-root singletons, from the accumulator blocks the
+    # units left in their records — the families' half of this finisher's
+    # "root singletons, exactly once" (issue #610 phase 4). WHICH families
+    # rode comes from the records, never from this invoke's event.
+    composed = finish_families(
+        store_root, manifest, by_shard, records=records, store_kwargs=store_kwargs
+    )
+    if composed is not None:
+        summary["families"] = composed
     summary["finisher"] = run_finisher(
         store_root,
         manifest,
@@ -1236,6 +1325,7 @@ def run_stage_finisher(
         release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
         touch_policy=touch_policy,
         withhold_levels=withheld,
+        root_moc=not (composed or {}).get("owns_root_moc"),
     )
     summary["lease"] = {"released": bool(summary["finisher"].get("lease_released"))}
     summary["duration_s"] = time.perf_counter() - t0
