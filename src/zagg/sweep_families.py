@@ -367,12 +367,16 @@ def finish_families(
         # levels fold from the rollups the units already wrote, which is the
         # whole reason only ``moc`` carries one (issue #610 phase 3).
         if source == "records" and fam.accumulator() is not None:
-            blocks = accumulator_blocks(records, fam.name)
-            for b in blocks:
-                if isinstance(b, dict):
-                    visited.update(b.get("visited") or ())
-                    told_visited = True
             try:
+                # The EXTRACTION is inside the try too: a record whose
+                # ``families`` is not a mapping of mappings raises here, and a
+                # malformed record has to degrade like a lost one (the shape
+                # :func:`zagg.sweep._load_finisher` wraps for the same reason).
+                blocks = accumulator_blocks(records, fam.name)
+                for b in blocks:
+                    if isinstance(b, dict):
+                        visited.update(b.get("visited") or ())
+                        told_visited = True
                 fam.load_accumulators(blocks)
             except Exception as e:
                 logger.warning(

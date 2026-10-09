@@ -754,3 +754,58 @@ class TestWhoOwnsTheRootMoc:
         assert composed["owns_root_moc"] is True
         assert composed["families"]["moc"]["base_rollups"] == 2  # two base cells
         assert summary["finisher"]["root_moc_from"] == "families"
+
+
+# ---------------------------------------------------------------------------
+# Review folds: validate before the lease; a malformed record degrades.
+# ---------------------------------------------------------------------------
+
+
+class TestRefuseBeforeTheLease:
+    @staticmethod
+    def _lease(root):
+        return (Path(root) / "sweep.lease.json").exists()
+
+    def test_the_driver_refuses_a_bad_family_without_taking_the_lease(self, tmp_path):
+        root = tmp_path / "s"
+        _store(root)
+        with pytest.raises(ValueError, match="cannot ride the staged cascade"):
+            run_stage_sweep(str(root), _refs(), families=["overview"], record=False)
+        assert not self._lease(root)
+
+    def test_the_worker_refuses_a_bad_family_without_taking_the_lease(self, tmp_path):
+        from zagg.sweep_stages import run_stage_worker
+
+        root = tmp_path / "s"
+        _store(root)
+        with pytest.raises(ValueError, match="cannot ride the staged cascade"):
+            run_stage_worker(
+                str(root),
+                _refs(),
+                run_id="R",
+                run_started="2026-10-09T00:00:00+00:00",
+                dispatch=0,
+                nodes=["1", "-2"],
+                child_order=3,
+                records_from=str(tmp_path / "status"),
+                families=["columns"],
+            )
+        assert not self._lease(root)
+
+
+class TestMalformedRecord:
+    def test_a_record_whose_families_block_is_not_a_mapping_degrades(self, tmp_path, caplog):
+        from zagg.hive import read_manifest
+        from zagg.sweep_families import finish_families
+
+        _pass, root, leaves = _temporal_pair(tmp_path, 4)
+        manifest = read_manifest(root)
+        by_shard = _by_shard_of(leaves)
+        run_stage_sweep(root, leaves, families=None, record=False)
+        with caplog.at_level("WARNING"):
+            composed = finish_families(
+                root, manifest, by_shard, records=[{"families": {"moc": ["not", "a", "map"]}}]
+            )
+        assert composed["families"]["moc"]["accumulator_error"]
+        assert "no usable" in caplog.text
+        assert composed["families"]["moc"]["base_rollups"] == 1
