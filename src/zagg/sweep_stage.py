@@ -1034,7 +1034,7 @@ def stage_node(
         return  # the root tuple, or nothing coarser gathers from this node
     fresh_gen = _summed_generation(list(readers.values()))
     if dispatch_level_current and _stage_column_current(
-        store_root, node, window, fresh_gen, run_id, run_started, store_kwargs
+        store, node, window, fresh_gen, run_id, run_started
     ):
         counts["columns_current"] += 1
         return
@@ -1088,23 +1088,27 @@ def stage_node(
         counts["under_covered"] += 1
 
 
-def _stage_column_current(
-    store_root, node, window, fresh_gen, run_id, run_started, store_kwargs
-) -> bool:
-    """Whether the dispatch node's column is committed at the fresh generation."""
+def _stage_column_current(store, node, window, fresh_gen, run_id, run_started) -> bool:
+    """Whether the dispatch node's column is committed at the fresh generation.
+
+    Read through the invoke's ONE obstore handle by relative key — the issue
+    #610 ``zarr_view`` seam, which :class:`_ColumnReader` and
+    :func:`_artifact_entry` already use. It used to ``open_store`` the
+    column's absolute path, which built a fresh client (botocore credential
+    resolution included) once per DISPATCH NODE on a path the cache never
+    hit: the last per-node open on the skip-gate path, and the one issue
+    #610's scope comment names in this module
+    (https://github.com/englacial/zagg/issues/610#issuecomment-6053115106).
+    """
     import zarr
 
     from zagg.column import COLUMN_ATTR, column_name, generation_key
     from zagg.hive import COMMIT_ATTR
-    from zagg.store import open_store
+    from zagg.store import zarr_view
 
-    path = f"{store_root}/{_node_rel(node)}/{column_name(window)}"
+    path = f"{_node_rel(node)}/{column_name(window)}"
     try:
-        attrs = dict(
-            zarr.open_group(
-                open_store(path, read_only=True, **store_kwargs), path="", mode="r", zarr_format=3
-            ).attrs
-        )
+        attrs = dict(zarr.open_group(zarr_view(store), path=path, mode="r", zarr_format=3).attrs)
     except Exception:
         return False
     stamp = attrs.get(COMMIT_ATTR)
