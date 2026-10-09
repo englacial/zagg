@@ -1878,10 +1878,13 @@ stated here:
 - A stage record's **`families`**
   ([issue #610](https://github.com/englacial/zagg/issues/610)) is present
   when the rollup families rode the same walk as the ladder (§4.7's first
-  paragraph: they add no byte layouts). It carries each family's per-pass
-  counts and, for `moc`, the §10 accumulator block the run's finisher
-  composes the root §10.2/§10.3 section and its §10.5 sibling from — the
-  same block a families-pass partition record carries, in the same currency.
+  paragraph: they add no byte layouts). It maps each family's name to that
+  family's block — its per-pass counts, the dispatch nodes whose span failed
+  (`node_failures`), and, for `moc`, the §10 accumulator block the run's
+  finisher composes the root §10.2/§10.3 section and its §10.5 sibling from,
+  the same block a families-pass partition record carries, in the same
+  currency. Every key of the mapping is a family name, so a reader may walk
+  it without an allow-list.
   Still telemetry: the objects it composes are normative, this record is not,
   and the finisher reads which families rode off these records rather than
   off its own invoke.
