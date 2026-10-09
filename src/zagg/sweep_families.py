@@ -52,7 +52,7 @@ CASCADE_FAMILIES = ("stats", "moc", "submap")
 
 
 def fold_span(
-    store, fam, by_shard, *, shard_order, spec, counts, from_order=None, to_order=0
+    store, fam, by_shard, *, shard_order, spec, counts, from_order, to_order=0, from_leaves=False
 ) -> list:
     """Fold one JSON-rollup family up the dirty ancestor paths over ONE span of orders.
 
@@ -61,14 +61,20 @@ def fold_span(
     forms, and this module's per-tuple rider all fold through this function,
     so a store's rollups do not depend on which executor produced them.
 
-    ``from_order`` is where the walk starts: ``shard_order`` (the default)
-    reads the leaves through :func:`zagg.sweep._rollup_shard_node`; a finer
-    order starts from the rollups ALREADY STORED at it, so no leaf is read
-    and a rollup missing there contributes nothing, exactly as an emptied
-    child does. ``to_order`` is the coarsest order written — 0 is the base
-    nodes, and anything above it belongs to another span's writer (a
-    partition's finisher, the next dispatch tuple). Returns the rollup
-    envelopes of the coarsest frontier it reached, which is what
+    ``from_order`` is the order the walk starts at and ``from_leaves`` is what
+    it starts FROM — the two are separate because ``from_order ==
+    shard_order`` means opposite things to the two callers, and conflating
+    them sent the phase-3 finisher back to the leaf walk whenever its
+    partitions split at the shard order (review finding). ``from_leaves``
+    folds each shard's window leaves through
+    :func:`zagg.sweep._rollup_shard_node` — what the cascade's finest tuple
+    and an unpartitioned pass do; otherwise the walk starts from the rollups
+    ALREADY STORED at ``from_order``, so no leaf is read and a rollup missing
+    there contributes nothing, exactly as an emptied child does — what a
+    coarser tuple and the finisher do. ``to_order`` is the coarsest order
+    written: 0 is the base nodes, and anything above it belongs to another
+    span's writer (a partition's finisher, the next dispatch tuple). Returns
+    the rollup envelopes of the coarsest frontier it reached, which is what
     :meth:`zagg.sweep.SweepFamily.finish` composes the store-root objects
     from.
 
@@ -82,15 +88,19 @@ def fold_span(
     from zagg.hive import _decimal_base
     from zagg.sweep import _ancestor, _read_rollup, _rollup_interior, _rollup_shard_node
 
-    start = int(shard_order if from_order is None else from_order)
-    to_order = int(to_order)
+    start, shard_order, to_order = int(from_order), int(shard_order), int(to_order)
+    if from_leaves and start != shard_order:
+        raise ValueError(
+            f"fold_span was asked to read the leaves at order {start}, but the leaves of this "
+            f"store are at {shard_order} — a span starting anywhere else reads rollups"
+        )
     computed: dict[str, dict | None] = {}
-    if start >= int(shard_order):
+    if from_leaves:
         for decimal in sorted(by_shard):
             computed[decimal] = _rollup_shard_node(
                 store, fam, decimal, by_shard[decimal], shard_order, spec, counts
             )
-        top = int(shard_order) - 1
+        top = shard_order - 1
     else:
         for node in sorted({d[: len(_decimal_base(d)) + start] for d in by_shard}):
             computed[node] = _read_rollup(store, fam, node)
@@ -210,6 +220,9 @@ class FamiliesRider:
                     counts=self.counts[fam.name],
                     from_order=int(child_order),
                     to_order=int(dispatch),
+                    # The finest tuple's children ARE the leaves; every
+                    # coarser tuple starts from the rollups below it.
+                    from_leaves=int(child_order) == self.shard_order,
                 )
             except Exception as e:
                 logger.warning(

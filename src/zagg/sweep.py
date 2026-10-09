@@ -1182,8 +1182,12 @@ def _sweep_family(
         shard_order=shard_order,
         spec=spec,
         counts=counts,
+        # ``above`` is falsy for an unpartitioned pass and is otherwise the
+        # finisher's floor — INCLUDING ``shard_order`` itself, where the
+        # partitions wrote the shard nodes' own rollups and no leaf is owed.
         from_order=above or shard_order,
         to_order=min_order,
+        from_leaves=not above,
     )
     result = dict(counts)
     result.update(fam.summary())
