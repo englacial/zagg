@@ -175,8 +175,14 @@ class FamiliesRider:
         self.shard_order = 0
         self.spec = None
         self.by_shard: dict = {}
-        #: Every shard any bound pass handed this invoke, across the
-        #: ``partitions=`` loop — what the accumulator's ``visited`` names.
+        #: Every shard this invoke actually FOLDED, across the passes bound
+        #: to it — what the accumulator's ``visited`` names. Not the work set
+        #: it was handed: a fleet invoke's scope is its own dispatch nodes,
+        #: and an event that overflowed into ``discover: true`` derives the
+        #: whole store's work set worker-side, so ``by_shard`` would claim
+        #: coverage no unit of this invoke produced and the finisher's
+        #: ``shards_unvisited`` check — the signal that a close invoke was
+        #: lost — would never fire.
         self.visited: set = set()
         #: The ``(node, dispatch, child_order)`` spans already folded. The
         #: rollup fold is idempotent, so a repeat would write nothing — but
@@ -201,7 +207,6 @@ class FamiliesRider:
         self.shard_order = int(manifest["shard_order"])
         self.spec = manifest.get("spec")
         self.by_shard = by_shard
-        self.visited.update(by_shard)
 
     def fold_node(self, node: str, *, dispatch: int, child_order: int) -> None:
         """Fold every family over this dispatch node's tuple span.
@@ -222,6 +227,7 @@ class FamiliesRider:
         if not work:
             return
         self.folded.add(span)
+        self.visited.update(work)
         for fam in self.families:
             try:
                 fold_span(
@@ -251,8 +257,9 @@ class FamiliesRider:
         carries (:meth:`zagg.sweep.SweepFamily.accumulator`, issue #610 phase
         3), so the ladder's finisher composes the root section from the stage
         records exactly as the families finisher composed it from the
-        partition records. ``visited`` is the shards this invoke walked — the
-        finisher refuses a work set holding one no record says it visited.
+        partition records. ``visited`` is the shards this invoke actually
+        FOLDED (see the attribute), which is what lets the finisher tell a
+        work set short of a close invoke from one it covered.
         """
         out: dict = {}
         for fam in self.families:

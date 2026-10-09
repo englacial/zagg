@@ -874,3 +874,52 @@ class TestStoreContradictsTheCaller:
         _store(root)
         summary = _fleet(root, _FakeLambda(), families=None, barrier_timeout_s=0.01)
         assert summary["families_unswept"] is False
+
+
+# ---------------------------------------------------------------------------
+# Review fold: ``visited`` is what the invoke folded, not what it was handed.
+# ---------------------------------------------------------------------------
+
+
+class TestVisitedIsWhatWasFolded:
+    def test_a_scoped_invoke_claims_only_its_own_nodes(self, tmp_path):
+        """A fleet invoke is handed the work set and scoped to its own dispatch nodes.
+
+        Claiming ``by_shard`` would make the finisher's ``shards_unvisited``
+        check — the signal that a close invoke was lost — unable to fire.
+        """
+        from zagg.sweep_families import finish_families, rider_for
+        from zagg.sweep_stages import normalize_scope, sweep_stage_pass
+
+        root = tmp_path / "s"
+        manifest = _store(root)
+        by_shard = {d: {None} for d in LEAVES}
+        rider = rider_for(None)
+        sweep_stage_pass(
+            str(root),
+            manifest,
+            by_shard,  # the whole work set, as a discover-fallback invoke gets it
+            scope=normalize_scope(["1"]),  # ...but this invoke owns base cell 1
+            run_id="S",
+            tuple_width=3,
+            families=rider,
+        )
+        assert sorted(rider.visited) == ["1111", "1112", "1121"]  # not the -2 leaf
+        record = {"families": rider.summary()}
+        composed = finish_families(str(root), manifest, by_shard, records=[record])
+        assert composed["shards_unvisited"] == 1
+
+    def test_a_complete_run_claims_the_whole_work_set(self, tmp_path):
+        from zagg.sweep_families import finish_families, rider_for
+        from zagg.sweep_stages import sweep_stage_pass
+
+        root = tmp_path / "s"
+        manifest = _store(root)
+        by_shard = {d: {None} for d in LEAVES}
+        rider = rider_for(None)
+        sweep_stage_pass(str(root), manifest, by_shard, run_id="C", tuple_width=3, families=rider)
+        assert sorted(rider.visited) == sorted(LEAVES)
+        composed = finish_families(
+            str(root), manifest, by_shard, records=[{"families": rider.summary()}]
+        )
+        assert "shards_unvisited" not in composed
