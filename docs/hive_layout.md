@@ -811,9 +811,11 @@ that combination by name rather than firing a fan-out that folds no rollup.
 The run's finisher then composes the families' store-root singletons once —
 the §10 temporal section inside `coverage.moc` and its `coverage.toc`
 sibling — from the base-node rollups (≤ 1 GET per base cell) plus the
-accumulator blocks the stage records carry, reading **no leaf**; the `moc`
-family's own finish owns the root `coverage.moc` refresh and the finisher's
-step 1 stands down (`root_moc_from: "families"`). Which families rode is
+accumulator blocks the stage records carry, reading **no leaf**. Where the
+`moc` family rode *and* found base-node rollups to compose from, its own
+finish owns the root `coverage.moc` refresh and the finisher's step 1 stands
+down (`root_moc_from: "families"`); otherwise step 1 runs from the work set
+as it always has, because only that family writes the object. Which families rode is
 taken from the *records*, like `closes`, never from the finisher's event. On
 the 64-leaf local fixture the reads are the same 192 leaf reads either way:
 192 in the one families invoke before, ≤ 12 per close unit across 16 units
