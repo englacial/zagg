@@ -657,3 +657,58 @@ class TestSpanSource:
         assert summary["families"]["moc"]["temporal_shards"] == 8
         run_sweep(single, leaves, families=CASCADE_FAMILIES, record=False)
         assert _objects(root) == _objects(single)
+
+
+# ---------------------------------------------------------------------------
+# Review fold: a span is folded once per rider, however many passes see it.
+# ---------------------------------------------------------------------------
+
+
+class TestFoldOnce:
+    def test_partitions_do_not_double_the_counts(self, tmp_path):
+        """``partitions=`` re-admits a coarse dispatch node in every partition.
+
+        The rollups would survive it (the fold is idempotent), the §10
+        accumulation would not: ``MocFamily._accumulate_temporal`` appends one
+        entry per leaf read, so the counts would multiply by the partition
+        count. The oracle is the unpartitioned pass over a twin store.
+        """
+        from test_sweep_store_handle import _store as temporal_store
+
+        from zagg.sweep import run_sweep
+
+        root, leaves = temporal_store(tmp_path / "part", 4)
+        single = str(_twin(Path(root), tmp_path / "single"))
+        summary = run_stage_sweep(
+            root, leaves, families=None, partitions=4, tuple_width=4, record=False
+        )
+        # Four partitions, one base cell: its one tuple is admitted by all
+        # four, and only the first fold counts.
+        assert len(summary["families"]["moc"]["accumulator"]["shards"]) == 4
+        assert summary["families"]["finish"]["families"]["moc"]["temporal_shards"] == 4
+        run_sweep(single, leaves, families=CASCADE_FAMILIES, record=False)
+        for name in ("coverage.moc", "coverage.toc"):
+            assert _stable_root(root, name) == _stable_root(single, name)
+
+    def test_the_guard_is_the_span_not_the_node(self, tmp_path):
+        """Two tuples over the same node fold both spans; a repeat of one does not."""
+        from zagg.sweep_families import rider_for
+        from zagg.sweep_stages import sweep_stage_pass
+
+        root = tmp_path / "s"
+        manifest = _store(root)
+        rider = rider_for(["stats"])
+        sweep_stage_pass(
+            str(root),
+            manifest,
+            {d: {None} for d in LEAVES},
+            run_id="W",
+            tuple_width=1,
+            families=rider,
+        )
+        # Width 1 on an o3 store: three spans per base cell, two base cells.
+        assert {s[1:] for s in rider.folded} == {(2, 3), (1, 2), (0, 1)}
+        written = rider.counts["stats"]["written"]
+        for node, dispatch, child_order in sorted(rider.folded):
+            rider.fold_node(node, dispatch=dispatch, child_order=child_order)
+        assert rider.counts["stats"]["written"] == written  # nothing re-folded
