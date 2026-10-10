@@ -58,7 +58,7 @@ aggregation:
     count:
       function: len
       source: h_ph
-      dtype: int32
+      dtype: int64
       fill_value: 0
     h_tdigest:
       # Located per-cell t-digest: ``build_tdigest`` receives the cell's

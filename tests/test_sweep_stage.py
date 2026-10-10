@@ -620,6 +620,33 @@ class TestCascade:
                 sum(v for dec, v in leaf_sum.items() if dec.startswith(c)) for c in cells
             ]
 
+    def test_count_past_int32_folds_exactly_when_declared_int64(self, tmp_path):
+        # Issue #626: the ATL03 v3 ladder summed thousands of int32 leaves past
+        # 2^31 at orders 1 and 0 and the stored count wrapped. Declared int64
+        # (every packaged template now), the column tier and every cascade
+        # level carry the exact sum -- here one leaf's own sum already
+        # exceeds int32, and the order-1 cells reach 2^33 + 64 (an int32
+        # ladder stores 64).
+        fields = {**FIELDS, "count": {**FIELDS["count"], "dtype": "int64"}}
+        root = tmp_path / "s"
+        m = _stage_store(root, leaves=(), write_moc=False, fields=fields)
+        per_cell = 2**27 + 1
+        for i, dec in enumerate(DENSE_16):
+            slabs = {**_leaf_slabs(i), "count": np.full(16, per_cell, dtype="int64")}
+            _write_leaf(root, dec, i, fields=fields, slabs=slabs)
+        write_root_coverage(str(root), build_root_coverage([morton_word(d) for d in DENSE_16], 3))
+        _sweep(root, m, leaves=DENSE_16)
+        leaf_sum = 16 * per_cell
+        assert leaf_sum > 2**31 - 1
+        column = _artifact(root, next(root.rglob("all.pyramid.zarr")).relative_to(root))["3"]
+        assert column["count"].dtype == np.int64
+        assert [int(v) for v in column["count"][:]] == [leaf_sum]
+        for rel, group, leaves_per_cell in (("1/1/all.zarr", "2", 1), ("1/all.zarr", "1", 4)):
+            counts = _artifact(root, rel)[group]["count"]
+            assert counts.dtype == np.int64
+            assert [int(v) for v in counts[:]] == [leaves_per_cell * leaf_sum] * 4
+        assert 4 * leaf_sum == 2**33 + 64
+
     def test_every_merge_artifact_the_pass_writes_goes_through_the_engine(
         self, tmp_path, monkeypatch
     ):

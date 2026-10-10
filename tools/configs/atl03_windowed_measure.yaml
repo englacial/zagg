@@ -164,7 +164,7 @@ aggregation:
     count:
       function: len
       source: h_ph
-      dtype: int32
+      dtype: int64
       fill_value: 0
     # The signal predicate below and the composition ``threshold`` MUST agree:
     # both commit the same ``conf >= 2`` cut (i.e. the ATBD ``> 1``).
