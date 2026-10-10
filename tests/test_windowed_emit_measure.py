@@ -453,6 +453,26 @@ def test_timeouts_match_the_dispatcher_error_strings(tmp_path):
     assert fleet["fits_one_invoke"] is False
 
 
+def test_a_timed_out_invoke_is_billed_the_function_wall(tmp_path):
+    from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
+
+    root = _store(tmp_path, windows=None)
+    before = tool.measure(root, store_kwargs={}, accuracy=False)
+    rows = [
+        failure_record(shard_key=SHARDS[0], error="Lambda timeout: Task timed out after 900 s"),
+        failure_record(shard_key=SHARDS[1], error="ValueError: bad granule", duration_s=5.0),
+    ]
+    write_run_parquet(root, [flatten_record(r) for r in rows], run_id="run-b")
+    after = tool.measure(root, store_kwargs={}, accuracy=False)
+    # the timeout at 900 s x the 4 GB default, the other failure at its own 5 s
+    added = tool.FUNCTION_TIMEOUT_S * 4.0 + 5.0 * 4.0
+    assert after["fleet"]["billed_gb_seconds"] == before["fleet"]["billed_gb_seconds"] + added
+    assert after["fleet"]["gb_seconds"] == before["fleet"]["gb_seconds"]  # successful only
+    assert after["cost"]["total_usd"] - before["cost"]["total_usd"] == pytest.approx(
+        added * LAMBDA_PRICE_PER_GB_SEC
+    )
+
+
 def test_the_tree_is_leaf_driven_not_parquet_driven(tmp_path):
     # A failed shard writes no leaf and a stale-worker / inexact parquet key
     # names no node: neither changes what the LIST says.
