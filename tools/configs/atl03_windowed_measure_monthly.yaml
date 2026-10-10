@@ -1,0 +1,333 @@
+# Schedule measurement, arm ``monthly`` -- 84 monthly windows (issue #602; issue #586 phase 5).
+#
+# One of FOUR arm configs that differ ONLY in ``output.windowing`` (pinned by
+# tests/test_windowed_measure_configs.py): atl03_windowed_measure_{none,yearly,
+# quarterly,monthly}.yaml. This arm writes up to 84 leaves per shard (5,376 leaves) over the Sierra order-6
+# cell ``3232131`` (64 order-9 shards), ATL03 v007, whole years 2019..2025. The
+# body below the marker is the live ATL03 store's build template
+# (atl03_tdigest_strata_healpix.yaml) carrying the measurement knobs: the staged
+# sweep (``output.sweep: stages``, so the ladder, the all-time fold and the
+# families tail chain in-run -- prerequisite recorded on #602, 2026-10-08), the
+# dense overview ladder from 13 down with the all-time overview, and the window
+# schedule. Run it against ONE order-6 cell into an in-region scratch store,
+# never the live store. The windowed arms dispatch under the default
+# ``windowing.unit: shard`` (one invoke per shard emits every window, issue
+# #586 phase 2); if an arm does not fit one invoke per shard that is a result:
+# record it, then re-run that arm with ``output.windowing.unit: window``.
+# The configs differ ONLY in ``output.windowing``, but the RUNS also differ in
+# Icechunk: an unset ``output.icechunk`` resolves ON for the unwindowed hive arm
+# and OFF for the windowed arms (``get_icechunk``, spec section 11.6), so only
+# the ``none`` arm's ladder commits Icechunk and only its stage rows carry
+# ``icechunk_*`` counters (the readout prints ``-`` for the windowed arms). The
+# ladder wall time and ``icechunk_*`` numbers compare like for like only once
+# windowed Icechunk (issue #584) lands; the leaf/object/fleet numbers compare now.
+#
+# ``count`` is ``int32`` (4 B/cell) on every arm: the 0.59.0 fleet predates the
+# issue #626 dtype fix (espg ruling 2026-10-09). Occupancy from the ``count``
+# object size therefore uses 16,384 B per occupied inner chunk + 4,100 B index;
+# the readout derives both from the leaf's zarr.json so a later dtype moves it.
+#
+# The staged tail: on the windowed arms the ladder fans one stage invoke per
+# (node, window) plus one close per node (the all-time fold); the unwindowed arm
+# runs one stage unit per node and no close. Every arm's stage invokes go to the
+# 8,192 MB tier -- the run's function family with ``-8192-disk``
+# (``process-shard-8192-disk``; env ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME``
+# overrides). The leaf fan-out stays on ``worker:`` below.
+#
+# Cost estimate per arm (issue #602 phase 3), extrapolated from the 0.55.0 run
+# (issue #586 phase 1) at $0.0000133334 per GB-s (arm64). Inputs: baseline
+# 60,018.3 GB-s read+aggregate over 64 invokes + 64 x 69.7 s x 4 GB write side
+# = 77,862 GB-s; yearly fan-out 84,989.3 GB-s over 448 invokes + 448 x 23.0 s
+# x 4 GB = 126,205 GB-s; ladder 27 nodes x (W + 1) stage units x 10-16 s x 8 GB
+# (the 0.55.0 relay re-stage ran 16 s per (node, window); the #621 cascade is
+# cheaper per node; the baseline ladder is the 2,912 GB-s measured).
+#
+# Two per-extra-leaf figures, and what each is:
+#   - measured marginal: (126,205 - 77,862) / 384 = 125.9 GB-s per extra leaf
+#     under fan-out, less the 12.8 s per-invoke read floor (x 4 GB) a bulk
+#     invoke pays once = 74.7 GB-s = 18.7 s at 4 GB. The bulk column uses it.
+#   - regression floors: ~33 s per extra leaf (18.4 s aggregate + ~15 s write),
+#     the per-window fan-out floors -- an upper bound for the bulk increment.
+# Per-shard bulk wall, from the baseline's 219 s p50 / 440 s max read+aggregate
+# plus its 69.7 s write side, then (W - 1) extra leaves at 18.7-33 s:
+#   yearly    ~400-490 s p50 /   ~620-710 s max   (fits)
+#   quarterly ~790-1,180 s p50 / ~1,010-1,400 s max (marginal to over the wall)
+#   monthly   ~1,840-3,030 s p50 / ~2,060-3,250 s max (over the wall)
+#
+#   arm        leaves   leaf side (bulk)    leaf side (unit: window)   ladder
+#   none           64     77,862 GB-s $1.04        -                    2,912 GB-s $0.04
+#   yearly        448    106,544 GB-s $1.42   126,205 GB-s $1.68      17-28k $0.23-0.37
+#   quarterly   1,792    206,935 GB-s $2.76   295,409 GB-s $3.94     63-100k $0.84-1.34
+#   monthly     5,376    474,643 GB-s $6.33   746,617 GB-s $9.95    184-294k $2.45-3.92
+#
+# A bulk arm that times out bills every invoke the full wall, 64 x 900 s x 4 GB
+# = 230,400 GB-s = $3.07 (the dispatcher's printed ceiling), and then needs
+# the ``unit: window`` re-run (its ceiling scales with the units: $21.50 /
+# $86.02 / $258.05). The monthly bulk figure (474,643 GB-s = 1,854 s per
+# invoke) is more than 64 x 900 s can bill, so that arm cannot complete bulk.
+# Per arm (leaf side + ladder):
+#   none       ~$1.08
+#   yearly     ~$1.65-1.79 (fits)
+#   quarterly  ~$3.59-4.10 if it fits; else ~$7.85-8.35 (timed-out attempt
+#              $3.07 + re-run $3.94 + ladder)
+#   monthly    ~$15.47-16.94 (timed-out attempt $3.07 + re-run $9.95 + ladder)
+# All four arms: ~$15.1-17.2 if both finer arms fit (the bulk model's figures,
+# monthly $8.78-10.25), ~$26.0-28.2 if neither does.
+#
+# Whether one invoke per shard FITS the 900 s wall is what the run measures; an
+# arm that does not is recorded as the result and re-run with ``unit: window``
+# (or the window groups of issue #596) into its own store.
+#
+# Operator invocation (live AWS -- espg runs it; the runbook is
+# demo/18_schedule_measure_2026-10.ipynb, the readout
+# tools/windowed_emit_measure.py):
+#
+#   # 1. catalog: the cell's own diamond shrunk by 1e-3 deg so its edges do not
+#   #    touch the neighbours -- coverage is then exactly the 64 order-9 shards
+#   #    (``--bbox`` of mortie.mort2bbox covers 169 shards across 8 order-6 cells).
+#   uv run python -c "import json, mortie; from shapely.geometry import Polygon, mapping; \
+#   from zagg.grids.morton import morton_word; \
+#   ring = mortie.mort2polygon(morton_word('3232131'), step=32); \
+#   json.dump(mapping(Polygon([(x, y) for y, x in ring]).buffer(-1e-3)), \
+#   open('/tmp/o6_sierra.geojson', 'w'))"
+#   uv run python -m zagg.catalog --config tools/configs/atl03_windowed_measure_monthly.yaml \
+#       --short-name ATL03 --start-date 2019-01-01 --end-date 2025-12-31 \
+#       --polygon /tmp/o6_sierra.geojson --output /tmp/o6_sierra.json
+#   # 2. the arm (same catalog for every arm)
+#   uv run python -m zagg --config tools/configs/atl03_windowed_measure_monthly.yaml \
+#       --catalog /tmp/o6_sierra.json --backend lambda --profile \
+#       --store s3://<scratch-bucket>/<prefix>/_measure_monthly.zarr
+#   # 3. readout, all four arms at once
+#   uv run python tools/windowed_emit_measure.py \
+#       s3://<scratch-bucket>/<prefix>/_measure_none.zarr \
+#       s3://<scratch-bucket>/<prefix>/_measure_yearly.zarr \
+#       s3://<scratch-bucket>/<prefix>/_measure_quarterly.zarr \
+#       s3://<scratch-bucket>/<prefix>/_measure_monthly.zarr --json out.json
+#
+# ---- template follows (atl03_tdigest_strata_healpix.yaml) ---------------------
+# ATL03 photon-height t-digest, SIGNAL/NOISE STRATIFIED (issue #321).
+#
+# Two disjoint per-cell t-digests split at ingest by the ATBD signal predicate
+# -- ``signal_conf_ph > 1`` on ANY surface column (selection rule A1: the
+# union is idempotent, decision-free, and narrowable downstream; a committed
+# single-surface subset is not widenable). Each stratum's digest total weight
+# is the exact stratum photon count; the total photon-flux distribution is
+# recovered at read by ONE deterministic two-way merge (``merge_tdigests``).
+# Classification is committed here because signal confidence is NOT
+# reconstructable post-aggregation (issue #321 background).
+#
+# The ``composition`` field packs eight u8 lanes of quantized fractions of the
+# signal stratum into one uint64 per cell (``zagg.stats.composition``,
+# spec ``zagg-composition/1``): five per-surface lanes (signal_conf_ph column
+# order) + low/med/high lanes. Quantization carries a presence floor, so
+# ``lane > 0`` is exact at every N; counts recover exactly for N <= 254 (the
+# below-compression-knee regime). The committed threshold is recorded in the
+# field's ``attrs`` so readers bind to store metadata, not this file.
+#
+# The low/med/high lanes are ABSOLUTE (conf == 2/3/4), never renumbered against
+# ``threshold``: at the default threshold 2 all three carry counts, and a
+# variant committing a higher threshold simply ships empty lower lanes rather
+# than shifted ones -- one lane layout for every product.
+#
+# The five ``signal_conf_*`` columns are read from the single 2-D
+# ``signal_conf_ph`` dataset via the per-variable ``column`` selector (one
+# read, five columns -- the dataset path is deduped with the TEP filter's).
+#
+# Both strata carry the located channel (issue #87, espg ruling on PR #334:
+# located strata IS the default, not a variant): each centroid stores its
+# order-29 morton word (exact photon position at weight 1) in the row-aligned
+# ``{field}_locations`` sibling arrays.
+#
+# Strata + composition run pooled, or under ``mode: spill`` including the
+# multi-block regime (issue #370): a block close folds per-block stratum
+# digests (row selection precedes the build) and composition words
+# (``merge_composition_kway`` — presence exact, counts within one
+# quantization however many blocks close).
+# ``mode: merge`` still rejects them (its per-flush fold would degrade
+# locations continuously and has no ``where`` state).
+# Grid geometry: o9 shard / o13 inner chunk / o19 cells.
+#
+# THIS TEMPLATE IS THE BUILD CONFIG OF THE LIVE STORE
+# ``englacial/zagg/demo/atl03_tdigest_o9_v3.zarr`` (issue #547; rebuilt from
+# the packaged atl03_tdigest_strata_healpix template with only the
+# hash-invisible ``output.pyramid`` set to ``{overviews: 13}``, on the 0.57.0
+# fleet, issue #560, 2026-10-08): every key in the
+# D19 semantic core below is what that store's run records carry, and
+# ``tests/test_live_store_templates.py`` pins the template's ``semantic_hash``
+# to the store manifest's frozen value. That is what lets a build from this
+# file APPEND to the live store rather than refuse on the frozen hash -- so a
+# change to any hashed key here (deltas, filters, variables, the index block,
+# ``time_source``) is a new product, and the pin says so.
+data_source:
+  reader: h5coro
+  driver: s3
+  # Sidecar chunk index (issue #460): read machinery outside the semantic core
+  # (issue #499 epoch), so ``store`` moves no hash. Public copy on Source
+  # Cooperative (moved 2026-09-17), in-region and inside the fleet's ``demo/*``
+  # grant: the fleet reads it signed and ``on_miss: build`` fills misses via its
+  # write. The read signs with ambient credentials (no unsigned seam): a reader
+  # without credentials drops this block (absent resolves to inline), one without
+  # write sets ``on_miss: fallback`` (fails open, per-granule metadata walk). Only
+  # a 404 is a miss (403 raises, issue #502); the sliderule-public-cors cache is retired.
+  index:
+    backend: sidecar
+    store: s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007
+    on_miss: build
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+    signal_conf_land: {path: "/{group}/heights/signal_conf_ph", column: 0}
+    signal_conf_ocean: {path: "/{group}/heights/signal_conf_ph", column: 1}
+    signal_conf_sea_ice: {path: "/{group}/heights/signal_conf_ph", column: 2}
+    signal_conf_land_ice: {path: "/{group}/heights/signal_conf_ph", column: 3}
+    signal_conf_inland_water: {path: "/{group}/heights/signal_conf_ph", column: 4}
+    # The per-photon clock the section-8.3 temporal companion encodes from
+    # (issue #410); ``output.time_source`` below declares its convention.
+    delta_time: "/{group}/heights/delta_time"
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # possible_tep is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1
+  read_plan:
+    spatial_index: segments
+    pad: 1
+
+aggregation:
+  coordinates:
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: h_ph
+      dtype: int32
+      fill_value: 0
+    # The signal predicate below and the composition ``threshold`` MUST agree:
+    # both commit the same ``conf >= 2`` cut (i.e. the ATBD ``> 1``).
+    h_tdigest_signal:
+      kind: ragged
+      function: "zagg.stats.tdigest.build_tdigest_where"
+      source: h_ph
+      location: leaf_id
+      # Per-centroid toc words beside the located words (spec section 8.3,
+      # issue #410): each centroid carries its photon's instant, so a cell's
+      # digest is queryable in time as well as position.
+      temporal: per-centroid
+      inner_shape: [2]
+      params:
+        delta: 4096              # leaf centroid budget (espg ruling 2026-09-13): the
+                                 # live stores' value, and loss-free for every
+                                 # surface cell measured -- the CA tail scan on
+                                 # issue #422 puts 1e-5 of cells above it, all
+                                 # cloud/background storm artifacts
+        where: >-
+          (signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
+          (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
+          (signal_conf_inland_water >= 2)
+      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
+      dtype: float32
+      fill_value: 0
+      attrs:
+        stratum: signal
+        signal_threshold: 2
+    h_tdigest_noise:
+      kind: ragged
+      function: "zagg.stats.tdigest.build_tdigest_where"
+      source: h_ph
+      location: leaf_id
+      temporal: per-centroid
+      inner_shape: [2]
+      params:
+        delta: 4096              # leaf centroid budget (espg ruling 2026-09-13): the
+                                 # live stores' value, and loss-free for every
+                                 # surface cell measured -- the CA tail scan on
+                                 # issue #422 puts 1e-5 of cells above it, all
+                                 # cloud/background storm artifacts
+        where: >-
+          ~((signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
+          (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
+          (signal_conf_inland_water >= 2))
+      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
+      dtype: float32
+      fill_value: 0
+      attrs:
+        stratum: noise
+        signal_threshold: 2
+    composition:
+      function: "zagg.stats.composition.pack_composition"
+      source: h_ph
+      dtype: uint64
+      fill_value: 0
+      params:
+        conf_land: signal_conf_land
+        conf_ocean: signal_conf_ocean
+        conf_sea_ice: signal_conf_sea_ice
+        conf_land_ice: signal_conf_land_ice
+        conf_inland_water: signal_conf_inland_water
+        threshold: 2
+      attrs:
+        composition:
+          spec: zagg-composition/1
+          lanes: [land, ocean, sea_ice, land_ice, inland_water, low, med, high]
+          of: h_tdigest_signal        # N_signal = this digest's total weight
+          threshold: 2
+  streaming:
+    mode: spill                  # the live build's regime (issue #370); not in
+                                 # the semantic core (every regime shares one
+                                 # identity under the law-equivalence contract)
+
+output:
+  # The store's per-observation clock (issue #410): ATL03 ``delta_time`` is
+  # seconds on the CONTINUOUS GPS scale since 2018-01-01 (spec section 8.3).
+  time_source:
+    field: delta_time
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 9              # shard / dispatch unit: 4^(19-9) = 1024x1024 cells
+                                 # (the live store's shard order -- a FROZEN
+                                 # manifest key on append)
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=16)
+    sharded: true
+    child_order: 19              # leaf cell resolution (~10 m)
+  store_layout: hive
+  # ---- measurement knobs (issue #586) ----------------------------------------
+  windowing:                     # 84 calendar-month windows, 201901..202512
+    schedule: monthly
+    time_field: delta_time       # the store's per-observation clock (time_source above)
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
+  sweep: stages                  # the staged sweep: per-window columns + overviews, the ladder
+  pyramid:
+    overviews: 13                # the live v3 store's dense ladder, declared at init
+    all_time: true               # the all-time overview pyramid: one close unit per node,
+                                 # merging the node's per-window overviews (issue #586
+                                 # phase 4). The default at the flip (phase 6), so the
+                                 # re-measure carries it. No effect on the unwindowed arm.
+
+worker:
+  memory: 4096                   # the live build's tier: 4096-disk (issue #460)
+  extra_disk: true
