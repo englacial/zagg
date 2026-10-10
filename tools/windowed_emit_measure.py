@@ -296,8 +296,10 @@ def _classify(path: str) -> tuple:
     version = None
     if rest and rest[0].startswith("run-"):  # a versioned leaf (issue #585)
         version, rest = rest[0], rest[1:]
-    if len(rest) >= 2 and rest[0].isdigit():
-        return "leaf", (full_id, window, version, rest[1], len(rest) >= 3 and rest[2] == "c")
+    # ``<cell_order>/<array>/...`` names an array; ``<cell_order>/zarr.json`` is
+    # the leaf's group metadata, not an array called ``zarr.json``
+    if len(rest) >= 3 and rest[0].isdigit():
+        return "leaf", (full_id, window, version, rest[1], rest[2] == "c")
     return "leaf", (full_id, window, version, None, False)
 
 
