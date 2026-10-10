@@ -2,7 +2,8 @@
 
 Given one or more hive store roots — typically the unwindowed BASELINE arm and
 the WINDOWED arm of the same order-6 cell, built with
-``tools/configs/atl03_windowed_measure.yaml`` — print, per store:
+``tools/configs/atl03_windowed_measure_{none,yearly,quarterly,monthly}.yaml``
+(issue #602; one body, four ``output.windowing`` blocks) — print, per store:
 
 - the fleet numbers off the run parquets (``stats_*.parquet`` at the root):
   units, shards, windows per shard, ``duration_s`` (the read + aggregate

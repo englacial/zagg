@@ -1,53 +1,56 @@
-# Windowed-emit measurement config (issue #586 phase 1) -- the live ATL03 store's
-# build template (atl03_tdigest_strata_healpix.yaml, byte-identical below the
-# marker except that its ``pyramid: false`` line is REPLACED by the knob block)
-# carrying the three knobs the measurement varies: a YEARLY window schedule on
-# the store's own ``delta_time`` clock, the staged sweep, and the dense overview
-# ladder from 13 down. Yearly windows are calendar years, so the catalog dates
-# below are trimmed to WHOLE years (2019..2025, 7 windows; espg 2026-09-26): the
-# mission's partial first (from 2018-10-14) and current (2026) years would pull
-# the per-unit quantiles with stub windows. Run it against ONE order-6 cell into
-# a scratch store, never the live store. The config differs between the arms ONLY in
-# ``output.windowing`` (delete the block for the baseline arm), but the RUNS also
-# differ in Icechunk: an unset ``output.icechunk`` resolves ON for the unwindowed
-# hive baseline and OFF for a windowed store (``get_icechunk``, spec section 11.6),
-# so only the baseline's ladder commits Icechunk and only its stage rows carry
-# ``icechunk_*`` counters (the readout prints ``-`` for the windowed arm). The
-# ladder wall time and ``icechunk_*`` numbers compare like for like only once
-# windowed Icechunk (issue #584) lands; the leaf/object/fleet numbers compare now.
+# Schedule measurement, arm ``monthly`` -- 84 monthly windows (issue #602; issue #586 phase 5).
 #
-# The staged tail (issue #586 phase 4): on the windowed arm the ladder fans one
-# stage invoke per (node, window) plus one close per node (the all-time fold),
-# and BOTH arms' stage invokes go to the 8,192 MB tier -- the run's function
-# family with ``-8192-disk`` (``process-shard-8192-disk``; override with env
-# ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME``). The dispatcher's role needs
-# ``lambda:InvokeFunction`` on it. The leaf fan-out stays on ``worker:`` below.
+# One of FOUR arm configs that differ ONLY in ``output.windowing`` (pinned by
+# tests/test_windowed_measure_configs.py): atl03_windowed_measure_{none,yearly,
+# quarterly,monthly}.yaml. This arm writes up to 84 leaves per shard (5,376 leaves) over the Sierra order-6
+# cell ``3232131`` (64 order-9 shards), ATL03 v007, whole years 2019..2025. The
+# body below the marker is the live ATL03 store's build template
+# (atl03_tdigest_strata_healpix.yaml) carrying the measurement knobs: the staged
+# sweep (``output.sweep: stages``, so the ladder, the all-time fold and the
+# families tail chain in-run -- prerequisite recorded on #602, 2026-10-08), the
+# dense overview ladder from 13 down with the all-time overview, and the window
+# schedule. Run it against ONE order-6 cell into an in-region scratch store,
+# never the live store. The windowed arms dispatch under the default
+# ``windowing.unit: shard`` (one invoke per shard emits every window, issue
+# #586 phase 2); if an arm does not fit one invoke per shard that is a result:
+# record it, then re-run that arm with ``output.windowing.unit: window``.
 #
-# Operator invocation (live AWS -- espg runs it; see tools/windowed_emit_measure.py
-# for the readout):
+# ``count`` is ``int32`` (4 B/cell) on every arm: the 0.59.0 fleet predates the
+# issue #626 dtype fix (espg ruling 2026-10-09). Occupancy from the ``count``
+# object size therefore uses 16,384 B per occupied inner chunk + 4,100 B index;
+# the readout derives both from the leaf's zarr.json so a later dtype moves it.
 #
-#   # 1. catalog: one order-6 cell over the Sierra Nevada (mortie cell 3232131),
-#   #    the full mission to date. Catalog by the cell's own diamond, pulled in
-#   #    1e-3 deg so its edges do not touch the neighbours: coverage is then
-#   #    exactly the cell's 64 order-9 shards. (``--bbox`` of mortie.mort2bbox
-#   #    covers 169 shards across 8 order-6 cells; the unshrunk diamond 88-100.)
+# The staged tail: the ladder fans one stage invoke per (node, window) plus one
+# close per node (the all-time fold) and every stage invoke goes to the 8,192 MB
+# tier -- the run's function family with ``-8192-disk``
+# (``process-shard-8192-disk``; env ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME``
+# overrides). The leaf fan-out stays on ``worker:`` below.
+#
+# Operator invocation (live AWS -- espg runs it; the runbook is
+# demo/18_schedule_measure_2026-10.ipynb, the readout
+# tools/windowed_emit_measure.py):
+#
+#   # 1. catalog: the cell's own diamond shrunk by 1e-3 deg so its edges do not
+#   #    touch the neighbours -- coverage is then exactly the 64 order-9 shards
+#   #    (``--bbox`` of mortie.mort2bbox covers 169 shards across 8 order-6 cells).
 #   uv run python -c "import json, mortie; from shapely.geometry import Polygon, mapping; \
 #   from zagg.grids.morton import morton_word; \
 #   ring = mortie.mort2polygon(morton_word('3232131'), step=32); \
 #   json.dump(mapping(Polygon([(x, y) for y, x in ring]).buffer(-1e-3)), \
 #   open('/tmp/o6_sierra.geojson', 'w'))"
-#   uv run python -m zagg.catalog --config tools/configs/atl03_windowed_measure.yaml \
+#   uv run python -m zagg.catalog --config tools/configs/atl03_windowed_measure_monthly.yaml \
 #       --short-name ATL03 --start-date 2019-01-01 --end-date 2025-12-31 \
 #       --polygon /tmp/o6_sierra.geojson --output /tmp/o6_sierra.json
-#   # 2. windowed arm
-#   uv run python -m zagg --config tools/configs/atl03_windowed_measure.yaml \
-#       --catalog /tmp/o6_sierra.json --backend lambda \
-#       --store s3://<scratch-bucket>/<prefix>/_measure_windowed.zarr
-#   # 3. baseline arm: same config with ``output.windowing`` removed
-#   # 4. readout
+#   # 2. the arm (same catalog for every arm)
+#   uv run python -m zagg --config tools/configs/atl03_windowed_measure_monthly.yaml \
+#       --catalog /tmp/o6_sierra.json --backend lambda --profile \
+#       --store s3://<scratch-bucket>/<prefix>/_measure_monthly.zarr
+#   # 3. readout, all four arms at once
 #   uv run python tools/windowed_emit_measure.py \
-#       s3://<scratch-bucket>/<prefix>/_measure_baseline.zarr \
-#       s3://<scratch-bucket>/<prefix>/_measure_windowed.zarr
+#       s3://<scratch-bucket>/<prefix>/_measure_none.zarr \
+#       s3://<scratch-bucket>/<prefix>/_measure_yearly.zarr \
+#       s3://<scratch-bucket>/<prefix>/_measure_quarterly.zarr \
+#       s3://<scratch-bucket>/<prefix>/_measure_monthly.zarr --json out.json
 #
 # ---- template follows (atl03_tdigest_strata_healpix.yaml) ---------------------
 # ATL03 photon-height t-digest, SIGNAL/NOISE STRATIFIED (issue #321).
@@ -259,8 +262,8 @@ output:
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive
   # ---- measurement knobs (issue #586) ----------------------------------------
-  windowing:                     # DELETE this block for the unwindowed baseline arm
-    schedule: yearly             # 182-day cycles need ``explicit``; ``quarterly`` is reserved
+  windowing:                     # 84 calendar-month windows, 201901..202512
+    schedule: monthly
     time_field: delta_time       # the store's per-observation clock (time_source above)
     epoch: "2018-01-01T00:00:00"
     scale: gps
