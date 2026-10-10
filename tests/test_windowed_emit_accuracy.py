@@ -141,6 +141,7 @@ def test_all_time_against_the_flat_fold(swept):
     # the exact leg: the all-time count IS the flat sum at every level
     assert all(lv["exact"] == {"count": True} for lv in out["levels"])
     assert all(lv["exact_cells_off"] == {"count": 0} for lv in out["levels"])
+    assert all(lv["cells_missing"] == {"count": 0} for lv in out["levels"])
     # node 2 (cells 3 == the member): the close merged exactly the digests the
     # flat fold merges, so the payloads are byte-identical and the error is 0
     f2 = levels[2]["fields"]["h_tdigest"]
@@ -165,6 +166,46 @@ def test_levels_filter_and_missing_artifact(swept, tmp_path):
     _windowed_store(bare, leaves=["1111"])
     out = acc.accuracy_numbers(str(bare), manifest, ["1111"], list(WINDOWS), store_kwargs={})
     assert all(lv["status"].startswith("artifact unreadable") for lv in out["levels"])
+
+
+def test_an_omitted_source_is_not_exact(tmp_path):
+    # A leaf column under node 111 that the sweep never saw (its window left
+    # out of the close). The artifact is dense over the node's children, so the
+    # omission reads as a count gap; an artifact LACKING the parent cell (a
+    # zeroed morton word stands in for a sparse level) reads as ``cells_missing``.
+    import zarr
+
+    root = tmp_path / "s"
+    manifest = _windowed_store(root)
+    by_shard = {d: set(WINDOWS) for d in LEAVES}
+    sweep_stage_pass(str(root), manifest, by_shard, run_id="A", tuple_width=1)
+    res = column_resolutions(manifest["pyramid"]["overviews"], 3)
+    folded = fold_column(_slabs(7), FIELDS, cell_order=5, resolutions=res)
+    write_column(
+        str(root),
+        morton_word("1113"),
+        folded,
+        FIELDS,
+        node_order=3,
+        cell_order=5,
+        window=WINDOWS[0],
+        granule_count=1,
+    )
+
+    def probe():
+        shards = [*LEAVES, "1113"]
+        return acc.level_accuracy(
+            str(root), "111", 2, 3, shards, list(WINDOWS), FIELDS, res, store_kwargs={}
+        )
+
+    out = probe()
+    assert out["sources"] == 5  # 1111 and 1112 x 2 windows, plus 1113's one column
+    assert out["exact"] == {"count": False} and out["exact_cells_off"] == {"count": 1}
+    assert out["cells_missing"] == {"count": 0}
+    words = zarr.open_array(str(root / "1" / "1" / "1" / "all.zarr" / "3" / "morton"), mode="r+")
+    words[0] = 0  # the first child (1111) no longer has a row in the artifact
+    out = probe()
+    assert out["cells_missing"]["count"] > 0 and out["exact"] == {"count": False}
 
 
 def test_rank_errors_are_zero_for_identical_digests():

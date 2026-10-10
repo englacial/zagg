@@ -12,7 +12,8 @@ order, below it). The flat fold is two or three merges from raw whatever the
 level, so the gap between the two is what the cascade's depth costs.
 
 Per level: the exact leg (``count`` at every populated cell equals the flat
-sum — an inequality is a defect, not a tolerance) and, per digest field, the
+sum, and no populated source cell under the node is missing from the artifact
+— ``cells_missing`` — an inequality is a defect, not a tolerance) and, per digest field, the
 **rank error** of the artifact's quantiles under the flat reference's CDF —
 ``cdf_ref(quantile_art(q)) - cdf_ref(quantile_ref(q))`` over the probe quantiles
 and every cell both hold — reported in units of ``1/δ`` (δ the fold budget, ``overview_fold_delta``):
@@ -184,11 +185,18 @@ def level_accuracy(
     index = {int(w): i for i, w in enumerate(art_words)}
     ref_exact = {n: np.zeros(len(art_words), dtype=np.float64) for n in exact}
     ref_parts: dict = {n: [[] for _ in art_words] for n in digests}
+    # a populated source cell under the node whose parent the artifact lacks is
+    # an omission, never skipped silently (the artifact is written dense over
+    # the node's children, so an omitted window reads as a count gap in
+    # ``exact_cells_off``; this catches a level that lacks the cell itself)
+    missing = dict.fromkeys(exact, 0)
     for src in sources:
         rows = _parents(src["morton"], order + (cells - order))  # ancestor at ``cells``
         for j, parent in enumerate(rows):
             i = index.get(int(parent))
             if i is None:
+                for n in exact:
+                    missing[n] += bool(src[n][j])
                 continue
             for n in exact:
                 ref_exact[n][i] += float(src[n][j])
@@ -200,8 +208,10 @@ def level_accuracy(
                             p, meta.get("dtype", "float32"), meta.get("inner_shape", [2])
                         )[:, :2]
                     )
+    out["cells_missing"] = missing
     out["exact"] = {
         n: bool(np.array_equal(np.asarray(art_arrays[n], dtype=np.float64), ref_exact[n]))
+        and missing[n] == 0
         for n in exact
     }
     out["exact_cells_off"] = {
