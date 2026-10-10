@@ -75,23 +75,25 @@ SEMANTIC_PINS = [
 ]
 
 #: (template, pre-epoch ``semantic_hash``, epoch-2 ``semantic_hash``,
-#: build-time sidecar store) — the LIVE STORES' frozen digests, the
-#: int32-``count`` identity the templates carried before issue #626: the v1
-#: ATL03 comparison store's and the v3 store's manifests on disk, and
-#: ``gedi_flux_o9``'s ``morton_hive.json`` (read 2026-09-13, no vendored
-#: manifest; the same known-answer pair ``tests/test_semantics.py`` pins from
-#: the run record).
+#: build-time sidecar store, vendored current-epoch manifest) — the LIVE
+#: STORES' frozen digests, the int32-``count`` identity the templates carried
+#: before issue #626: the v1 ATL03 comparison store's and the v3 store's
+#: manifests on disk, and ``gedi_flux_o9``'s ``morton_hive.json`` (read
+#: 2026-09-13, no vendored manifest; the same known-answer pair
+#: ``tests/test_semantics.py`` pins from the run record).
 LIVE_STORE_HASHES = [
     (
         "atl03_tdigest_strata_healpix",
         json.loads(CA_V1_MANIFEST.read_text())["semantic_hash"],
         json.loads(CA_MANIFEST.read_text())["semantic_hash"],
         "s3://sliderule-public-cors/zagg-index/ATL03/007",
+        CA_MANIFEST,
     ),
     (
         "gedi01b_waveform_healpix_hive",
         "4f8287947a83abd38519372c047e7f4c62c0479d64bc72f6d512eda413d88f63",
         "337b2c3acac928c4b1b708e5895081b407d03001325ca756eb6c600c02b11e96",
+        None,
         None,
     ),
 ]
@@ -148,9 +150,11 @@ def test_template_hashes_are_pinned(name, legacy, current, build_store):
     assert _legacy_hash(cfg, build_store) == legacy
 
 
-@pytest.mark.parametrize(("name", "legacy", "current", "build_store"), LIVE_STORE_HASHES)
+@pytest.mark.parametrize(
+    ("name", "legacy", "current", "build_store", "manifest"), LIVE_STORE_HASHES
+)
 def test_template_diverges_from_the_live_store_by_the_count_dtype_alone(
-    name, legacy, current, build_store
+    name, legacy, current, build_store, manifest
 ):
     # Issue #626: a default build does not reproduce the live store's frozen
     # digest, so the append path refuses it (``_frozen_matches`` compares the
@@ -158,12 +162,20 @@ def test_template_diverges_from_the_live_store_by_the_count_dtype_alone(
     # behind that is count's dtype: int32 back in, every live digest returns.
     from zagg.hive import _frozen_matches
 
+    # The refusal is checked against the vendored live manifest, every other
+    # frozen key held at its live value so the hash is the only difference.
+    # GEDI has no vendored manifest (and a pre-epoch hash, which
+    # ``_frozen_matches`` never matches), so its row pins the digests alone.
+    live = json.loads(manifest.read_text()) if manifest is not None else None
     cfg = default_config(name)
     assert semantic_hash(cfg) != current
-    assert not _frozen_matches({"semantic_hash": current}, {"semantic_hash": semantic_hash(cfg)})
+    if live is not None:
+        assert not _frozen_matches(live, {**live, "semantic_hash": semantic_hash(cfg)})
     cfg.aggregation["variables"]["count"]["dtype"] = "int32"
     assert semantic_hash(cfg) == current
     assert _legacy_hash(cfg, build_store) == legacy
+    if live is not None:
+        assert _frozen_matches(live, {**live, "semantic_hash": semantic_hash(cfg)})
 
 
 @pytest.mark.parametrize(("name", "digests", "orders", "overview_delta"), DECLARED_PINS)
