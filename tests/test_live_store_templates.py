@@ -39,11 +39,13 @@ digest-bearing template.
 """
 
 import json
+from importlib import resources
 from pathlib import Path
 
 import pytest
 
-from zagg.config import default_config
+import zagg.configs
+from zagg.config import default_config, load_config
 from zagg.semantics import semantic_hash, semantic_hash_legacy
 
 CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_v3_morton_hive.json"
@@ -119,6 +121,15 @@ DECLARED_PINS = [
 #: The public sidecar cache (issue #499, moved 2026-09-17): a ``demo/*`` key,
 #: inside the fleet execution role's source.coop grant.
 SIDECAR_STORE = "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007"
+
+#: Every packaged template, plus the out-of-package measurement config that
+#: mirrors the strata template (issue #586).
+PACKAGED_TEMPLATES = sorted(
+    f.name.removesuffix(".yaml")
+    for f in resources.files(zagg.configs).iterdir()
+    if f.name.endswith(".yaml")
+)
+MEASURE_CONFIG = Path(__file__).parents[1] / "tools" / "configs" / "atl03_windowed_measure.yaml"
 
 #: Every packaged template carrying a digest field shares one centroid budget.
 DIGEST_TEMPLATES = [
@@ -205,3 +216,23 @@ def test_every_digest_template_shares_the_uniform_delta(name):
     ragged = [m for m in cfg.aggregation["variables"].values() if m.get("kind") == "ragged"]
     assert ragged
     assert {m["params"]["delta"] for m in ragged} == {4096}
+
+
+def _count_fields(cfg):
+    # The ``len`` fields; a raster template declares no ``variables`` at all.
+    return [m for m in cfg.aggregation.get("variables", {}).values() if m.get("function") == "len"]
+
+
+@pytest.mark.parametrize("name", [*PACKAGED_TEMPLATES, MEASURE_CONFIG])
+def test_every_template_declares_count_int64(name):
+    # Issue #626 ruling: ``count`` (the ``len`` field) is int64 in every
+    # template, so no ladder of any packaged product wraps past 2^31. A
+    # template without a ``len`` field passes vacuously; the next test pins
+    # that the ruling is not vacuous overall.
+    cfg = load_config(str(name)) if isinstance(name, Path) else default_config(name)
+    assert {m["dtype"] for m in _count_fields(cfg)} <= {"int64"}
+
+
+def test_count_bearing_templates_are_the_expected_set():
+    has_count = {name for name in PACKAGED_TEMPLATES if _count_fields(default_config(name))}
+    assert has_count >= {*DIGEST_TEMPLATES, "atl03", "atl06", "atl06_nullable", "atl06_polar"}
