@@ -263,7 +263,7 @@ class TestCanonicalization:
         cfg.aggregation["variables"]["h_min"]["function"] = "max"
         assert semantic_hash(cfg) != base
         cfg = _cfg()
-        cfg.aggregation["variables"]["count"]["dtype"] = "int64"
+        cfg.aggregation["variables"]["count"]["dtype"] = "int32"  # the pre-#626 width
         assert semantic_hash(cfg) != base
         cfg = _cfg()
         cfg.aggregation["variables"]["extra"] = {

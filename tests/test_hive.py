@@ -337,7 +337,7 @@ class TestSemanticManifest:
         import copy
 
         other_cfg = copy.deepcopy(cfg)
-        other_cfg.aggregation["variables"]["count"]["dtype"] = "int64"
+        other_cfg.aggregation["variables"]["count"]["dtype"] = "int32"  # the pre-#626 width
         other = hive.build_manifest(self._grid(other_cfg))
         with pytest.raises(ValueError, match="does not match this run"):
             hive.validate_manifest(root, other)
@@ -381,7 +381,7 @@ class TestSemanticManifest:
         # A DIFFERENT config's pre-epoch digest earns no hint: the probe
         # recognizes this config's own old digest only.
         other = copy.deepcopy(indexed)
-        other.aggregation["variables"]["count"]["dtype"] = "int64"
+        other.aggregation["variables"]["count"]["dtype"] = "int32"  # the pre-#626 width
         with pytest.raises(ValueError) as exc:
             hive.validate_manifest(root, hive.build_manifest(self._grid(other)), config=other)
         assert "issue #499" not in str(exc.value)
@@ -438,7 +438,7 @@ class TestSemanticManifest:
         (root / "-5" / "1").mkdir(parents=True)
         (root / "-5" / "1" / "obj").write_text("x")
         other_cfg = copy.deepcopy(cfg)
-        other_cfg.aggregation["variables"]["count"]["dtype"] = "int64"
+        other_cfg.aggregation["variables"]["count"]["dtype"] = "int32"  # the pre-#626 width
         other = hive.build_manifest(self._grid(other_cfg))
         with pytest.raises(ValueError, match="clear the store root first"):
             hive.ensure_manifest(str(root), other, overwrite=True)

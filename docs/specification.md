@@ -1218,7 +1218,14 @@ so, in every class.
 artifacts, no precision guarantee past the exact levels" posture is
 superseded (espg ruling on the declaring PR): **exact-class** fields are
 exactly correct at every order — the reductions are associative, so the
-pyramid is a true downsampling pyramid for them — and **approximate-class**
+pyramid is a true downsampling pyramid for them, **provided the declared
+`dtype` holds the coarse reductions**: every level carries the field's
+declared dtype (the `dtype` key above, copied from the build config), and a
+`sum` that exceeds it wraps rather than widens. zagg's packaged templates
+declare `count` as `int64` ([#626](https://github.com/englacial/zagg/issues/626):
+an `int32` count summed past 2^31 at orders 1 and 0 of a dense order-9
+store); a reader MUST take `count`'s dtype from the array metadata, never
+assume a width — and **approximate-class**
 fields are **analysis-grade at their recorded generation**: the per-entry
 merges-from-raw count (#381 point (7), recorded in the §4.5 `actuals` and
 per artifact in `zagg_overview`) is
@@ -1244,7 +1251,7 @@ overview family under the versioned `pyramid` block:
     "exact_levels": 1,
     "fields": {
       "count":     {"class": "exact", "method": "sum", "nan_policy": "skip",
-                    "dtype": "int32", "fill_value": 0},
+                    "dtype": "int64", "fill_value": 0},
       "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
                     "dtype": "float32", "inner_shape": [2], "delta": 512},
       "photon_ids": {"class": "none"}
