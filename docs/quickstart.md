@@ -138,7 +138,7 @@ aggregation:
     count:
       function: len
       source: h_li
-      dtype: int32
+      dtype: int64
       fill_value: 0
 
 output:

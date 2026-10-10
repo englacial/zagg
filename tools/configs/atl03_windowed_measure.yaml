@@ -92,17 +92,21 @@
 # locations continuously and has no ``where`` state).
 # Grid geometry: o9 shard / o13 inner chunk / o19 cells.
 #
-# THIS TEMPLATE IS THE BUILD CONFIG OF THE LIVE STORE
-# ``englacial/zagg/demo/atl03_tdigest_o9_v3.zarr`` (issue #547; rebuilt from
-# the packaged atl03_tdigest_strata_healpix template with only the
-# hash-invisible ``output.pyramid`` set to ``{overviews: 13}``, on the 0.57.0
-# fleet, issue #560, 2026-10-08): every key in the
-# D19 semantic core below is what that store's run records carry, and
-# ``tests/test_live_store_templates.py`` pins the template's ``semantic_hash``
-# to the store manifest's frozen value. That is what lets a build from this
-# file APPEND to the live store rather than refuse on the frozen hash -- so a
-# change to any hashed key here (deltas, filters, variables, the index block,
-# ``time_source``) is a new product, and the pin says so.
+# THIS TEMPLATE IS THE LIVE STORE'S BUILD CONFIG WITH ``count`` WIDENED TO
+# INT64 (issue #626). ``englacial/zagg/demo/atl03_tdigest_o9_v3.zarr`` (issue
+# #547; rebuilt from this template with only the hash-invisible
+# ``output.pyramid`` set to ``{overviews: 13}``, on the 0.57.0 fleet, issue
+# #560, 2026-10-08) was built with ``count: int32``; that config lives in the
+# store's run records, and its frozen hash in the vendored manifest
+# ``tests/data/ca_atl03_tdigest_o9_v3_morton_hive.json``.
+# Every other key in the D19 semantic core below is what that store's run
+# records carry, but ``count``'s dtype is hashed, so a build from this file
+# REFUSES to append to the live store on the frozen ``semantic_hash`` until
+# the store is rebuilt as a new product (v3 then stays the comparison store,
+# as v1 did). ``tests/test_live_store_templates.py`` pins this template's
+# hash and proves ``count`` is the only divergence from the live one; a
+# change to any other hashed key here (deltas, filters, variables, the index
+# block, ``time_source``) is a further new product, and the pin says so.
 data_source:
   reader: h5coro
   driver: s3
@@ -164,7 +168,7 @@ aggregation:
     count:
       function: len
       source: h_ph
-      dtype: int32
+      dtype: int64
       fill_value: 0
     # The signal predicate below and the composition ``threshold`` MUST agree:
     # both commit the same ``conf >= 2`` cut (i.e. the ATBD ``> 1``).

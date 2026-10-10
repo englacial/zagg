@@ -877,7 +877,7 @@ class TestPyramidBlock:
             "class": "exact",
             "method": "sum",
             "nan_policy": "skip",
-            "dtype": "int32",
+            "dtype": "int64",  # issue #626
             "fill_value": 0,
         }
         assert overview["fields"]["h_min"] == {

@@ -1,11 +1,14 @@
 # GEDI L1B waveform flux t-digest (HEALPix, hive store layout) -- issue #425.
 #
-# THIS TEMPLATE IS THE BUILD CONFIG OF THE LIVE STORE
-# ``englacial/zagg/demo/gedi_flux_o9.zarr`` (issue #547): its D19
-# ``semantic_hash`` is pinned to the store manifest's frozen value in
-# ``tests/test_live_store_templates.py``, so a build from this file appends
-# to that store; a change to any hashed key is a new product and the pin
-# says so.
+# THIS TEMPLATE IS THE LIVE STORE'S BUILD CONFIG WITH ``count`` WIDENED TO
+# INT64 (issue #626). ``englacial/zagg/demo/gedi_flux_o9.zarr`` (issue #547)
+# was built with ``count: int32``; that config is its run record (vendored as
+# ``tests/data/gedi_flux_o9.config.json``). ``count``'s dtype is hashed, so a
+# build from this file REFUSES to append to the live store on the frozen
+# ``semantic_hash`` until the store is rebuilt as a new product.
+# ``tests/test_live_store_templates.py`` pins this template's hash and proves
+# ``count`` is the only divergence from the live one; a change to any other
+# hashed key is a further new product, and the pin says so.
 # The vlen-grammar template (issue #422 rulings): GEDI is pure config -- the
 # three generic primitives (origin-aware ragged gather, expand-by-count,
 # linspace coordinate synthesis) turn each waveform sample into an ordinary
@@ -170,7 +173,7 @@ aggregation:
     count:
       function: len
       source: rxwaveform
-      dtype: int32
+      dtype: int64
       fill_value: 0
     rx_flux:
       # Per-cell flux-weighted elevation digest: (k, 2) ragged payload of

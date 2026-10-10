@@ -111,15 +111,18 @@ class TestLiveCaManifestFixture:
             k: v for k, v in published["overview"].items() if k != "fields"
         }
         # The per-field map is the ONLY divergence, and only in the ruled
-        # entries: count byte-identical, the two strata fields the phase-2
-        # admission, composition the phase-3 packed declaration.
+        # entries: count by its dtype alone (int64 since issue #626), the two
+        # strata fields the phase-2 admission, composition the phase-3 packed
+        # declaration.
         fields = block["overview"]["fields"]
         assert set(fields) == set(CA_FIELDS_BEFORE)
         assert [n for n in CA_FIELDS_BEFORE if fields[n] != CA_FIELDS_BEFORE[n]] == [
+            "count",
             "h_tdigest_signal",
             "h_tdigest_noise",
             "composition",
         ]
+        assert fields["count"] == {**CA_FIELDS_BEFORE["count"], "dtype": "int64"}
         assert fields["h_tdigest_signal"]["class"] == "approximate"
         assert fields["composition"]["class"] == "packed"
 
@@ -199,11 +202,11 @@ class TestD24Classification:
         # The before/after known-answer: phase 1 asserted ``fields ==
         # CA_FIELDS_BEFORE`` (today's classifier reproduced the v1 store's
         # declaration exactly); the admissions change ONLY the ruled entries —
-        # count is untouched, the strata declare the digest fold (phase 2),
-        # composition the packed one (phase 3).
+        # count only by its width (int64 since issue #626), the strata declare
+        # the digest fold (phase 2), composition the packed one (phase 3).
         fields, excluded = declared_fields(default_config("atl03_tdigest_strata_healpix"))
         assert fields != CA_FIELDS_BEFORE
-        assert fields["count"] == CA_FIELDS_BEFORE["count"]
+        assert fields["count"] == {**CA_FIELDS_BEFORE["count"], "dtype": "int64"}
         assert fields["composition"] == {
             "class": "packed",
             "method": "composition_kway",
