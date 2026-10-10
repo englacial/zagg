@@ -348,7 +348,7 @@ def test_ladder_and_stage_runs(arms):
     )
     assert o3["wall_s"]["p100"] == 12.0 and o3["window_wall_s"]["p50"] == 10.0
     assert o3["close_wall_s"]["p100"] == 3.0
-    assert o3["fold_cells_read"] == 144 and o3["fold_cells_read_per_node"] == 24.0
+    assert o3["fold_cells_read"] == 144 and o3["fold_cells_read_per_node_unit"] == 24.0
     assert o3["fold_peak_cells"] == 32 and o3["worker_s"] == 23.0
     assert (o0["dispatch_order"], o0["failed"], o0["whole_invokes"]) == (0, 1, 0)
     b = base["stage_runs"]["latest"]
@@ -387,7 +387,7 @@ def test_prints_one_column_per_arm(arms, capsys):
         "  x one full row",
         "non-leaf overviews objects / bytes",
         "stage invokes per order",
-        "stage fold cells read per node per order",
+        "stage fold cells read per node-unit per order",
         "barrier timed out / short orders",
         "all-time probe orders",
         "cost USD leaf / stage / total",

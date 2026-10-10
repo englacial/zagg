@@ -21,7 +21,7 @@ Given one or more hive store roots — the arms of one order-6 cell built with
   newest kept apart) summed per ``dispatch_order``, plus every fleet stage run
   under ``<store>.status/run-stage-*/`` (``stage-<order>-<batch>.json`` per
   invoke and the ``finisher.json``): invokes per order, wall per invoke by unit
-  kind, worker seconds, ``fold_cells_read`` per node, ``fold_peak_cells``,
+  kind, worker seconds, ``fold_cells_read`` per node-unit, ``fold_peak_cells``,
   ``barrier_timed_out`` / ``short_orders``, failed units;
 - the all-time accuracy leg (``windowed_emit_accuracy.py``): the all-time
   overview at one node per ladder level against a flat fold of the same leaves
@@ -622,7 +622,9 @@ def _stage_run(status, prefix: str, workers: int) -> dict:
         row = {"dispatch_order": order, **agg}
         for k in ("wall_s", "window_wall_s", "close_wall_s"):
             row[k] = _quantiles(agg[k])
-        row["fold_cells_read_per_node"] = (
+        # per node-UNIT: on a windowed arm a node has W + 1 units (each window
+        # and the close), each counted in ``nodes``
+        row["fold_cells_read_per_node_unit"] = (
             agg["fold_cells_read"] / agg["nodes"] if agg["nodes"] else None
         )
         per_order.append(row)
@@ -933,8 +935,8 @@ def table_rows(results: list[dict]) -> list[tuple]:
             lambda r: _run_orders(r, lambda o: o["close_wall_s"]["p100"]),
         ),
         (
-            "stage fold cells read per node per order",
-            lambda r: _run_orders(r, lambda o: o["fold_cells_read_per_node"]),
+            "stage fold cells read per node-unit per order",
+            lambda r: _run_orders(r, lambda o: o["fold_cells_read_per_node_unit"]),
         ),
         (
             "stage worker_s / finisher_s / failed",
