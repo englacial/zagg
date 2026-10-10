@@ -529,7 +529,14 @@ class TestCoordinateAndDense:
     def test_count_field_matches_expected(self, name):
         exp = _expected(name)
         arr = self._open(name, exp, "count")
-        assert arr.dtype == np.int32
+        # §4.4: a reader takes ``count``'s width from the array metadata, never
+        # a literal (issue #626) -- so cross-check it against the width the
+        # fixture's own manifest declares, which follows a regeneration.
+        manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
+        fields = (manifest.get("pyramid") or {}).get("overview", {}).get("fields", {})
+        assert arr.dtype.kind == "i"
+        if "count" in fields:
+            assert arr.dtype == np.dtype(fields["count"]["dtype"])
         counts = np.asarray(arr[:])
         by_cell = {c["index"]: c["count"] for c in exp["cells"]}
         for cell in range(counts.shape[0]):
