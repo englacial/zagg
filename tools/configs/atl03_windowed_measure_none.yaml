@@ -34,29 +34,49 @@
 # (``process-shard-8192-disk``; env ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME``
 # overrides). The leaf fan-out stays on ``worker:`` below.
 #
-# Cost estimate per arm (issue #602 phase 3), extrapolated from the 0.55.0 run's
-# GB-seconds (issue #586 phase 1: baseline 60,018 GB-s read+aggregate over 64
-# invokes plus a 69.7 s/unit write side; yearly fan-out 84,989 GB-s over 448
-# invokes plus 23.0 s/unit) at $0.0000133334 per GB-s (arm64): the marginal
-# leaf costs 125.9 GB-s under per-window fan-out and ~74.7 GB-s under bulk emit
-# (the 12.8 s per-invoke read floor removed); the ladder is 27 nodes x (W + 1)
-# stage units at the 8 GB tier, 10-16 s each (the 0.55.0 relay re-stage ran
-# 16 s per (node, window); the #621 cascade is cheaper per node).
+# Cost estimate per arm (issue #602 phase 3), extrapolated from the 0.55.0 run
+# (issue #586 phase 1) at $0.0000133334 per GB-s (arm64). Inputs: baseline
+# 60,018.3 GB-s read+aggregate over 64 invokes + 64 x 69.7 s x 4 GB write side
+# = 77,862 GB-s; yearly fan-out 84,989.3 GB-s over 448 invokes + 448 x 23.0 s
+# x 4 GB = 126,205 GB-s; ladder 27 nodes x (W + 1) stage units x 10-16 s x 8 GB
+# (the 0.55.0 relay re-stage ran 16 s per (node, window); the #621 cascade is
+# cheaper per node; the baseline ladder is the 2,912 GB-s measured).
 #
-#   arm        leaves   leaf side (bulk)   leaf side (unit: window)   ladder          total
-#   none           64     77,862 GB-s $1.04        -                    2,912 $0.04     ~$1.08
-#   yearly        448    106,544 GB-s $1.42   126,205 GB-s $1.68      17-28k $0.23-0.37  ~$1.65-1.79
-#   quarterly   1,792    206,935 GB-s $2.76   295,409 GB-s $3.94     63-100k $0.84-1.34  ~$3.6-4.1
-#   monthly     5,376    474,643 GB-s $6.33   746,617 GB-s $9.95    184-294k $2.45-3.92  ~$8.8-10.3
+# Two per-extra-leaf figures, and what each is:
+#   - measured marginal: (126,205 - 77,862) / 384 = 125.9 GB-s per extra leaf
+#     under fan-out, less the 12.8 s per-invoke read floor (x 4 GB) a bulk
+#     invoke pays once = 74.7 GB-s = 18.7 s at 4 GB. The bulk column uses it.
+#   - regression floors: ~33 s per extra leaf (18.4 s aggregate + ~15 s write),
+#     the per-window fan-out floors -- an upper bound for the bulk increment.
+# Per-shard bulk wall, from the baseline's 219 s p50 / 440 s max read+aggregate
+# plus its 69.7 s write side, then (W - 1) extra leaves at 18.7-33 s:
+#   yearly    ~400-490 s p50 /   ~620-710 s max   (fits)
+#   quarterly ~790-1,180 s p50 / ~1,010-1,400 s max (marginal to over the wall)
+#   monthly   ~1,840-3,030 s p50 / ~2,060-3,250 s max (over the wall)
 #
-# The dispatcher's printed ceiling (64 x 4 GB x 900 s) is $3.07 per arm; under
-# ``unit: window`` it scales with the units ($21.50 / $86.02 / $258.05). Whether
-# one invoke per shard FITS the 900 s wall is what the run measures: at the
-# fan-out's per-window floors (~18 s aggregate + ~15 s write per extra leaf,
-# on a 219 s p50 / 440 s max read+aggregate) the yearly arm projects to
-# ~420 s p50 / ~640 s max, the quarterly arm to ~1,100 s and the monthly arm to
-# ~3,000 s -- so expect the two finer arms to need ``unit: window`` (or the
-# window groups of issue #596) and record that as the result.
+#   arm        leaves   leaf side (bulk)    leaf side (unit: window)   ladder
+#   none           64     77,862 GB-s $1.04        -                    2,912 GB-s $0.04
+#   yearly        448    106,544 GB-s $1.42   126,205 GB-s $1.68      17-28k $0.23-0.37
+#   quarterly   1,792    206,935 GB-s $2.76   295,409 GB-s $3.94     63-100k $0.84-1.34
+#   monthly     5,376    474,643 GB-s $6.33   746,617 GB-s $9.95    184-294k $2.45-3.92
+#
+# A bulk arm that times out bills every invoke the full wall, 64 x 900 s x 4 GB
+# = 230,400 GB-s = $3.07 (the dispatcher's printed ceiling), and then needs
+# the ``unit: window`` re-run (its ceiling scales with the units: $21.50 /
+# $86.02 / $258.05). The monthly bulk figure (474,643 GB-s = 1,854 s per
+# invoke) is more than 64 x 900 s can bill, so that arm cannot complete bulk.
+# Per arm (leaf side + ladder):
+#   none       ~$1.08
+#   yearly     ~$1.65-1.79 (fits)
+#   quarterly  ~$3.59-4.10 if it fits; else ~$7.85-8.35 (timed-out attempt
+#              $3.07 + re-run $3.94 + ladder)
+#   monthly    ~$15.47-16.94 (timed-out attempt $3.07 + re-run $9.95 + ladder)
+# All four arms: ~$15.1-17.2 if both finer arms fit (the bulk model's figures,
+# monthly $8.78-10.25), ~$26.0-28.2 if neither does.
+#
+# Whether one invoke per shard FITS the 900 s wall is what the run measures; an
+# arm that does not is recorded as the result and re-run with ``unit: window``
+# (or the window groups of issue #596) into its own store.
 #
 # Operator invocation (live AWS -- espg runs it; the runbook is
 # demo/18_schedule_measure_2026-10.ipynb, the readout
