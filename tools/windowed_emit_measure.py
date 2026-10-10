@@ -26,8 +26,10 @@ Given one or more hive store roots — the arms of one order-6 cell built with
 - the all-time accuracy leg (``windowed_emit_accuracy.py``): the all-time
   overview at one node per ladder level against a flat fold of the same leaves
   — exact ``count`` and the digests' rank error in units of 1/δ;
-- cost: the leaf fan-out's billed GB-seconds (``duration_total_s x`` the
-  invoke's memory, falling back to the self-reported ``gb_seconds``), the
+- cost: the leaf fan-out's billed GB-seconds over EVERY invoke, failed ones
+  included (``duration_total_s x`` the invoke's memory, falling back to the
+  self-reported ``gb_seconds``; a timed-out invoke with no recorded wall at
+  ``FUNCTION_TIMEOUT_S`` x its memory, as Lambda bills it), the
   stage runs' (``duration_s x`` the 8 GB tier) and the finisher's, priced at
   ``zagg.dispatch.LAMBDA_PRICE_PER_GB_SEC``.
 
@@ -187,7 +189,10 @@ def _billed_gb_seconds(invokes) -> float | None:
     worker prices ``duration_total_s`` — or ``duration_s`` before issue #589 —
     times its memory, ``telemetry.build_record``) where it carries one, else
     that product recomputed from the row (``lambda_memory_mb``, 4096 when
-    unrecorded). ``None`` when no invoke has any of it."""
+    unrecorded). A failed invoke prices whatever wall it carries, except a
+    timed-out one with none (the dispatcher's ``failure_record`` stamps
+    ``duration_s`` 0): Lambda billed it the full :data:`FUNCTION_TIMEOUT_S`.
+    ``None`` when no invoke has any of it."""
     import pandas as pd
 
     if len(invokes) == 0:
@@ -199,6 +204,9 @@ def _billed_gb_seconds(invokes) -> float | None:
         errors="coerce",
     )
     wall = col("duration_total_s").where(col("duration_total_s").notna(), col("duration_s"))
+    if "error_class" in invokes:
+        timed_out = invokes["error_class"].fillna("").astype(str).str.contains(_TIMEOUT, case=False)
+        wall = wall.where(~(timed_out & wall.fillna(0).eq(0)), FUNCTION_TIMEOUT_S)
     computed = wall * col("lambda_memory_mb").fillna(4096) / 1024.0
     recorded = col("gb_seconds")
     billed = recorded.where(recorded.notna(), computed)
@@ -239,8 +247,10 @@ def fleet_numbers(store) -> dict:
         "max_memory_mb": _quantiles(ok_invokes.get("max_memory_mb", [])),
         "errors": int((~df["success"]).sum()) if "success" in df else 0,
         "timeouts": timeouts,
+        # self-reported: the successful invokes' own figure; billed: every
+        # invoke, a timed-out one at the full function wall
         "gb_seconds": _total(ok_invokes, "gb_seconds"),
-        "billed_gb_seconds": _billed_gb_seconds(ok_invokes),
+        "billed_gb_seconds": _billed_gb_seconds(_invokes(df)),
         "n_obs": _total(ok, "n_obs"),
         # one invoke per shard fit the function wall: no timeout, no error, and
         # the slowest invoke's billed wall under the ceiling
