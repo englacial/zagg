@@ -27,9 +27,10 @@
 # object size therefore uses 16,384 B per occupied inner chunk + 4,100 B index;
 # the readout derives both from the leaf's zarr.json so a later dtype moves it.
 #
-# The staged tail: the ladder fans one stage invoke per (node, window) plus one
-# close per node (the all-time fold) and every stage invoke goes to the 8,192 MB
-# tier -- the run's function family with ``-8192-disk``
+# The staged tail: on the windowed arms the ladder fans one stage invoke per
+# (node, window) plus one close per node (the all-time fold); the unwindowed arm
+# runs one stage unit per node and no close. Every arm's stage invokes go to the
+# 8,192 MB tier -- the run's function family with ``-8192-disk``
 # (``process-shard-8192-disk``; env ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME``
 # overrides). The leaf fan-out stays on ``worker:`` below.
 #
