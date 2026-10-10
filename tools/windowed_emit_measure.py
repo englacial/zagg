@@ -33,6 +33,13 @@ Given one or more hive store roots — the arms of one order-6 cell built with
   stage runs' (``duration_s x`` the 8 GB tier) and the finisher's, priced at
   ``zagg.dispatch.LAMBDA_PRICE_PER_GB_SEC``.
 
+An arm that does not fit one invoke per shard is re-run with
+``output.windowing.unit: window`` into its OWN store
+(``_measure_<arm>_window.zarr``, the runbook
+``demo/18_schedule_measure_2026-10.ipynb``), so each column reads one run; a
+store that does hold several runs still counts a re-run ``(shard, window)``
+once in ``leaves`` and prints ``fits_one_invoke`` per run parquet.
+
 Icechunk is OFF on a windowed store (spec section 11.6), so its stage rows
 carry no ``icechunk_*`` keys and the table prints ``-`` (not measured), not
 ``0``. Read-only: LISTs and small GETs, nothing written. Operator tool (the
@@ -122,14 +129,14 @@ def _stats(values) -> dict:
 
 
 def _run_frames(store) -> list:
-    """Every ``stats_*.parquet`` at the root, one frame each."""
+    """Every ``stats_*.parquet`` at the root, one frame each, oldest first (the
+    key is timestamp-first, ``telemetry.run_parquet_key``)."""
     import pandas as pd
 
-    return [
-        pd.read_parquet(io.BytesIO(_get(store, o["path"])), engine="fastparquet")
-        for o in _root_objects(store)
-        if _RUN_PARQUET.match(o["path"].rsplit("/", 1)[-1])
-    ]
+    names = sorted(
+        o["path"] for o in _root_objects(store) if _RUN_PARQUET.match(o["path"].rsplit("/", 1)[-1])
+    )
+    return [pd.read_parquet(io.BytesIO(_get(store, n)), engine="fastparquet") for n in names]
 
 
 def _concat(frames):
@@ -213,6 +220,28 @@ def _billed_gb_seconds(invokes) -> float | None:
     return float(billed.sum()) if billed.notna().any() else None
 
 
+def _timeouts(df) -> int:
+    if "error_class" not in df:
+        return 0
+    return int(df["error_class"].fillna("").str.contains(_TIMEOUT, case=False).sum())
+
+
+def _fits_one_invoke(df) -> bool:
+    """One invoke per shard fit the function wall: no timeout, no error, and
+    the slowest successful invoke's billed wall under the ceiling."""
+    ok = df[df["success"]] if "success" in df else df
+    invokes = _invokes(ok)
+    wall = invokes.get("duration_total_s")
+    wall = wall if wall is not None and wall.notna().any() else invokes.get("duration_s")
+    return bool(
+        _timeouts(df) == 0
+        and ("success" not in df or df["success"].all())
+        and wall is not None
+        and wall.notna().any()
+        and float(wall.max()) < FUNCTION_TIMEOUT_S
+    )
+
+
 def fleet_numbers(store) -> dict:
     """The run-parquet summary: every ``stats_*.parquet`` at the root, concatenated.
 
@@ -229,38 +258,27 @@ def fleet_numbers(store) -> dict:
     # distinct windows per shard, None (unwindowed) counting as one: a re-run of
     # the same (shard, window) unit is one leaf, not two
     per_shard = ok.groupby("shard_key")["window"].nunique(dropna=False)
-    timeouts = (
-        int(df["error_class"].fillna("").str.contains(_TIMEOUT, case=False).sum())
-        if "error_class" in df
-        else 0
-    )
-    wall = ok_invokes.get("duration_total_s")
-    wall = wall if wall is not None and wall.notna().any() else ok_invokes.get("duration_s")
     out = {
         "runs": len(frames),
         "units": int(len(_invokes(df))),
         "shards": int(ok["shard_key"].nunique()),
-        "leaves": int(len(ok)),
+        # distinct (shard, window) leaves: a re-run of the same unit is one leaf
+        "leaves": int(len(ok.drop_duplicates(subset=["shard_key", "window"]))),
         "windows_per_shard": _quantiles(per_shard.values),
         "duration_s": _quantiles(ok_invokes.get("duration_s", [])),
         "duration_total_s": _quantiles(ok_invokes.get("duration_total_s", [])),
         "max_memory_mb": _quantiles(ok_invokes.get("max_memory_mb", [])),
         "errors": int((~df["success"]).sum()) if "success" in df else 0,
-        "timeouts": timeouts,
+        "timeouts": _timeouts(df),
         # self-reported: the successful invokes' own figure; billed: every
         # invoke, a timed-out one at the full function wall
         "gb_seconds": _total(ok_invokes, "gb_seconds"),
         "billed_gb_seconds": _billed_gb_seconds(_invokes(df)),
         "n_obs": _total(ok, "n_obs"),
-        # one invoke per shard fit the function wall: no timeout, no error, and
-        # the slowest invoke's billed wall under the ceiling
-        "fits_one_invoke": bool(
-            timeouts == 0
-            and ("success" not in df or df["success"].all())
-            and wall is not None
-            and wall.notna().any()
-            and float(wall.max()) < FUNCTION_TIMEOUT_S
-        ),
+        "fits_one_invoke": _fits_one_invoke(df),
+        # the same verdict per run parquet (oldest first), so a store holding
+        # a bulk attempt and a re-run still shows each run's
+        "fits_one_invoke_by_run": [_fits_one_invoke(g) for _, g in df.groupby("_run")],
     }
     for col in sorted(c for c in ok.columns if c.startswith("phase_")):
         out[col] = _quantiles(ok_invokes[col])
@@ -778,6 +796,14 @@ def _stat(d: dict | None, *keys):
     return {k: d.get(k) for k in keys}
 
 
+def _fits_cell(fleet: dict) -> str:
+    """The fit verdict; per run (``yes,no``) when the store holds several."""
+    by_run = fleet.get("fits_one_invoke_by_run") or []
+    if len(by_run) > 1:
+        return ",".join(_fmt(v) for v in by_run)
+    return _fmt(fleet.get("fits_one_invoke"))
+
+
 def table_rows(results: list[dict]) -> list[tuple]:
     arrays = sorted({a for r in results for a in r["objects"].get("leaf_bytes_by_array", {})})
     classes = sorted({c for r in results for c in r.get("non_leaf", {})})
@@ -799,7 +825,7 @@ def table_rows(results: list[dict]) -> list[tuple]:
             "errors / timeouts / fits 1 invoke",
             lambda r: (
                 f"{r['fleet'].get('errors')} / {r['fleet'].get('timeouts')} / "
-                f"{_fmt(r['fleet'].get('fits_one_invoke'))}"
+                f"{_fits_cell(r['fleet'])}"
             ),
         ),
         (

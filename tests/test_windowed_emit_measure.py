@@ -437,6 +437,9 @@ def test_a_rerun_unit_is_not_an_extra_window(tmp_path, windows):
     fleet = tool.measure(root, store_kwargs={}, accuracy=False)["fleet"]
     assert fleet["runs"] == 2 and fleet["units"] == 2 * len(windows or (None,)) + 1
     assert fleet["windows_per_shard"]["p100"] == len(windows or (None,))
+    # the re-run (shard, window) is one leaf, not two; each run fits on its own
+    assert fleet["leaves"] == 2 * len(windows or (None,))
+    assert fleet["fits_one_invoke_by_run"] == [True, True]
 
 
 def test_timeouts_match_the_dispatcher_error_strings(tmp_path):
@@ -451,6 +454,9 @@ def test_timeouts_match_the_dispatcher_error_strings(tmp_path):
     fleet = tool.measure(root, store_kwargs={}, accuracy=False)["fleet"]
     assert fleet["errors"] == 3 and fleet["timeouts"] == 2
     assert fleet["fits_one_invoke"] is False
+    # the first run fit; only the run that timed out does not
+    assert fleet["fits_one_invoke_by_run"] == [True, False]
+    assert tool._fits_cell(fleet) == "yes,no"
 
 
 def test_a_timed_out_invoke_is_billed_the_function_wall(tmp_path):
