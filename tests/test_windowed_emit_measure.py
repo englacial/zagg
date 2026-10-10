@@ -44,6 +44,8 @@ COUNT_ZARR_JSON = {
     ],
 }
 CHUNK_B, INDEX_B = 16, 68
+#: The leaf's cell-order group (``<leaf>.zarr/6/zarr.json``), beside its arrays.
+GROUP_ZARR_JSON = {"zarr_format": 3, "node_type": "group"}
 #: Occupied inner chunks per (shard index, window index): the second shard's
 #: leaves are fuller, every window differs.
 OCCUPANCY = {(0, 0): 1, (0, 1): 2, (0, 2): 3, (1, 0): 4, (1, 1): 2, (1, 2): 4}
@@ -51,6 +53,7 @@ OCCUPANCY = {(0, 0): 1, (0, 1): 2, (0, 2): 3, (1, 0): 4, (1, 1): 2, (1, 2): 4}
 
 def _write_leaf_arrays(leaf: Path, occupied: int) -> None:
     (leaf / "6" / "count").mkdir(parents=True)
+    (leaf / "6" / "zarr.json").write_text(json.dumps(GROUP_ZARR_JSON))
     (leaf / "6" / "count" / "zarr.json").write_text(json.dumps(COUNT_ZARR_JSON))
     (leaf / "6" / "count" / "c").mkdir()
     (leaf / "6" / "count" / "c" / "0").write_bytes(b"x" * (INDEX_B + occupied * CHUNK_B))
@@ -60,9 +63,10 @@ def _write_leaf_arrays(leaf: Path, occupied: int) -> None:
 
 
 def _store(tmp_path, *, windows, versioned_first=False):
-    """Two shards under node ``1/1/1/1``; per window one leaf of 5 objects
-    (``zarr.json`` + 4 array objects), a column per window at the shard node,
-    overviews above it, a node sidecar, run parquets and stage records."""
+    """Two shards under node ``1/1/1/1``; per window one leaf of 6 objects
+    (``zarr.json``, the cell-order group ``6/zarr.json`` + 4 array objects), a
+    column per window at the shard node, overviews above it, a node sidecar,
+    run parquets and stage records."""
     root = tmp_path / ("windowed" if windows else "baseline")
     root.mkdir()
     temporal = {"schedule": "yearly"} if windows else None
@@ -249,17 +253,20 @@ def test_tree_numbers_leaves_arrays_and_siblings(arms):
     base, win = arms
     assert base["objects"]["leaves_per_shard"]["p50"] == 1.0
     assert win["objects"]["leaves_per_shard"]["p50"] == 3.0
-    # a leaf is zarr.json + count/zarr.json + count, morton, digest chunks = 5 objects
-    assert base["objects"]["objects_per_shard"]["p50"] == 5.0
-    # 3 leaves x 5, plus the first shard's retried leaf keeps its stale version's 4 objects
-    assert win["objects"]["objects_per_shard"] == {"p50": 17.0, "p90": 18.6, "p100": 19.0}
+    # a leaf is zarr.json + 6/zarr.json + count/zarr.json + count, morton, digest chunks = 6
+    assert base["objects"]["objects_per_shard"]["p50"] == 6.0
+    # 3 leaves x 6, plus the first shard's retried leaf keeps its stale version's 5 objects
+    assert win["objects"]["objects_per_shard"] == {"p50": 20.5, "p90": 22.5, "p100": 23.0}
     assert base["objects"]["leaves"] == 2 and win["objects"]["leaves"] == 6
     by_array = base["objects"]["leaf_bytes_by_array"]
     assert by_array["morton"] == 200 and by_array["h_tdigest_signal"] == 600
     assert (
         by_array["count"] == 2 * len(json.dumps(COUNT_ZARR_JSON)) + 2 * INDEX_B + (1 + 4) * CHUNK_B
     )
-    assert "(leaf metadata)" in by_array
+    # the leaf stamp and the cell-order group ``6/zarr.json`` are leaf metadata, not an array
+    stamp = json.dumps({"attributes": {"morton_hive_commit": {"complete": True}}})
+    assert "zarr.json" not in by_array
+    assert by_array["(leaf metadata)"] == 2 * (len(stamp) + len(json.dumps(GROUP_ZARR_JSON)))
     assert base["objects"]["total_leaf_bytes"] == sum(by_array.values())
     # siblings at the shard node, keyed by stem; overviews above the node are not siblings
     assert base["objects"]["sibling_bytes"] == {"all.pyramid": 20, "stats.json": 10}
@@ -402,6 +409,7 @@ def test_prints_one_column_per_arm(arms, capsys):
         ("1/1/all.zarr/3/count/c/0", ("overviews", ("1/1", "all"))),
         ("1/1/2019.zarr/zarr.json", ("overviews", ("1/1", "2019"))),
         ("1/1/1/1/1111.zarr/zarr.json", ("leaf", ("1111", None, None, None, False))),
+        ("1/1/1/1/1111.zarr/6/zarr.json", ("leaf", ("1111", None, None, None, False))),
         ("1/1/1/1/1111_2019.zarr/6/count/c/0", ("leaf", ("1111", "2019", None, "count", True))),
         (
             "1/1/1/1/1111_2019.zarr/6/count/zarr.json",
