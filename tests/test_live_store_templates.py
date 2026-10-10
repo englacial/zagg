@@ -1,23 +1,23 @@
-"""The packaged templates that ARE the live stores' build configs (issue #547).
+"""The packaged templates that carry the live stores' build configs (issue #547).
 
 ``atl03_tdigest_strata_healpix`` and ``gedi01b_waveform_healpix_hive`` carry,
 key for key, the configs that built ``atl03_tdigest_o9_v3`` and
 ``gedi_flux_o9`` (the GEDI one recovered from the store's run record, espg
-ruling 2026-09-13: the packaged template matches what is live, so a default
-build APPENDS instead of refusing on the frozen ``semantic_hash``; the ATL03
-store was rebuilt from the packaged template on the 0.57.0 fleet, issue
-#560). The anchor is the store MANIFEST's frozen hash, vendored for ATL03 in
+ruling 2026-09-13; the ATL03 store was rebuilt from the packaged template on
+the 0.57.0 fleet, issue #560) -- with ONE deliberate exception since issue
+#626: ``count`` is ``int64`` in the templates and ``int32`` in the stores, so
+a default build no longer appends to either store (below). The anchor is the
+store MANIFEST's frozen hash, vendored for ATL03 in
 ``tests/data/ca_atl03_tdigest_o9_v3_morton_hive.json``. The v3 store was born
-after the issue #499 index epoch, so its frozen hash is the template's
+after the issue #499 index epoch, so its frozen hash is the int32 config's
 CURRENT digest -- the one ``sweep_overview._semantic_guard`` and
-``hive._frozen_matches`` compare, so the append lands with no migration. The
-pre-epoch stores -- ``gedi_flux_o9``, and the v1 ``atl03_tdigest_o9``
-retained as the comparison store (its manifest stays vendored in
-``tests/data/ca_atl03_tdigest_o9_morton_hive.json``) -- are frozen at the
-templates' LEGACY digests, so each pin carries both columns and an append
-there lands after ``declare_pyramid`` migrates the store. A canonicalization
-change or a template edit that moves either hash surfaces here, not at the
-operator's console.
+``hive._frozen_matches`` compare. The pre-epoch stores -- ``gedi_flux_o9``,
+and the v1 ``atl03_tdigest_o9`` retained as the comparison store (its
+manifest stays vendored in ``tests/data/ca_atl03_tdigest_o9_morton_hive.json``)
+-- are frozen at the LEGACY digests, so each pin carries both columns and an
+append there lands only after ``declare_pyramid`` migrates the store. A
+canonicalization change or a template edit that moves either hash surfaces
+here, not at the operator's console.
 
 **The issue #626 epoch.** ``count`` is ``int64`` in every packaged template
 (espg ruling 2026-10-09: the int32 ladder wrapped past 2^31 at orders 1 and
