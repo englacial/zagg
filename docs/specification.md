@@ -1220,8 +1220,9 @@ superseded (espg ruling on the declaring PR): **exact-class** fields are
 exactly correct at every order — the reductions are associative, so the
 pyramid is a true downsampling pyramid for them, **provided the declared
 `dtype` holds the coarse reductions**: every level carries the field's
-declared dtype (the `dtype` key above, copied from the build config), and a
-`sum` that exceeds it wraps rather than widens. zagg's packaged templates
+declared dtype (the per-field `dtype` of the §4.5 `pyramid` block below,
+copied from the build config), and a `sum` that exceeds it wraps rather than
+widens. zagg's packaged templates
 declare `count` as `int64` ([#626](https://github.com/englacial/zagg/issues/626):
 an `int32` count summed past 2^31 at orders 1 and 0 of a dense order-9
 store); a reader MUST take `count`'s dtype from the array metadata, never
