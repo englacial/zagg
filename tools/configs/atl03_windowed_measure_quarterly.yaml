@@ -14,6 +14,13 @@
 # ``windowing.unit: shard`` (one invoke per shard emits every window, issue
 # #586 phase 2); if an arm does not fit one invoke per shard that is a result:
 # record it, then re-run that arm with ``output.windowing.unit: window``.
+# The configs differ ONLY in ``output.windowing``, but the RUNS also differ in
+# Icechunk: an unset ``output.icechunk`` resolves ON for the unwindowed hive arm
+# and OFF for the windowed arms (``get_icechunk``, spec section 11.6), so only
+# the ``none`` arm's ladder commits Icechunk and only its stage rows carry
+# ``icechunk_*`` counters (the readout prints ``-`` for the windowed arms). The
+# ladder wall time and ``icechunk_*`` numbers compare like for like only once
+# windowed Icechunk (issue #584) lands; the leaf/object/fleet numbers compare now.
 #
 # ``count`` is ``int32`` (4 B/cell) on every arm: the 0.59.0 fleet predates the
 # issue #626 dtype fix (espg ruling 2026-10-09). Occupancy from the ``count``
