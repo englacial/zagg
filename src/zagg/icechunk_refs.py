@@ -1071,6 +1071,9 @@ def _commit(
 ) -> tuple[str, int]:
     """Commit with rebase-on-conflict; returns ``(snapshot_id, rebases)``.
 
+    A rebase that fails raises ``RebaseFailedError`` carrying ``rebases``, the
+    rounds run (the failed one included), so a replay's record keeps them.
+
     The loop is icechunk's own ``rebase_with`` pattern, unrolled so the
     attempt count is observable (recorded in the stats sidecar / stage row —
     the fleet's first real measurement of commit contention).
@@ -1092,8 +1095,12 @@ def _commit(
             except icechunk.ConflictError:
                 if rebases >= REBASE_TRIES:
                     raise
-                session.rebase(icechunk.ConflictDetector())
                 rebases += 1
+                try:
+                    session.rebase(icechunk.ConflictDetector())
+                except icechunk.RebaseFailedError as exc:
+                    exc.rebases = rebases  # the rounds run, the failed one included
+                    raise
 
 
 def open_vetted(store_root: str, *, store_kwargs: dict, want: dict | None = None):
@@ -1221,7 +1228,8 @@ def commit_units(
     session based on the grown arrays and committed, each unit's label
     resolving to the same row index (the row law, §11.2: a row never moves),
     at most :data:`REPLAY_TRIES` times, then the failure propagates to the
-    fail-open caller. A growth with ANY commit since the session's base that
+    fail-open caller. ``rebases`` and ``commit_s`` sum every session's,
+    the failed ones included. A growth with ANY commit since the session's base that
     updated a staged chunk is refused, whichever landed first: the original
     ``RebaseFailedError`` propagates. The record's ``replays`` counts them.
     """
@@ -1231,7 +1239,7 @@ def commit_units(
         repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
     source = units if callable(units) else list(units)
     path = repo_path(store_root)
-    replays = 0
+    replays, rebases, commit_s = 0, 0, 0.0  # summed over the replays: the node's contention
     while True:
         session = repo.writable_session(BRANCH)
         base = session.snapshot_id
@@ -1242,14 +1250,16 @@ def commit_units(
                 "snapshot": None,
                 "refs": 0,
                 "levels": [],
-                "rebases": 0,
+                "rebases": rebases,
                 "replays": replays,
-                "commit_s": 0.0,
+                "commit_s": commit_s,
             }
         t0 = time.perf_counter()
         try:
-            snapshot, rebases = _commit(session, message, local=_is_local(store_root), path=path)
+            snapshot, rounds = _commit(session, message, local=_is_local(store_root), path=path)
         except icechunk.RebaseFailedError as exc:
+            rebases += getattr(exc, "rebases", 0)
+            commit_s += time.perf_counter() - t0
             if replays >= REPLAY_TRIES or not _row_growth_only(exc, repo, session, base):
                 raise
             replays += 1
@@ -1264,9 +1274,9 @@ def commit_units(
             "snapshot": snapshot,
             "refs": refs,
             "levels": sorted(orders, reverse=True),
-            "rebases": rebases,
+            "rebases": rebases + rounds,
             "replays": replays,
-            "commit_s": time.perf_counter() - t0,
+            "commit_s": commit_s + time.perf_counter() - t0,
         }
 
 
@@ -1374,7 +1384,7 @@ def record_leaf(
     them (the worker seam, which knows whether it wrote a column); ``None``
     commits the base arrays alone. Returns the record the caller rides into
     the leaf's stats sidecar: ``{"path", "snapshot", "arrays", "refs",
-    "levels", "rebases", "commit_s", "checksum"}`` (``checksum`` the form the
+    "levels", "rebases", "replays", "commit_s", "checksum"}`` (``checksum`` the form the
     refs carry: ``"etag"`` or ``"last_modified"``, §11.3), or ``{"skipped":
     reason}`` for a leaf with no chunk objects. Raises on failure — the
     caller is fail-open. ``repo`` is a handle :func:`vet_leaf_repo` already

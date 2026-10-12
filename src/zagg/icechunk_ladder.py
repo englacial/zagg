@@ -594,9 +594,10 @@ def stage_node_refs(
     counts["icechunk_refs"] += outcome["refs"]
     if outcome["snapshot"] is not None:
         counts["icechunk_commits"] += 1
-        counts["icechunk_rebases"] += outcome["rebases"]
-        counts["icechunk_replays"] += outcome["replays"]
-        counts["icechunk_commit_s"] += outcome["commit_s"]
+    # A replay whose source then yields nothing still cost its contention.
+    counts["icechunk_rebases"] += outcome["rebases"]
+    counts["icechunk_replays"] += outcome["replays"]
+    counts["icechunk_commit_s"] += outcome["commit_s"]
     return record
 
 

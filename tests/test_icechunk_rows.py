@@ -944,8 +944,10 @@ class TestRowGrowthUnderStagedRefs:
                 root, self._grown_under(unit, grow), "node 1", store_kwargs={}
             )
         assert grown == [["2019", "2020"]] and out["snapshot"]
-        # The record says a replay happened, once; the log says why.
-        assert out["replays"] == 1 and out["rebases"] == 0
+        # The record says a replay happened, once; the log says why. The
+        # first session's rebase round (the one the growth defeated) and its
+        # commit time are carried into the record, not dropped with it.
+        assert out["replays"] == 1 and out["rebases"] == 1 and out["commit_s"] > 0.0
         assert "fresh session" in caplog.text and "row axis grew" in caplog.text
         group, repo = _open(root)
         refs = _refs(repo.readonly_session(snapshot_id=out["snapshot"]), "6/count")
@@ -983,6 +985,25 @@ class TestRowGrowthUnderStagedRefs:
         _group, repo = _open(root)
         assert _refs(repo.readonly_session(icechunk_refs.BRANCH), "6/count") == {}
         assert "node 1" not in [s.message for s in repo.ancestry(branch="main")]
+
+    def test_a_replay_that_stages_nothing_still_records_its_contention(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The replay's source re-read yields no refs (a carrier vanished
+        # between passes): nothing is committed, but the record still carries
+        # the replay and the first session's rebase round.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        passes = []
+
+        def units():
+            passes.append(1)
+            if len(passes) == 1:
+                yield unit
+                _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+
+        out = icechunk_refs.commit_units(root, units, "node 1", store_kwargs={})
+        assert out["snapshot"] is None and out["refs"] == 0
+        assert out["replays"] == 1 and out["rebases"] == 1 and out["commit_s"] > 0.0
 
     def test_a_replay_is_bounded(self, monkeypatch, cfg, tmp_path):
         # A growth landing under the REPLAY too is one more than the bound

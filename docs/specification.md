@@ -4640,7 +4640,10 @@ columns do:
    subtree again rather than holding it), at most once (`REPLAY_TRIES`),
    after which the failure propagates to the fail-open hook. A double update
    of the same chunks by two writers is never replayed over, whichever of it
-   and the growth landed first; the rebase failure propagates. Each stage row
+   and the growth landed first; the rebase failure propagates. A replayed
+   node's rebases and commit time sum every session's, the defeated one
+   included, and a replay counts whether or not its re-read then staged
+   anything to commit. Each stage row
    records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
    `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
    `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
