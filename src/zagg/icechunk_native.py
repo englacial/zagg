@@ -176,7 +176,19 @@ def _tasks(entries: list[dict], prefix: str) -> list[tuple]:
     single ``checksum`` belongs to and what ``object_ref_plan`` refuses
     anything else for — whose index yields every chunk of the array, so its
     ``chunk`` is ``None``; a regular entry is one object per chunk.
+
+    The prefix strip is the house helper, ``icechunk_ladder._strip``, which
+    refuses a location ``outside the container`` rather than silently
+    removing the wrong bytes. No carried entry can be outside it —
+    ``pack_units`` stores locations relative to the prefix and
+    ``unpack_units`` re-expands them with the same ``container_prefix``
+    this strips, and ``open_vetted`` refuses a root disagreeing with the
+    block's ``url_prefix`` — but a plain slice would report a mismatch as
+    ``_vet_meta``'s "another writer re-folded this overview", which is the
+    wrong cause (issue #584 review).
     """
+    from zagg.icechunk_ladder import _strip
+
     tasks: list[tuple] = []
     for entry in entries:
         if entry["sharded"]:
@@ -187,10 +199,10 @@ def _tasks(entries: list[dict], prefix: str) -> list[tuple]:
                     f"one checksum; a hive leaf array is one shard object (spec §11.3)"
                 )
             for location in objects:
-                tasks.append((entry, location[len(prefix) :], entry.get("checksum"), None))
+                tasks.append((entry, _strip(location, prefix), entry.get("checksum"), None))
         else:
             for chunk in entry["chunks"]:
-                tasks.append((entry, chunk[1][len(prefix) :], chunk[3], chunk))
+                tasks.append((entry, _strip(chunk[1], prefix), chunk[3], chunk))
     return tasks
 
 
@@ -251,7 +263,8 @@ def stage_unit(
     the objects are read :data:`READ_BATCH` at a time, concurrently, and
     written before the next window is read: the round trips come off the wall
     clock while the peak stays that many objects rather than the subtree's
-    (issue #584 review).
+    (issue #584 review). Each slice is a **copy** of its bytes, so that peak
+    is about twice a window's object bytes, not one window's.
     """
     tasks = _tasks(entries, prefix)
     written = 0

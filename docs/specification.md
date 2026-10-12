@@ -4644,8 +4644,9 @@ overview nodes under one committing node number 4⁵+4⁴+4³+4²+4+1 = 1,365
 across the orders, times the composable arrays per node — of order 10⁴
 objects in one invoke, where the virtual arm did **no** IO at commit time.
 The reads are issued concurrently in fixed windows (`icechunk_native.READ_BATCH`),
-which bounds the memory at one window's objects and takes the round trips
-off the wall clock, but the per-invoke wall time against the Lambda ceiling
+which takes the round trips off the wall clock and bounds the memory at
+roughly **twice** one window's object bytes (each chunk slice is a copy),
+but the per-invoke wall time against the Lambda ceiling
 is **unmeasured** — a fleet measurement is owed before a global-scale build.
 
 A native chunk carries **no** checksum, the bytes being the repository's

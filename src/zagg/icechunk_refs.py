@@ -1185,8 +1185,9 @@ def _stage_units(
     and the per-invoke wall time against the 900 s ceiling is **unmeasured**
     (issue #584 review: a fleet run before the v4 build). **Memory**, which
     is bounded: one read window's objects plus the slices taken from them,
-    so the §11.4 streaming peak is one child's carriers plus
-    ``READ_BATCH`` overview objects. A copy whose object moved since the
+    each slice a copy of its bytes, so the §11.4 streaming peak is one
+    child's carriers plus about TWICE ``READ_BATCH`` overview objects. A
+    copy whose object moved since the
     plan raises (:func:`zagg.icechunk_native.stage_unit`), which costs the
     node its whole gather: the gather describes a state that no longer
     exists, so the hook counts it failed (D9) and the next sweep re-gathers
