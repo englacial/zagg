@@ -986,14 +986,14 @@ def table_rows(results: list[dict]) -> list[tuple]:
             lambda r: _run_orders(r, lambda o: o["fold_cells_read_per_node_unit"]),
         ),
         (
+            "stage peak RSS MB per order (latest run)",
+            lambda r: _run_orders(r, lambda o: o.get("container_hwm_mb")),
+        ),
+        (
             "stage worker_s / finisher_s / failed",
             lambda r: (
                 f"{_fmt(_latest(r).get('worker_s'))} / {_fmt(_latest(r).get('finisher_s'))} / {_fmt(_latest(r).get('failed'))}"
             ),
-        ),
-        (
-            "stage peak RSS MB per order (latest run)",
-            lambda r: _run_orders(r, lambda o: o.get("container_hwm_mb")),
         ),
         (
             "stage tier MB / peak MB / headroom MB",
