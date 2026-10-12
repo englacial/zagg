@@ -249,6 +249,30 @@ def _rows(summary):
     return sorted(zip(rows["window"], rows["success"].astype(bool), strict=True))
 
 
+#: Per-run and per-host values a rollup body carries: ids, clocks, memory.
+_VOLATILE = {
+    "run_id",
+    "max_leaf_timestamp",
+    "timestamp",
+    "duration_s",
+    "duration_total_s",
+    "phase_timings",
+    "container_hwm_mb",
+    "max_memory_mb",
+}
+
+
+def _rollup(root, family, node="-5"):
+    """The node's ``family`` rollup body, its volatile values dropped."""
+
+    def scrub(v):
+        if isinstance(v, dict):
+            return {k: scrub(x) for k, x in v.items() if k not in _VOLATILE}
+        return [scrub(x) for x in v] if isinstance(v, list) else v
+
+    return scrub(json.loads(Path(root, node, f"{family}.rollup.json").read_text()))
+
+
 def _overviews(root, name):
     return [a for a in _artifacts(root) if a.endswith(f"/{name}.zarr") and "_" not in a]
 
@@ -341,6 +365,9 @@ class TestBackendsAgree:
             # ... and the rollup families, built by the ride, not by a pass.
             rollups = {p.name.split(".")[0] for p in Path(root, "-5").glob("*.rollup.json")}
             assert rollups == set(CASCADE_FAMILIES)
+        # ... with the same bodies: what the landed windows fold, nothing more.
+        for family in CASCADE_FAMILIES:
+            assert _rollup(local_root, family) == _rollup(fleet_root, family)
         # The staged sweep ran its (node, window) units for the landed windows.
         windows = {
             e["stage"]["window"]
