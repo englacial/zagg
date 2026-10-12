@@ -97,7 +97,15 @@
 #   uv run python -m zagg --config tools/configs/atl03_windowed_measure_quarterly.yaml \
 #       --catalog /tmp/o6_sierra.json --backend lambda --profile \
 #       --store s3://<scratch-bucket>/<prefix>/_measure_quarterly.zarr
-#   # 3. readout, all four arms at once
+#   # 3. ONLY if the arm did not fit one invoke per shard (the readout's
+#   #    ``fits_one_invoke`` is ``no``): record THAT as the result, then set
+#   #    ``output.windowing.unit: window`` in a copy of this config -- there is
+#   #    no CLI override for it -- and re-run the arm into its OWN store, so
+#   #    every readout column still reads one run.
+#   uv run python -m zagg --config /tmp/atl03_windowed_measure_quarterly_window.yaml \
+#       --catalog /tmp/o6_sierra.json --backend lambda --profile \
+#       --store s3://<scratch-bucket>/<prefix>/_measure_quarterly_window.zarr
+#   # 4. readout, all four arms at once
 #   uv run python tools/windowed_emit_measure.py \
 #       s3://<scratch-bucket>/<prefix>/_measure_none.zarr \
 #       s3://<scratch-bucket>/<prefix>/_measure_yearly.zarr \
