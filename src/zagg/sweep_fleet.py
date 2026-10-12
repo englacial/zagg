@@ -1430,6 +1430,11 @@ def run_stage_sweep_fleet(
             f"ref(s), {skipped} skipped) — nothing fired, no finisher, no barrier"
         )
         summary["skipped"] = "no dispatch nodes"
+        # The same reason the ladder gate above reports it (review finding):
+        # no node closed, so the families this run was asked to carry folded
+        # nowhere — and the asymmetry would leave the runner's backstop
+        # warning silent on the one of the two no-op returns.
+        summary["families_unswept"] = bool(family_names)
         summary["finisher"] = {"landed": False, "fired": False}
         summary["duration_s"] = time.perf_counter() - t0
         return summary
