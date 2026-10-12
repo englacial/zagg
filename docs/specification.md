@@ -2535,9 +2535,9 @@ never sharded, §8/#247):
   no arrays, no refs — the committed golden pins the documents a
   conformant reader validates: the root group document against the
   multiscales v0.1 schema, and every level group against the dggs v1
-  schema once [#616](https://github.com/englacial/zagg/issues/616) lands
-  the `semi_major_axis` spelling (a test pins that one gap until then), both
-  vendored under `tests/data/conventions/`. `icechunk.expected.json` spells the
+  schema (the `semi_major_axis` spelling, since
+  [#616](https://github.com/englacial/zagg/issues/616)), both vendored
+  under `tests/data/conventions/`. `icechunk.expected.json` spells the
   `layout` from the generator's inputs (the §11.1 rules over `pyramid/`'s
   expanded levels), never read back through zagg.
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
