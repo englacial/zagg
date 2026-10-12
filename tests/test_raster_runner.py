@@ -1176,6 +1176,12 @@ class TestRasterWindowedAllTimeFold:
         # keeps the per-order loop at the bottom from going vacuous.
         assert decl["orders"] == [8, 6, 4, 2, 0]
         refs = [(shard, "20260713"), (shard, "20260718")]
+        # The gate returns before the dirty set is read, so the sweep never
+        # touches a leaf and ``refs`` alone pins nothing. Read the two
+        # windowed leaves back, as ``test_windowed_daily_leaves`` does with
+        # these same fixtures, so "a sweep over that store" names a store.
+        for _shard_ref, label in refs:
+            assert hive.read_commit(hive.shard_leaf_path(store_path, shard, window=label))
         with caplog.at_level(logging.INFO, logger="zagg.sweep_overview"):
             result = run_sweep(store_path, refs, families=("overview",))
         counts = result["families"]["overview"]
