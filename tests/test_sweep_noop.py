@@ -484,6 +484,11 @@ class TestStoreLadderGate:
         ({"spec": "zagg-pyramid/1", "overview": {"orders": [2, 1], "spacing": 1}}, "/1 stores"),
         ({"spec": "zagg-pyramid/1", "overview": {"orders": []}}, "/1 stores"),
         ({"spec": PYRAMID_SPEC_V2, "overviews": []}, "absent or empty"),
+        # ``ladder_entries`` normalizes each entry, so a malformed one raises
+        # KeyError/TypeError rather than the named ValueError — and a decline
+        # is owed for those too (review finding).
+        ({"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 2}]}, "KeyError"),
+        ({"spec": PYRAMID_SPEC_V2, "overviews": ["2"]}, "TypeError"),
         (
             {"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 3, "cells": [4]}]},
             "no level below shard_order 3",
@@ -507,6 +512,21 @@ class TestStoreLadderGate:
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
         assert "--declare-pyramid" in warnings[0] and named in warnings[0]
+
+    def test_a_manifest_that_is_not_an_object_fires_nothing(self, tmp_path):
+        # The corrupt-manifest arm of the same finding: ``read_manifest``
+        # parses whatever JSON is there, so a non-object manifest reaches the
+        # gate as an AttributeError on ``manifest.get`` rather than as a
+        # refusal — still a decline, never a traceback out of the dispatcher.
+        from zagg.hive import MANIFEST_NAME
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        (root / MANIFEST_NAME).write_text(json.dumps(["not", "a", "manifest"]))
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert client.events == [] and summary["invokes"] == 0
+        assert summary["skipped"].startswith("no zagg-pyramid/2 ladder")
 
     def test_a_root_with_no_manifest_fires_nothing(self, tmp_path):
         root = tmp_path / "empty"

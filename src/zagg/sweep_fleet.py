@@ -638,8 +638,16 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         return f"no {MANIFEST_NAME} at the store root"
     try:
         entries = ladder_entries(manifest.get("pyramid") or {}, shard_order)
-    except ValueError as e:
-        return str(e)
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        # Not ``ValueError`` alone (review finding): ``ladder_entries``
+        # normalizes every entry (``int(e["node"])``, ``[int(c) for c in
+        # e["cells"]]``), so a malformed declaration arrives as ``KeyError``
+        # or ``TypeError`` as readily as the named refusal, and a manifest
+        # whose top level is not an object as ``AttributeError``. The verdict
+        # is the same for all four — nothing a worker would fold — and a
+        # decline is the whole point of reading first: the alternative is the
+        # traceback this gate exists to replace.
+        return str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
     if not entries:
         return f"its ladder declares no level below shard_order {shard_order}"
     return None
