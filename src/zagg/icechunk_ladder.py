@@ -40,7 +40,7 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 
@@ -68,11 +68,13 @@ GEOMETRY_KEYS = ("shard_order", "chunk_order", "cell_order")
 #: Every counter the hook adds to a stage row — pre-seeded there whether or
 #: not any node did work, so the row's key set does not depend on the pass.
 #: ``icechunk_commit_s`` is the commit's own wall time, ``icechunk_s`` the
-#: hook's (the gather included).
+#: hook's (the gather included); ``icechunk_replays`` counts the commits
+#: replayed in a fresh session over another run's row growth (§11.4).
 STAGE_COUNTS = (
     "icechunk_refs",
     "icechunk_commits",
     "icechunk_rebases",
+    "icechunk_replays",
     "icechunk_commit_s",
     "icechunk_missing",
     "icechunk_failed",
@@ -538,7 +540,7 @@ def stage_node_refs(
     commits_all = dispatch <= commit_order < child_order and not per_leaf
     column_only = dispatch > commit_order and not per_leaf
     record: dict = {"node": node, "refs": 0, "missing": 0}
-    source: Iterable[dict]
+    source: Iterable[dict] | Callable[[], Iterable[dict]]
     args = (
         store_root,
         node,
@@ -569,18 +571,21 @@ def stage_node_refs(
         # STREAMED into the one session: each child's units are written and
         # released before the next is read, so the node's peak is one child,
         # not its whole subtree (review finding). The commit is unchanged —
-        # still one per node, covering every order it gathered.
+        # still one per node, covering every order it gathered. Handed as the
+        # FUNCTION: a replay over another run's row growth (§11.4) streams the
+        # subtree again rather than holding it, so the tally restarts with it.
         tally = [0]
 
         def stream():
+            tally[0] = 0
             for child_units, miss in _child_units(*args):
                 tally[0] += miss
                 yield from child_units
             yield from own
 
-        source = stream()
+        source = stream
     else:
-        source = iter(own)  # coarser than the committing tuple (or per-leaf): own overviews only
+        source = own  # coarser than the committing tuple (or per-leaf): own overviews only
     outcome = commit_units(store_root, source, f"node {node}", store_kwargs=store_kwargs)
     if commits_all:
         record["missing"] = tally[0]
@@ -590,6 +595,7 @@ def stage_node_refs(
     if outcome["snapshot"] is not None:
         counts["icechunk_commits"] += 1
         counts["icechunk_rebases"] += outcome["rebases"]
+        counts["icechunk_replays"] += outcome["replays"]
         counts["icechunk_commit_s"] += outcome["commit_s"]
     return record
 
@@ -663,6 +669,7 @@ def node_row(record: dict) -> dict:
     if commit.get("snapshot"):
         row["snapshot"] = commit["snapshot"]
         row["rebases"] = int(commit["rebases"])
+        row["replays"] = int(commit.get("replays") or 0)
         row["commit_s"] = float(commit["commit_s"])
     return row
 

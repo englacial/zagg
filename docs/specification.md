@@ -4625,11 +4625,21 @@ columns do:
      commit nothing.
 
    Commits rebase on conflict exactly as before (`ConflictDetector`; nodes
-   touch disjoint chunk ranges), and each stage row records
-   `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
-   `icechunk_refs`, `icechunk_missing`, `icechunk_failed`,
-   `icechunk_skipped_levels`, `icechunk_clean`, `icechunk_regathered` and
-   `icechunk_s` — every one
+   touch disjoint chunk ranges). One conflict no rebase reconciles is
+   **another run's row growth** (its `init`, below) landing while a node
+   holds staged refs: Icechunk reports `Chunks updated in updated array` on
+   every array the node touched and the rebase fails. That class, and only
+   that class — every conflict of the failed rebase is one, nothing else —
+   is **replayed**: the node writes the same units into a fresh session
+   based on the grown arrays and commits them there (each label resolves to
+   the same row index, §11.2 — a row never moves; the ladder streams the
+   subtree again rather than holding it), at most once (`REPLAY_TRIES`),
+   after which the failure propagates to the fail-open hook. A double update
+   of the same chunks by two writers is never replayed over. Each stage row
+   records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
+   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
+   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
+   `icechunk_regathered` and `icechunk_s` — every one
    pre-seeded, so a row's key set does not depend on whether a node did work
    — plus `icechunk_nodes`, one entry per node that did, carrying the
    snapshot it committed (the leaf→snapshot join).
@@ -4695,7 +4705,9 @@ event names, and a window label on an unwindowed store — or one its
 schedule does not declare — is refused. Two runs allocating at once both
 resize every array, which Icechunk's rebase does not reconcile: the loser's
 init retries in a fresh session (5 attempts in all), re-reads the rows the winner
-recorded and appends after them. A retry re-applies the loser's own block
+recorded and appends after them. The other side of that race — a node of a
+run already committing when the growth lands — replays its units in a fresh
+session (**One tuple commits**, above). A retry re-applies the loser's own block
 changes (a ratchet, the per-run knobs) only when the winner changed nothing
 else, or made the same changes: a block the winner moved otherwise — a
 different ratchet, other knobs — is not overwritten with changes computed
@@ -4959,7 +4971,7 @@ fails the sweep — the leaf is normative, the index is regenerable (a later
 staged sweep re-gathers). The leaf's `icechunk` block records the sidecar it
 wrote — `{sidecar, bytes, refs, arrays, checksum}` — or, under
 `commit: "leaf"`, its commit `{path, snapshot, arrays, refs, rebases,
-commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
+replays, commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
 (§11.6); `{error: message}` on failure. The run parquet flattens the same
 fields to `icechunk_*` columns.
 

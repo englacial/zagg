@@ -2053,6 +2053,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   few manifests are shared across nodes and rebased, which keeps the
   manifest count at the base's (spec §11.5).
   Each stage row records `icechunk_commits`, `icechunk_rebases`,
+  `icechunk_replays` (commits replayed in a fresh session because another
+  run's init grew the row axis under the node's staged refs, spec §11.4),
   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
   `icechunk_regathered` (dirt-only nodes, re-gathered without a fold) and

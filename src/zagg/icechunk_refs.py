@@ -31,8 +31,10 @@ D8):
   shard-index suffix per sharded array, one HEAD per single-chunk array, one
   LIST per multi-chunk regular array.
 - :func:`commit_units` — write ref-plan entries for any set of orders into
-  one session and commit once, rebase-on-conflict, rebase count + wall time
-  recorded. :func:`record_leaf` is the per-leaf commit (``commit: "leaf"``);
+  one session and commit once, rebase-on-conflict (a rebase the row growth
+  of another run's init defeats is REPLAYED in a fresh session), rebase +
+  replay counts and wall time recorded. :func:`record_leaf` is the per-leaf
+  commit (``commit: "leaf"``);
   the ladder (:mod:`zagg.icechunk_ladder`, the default when the run walks
   it — :func:`ladder_walks`) commits at a stage node instead.
 
@@ -54,7 +56,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -103,6 +105,11 @@ LOCATION_DICT_MIN_CHUNKS = 1000
 #: Rebase-and-retry ceiling on a commit (icechunk's own ``rebase_tries``
 #: semantics: this many rebase rounds; no backoff/jitter machinery).
 REBASE_TRIES = 20
+#: Fresh-session replays :func:`commit_units` allows a commit whose rebase
+#: failed on the row-growth class alone (§11.4, issue #584 phase 3): one —
+#: a run's init grows the rows once, and a second growth under the replay is
+#: a second run's, rare enough to fail open and re-gather.
+REPLAY_TRIES = 1
 #: zarr v3 sharding-index sentinel for an absent inner chunk (spec §1.5).
 _ABSENT = np.uint64(2**64 - 1)
 #: ``(offset, nbytes)`` u64 pair per inner chunk, plus the crc32c suffix.
@@ -1117,27 +1124,8 @@ def open_vetted(store_root: str, *, store_kwargs: dict, want: dict | None = None
     return repo, block
 
 
-def commit_units(
-    store_root: str, units: Iterable[dict], message: str, *, store_kwargs: dict, repo=None
-) -> dict:
-    """Write ref-plan units for any set of orders into ONE session and commit once.
-
-    ``units`` is any ITERABLE of ``{"level", "row", "entries"}``: each entry
-    lands under its level's group (``/{level}/{path}``, the level's CELL
-    order) at the row the repo allocated the unit's LABEL (absent: ``all``;
-    §11.3 — the entries are the object's cell-axis plan, row-free). The label
-    is resolved against the block the committing session reads, the
-    authority, so a unit for a row the repo never allocated raises. A
-    generator is the point — the ladder streams a committing node's subtree
-    through here one child at a time, so the node's peak is one child's
-    carriers rather than the whole subtree's (§11.4). Returns ``{"path",
-    "snapshot", "refs", "levels", "rebases", "commit_s"}`` (``snapshot``
-    ``None`` when nothing was written). ``repo`` skips the open/vet when the
-    caller already holds a vetted handle.
-    """
-    if repo is None:
-        repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
-    session = repo.writable_session(BRANCH)
+def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
+    """Write ``units`` into ``session`` (nothing committed); ``(refs, levels)`` staged."""
     rows = (_session_block(session) or {}).get("rows") or []
     refs = 0
     orders: set = set()
@@ -1171,26 +1159,104 @@ def commit_units(
                     )
             refs += int(entry["refs"])
             orders.add(order)
+    return refs, orders
+
+
+def _row_growth_only(exc) -> bool:
+    """Whether a failed rebase conflicts ONLY on chunks staged in arrays another commit resized.
+
+    ``ChunksUpdatedInUpdatedArray`` on every array touched and nothing else
+    is the phase-0 spike's item (iii): the other commit changed the arrays'
+    metadata — a run's init growing the rows — under this session's staged
+    chunks, which the rebase does not carry over. A double update of the same
+    chunks, or any mix, is another writer's refs and is never replayed over.
+    """
+    import icechunk
+
+    growth = icechunk.ConflictType.ChunksUpdatedInUpdatedArray  # unhashable: compared, not set
+    return bool(exc.conflicts) and all(c.conflict_type == growth for c in exc.conflicts)
+
+
+def commit_units(
+    store_root: str,
+    units: Iterable[dict] | Callable[[], Iterable[dict]],
+    message: str,
+    *,
+    store_kwargs: dict,
+    repo=None,
+) -> dict:
+    """Write ref-plan units for any set of orders into ONE session and commit once.
+
+    ``units`` is any ITERABLE of ``{"level", "row", "entries"}``, or a
+    zero-argument callable producing one: each entry lands under its level's
+    group (``/{level}/{path}``, the level's CELL order) at the row the repo
+    allocated the unit's LABEL (absent: ``all``; §11.3 — the entries are the
+    object's cell-axis plan, row-free). The label is resolved against the
+    block the committing session reads, the authority, so a unit for a row
+    the repo never allocated raises. A generator is the point — the ladder
+    streams a committing node's subtree through here one child at a time, so
+    the node's peak is one child's carriers rather than the whole subtree's
+    (§11.4) — and it hands the stream as a CALLABLE so a replay (below)
+    streams the subtree again instead of holding it; a one-shot iterable is
+    retained for the replay. Returns ``{"path", "snapshot", "refs", "levels",
+    "rebases", "replays", "commit_s"}`` (``snapshot`` ``None`` when nothing
+    was written). ``repo`` skips the open/vet when the caller already holds a
+    vetted handle.
+
+    **The row-growth replay (§11.4, issue #584 phase 3).** Another run's init
+    landing while this session holds staged refs grows every level array by a
+    row, and a rebase does not carry staged chunks over an array whose
+    metadata changed (:func:`_row_growth_only`). Inside one run nothing is in
+    flight at the init; between concurrent runs on one store — the fleet's
+    normal shape — it would cost the node its whole gather. So that failure,
+    and only that class, is replayed: the same units are written into a FRESH
+    session based on the grown arrays and committed, each unit's label
+    resolving to the same row index (the row law, §11.2: a row never moves),
+    at most :data:`REPLAY_TRIES` times, then the failure propagates to the
+    fail-open caller. The record's ``replays`` counts them.
+    """
+    import icechunk
+
+    if repo is None:
+        repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
+    source = units if callable(units) else list(units)
     path = repo_path(store_root)
-    if not refs:
+    replays = 0
+    while True:
+        session = repo.writable_session(BRANCH)
+        refs, orders = _stage_units(session, source() if callable(source) else source)
+        if not refs:
+            return {
+                "path": path,
+                "snapshot": None,
+                "refs": 0,
+                "levels": [],
+                "rebases": 0,
+                "replays": replays,
+                "commit_s": 0.0,
+            }
+        t0 = time.perf_counter()
+        try:
+            snapshot, rebases = _commit(session, message, local=_is_local(store_root), path=path)
+        except icechunk.RebaseFailedError as exc:
+            if replays >= REPLAY_TRIES or not _row_growth_only(exc):
+                raise
+            replays += 1
+            logger.warning(
+                f"icechunk: {message}: the row axis grew under this session's staged refs "
+                f"({len(exc.conflicts)} arrays resized by another commit); replaying them in a "
+                f"fresh session (replay {replays} of {REPLAY_TRIES}, spec §11.4, issue #584)"
+            )
+            continue
         return {
             "path": path,
-            "snapshot": None,
-            "refs": 0,
-            "levels": [],
-            "rebases": 0,
-            "commit_s": 0.0,
+            "snapshot": snapshot,
+            "refs": refs,
+            "levels": sorted(orders, reverse=True),
+            "rebases": rebases,
+            "replays": replays,
+            "commit_s": time.perf_counter() - t0,
         }
-    t0 = time.perf_counter()
-    snapshot, rebases = _commit(session, message, local=_is_local(store_root), path=path)
-    return {
-        "path": path,
-        "snapshot": snapshot,
-        "refs": refs,
-        "levels": sorted(orders, reverse=True),
-        "rebases": rebases,
-        "commit_s": time.perf_counter() - t0,
-    }
 
 
 def leaf_units(
@@ -1351,6 +1417,7 @@ __all__ = [
     "LOCATION_DICT_MIN_CHUNKS",
     "MULTISCALES_ATTR",
     "REBASE_TRIES",
+    "REPLAY_TRIES",
     "ZARR_CONVENTIONS_ATTR",
     "commit_units",
     "container_prefix",

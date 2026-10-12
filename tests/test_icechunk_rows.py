@@ -927,6 +927,181 @@ class TestTheLadderWalksAWindowedStore:
             np.testing.assert_array_equal(tip[level]["count"][:1], values)
 
 
+class TestRowGrowthUnderStagedRefs:
+    """Issue #584 phase 3: another run's init grows the row axis under a session's staged refs.
+
+    The phase-0 spike's item (iii): refs staged in EXISTING rows cannot rebase
+    over a commit that resized the arrays (``Chunks updated in updated
+    array``), so without a replay the node's whole gather is lost — a race
+    between concurrent runs on one store, the fleet's normal shape.
+    """
+
+    def _staged(self, monkeypatch, cfg, tmp_path):
+        """A windowed repo at row ``2019`` and one leaf's unit for that row."""
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        version = _write_leaf(monkeypatch, grid, root, shard, fill=1.0, refs=False, run_id="a")
+        _init(root, grid, cfg, manifest, ["2019"])
+        plan = icechunk_refs.leaf_ref_plan(
+            grid, shard, root, store_kwargs={}, version=version["leaf_version"]
+        )
+        return grid, root, manifest, shard, {"level": 6, "row": "2019", "entries": plan}
+
+    @staticmethod
+    def _grown_under(unit, grow):
+        """A unit source that lands ``grow()`` once, AFTER ``unit`` is staged and before the commit."""
+        fired = []
+
+        def units():
+            yield unit
+            if not fired:  # the replay streams the source again; the other run landed once
+                fired.append(grow())
+
+        return units
+
+    def test_a_row_grown_under_staged_refs_is_replayed_in_a_fresh_session(
+        self, monkeypatch, cfg, tmp_path, caplog
+    ):
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        (rank,) = grid.block_index(shard)
+        grown = []
+
+        def grow():
+            grown.append(_init(root, grid, cfg, manifest, ["2020"], run_id="run-2")["rows"])
+
+        with caplog.at_level("WARNING"):
+            out = icechunk_refs.commit_units(
+                root, self._grown_under(unit, grow), "node 1", store_kwargs={}
+            )
+        assert grown == [["2019", "2020"]] and out["snapshot"]
+        # The record says a replay happened, once; the log says why.
+        assert out["replays"] == 1 and out["rebases"] == 0
+        assert "fresh session" in caplog.text and "row axis grew" in caplog.text
+        group, repo = _open(root)
+        refs = _refs(repo.readonly_session(snapshot_id=out["snapshot"]), "6/count")
+        # Every ref landed at ITS row (2019 = 0), none in the grown row, and
+        # exactly the plan's chunks — nothing doubled, nothing dropped.
+        assert {k[0] for k in refs} == {0}
+        assert len(refs) == next(e["refs"] for e in unit["entries"] if e["path"] == "count")
+        assert group["6"]["count"].shape[0] == 2
+        np.testing.assert_array_equal(group["6"]["count"][0, rank * 16 : rank * 16 + 4], 1)
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        assert messages.count("node 1") == 1 and "init run-2" in messages
+        # Idempotent: the same units again, with nothing racing, change no ref.
+        again = icechunk_refs.commit_units(root, [unit], "node 1 again", store_kwargs={})
+        assert again["replays"] == 0
+        assert _refs(repo.readonly_session(snapshot_id=again["snapshot"]), "6/count") == refs
+
+    def test_without_the_replay_the_node_loses_its_refs_to_the_growth(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The replay is load-bearing: with none allowed, the conflict is the
+        # spike's class and nothing of the node lands.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        monkeypatch.setattr(icechunk_refs, "REPLAY_TRIES", 0)
+        with pytest.raises(icechunk.RebaseFailedError) as info:
+            icechunk_refs.commit_units(
+                root,
+                self._grown_under(
+                    unit, lambda: _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+                ),
+                "node 1",
+                store_kwargs={},
+            )
+        kinds = {repr(c.conflict_type) for c in info.value.conflicts}
+        assert kinds == {"ChunksUpdatedInUpdatedArray"}
+        _group, repo = _open(root)
+        assert _refs(repo.readonly_session(icechunk_refs.BRANCH), "6/count") == {}
+        assert "node 1" not in [s.message for s in repo.ancestry(branch="main")]
+
+    def test_a_replay_is_bounded(self, monkeypatch, cfg, tmp_path):
+        # A growth landing under the REPLAY too is one more than the bound
+        # allows: the node raises (fail-open at the hook) rather than looping.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        years = iter(["2020", "2021", "2022"])
+
+        def units():
+            yield unit
+            _init(root, grid, cfg, manifest, [next(years)], run_id="run-2")
+
+        with pytest.raises(icechunk.RebaseFailedError):
+            icechunk_refs.commit_units(root, units, "node 1", store_kwargs={})
+        _group, repo = _open(root)
+        # One replay was attempted (two sessions, two growths), then it raised.
+        assert next(years) == "2022"
+        assert "node 1" not in [s.message for s in repo.ancestry(branch="main")]
+
+    def test_another_conflict_class_is_refused_not_replayed(self, monkeypatch, cfg, tmp_path):
+        # Only the row-growth class is replayed: the same chunks set by two
+        # writers is a double update, refused as before — replaying it would
+        # silently overwrite the other writer's refs.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+
+        def other_writer():
+            icechunk_refs.commit_units(root, [unit], "node 1 (other)", store_kwargs={})
+
+        with pytest.raises(icechunk.RebaseFailedError) as info:
+            icechunk_refs.commit_units(
+                root, self._grown_under(unit, other_writer), "node 1", store_kwargs={}
+            )
+        kinds = {repr(c.conflict_type) for c in info.value.conflicts}
+        assert kinds == {"ChunkDoubleUpdate"}
+        _group, repo = _open(root)
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        assert messages.count("node 1 (other)") == 1 and "node 1" not in messages
+
+    def test_the_ladder_replays_a_node_and_counts_it(self, monkeypatch, cfg, tmp_path, caplog):
+        # The fleet path: ``stage_node_refs`` streams the node's children into
+        # one session; a run-2 init landing mid-stream grows the rows under
+        # it, the node replays, and the stage row counts the replay.
+        from test_icechunk_refs import _ladder_run, _stage_rows
+
+        from zagg import icechunk_ladder
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        root = str(tmp_path / "store")
+        real, grown = icechunk_ladder._child_units, []
+
+        def child_units(*args):
+            for item in real(*args):
+                yield item
+                if not grown:  # once: after the first child's refs are staged
+                    out = icechunk_refs.init_repo(
+                        root, _grid(cfg), cfg, run_id="run-2", store_kwargs={}, rows=["2021"]
+                    )
+                    grown.append(out["rows"])
+
+        monkeypatch.setattr(icechunk_ladder, "_child_units", child_units)
+        with caplog.at_level("WARNING"):
+            grid, root, summary = _ladder_run(
+                monkeypatch,
+                cfg,
+                tmp_path,
+                icechunk_block={"commit": "ladder"},
+                shards=shards,
+                windowing={**_YEARLY, "unit": "window"},
+                windows=_WINDOW_GRANULES,
+                root=root,
+            )
+        assert grown == [["2019", "2020", "all", "2021"]]
+        assert summary["cells_error"] == 0
+        rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
+        assert rows[3]["icechunk_failed"] == 0 and rows[3]["icechunk_replays"] == 1
+        assert rows[0]["icechunk_replays"] == 0  # the coarser tuple raced nothing
+        assert "row axis grew" in caplog.text
+        # Every window's leaf still reads back at its own row.
+        group, _repo = _open(root)
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            span = slice(rank * 16, (rank + 1) * 16)
+            for row, label in enumerate(("2019", "2020")):
+                path, _stamp = hive.resolve_leaf(hive.shard_leaf_path(root, shard, window=label))
+                leaf = zarr.open_group(path, mode="r")["6"]
+                np.testing.assert_array_equal(group["6"]["count"][row, span], leaf["count"][:])
+        assert group["6"]["count"].shape[0] == 4  # the raced-in 2021 row is there, empty
+
+
 class TestRevisionOneIsRefused:
     def _downgrade(self, root):
         """Rewrite the block's spec token to ``/1``: a repo of the earlier revision."""
