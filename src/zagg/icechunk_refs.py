@@ -58,6 +58,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from zagg.column_shards import check_column_entry, column_grid, stale_column_levels
 from zagg.icechunk_rows import (
     ALL_ROW,
     cell_axis_split,
@@ -480,7 +481,6 @@ def level_grids(manifest: dict, grid) -> dict:
     level only.
     """
     from zagg.column import composable_fields
-    from zagg.column_shards import column_grid
     from zagg.grids.healpix import HealpixGrid
     from zagg.sweep_overview import _overview_config
 
@@ -511,11 +511,8 @@ def level_grids(manifest: dict, grid) -> dict:
                 # indexed.
                 continue
             levels[cells] = {
-                # A column level's grid carries the §4.6 layout rule (issue
-                # #631): a fine member is sharded on power-of-four inner
-                # chunks, so its level is chunked at the inner chunk and its
-                # refs are byte ranges found through the shard index, exactly
-                # as a leaf's are. Overview levels stay one chunk per array.
+                # A column level carries the §4.6 layout rule (a fine one is
+                # chunked at its inner chunk, issue #631); an overview is not.
                 "grid": (
                     column_grid(node, cells, config)
                     if artifact == "column"
@@ -681,6 +678,12 @@ def _check_block(block: dict, want: dict, path: str) -> None:
             f"icechunk repo {path} keys its levels {sorted(block.get('levels') or {}, key=int)} "
             f"by node order, not cell order (pre-§11.1-amendment): every commit into it would "
             f"raise NodeNotFound. Clear {path} and re-init (spec §11.1, issue #580)."
+        )
+    stale = stale_column_levels(block.get("levels")) if "cell_order" in want else []
+    if stale:
+        raise ValueError(
+            f"icechunk repo {path} chunks column levels {stale} against the §4.6 layout rule "
+            f"(pre-#631): every fine column ref would land out of place. Clear {path} and re-init."
         )
 
 
@@ -1076,7 +1079,8 @@ def commit_units(
     if repo is None:
         repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
     session = repo.writable_session(BRANCH)
-    rows = (_session_block(session) or {}).get("rows") or []
+    block = _session_block(session) or {}
+    rows, levels = block.get("rows") or [], block.get("levels") or {}
     refs = 0
     orders: set = set()
     for unit in units:
@@ -1099,6 +1103,7 @@ def commit_units(
                 if rejected:
                     raise RuntimeError(f"{array_path}: {len(rejected)} virtual refs rejected")
             else:
+                check_column_entry(levels.get(str(order)), entry, array_path)
                 for key, location, length, chunk_checksum in entry["chunks"]:
                     session.store.set_virtual_ref(
                         f"{order}/{row_key(key, row)}",
@@ -1151,14 +1156,9 @@ def leaf_units(
     cells (:func:`zagg.column.leaf_level_cells` — ``[13]`` at production),
     never the within-footprint intermediates (``12, 11, 10``) or the
     node-order partial, which are sweep inputs that overlap the overview
-    levels (:func:`level_grids`). A column array is one object either way;
-    its refs are the whole object for an unsharded group, or one byte range
-    per present inner chunk read off the shard index for a fine group (the
-    §4.6 layout rule, issue #631 — the same :func:`zagg.column_shards.column_grid`
-    the writer laid it out with).
+    levels (:func:`level_grids`), laid out by :func:`zagg.column_shards.column_grid`.
     """
     from zagg.column import leaf_column_plan, leaf_level_cells
-    from zagg.column_shards import column_grid
     from zagg.hive import shard_leaf_path
     from zagg.sweep_overview import _overview_config
 
