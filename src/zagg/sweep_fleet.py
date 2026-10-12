@@ -629,9 +629,11 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     role may legitimately hold nothing but ``lambda:InvokeFunction`` against
     the store itself — the same D8 posture ``shard_order`` is handed in for —
     and refusing there would take the ladder away from every such deployment.
-    It warns and the fan-out proceeds exactly as it did before this gate; the
-    one grant that closes the hazard is named in the warning and in
-    ``docs/deployment/lambda.md``.
+    It warns and the fan-out proceeds exactly as it did before this gate, and
+    the warning itself names the one grant that closes the hazard
+    (``s3:GetObject`` on the store root) — a dispatcher policy scoped to
+    ``lambda:InvokeFunction`` plus list/get on the ``<store>.status/``
+    sibling does not carry it.
     """
     from zagg.hive import MANIFEST_NAME, read_manifest
     from zagg.sweep_stage import ladder_entries
