@@ -245,6 +245,32 @@ def test_hive_templates_declare_the_ladder_and_chain_the_staged_sweep(name):
     assert fields  # at least one composable field rides the ladder
 
 
+@pytest.mark.parametrize("name", LADDER_TEMPLATES)
+def test_an_older_store_opts_out_by_its_own_declaration_not_by_sweep(name):
+    # The leaf worker writes its column, and the Icechunk leaf seam indexes
+    # its levels, from the CONFIG's ladder (``leaf_column_plan`` /
+    # ``leaf_level_cells``), never the store's manifest -- so ``sweep: true``
+    # stops the staged fan-out but still writes undeclared [16..9] columns and
+    # stages refs for levels a manifest-built repo lacks (review round 3 on PR
+    # #622). The opt-out is ``output.pyramid`` set back to the store's own
+    # declaration: ``false`` writes no column and indexes no leaf level, and
+    # the v3 store's ``{overviews: 13}`` indexes exactly its 13.
+    from zagg.column import leaf_column_plan, leaf_level_cells
+    from zagg.config import SWEEP_FAMILIES, get_sweep_mode
+    from zagg.grids import from_config
+
+    cfg = default_config(name)
+    grid = from_config(cfg)
+    cfg.output["sweep"] = True
+    assert leaf_level_cells(cfg, grid) == LADDER  # sweep alone is no opt-out
+    del cfg.output["sweep"]
+    cfg.output["pyramid"] = False
+    assert leaf_column_plan(cfg, grid) is None and leaf_level_cells(cfg, grid) == []
+    assert get_sweep_mode(cfg, grid) == SWEEP_FAMILIES
+    cfg.output["pyramid"] = {"overviews": 13}
+    assert leaf_level_cells(cfg, grid) == [13]
+
+
 def test_the_ladder_is_hash_invisible():
     # ``output.pyramid`` is outside the D19 semantic core, so declaring the
     # ladder moved no template digest: SEMANTIC_PINS above still hold (their

@@ -505,10 +505,24 @@ consequences follow for an operator:
   [the staged sweep](#the-staged-sweep-issue-384)), so the ladder — and the
   rollup families riding it — folds in the run tail, scoped to the run's own
   footprint. `sweep: true` keeps the families pass alone; `false` keeps neither.
-- **A store templated before this carries no ladder, and its manifest is the
-  store's truth.** `pyramid.spec` is written once, at init; an append from the
-  new template never rewrites it, and the staged sweep refuses a `/1` manifest
-  per invoke (see the *Migration* notes on PR #622). The retrofit is
+- **A store templated before this may carry a different declaration, and its
+  manifest is the store's truth.** The older templates built `pyramid: false`
+  stores, and the v3 ATL03 store declares `{overviews: 13}`. `pyramid.spec`
+  is written once, at init; an append from the new template never rewrites
+  it, and the staged sweep refuses a `/1` manifest per invoke (see the
+  *Migration* notes on PR #622). **`sweep: true` is not the opt-out.** It
+  stops the staged fan-out, but the leaf side follows the *config's* ladder
+  and not the manifest. The leaf worker writes `[16..9]` columns
+  (`leaf_column_plan`) that the store declares nowhere. The Icechunk leaf seam
+  stages refs for the config's leaf levels (`leaf_level_cells`) into a repo
+  whose groups were built from the manifest. The `16` group does not exist
+  there, so every new leaf's commit fails, its base refs included, and the
+  leaf drops out of the index (fail-open: `icechunk.error` in its sidecar).
+  Append to an older store with **`output.pyramid` set to what its manifest
+  declares**: `false`, or `{overviews: 13}` for the v3 store. That config
+  writes no undeclared column and indexes only the store's own levels. A
+  `false` declaration also resolves the default sweep to the families pass.
+  Or retrofit the store first. The retrofit is
   [`--declare-pyramid`](#retrofitting-the-pyramid-declaration) with the
   config the store was built from; `declare_pyramid` replaces a differing
   declaration, so the template as shipped re-declares an older store's ladder
