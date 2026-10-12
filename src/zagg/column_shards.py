@@ -116,11 +116,20 @@ def layout_mismatch(node_order: int, res: int, metadata: dict) -> str | None:
 
     The ``pyramid_check`` layout leg (spec §4.6 is normative on the layout,
     so a fine group written whole — a pre-#631 worker, or a hand-built
-    column — fails read-back by name rather than passing on its values).
+    column — fails read-back by name rather than passing on its values). A
+    sharded array must also be ONE shard object spanning the group: the
+    inner chunk alone cannot see an array split across several.
     """
     want, got = expected_layout(node_order, res), stored_layout(metadata)
     if want == got:
-        return None
+        cells = int(metadata["shape"][0])
+        objects = -(-cells // int(metadata["chunk_grid"]["configuration"]["chunk_shape"][0]))
+        if not got["sharded"] or objects == 1:
+            return None
+        return (
+            f"layout is {objects} shard objects; §4.6 requires one object per array "
+            f"for a group at order {int(res)}"
+        )
 
     def _say(layout):
         kind = "sharded" if layout["sharded"] else "unsharded"
