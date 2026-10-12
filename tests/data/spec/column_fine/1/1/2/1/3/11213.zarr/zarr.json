@@ -1,0 +1,36 @@
+{
+  "attributes": {
+    "morton_hive_commit": {
+      "spec": "morton-hive/1",
+      "complete": true,
+      "cells_with_data": 4,
+      "granule_count": 1,
+      "written_at": "2026-10-12T03:32:50+00:00",
+      "coverage": {
+        "spec": "morton-moc/1",
+        "box": [
+          "1121311111",
+          "11213212112",
+          "11213413444",
+          null
+        ],
+        "cell_order": 10,
+        "source": "worker",
+        "encoding": "bitmap",
+        "sidecar": "coverage.moc",
+        "nbytes": 26,
+        "raw_nbytes": 512
+      },
+      "content_hashes": {
+        "arrays": {
+          "10/count": "63dfb402b44f7d08872a0d4867e307b1da27207437a4ecca7d2f55703863e281",
+          "10/h_tdigest": "1228b4ea2f3d29267ffdc5add6f68df03e9b29285cb3b95f2bdcb8a661bddab4",
+          "10/morton": "52eacb89307d3d964968fd735ecd338cace61d8ae6c61830d63325968d527ce1"
+        },
+        "combined": "735e38b5258327fe6fca4de42ccd9f414525557eff4f8c353c5e1fbac266ab3e"
+      }
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}
