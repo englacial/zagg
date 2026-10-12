@@ -40,7 +40,7 @@ NATIVE_ARTIFACT = "overview"
 
 def native_level(level: dict | None) -> bool:
     """Whether this repo level's chunks are copied in rather than referenced (§11.3)."""
-    return bool(level) and level.get("artifact") == NATIVE_ARTIFACT
+    return level is not None and level.get("artifact") == NATIVE_ARTIFACT
 
 
 def _object_bytes(store, key: str, checksum, *, etags: bool) -> bytes:
