@@ -78,6 +78,23 @@ def _refs(session, array_path: str) -> dict:
     return asyncio.run(collect())
 
 
+def _fold_objects(root) -> dict:
+    """``{key: sha256}`` of every all-time overview chunk object under ``root``.
+
+    The bytes, not the mtime: what a virtual ref's checksum catches is a
+    rewrite of the object's CONTENT, and a rewrite inside one second is
+    exactly the case a timestamp proxy would miss (spec §11.3).
+    """
+    import hashlib
+    from pathlib import Path
+
+    return {
+        str(obj): hashlib.sha256(obj.read_bytes()).hexdigest()
+        for obj in sorted(Path(root).rglob("all.zarr/**/c/*"))
+        if obj.is_file()
+    }
+
+
 class TestRunRows:
     def test_an_unwindowed_run_writes_the_all_row(self):
         assert icechunk_rows.run_rows(None) == ["all"]
@@ -863,8 +880,6 @@ class TestTheLadderWalksAWindowedStore:
         # row is the repo's own bytes (spec §11.3), so the tag reads the
         # ``all`` row it was cut with and not the append's. Every per-window
         # row is immutable and reads either way.
-        from pathlib import Path
-
         from test_icechunk_refs import _ladder_run
 
         shards = _shards(_grid(cfg), 2)
@@ -889,11 +904,7 @@ class TestTheLadderWalksAWindowedStore:
         assert before and any(values.any() for values in folded.values()), (
             "the first run wrote no all-time fold to read back"
         )
-        objects = {
-            str(obj): obj.stat().st_mtime_ns
-            for obj in sorted(Path(root).rglob("all.zarr/**/c/*"))
-            if obj.is_file()
-        }
+        objects = _fold_objects(root)
         assert objects, "no all-time overview object was written"
         _grid_, _root, second = _ladder_run(
             monkeypatch,
@@ -908,11 +919,7 @@ class TestTheLadderWalksAWindowedStore:
         # The append rewrote the fold's objects under the tag's feet -- which
         # is what makes the ``all`` row below a test of the copy and not of
         # immutable bytes.
-        rewritten = {
-            str(obj): obj.stat().st_mtime_ns
-            for obj in sorted(Path(root).rglob("all.zarr/**/c/*"))
-            if obj.is_file()
-        }
+        rewritten = _fold_objects(root)
         assert [key for key in objects if rewritten.get(key) != objects[key]], (
             "the append left every all-time overview object as it was"
         )
