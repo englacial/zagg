@@ -121,10 +121,19 @@ class TestRule:
 
     def test_the_inner_chunk_is_the_stage_fold_block(self):
         # A stage gather reads a child column one fold block at a time; over
-        # a fine leaf column each block read is then exactly one inner chunk.
+        # a fine leaf column a block read is at most one inner chunk: exactly
+        # one above 4^5 cells, the whole four-chunk object at exactly 4^5.
         from zagg.sweep_fold import STAGE_BLOCK_ORDER
 
         assert COLUMN_INNER_ORDER == STAGE_BLOCK_ORDER
+        block = 4**STAGE_BLOCK_ORDER
+        for node in range(0, 10):
+            for res in range(node + COLUMN_INNER_ORDER, node + 12):
+                assert inner_chunk_cells(node, res) <= block
+                if res - node >= COLUMN_INNER_ORDER + 1:
+                    assert inner_chunk_cells(node, res) == block
+                else:
+                    assert 4 * inner_chunk_cells(node, res) == 4 ** (res - node) == block
 
     def test_coarse_groups_keep_the_pre_631_spec_byte_for_byte(self):
         cfg = _overview_config(FIELDS)

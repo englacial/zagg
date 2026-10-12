@@ -42,8 +42,12 @@ reads column shards unchanged.
 
 The constant equals the staged sweep's fold block
 (:data:`zagg.sweep_fold.STAGE_BLOCK_ORDER`): a stage gather reads a child
-column's member one block at a time, so over a fine leaf column each block
-read is exactly one inner chunk — one ranged GET, never a partial chunk.
+column's member one block at a time, so over a fine leaf column a block read
+is at most one inner chunk's worth of cells — one 1,024-cell inner chunk
+above ``4^5`` cells, the whole four-inner-chunk object at exactly ``4^5``.
+(A STAGE column keeps a ``4^5``-cell group one chunk, ``sweep_stage``'s
+``res - node <= STAGE_BLOCK_ORDER``: its chunking is orchestration, §4.6,
+where a leaf column's is the wire contract.)
 """
 
 from __future__ import annotations
