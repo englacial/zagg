@@ -61,6 +61,12 @@ from zagg.multiscales import ARTIFACT_COLUMN
 COLUMN_INNER_ORDER = 5
 
 
+#: The repair :func:`layout_mismatch` names: the column backfill reads a
+#: column laid against the rule as structure drift and re-lays it, values
+#: unchanged (:func:`zagg.column_backfill.column_is_current`).
+RELAY = " — re-lay with the column backfill: python -m zagg.sweep <root> --families columns"
+
+
 def inner_chunk_order(node_order: int, res: int) -> int | None:
     """The ``chunk_inner`` order of a column group's arrays, or ``None``.
 
@@ -128,14 +134,16 @@ def layout_mismatch(node_order: int, res: int, metadata: dict) -> str | None:
             return None
         return (
             f"layout is {objects} shard objects; §4.6 requires one object per array "
-            f"for a group at order {int(res)}"
+            f"for a group at order {int(res)}{RELAY}"
         )
 
     def _say(layout):
         kind = "sharded" if layout["sharded"] else "unsharded"
         return f"{kind}, {layout['chunk_cells']} cells per chunk"
 
-    return f"layout is {_say(got)}; §4.6 requires {_say(want)} for a group at order {int(res)}"
+    return (
+        f"layout is {_say(got)}; §4.6 requires {_say(want)} for a group at order {int(res)}{RELAY}"
+    )
 
 
 def stored_layout(metadata: dict) -> dict:

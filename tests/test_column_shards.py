@@ -784,12 +784,15 @@ class TestPyramidCheckOnAFineTier:
         report = validate_pyramid(str(tmp_path), full=True)
         assert report["passed"] is False
         assert report["checks"]["readback"]["status"] == "fail"
-        mismatches = report["checks"]["readback"]["mismatches"]
-        assert {m.split(": ")[0] for m in mismatches} == {
-            f"{SHARD}[{BASE}]/{name}" for name in ("morton", "count", "h_tdigest")
-        }, format_report(report)
-        why = (
-            "layout is unsharded, 1024 cells per chunk; §4.6 requires sharded, 256 cells per chunk"
+        # Every array of the group fails the same way: ONE line for the group,
+        # naming the arrays, the violation and the repair.
+        (mismatch,) = report["checks"]["readback"]["mismatches"]
+        head, why = mismatch.split("): ", 1)
+        assert head.startswith(f"{SHARD}[{BASE}] (every array: "), format_report(report)
+        assert set(head.split(": ", 1)[1].split(", ")) == {"morton", "count", "h_tdigest"}
+        assert why == (
+            "layout is unsharded, 1024 cells per chunk; §4.6 requires sharded, 256 cells per "
+            f"chunk for a group at order {BASE}" + column_shards.RELAY
         )
-        assert all(why in m for m in mismatches), mismatches
+        assert "python -m zagg.sweep <root> --families columns" in why
         assert report["checks"]["counts"]["status"] == "pass"  # the values never moved
