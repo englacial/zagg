@@ -672,17 +672,24 @@ def _column_layout_errors(harness, dec, s, q) -> list:
     one unsharded chunk below ``4^5`` cells, a ``sharding_indexed`` object on
     the rule's inner chunk at or above it — one line per array, or one per
     group when every array fails the same way (a legacy fine group, until the
-    column backfill re-lays it). The handles are the memoized ones
-    the value legs open anyway (:meth:`_Harness.array`), so the leg costs no
-    extra GET; an absent group or array is the read-back leg's finding, not
-    this one's.
+    column backfill re-lays it). The handles are memoized
+    (:meth:`_Harness.array`): one metadata GET per array the value legs did
+    not already open — in sampled mode with the payload re-fold declined, a
+    digest field without a companion — and none for the rest. An absent group
+    or array is the read-back leg's finding, not this one's; any other open
+    failure declines the leg BY NAME (:meth:`_Harness.warn`), never silently.
     """
+    from zarr.errors import GroupNotFoundError
+
     from zagg.column_shards import layout_mismatch
 
     try:
         group = harness.column_group(dec, q)
-    except Exception:
+    except (GroupNotFoundError, FileNotFoundError, KeyError):
         return []  # absent group: _check_node's read-back leg names it
+    except Exception as exc:
+        harness.warn(f"{dec}[{q}]: §4.6 layout not checked: {type(exc).__name__}: {exc}")
+        return []
     found, checked = {}, 0
     for name in ("morton", *harness.fields, *harness.companions):
         arr = harness.array(group, name)

@@ -761,6 +761,30 @@ class TestPyramidCheckOnAFineTier:
         assert sum(row["failed"] for row in summary["stages"]) == 0, summary
         return manifest
 
+    def test_layout_leg_names_an_open_failure_and_leaves_absence_to_readback(self):
+        from zarr.errors import GroupNotFoundError
+
+        from zagg.pyramid_check_v2 import _column_layout_errors
+
+        class _Harness:
+            def __init__(self, exc):
+                self.exc, self.warnings = exc, []
+
+            def column_group(self, dec, q):
+                raise self.exc
+
+            def warn(self, message):
+                self.warnings.append(message)
+
+        absent = _Harness(GroupNotFoundError("gone"))
+        assert _column_layout_errors(absent, SHARD, NODE, BASE) == []
+        assert absent.warnings == []
+        flaky = _Harness(OSError("connection reset"))
+        assert _column_layout_errors(flaky, SHARD, NODE, BASE) == []
+        assert flaky.warnings == [
+            f"{SHARD}[{BASE}]: §4.6 layout not checked: OSError: connection reset"
+        ]
+
     def test_full_checklist_passes_and_the_layout_leg_holds(self, tmp_path, monkeypatch):
         from zagg.column_backfill import backfill_columns
         from zagg.pyramid_check import format_report, validate_pyramid
