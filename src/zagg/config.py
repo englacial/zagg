@@ -3534,14 +3534,23 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
 
 
 def _declares_windowing(config: PipelineConfig) -> bool:
-    """Whether ``output.windowing`` declares a window schedule, read off the raw block.
+    """Whether ``output.windowing`` declares a known window schedule, read off the raw block.
 
     The same test :func:`get_windowing` opens with, without the normalization
-    — so it is safe before :func:`_validate_windowing` has run (a malformed
-    block answers ``False`` here and is refused by name there).
+    — so it is safe before :func:`_validate_windowing` has run. A non-mapping
+    block, or a schedule that is not a known one (a typo, a reserved name,
+    ``null``), answers ``False`` here and is refused by name there, so the
+    windowing refusal is never masked by the all-time one.
     """
+    from zagg import windows as _windows
+
     block = config.output.get("windowing")
-    return isinstance(block, dict) and block.get("schedule", "none") != "none"
+    if not isinstance(block, dict):
+        return False
+    try:
+        return _windows.check_schedule(block.get("schedule", "none")) != "none"
+    except (TypeError, ValueError):
+        return False
 
 
 def _validate_pyramid(config: PipelineConfig) -> None:
