@@ -41,9 +41,18 @@ therefore a dispatch knob, never grammar — the cascade (issue #620): a merge
 folds its four children's artifacts, so grouping changes no values — and the
 fleet-built ladder is byte-identical to the CLI-built one on the same store.
 
-Dispatch nodes come from the WORK SET the dispatcher holds, not from the
-store: an invoke-only dispatcher role cannot read the root ``coverage.moc``,
-and D8 keeps it that way. The in-process pass derives its dispatch nodes from
+The dispatcher reads exactly ONE object off the store root: the manifest, for
+the ladder gate (:func:`no_ladder_reason`, issue #635) — a store that
+declares no ``zagg-pyramid/2`` ladder is a run that fires nothing, rather
+than one no-op invoke per dispatch node. D8 is amended for that single read
+and for nothing else: it is about WRITES, every one of which stays
+worker-side.
+
+Dispatch nodes still come from the WORK SET the dispatcher holds, not from
+the store: an invoke-only dispatcher role cannot read the root
+``coverage.moc``, and D8 keeps it that way (an unreadable manifest is
+fail-open, so such a role keeps the fan-out it has today). The in-process
+pass derives its dispatch nodes from
 work set ∪ root MOC, so a node whose ONLY leaves are untouched siblings
 recorded in the MOC is not invoked here. That is the same scoped-sweep
 posture ``stage_sweep_after_run`` already has (#381 point (11): the run's
@@ -581,6 +590,61 @@ def await_records(
         time.sleep(max(0.0, min(float(interval_s), deadline - time.monotonic())))
 
 
+def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> str | None:
+    """Why this store's manifest declares no sweepable ladder, or ``None`` (issue #635).
+
+    THE dispatcher's one store read, and its only one. The staged-sweep
+    default keys on the CONFIG (:func:`zagg.config.get_sweep_mode`, issue
+    #620) while ``pyramid.spec`` is written once, at init, and no append
+    rewrites it — so a hive store initialized before the issue #384 flip, or
+    from a config whose ``orders``/``spacing`` schedule was later dropped,
+    carries a ``/1`` manifest while its config now resolves to ``"stages"``.
+    Without this read the dispatcher fans out one stage invoke per dispatch
+    node of the schedule and EVERY one of them dies in
+    :func:`zagg.sweep_stage.ladder_entries`: billed invokes, zero writes —
+    the exact issue #610 cost the default exists to close. D8 is about
+    WRITES, and one GET of one small object at a store root the dispatcher is
+    already handed is neither a write nor store data held in flight.
+
+    The gate IS the workers' own, :func:`zagg.sweep_stage.ladder_entries`, so
+    the dispatcher declines exactly what every invoke would have refused — a
+    non-``/2`` spec, an absent or empty ``overviews`` list, a malformed
+    ladder entry — plus a ``/2`` declaration carrying no level below
+    ``shard_order``, which enumerates to nothing for the staged sweep to
+    fold. ``None`` is a sweepable ladder, the only case that fans out.
+
+    An UNREADABLE manifest is fail-open (D9), not a refusal: a dispatcher
+    role may legitimately hold nothing but ``lambda:InvokeFunction`` against
+    the store itself — the same D8 posture ``shard_order`` is handed in for —
+    and refusing there would take the ladder away from every such deployment.
+    It warns and the fan-out proceeds exactly as it did before this gate; the
+    one grant that closes the hazard is named in the warning and in
+    ``docs/deployment/lambda.md``.
+    """
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.sweep_stage import ladder_entries
+
+    try:
+        manifest = read_manifest(store_path, **store_kwargs)
+    except Exception as e:
+        logger.warning(
+            f"stage fleet: the {MANIFEST_NAME} at {store_path} could not be read ({e}) — the "
+            "store's ladder gate (issue #635) cannot be evaluated, so the fan-out proceeds as "
+            "it did before the gate; a dispatcher role needs s3:GetObject on the store root to "
+            "spend the gate's one read"
+        )
+        return None
+    if manifest is None:
+        return f"no {MANIFEST_NAME} at the store root"
+    try:
+        entries = ladder_entries(manifest.get("pyramid") or {}, shard_order)
+    except ValueError as e:
+        return str(e)
+    if not entries:
+        return f"its ladder declares no level below shard_order {shard_order}"
+    return None
+
+
 def run_stage_sweep_fleet(
     lambda_client,
     function_name: str,
@@ -617,7 +681,12 @@ def run_stage_sweep_fleet(
 
     ``shard_order`` is supplied by the caller rather than read from the
     manifest for the same reason: a dispatcher role may hold nothing but
-    ``lambda:InvokeFunction``. The runner has it from the config.
+    ``lambda:InvokeFunction``. The runner has it from the config. The ONE
+    thing this side does read is the manifest's ladder declaration
+    (:func:`no_ladder_reason`, issue #635), before anything fires and
+    fail-open when the read itself is denied — so a store carrying no
+    ``zagg-pyramid/2`` ladder fires nothing instead of billing one invoke per
+    dispatch node, and a role that cannot read it keeps today's behaviour.
 
     ``coverage`` is the store's own coverage MOC, and supplying it makes every
     tuple's node set THE ruled computation (:func:`coverage_dispatch_nodes`,
@@ -627,8 +696,9 @@ def run_stage_sweep_fleet(
     It composes with ``scope`` (intersection, so a scoped run cannot widen),
     and it is handed IN, the way ``shard_order`` is — the operator reads it
     with :func:`zagg.hive.read_root_coverage` /
-    :func:`zagg.hive.root_coverage_words`, and the dispatcher never reads the
-    store (D8). Omitted, the nodes come from the work set alone, which is what
+    :func:`zagg.hive.root_coverage_words`, and the dispatcher reads nothing
+    but the manifest's ladder declaration (D8, issue #635). Omitted, the
+    nodes come from the work set alone, which is what
     the runner's auto-scoped tail passes and what this transport has always
     done.
 
@@ -702,7 +772,8 @@ def run_stage_sweep_fleet(
     lays tuples from the top down, each the widest width whose fattest
     dispatch node stays within the target, with the remainder at order 0
     (issue #637; a store sparse enough to carry the full width keeps it).
-    Nothing is read from the store either way (D8).
+    The SIZING reads nothing from the store either way (D8; the ladder gate's
+    one manifest GET is the dispatcher's only read, issue #635).
     What it narrows AGAINST depends on what the caller handed in. With a
     ``coverage`` MOC the fold is MEASURED, over the set the worker itself
     folds — the run's leaves union that coverage, coarsened per order
@@ -752,8 +823,10 @@ def run_stage_sweep_fleet(
 
     ``windowed`` / ``all_time`` are the store's declaration (issue #586 phase
     4) — whether it has a window schedule and whether its pyramid declares
-    the all-time fold — handed IN like ``shard_order``, since this side never
-    reads the manifest. They select the unit shape
+    the all-time fold — handed IN like ``shard_order``: the ladder gate's one
+    manifest read (issue #635) is the gate's, and deliberately resolves
+    nothing else, so a ``/2`` store's run is byte-for-byte the run it was.
+    They select the unit shape
     (:func:`zagg.sweep_units.stage_units`): unwindowed, one invoke per batch
     of nodes, as ever; windowed, one per batch of nodes PER WINDOW, plus —
     with ``all_time`` — a close invoke per batch of nodes after them. A
@@ -935,6 +1008,35 @@ def run_stage_sweep_fleet(
     budget_left = [float(total_barrier_budget_s)]
     # The close follows the STORE's declaration once a window record names it.
     declared = {"closes": bool(all_time), "from": "caller"}
+
+    # The STORE's ladder, one GET, before anything fires (issue #635). The
+    # default that chains this dispatcher keys on the config, so a
+    # ``/1``-manifest store appended to by a ladder-declaring config would
+    # otherwise bill one no-op invoke per dispatch node of the sized schedule
+    # — 287 on the California o9 shardmap — each dying in ``ladder_entries``.
+    # The run tail and the hand-called form share the gate because both
+    # arrive here; a ``/2`` store reads one more object and is otherwise
+    # untouched.
+    no_ladder = no_ladder_reason(store_path, shard_order, store_kwargs)
+    if no_ladder is not None:
+        logger.warning(
+            f"stage fleet: {store_path} declares no zagg-pyramid/2 ladder to sweep "
+            f"({no_ladder}) — run {run_id} fires nothing: no stage invoke, no finisher, no "
+            "barrier. The ladder is the MANIFEST's and a manifest is written once, at init: "
+            "retrofit the store with `python -m zagg.sweep <store> --declare-pyramid "
+            "<config.yaml>` (plus `--overviews <resolutions>` where the config spells none), "
+            "or append with `output.pyramid` set to what the manifest declares"
+        )
+        summary["skipped"] = "no zagg-pyramid/2 ladder"
+        # The families ride a node CLOSE (issue #610 phase 4) and nothing
+        # closes in a run that fires nothing, so the rollups handed to this
+        # sweep are unswept — which is what the runner's backstop warning
+        # (``_warn_families_unswept``) reads.
+        summary["families_unswept"] = bool(family_names)
+        summary["all_time"], summary["all_time_from"] = declared["closes"], declared["from"]
+        summary["finisher"] = {"landed": False, "fired": False}
+        summary["duration_s"] = time.perf_counter() - t0
+        return summary
 
     # Record names are deterministic and the prefix is keyed on run_id alone,
     # so a SUPPLIED run_id that has been driven before would make every barrier
