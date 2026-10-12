@@ -625,6 +625,21 @@ class TestStoreLadderGate:
         assert client.events == [] and summary["invokes"] == 0
         assert "does not parse" in summary["skipped"]
 
+    def test_a_local_root_that_does_not_exist_declines_without_writing(self, tmp_path):
+        # The gate's ONE READ must not write, on either path form (review
+        # finding): ``open_object_store``'s local branch mkdirs the root it is
+        # handed, so reading through it on a path that does not exist used to
+        # materialize the tree the gate then declined — "not a hive store
+        # root" about a directory the dispatcher had just created. The D8
+        # audit counts ``obstore.put``, so it cannot see this.
+        root = tmp_path / "typo" / "store"
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert client.events == [] and summary["invokes"] == 0
+        assert summary["skipped"].startswith(NO_LADDER_SKIP)
+        assert "no morton_hive.json at the store root" in summary["skipped"]
+        assert not root.exists() and not root.parent.exists()  # nothing was created
+
     def test_a_root_with_no_manifest_fires_nothing(self, tmp_path):
         root = tmp_path / "empty"
         root.mkdir()

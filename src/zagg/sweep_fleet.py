@@ -609,7 +609,11 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     :func:`zagg.sweep_stage.ladder_entries`: billed invokes, zero writes —
     the exact issue #610 cost the default exists to close. D8 is about
     WRITES, and one GET of one small object at a store root the dispatcher is
-    already handed is neither a write nor store data held in flight.
+    already handed is neither a write nor store data held in flight. That
+    holds on BOTH path forms: a local root that does not exist declines
+    without a read at all, because ``open_object_store``'s local branch
+    CREATES the directory it is handed, and the gate must not write a tree it
+    is about to decline (review finding).
 
     The gate IS the workers' own, :func:`zagg.sweep_stage.ladder_entries`,
     and it declines exactly what every invoke would have REFUSED and nothing
@@ -642,9 +646,27 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     ``lambda:InvokeFunction`` plus list/get on the ``<store>.status/``
     sibling does not carry it.
     """
+    from pathlib import Path
+
     from zagg.hive import MANIFEST_NAME, read_manifest
     from zagg.sweep_stage import ladder_entries
 
+    absent = (
+        f"no {MANIFEST_NAME} at the store root — not a hive store root, or the run's "
+        f"manifest finalize has not landed (re-run it; `--declare-pyramid` refuses a "
+        f"store with no manifest)"
+    )
+    if not store_path.startswith("s3://") and not Path(store_path).is_dir():
+        # The read must not WRITE, on either path form (review finding).
+        # ``open_object_store``'s local branch is
+        # ``Path(path).resolve().mkdir(parents=True, exist_ok=True)``
+        # (:mod:`zagg.store`), so READING through it on a root that does not
+        # exist materializes the very tree the gate then declines — and the
+        # D8 audit cannot see it, because it counts ``obstore.put``. An absent
+        # local root is the same verdict as an absent manifest, and this
+        # reaches it without touching the filesystem at all. The store
+        # factory's contract is untouched for every other caller.
+        return absent
     try:
         manifest = read_manifest(store_path, **store_kwargs)
     except ValueError as e:
@@ -672,11 +694,7 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # finalize write (issue #252), and that write's failure is DEFERRED
         # past the tail — so this is reachable on a store whose finalize has
         # not landed, where re-running it is the fix.
-        return (
-            f"no {MANIFEST_NAME} at the store root — not a hive store root, or the run's "
-            f"manifest finalize has not landed (re-run it; `--declare-pyramid` refuses a "
-            f"store with no manifest)"
-        )
+        return absent
     if not isinstance(manifest, dict):
         # The fourth broken-manifest shape, and the fourth remedy (review
         # finding): a top level that PARSES but is not an object reaches
