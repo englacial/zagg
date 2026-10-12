@@ -1560,15 +1560,18 @@ class TestStagedSweepTail:
         assert seam["run_id"] == cell and handle.families_sweep == {"x": 1}
         assert seam["store_kwargs"]["region"] == run.region == "us-west-2"
 
-    def test_the_cascade_decides_with_the_runners_gate(self):
+    def test_the_cascade_decides_with_the_runners_gate(self, catalog, monkeypatch):
         # Shared, not copied (as the seam and the completion gate are): the
         # facade asks ``runner._cascade_families`` which families ride, so it
         # cannot drift from ``_run_lambda`` on when the separate pass fires.
-        import inspect
+        # A ladder-walking drive whose gate says "none ride" fires the pass.
+        from zagg import runner
 
-        src = inspect.getsource(zagg.client)
-        assert "def _cascade_families" not in src
-        assert "runner._cascade_families(" in src
+        monkeypatch.setattr(runner, "_cascade_families", lambda *a, **k: ())
+        _run_, _handle, stub, seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
+        assert "sweep" in stub.modes()
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == ()
 
     @pytest.mark.parametrize(
         "staged, reason",
