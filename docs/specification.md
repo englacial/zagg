@@ -2435,10 +2435,11 @@ what that artifact means). The one **versioned** leaf (§1.5; a stamp
 naming `current`) is `versioned/` below, added standalone with the writer
 that produces it (issue [#582](https://github.com/englacial/zagg/issues/582));
 the other leaf fixtures are unversioned and pin the absent-`current` rule.
-Two older-era pins survive a regeneration by hand (the generator's STALE BY
-DESIGN note): the §4.9 `multiscales` mirror is deleted from `column/`'s
-manifest, and `kitchen_sink/`'s two `*_locations` siblings keep their
-pre-§9 attrs.
+Two older-era pins are produced deliberately by the generator (its STALE
+BY DESIGN note): `column/`'s builder drops the §4.9 `multiscales` mirror
+from its manifest, and `kitchen_sink/`'s builder strips the §9 `located`
+attrs from its two leaf `*_locations` siblings, so a regeneration
+reproduces both.
 
 Nine tiny single-shard hive stores plus four metadata-only ones (the
 `pyramid/` declaration, the `multiscales/` companion, the `icechunk/` repo
@@ -2492,8 +2493,8 @@ never sharded, §8/#247):
   alone — the `/2` artifacts a fleet writes are `column/`'s job below
   (sweep-side levels are #384's). The same manifest carries the §4.9
   `multiscales` discovery mirror the retrofit installs beside a `/2`
-  block; `column/`'s manifest, whose mirror is deleted by hand after a
-  regeneration (stale by design), is the absent-key ⇒ pre-convention pin.
+  block; `column/`'s manifest, whose mirror the generator drops on purpose
+  (stale by design), is the absent-key ⇒ pre-convention pin.
 - **`column/`** — the `minimal/` inputs plus an explicit
   `output.pyramid.overviews: 5` knob, so the same worker invocation that
   committed the leaf also wrote its §4.6 **column**: `all.pyramid.zarr`
@@ -2572,8 +2573,9 @@ never sharded, §8/#247):
   per-centroid envelope beneath it) on committed bytes. Its located sibling
   carries **heterogeneous orders** — order-29 point words on unmerged
   centroids, coarser ancestors on merged ones — which is §9.1's claim
-  pinned. `kitchen_sink/`, whose two located siblings keep their pre-§9
-  attrs by hand (stale by design), is the absent-`located` ⇒ §2.2 pin,
+  pinned. `kitchen_sink/`, whose two located siblings the generator writes
+  without the §9 attrs on purpose (stale by design), is the
+  absent-`located` ⇒ §2.2 pin,
   exactly as `minimal/` is §2.0's.
 
   Its §4.6 leaf column carries the **folded** companions: every resolution

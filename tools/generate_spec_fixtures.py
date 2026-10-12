@@ -62,9 +62,9 @@ conformance tests assert decoded values, never object bytes.
   ``pyramid.expected.json`` record of the raw config knob, the leaf-list
   form of the declaration the expansion was derived from. Since issue #392
   the same manifest also carries the §4.9 ``multiscales`` discovery mirror
-  installed beside every ``/2`` block (``column/``'s manifest has the key
-  removed by hand after a regen — STALE BY DESIGN below — as the absent-key
-  ⇒ pre-convention pin). No store beneath
+  installed beside every ``/2`` block (``column/``'s builder drops the key
+  — STALE BY DESIGN below — as the absent-key ⇒ pre-convention pin). No
+  store beneath
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone; the ``/2`` artifacts a fleet writes are the
   ``column/`` fixture's job (issue #383 — sweep-side levels are issue #384).
@@ -105,10 +105,9 @@ conformance tests assert decoded values, never object bytes.
   multi-observation cell and merged centroid a conservative RANGE. The words
   are computed here from the generator's inputs and handed to the write path
   — the aggregation kernel that will produce them is #410's next PR — so the
-  expectations stay input-derived. ``kitchen_sink/``'s two
-  ``*_locations/zarr.json`` siblings, committed before §9 and deliberately
-  NOT refreshed (``git checkout --`` them after a regen), are the
-  absent-``located`` ⇒ §2.2 pin.
+  expectations stay input-derived. ``kitchen_sink/``'s two leaf
+  ``*_locations/zarr.json`` siblings, whose ``located`` block its builder
+  strips (STALE BY DESIGN below), are the absent-``located`` ⇒ §2.2 pin.
   ``temporal/`` is ALSO the only fixture carrying a **root ``coverage.moc``**
   (issue #480): the §10 ``zagg-coverage-toc/1`` section, written here by the
   production sweep writer (``MocFamily``'s leaf read + finisher) — and, from
@@ -142,16 +141,16 @@ conformance tests assert decoded values, never object bytes.
   composition cleanly (no ``demotions`` key — the absence pin), the
   cascaded level fires ``divisor-missing`` and records it.
 
-STALE BY DESIGN: some committed bytes deliberately pin an older writer era
-and must NOT be refreshed by a regen — currently ``kitchen_sink/``'s two
-``*_locations/zarr.json`` siblings (the pre-§9 absent-``located`` pin
-above) and the ``multiscales`` key of ``column/``'s ``morton_hive.json``
-(the pre-§4.9 absent-key pin above). Running this script rewrites both;
-``git checkout --`` the two siblings and delete the one manifest key after a
-regen (``tests/test_spec_conformance.py`` asserts all three absences).
-Every count-bearing fixture was otherwise regenerated for issue #626
-(``count`` is ``int64``), so the committed stamps, manifests and stats
-records are the current writer's. When regenerating for one fixture only,
+STALE BY DESIGN: two builders deliberately produce an older writer era
+on top of the production write — :func:`build_kitchen_sink` strips the
+``located`` block from its two leaf ``*_locations/zarr.json`` siblings (the
+pre-§9 absent-``located`` pin above) and :func:`build_column` drops the
+``multiscales`` key from its ``morton_hive.json`` (the pre-§4.9 absent-key
+pin above), so a bare regen reproduces both pins
+(``tests/test_spec_conformance.py`` asserts all three absences). Every
+count-bearing fixture was otherwise regenerated for issue #626 (``count``
+is ``int64``), so the committed stamps, manifests and stats records are the
+current writer's. When regenerating for one fixture only,
 ``git checkout --`` the others; a deliberate refresh of an older-era fixture
 is its own commit.
 """
@@ -686,6 +685,39 @@ def _column_expected(column_dir: Path, basename: str) -> dict:
         "groups": groups,
         "content_hashes": _o11_hashes(str(column_dir)),
     }
+
+
+def build_kitchen_sink(out: Path) -> None:
+    """``kitchen_sink/``, its leaf ``*_locations`` siblings in the pre-§9 era.
+
+    The production write stamps a ``located`` block on each sibling; this
+    fixture strips it deliberately so a regen reproduces the committed
+    absent-``located`` ⇒ §2.2 pin (STALE BY DESIGN in the module docstring).
+    The chunk bytes and O11 hashes are the writer's, untouched.
+    """
+    build(out, kitchen_sink=True)
+    leaf = out / json.loads((out.parent / f"{out.name}.expected.json").read_text())["leaf"]
+    for path in sorted(leaf.glob("*/*_locations/zarr.json")):
+        doc = json.loads(path.read_text())
+        del doc["attributes"]["located"]
+        path.write_text(json.dumps(doc, indent=2))
+
+
+def build_column(out: Path) -> None:
+    """``column/``, its ``/2`` manifest in the pre-§4.9 era (no mirror).
+
+    ``build_manifest`` installs the §4.9 ``multiscales`` mirror beside every
+    ``/2`` block; this fixture drops it deliberately so a regen reproduces
+    the committed absent-key ⇒ pre-convention pin (STALE BY DESIGN in the
+    module docstring), the same read/PUT pattern ``build_demoted`` uses.
+    """
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.store import open_object_store, put_object
+
+    build(out, kitchen_sink=False, pyramid={"overviews": 5})
+    manifest = read_manifest(str(out))
+    del manifest["multiscales"]
+    put_object(open_object_store(str(out)), MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
 
 
 def _expected_multiscales(levels: list, s: int) -> list:
@@ -2238,8 +2270,8 @@ def main() -> None:
     args = parser.parse_args()
     builders = {
         "minimal": lambda: build(args.out / "minimal", kitchen_sink=False),
-        "kitchen_sink": lambda: build(args.out / "kitchen_sink", kitchen_sink=True),
-        "column": lambda: build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5}),
+        "kitchen_sink": lambda: build_kitchen_sink(args.out / "kitchen_sink"),
+        "column": lambda: build_column(args.out / "column"),
         "pyramid": lambda: build_pyramid(args.out / "pyramid"),
         "multiscales": lambda: build_multiscales(args.out / "multiscales"),
         "icechunk": lambda: build_icechunk(args.out / "icechunk"),

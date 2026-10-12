@@ -1002,7 +1002,7 @@ class TestMultiscalesMirror:
 
     def test_absence_is_the_pre_convention_pin(self):
         # §4.9: the key is present exactly when the pyramid block is /2 —
-        # column/ (a /2 manifest whose key is removed by hand after a regen —
+        # column/ (a /2 manifest whose generator builder drops the key —
         # stale by design, see the generator) pins absence as the legal
         # pre-convention state, and raster_toc/ pins that /1 never carries it.
         for name in ("column", "raster_toc"):
@@ -2094,9 +2094,9 @@ class TestLocatedDeclaration:
     """§9 — the located declaration, pinned on the committed `temporal/`.
 
     The absent-key ⇒ §2.2 side is pinned by `kitchen_sink/`, whose two located
-    siblings are held at their pre-§9 bytes (stale by design, see the
-    generator): they carry no `located` key, and a reader must read them as
-    §2.2 verbatim rather than refuse them.
+    siblings its generator builder writes in the pre-§9 era (stale by design,
+    see the generator): they carry no `located` key, and a reader must read
+    them as §2.2 verbatim rather than refuse them.
     """
 
     def test_declaration_rides_the_sibling_that_holds_the_words(self):
