@@ -2283,7 +2283,9 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   `icechunk_replays` (commits replayed in a fresh session because another
   run's init grew the row axis under the node's staged refs, spec §11.4),
   `icechunk_commit_s`, `icechunk_native_bytes` (the overview bytes copied
-  into the repo instead of referenced, spec §11.3), `icechunk_refs`,
+  into the repo instead of referenced, spec §11.3 — every commit attempt's,
+  since a replay re-copies the whole unit and leaves the abandoned
+  attempt's chunk objects behind unreferenced), `icechunk_refs`,
   `icechunk_missing`,
   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
   `icechunk_regathered` (dirt-only nodes, re-gathered without a fold) and

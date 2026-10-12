@@ -1296,9 +1296,10 @@ def commit_units(
     streams the subtree again instead of holding it; a one-shot iterable is
     retained for the replay. Returns ``{"path", "snapshot", "refs", "levels",
     "rebases", "replays", "commit_s", "native_bytes"}`` (``snapshot`` ``None``
-    when nothing was written; ``native_bytes`` the overview bytes this commit
-    copied into the repo rather than referenced, §11.3). ``repo`` skips the
-    open/vet when the caller already holds a vetted handle.
+    when nothing was written; ``native_bytes`` the overview bytes copied into
+    the repo rather than referenced, §11.3 — every ATTEMPT's, as ``rebases``
+    and ``commit_s`` are, because a replay re-pays the whole copy). ``repo``
+    skips the open/vet when the caller already holds a vetted handle.
 
     **The row-growth replay (§11.4, issue #584 phase 3).** Another run's init
     landing while this session holds staged refs grows every level array by a
@@ -1310,10 +1311,27 @@ def commit_units(
     session based on the grown arrays and committed, each unit's label
     resolving to the same row index (the row law, §11.2: a row never moves),
     at most :data:`REPLAY_TRIES` times, then the failure propagates to the
-    fail-open caller. ``rebases`` and ``commit_s`` sum every session's,
-    the failed ones included. A growth with ANY commit since the session's base that
+    fail-open caller. ``rebases``, ``commit_s`` and ``native_bytes`` sum
+    every session's, the failed ones included. A growth with ANY commit since
+    the session's base that
     updated a staged chunk is refused, whichever landed first: the original
     ``RebaseFailedError`` propagates. The record's ``replays`` counts them.
+
+    **What a replay costs, and the residue it leaves (issue #584 review).** A
+    fresh session cannot adopt the abandoned one's staged chunks, so a replay
+    re-GETs and re-copies the units in full; ``native_bytes`` therefore
+    reports every attempt, which is what the repo paid. Icechunk writes a
+    native chunk's object **eagerly**, at ``store.set`` rather than at the
+    commit (verified against icechunk 2.2.2: one chunk object present before
+    the commit, still present after the session is dropped), so the
+    abandoned attempt's objects **stay in repo storage referenced by no
+    snapshot** — as do those of a copy that raised part-way through a node's
+    entries. Correctness is unaffected: the session is never committed, so no
+    half-copied level is visible to any read or tag. The residue is bytes,
+    and only ``garbage_collect`` can see them, which the default
+    ``retain_runs: 0`` never runs (§11.4). Preventing the orphan needs an
+    Icechunk-side deferred write or an explicit abort, so it is recorded
+    rather than fixed.
     """
     import icechunk
 
@@ -1321,13 +1339,17 @@ def commit_units(
         repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
     source = units if callable(units) else list(units)
     path = repo_path(store_root)
-    replays, rebases, commit_s = 0, 0, 0.0  # summed over the replays: the node's contention
+    # Summed over the replays: the node's contention, and the bytes it
+    # paid — a replay re-copies the whole unit (above), so the committed
+    # attempt alone under-reports exactly when the repo paid most.
+    replays, rebases, commit_s, copied = 0, 0, 0.0, 0
     while True:
         session = repo.writable_session(BRANCH)
         base = session.snapshot_id
         refs, orders, native = _stage_units(
             session, source() if callable(source) else source, store_root, store_kwargs
         )
+        copied += native
         if not refs:
             return {
                 "path": path,
@@ -1337,7 +1359,7 @@ def commit_units(
                 "rebases": rebases,
                 "replays": replays,
                 "commit_s": commit_s,
-                "native_bytes": native,
+                "native_bytes": copied,
             }
         t0 = time.perf_counter()
         try:
@@ -1362,7 +1384,7 @@ def commit_units(
             "rebases": rebases + rounds,
             "replays": replays,
             "commit_s": commit_s + time.perf_counter() - t0,
-            "native_bytes": native,
+            "native_bytes": copied,
         }
 
 

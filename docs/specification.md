@@ -4790,10 +4790,25 @@ columns do:
    and the growth landed first; the rebase failure propagates. A replayed
    node's rebases and commit time sum every session's, the defeated one
    included, and a replay counts whether or not its re-read then staged
-   anything to commit. Each stage row
+   anything to commit.
+
+   A replay **re-pays the native copy in full** (§11.3): a fresh session
+   cannot adopt the abandoned one's staged chunks, so every overview object
+   the node reads is read and copied again, and `icechunk_native_bytes`
+   counts every attempt — what the repository actually paid, not the
+   committed attempt alone. Two consequences follow from Icechunk writing a
+   native chunk's object **eagerly**, at the staging write rather than at the
+   commit: the abandoned attempt's chunk objects **remain in repository
+   storage referenced by no snapshot**, as do those of a copy that raised
+   part-way through a node's entries, and only `garbage_collect` can ever see
+   them — which the default `retain_runs: 0` does not run (below). No
+   *correctness* consequence: the session is never committed, so no
+   half-copied level is visible to any read or tag, and the residue is bytes
+   rather than state. Each stage row
    records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
    `icechunk_commit_s`, `icechunk_native_bytes` (the overview bytes its
-   commits copied into the repo rather than referenced, §11.3),
+   commit attempts copied into the repo rather than referenced, §11.3,
+   the replayed attempts included),
    `icechunk_refs`, `icechunk_missing`,
    `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
    `icechunk_regathered` and `icechunk_s` — every one

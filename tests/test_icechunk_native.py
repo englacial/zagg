@@ -244,6 +244,53 @@ class TestTheCopy:
             self._copy(root, [whole])
 
 
+class TestTheReplayRePaysTheCopy:
+    """A row-growth replay copies the unit again, and the record says so (issue #584)."""
+
+    @staticmethod
+    def _declare_native(root, level: str):
+        """Declare ``level`` an ``overview`` level, so its chunks are copied in (§11.3)."""
+        from zagg.icechunk_refs import ICECHUNK_ATTR
+
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        session = repo.writable_session(icechunk_refs.BRANCH)
+        group = zarr.open_group(session.store, mode="r+")
+        block = dict(group.attrs[ICECHUNK_ATTR])
+        native = {**block["levels"][level], "artifact": icechunk_native.NATIVE_ARTIFACT}
+        group.attrs[ICECHUNK_ATTR] = {**block, "levels": {**block["levels"], level: native}}
+        session.commit(f"level {level} is native")
+
+    def test_the_record_counts_every_attempts_copied_bytes(self, monkeypatch, cfg, tmp_path):
+        # A fresh session cannot adopt the abandoned one's staged chunks, so
+        # the replay re-GETs and re-copies the whole unit. Reporting the
+        # committed attempt alone under-reported exactly when the repo paid
+        # most, and left the abandoned attempt's chunk objects unaccounted
+        # (issue #584 review); the counter is now every attempt's, as
+        # ``rebases`` and ``commit_s`` already were.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        version = _write_leaf(monkeypatch, grid, root, shard, fill=1.0, refs=False, run_id="a")
+        _init(root, grid, cfg, manifest, ["2019"])
+        plan = icechunk_refs.leaf_ref_plan(
+            grid, shard, root, store_kwargs={}, version=version["leaf_version"]
+        )
+        self._declare_native(root, "6")
+        unit = {"level": 6, "row": "2019", "entries": plan}
+        grown: list = []
+
+        def units():
+            yield unit
+            if not grown:  # another run's init, landing on the staged copy
+                grown.append(_init(root, grid, cfg, manifest, ["2020"], run_id="run-2")["rows"])
+
+        out = icechunk_refs.commit_units(root, units, "node 1", store_kwargs={})
+        assert out["replays"] == 1 and grown == [["2019", "2020"]]
+        # The same unit, committed with nothing racing: one copy's bytes.
+        again = icechunk_refs.commit_units(root, [unit], "node 1 again", store_kwargs={})
+        assert again["replays"] == 0 and again["native_bytes"] > 0
+        assert out["native_bytes"] == 2 * again["native_bytes"]
+
+
 class TestTheLadderCommitsOverviewsNatively:
     def test_the_overview_levels_are_native_and_the_base_stays_virtual(
         self, monkeypatch, cfg, tmp_path
