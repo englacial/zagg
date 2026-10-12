@@ -1162,11 +1162,27 @@ def open_vetted(store_root: str, *, store_kwargs: dict, want: dict | None = None
     return repo, block
 
 
-def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
-    """Write ``units`` into ``session`` (nothing committed); ``(refs, levels)`` staged."""
+def _stage_units(
+    session, units: Iterable[dict], store_root: str, store_kwargs: dict
+) -> tuple[int, set, int]:
+    """Write ``units`` into ``session`` (nothing committed); ``(refs, levels, bytes)`` staged.
+
+    A unit lands as virtual refs, except on a level whose chunks are the
+    repo's own bytes (:func:`zagg.icechunk_native.native_level` — the §4
+    overview levels, which a later run rewrites in place), where the entry's
+    chunks are COPIED in and ``bytes`` counts them. The decision is the
+    repo's own ``levels`` block, never the unit's: a carrier written before
+    this writer carries exactly the same entries (§11.3, issue #584).
+    """
+    from zagg.icechunk_native import native_level, stage_entry
+    from zagg.store import open_object_store
+
     block = _session_block(session) or {}
     rows, levels = block.get("rows") or [], block.get("levels") or {}
-    refs = 0
+    prefix = container_prefix(store_root)
+    etags = prefix.startswith("s3://")
+    store = None
+    refs, native = 0, 0
     orders: set = set()
     for unit in units:
         order = int(unit["level"])
@@ -1175,7 +1191,11 @@ def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
             if not entry["refs"]:
                 continue
             array_path = f"{order}/{entry['path']}"
-            if entry["sharded"]:
+            if native_level(levels.get(str(order))):
+                if store is None:
+                    store = open_object_store(store_root, **store_kwargs)
+                native += stage_entry(session, order, row, entry, prefix, store, etags=etags)
+            elif entry["sharded"]:
                 rejected = session.store.set_virtual_refs_arr(
                     array_path,
                     (1, *entry["chunk_grid"]),
@@ -1199,7 +1219,7 @@ def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
                     )
             refs += int(entry["refs"])
             orders.add(order)
-    return refs, orders
+    return refs, orders, native
 
 
 def _row_growth_only(exc, repo, session, base: str) -> bool:
@@ -1252,9 +1272,10 @@ def commit_units(
     (§11.4) — and it hands the stream as a CALLABLE so a replay (below)
     streams the subtree again instead of holding it; a one-shot iterable is
     retained for the replay. Returns ``{"path", "snapshot", "refs", "levels",
-    "rebases", "replays", "commit_s"}`` (``snapshot`` ``None`` when nothing
-    was written). ``repo`` skips the open/vet when the caller already holds a
-    vetted handle.
+    "rebases", "replays", "commit_s", "native_bytes"}`` (``snapshot`` ``None``
+    when nothing was written; ``native_bytes`` the overview bytes this commit
+    copied into the repo rather than referenced, §11.3). ``repo`` skips the
+    open/vet when the caller already holds a vetted handle.
 
     **The row-growth replay (§11.4, issue #584 phase 3).** Another run's init
     landing while this session holds staged refs grows every level array by a
@@ -1281,7 +1302,9 @@ def commit_units(
     while True:
         session = repo.writable_session(BRANCH)
         base = session.snapshot_id
-        refs, orders = _stage_units(session, source() if callable(source) else source)
+        refs, orders, native = _stage_units(
+            session, source() if callable(source) else source, store_root, store_kwargs
+        )
         if not refs:
             return {
                 "path": path,
@@ -1291,6 +1314,7 @@ def commit_units(
                 "rebases": rebases,
                 "replays": replays,
                 "commit_s": commit_s,
+                "native_bytes": native,
             }
         t0 = time.perf_counter()
         try:
@@ -1315,6 +1339,7 @@ def commit_units(
             "rebases": rebases + rounds,
             "replays": replays,
             "commit_s": commit_s + time.perf_counter() - t0,
+            "native_bytes": native,
         }
 
 

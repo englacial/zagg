@@ -10,8 +10,12 @@ travel the way the digest columns do:
    leaf (:func:`write_leaf_refs`) and commits nothing;
 2. each stage node of the staged sweep gathers its subtree — the leaf
    sidecars at the finest tuple, its children's node **ref columns** above —
-   adds the refs of the overview objects it just wrote, and either writes
-   its own node column for the tuple above or **commits** (:func:`stage_node_refs`);
+   adds the plan of the overview objects it just wrote, and either writes
+   its own node column for the tuple above or **commits** (:func:`stage_node_refs`).
+   An overview level's plan is **copied in** rather than referenced at that
+   commit (:mod:`zagg.icechunk_native`, §11.3): those objects are rewritten in
+   place by the next run that re-folds them, so a tag holding virtual refs to
+   them could not read the level it was cut with;
 3. the tuple whose order range contains ``icechunk.commit_order`` commits
    everything gathered in ONE commit per node covering every order in its
    subtree (refs into ``/19/…``, ``/13/…``, ``/12/…``, … of the one repo —
@@ -353,6 +357,12 @@ def _overview_units(
     store_root, node, orders, level_by_order, fields, candidates, store_kwargs, rows=(ALL_ROW,)
 ):
     """Ref entries of every overview object under ``node`` at the tuple's orders.
+
+    The entries are planned exactly as a leaf's are and the committing
+    session copies their bytes in instead of referencing them (an overview
+    level is native, :mod:`zagg.icechunk_native`); nothing about the plan or
+    the carrier differs, so a node column written by an earlier writer
+    travels and commits unchanged.
 
     One unit per (level, ROW): a windowed store's node carries one overview
     object per window (``{window}.zarr``, D23) plus ``all.zarr`` for the
