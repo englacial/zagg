@@ -2817,6 +2817,15 @@ class TestDerivedCellCoordinate:
         )
         assert exp["content_hashes"]["combined"] == FROZEN_COMBINED[self.NAME]
 
+    def test_the_manifest_declares_the_all_time_fold(self):
+        # §4.5 `all_time`: a windowed store that declares an overview schedule
+        # MUST declare the fold `true` (issue #610 phase 4). The fixture is a
+        # leaf-tier one, so it commits no `all.zarr`: declared-but-unmaterialized
+        # is legal, and this pins the declaration a regenerator could drop.
+        manifest = json.loads((SPEC_DATA / self.NAME / "morton_hive.json").read_text())
+        assert manifest["pyramid"]["overviews"]
+        assert manifest["pyramid"]["overview"]["all_time"] is True
+
     def test_the_unwindowed_fixtures_still_store_theirs(self):
         # The other half of the rule: every unwindowed leaf keeps its array,
         # key and bytes — no committed fixture moved (the FROZEN literals
