@@ -61,6 +61,14 @@ def container_hwm_mb() -> float | None:
     (issue #602 reads the staged sweep's headroom against the 8 GB tier to
     decide whether that tier can come back down). It is NOT a per-unit peak,
     so it bounds the tuple, not the fold.
+
+    The ``ru_maxrss`` unit branch below is the same conversion as
+    ``zagg.processing.aggregate._rss_mb``'s fallback and the leaf worker's
+    (``deployment/aws/lambda_handler.py``); it is spelled out rather than
+    shared because those two return a float on failure where a stage row
+    needs ``None`` (not measured), and the leaf one lives in the deployment
+    tree. ``container_hwm_mb`` is named in ``docs/specification.md`` §4.7's
+    stage-record field list.
     """
     try:
         import resource

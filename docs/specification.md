@@ -1918,10 +1918,17 @@ stated here:
   rows count `window_units` and `close_units`, name a unit that raised in
   `unit_errors`, and report the streamed fold's accounting (`fold_blocks`,
   `fold_cells_read`, `fold_peak_cells` — the most source cells any one fold
-  block held). **`closes`** is whether the store's nodes take a close, as
-  the worker read it off the store manifest (a windowed store declaring
-  `pyramid.overview.all_time`). The fleet dispatcher fires the close units
-  from it, not from its run config: `pyramid` is not a frozen manifest key,
+  block held) and the tuple's memory (**`container_hwm_mb`**,
+  [issue #602](https://github.com/englacial/zagg/issues/602) — the worker
+  process's `ru_maxrss` in MB read at the end of the tuple, so a
+  CONTAINER-LIFETIME high-water and an UPPER BOUND on what the tuple needed,
+  not the sampled per-invocation peak a leaf row's `max_memory_mb` is
+  ([issue #141](https://github.com/englacial/zagg/issues/141)); `null` where
+  the platform offers no `resource`). **`closes`** is whether the store's
+  nodes take a close, as the worker read it off the store manifest (a
+  windowed store declaring `pyramid.overview.all_time`). The fleet
+  dispatcher fires the close units from it, not from its run config:
+  `pyramid` is not a frozen manifest key,
   so the two can disagree, and the store is the source of truth.
 - A stage record's **`families`**
   ([issue #610](https://github.com/englacial/zagg/issues/610)) is present
