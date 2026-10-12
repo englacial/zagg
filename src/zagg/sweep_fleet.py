@@ -618,11 +618,13 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     does, which is the one thing issue #635 asks not to move (review
     finding).
 
-    ``shard_order`` is the caller's as a FALLBACK only: the ladder is filtered
-    at the store's own ``shard_order`` where the manifest carries one, because
-    the leaf exclusion is the workers' and every worker takes
-    ``int(manifest["shard_order"])``. In the hand-driven recovery form the
-    caller's value is an operator's, and the store's truth wins over it — the
+    ``shard_order`` is CHECKED against the manifest's, not reconciled with
+    it: the ladder is filtered at the store's own value, because the leaf
+    exclusion is the workers' and every worker takes
+    ``int(manifest["shard_order"])``, and a caller whose value disagrees — or
+    a manifest that declares none — declines by name here rather than
+    refusing once per invoke worker-side (review finding). In the hand-driven
+    recovery form that value is an operator's, so the store's truth wins, the
     same posture ``declare_pyramid`` takes.
 
     An UNREADABLE manifest is fail-open (D9), not a refusal: a dispatcher
@@ -659,13 +661,22 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     if manifest is None:
         return f"no {MANIFEST_NAME} at the store root"
     try:
-        # The STORE's shard order where it has one, not the caller's (review
-        # finding): the leaf exclusion is the workers' own, and every worker
-        # takes ``int(manifest["shard_order"])``. In the hand-driven recovery
-        # form ``shard_order`` is the operator's, so a value that disagrees
-        # would otherwise decline a store the workers sweep — under a
-        # retrofit warning that hides the real mismatch.
-        order = int(manifest.get("shard_order") or shard_order)
+        # The STORE's shard order, not the caller's: the leaf exclusion is the
+        # workers' own and every worker takes ``int(manifest["shard_order"])``.
+        # The two are checked rather than reconciled (review finding) — the
+        # gate is the one place holding both numbers, and a run every worker
+        # would refuse by name ("stage tuple [3, 5) is not a span of this
+        # ladder", or a bare ``KeyError`` with no order declared at all) is
+        # exactly what reading first exists to make free.
+        order = manifest.get("shard_order")
+        if order is None:
+            return f"the {MANIFEST_NAME} at the store root declares no shard_order"
+        if int(order) != int(shard_order):
+            return (
+                f"its manifest declares shard_order {int(order)}, not the {int(shard_order)} "
+                "this dispatch was handed — every worker would refuse the tuple span"
+            )
+        order = int(order)
         entries = ladder_entries(manifest.get("pyramid") or {}, order)
     except (AttributeError, KeyError, TypeError, ValueError) as e:
         # Not ``ValueError`` alone (review finding): ``ladder_entries``

@@ -515,12 +515,10 @@ class TestStoreLadderGate:
 
     def test_the_gate_filters_at_the_manifest_shard_order(self, tmp_path):
         # The leaf exclusion is the workers' own, and every worker takes
-        # ``int(manifest["shard_order"])`` — so a caller value that disagrees
-        # must not decide the verdict (review finding). Pinned on the one
-        # declaration where the two differ: a malformed entry at order 2 is
-        # validated only when the gate filters at the store's 3, where a
-        # caller's 2 would exclude it and pass a declaration every worker
-        # refuses by name.
+        # ``int(manifest["shard_order"])``. Pinned on the declaration where
+        # the filter decides the verdict: a malformed entry at order 2 is
+        # validated at the store's 3, where a filter at 2 would have excluded
+        # it unseen and passed a declaration every worker refuses.
         from zagg.sweep_fleet import no_ladder_reason
 
         root = tmp_path / "s"
@@ -536,7 +534,35 @@ class TestStoreLadderGate:
                 ],
             },
         )
-        assert "carries 2 members" in (no_ladder_reason(str(root), 2, {}) or "")
+        assert "carries 2 members" in (no_ladder_reason(str(root), 3, {}) or "")
+
+    @pytest.mark.parametrize("handed, named", [(5, "not the 5"), (2, "not the 2")])
+    def test_a_shard_order_the_manifest_denies_declines_by_name(self, tmp_path, handed, named):
+        # The gate is the one place holding both numbers, so it refuses the
+        # divergence rather than reconciling it (review finding): a worker
+        # handed such a tuple refuses by name ("stage tuple [3, 5) is not a
+        # span of this ladder"), which is one billed invoke per dispatch node
+        # for a run that cannot start.
+        from zagg.sweep_fleet import no_ladder_reason
+
+        root = tmp_path / "s"
+        _stage_store(root)  # shard_order 3
+        reason = no_ladder_reason(str(root), handed, {}) or ""
+        assert "declares shard_order 3" in reason and named in reason
+
+    def test_a_manifest_with_no_shard_order_declines(self, tmp_path):
+        # Every worker takes ``manifest["shard_order"]`` unguarded, so such a
+        # store costs one invoke per dispatch node and a bare KeyError each.
+        from zagg.hive import MANIFEST_NAME
+        from zagg.sweep_fleet import no_ladder_reason
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        path = root / MANIFEST_NAME
+        manifest = json.loads(path.read_text())
+        del manifest["shard_order"]
+        path.write_text(json.dumps(manifest))
+        assert "declares no shard_order" in (no_ladder_reason(str(root), 3, {}) or "")
 
     def test_a_leaf_only_ladder_still_fans_out(self, tmp_path):
         # A /2 declaration whose only entry is the leaf one (the fleet's own
