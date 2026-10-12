@@ -38,8 +38,8 @@ Given one or more hive store roots — the arms of one order-6 cell built with
 
 An arm that does not fit one invoke per shard is re-run with
 ``output.windowing.unit: window`` into its OWN store
-(``_measure_<arm>_window.zarr``, the runbook
-``demo/18_schedule_measure_2026-10.ipynb``), so each column reads one run; a
+(``_measure_<arm>_window.zarr``; the runbook is each arm config's header, which
+carries the catalog, arm and readout commands), so each column reads one run; a
 store that does hold several runs still counts a re-run ``(shard, window)``
 once in ``leaves`` and prints ``fits_one_invoke`` per run parquet.
 

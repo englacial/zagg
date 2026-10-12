@@ -83,3 +83,27 @@ def test_the_quarterly_arm_is_an_explicit_contiguous_list_in_the_reserved_spelli
     assert all(a["end"] == b["start"] for a, b in zip(windows, windows[1:]))
     months = {(x["start"][5:7], x["end"][5:7]) for x in windows}
     assert months == {("01", "04"), ("04", "07"), ("07", "10"), ("10", "01")}
+
+
+#: Repo files a header may name: the runbook is the header itself (issue #602),
+#: so a path it cites has to resolve — a cited notebook nobody wrote sends the
+#: operator nowhere. Store paths in the template body are not repo files, hence
+#: the header-only scope and the source-file suffixes.
+CITED = re.compile(
+    r"(?:tools|demo|docs|notebooks|deployment|src|tests)/[A-Za-z0-9_./-]+\.(?:py|ipynb|md|ya?ml|json|sh)"
+)
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_the_header_cites_only_repo_paths_that_exist(arm):
+    repo = CONFIGS.parent.parent
+    header = (
+        (CONFIGS / f"atl03_windowed_measure_{arm}.yaml")
+        .read_text()
+        .split("# ---- template follows")[0]
+    )
+    cited = sorted(set(CITED.findall(header)))
+    # the commands, the readout and this test at least
+    assert f"tools/configs/atl03_windowed_measure_{arm}.yaml" in cited
+    assert "tools/windowed_emit_measure.py" in cited
+    assert [path for path in cited if not (repo / path).exists()] == []

@@ -78,9 +78,9 @@
 # arm that does not is recorded as the result and re-run with ``unit: window``
 # (or the window groups of issue #596) into its own store.
 #
-# Operator invocation (live AWS -- espg runs it; the runbook is
-# demo/18_schedule_measure_2026-10.ipynb, the readout
-# tools/windowed_emit_measure.py):
+# Operator invocation (live AWS -- espg runs it). This header IS the runbook:
+# the commands below are the whole kit, and the readout is
+# tools/windowed_emit_measure.py:
 #
 #   # 1. catalog: the cell's own diamond shrunk by 1e-3 deg so its edges do not
 #   #    touch the neighbours -- coverage is then exactly the 64 order-9 shards
