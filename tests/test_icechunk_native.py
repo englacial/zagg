@@ -179,6 +179,40 @@ class TestTheLadderCommitsOverviewsNatively:
                     assert kinds == {VIRTUAL}, f"{level}/{array} is not virtual"
         assert seen["overview"] and seen["leaf"]
 
+    def test_an_overview_rewritten_under_the_node_fails_that_node_open(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The copy's new failure surface (issue #584 review): the staleness
+        # guard raises INSIDE the commit, which costs the node its whole
+        # gather — the base refs with it — where a virtual ref would merely
+        # have gone stale. What must hold is that the run itself is
+        # unharmed: the repo is fail-open (D9), the hook counts the node and
+        # the next sweep re-gathers it.
+        from pathlib import Path
+
+        from test_icechunk_refs import _stage_rows
+
+        from zagg import icechunk_ladder
+
+        real = icechunk_ladder.object_ref_plan
+
+        def rewritten(grid, object_rel, rank, store_root, **kw):
+            entries = real(grid, object_rel, rank, store_root, **kw)
+            for path in Path(f"{store_root}/{object_rel}").rglob("*"):
+                if path.is_file():  # another writer re-folding it after the plan
+                    stat = path.stat()
+                    os.utime(path, (stat.st_atime + 2, stat.st_mtime + 2))
+            return entries
+
+        monkeypatch.setattr(icechunk_ladder, "object_ref_plan", rewritten)
+        _grid_, root, summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block={}, shards=_shards(_grid(cfg), 2)
+        )
+        assert summary["cells_error"] == 0
+        rows = _stage_rows(root)
+        assert sum(row["icechunk_failed"] for row in rows) >= 1
+        assert sum(row["icechunk_commits"] for row in rows) == 0
+
     def test_the_overview_objects_values_survive_the_copy(self, monkeypatch, cfg, tmp_path):
         from pathlib import Path
 

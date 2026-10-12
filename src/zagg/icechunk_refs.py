@@ -1173,6 +1173,16 @@ def _stage_units(
     chunks are COPIED in and ``bytes`` counts them. The decision is the
     repo's own ``levels`` block, never the unit's: a carrier written before
     this writer carries exactly the same entries (§11.3, issue #584).
+
+    Two things a native level adds to the session, both bounded by one
+    overview ARRAY (the levels above the base, not a leaf): a GET inside the
+    session, which lengthens the window in which a sibling node's commit can
+    force this one to rebase, and that object's bytes in memory while its
+    chunks are written — so the §11.4 streaming peak is one child's carriers
+    plus one overview array. A copy whose object moved since the plan raises
+    (:func:`zagg.icechunk_native.stage_entry`), which costs the node its
+    whole gather: the gather describes a state that no longer exists, so the
+    hook counts it failed (D9) and the next sweep re-gathers it.
     """
     from zagg.icechunk_native import native_level, stage_entry
     from zagg.store import open_object_store
