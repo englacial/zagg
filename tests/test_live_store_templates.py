@@ -235,7 +235,10 @@ def test_hive_templates_declare_the_ladder_and_chain_the_staged_sweep(name):
     # ladder above the shard, and a leaf column plan the worker writes — and
     # because a hive store that declares a ladder chains the staged sweep by
     # default (issue #620, ``zagg.config.get_sweep_mode``), a run from any of
-    # these templates folds its ladder in the run tail without ``sweep`` spelled.
+    # these templates folds its ladder in the run tail -- and the templates
+    # spell ``sweep: stages`` anyway, because the Icechunk commit regime keys
+    # on the explicit key (PR #622 ruling (1)): spelled, a templated run
+    # commits refs up the ladder rather than per leaf (espg, PR #639).
     from zagg.column import leaf_column_plan
     from zagg.config import SWEEP_STAGES, get_pyramid, get_sweep_mode
     from zagg.grids import from_config
@@ -243,7 +246,7 @@ def test_hive_templates_declare_the_ladder_and_chain_the_staged_sweep(name):
     from zagg.sweep_overview import build_pyramid_block
 
     cfg = default_config(name)
-    assert "sweep" not in cfg.output  # the default, not a spelled "stages"
+    assert cfg.output["sweep"] == "stages"  # spelled: the ladder commit regime
     assert get_pyramid(cfg)["overviews"] == LADDER  # all_time resolves true when windowed (#623)
     grid = from_config(cfg)
     shard = int(cfg.output["grid"]["parent_order"])

@@ -297,6 +297,14 @@ output:
     sharded: true
     child_order: 18              # leaf cell resolution (~20 m, ~GEDI footprint)
   store_layout: hive
+  sweep: stages                  # spelled, not left to the default: the Icechunk commit
+                                 # regime keys on the EXPLICIT key (PR #622 ruling (1),
+                                 # zagg.icechunk_refs.ladder_walks), so a run from this
+                                 # template commits refs up the ladder -- one commit per
+                                 # commit-order node, the regime that scales to the globe
+                                 # (spec §11.4) -- instead of one commit per leaf. Also
+                                 # what the default resolves to (issue #620); hash-
+                                 # invisible (a run trigger, D9).
   pyramid:
     overviews: [16, 15, 14, 13]  # the leaf ladder (issue #620, espg's ruling on PR #622
                                  # question (2): the same switch as the ATL03 templates,
@@ -311,7 +319,7 @@ output:
                                  # every level inherits its `weights: flux` declaration +
                                  # gain provenance via the manifest (declared_fields). A
                                  # hive store that declares a ladder chains the staged
-                                 # sweep by default (`output.sweep` unset -> "stages").
+                                 # sweep by default; `sweep: stages` above spells it.
 
 worker:
   memory: 4096                   # optimized probe (run 5d081b68, 4/4 green):

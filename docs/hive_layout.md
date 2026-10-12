@@ -512,13 +512,14 @@ windowed hive store gets its Icechunk repo at birth, one manifest per row
 either template builds the v4 shape — per-year leaves, the `all` row, the
 ladder, the repo — with no flags
 (`tests/test_template_windowed_build.py` builds one from each on the local
-backend and runs `pyramid_check` over it). One part is not the v4 regime
-yet: such a run commits Icechunk refs **per leaf**, because the commit
-default keys on the *explicit* `output.sweep: "stages"`
-(`zagg.icechunk_refs.ladder_walks`) and the templates leave `sweep` unset;
-spell it to commit up the ladder (spec §11.4). Which way the templates go is
-question (2) on [PR #639](https://github.com/englacial/zagg/pull/639), open
-until ruled. A windowed store is the one that
+backend and runs `pyramid_check` over it). The templates also **spell**
+`output.sweep: "stages"` although the default resolves to it, because the
+Icechunk commit regime keys on the *explicit* key
+(`zagg.icechunk_refs.ladder_walks`, PR #622 ruling (1)): spelled, a run from
+a template commits refs **up the ladder** — one commit per commit-order
+node, the regime that scales to the globe (spec §11.4) — where an unspelled
+one would commit per leaf (espg ruling on
+[PR #639](https://github.com/englacial/zagg/pull/639)). A windowed store is the one that
 scales (windowed emit cut worker peak memory 3.7 → 1.56 GB,
 [issue #586](https://github.com/englacial/zagg/issues/586); a window invoke
 reads only its year's granules), and the schedule is fixed at birth and only

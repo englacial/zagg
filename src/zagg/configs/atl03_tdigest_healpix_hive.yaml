@@ -119,14 +119,22 @@ output:
     epoch: "2018-01-01T00:00:00"
     scale: gps
     units: seconds
+  sweep: stages                  # spelled, not left to the default: the Icechunk commit
+                                 # regime keys on the EXPLICIT key (PR #622 ruling (1),
+                                 # zagg.icechunk_refs.ladder_walks), so a run from this
+                                 # template commits refs up the ladder -- one commit per
+                                 # commit-order node, the regime that scales to the globe
+                                 # (spec §11.4) -- instead of one commit per leaf. Also
+                                 # what the default resolves to (issue #620); hash-
+                                 # invisible (a run trigger, D9).
   pyramid:
     overviews: [16, 15, 14, 13]  # the leaf ladder, following atl03_tdigest_strata_healpix
                                  # exactly (issue #620, espg's ruling on PR #622 question
                                  # (2)): a contiguous column tier from cells 16 down to
                                  # 13 = shard order 9 + 4, the fixed every-order ladder
                                  # above the shard. Hash-invisible (D11). A hive store that
-                                 # declares a ladder chains the staged sweep by default
-                                 # (`output.sweep` unset resolves to "stages").
+                                 # declares a ladder chains the staged sweep by default;
+                                 # `sweep: stages` above spells it anyway.
 
 worker:
   memory: 4096                   # pre-provisioned Lambda variant, MB (2048|4096|8192) --
