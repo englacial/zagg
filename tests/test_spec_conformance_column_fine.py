@@ -11,7 +11,6 @@ the same fixture for its parity gate.
 
 import hashlib
 import json
-import struct
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +22,7 @@ from test_spec_conformance import (
     _decode_framing,
     _expected,
 )
-from test_spec_conformance import TestContentHashes as _Hashes  # noqa: N814 — not re-collected here
+from test_spec_conformance import TestContentHashes as _Hashes  # aliased: not re-collected here
 
 FIXTURE = "column_fine"
 #: The §4.6 formula, spelled here independently of ``zagg.column_shards`` so
@@ -171,7 +170,11 @@ class TestFineGroupDecodesBySpecText:
             # node's order-9 descendants in canonical nested order (§1.5).
             assert all(b > a for a, b in zip(values.tolist(), values.tolist()[1:], strict=False))
         else:
-            assert set(values[512:768].tolist()) == {fill}  # the absent chunk reads as fill
+            # Chunk 2 has no index entry (the §1.5 sentinel) and the generator
+            # recorded fill for its cells, so filling an absent chunk with
+            # ``fill_value`` is what reproduces the recorded values.
+            assert _index(blob, 4)[2, 0] == SENTINEL
+            assert set(want[512:768]) == {fill}
 
     def test_group_nine_is_the_from_leaves_fold_of_the_committed_leaf(self):
         exp = _expected(FIXTURE)
@@ -236,8 +239,11 @@ class TestFineColumnRecord:
 
     def test_groups_five_and_four_equal_the_column_fixtures(self):
         # The same observations fold to the same res-5 rows on both leaves,
-        # so the deeper leaf and the sharded layout move no value: the two
-        # fixtures' groups 5 and 4 hash identically, array for array.
+        # so the deeper leaf and the fine-tier fold leave the coarse groups'
+        # values unchanged: the two fixtures' groups 5 and 4 hash identically,
+        # array for array. Groups 5 and 4 fold flat from the unsharded member
+        # 6 and never read group 9, so this says nothing about the sharded
+        # layout; tests/test_column_shards.py::TestLayoutParity pins that.
         fine, column = _expected(FIXTURE), _expected("column")
         for key in ("5/count", "5/h_tdigest", "5/morton", "4/count", "4/h_tdigest", "4/morton"):
             assert (
@@ -252,4 +258,3 @@ class TestFineColumnRecord:
         # The multiscales mirror names the column level — the sharded one.
         datasets = manifest["multiscales"][0]["datasets"]
         assert datasets[0] == {"order": 4, "cells": [9], "artifact": "column"}
-        assert struct.calcsize("<Q") == 8  # the index word width the recipe assumes
