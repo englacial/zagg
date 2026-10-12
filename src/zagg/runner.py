@@ -6372,6 +6372,14 @@ def _tail_sweep_short(
     finisher deliberately left those levels' manifest actuals standing, which
     is the honest record of a walled tuple and not a complete sweep.
 
+    ``families_unswept`` is read as a shortfall too (review finding): a
+    cascade run whose store withdrew the all-time fold fires no close, so the
+    families it asked to ride fold NOWHERE —
+    :func:`zagg.sweep_fleet.run_stage_sweep_fleet` warns it and the finalize
+    gate does not, since nothing is in flight. Without it ``[]`` meant both
+    "the pass was whole" and "the rollup families folded nowhere", which is
+    the shortfall issue #610 was filed about.
+
     ``tail_error`` is what the tail's own fail-open ``except`` swallowed, and
     it leads the list: a block that raised before either leg fired reports
     neither outcome, so without it the worst case — nothing swept at all —
@@ -6397,9 +6405,16 @@ def _tail_sweep_short(
             "so the root temporal section may under-report them"
         )
     if stage_chained:
+        staged = stage_sweep or {}
         if (why := _staged_sweep_incomplete(stage_sweep)) is not None:
             reasons.append(f"{why}, so the ladder may be partly unfolded")
-        if short := (stage_sweep or {}).get("short_orders"):
+        if staged.get("families_unswept"):
+            reasons.append(
+                f"the rollup families {staged.get('families') or []} rode a store that declares "
+                "no all-time fold, so no close folded them and the root temporal section and "
+                "coverage.toc stand as they were"
+            )
+        if short := staged.get("short_orders"):
             reasons.append(
                 f"the staged sweep is short a unit record at order(s) {list(short)}, whose "
                 "manifest actuals were withheld rather than stamped"

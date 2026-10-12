@@ -5121,6 +5121,32 @@ class TestTailSweepShort:
         reasons = runner._tail_sweep_short(None, staged, stage_chained=True)
         assert len(reasons) == 2 and "[2, 1, 0]" in reasons[1]
 
+    def test_families_that_rode_a_store_with_no_fold_are_short(self):
+        # The cascade run issue #610 was filed about: the manifest withdrew
+        # the all-time fold, so no close carries the families and they fold
+        # NOWHERE, while every other fact about the staged sweep says whole
+        # (``sweep_fleet.py`` sets ``families_unswept`` from the store's own
+        # answer; the finalize gate stays silent because nothing is in flight).
+        from zagg import runner
+
+        staged = {
+            "families": ["stats", "moc", "submap"],
+            "families_unswept": True,
+            "barrier_timed_out": False,
+            "short_orders": [],
+            "finisher": {"fired": True, "landed": True},
+        }
+        assert runner._staged_sweep_incomplete(staged) is None
+        (reason,) = runner._tail_sweep_short(None, staged, stage_chained=True)
+        assert "['stats', 'moc', 'submap']" in reason and "no all-time fold" in reason
+        # A store that DID declare the fold is short of nothing.
+        assert (
+            runner._tail_sweep_short(
+                None, {**staged, "families_unswept": False}, stage_chained=True
+            )
+            == []
+        )
+
     def test_an_unchained_staged_leg_is_not_read(self):
         # ``stage_sweep is None`` means "dispatch failed" only when the tail
         # CHAINED one; otherwise it means there was no staged sweep.

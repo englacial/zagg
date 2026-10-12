@@ -223,7 +223,8 @@ class RunHandle:
         #: ``runner._tail_sweep_short`` — a families pass that did not
         #: dispatch or landed no record, a staged sweep whose barrier expired
         #: or whose finisher did not land, orders whose manifest actuals were
-        #: withheld — and ``[]`` when the tail left nothing short, which is
+        #: withheld, rollup families that rode a store declaring no all-time
+        #: fold — and ``[]`` when the tail left nothing short, which is
         #: also its value while the tail is in flight. The two keys above
         #: carry the detail; this is the verdict, and the tail logs it as one
         #: warning naming the ``python -m zagg.sweep`` backstop.
