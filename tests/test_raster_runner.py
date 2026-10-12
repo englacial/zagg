@@ -1190,7 +1190,9 @@ class TestRasterWindowedAllTimeFold:
         root, decimal = Path(store_path), morton_decimal(shard)
         for order in decl["orders"]:
             node = root / _node_rel(_node_at(decimal, order))
-            assert node.is_dir()  # the node prefix is real, so the absence is
+            # The node path is composed from private helpers, so prove the
+            # prefix exists before reading anything into what is not under it.
+            assert node.is_dir()
             assert not (node / "all.zarr").exists()
             assert not (node / "overview.rollup.json").exists()
         assert not list(root.rglob("all.zarr"))
