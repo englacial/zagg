@@ -6523,6 +6523,17 @@ def _invoke_lambda_stage_sweep(
     invoke or a timed-out barrier costs one later
     ``python -m zagg.sweep --stages`` pass, never a wrong answer.
 
+    **The tail does not have to know the store declares a ladder.** The
+    chaining gate is the CONFIG's (:func:`zagg.config.chains_stages`) and a
+    manifest's ``pyramid`` block may lag it, so the dispatcher reads the
+    store's own declaration once before it fans out
+    (:func:`zagg.sweep_fleet.no_ladder_reason`, issue #635): a store carrying
+    no ``zagg-pyramid/2`` ladder costs this tail one manifest GET and zero
+    invokes, reported as ``skipped`` on the summary, where it used to bill one
+    no-op invoke per dispatch node. Such a run rode no node close, so the
+    summary's ``families_unswept`` sends the rollups to
+    :func:`_warn_families_unswept`'s backstop.
+
     **How long the tail can block.** One barrier per tuple plus the finisher's,
     each bounded by ``barrier_timeout_s``
     (:data:`zagg.sweep_fleet.DEFAULT_BARRIER_TIMEOUT_S`) and ALL of them
