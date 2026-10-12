@@ -6372,6 +6372,13 @@ def _tail_sweep_short(
     finisher deliberately left those levels' manifest actuals standing, which
     is the honest record of a walled tuple and not a complete sweep.
 
+    The families leg's named outcomes each get their own wording, and any
+    other ``finisher`` than ``None`` (no pass) or ``"ok"`` falls through to a
+    generic reason rather than to silence, so ``[]`` stays unambiguous by
+    construction — the rule ``client.RunHandle.families_sweep`` already
+    states, "a ``finisher`` other than ``"ok"`` means the root temporal
+    section may be short" (review finding).
+
     ``families_unswept`` is read as a shortfall too (review finding): a
     cascade run whose store withdrew the all-time fold fires no close, so the
     families it asked to ride fold NOWHERE —
@@ -6403,6 +6410,11 @@ def _tail_sweep_short(
         reasons.append(
             f"the families sweep is short {fired - landed} of {fired} partition record(s), "
             "so the root temporal section may under-report them"
+        )
+    elif finisher not in (None, "ok"):
+        reasons.append(
+            f"the families sweep reports finisher {finisher!r} with {landed} of {fired} "
+            "partition record(s) landed, so the root temporal section may be short"
         )
     if stage_chained:
         staged = stage_sweep or {}

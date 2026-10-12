@@ -5084,6 +5084,10 @@ class TestTailSweepShort:
             ({"fired": 0, "landed": 0, "finisher": "dispatch_failed"}, "did not dispatch"),
             ({"fired": 1, "landed": 0, "finisher": "timed_out"}, "landed no record"),
             ({"fired": 22, "landed": 19, "finisher": "records_short"}, "short 3 of 22"),
+            # Not a whitelist: a finisher nobody taught this helper reads as
+            # short, never as whole (``client.RunHandle.families_sweep``'s
+            # own rule — anything other than ``"ok"`` may be short).
+            ({"fired": 4, "landed": 1, "finisher": "wall_hit"}, "finisher 'wall_hit' with 1 of 4"),
         ],
     )
     def test_each_families_shortfall_names_itself(self, families, phrase):
