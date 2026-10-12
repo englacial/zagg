@@ -60,7 +60,7 @@ class TestTheCopy:
         assert plan, "the leaf wrote no object to copy"
         return grid, root, shard, plan
 
-    def _copy(self, root, plan, *, row=0, order=6):
+    def _copy(self, root, plan, *, row=0, order=6, etags=False):
         """Copy ``plan`` into the repo natively; the bytes written."""
         from zagg.store import open_object_store
 
@@ -69,7 +69,7 @@ class TestTheCopy:
         store = open_object_store(root, **{})
         prefix = icechunk_refs.container_prefix(root)
         written = sum(
-            icechunk_native.stage_entry(session, order, row, entry, prefix, store, etags=False)
+            icechunk_native.stage_entry(session, order, row, entry, prefix, store, etags=etags)
             for entry in plan
             if entry["refs"]
         )
@@ -107,6 +107,26 @@ class TestTheCopy:
         os.utime(path, (stat.st_atime + 2, stat.st_mtime + 2))
         with pytest.raises(ValueError, match="moved between the ref plan"):
             self._copy(root, [entry])
+
+    def test_the_etag_form_is_the_one_every_object_store_takes(self, monkeypatch, cfg, tmp_path):
+        # ``etags`` is True for every ``s3://`` container, so this is the arm
+        # the fleet runs and the local tests above never reach (issue #584
+        # review). ``obstore`` carries an ``e_tag`` on a local store too, so
+        # the comparison itself is testable here.
+        import obstore
+
+        from zagg.store import open_object_store
+
+        grid, root, shard, plan = self._staged(monkeypatch, cfg, tmp_path)
+        prefix = icechunk_refs.container_prefix(root)
+        entry = next(e for e in plan if e["sharded"] and e["refs"])
+        target = next(loc for loc in entry["locations"] if loc)[len(prefix) :]
+        etag = obstore.head(open_object_store(root), target)["e_tag"]
+        assert etag, "the object store recorded no ETag to compare"
+        _repo, written = self._copy(root, [{**entry, "checksum": etag}], etags=True)
+        assert written == sum(int(n) for n in entry["lengths"])
+        with pytest.raises(ValueError, match="moved between the ref plan"):
+            self._copy(root, [{**entry, "checksum": f"{etag}-stale"}], etags=True)
 
     def test_a_truncated_whole_object_chunk_is_refused(self, monkeypatch, cfg, tmp_path):
         # The regular (unsharded) plan shape carries the object's size as the
