@@ -228,8 +228,11 @@ def sized_stage_tuples(
     **Top-aligned, remainder at the base** (issue #637). Tuples are laid from
     ``shard_order - 1`` DOWNWARD, each the widest width (at most
     ``tuple_width``) whose fattest dispatch node folds at most ``target``
-    nodes over that span, and whatever is left over at the coarse end is one
-    narrower tuple ending at order 0. Alignment matters more than width:
+    nodes over that span; the last tuple ends at order 0 and is short when
+    the remaining span is. Under the dense bound every fit is the same width,
+    so that remainder is the only narrower tuple; a measured ``nodes_at`` fits
+    each tuple on its own and can narrow anywhere on the ladder, with the
+    same top alignment. Alignment matters more than width:
     the remainder tuple folds ONE node at order 0, where the bottom-aligned
     :func:`zagg.sweep_stage.stage_tuples` at width 2 would put it at
     ``shard_order - 1`` — 731 dispatch nodes on the California o9 shardmap,
