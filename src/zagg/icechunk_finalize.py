@@ -25,8 +25,17 @@ One finalize does, in order:
    does reclaim of ours are the **native** overview chunks (§11.3) that no
    retained snapshot references — the repo's own objects, so they go in step
    with the snapshots that could have read them, while the store's own
-   overview objects stay as they are. Fail-open: an error
-   is recorded as ``retention_error`` and steps 2 and 3 still run;
+   overview objects stay as they are. **Under the default K = 0 none of that
+   happens**, and that is the configuration almost every store runs: the
+   whole of retention is skipped (``_retain`` returns before
+   ``expire_snapshots`` and ``garbage_collect``), so every superseded native
+   overview chunk — and every chunk object a failed or replayed copy
+   orphaned (``icechunk_refs.commit_units``) — is kept for ever, and the
+   repo grows every run by the touched rows' overview byte set where before
+   this rule it grew by manifest bytes alone. The per-run figure an operator
+   can read is ``icechunk_native_bytes`` summed over the stage rows. Whether
+   the default should change with it is open (issue #584). Fail-open: an
+   error is recorded as ``retention_error`` and steps 2 and 3 still run;
 2. one empty ``finalize {run_id}`` commit whose METADATA identifies the run
    (``run_id``, ``semantic_hash``, ``zagg_version``, the ladder knobs) and
    records the retention counts, so the repo is its own durable run record;

@@ -4938,7 +4938,24 @@ tags it once the ladder is complete). One finalize, in order:
    chunks (§11.3) that no retained snapshot references — they are the
    repository's own objects, so they go exactly in step with the snapshots
    that could have read them, and the store's own overview objects are
-   untouched. Retention is fail-open inside finalize: an error (two
+   untouched.
+
+   **Under the default `retain_runs: 0` there is no collection at all**, and
+   that is the configuration almost every store runs. Nothing above this
+   paragraph happens: no tag is deleted, no snapshot expires, and
+   `garbage_collect` is never called. Three things follow, and they are the
+   genuinely new operational property of native overview levels (§11.3):
+   every **superseded** native overview chunk is kept for ever; the
+   repository therefore grows each run by the **touched rows'** overview byte
+   set (`_overview_units` plans this run's rows, so an append is its new
+   window plus `all`), where before this rule it grew by manifest bytes
+   alone; and the chunk objects a failed or replayed copy orphaned (above)
+   are unreachable too, since only `garbage_collect` can see them. The
+   per-run figure an operator can read is `icechunk_native_bytes` summed over
+   the run's stage rows. Whether the default K should change with this is a
+   posture question, open on issue
+   [#584](https://github.com/englacial/zagg/issues/584); this page records
+   the behaviour, it does not change it. Retention is fail-open inside finalize: an error (two
    finalizes racing on one tag delete, a collection cut off by the invoke's
    ceiling) is recorded as `retention_error` and steps 2 and 3 still run;
 2. one content-free **`finalize {run_id}` commit** whose commit metadata

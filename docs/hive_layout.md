@@ -2436,6 +2436,14 @@ cutoff — the oldest retained run's own intermediate commits included — into
 its finalize snapshot; the newer runs keep theirs until a later cutoff
 passes them. Leaf objects are never touched by any of it.
 
+What K = 0 now means, with native overview levels (spec §11.3): the repo
+keeps **every** superseded overview chunk it ever copied in, so it grows each
+run by the touched rows' overview byte set rather than by manifest bytes, and
+the chunk objects a failed or replayed node commit orphaned are never
+reclaimed either — only `garbage_collect` can see those, and K = 0 never
+calls it. `icechunk_native_bytes`, summed over the run's stage rows, is the
+per-run figure.
+
 `output.icechunk: false` opts a hive run out (default on; excluded from the
 D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves and raster
 hive products are not indexed yet (spec §11.6: the row model holds them, the
