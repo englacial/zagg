@@ -166,10 +166,43 @@ def test_pyramid_check_passes(built):
     name, cfg, root, shards = built
     report = validate_pyramid(str(root), full=True)
     assert report["passed"], format_report(report)
+    # ``passed`` tolerates a skip; the value legs must actually run.
+    for check in ("materialization", "columns", "readback", "counts", "digests", "all_time"):
+        assert report["checks"][check]["status"] == "pass", format_report(report)
     assert report["windows"] == list(WINDOWS)
     assert report["roster"]["leaves"] == len(shards) * len(WINDOWS)
     assert report["all_time_nodes"]["missing"] == []
     assert report["columns"]["missing"] == [] and report["columns"]["partial"] == []
+
+
+#: Per-shard leaf ``count`` totals by year, from the fixture: each granule
+#: puts 20 photons per day in every group, the TEP filter drops the first
+#: quarter (10, all from its first day), times 6 groups. A: day 300 (2018,
+#: 10 kept) and day 400 (2019, 20). B: days 800/801 (2020, 30). C: day
+#: 729.5 (2019-12-31T12:00, 10) and day 730.25 (2020-01-01T06:00, 20).
+WINDOW_COUNTS = {"2018": 10 * 6, "2019": (20 + 10) * 6, "2020": (30 + 20) * 6}
+
+
+def test_each_photon_lands_in_its_own_year(built):
+    """Window membership, not just conservation: an epoch, scale or GPS/UTC
+    slip that moved C's 2019 photons into 2020 conserves every ladder total
+    but changes these."""
+    import zarr
+
+    from zagg.store import open_store
+
+    name, cfg, root, shards = built
+    for shard in shards:
+        for label, expected in WINDOW_COUNTS.items():
+            # A versioned leaf's arrays live under its stamp's ``current``.
+            data, _ = hive.resolve_leaf(hive.shard_leaf_path(str(root), shard, window=label))
+            grp = zarr.open_group(
+                open_store(data),
+                path=str(cfg.output["grid"]["child_order"]),
+                mode="r",
+                zarr_format=3,
+            )
+            assert int(np.asarray(grp["count"][:]).sum()) == expected, (shard, label)
 
 
 def _store(leaf):
