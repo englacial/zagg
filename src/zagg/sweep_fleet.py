@@ -670,10 +670,10 @@ def run_stage_sweep_fleet(
     if one node an invoke. That is what walled the v3 ladder — the base-cell
     ``3`` invoke of the ``[2,1,0]`` tuple folded 21 and died at 900 s after 12
     of its 16 order-2 nodes. :func:`zagg.sweep_partition.sized_stage_tuples`
-    refines the fixed-width schedule, subdividing each tuple inside its own
-    span until its fattest dispatch node stays within the target (so a store
-    needing no narrowing keeps that schedule outright). Nothing is read from
-    the store either way (D8).
+    lays tuples from the top down, each the widest width whose fattest
+    dispatch node stays within the target, with the remainder at order 0
+    (issue #637; a store sparse enough to carry the full width keeps it).
+    Nothing is read from the store either way (D8).
     What it narrows AGAINST depends on what the caller handed in. With a
     ``coverage`` MOC the fold is MEASURED, over the set the worker itself
     folds — the run's leaves union that coverage, coarsened per order
