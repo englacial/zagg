@@ -22,7 +22,6 @@ import test_windowed_emit as emit
 
 from zagg import hive, runner
 from zagg.config import default_config, get_windowing
-from zagg.grids.morton import morton_decimal
 from zagg.hive import MANIFEST_NAME
 from zagg.pyramid_check import format_report, validate_pyramid
 
@@ -209,9 +208,3 @@ def _store(leaf):
     from zagg.store import open_store
 
     return open_store(str(leaf))
-
-
-def _node(shard, order):
-    from zagg.sweep_overview import _node_at
-
-    return _node_at(morton_decimal(int(shard)), order)
