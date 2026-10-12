@@ -829,7 +829,14 @@ the fleet dispatcher refuses a windowed caller that says otherwise before
 anything fires. Its `all_time` is still only the caller's first guess about
 the *store*: a manifest that withdrew the fold is reported
 (`families_unswept`) from the store's own answer, read back off the first
-landed window record, and those rollups are then swept by hand.
+landed window record, and those rollups are then swept by hand. That is
+the case for every append to a windowed store written before the fold was
+required (its manifest says `all_time: false`, and `ensure_manifest` never
+rewrites the block): the dispatcher fires no close, warns that the rollups
+went unswept, and the fix is the one-time `python -m zagg.sweep <store>
+--declare-pyramid <config.yaml>` retrofit (or the hand `--families
+stats,moc,submap` pass), per the recovery runbook in
+[Recovering a run whose launcher died](deployment/lambda.md#recovering-a-run).
 The run's finisher then composes the families' store-root singletons once —
 the §10 temporal section inside `coverage.moc` and its `coverage.toc`
 sibling — from the base-node rollups (≤ 1 GET per base cell) plus the

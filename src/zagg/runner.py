@@ -5968,12 +5968,19 @@ def _warn_families_unswept(riding, staged) -> None:
 
     ``riding`` non-empty means the tail fired no families pass; a staged
     dispatch that failed open (``staged is None``) or reported
-    ``families_unswept`` then left the rollups unswept, so name the backstop.
+    ``families_unswept`` then left the rollups unswept, so name the backstop
+    and the migration: a windowed store templated before the fold was required
+    declares ``all_time: false``, closes nothing, and stays that way until the
+    one-time ``--declare-pyramid`` retrofit rewrites its manifest.
     """
     if riding and (staged is None or staged.get("families_unswept")):
         logger.warning(
             f"rollup families {list(riding)} rode no node close this run; sweep them with "
-            "`python -m zagg.sweep <store> --families stats,moc,submap`"
+            "`python -m zagg.sweep <store> --families stats,moc,submap`. A windowed store "
+            "whose manifest declares `all_time: false` (templated before the fold was "
+            "required) never closes: retrofit it once with `python -m zagg.sweep <store> "
+            "--declare-pyramid <config.yaml>` (add `--overviews <resolutions>` for a "
+            "zagg-pyramid/2 store whose config spells none)"
         )
 
 
