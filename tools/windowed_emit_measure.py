@@ -22,6 +22,9 @@ Given one or more hive store roots — the arms of one order-6 cell built with
   under ``<store>.status/run-stage-*/`` (``stage-<order>-<batch>.json`` per
   invoke and the ``finisher.json``): invokes per order, wall per invoke by unit
   kind, worker seconds, ``fold_cells_read`` per node-unit, ``fold_peak_cells``,
+  the peak RSS per tuple and the **8 GB tier's memory headroom** — what the
+  tier was never asked for, an upper bound since ``container_hwm_mb`` is a
+  per-process high-water, ``-`` on a run whose workers predate the stamp —
   ``barrier_timed_out`` / ``short_orders``, failed units;
 - the all-time accuracy leg (``windowed_emit_accuracy.py``): the all-time
   overview at one node per ladder level against a flat fold of the same leaves
@@ -511,8 +514,10 @@ _LADDER_KEYS = (
 )
 #: Stage-row counters that are a HIGH-WATER, not a sum, across a dispatch
 #: order's rows: the streamed fold's largest single block of inputs, in source
-#: cells (``zagg.sweep_fold.FoldMeter``).
-_LADDER_MAX_KEYS = ("fold_peak_cells",)
+#: cells (``zagg.sweep_fold.FoldMeter``), and the tuple's peak RSS in MB
+#: (``zagg.sweep_units.container_hwm_mb`` — an upper bound: a per-process
+#: high-water, so on a warm container it carries earlier invokes' peaks too).
+_LADDER_MAX_KEYS = ("fold_peak_cells", "container_hwm_mb")
 
 
 def _per_order(rows: list) -> list:
@@ -596,6 +601,7 @@ def _stage_run(status, prefix: str, workers: int) -> dict:
                 "nodes": 0,
                 "fold_cells_read": 0,
                 "fold_peak_cells": 0,
+                "container_hwm_mb": None,
                 "failed": 0,
                 "written": 0,
                 "current": 0,
@@ -615,6 +621,12 @@ def _stage_run(status, prefix: str, workers: int) -> dict:
             agg["fold_peak_cells"] = max(
                 agg["fold_peak_cells"], int(row.get("fold_peak_cells") or 0)
             )
+            # A high-water, and ``None`` (not 0) for a worker that predates the
+            # stamp — the tier verdict must not read "0 MB used" off a run
+            # that simply did not record it.
+            hwm = row.get("container_hwm_mb")
+            if hwm is not None:
+                agg["container_hwm_mb"] = max(agg["container_hwm_mb"] or 0.0, float(hwm))
             for k in ("failed", "written", "current"):
                 agg[k] += int(row.get(k) or 0)
     per_order = []
@@ -630,8 +642,10 @@ def _stage_run(status, prefix: str, workers: int) -> dict:
         per_order.append(row)
     worker_s = sum(float(r.get("duration_s") or 0.0) for r in records)
     finisher_s = float(finisher.get("duration_s") or 0.0)
+    peaks = [r["container_hwm_mb"] for r in per_order if r["container_hwm_mb"] is not None]
     return {
         "run_id": prefix.rstrip("/").removeprefix("run-"),
+        "container_hwm_mb": max(peaks) if peaks else None,
         "pipeline_run_id": finisher.get("pipeline_run_id")
         or next((r.get("pipeline_run_id") for r in records), None),
         "invokes": len(records),
@@ -666,6 +680,34 @@ def stage_run_numbers(store_root: str, store_kwargs: dict, workers: int = 32) ->
         return {"runs": [], "latest": None}
     runs = [_stage_run(status, p, workers) for p in prefixes]
     return {"runs": runs, "latest": runs[-1] if runs else None}
+
+
+def stage_memory(ladder: dict, stages: dict) -> dict:
+    """The staged sweep's memory high-water against the tier it ran on.
+
+    The peak is the largest ``container_hwm_mb`` any stage row carries, over
+    BOTH legs — the root run record's per-order rows and the newest fleet stage
+    run's — since a store may hold one, the other or both. ``headroom_mb`` is
+    what the 8 GB tier (:data:`STAGE_TIER_GB`) was never asked for, the number
+    issue #602 reads to decide whether that tier can come back down.
+
+    Every value is ``None`` (printed ``-``, never ``0``) when no row carries a
+    high-water: a run whose workers predate the stamp measured no memory, which
+    is not the same as having used none. The peak is an UPPER bound per tuple,
+    not a per-unit peak (``zagg.sweep_units.container_hwm_mb``), so headroom
+    read off it is the pessimistic side — a tier that looks roomy here is roomy.
+    """
+    peaks = [s["container_hwm_mb"] for s in ladder.get("stages") or []]
+    peaks.append(((stages or {}).get("latest") or {}).get("container_hwm_mb"))
+    recorded = [float(p) for p in peaks if p is not None]
+    tier_mb = STAGE_TIER_GB * 1024.0
+    peak = max(recorded) if recorded else None
+    return {
+        "tier_mb": tier_mb,
+        "peak_mb": peak,
+        "headroom_mb": None if peak is None else tier_mb - peak,
+        "peak_fraction": None if peak is None else peak / tier_mb,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +755,7 @@ def measure(
     fleet = fleet_numbers(store)
     tree = tree_numbers(store, max_shards)
     stages = stage_run_numbers(store_root, store_kwargs)
+    ladder = ladder_numbers(store)
     result = {
         "store": store_root,
         "schedule": ((manifest.get("temporal") or {}).get("schedule")) or "none",
@@ -722,8 +765,9 @@ def measure(
         "objects": tree["objects"],
         "occupancy": tree["occupancy"],
         "non_leaf": tree["non_leaf"],
-        "ladder": ladder_numbers(store),
+        "ladder": ladder,
         "stage_runs": stages,
+        "stage_memory": stage_memory(ladder, stages),
         "cost": cost_numbers(fleet, stages),
     }
     if accuracy and manifest.get("pyramid") and tree["shards"]:
@@ -906,6 +950,7 @@ def table_rows(results: list[dict]) -> list[tuple]:
         ),
         ("stage worker_s per tuple", lambda r: _stage_orders(r, "duration_s")),
         ("stage fold peak cells per tuple", lambda r: _stage_orders(r, "fold_peak_cells")),
+        ("stage peak RSS MB per tuple", lambda r: _stage_orders(r, "container_hwm_mb")),
         ("stage failed (sum)", lambda r: _fmt(_stage_sum(r, "failed"))),
         (
             "barrier timed out / short orders",
@@ -943,6 +988,21 @@ def table_rows(results: list[dict]) -> list[tuple]:
             lambda r: (
                 f"{_fmt(_latest(r).get('worker_s'))} / {_fmt(_latest(r).get('finisher_s'))} / {_fmt(_latest(r).get('failed'))}"
             ),
+        ),
+        (
+            "stage peak RSS MB per order (latest run)",
+            lambda r: _run_orders(r, lambda o: o.get("container_hwm_mb")),
+        ),
+        (
+            "stage tier MB / peak MB / headroom MB",
+            lambda r: " / ".join(
+                _fmt(r.get("stage_memory", {}).get(k))
+                for k in ("tier_mb", "peak_mb", "headroom_mb")
+            ),
+        ),
+        (
+            "  peak as a fraction of the tier",
+            lambda r: _fmt(r.get("stage_memory", {}).get("peak_fraction")),
         ),
         ("all-time probe orders", lambda r: _levels(r, lambda lv: lv["order"])),
         (

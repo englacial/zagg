@@ -139,14 +139,21 @@ def _store(tmp_path, *, windows, versioned_first=False):
         stages = [{k: v for k, v in s.items() if not k.startswith("icechunk_")} for s in stages]
         # the (node, window) unit rows of issue #586 phase 4: one row per
         # invoke, each with its own units, worker seconds and fold peak
-        units = [(1, 0, 30.0, 256), (1, 0, 20.0, 1024), (0, 1, 5.0, 64)]
-        for row, (n_window, n_close, seconds, peak) in zip(stages, units, strict=True):
+        # ... and its memory high-water, which the baseline's rows leave out:
+        # an older worker records none, and that reads ``-``, never 0 MB.
+        units = [
+            (1, 0, 30.0, 256, 1500.0),
+            (1, 0, 20.0, 1024, 2300.5),
+            (0, 1, 5.0, 64, 900.0),
+        ]
+        for row, (n_window, n_close, seconds, peak, hwm) in zip(stages, units, strict=True):
             row.update(
                 window_units=n_window,
                 close_units=n_close,
                 failed=0,
                 duration_s=seconds,
                 fold_peak_cells=peak,
+                container_hwm_mb=hwm,
             )
     (root / "sweep_stats_20260101T000000Z_stages.json").write_text(
         json.dumps({"stages": stages, "barrier_timed_out": False, "short_orders": []})
@@ -163,7 +170,7 @@ def _stage_records(root: Path, windows) -> None:
     status = Path(str(root) + ".status") / "run-stage-20260101T000100Z-abcdef"
     status.mkdir(parents=True)
 
-    def rec(dispatch, batch, unit, window, wall, n_nodes, cells, peak, failed=0):
+    def rec(dispatch, batch, unit, window, wall, n_nodes, cells, peak, failed=0, hwm=None):
         return {
             "spec": "zagg-sweep-stage-record/1",
             "role": "stage",
@@ -184,16 +191,19 @@ def _stage_records(root: Path, windows) -> None:
                     "failed": failed,
                     "fold_cells_read": cells,
                     "fold_peak_cells": peak,
+                    # the tuple's memory high-water, absent on a record whose
+                    # worker predates the stamp
+                    **({} if hwm is None else {"container_hwm_mb": hwm}),
                 }
             ],
         }
 
     if windows:
         records = [
-            rec(3, 0, "window", "2019", 12.0, 2, 64, 32),
-            rec(3, 1, "window", "2020", 8.0, 2, 64, 32),
-            rec(3, 2, "close", None, 3.0, 2, 16, 8),
-            rec(0, 0, "window", "2019", 20.0, 1, 128, 128, failed=1),
+            rec(3, 0, "window", "2019", 12.0, 2, 64, 32, hwm=1200.0),
+            rec(3, 1, "window", "2020", 8.0, 2, 64, 32, hwm=1800.0),
+            rec(3, 2, "close", None, 3.0, 2, 16, 8, hwm=1100.0),
+            rec(0, 0, "window", "2019", 20.0, 1, 128, 128, failed=1, hwm=2600.0),
             rec(0, 1, "close", None, 6.0, 1, 32, 32),
         ]
     else:
@@ -353,6 +363,48 @@ def test_ladder_and_stage_runs(arms):
     assert (o0["dispatch_order"], o0["failed"], o0["whole_invokes"]) == (0, 1, 0)
     b = base["stage_runs"]["latest"]
     assert b["per_order"][0]["whole_invokes"] == 1 and b["barrier_timed_out"] is False
+
+
+def test_the_stage_memory_high_water_and_the_tier_headroom(arms):
+    base, win = arms
+    # the root run record: a HIGH-WATER per dispatch order, never a sum
+    # (order 3 holds 1,500.0 and 2,300.5; order 0 holds 900.0)
+    assert [s["container_hwm_mb"] for s in win["ladder"]["stages"]] == [900.0, 2300.5]
+    assert [s["container_hwm_mb"] for s in base["ladder"]["stages"]] == [None, None]
+    # the fleet's per-invoke records: the same, per order and per run — the
+    # order-0 close carries no high-water and does not drag the max to 0
+    o3, o0 = win["stage_runs"]["latest"]["per_order"]
+    assert (o3["container_hwm_mb"], o0["container_hwm_mb"]) == (1800.0, 2600.0)
+    assert win["stage_runs"]["latest"]["container_hwm_mb"] == 2600.0
+    assert base["stage_runs"]["latest"]["container_hwm_mb"] is None
+    # the headroom: the tier less the largest high-water EITHER leg carries
+    mem = win["stage_memory"]
+    assert mem["tier_mb"] == tool.STAGE_TIER_GB * 1024
+    assert mem["peak_mb"] == 2600.0 and mem["headroom_mb"] == mem["tier_mb"] - 2600.0
+    assert mem["peak_fraction"] == pytest.approx(2600.0 / mem["tier_mb"])
+    # a run that recorded none measured no memory, which is not "used none"
+    assert base["stage_memory"] == {
+        "tier_mb": tool.STAGE_TIER_GB * 1024,
+        "peak_mb": None,
+        "headroom_mb": None,
+        "peak_fraction": None,
+    }
+
+
+def test_the_table_prints_the_headroom_and_dashes_when_unmeasured(arms, capsys):
+    base, win = arms
+    tool.print_table([base, win])
+    out = capsys.readouterr().out
+    (tier,) = [ln for ln in out.splitlines() if ln.startswith("stage tier MB / peak MB")]
+    assert "8,192.0 / - / -" in tier  # the baseline arm: not measured
+    assert "8,192.0 / 2,600.0 / 5,592.0" in tier
+    (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  peak as a fraction")]
+    assert fraction.split()[-2:] == ["-", "0.3"]
+    # per tuple (root record, finest order first) and per order (fleet records)
+    (per_tuple,) = [ln for ln in out.splitlines() if ln.startswith("stage peak RSS MB per tuple")]
+    assert per_tuple.split()[-3:] == ["2,300.5", "/", "900.0"]
+    (per_order,) = [ln for ln in out.splitlines() if ln.startswith("stage peak RSS MB per order")]
+    assert per_order.split()[-3:] == ["1,800.0", "/", "2,600.0"]
 
 
 def test_cost_sums_leaf_and_stage_gb_seconds(arms):
