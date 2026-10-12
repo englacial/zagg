@@ -4889,6 +4889,15 @@ class TestLambdaFamiliesRideTheCascade:
         assert seen["sweep"] == 0 and len(seen["stage"]) == 1
         assert summary["families_sweep"] is None
 
+    @pytest.mark.parametrize(
+        "staged", [None, {"finisher": {}, "families_unswept": True}, {"finisher": {}}]
+    )
+    def test_unswept_families_name_the_backstop(self, monkeypatch, atl06_config, caplog, staged):
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            self._drive(monkeypatch, atl06_config, staged=staged, ladder=True)
+        warned = "--families stats,moc,submap" in caplog.text
+        assert warned == (staged is None or bool(staged.get("families_unswept")))
+
     def test_the_gate_is_the_ladder_walk(self, atl06_config):
         from zagg import runner
         from zagg.sweep_families import CASCADE_FAMILIES
