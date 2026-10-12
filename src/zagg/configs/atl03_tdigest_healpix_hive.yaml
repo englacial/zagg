@@ -17,6 +17,9 @@ data_source:
     longitude: "/{group}/heights/lon_ph"
   variables:
     h_ph: "/{group}/heights/h_ph"
+    # The per-photon clock ``output.windowing`` bins on (issue #638): GPS
+    # seconds since 2018-01-01, as in atl03_tdigest_strata_healpix.
+    delta_time: "/{group}/heights/delta_time"
   filters:
     - dataset: "/{group}/heights/signal_conf_ph"
       column: 0                  # land surface type; TEP is uniform across columns
@@ -76,7 +79,10 @@ aggregation:
                                  # surface cell measured -- the CA tail scan on
                                  # issue #422 puts 1e-5 of cells above it, all
                                  # cloud/background storm artifacts
-      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
+      overview_delta: 128        # pyramid-fold budget (issue #424; v4 ruling, issue
+                                 # #638): overview digests capped at 128 centroids,
+                                 # following atl03_tdigest_strata_healpix. Hash-
+                                 # invisible; the leaf ``delta`` above is unchanged
       dtype: float32
       fill_value: 0
 
@@ -89,6 +95,28 @@ output:
     sharded: true                # one ShardingCodec object per array per leaf
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive             # each dispatched shard writes its own leaf zarr
+  # Windowed, yearly, from birth (issue #638, espg ruling 2026-10-12): one
+  # leaf per (shard, calendar year) plus the ``all`` row, which a windowed
+  # config allocates at init (``pyramid.all_time`` resolves true, issue
+  # #623) -- so neither ``all_time`` nor ``icechunk`` is spelled here (a
+  # windowed hive store gets its Icechunk repo at birth, issue #604, one
+  # manifest per row). The schedule is fixed at a store's birth and only
+  # folds UP later (a year is the merge of its months, never the reverse),
+  # so the template carries the schedule the product is meant to have;
+  # monthly is a deliberate per-store choice (~6.5x the compute). Windowed
+  # emit is what scales: worker peak memory 3.7 -> 1.56 GB (issue #586),
+  # and a window invoke reads only its year's granules. ``windowing`` is a
+  # D13 leaf-shaping key, so this moves the template's ``semantic_hash``
+  # (pinned in tests/test_live_store_templates.py): a windowed store is a
+  # different product from the unwindowed live one. Delete the block to
+  # build an unwindowed store; ``unit`` stays at its default ``shard``.
+  windowing:
+    schedule: yearly
+    time_field: delta_time       # the per-photon clock, declared under
+                                 # data_source.variables above
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
   pyramid:
     overviews: [16, 15, 14, 13]  # the leaf ladder, following atl03_tdigest_strata_healpix
                                  # exactly (issue #620, espg's ruling on PR #622 question

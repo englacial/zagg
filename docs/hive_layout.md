@@ -495,9 +495,42 @@ ladder above the shard bottoms out at node 0 / cells 4 — the same 13..4 dense
 ladder the v3 ATL03 store declared as `{overviews: 13}`, plus the finer leaf
 members. GEDI's cells are order 18, so its finest member sits two orders above
 the base data where ATL03's sits three; the tier is otherwise identical. The
-declaration is hash-invisible (D11), so no template's `semantic_hash` moved
-(`tests/test_live_store_templates.py` pins the digests and the ladder). Two
-consequences follow for an operator:
+declaration is hash-invisible (D11), so declaring it moved no template's
+`semantic_hash` (`tests/test_live_store_templates.py` pins the digests and
+the ladder).
+
+**The ATL03 templates are windowed yearly from birth**
+([issue #638](https://github.com/englacial/zagg/issues/638), espg's ruling
+2026-10-12). `atl03_tdigest_strata_healpix` and `atl03_tdigest_healpix_hive`
+carry an `output.windowing` block — `schedule: yearly`, `time_field:
+delta_time` (declared under `data_source.variables`), the 2018-01-01 GPS
+epoch in seconds — and spell neither `all_time` nor `icechunk`: a windowed
+config resolves `pyramid.all_time` to true (the `all` row is allocated at
+birth, [issue #623](https://github.com/englacial/zagg/issues/623)) and a
+windowed hive store gets its Icechunk repo at birth, one manifest per row
+([issue #604](https://github.com/englacial/zagg/issues/604)). So a run from
+either template builds the complete v4 shape — per-year leaves, the `all`
+row, the ladder, the repo — with no flags
+(`tests/test_template_windowed_build.py` builds one from each on the local
+backend and runs `pyramid_check` over it). A windowed store is the one that
+scales (windowed emit cut worker peak memory 3.7 → 1.56 GB,
+[issue #586](https://github.com/englacial/zagg/issues/586); a window invoke
+reads only its year's granules), and the schedule is fixed at birth and only
+folds *up* later, so the template carries the schedule the product is meant
+to have; monthly is a deliberate per-store choice (≈6.5× the compute).
+Deleting the block is the opt-out — an unwindowed build stays legal. Unlike
+the ladder, `windowing` **is** hashed (a D13 leaf-shaping key: a windowed
+store is a different product), so the ATL03 template's digest moved and the
+pins say so. The same templates set the pyramid digests' `overview_delta` to
+**128** centroids (the v4 ruling: the stored 15/16 columns at ~12 GB rather
+than ~95 GB at 512, the viewer's order-13 fill 1.29 GB → ~0.32 GB; the leaf
+`delta: 4096` is unchanged, and the knob is hash-invisible). GEDI stays
+unwindowed and at 512 for now: its `delta_time` is a *shot-rate* column
+(declared on the `shots` level and broadcast to samples), and window
+membership is decided on a base-rate `data_source.variables` column only, so
+the block is refused by name there; its overview budget is
+[issue #640](https://github.com/englacial/zagg/issues/640). Two consequences
+follow for an operator:
 
 - **A run from any of these templates chains the staged sweep by default.**
   `output.sweep` is unset in all three, and an unset `sweep` on a hive config

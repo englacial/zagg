@@ -41,7 +41,8 @@
 # Grid geometry: o9 shard / o13 inner chunk / o19 cells.
 #
 # THIS TEMPLATE IS THE LIVE STORE'S BUILD CONFIG WITH ``count`` WIDENED TO
-# INT64 (issue #626). ``englacial/zagg/demo/atl03_tdigest_o9_v3.zarr`` (issue
+# INT64 (issue #626) AND WINDOWED YEARLY (issue #638, ``output.windowing``
+# below -- the v4 shape). ``englacial/zagg/demo/atl03_tdigest_o9_v3.zarr`` (issue
 # #547; rebuilt from this template with only the hash-invisible
 # ``output.pyramid`` set to ``{overviews: 13}``, on the 0.57.0 fleet, issue
 # #560, 2026-10-08 -- the template itself now declares the v4 ladder
@@ -54,9 +55,10 @@
 # REFUSES to append to the live store on the frozen ``semantic_hash`` until
 # the store is rebuilt as a new product (v3 then stays the comparison store,
 # as v1 did). ``tests/test_live_store_templates.py`` pins this template's
-# hash and proves ``count`` is the only divergence from the live one; a
-# change to any other hashed key here (deltas, filters, variables, the index
-# block, ``time_source``) is a further new product, and the pin says so.
+# hash and proves ``count`` and ``windowing`` are the only divergences from
+# the live one; a change to any other hashed key here (deltas, filters,
+# variables, the index block, ``time_source``) is a further new product, and
+# the pin says so.
 data_source:
   reader: h5coro
   driver: s3
@@ -142,7 +144,13 @@ aggregation:
           (signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
           (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
           (signal_conf_inland_water >= 2)
-      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
+      overview_delta: 128        # pyramid-fold budget (issue #424; v4 ruling, issue
+                                 # #638): overview digests capped at 128 centroids,
+                                 # so the stored 15/16 columns are ~12 GB rather
+                                 # than ~95 GB at 512 and the viewer's order-13
+                                 # fill drops 1.29 GB -> ~0.32 GB. Hash-invisible
+                                 # (zagg.semantics.VARIABLE_PACKAGING_KEYS); the
+                                 # leaf ``delta`` above is unchanged
       dtype: float32
       fill_value: 0
       attrs:
@@ -165,7 +173,13 @@ aggregation:
           ~((signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
           (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
           (signal_conf_inland_water >= 2))
-      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
+      overview_delta: 128        # pyramid-fold budget (issue #424; v4 ruling, issue
+                                 # #638): overview digests capped at 128 centroids,
+                                 # so the stored 15/16 columns are ~12 GB rather
+                                 # than ~95 GB at 512 and the viewer's order-13
+                                 # fill drops 1.29 GB -> ~0.32 GB. Hash-invisible
+                                 # (zagg.semantics.VARIABLE_PACKAGING_KEYS); the
+                                 # leaf ``delta`` above is unchanged
       dtype: float32
       fill_value: 0
       attrs:
@@ -212,6 +226,29 @@ output:
     sharded: true
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive
+  # Windowed, yearly, from birth (issue #638, espg ruling 2026-10-12): one
+  # leaf per (shard, calendar year) plus the ``all`` row, which a windowed
+  # config allocates at init (``pyramid.all_time`` resolves true, issue
+  # #623) -- so neither ``all_time`` nor ``icechunk`` is spelled here (a
+  # windowed hive store gets its Icechunk repo at birth, issue #604, one
+  # manifest per row). The schedule is fixed at a store's birth and only
+  # folds UP later (a year is the merge of its months, never the reverse),
+  # so the template carries the schedule the product is meant to have;
+  # monthly is a deliberate per-store choice (~6.5x the compute). Windowed
+  # emit is what scales: worker peak memory 3.7 -> 1.56 GB (issue #586),
+  # and a window invoke reads only its year's granules. ``windowing`` is a
+  # D13 leaf-shaping key, so this moves the template's ``semantic_hash``
+  # (pinned in tests/test_live_store_templates.py): a windowed store is a
+  # different product from the unwindowed live one. Delete the block to
+  # build an unwindowed store; ``unit`` stays at its default ``shard``.
+  windowing:
+    schedule: yearly
+    time_field: delta_time       # the per-photon clock, declared under
+                                 # data_source.variables above (time_source
+                                 # declares the same convention)
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
   pyramid:
     overviews: [16, 15, 14, 13]  # the v4 store's leaf ladder (issue #620, espg's ruling on
                                  # PR #622 question (2)): the zagg-pyramid/2 grammar, leaf

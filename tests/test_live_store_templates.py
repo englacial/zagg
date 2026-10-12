@@ -23,15 +23,20 @@ here, not at the operator's console.
 (espg ruling 2026-10-09: the int32 ladder wrapped past 2^31 at orders 1 and
 0 of the v3 store), and the dtype sits inside the hashed ``aggregation``
 block, so both templates' digests moved while the live stores keep the
-int32 ones. Until each store is rebuilt as a new product (v3 stays the
+int32 ones. **The issue #638 epoch** adds one more deliberate divergence for
+ATL03: the hive templates are windowed yearly from birth, and
+``output.windowing`` is a D13 leaf-shaping key (a windowed store is a
+different product), so the strata template's digest moved again while GEDI's
+-- unwindowed, see ``test_gedi_stays_unwindowed_until_shot_rate_membership``
+-- did not. Until each store is rebuilt as a new product (v3 stays the
 comparison store, as v1 did), a default build hashes to the template pin
 (``SEMANTIC_PINS``) and CANNOT append to the live store
 (``LIVE_STORE_HASHES``) -- ``hive._frozen_matches`` refuses it by design.
-``test_template_diverges_from_the_live_store_by_the_count_dtype_alone`` is
-the proof that nothing else moved: re-declaring ``count`` as ``int32``
-reproduces every live digest exactly. When the rebuilt stores land, their
-manifests replace the vendored ones and the two tables collapse back into
-one.
+``test_template_diverges_from_the_live_store_by_count_and_windowing_alone``
+is the proof that nothing else moved: re-declaring ``count`` as ``int32``
+and dropping the windowing block reproduces every live digest exactly. When
+the rebuilt stores land, their manifests replace the vendored ones and the
+two tables collapse back into one.
 
 The knob pins cover what the hash cannot see but the redeclare tool consumes
 (``overview_delta``, the orders) and the uniform-δ ruling across every
@@ -60,12 +65,14 @@ CA_V1_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hi
 #: pinned under the location the v1 store was BUILT from: the packaged
 #: template reads the source.coop copy instead (``SIDECAR_STORE``, moved
 #: 2026-09-17). Values computed 2026-10-09 from the int64 ``count`` templates
-#: (issue #626); they are NOT the live stores' digests until the rebuild.
+#: (issue #626), and for ATL03 recomputed 2026-10-12 with the yearly
+#: ``output.windowing`` block (issue #638; a hashed D13 key); they are NOT the
+#: live stores' digests until the rebuild.
 SEMANTIC_PINS = [
     (
         "atl03_tdigest_strata_healpix",
-        "b29d9fce5914717d40031d90f103bf3e32ecd7a46a10b972699612678f688228",
-        "95906aa9e342a159c43b3d19d6822c55683752e5605ebae31944b0844cd68f17",
+        "d3c16792fa6e423cec52b6bc4dfe2583379e0e50360babb3acc8d5d935cd56f0",
+        "252c1011d347ffa436afefe3d7a5358bcc0438d988c78fa989183fa526778417",
         "s3://sliderule-public-cors/zagg-index/ATL03/007",
     ),
     (
@@ -101,14 +108,16 @@ LIVE_STORE_HASHES = [
 ]
 
 #: (template, digest fields, (parent, child, chunk_inner), overview_delta) —
-#: the hash-invisible knobs ``redeclare_dense_ladder.py`` consumes. Every
-#: digest declares the 512 fold budget (issue #424).
+#: the hash-invisible knobs ``redeclare_dense_ladder.py`` consumes. ATL03's
+#: digests declare the v4 fold budget of 128 centroids (issue #638: the stored
+#: 15/16 columns at ~12 GB rather than ~95 GB at 512); GEDI keeps 512 (issue
+#: #424) pending its own measurement.
 DECLARED_PINS = [
     (
         "atl03_tdigest_strata_healpix",
         ["h_tdigest_signal", "h_tdigest_noise"],
         (9, 19, 13),
-        512,
+        128,
     ),
     (
         "gedi01b_waveform_healpix_hive",
@@ -164,13 +173,15 @@ def test_template_hashes_are_pinned(name, legacy, current, build_store):
 @pytest.mark.parametrize(
     ("name", "legacy", "current", "build_store", "manifest"), LIVE_STORE_HASHES
 )
-def test_template_diverges_from_the_live_store_by_the_count_dtype_alone(
+def test_template_diverges_from_the_live_store_by_count_and_windowing_alone(
     name, legacy, current, build_store, manifest
 ):
     # Issue #626: a default build does not reproduce the live store's frozen
     # digest, so the append path refuses it (``_frozen_matches`` compares the
-    # current-epoch digest when both sides carry one) -- and the ONLY key
-    # behind that is count's dtype: int32 back in, every live digest returns.
+    # current-epoch digest when both sides carry one) -- and the ONLY keys
+    # behind that are count's dtype and, for ATL03, the yearly windowing
+    # block (issue #638): int32 back in and the block out, every live digest
+    # returns. GEDI carries no windowing block, so count is its one divergence.
     from zagg.hive import _frozen_matches
 
     # The refusal is checked against the vendored live manifest, every other
@@ -183,6 +194,7 @@ def test_template_diverges_from_the_live_store_by_the_count_dtype_alone(
     if live is not None:
         assert not _frozen_matches(live, {**live, "semantic_hash": semantic_hash(cfg)})
     cfg.aggregation["variables"]["count"]["dtype"] = "int32"
+    cfg.output.pop("windowing", None)
     assert semantic_hash(cfg) == current
     assert _legacy_hash(cfg, build_store) == legacy
     if live is not None:
@@ -232,7 +244,7 @@ def test_hive_templates_declare_the_ladder_and_chain_the_staged_sweep(name):
 
     cfg = default_config(name)
     assert "sweep" not in cfg.output  # the default, not a spelled "stages"
-    assert get_pyramid(cfg) == {"overviews": LADDER}
+    assert get_pyramid(cfg)["overviews"] == LADDER  # all_time resolves true when windowed (#623)
     grid = from_config(cfg)
     shard = int(cfg.output["grid"]["parent_order"])
     assert LADDER[-1] == shard + 4
@@ -243,6 +255,104 @@ def test_hive_templates_declare_the_ladder_and_chain_the_staged_sweep(name):
     resolutions, fields = leaf_column_plan(cfg, grid)
     assert resolutions == list(range(16, shard - 1, -1))  # the contiguous column tier
     assert fields  # at least one composable field rides the ladder
+
+
+#: The hive templates that are windowed yearly from birth (issue #638, espg
+#: ruling 2026-10-12). GEDI is not among them -- see
+#: ``test_gedi_stays_unwindowed_until_shot_rate_membership``.
+WINDOWED_TEMPLATES = ["atl03_tdigest_strata_healpix", "atl03_tdigest_healpix_hive"]
+WINDOWING = {
+    "schedule": "yearly",
+    "time_field": "delta_time",
+    "epoch": "2018-01-01T00:00:00+00:00",
+    "scale": "gps",
+    "units": "seconds",
+    "windows": None,
+}
+
+
+@pytest.mark.parametrize("name", WINDOWED_TEMPLATES)
+def test_atl03_hive_templates_are_windowed_yearly(name):
+    # Validated at load (default_config runs validate_config) and resolved
+    # through ``get_windowing``, so the epoch spelling canonicalizes. Neither
+    # ``all_time`` nor ``icechunk`` is spelled: a windowed config resolves the
+    # ``all`` row (issue #623) and a windowed hive store gets its Icechunk repo
+    # at birth (issue #604), one manifest per row. The clock is the one
+    # ``time_source`` declares where the template has one, and the per-photon
+    # ``delta_time`` column is declared under ``data_source.variables`` -- the
+    # base-rate column window membership is decided on.
+    from zagg.config import get_icechunk, get_pyramid, get_windowing, get_windowing_unit
+    from zagg.icechunk_rows import DEFAULT_ROWS_PER_MANIFEST
+
+    cfg = default_config(name)
+    assert get_windowing(cfg) == WINDOWING
+    assert get_windowing_unit(cfg) == "shard"
+    assert "all_time" not in cfg.output["pyramid"] and "icechunk" not in cfg.output
+    assert get_pyramid(cfg)["all_time"] is True  # resolved, not spelled (issue #623)
+    assert cfg.data_source["variables"]["delta_time"] == "/{group}/heights/delta_time"
+    if "time_source" in cfg.output:
+        source = cfg.output["time_source"]
+        assert (source["field"], source["scale"], source["units"]) == (
+            "delta_time",
+            "gps",
+            "seconds",
+        )
+    assert get_icechunk(cfg) is True
+    from zagg.icechunk_refs import resolve_options
+
+    shard = int(cfg.output["grid"]["parent_order"])
+    assert resolve_options(cfg, shard)["rows_per_manifest"] == DEFAULT_ROWS_PER_MANIFEST
+    # Deleting the block is the opt-out: an unwindowed build stays legal.
+    del cfg.output["windowing"]
+    from zagg.config import validate_config
+
+    validate_config(cfg)
+    assert get_windowing(cfg) is None
+
+
+def test_gedi_stays_unwindowed_until_shot_rate_membership():
+    # GEDI's clock is shot-rate -- ``delta_time`` is declared on the
+    # ``shots`` level and broadcast to sample rate -- and window membership is
+    # decided on a BASE-rate ``data_source.variables`` column only
+    # (``_validate_windowing``), so the #638 block is refused by name on this
+    # template. It stays unwindowed, and this test says why: when level-rate
+    # membership lands, this assertion is the one to flip.
+    from zagg.config import get_windowing, validate_config
+
+    cfg = default_config("gedi01b_waveform_healpix_hive")
+    assert get_windowing(cfg) is None
+    assert "delta_time" in cfg.data_source["levels"]["shots"]["variables"]
+    cfg.output["windowing"] = {k: v for k, v in WINDOWING.items() if k != "windows"}
+    with pytest.raises(ValueError, match="non-base .segment-rate. level"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "name,budget",
+    (
+        ("atl03_tdigest_strata_healpix", 128),
+        ("atl03_tdigest_healpix_hive", 128),
+        ("gedi01b_waveform_healpix_hive", 512),
+    ),
+)
+def test_overview_delta_is_the_v4_budget_on_atl03_and_unchanged_on_gedi(name, budget):
+    # Every ragged (digest) field of the ATL03 hive templates declares the v4
+    # overview budget of 128 centroids (issue #638); GEDI's waveform digests
+    # keep 512 pending a measurement of their own. The leaf ``delta`` is 4096
+    # throughout (``test_every_digest_template_shares_the_uniform_delta``),
+    # and ``overview_delta`` is hash-invisible
+    # (``zagg.semantics.VARIABLE_PACKAGING_KEYS``), so no pin above moved for it.
+    from zagg.semantics import VARIABLE_PACKAGING_KEYS
+
+    assert "overview_delta" in VARIABLE_PACKAGING_KEYS
+    cfg = default_config(name)
+    ragged = {k: m for k, m in cfg.aggregation["variables"].items() if m.get("kind") == "ragged"}
+    assert ragged
+    assert {m["overview_delta"] for m in ragged.values()} == {budget}
+    cfg.aggregation["variables"][next(iter(ragged))]["overview_delta"] = (
+        512 if budget == 128 else 128
+    )
+    assert semantic_hash(cfg) == semantic_hash(default_config(name))
 
 
 @pytest.mark.parametrize("name", LADDER_TEMPLATES)

@@ -42,8 +42,11 @@ leaf.
   config built from the templates as shipped is refused against those stores
   until they are rebuilt. Use each store's run-record config (vendored for
   the v1 ATL03 store and `gedi_flux_o9` as `tests/data/*.config.json`);
-  `tests/test_live_store_templates.py` pins both digests and proves `count` is
-  the only divergence (issue #547). The templates also declare the leaf
+  `tests/test_live_store_templates.py` pins both digests and proves `count`
+  is the only divergence for GEDI, and `count` plus the yearly
+  `output.windowing` block — a hashed D13 key, since
+  [issue #638](https://github.com/englacial/zagg/issues/638) — the only two
+  for ATL03 (issue #547). The templates also declare the leaf
   ladder now — `output.pyramid: {overviews: [16, 15, 14, 13]}` since
   [issue #620](https://github.com/englacial/zagg/issues/620), where the live
   stores were built with `pyramid: false` (GEDI) or `{overviews: 13}` (the v3
