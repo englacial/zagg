@@ -4887,6 +4887,21 @@ class TestLambdaSkipAndDirtOnly:
         summary, seen = self._drive(monkeypatch, atl06_config, body=body)
         assert seen["stage"] == [] and summary["stage_sweep"] is None
 
+    def test_a_tail_that_raised_keeps_both_keys(self, monkeypatch, atl06_config):
+        # The tail's fail-open arm (D9): a raise anywhere in the sweep block
+        # must leave the two reported keys PRESENT — the summary's key set is
+        # pinned by name (TestSummaryKeysByteIdentical), so dropping one would
+        # break a caller's dict rather than report a skipped tail.
+        import zagg.sweep as sweep_mod
+
+        def boom(*a, **k):
+            raise RuntimeError("no leaves for you")
+
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", boom)
+        summary, seen = self._drive(monkeypatch, atl06_config, body=self._DIRTY)
+        assert seen["stage"] == [] and seen["sweep"] == 0
+        assert summary["stage_sweep"] is None and summary["families_sweep"] is None
+
 
 class TestLambdaFamiliesRideTheCascade:
     """The fleet tail is ONE fan-out (issue #610 phase 4, espg's ruling on PR #623).
