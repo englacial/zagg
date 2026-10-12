@@ -5945,14 +5945,20 @@ def _cascade_families(config, grid) -> tuple:
     families pass exactly as before: the ``/1`` retrofit regime, and a
     ``"stages"`` config whose store declares no walkable ladder — there the
     stage worker refuses at the ``/2`` gate and would fold nothing, so the
-    separate pass is the only one that reaches the rollups. Every tail that
-    chains the staged sweep decides with this (the CLI's two backends and the
-    ``client`` facade), so no dispatcher can carry the families twice or not
-    at all.
+    separate pass is the only one that reaches the rollups. ``()`` too for a
+    windowed store without ``output.pyramid.all_time``: it has no node close,
+    and a rollup object is per node and merges every window, so only a close
+    can fold it — the separate pass keeps those stores on every backend.
+    Every tail that chains the staged sweep decides with this (the CLI's two
+    backends and the ``client`` facade), so the backends agree; the
+    dispatcher's store-side ``closes`` check remains the warning path for a
+    config that declares the close on a store that withdrew it.
     """
     from zagg.icechunk_refs import ladder_walks
     from zagg.sweep_families import CASCADE_FAMILIES
 
+    if get_windowing(config) is not None and not (get_pyramid(config) or {}).get("all_time"):
+        return ()
     return tuple(CASCADE_FAMILIES) if ladder_walks(config, grid) else ()
 
 

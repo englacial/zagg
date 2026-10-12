@@ -5,9 +5,9 @@ object, an error naming the window — but the leaves that landed are in the
 store, so the post-run tail reads LEAVES, not invokes:
 
 - the sweep work set (the staged sweep's ``(node, window)`` units and the
-  node close, which the rollup families ride — issue #610 phase 4 — so no
-  families pass is fired) is every result's stats records, each on its own
-  ``success``;
+  node close, which the rollup families ride where the store declares one —
+  issue #610 phase 4 — and the families pass otherwise) is every result's
+  stats records, each on its own ``success``;
 - a shard enters the root ``coverage.moc`` when at least one of its leaves
   stands, and the time-range union takes those leaves' ranges alone;
 - the failed window is in none of them, and a re-run redoes it while the gate
@@ -62,10 +62,10 @@ ERROR = f"window {FAILED}: RuntimeError: PUT failed"
 _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
 
-def _cfg():
+def _cfg(all_time=True):
     cfg = emit._digest_cfg()
     cfg.output["sweep"] = "stages"
-    cfg.output["pyramid"] = {"overviews": 7, "all_time": True}
+    cfg.output["pyramid"] = {"overviews": 7, **({"all_time": True} if all_time else {})}
     validate_config(cfg)
     return cfg
 
@@ -216,10 +216,10 @@ def _run_fleet(monkeypatch, tmp_path, cfg, invocation, root=None):
         )
     families = [e for e in stub.modes("sweep") if "stage" not in e]
     seen["sweep"] = [tuple(leaf) for e in families for leaf in e["leaves"]]
-    # The families the cascade carried: on a windowed store, the close events'.
-    closes = [
-        e["stage"] for e in stub.modes("sweep") if e.get("stage", {}).get("unit") == UNIT_CLOSE
-    ]
+    # The families the cascade carried: on a windowed store, the close events';
+    # a closeless one (no ``all_time``) rides none, so its stage events say so.
+    stages = [e["stage"] for e in stub.modes("sweep") if "stage" in e]
+    closes = [s for s in stages if s.get("unit") == UNIT_CLOSE] or stages
     seen["families"] = sorted({tuple(c.get("families") or ()) for c in closes})
     seen["coverage"] = [_cover(e["coverage"]) for e in stub.modes("coverage")]
     return root, shard, summary, seen, stub
@@ -348,6 +348,27 @@ class TestBackendsAgree:
             if e.get("stage", {}).get("unit") == "window"
         }
         assert windows == set(LANDED)
+
+    @pytest.mark.parametrize("invocation", ["sync", "event"])
+    def test_a_closeless_windowed_store_keeps_the_families_pass_on_both(
+        self, monkeypatch, tmp_path, invocation
+    ):
+        # No ``all_time``: no node close for the families to ride, so both
+        # tails fire the whole-tree pass over the landed windows, hand the
+        # staged sweep no family, and build the same rollups (review round 3 (1)).
+        cfg = _cfg(all_time=False)
+        emit._patch(monkeypatch)
+        _fail_one_window(monkeypatch)
+        local_root, shard, _local, local_seen = _run_local(monkeypatch, tmp_path, cfg)
+        fleet_root, _shard, _fleet, fleet_seen, _stub = _run_fleet(
+            monkeypatch, tmp_path, cfg, invocation
+        )
+        landed = [(shard, w) for w in LANDED]
+        for seen in (local_seen, fleet_seen):
+            assert (seen["sweep"], seen["stage"], seen["families"]) == (landed, landed, [()])
+        for root in (local_root, fleet_root):
+            rollups = {p.name.split(".")[0] for p in Path(root, "-5").glob("*.rollup.json")}
+            assert rollups == set(CASCADE_FAMILIES)
 
     @pytest.mark.parametrize("backend", ["local", "sync"])
     def test_a_rerun_redoes_the_failed_window_and_skips_the_landed_ones(
