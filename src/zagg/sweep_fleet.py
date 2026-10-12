@@ -606,12 +606,17 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     WRITES, and one GET of one small object at a store root the dispatcher is
     already handed is neither a write nor store data held in flight.
 
-    The gate IS the workers' own, :func:`zagg.sweep_stage.ladder_entries`, so
-    the dispatcher declines exactly what every invoke would have refused — a
-    non-``/2`` spec, an absent or empty ``overviews`` list, a malformed
-    ladder entry — plus a ``/2`` declaration carrying no level below
-    ``shard_order``, which enumerates to nothing for the staged sweep to
-    fold. ``None`` is a sweepable ladder, the only case that fans out.
+    The gate IS the workers' own, :func:`zagg.sweep_stage.ladder_entries`,
+    and it declines exactly what every invoke would have REFUSED and nothing
+    besides: a non-``/2`` spec, an absent or empty ``overviews`` list, a
+    malformed ladder entry. A ``/2`` declaration whose ladder filters to
+    nothing — only the leaf entry, which is the fleet's own column — is NOT
+    declined, because the workers accept it: they call ``ladder_entries`` for
+    its refusals and discard the list, so such a run folds no level but still
+    does the finisher's store-root work (root ``coverage.moc``, manifest
+    actuals, the run record). Declining it would move what a ``/2`` store
+    does, which is the one thing issue #635 asks not to move (review
+    finding).
 
     An UNREADABLE manifest is fail-open (D9), not a refusal: a dispatcher
     role may legitimately hold nothing but ``lambda:InvokeFunction`` against
@@ -649,7 +654,12 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # traceback this gate exists to replace.
         return str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
     if not entries:
-        return f"its ladder declares no level below shard_order {shard_order}"
+        # Accepted, like every worker accepts it: a ladder that filters to
+        # nothing folds nothing but still carries the finisher's work.
+        logger.info(
+            f"stage fleet: {store_path} declares a ladder with no level below shard_order "
+            f"{shard_order} — the fan-out folds no level, as the workers' own gate allows"
+        )
     return None
 
 

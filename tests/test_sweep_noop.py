@@ -477,9 +477,10 @@ class TestStoreLadderGate:
 
     #: Every declaration the workers refuse, and the clause that names it. A
     #: ``/1`` schedule and a declared-off ``/1`` are the two shapes PR #622's
-    #: Migration note describes; the two ``/2`` shapes are a malformed
-    #: declaration and a ladder whose only entry is the leaf one (the fleet's
-    #: own column, never the sweep's).
+    #: Migration note describes; the ``/2`` shapes are an empty and two
+    #: malformed ``overviews`` lists. A ladder that merely FILTERS to nothing
+    #: is not here — the workers accept it, so the dispatcher does too
+    #: (``test_a_leaf_only_ladder_still_fans_out``).
     NO_LADDER = [
         ({"spec": "zagg-pyramid/1", "overview": {"orders": [2, 1], "spacing": 1}}, "/1 stores"),
         ({"spec": "zagg-pyramid/1", "overview": {"orders": []}}, "/1 stores"),
@@ -489,10 +490,6 @@ class TestStoreLadderGate:
         # is owed for those too (review finding).
         ({"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 2}]}, "KeyError"),
         ({"spec": PYRAMID_SPEC_V2, "overviews": ["2"]}, "TypeError"),
-        (
-            {"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 3, "cells": [4]}]},
-            "no level below shard_order 3",
-        ),
     ]
 
     @pytest.mark.parametrize("pyramid, named", NO_LADDER)
@@ -512,6 +509,26 @@ class TestStoreLadderGate:
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
         assert "--declare-pyramid" in warnings[0] and named in warnings[0]
+
+    def test_a_leaf_only_ladder_still_fans_out(self, tmp_path):
+        # A /2 declaration whose only entry is the leaf one (the fleet's own
+        # column) filters to an EMPTY ladder, and every worker accepts it:
+        # the three worker gates call ``ladder_entries`` for its refusals and
+        # discard the list, so such a run folds no level but still does the
+        # finisher's store-root work — the root MOC, the manifest actuals,
+        # the run record. Declining it would move what a /2 store does
+        # (review finding), so the gate does not.
+        from zagg.sweep_fleet import dispatch_nodes
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        self._redeclare(root, {"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 3, "cells": [4]}]})
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert summary["skipped"] is None
+        by_shard = {d: {None} for d in LEAVES}
+        assert _fired(client) == {d: dispatch_nodes(by_shard, d) for d in (2, 1, 0)}
+        assert summary["finisher"]["fired"] is True
 
     def test_a_manifest_that_is_not_an_object_fires_nothing(self, tmp_path):
         # The corrupt-manifest arm of the same finding: ``read_manifest``
