@@ -460,8 +460,8 @@ def build_record(
         # not on the column artifacts' own.
         "leaf_column": metadata.get("leaf_column"),
         # Icechunk companion refs (issue #580, spec §11.4): the leaf's refs
-        # commit — ``{path, snapshot, arrays, refs, rebases, commit_s,
-        # checksum}`` on success (``commit: "leaf"``), or in ladder mode the
+        # commit — ``{path, snapshot, arrays, refs, rebases, replays,
+        # commit_s, checksum}`` on success (``commit: "leaf"``), or in ladder mode the
         # ref sidecar it wrote instead — ``{sidecar, bytes, refs, arrays,
         # checksum}`` — ``{"skipped": reason}`` for a unit stage 1
         # does not index (windowed, empty), ``{"error": ...}`` when the
@@ -698,6 +698,7 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     row["icechunk_snapshot"] = ice.get("snapshot")
     row["icechunk_refs"] = ice.get("refs")
     row["icechunk_rebases"] = ice.get("rebases")
+    row["icechunk_replays"] = ice.get("replays")  # fresh-session replays over row growth (§11.4)
     row["icechunk_commit_s"] = ice.get("commit_s")
     row["icechunk_checksum"] = ice.get("checksum")
     # Ladder mode (phase 6): the leaf wrote a ref sidecar instead of committing.

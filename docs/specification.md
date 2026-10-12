@@ -4679,17 +4679,22 @@ columns do:
    container prefix, which is vetted at the repo) and the entries (≈40 KB per
    leaf at production geometry), grouped into units that each name the
    **row** they land in by **label** (`row`: `all` for an unwindowed leaf
-   and its column; a carrier written before `/2` names none and is read as
-   `all`) — never a row index, which only the repo knows (§11.2), so a
+   and its column, the window's label for a windowed leaf — one leaf, and
+   so one carrier, per window; a carrier written before `/2` names none and
+   is read as `all`) — never a row index, which only the repo knows (§11.2), so a
    carrier stays valid whatever rows other runs allocate. It is a
    **writer-internal carrier**, not part of the reader contract — the repo
    is. No Icechunk session is opened on the leaf path.
 2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
    `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
-   the finest tuple, its children's **node ref columns** (the same carrier at
+   the finest tuple, one per `(leaf, window)` on a windowed store, its
+   children's **node ref columns** (the same carrier at
    `{node}/icechunk_refs.json`) above — and adds the refs of the overview
    objects at every order of its tuple beneath it (read the same way a
-   leaf's are). A missing carrier is counted (`icechunk_missing`) and
+   leaf's are). What it reads and plans is scoped to the rows THIS RUN
+   writes under the node — the window labels dirty beneath it plus `all`
+   when it closes — so an append costs the new rows, not the store's
+   history. A missing carrier is counted (`icechunk_missing`) and
    tolerated — under-coverage, never a failure — and a carrier whose
    recorded geometry disagrees with the repo's block is refused.
 3. **One tuple commits.** Let `c` be `commit_order`, `d` a tuple's dispatch
@@ -4709,11 +4714,29 @@ columns do:
      commit nothing.
 
    Commits rebase on conflict exactly as before (`ConflictDetector`; nodes
-   touch disjoint chunk ranges), and each stage row records
-   `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
-   `icechunk_refs`, `icechunk_missing`, `icechunk_failed`,
-   `icechunk_skipped_levels`, `icechunk_clean`, `icechunk_regathered` and
-   `icechunk_s` — every one
+   touch disjoint chunk ranges). One conflict no rebase reconciles is
+   **another run's row growth** (its `init`, below) landing while a node
+   holds staged refs: Icechunk reports `Chunks updated in updated array` on
+   every array the node touched and the rebase fails. That class, and only
+   that class — every conflict of the failed rebase is one, nothing else,
+   **and** no commit between the session's base snapshot and the branch tip
+   updated a chunk the session staged (the rebase stops at the first commit
+   it cannot reconcile, so a double update landing after the growth is
+   caught by that diff, not by the conflict list) —
+   is **replayed**: the node writes the same units into a fresh session
+   based on the grown arrays and commits them there (each label resolves to
+   the same row index, §11.2 — a row never moves; the ladder streams the
+   subtree again rather than holding it), at most once (`REPLAY_TRIES`),
+   after which the failure propagates to the fail-open hook. A double update
+   of the same chunks by two writers is never replayed over, whichever of it
+   and the growth landed first; the rebase failure propagates. A replayed
+   node's rebases and commit time sum every session's, the defeated one
+   included, and a replay counts whether or not its re-read then staged
+   anything to commit. Each stage row
+   records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
+   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
+   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
+   `icechunk_regathered` and `icechunk_s` — every one
    pre-seeded, so a row's key set does not depend on whether a node did work
    — plus `icechunk_nodes`, one entry per node that did, carrying the
    snapshot it committed (the leaf→snapshot join).
@@ -4779,7 +4802,9 @@ event names, and a window label on an unwindowed store — or one its
 schedule does not declare — is refused. Two runs allocating at once both
 resize every array, which Icechunk's rebase does not reconcile: the loser's
 init retries in a fresh session (5 attempts in all), re-reads the rows the winner
-recorded and appends after them. A retry re-applies the loser's own block
+recorded and appends after them. The other side of that race — a node of a
+run already committing when the growth lands — replays its units in a fresh
+session (**One tuple commits**, above). A retry re-applies the loser's own block
 changes (a ratchet, the per-run knobs) only when the winner changed nothing
 else, or made the same changes: a block the winner moved otherwise — a
 different ratchet, other knobs — is not overwritten with changes computed
@@ -5044,27 +5069,40 @@ fails the sweep — the leaf is normative, the index is regenerable (a later
 staged sweep re-gathers). The leaf's `icechunk` block records the sidecar it
 wrote — `{sidecar, bytes, refs, arrays, checksum}` — or, under
 `commit: "leaf"`, its commit `{path, snapshot, arrays, refs, rebases,
-commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
+replays, commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
 (§11.6); `{error: message}` on failure. The run parquet flattens the same
 fields to `icechunk_*` columns.
 
 ### 11.5 Manifest splitting
 
-**Contract.** Manifests are split along the **cell** axis into runs of
-`4^m` chunks — and along no other: one manifest spans **every row** of its
-run (§11.2) — and `m` is fixed **once, from the base level**:
+**Contract.** Manifests are split along **both** axes of a level array: the
+**cell** axis into runs of `4^m` chunks, and the **row** axis into blocks of
+`rows_per_manifest` rows (§11.2), default **one row per manifest**. `m` is
+fixed **once, from the base level**:
 
 ```text
 m_base = chunk_order_base − split_order          (7 at production: 4^7 = 16,384 chunks)
 m      = min(m_base, chunk_order_level)          (per level)
 ```
 
-The split therefore names **both** axes of a level array: the cell axis at
-`4^m`, and the row axis at a run length no row count reaches (`2^31 − 1`).
-Naming the row axis is required, not decorative — Icechunk splits an axis
-its config does not name at **one** chunk, which would cut a manifest per
-(row, cell run) and multiply the manifest count, and the snapshot that lists
-every manifest, by the number of rows.
+Both axes are named explicitly, which is required rather than decorative:
+Icechunk splits an axis its config does not name at **one** chunk, so an
+unnamed cell axis would cut a manifest per chunk.
+
+**Why the row axis is split.** With one manifest per row an append only
+**adds** manifest files: the rows already written are never rewritten, so a
+reader's cached manifests stay valid and a reader after one window
+downloads that window's refs alone. The alternative — one manifest spanning
+every row of its cell run — makes each append rewrite the whole manifest of
+every cell it touches (at 7 yearly windows, ≈1.05 MB rewritten per order-6
+cell per array to add a row's refs) and makes a one-window read download
+every window's refs. The cost of splitting is the **snapshot**, which lists
+every manifest and so grows with the row count: negligible at regional
+scale, and the reason the cut is a knob
+(`output.icechunk.rows_per_manifest`, default 1) rather than a law — a
+global store sets blocks of several rows. One row per manifest is the
+**finest** cut a store can carry, which is the side a later coarsening can
+still move from.
 
 Because the chunk axis is in nested order, one run of the **base** is
 exactly the chunks of one HEALPix cell at order `split_order`, so the split
@@ -5084,9 +5122,14 @@ levels (≈5× at production).
 The split is configured **per order group** (Icechunk's path-matched split
 conditions, `^/{order}/`) and recorded per level as `levels.{order}.split`
 (`chunks` = `4^m`, `order` = `chunk_order − m` — the cell order one
-manifest spans, which differs per level by design) and once as
-`split_order` in the `zagg_icechunk` block (§11.1), never assumed by
-readers. `split_order` MUST satisfy `commit_order ≤ split_order ≤
+manifest spans, which differs per level by design — and `rows`, the row-axis
+block, the same for every level) and once each as `split_order` and
+`rows_per_manifest` in the `zagg_icechunk` block (§11.1), never assumed by
+readers. A `/2` repo whose block carries **no** `rows_per_manifest` was
+written before this rule — an interim repo, never published — and is
+**refused** with the remedy (clear it; the next run's init re-creates it),
+never operated on: its `rows`-less level records are compared with nothing.
+`split_order` MUST satisfy `commit_order ≤ split_order ≤
 shard_order`: the committing node (§11.4) owns every leaf under its order,
 so a **base** manifest keyed to a cell at or below it is written by that one
 commit and no other — **zero rewrite amplification** at the only heavy
@@ -5103,15 +5146,18 @@ keeps its id. Refs written into a new row rewrite, per array, exactly the
 manifests of the split cells they touch — **whole**, the earlier rows'
 refs included — and no other; every earlier reference stays byte-identical.
 The one-row case costs nothing over a row-less array (2.10 MB of manifests
-for 147,456 refs against 2.14 MB). A windowed store's 14 windows, each
-leaf's window holding ≈20 % of its inner chunks, are 2.8× the refs and
-≈3.0× the manifest bytes of one dense row, in the **same** manifest count —
-the snapshot does not grow with the rows. The price is the append: adding
-one window to that cell rewrites its 5.8 MB of manifests to add ≈0.4 MB of
-refs (the superseded manifests are what retention collects, §11.4).
-Splitting the row axis too would write only the new refs, at one manifest
-per (row, cell run) — 14× the manifests and the snapshot entries here —
-which is the trade the cell-axis-only rule declines.
+for 147,456 refs against 2.14 MB). Under the default
+one-row cut, refs written into a new row therefore touch only that row's
+manifests and no earlier one. Measured on the issue #586 Sierra stores, a
+yearly-windowed leaf occupies ≈62 % of its 256 inner chunks (mean 158,
+min 34, max 234), so one shard's 7 yearly windows carry ≈4.3× the occupied
+chunks of one dense row — ≈8.4 MB of manifests for one order-6 cell: 8
+files of ≈1.05 MB spanning every row, against 56 files of ≈150 KB at one
+manifest per row. Row-spanning manifests rewrite that 1.05 MB per append;
+the one-row cut writes only the new row's ≈150 KB and supersedes nothing,
+paying ≈33 B of snapshot per manifest (≈4.8 KB per order-6 cell against
+≈1.4 KB). Occupancy did not track a leaf's pass count, so these numbers do
+not project to finer schedules — issue #602 measures those.
 
 **Contract — the ratchet.** The store's recorded `split_order` is
 authoritative and moves **one way, toward coarser**. At `init`, the run
@@ -5129,6 +5175,17 @@ the run's finalize (§11.4) reports as `rewrite_pending` for an **operator**
 by finalize; mixed cuts are valid — each manifest carries its own extents). A repo is never re-split finer. `split_order` is
 a layout knob outside the D19 semantic core: it changes no leaf byte.
 `commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`.
+
+`rows_per_manifest` does **not** ratchet: it is fixed at the repo's
+creation, because it is baked into every manifest already written. A later
+config value is not applied — the init adopts the store's and logs a
+warning naming both — and moving it on an existing repo is an operator
+`rewrite_manifests` pass. It MUST be at least 1. Adoption governs the
+**repository handle** the run then writes through, not only the value it
+reports: an Icechunk config supplied when a repository is opened overrides
+the saved one, so an init whose config differs from the store reopens at
+the store's cut before any commit. The block and the manifests a run writes
+therefore always name the same cut.
 
 At the defaults (`split_order = commit_order = 6` at production) a
 shard-order manifest is `4^7` = 16,384 chunks — one order-6 cell, 64 leaves —
@@ -5157,14 +5214,28 @@ having precisely because all refs of one leaf array carry the **same**
 
 Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
 across windows, which is what the `/2` row dimension is for: each window is
-a row (§11.2), so the array model holds them. The **writer** does not index
-them yet: it records no refs for a windowed leaf (the sidecar says
-`skipped: windowed`), the ladder does not run on a windowed store, and
-`output.icechunk` resolves off there (an explicit `true` is refused), so no
-windowed store has a repo. Raster hive products (`(time, cells)` arrays,
-never sharded — one row per acquisition, in append order) are likewise out
-of the writer's scope. Both are tracked on issue
-[#584](https://github.com/englacial/zagg/issues/584) (its phases 2 and 4);
+a row (§11.2), so the array model holds them — and the writer now indexes
+them (issue #584 phase 2). A windowed hive store is **in** scope, and
+`output.icechunk` defaults ON there as it does for an unwindowed hive
+store:
+
+- the run's init allocates one row per window label its dispatch units
+  carry, plus the reserved `all` row when the store maintains the
+  cross-window fold (`pyramid.overview.all_time`);
+- each window leaf's refs land at its window's row. A leaf unit that names
+  **no** window label is refused: `all` is the fold's own row, it IS
+  allocated whenever the fold is maintained, so nothing downstream would
+  catch a base ref written over it;
+- the ladder's node units plan one overview object per row **this run
+  writes** (`{window}.zarr` per window unit beneath the node, and
+  `all.zarr` when the node closes), never per row the repo holds — which
+  would re-plan and re-commit every window ever allocated, rewriting those
+  rows' manifests on every append.
+
+Raster hive products (`(time, cells)` arrays, never sharded — one row per
+acquisition, in append order) remain out of the writer's scope: the knob
+resolves off there and an explicit `true` is refused. They are tracked on
+issue [#584](https://github.com/englacial/zagg/issues/584) (its phase 4);
 the finalize and tags of §11.4 apply to them unchanged once they have a
 repo. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview

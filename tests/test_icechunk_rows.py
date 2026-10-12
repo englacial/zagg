@@ -2,7 +2,7 @@
 
 ``zagg-icechunk/2``: every level array is ``(n_rows, n_cells)``. These tests
 pin the row law (allocated once, by label, in order of first appearance,
-never reordered), the root coordinate, the cell-axis-only manifest split, the
+never reordered), the root coordinate, the two-axis manifest split, the
 refusal of a ``/1`` repo — and that a run adding a row leaves every earlier
 ref byte-identical. A windowed store's repo is driven through ``init_repo``
 and ``commit_units`` directly: the config guard still resolves the companion
@@ -22,6 +22,7 @@ from test_icechunk_refs import (
     _grid,
     _leaf_arrays,
     _open,
+    _saved_row_splits,
     _saved_splits,
     _shards,
     _write_leaf,
@@ -325,9 +326,10 @@ class TestRefsLandAtTheirRow:
         assert old["6"]["count"].shape == (1, 12 * 4**6)
         np.testing.assert_array_equal(old["6"]["count"][0, span][:4], np.full(4, 1))
 
-    def test_the_manifest_split_is_the_cell_axis_alone(self, monkeypatch, cfg, tmp_path):
-        # One manifest per split cell spans EVERY row (§11.5): the snapshot's
-        # manifest count does not grow with the rows.
+    def test_the_manifest_split_cuts_the_row_axis_at_one_row(self, monkeypatch, cfg, tmp_path):
+        # One manifest per ROW per split cell (§11.5, the 2026-10-02 ruling):
+        # each manifest's row extent is a single row, so an append adds
+        # manifests instead of rewriting the rows already written.
         grid, root, manifest = _windowed(cfg, tmp_path)
         (shard,) = _shards(grid, 1)
         v1, v2 = self._two_versions(monkeypatch, grid, root, shard)
@@ -340,8 +342,149 @@ class TestRefsLandAtTheirRow:
         )
         _group, repo = _open(root)
         nodes = {n["path"]: n for n in repo.inspect_snapshot(out["snapshot"])["nodes"]}
+        refs = nodes["/6/count"]["manifest_refs"]
+        assert len(refs) == 2
+        assert sorted(r["extents"][0] for r in refs) == [[0, 1], [1, 2]]
+
+    def test_a_block_of_rows_per_manifest_is_a_knob(self, monkeypatch, cfg, tmp_path):
+        # ``rows_per_manifest`` widens the row block; a global store sets one.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        v1, v2 = self._two_versions(monkeypatch, grid, root, shard)
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}  # after _write_leaf pops the block
+        out = _init(root, grid, cfg, manifest, ["2019", "2020"])
+        assert out["options"]["rows_per_manifest"] == 4
+        assert out["levels"]["6"]["split"]["rows"] == 4
+        committed = icechunk_refs.commit_units(
+            root,
+            [self._unit(grid, root, shard, "2019", v1), self._unit(grid, root, shard, "2020", v2)],
+            "node",
+            store_kwargs={},
+        )
+        _group, repo = _open(root)
+        nodes = {n["path"]: n for n in repo.inspect_snapshot(committed["snapshot"])["nodes"]}
+        # Both rows fall inside the one 4-row block, so there is ONE
+        # manifest; its extent is clipped to the rows the array has.
         (ref,) = nodes["/6/count"]["manifest_refs"]
-        assert ref["extents"][0] == [0, 2]  # both rows in the one manifest
+        assert ref["extents"][0] == [0, 2]
+
+    def test_an_appended_row_supersedes_no_earlier_manifest(self, monkeypatch, cfg, tmp_path):
+        # The point of the row cut: run 2 adds manifest files and the row-0
+        # manifests keep their ids, so a reader's cached manifests stay valid.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        v1, v2 = self._two_versions(monkeypatch, grid, root, shard)
+        _init(root, grid, cfg, manifest, ["2019"])
+        first = icechunk_refs.commit_units(
+            root, [self._unit(grid, root, shard, "2019", v1)], "leaf", store_kwargs={}
+        )
+        _group, repo = _open(root)
+
+        def manifest_ids(snapshot):
+            # The LEVEL arrays only: the root row coordinate is a small
+            # native array that run 2 writes its new row's bounds into, so
+            # its manifest is rewritten by design (§11.2).
+            nodes = {n["path"]: n for n in repo.inspect_snapshot(snapshot)["nodes"]}
+            return {
+                path: {r["id"] for r in node["manifest_refs"]}
+                for path, node in nodes.items()
+                if node.get("manifest_refs") and path.startswith("/6/")
+            }
+
+        before = manifest_ids(first["snapshot"])
+        assert before
+        _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        second = icechunk_refs.commit_units(
+            root, [self._unit(grid, root, shard, "2020", v2)], "leaf", store_kwargs={}
+        )
+        _group, repo = _open(root)
+        after = manifest_ids(second["snapshot"])
+        for path, ids in before.items():
+            # Every row-0 manifest survives by id, and the row-1 refs arrive
+            # as NEW manifests alongside them -- nothing is rewritten.
+            assert ids <= after[path], path
+            assert len(after[path]) == len(ids) + 1, path
+
+    def test_the_row_cut_is_fixed_at_creation_and_a_later_config_adopts_it(
+        self, monkeypatch, cfg, tmp_path, caplog
+    ):
+        # ``rows_per_manifest`` is baked into every manifest already written,
+        # so it does NOT ratchet: a later run adopts the store's and warns.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        self._two_versions(monkeypatch, grid, root, shard)
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}
+        assert _init(root, grid, cfg, manifest, ["2019"])["options"]["rows_per_manifest"] == 4
+        cfg.output["icechunk"] = {"rows_per_manifest": 1}
+        with caplog.at_level("WARNING"):
+            again = _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        assert again["options"]["rows_per_manifest"] == 4
+        assert "fixed at creation" in caplog.text
+        assert _saved_row_splits(root)["6"] == 4
+
+    def test_a_repo_recording_no_row_cut_is_refused_with_the_remedy(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # A ``/2`` repo written before the row-split ruling records no
+        # ``rows_per_manifest`` and its levels no ``rows``. Interim repos are
+        # disposable (ruling of 2026-10-12, issue #584): every operation
+        # refuses it with the remedy — ahead of the level check and of any
+        # save — and nothing keeps an every-row-in-one cut alive for it.
+        from zagg import icechunk_ops
+
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        _init(root, grid, cfg, manifest, ["2019"])
+        _group, repo = _open(root)
+        session = repo.writable_session(icechunk_refs.BRANCH)
+        group = zarr.open_group(session.store, mode="a")
+        block = dict(group.attrs[ICECHUNK_ATTR])
+        block.pop("rows_per_manifest")
+        block["levels"] = {
+            o: {**lvl, "split": {k: v for k, v in lvl["split"].items() if k != "rows"}}
+            for o, lvl in block["levels"].items()
+        }
+        group.attrs[ICECHUNK_ATTR] = block
+        session.commit("a pre-ruling block")
+        saved = _saved_row_splits(root)
+        remedy = r"records no rows_per_manifest.*Clear .*icechunk and re-run"
+        with pytest.raises(ValueError, match=remedy):
+            _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        with pytest.raises(ValueError, match=remedy):
+            icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=manifest, grid=grid)
+        # Nothing was written, grown or re-saved on its account.
+        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == ["2019"]
+        assert _saved_row_splits(root) == saved
+        assert not hasattr(icechunk_rows, "LEGACY_ROW_SPLIT")
+
+    def test_the_adopted_cut_reaches_the_handle_the_run_writes_through(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # Adoption has to move the REPO HANDLE, not only the returned
+        # options: a config handed to ``open_or_create`` overrides the repo's
+        # saved one, so an init opened at the config's cut would write this
+        # run's manifests at a value the block does not record.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}
+        _init(root, grid, cfg, manifest, ["2019"])
+        real, reopened = icechunk_refs._reopen_splits, []
+
+        def spy(repo, store_root, splits, store_kwargs):
+            reopened.append({o: s["rows"] for o, s in splits.items()})
+            return real(repo, store_root, splits, store_kwargs)
+
+        monkeypatch.setattr(icechunk_refs, "_reopen_splits", spy)
+        cfg.output["icechunk"] = {"rows_per_manifest": 1}
+        out = _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+        assert out["options"]["rows_per_manifest"] == 4
+        levels = icechunk_refs.read_block(root, store_kwargs={})["levels"]
+        assert reopened == [dict.fromkeys(levels, 4)]
+        # Nothing is persisted over the store's own config by the adoption.
+        assert _saved_row_splits(root) == dict.fromkeys(levels, 4)
+        # A config that agrees with the store reopens nothing.
+        reopened.clear()
+        cfg.output["icechunk"] = {"rows_per_manifest": 4}
+        _init(root, grid, cfg, manifest, ["2021"], run_id="run-3")
+        assert reopened == []
 
     def test_a_row_the_repo_never_allocated_is_refused(self, monkeypatch, cfg, tmp_path):
         grid, root, manifest = _windowed(cfg, tmp_path)
@@ -366,14 +509,623 @@ class TestRefsLandAtTheirRow:
         _write_leaf(monkeypatch, grid, root, shard, refs=False)
         units = icechunk_refs.leaf_units(grid, cfg, shard, root, column=None, store_kwargs={})
         assert [u["row"] for u in units] == ["all"]
-        units = icechunk_refs.leaf_units(
+        # The row IS the window: it names the unit's row AND selects the
+        # leaf the plan reads (``{id}_2019.zarr``), so on this unwindowed
+        # store the 2019 plan finds no object (issue #584 phase 2).
+        windowed = icechunk_refs.leaf_units(
             grid, cfg, shard, root, column=None, store_kwargs={}, row="2019"
         )
-        assert [u["row"] for u in units] == ["2019"]
+        assert [u["row"] for u in windowed] == ["2019"]
+        assert windowed[0]["entries"] == []
         # The plan itself is the object's cell-axis plan: row-free.
         (rank,) = grid.block_index(shard)
         count = next(e for e in units[0]["entries"] if e["path"] == "count")
         assert count["chunk_grid"] == (4,) and count["arr_offset"] == (rank * 4,)
+
+
+class TestWindowedStoresAreInScope:
+    """Issue #584 phase 2: §11.6 no longer refuses a windowed hive store."""
+
+    def test_the_knob_defaults_on_and_validates_for_a_windowed_store(self, cfg):
+        from zagg.config import get_icechunk, validate_config
+
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "h_li",
+            "epoch": "1970-01-01T00:00:00Z",
+            "scale": "utc",
+            "units": "seconds",
+        }
+        assert get_icechunk(cfg) is True
+        cfg.output["icechunk"] = True
+        validate_config(cfg)
+
+    def test_the_dispatchers_rows_are_its_units_window_labels(self, cfg):
+        # The init allocates exactly the rows the run can write: the labels
+        # its expanded dispatch units carry, plus ``all`` when the store
+        # maintains the cross-window fold.
+        from zagg import runner
+
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = _YEARLY
+        shard_units = [
+            (1, [], [({"label": "2019"}, []), ({"label": "2020"}, [])]),
+            (2, [], [({"label": "2019"}, [])]),
+        ]
+        assert runner._unit_window_labels(shard_units, "shard") == ["2019", "2020"]
+        window_units = [(1, [], {"label": "2020"}), (2, [], {"label": "2019"})]
+        assert runner._unit_window_labels(window_units, "window") == ["2020", "2019"]
+        # ``unit: shard`` is the default, so the shard-major units are read.
+        # A windowed store maintains the cross-window fold unless its pyramid
+        # is off (PR #623: an absent ``all_time`` resolves true), so ``all``
+        # is allocated at birth; spelling the key changes nothing.
+        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020", "all"]
+        cfg.output["pyramid"] = {"all_time": True}
+        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020", "all"]
+        cfg.output["pyramid"] = False
+        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020"]
+        cfg.output.pop("pyramid")
+        # An unwindowed run is the one ``all`` row, whatever the units are.
+        cfg.output.pop("windowing")
+        assert runner._icechunk_rows(cfg, shard_units) == ["all"]
+
+    def test_the_init_rows_refuse_a_windowed_config_with_no_units(self, cfg):
+        # ``zagg.client`` calls this with no ``cells`` (it fans out nothing);
+        # it is safe today only because it refuses windowed configs earlier,
+        # so the seam says so rather than returning an empty row list that
+        # would make a repo with no row for any window (issue #584 review).
+        from zagg import runner
+
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = _YEARLY
+        with pytest.raises(ValueError, match="needs the run's cells"):
+            runner._icechunk_rows(cfg)
+        # An EMPTY fan-out is legitimate; an absent one is not.
+        cfg.output["pyramid"] = {"all_time": True}
+        assert runner._icechunk_rows(cfg, []) == ["all"]
+        # An unwindowed config never needs them.
+        cfg.output.pop("windowing")
+        assert runner._icechunk_rows(cfg) == ["all"]
+
+    def test_a_unit_of_the_wrong_shape_is_named_not_unpacked(self, cfg):
+        from zagg import runner
+
+        labels = runner._unit_window_labels
+        # The un-fanned ``(shard, records)`` pair the reordering exists to rule out.
+        with pytest.raises(ValueError, match="is not an expanded"):
+            labels([(1, [])], "shard")
+        # A shard-major unit read as window-major, and the reverse.
+        with pytest.raises(ValueError, match="names no window label"):
+            labels([(1, [], [({"label": "2019"}, [])])], "window")
+        with pytest.raises(ValueError, match=r"not the \(payload, subset\) pairs"):
+            labels([(1, [], {"label": "2019"})], "shard")
+        # A payload that lost its label.
+        for unit, mode in (((1, [], {"label": None}), "window"), ((1, [], [({}, [])]), "shard")):
+            with pytest.raises(ValueError, match="names no window label"):
+                labels([unit], mode)
+
+    def test_a_window_leaf_records_its_refs_at_its_window_row(self, monkeypatch, cfg, tmp_path):
+        # The end-to-end worker path (``hive._leaf_icechunk_refs``): two
+        # windows of ONE shard, whose leaves share a shard rank, land at
+        # two different rows and read back their own values.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        (rank,) = grid.block_index(shard)
+        _init(root, grid, cfg, manifest, ["2019", "2020"])
+        cfg.output["windowing"] = _YEARLY  # the worker reads its time_field
+        cfg.output["icechunk"] = {"commit": "leaf"}
+        for label, fill in (("2019", 1.0), ("2020", 50.0)):
+            year = int(label)
+            window = {"label": label, "start": _Y[year], "end": _Y[year + 1]}
+            out = _write_leaf(
+                monkeypatch, grid, root, shard, fill=fill, refs=True, run_id=label, window=window
+            )
+            assert out["icechunk"].get("error") is None, out["icechunk"]
+        group, _repo = _open(root)
+        span = slice(rank * 16, (rank + 1) * 16)
+        np.testing.assert_array_equal(group["6"]["count"][0, span][:4], np.full(4, 1))
+        np.testing.assert_array_equal(group["6"]["count"][1, span][:4], np.full(4, 50))
+
+
+#: A windowed ladder run's granules: one per shard per year.
+_WINDOW_GRANULES = (
+    ("2019", "2019-03-01T00:00:00Z", "2019-03-02T00:00:00Z"),
+    ("2020", "2020-03-01T00:00:00Z", "2020-03-02T00:00:00Z"),
+)
+
+
+class TestAMissingWindowLabelIsRefused:
+    """Issue #584 review: ``all`` is the fold's row, never a default."""
+
+    def test_unit_row_reads_a_label_a_unit_dict_or_nothing(self):
+        for window in ("2019", {"label": "2019"}, {"label": "2019", "start": 0, "end": 1}):
+            assert icechunk_rows.unit_row(window, windowed=True) == "2019"
+        # An unwindowed leaf names no window and takes the one ``all`` row.
+        assert icechunk_rows.unit_row(None, windowed=False) == "all"
+        assert icechunk_rows.unit_row({}, windowed=False) == "all"
+
+    def test_a_windowed_unit_that_lost_its_label_raises(self):
+        for window in (None, {}, {"label": None}, {"label": ""}, ""):
+            with pytest.raises(ValueError, match="names no window label"):
+                icechunk_rows.unit_row(window, windowed=True)
+
+    def test_a_payload_of_another_shape_raises_rather_than_falling_through(self):
+        for window in (2019, ["2019"], object()):
+            for windowed in (True, False):
+                with pytest.raises(ValueError, match="is not a window label"):
+                    icechunk_rows.unit_row(window, windowed=windowed)
+
+    def test_record_leaf_refuses_it_against_a_windowed_repo(self, monkeypatch, cfg, tmp_path):
+        # The row is read off the repo: an unwindowed store's init allocates
+        # ``all`` and no other row, so a repo holding more is windowed.
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        _init(root, grid, cfg, manifest, ["2019", "all"])
+        cfg.output["windowing"] = _YEARLY
+        window = {"label": "2019", "start": _Y[2019], "end": _Y[2020]}
+        meta = _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id="2019", window=window)
+        out = icechunk_refs.record_leaf(
+            root, grid, shard, store_kwargs={}, window=window, version=meta["leaf_version"]
+        )
+        assert out["refs"] > 0
+        with pytest.raises(ValueError, match="names no window label"):
+            icechunk_refs.record_leaf(root, grid, shard, store_kwargs={}, window={"label": None})
+
+    def test_the_worker_seam_fails_open_with_the_reserved_row_named(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        _init(root, grid, cfg, manifest, ["2019", "all"])
+        cfg.output["windowing"] = _YEARLY
+        cfg.output["icechunk"] = {"commit": "leaf"}
+        window = {"label": "2019", "start": _Y[2019], "end": _Y[2020]}
+        _write_leaf(monkeypatch, grid, root, shard, refs=False, run_id="2019", window=window)
+        leaf = hive.shard_leaf_path(root, shard, window="2019")
+        out = hive._leaf_icechunk_refs(
+            root,
+            grid,
+            cfg,
+            shard,
+            leaf,
+            column=None,
+            window={"label": None},
+            sidecar_spec=manifest["spec"],
+            store_kwargs={},
+        )
+        # Fail-open at the leaf (D9), but named — not a silent write to ``all``.
+        assert "names no window label" in out["error"]
+
+
+class TestTheLadderWalksAWindowedStore:
+    """Issue #584 phase 2: a windowed store's nodes gather and commit per row."""
+
+    def test_a_windowed_ladder_run_commits_every_row_through_the_repo(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        from test_icechunk_refs import _ladder_run, _stage_rows
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        grid, root, summary = _ladder_run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+            windows=_WINDOW_GRANULES,
+        )
+        assert summary["cells_error"] == 0
+        init = summary["icechunk"]
+        assert init["options"]["commit"] == "ladder"
+        assert init["rows"] == ["2019", "2020", "all"]
+        # Every leaf wrote a SIDECAR, not a commit: the node commits.
+        for meta in summary["results"]:
+            assert "sidecar" in meta["icechunk"], meta["icechunk"]
+        rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
+        assert rows[3]["icechunk_commits"] > 0 and rows[3]["icechunk_failed"] == 0
+        assert rows[3]["icechunk_missing"] == 0
+        group, _repo = _open(root)
+        # Each window's leaf reads back at its own row, and the all-time
+        # fold at the reserved ``all`` row of the OVERVIEW levels (§11.2).
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            span = slice(rank * 16, (rank + 1) * 16)
+            for row, label in enumerate(("2019", "2020")):
+                path, _stamp = hive.resolve_leaf(hive.shard_leaf_path(root, shard, window=label))
+                leaf = zarr.open_group(path, mode="r")["6"]
+                assert leaf["count"][:].any(), "the window leaf wrote nothing to index"
+                np.testing.assert_array_equal(group["6"]["count"][row, span], leaf["count"][:])
+        assert (group["6"]["count"][2, :] == 0).all()  # no all-time leaf at the base
+        # The row — not the shard rank — is what separates one shard's
+        # windows: each row's refs point into that window's OWN leaf object.
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        refs = _refs(repo.readonly_session(icechunk_refs.BRANCH), "6/count")
+        by_row: dict = {}
+        for (row, _cell), (_kind, location, _offset, _length) in refs.items():
+            leaf = next(part for part in location.split("/") if part.endswith(".zarr"))
+            by_row.setdefault(row, set()).add(leaf.rpartition("_")[2])
+        assert by_row == {0: {"2019.zarr"}, 1: {"2020.zarr"}}
+
+    def test_a_node_plans_the_rows_the_run_writes_not_the_repos_whole_list(self):
+        from zagg import sweep_units
+
+        by_shard = {"11111": {"2021"}, "11112": {"2021", "2022"}}
+        dirt = {"11113": {"2019"}}  # refs-only: its row still has to be planned
+        # An unwindowed store is the one ``all`` row whatever the units say.
+        assert sweep_units.node_rows("1111", by_shard, dirt, windowed=False, close=False) == ["all"]
+        assert sweep_units.node_rows("1111", by_shard, dirt, windowed=True, close=False) == [
+            "2019",
+            "2021",
+            "2022",
+        ]
+        # The close is the cross-window fold, written at the ``all`` row.
+        assert sweep_units.node_rows("1111", by_shard, None, windowed=True, close=True) == [
+            "2021",
+            "2022",
+            "all",
+        ]
+        # A node with no dirty leaf beneath it plans only what it closes.
+        assert sweep_units.node_rows("1112", by_shard, None, windowed=True, close=True) == ["all"]
+        assert sweep_units.node_rows("1112", by_shard, None, windowed=True, close=False) == []
+
+    def test_an_appended_window_replans_no_earlier_rows_objects(self, monkeypatch, cfg, tmp_path):
+        # The harm the run's rows avoid: planning the repo's whole row list
+        # HEADs every window the store ever allocated, per node per level,
+        # and re-commits the untouched ones at their rows — rewriting those
+        # rows' manifests, the opposite of the cut's point (issue #584 review).
+        from test_icechunk_refs import _ladder_run
+
+        from zagg import icechunk_ladder
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        run = dict(
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+        )
+        _grid_, root, _summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, windows=_WINDOW_GRANULES[:1], **run
+        )
+        planned: list = []
+        real = icechunk_ladder.object_ref_plan
+
+        def spy(grid, object_rel, rank, store_root, **kw):
+            planned.append(object_rel)
+            return real(grid, object_rel, rank, store_root, **kw)
+
+        monkeypatch.setattr(icechunk_ladder, "object_ref_plan", spy)
+        append = (("2020", "2020-03-01T00:00:00Z", "2020-03-02T00:00:00Z"),)
+        _grid_, _root, summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, windows=append, root=root, **run
+        )
+        assert summary["cells_error"] == 0
+        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == ["2019", "all", "2020"]
+        # The append planned its own window's overviews and the all-time
+        # fold it rewrote — never 2019's, whose refs stand as committed.
+        assert planned, "the ladder planned nothing"
+        assert not [rel for rel in planned if rel.endswith("/2019.zarr")], sorted(set(planned))
+
+    def test_the_all_time_fold_reads_back_at_the_reserved_row(self, monkeypatch, cfg, tmp_path):
+        # Plan phase 2 acceptance (1): a windowed run reads back per window
+        # AND all-time through the repo. The all-time fold is the overview
+        # levels' ``all.zarr``, indexed at the reserved ``all`` row.
+        from pathlib import Path
+
+        from mortie import mort2healpix
+        from test_icechunk_refs import _ladder_run
+
+        from zagg.grids.morton import morton_word
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        _grid_, root, summary = _ladder_run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+            windows=_WINDOW_GRANULES,
+        )
+        assert summary["cells_error"] == 0
+        rows = icechunk_refs.read_block(root, store_kwargs={})["rows"]
+        fold = rows.index("all")
+        group, _repo = _open(root)
+        manifest = hive.read_manifest(root)
+        levels = {int(e["node"]): int(e["cells"][0]) for e in manifest["pyramid"]["overviews"]}
+        read = 0
+        for k, r in levels.items():
+            for obj in sorted(Path(root).glob("/".join(["*"] * (k + 1)) + "/all.zarr")):
+                node = "".join(obj.relative_to(root).parts[:-1])
+                rank = mort2healpix(morton_word(node))[0]
+                src = zarr.open_group(str(obj), mode="r")[str(r)]
+                n = 4 ** (r - k)
+                np.testing.assert_array_equal(
+                    group[str(r)]["count"][fold, rank * n : (rank + 1) * n], src["count"][:]
+                )
+                read += 1
+        assert read, "no all-time overview object was written"
+        # It is the fold of the windows, not a copy of one of them.
+        level = str(levels[min(levels)])
+        window = rows.index("2019")
+        assert group[level]["count"][fold, :].sum() > group[level]["count"][window, :].sum()
+
+    def test_a_tag_cut_before_an_append_still_reads_every_level(self, monkeypatch, cfg, tmp_path):
+        # Plan phase 2 acceptance (3). A windowed store maintains the fold
+        # (PR #623), and ``all.zarr`` is the one overview object an append
+        # REWRITES, so a pre-append tag's virtual ref to the ``all`` row is
+        # stale until the fold is written natively (plan phase 3): the tag is
+        # read at its window row only. Every per-window row is immutable and
+        # reads.
+        from test_icechunk_refs import _ladder_run
+
+        shards = _shards(_grid(cfg), 2)
+        run = dict(
+            icechunk_block={"commit": "ladder"},
+            shards=shards,
+            windowing={**_YEARLY, "unit": "window"},
+        )
+        _grid_, root, first = _ladder_run(
+            monkeypatch, cfg, tmp_path, windows=_WINDOW_GRANULES[:1], **run
+        )
+        tag = first["icechunk_finalize"]["tag"]
+        assert first["icechunk_finalize"]["tagged"]
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        rows = icechunk_refs.read_block(root, store_kwargs={})["rows"]
+        assert sorted(rows) == ["2019", "all"]  # the one window and the fold's row
+        window = rows.index("2019")
+        before = {
+            level: zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")[level]["count"][
+                window
+            ]
+            for level in icechunk_refs.read_block(root, store_kwargs={})["levels"]
+        }
+        assert before
+        _grid_, _root, second = _ladder_run(
+            monkeypatch,
+            cfg,
+            tmp_path,
+            windows=(("2020", "2020-03-01T00:00:00Z", "2020-03-02T00:00:00Z"),),
+            root=root,
+            **run,
+        )
+        assert second["cells_error"] == 0
+        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == [*rows, "2020"]
+        # The tag reads what it was cut with: its window row, every level, the
+        # same values -- the append added a row and moved no window ref.
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        tagged = zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")
+        for level, values in before.items():
+            np.testing.assert_array_equal(tagged[level]["count"][window], values)
+        # And the branch tip carries the new row, the window row unchanged.
+        tip, _repo = _open(root)
+        for level, values in before.items():
+            assert tip[level]["count"].shape[0] == 3
+            np.testing.assert_array_equal(tip[level]["count"][window], values)
+
+
+class TestRowGrowthUnderStagedRefs:
+    """Issue #584 phase 3: another run's init grows the row axis under a session's staged refs.
+
+    The phase-0 spike's item (iii): refs staged in EXISTING rows cannot rebase
+    over a commit that resized the arrays (``Chunks updated in updated
+    array``), so without a replay the node's whole gather is lost — a race
+    between concurrent runs on one store, the fleet's normal shape.
+    """
+
+    def _staged(self, monkeypatch, cfg, tmp_path):
+        """A windowed repo at row ``2019`` and one leaf's unit for that row."""
+        grid, root, manifest = _windowed(cfg, tmp_path)
+        (shard,) = _shards(grid, 1)
+        version = _write_leaf(monkeypatch, grid, root, shard, fill=1.0, refs=False, run_id="a")
+        _init(root, grid, cfg, manifest, ["2019"])
+        plan = icechunk_refs.leaf_ref_plan(
+            grid, shard, root, store_kwargs={}, version=version["leaf_version"]
+        )
+        return grid, root, manifest, shard, {"level": 6, "row": "2019", "entries": plan}
+
+    @staticmethod
+    def _grown_under(unit, grow):
+        """A unit source that lands ``grow()`` once, AFTER ``unit`` is staged and before the commit."""
+        fired = []
+
+        def units():
+            yield unit
+            if not fired:  # the replay streams the source again; the other run landed once
+                fired.append(grow())
+
+        return units
+
+    def test_a_row_grown_under_staged_refs_is_replayed_in_a_fresh_session(
+        self, monkeypatch, cfg, tmp_path, caplog
+    ):
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        (rank,) = grid.block_index(shard)
+        grown = []
+
+        def grow():
+            grown.append(_init(root, grid, cfg, manifest, ["2020"], run_id="run-2")["rows"])
+
+        with caplog.at_level("WARNING"):
+            out = icechunk_refs.commit_units(
+                root, self._grown_under(unit, grow), "node 1", store_kwargs={}
+            )
+        assert grown == [["2019", "2020"]] and out["snapshot"]
+        # The record says a replay happened, once; the log says why. The
+        # first session's rebase round (the one the growth defeated) and its
+        # commit time are carried into the record, not dropped with it.
+        assert out["replays"] == 1 and out["rebases"] == 1 and out["commit_s"] > 0.0
+        assert "fresh session" in caplog.text and "row axis grew" in caplog.text
+        group, repo = _open(root)
+        refs = _refs(repo.readonly_session(snapshot_id=out["snapshot"]), "6/count")
+        # Every ref landed at ITS row (2019 = 0), none in the grown row, and
+        # exactly the plan's chunks — nothing doubled, nothing dropped.
+        assert {k[0] for k in refs} == {0}
+        assert len(refs) == next(e["refs"] for e in unit["entries"] if e["path"] == "count")
+        assert group["6"]["count"].shape[0] == 2
+        np.testing.assert_array_equal(group["6"]["count"][0, rank * 16 : rank * 16 + 4], 1)
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        assert messages.count("node 1") == 1 and "init run-2" in messages
+        # Idempotent: the same units again, with nothing racing, change no ref.
+        again = icechunk_refs.commit_units(root, [unit], "node 1 again", store_kwargs={})
+        assert again["replays"] == 0
+        assert _refs(repo.readonly_session(snapshot_id=again["snapshot"]), "6/count") == refs
+
+    def test_without_the_replay_the_node_loses_its_refs_to_the_growth(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The replay is load-bearing: with none allowed, the conflict is the
+        # spike's class and nothing of the node lands.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        monkeypatch.setattr(icechunk_refs, "REPLAY_TRIES", 0)
+        with pytest.raises(icechunk.RebaseFailedError) as info:
+            icechunk_refs.commit_units(
+                root,
+                self._grown_under(
+                    unit, lambda: _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+                ),
+                "node 1",
+                store_kwargs={},
+            )
+        kinds = {repr(c.conflict_type) for c in info.value.conflicts}
+        assert kinds == {"ChunksUpdatedInUpdatedArray"}
+        _group, repo = _open(root)
+        assert _refs(repo.readonly_session(icechunk_refs.BRANCH), "6/count") == {}
+        assert "node 1" not in [s.message for s in repo.ancestry(branch="main")]
+
+    def test_a_replay_that_stages_nothing_still_records_its_contention(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The replay's source re-read yields no refs (a carrier vanished
+        # between passes): nothing is committed, but the record still carries
+        # the replay and the first session's rebase round.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        passes = []
+
+        def units():
+            passes.append(1)
+            if len(passes) == 1:
+                yield unit
+                _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+
+        out = icechunk_refs.commit_units(root, units, "node 1", store_kwargs={})
+        assert out["snapshot"] is None and out["refs"] == 0
+        assert out["replays"] == 1 and out["rebases"] == 1 and out["commit_s"] > 0.0
+
+    def test_a_replay_is_bounded(self, monkeypatch, cfg, tmp_path):
+        # A growth landing under the REPLAY too is one more than the bound
+        # allows: the node raises (fail-open at the hook) rather than looping.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+        years = iter(["2020", "2021", "2022"])
+
+        def units():
+            yield unit
+            _init(root, grid, cfg, manifest, [next(years)], run_id="run-2")
+
+        with pytest.raises(icechunk.RebaseFailedError):
+            icechunk_refs.commit_units(root, units, "node 1", store_kwargs={})
+        _group, repo = _open(root)
+        # One replay was attempted (two sessions, two growths), then it raised.
+        assert next(years) == "2022"
+        assert "node 1" not in [s.message for s in repo.ancestry(branch="main")]
+
+    def test_another_conflict_class_is_refused_not_replayed(self, monkeypatch, cfg, tmp_path):
+        # Only the row-growth class is replayed: the same chunks set by two
+        # writers is a double update, refused as before — replaying it would
+        # silently overwrite the other writer's refs.
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+
+        def other_writer():
+            icechunk_refs.commit_units(root, [unit], "node 1 (other)", store_kwargs={})
+
+        with pytest.raises(icechunk.RebaseFailedError) as info:
+            icechunk_refs.commit_units(
+                root, self._grown_under(unit, other_writer), "node 1", store_kwargs={}
+            )
+        kinds = {repr(c.conflict_type) for c in info.value.conflicts}
+        assert kinds == {"ChunkDoubleUpdate"}
+        _group, repo = _open(root)
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        assert messages.count("node 1 (other)") == 1 and "node 1" not in messages
+
+    def test_a_double_update_after_the_growth_is_refused_not_replayed(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The rebase stops at the FIRST commit it cannot reconcile: with the
+        # growth first, its conflicts are growth only and the later double
+        # update is never examined. The diff since the session's base catches
+        # it, so the other writer's refs stand — the same outcome as the
+        # reverse order above (review finding, two all-time runs on one node).
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+
+        def grow_then_other_writer():
+            _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+            icechunk_refs.commit_units(root, [unit], "node 1 (other)", store_kwargs={})
+
+        with pytest.raises(icechunk.RebaseFailedError) as info:
+            icechunk_refs.commit_units(
+                root, self._grown_under(unit, grow_then_other_writer), "node 1", store_kwargs={}
+            )
+        kinds = {repr(c.conflict_type) for c in info.value.conflicts}
+        assert kinds == {"ChunksUpdatedInUpdatedArray"}
+        _group, repo = _open(root)
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        assert messages[:2] == ["node 1 (other)", "init run-2"] and "node 1" not in messages
+
+    def test_the_ladder_replays_a_node_and_counts_it(self, monkeypatch, cfg, tmp_path, caplog):
+        # The fleet path: ``stage_node_refs`` streams the node's children into
+        # one session; a run-2 init landing mid-stream grows the rows under
+        # it, the node replays, and the stage row counts the replay.
+        from test_icechunk_refs import _ladder_run, _stage_rows
+
+        from zagg import icechunk_ladder
+
+        cfg.output["pyramid"] = {"all_time": True}
+        shards = _shards(_grid(cfg), 2)
+        root = str(tmp_path / "store")
+        real, grown = icechunk_ladder._child_units, []
+
+        def child_units(*args):
+            for item in real(*args):
+                yield item
+                if not grown:  # once: after the first child's refs are staged
+                    out = icechunk_refs.init_repo(
+                        root, _grid(cfg), cfg, run_id="run-2", store_kwargs={}, rows=["2021"]
+                    )
+                    grown.append(out["rows"])
+
+        monkeypatch.setattr(icechunk_ladder, "_child_units", child_units)
+        with caplog.at_level("WARNING"):
+            grid, root, summary = _ladder_run(
+                monkeypatch,
+                cfg,
+                tmp_path,
+                icechunk_block={"commit": "ladder"},
+                shards=shards,
+                windowing={**_YEARLY, "unit": "window"},
+                windows=_WINDOW_GRANULES,
+                root=root,
+            )
+        assert grown == [["2019", "2020", "all", "2021"]]
+        assert summary["cells_error"] == 0
+        rows = {r["dispatch_order"]: r for r in _stage_rows(root)}
+        assert rows[3]["icechunk_failed"] == 0 and rows[3]["icechunk_replays"] == 1
+        assert rows[0]["icechunk_replays"] == 0  # the coarser tuple raced nothing
+        assert "row axis grew" in caplog.text
+        # Every window's leaf still reads back at its own row.
+        group, _repo = _open(root)
+        for shard in shards:
+            (rank,) = grid.block_index(shard)
+            span = slice(rank * 16, (rank + 1) * 16)
+            for row, label in enumerate(("2019", "2020")):
+                path, _stamp = hive.resolve_leaf(hive.shard_leaf_path(root, shard, window=label))
+                leaf = zarr.open_group(path, mode="r")["6"]
+                np.testing.assert_array_equal(group["6"]["count"][row, span], leaf["count"][:])
+        assert group["6"]["count"].shape[0] == 4  # the raced-in 2021 row is there, empty
 
 
 class TestRevisionOneIsRefused:
