@@ -68,7 +68,7 @@ def container_hwm_mb() -> float | None:
 
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return rss / 1e6 if sys.platform == "darwin" else rss / 1024.0  # mac bytes, linux KB
-    except Exception as e:  # pragma: no cover - no ``resource`` on this platform
+    except Exception as e:  # no ``resource``, or a platform that refuses the call
         logger.debug(f"stage sweep: no peak RSS available ({e})")
         return None
 
