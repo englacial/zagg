@@ -4897,6 +4897,8 @@ class TestLambdaFamiliesRideTheCascade:
             self._drive(monkeypatch, atl06_config, staged=staged, ladder=True)
         warned = "--families stats,moc,submap" in caplog.text
         assert warned == (staged is None or bool(staged.get("families_unswept")))
+        # The migration for a pre-rule windowed store rides the same warning.
+        assert ("--declare-pyramid <config.yaml>" in caplog.text) == warned
 
     def test_the_gate_is_the_ladder_walk(self, atl06_config):
         from zagg import runner

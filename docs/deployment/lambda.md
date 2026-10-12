@@ -1097,6 +1097,22 @@ summary: `record`, the `sweep_stats_<ts>_stages.json` it wrote, and a
 found a completed staged sweep newer than the run whose `pipeline_run_id` is
 this run's.
 
+*Appending to a windowed store written before the fold was required.* A
+windowed store templated before [issue
+#610](https://github.com/englacial/zagg/issues/610) phase 4 can declare
+`pyramid.overview.all_time: false` in its manifest, and `ensure_manifest`
+never rewrites that block on an append. The dispatcher follows the
+manifest, not the config: the first landed window record says the store
+does not close, so no close fires, the rollup families are left unswept, and
+the summary reports `families_unswept` with the tail's warning. The fix is
+the one-time retrofit, `python -m zagg.sweep <store> --declare-pyramid
+<config.yaml>` (add `--overviews <resolutions>` for a `zagg-pyramid/2` store
+whose config spells none), which re-derives the block from the windowed
+config (`all_time` now resolves to true) so every later append closes its
+nodes; until then, or for the runs already landed, the hand pass
+`python -m zagg.sweep <store> --families stats,moc,submap` sweeps the
+rollups.
+
 - `No completed leaves found in the store's run records` — no run record,
   this run's included, names a completed leaf: there is nothing to fold.
 - `SweepRefusedError: a sweep already holds this store: run '…'` — the dead

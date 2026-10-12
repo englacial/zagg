@@ -3592,6 +3592,30 @@ class TestDeclarePyramid:
         assert summary["validated"].startswith("manifest only (none of the 2 run-record refs")
         assert "field-level validation skipped" in caplog.text
 
+    def test_retrofits_the_all_time_fold_on_a_pre_rule_windowed_store(self, tmp_path):
+        from zagg.sweep_units import manifest_closes
+
+        # A windowed store templated before issue #610 phase 4 declares
+        # ``all_time: false``; its fleet appends fire no node close (the
+        # dispatcher follows the store), so the families go unswept. The
+        # one-time migration is this retrofit: the same windowed config now
+        # resolves the fold on, and the rewritten manifest makes the store close.
+        _write_manifest(tmp_path, windowed=True)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["pyramid"]["overview"]["all_time"] = False
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        assert manifest_closes(manifest) is False
+        _make_leaf(tmp_path, "-311", self.CELLS["-311"], window="2019")
+        _run_record(tmp_path, ("-311",), window="2019")
+        cfg = _leaf_cfg()
+        cfg.output["windowing"] = {"schedule": "yearly", "time_field": "t"}
+        summary = declare_pyramid(str(tmp_path), cfg, overviews=[3])
+        assert summary["updated"] is True and summary["previous"] == "replaced"
+        after = read_manifest(str(tmp_path))
+        assert after["pyramid"]["spec"] == "zagg-pyramid/2"
+        assert after["pyramid"]["overview"]["all_time"] is True
+        assert manifest_closes(after) is True
+
     def test_orders_outside_the_store_refuse(self, tmp_path):
         self._pre_declaration_store(tmp_path)
         cfg = _leaf_cfg()
