@@ -5,7 +5,7 @@
       "complete": true,
       "cells_with_data": 4,
       "granule_count": 1,
-      "written_at": "2026-08-10T11:57:30+00:00",
+      "written_at": "2026-10-12T01:50:14+00:00",
       "coverage": {
         "spec": "morton-moc/1",
         "box": [
@@ -20,6 +20,14 @@
         "sidecar": "coverage.moc",
         "nbytes": 11,
         "raw_nbytes": 2
+      },
+      "content_hashes": {
+        "arrays": {
+          "6/count": "4aec3cf06563de006246f3c30a7e1e4688e8a8b0171185371cdf4203d6f7c88d",
+          "6/h_tdigest": "ba43774865b69f60aaf42875c9c4a72edaca6058bd9a4fb95760d43f203c9d4c",
+          "6/morton": "f6282635e373d534ef4d91166d306441049e7bbed3d7d2ec8add306f62274d06"
+        },
+        "combined": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c"
       }
     }
   },

@@ -13,7 +13,7 @@ from test_icechunk_refs import _grid, _ladder_run, _open, _shards, _write_leaf
 
 from zagg import hive, icechunk_ops, icechunk_refs
 from zagg.config import default_config
-from zagg.icechunk_refs import ICECHUNK_ATTR, MULTISCALES_ATTR
+from zagg.icechunk_refs import ICECHUNK_ATTR, MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR
 
 RUN = "r1"
 
@@ -246,6 +246,26 @@ class TestValidation:
 
 
 class TestDeclarePyramid:
+    def test_init_upgrades_a_pre_615_root(self, cfg, tmp_path):
+        # A repo initialized before the §11.1 object shape: the list mirror,
+        # no registration. The next fleet init rewrites both (issue #615).
+        grid = _grid(cfg)
+        root = str(tmp_path / "store")
+        manifest = _write_manifest(root, grid)
+        icechunk_refs.init_repo(root, grid, cfg, run_id=RUN, store_kwargs={})
+        group, repo = _open(root)
+        want = {k: group.attrs[k] for k in (MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)}
+        session = repo.writable_session("main")
+        attrs = zarr.open_group(session.store, mode="r+").attrs
+        attrs[MULTISCALES_ATTR] = manifest[MULTISCALES_ATTR]
+        del attrs[ZARR_CONVENTIONS_ATTR]
+        session.commit("pre-615 init")
+        assert ZARR_CONVENTIONS_ATTR not in _open(root)[0].attrs
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r2", store_kwargs={})
+        assert {k: _open(root)[0].attrs[k] for k in want} == want
+        # The upgraded repo is current: the operator op has nothing to do.
+        assert icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})["unchanged"] is True
+
     def test_adds_the_declared_levels_and_the_mirror(self, monkeypatch, cfg, tmp_path):
         grid, root = _store(monkeypatch, cfg, tmp_path)
         cfg.output.pop("pyramid")  # the default declaration: overviews at every ancestor order
@@ -257,12 +277,21 @@ class TestDeclarePyramid:
         assert r["multiscales"] is True
         group, repo = _open(root)
         block = group.attrs[ICECHUNK_ATTR]
+        # The refreshed mirror is the conformant object: layout over the
+        # levels just added, registration beside it (§11.1).
+        assert [e["asset"] for e in group.attrs[MULTISCALES_ATTR]["layout"]] == list(
+            block["levels"]
+        )
+        assert group.attrs["zarr_conventions"][0]["name"] == "multiscales"
         # Exactly what a fresh init of the declared store would record.
         fresh = icechunk_refs.init_repo(
             str(tmp_path / "fresh"), grid, cfg, run_id=RUN, store_kwargs={}
         )
         assert block["levels"] == fresh["levels"] == r["levels"]
-        assert group.attrs[MULTISCALES_ATTR] == manifest[MULTISCALES_ATTR]
+        assert group.attrs[MULTISCALES_ATTR] == {
+            **manifest[MULTISCALES_ATTR][0],
+            "layout": group.attrs[MULTISCALES_ATTR]["layout"],
+        }
         assert {k for k, _ in group.groups()} == set(block["levels"])
         # Each new group carries the level's array model, and the repo's
         # persisted manifest splits cover it (a commit into it cuts at its
@@ -388,20 +417,43 @@ class TestDeclarePyramid:
         assert r["multiscales"] is False
         group, _repo = _open(root)
         assert list(group.attrs[ICECHUNK_ATTR]["levels"]) == ["6"]
-        assert MULTISCALES_ATTR not in group.attrs
+        assert MULTISCALES_ATTR not in group.attrs and "zarr_conventions" not in group.attrs
         assert {k for k, _ in group.groups()} == {"1", "2", "3", "4", "5", "6"}  # kept
         cfg.output.pop("pyramid")
         _write_manifest(root, grid)
         r = icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
         assert r["added"] == ["1", "2", "3", "4", "5"] and r["snapshot"]
-        assert sorted(_open(root)[0].attrs[ICECHUNK_ATTR]["levels"], key=int) == [
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-        ]
+        assert r["multiscales"] is True
+        group, _repo = _open(root)
+        block = group.attrs[ICECHUNK_ATTR]
+        assert sorted(block["levels"], key=int) == ["1", "2", "3", "4", "5", "6"]
+        assert "retired" not in block
+        # The relist refreshes the whole convention surface (§11.1): the
+        # layout is exactly the listed levels again, the registration is back.
+        layout = group.attrs[MULTISCALES_ATTR]["layout"]
+        assert [e["asset"] for e in layout] == list(block["levels"])
+        assert layout[0]["dggs"] == group["6"].attrs["dggs"]
+        assert group.attrs["zarr_conventions"][0]["name"] == "multiscales"
+
+    def test_a_set_attrs_dggs_change_holds_in_the_layout(self, monkeypatch, cfg, tmp_path):
+        # The base layout entry copies the LIVE group's dggs (§11.1): set-attrs
+        # refreshes it in its own commit, and neither declare-pyramid nor the
+        # next init reverts it to the grid's block.
+        grid, root = _store(monkeypatch, cfg, tmp_path, leaf=False)
+        cfg.output.pop("pyramid")
+        _write_manifest(root, grid)
+        icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
+        group, _repo = _open(root)
+        derived = group.attrs[MULTISCALES_ATTR]["layout"][1:]
+        dggs = {**group["6"].attrs["dggs"], "latitude": "geodetic"}
+        icechunk_ops.set_attrs(root, "/6", {"dggs": dggs}, store_kwargs={})
+        assert _messages(root)[0] == "set-attrs /6"
+        assert icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})["unchanged"] is True
+        icechunk_refs.init_repo(root, grid, cfg, run_id="r2", store_kwargs={})
+        assert _messages(root)[:2] == ["init r2", "set-attrs /6"]
+        group, _repo = _open(root)
+        layout = group.attrs[MULTISCALES_ATTR]["layout"]
+        assert layout[0]["dggs"] == dggs and layout[1:] == derived
 
     def test_levels_follow_the_repos_rows(self, cfg, tmp_path):
         # A level declared after the repo's rows were allocated is built at
@@ -557,7 +609,11 @@ class TestRetrofitFollowThrough:
         assert summary["icechunk"]["operation"] == "declare-pyramid"
         assert summary["icechunk"]["added"] == ["1", "2", "3", "4", "5"]
         group, _repo = _open(root)
-        assert group.attrs[MULTISCALES_ATTR] == hive.read_manifest(root)[MULTISCALES_ATTR]
+        (mirror,) = hive.read_manifest(root)[MULTISCALES_ATTR]
+        assert group.attrs[MULTISCALES_ATTR] == {
+            **mirror,
+            "layout": group.attrs[MULTISCALES_ATTR]["layout"],
+        }
         # An unchanged declaration writes neither plane, but still vets the repo.
         n = len(_messages(root))
         assert declare_pyramid(root, cfg, chunk_order=5)["icechunk"]["unchanged"] is True

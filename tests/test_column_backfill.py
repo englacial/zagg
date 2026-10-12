@@ -37,7 +37,7 @@ from zagg.store import open_store
 GENERATOR = pathlib.Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
 
 #: Four leaves under one order-4 shard tree, spread over two base cells so the
-#: ladder above them has something to k-way merge rather than relay — which is
+#: ladder above them has something to cascade rather than gather — which is
 #: what phase 4 needs. They are NOT four independent parity witnesses:
 #: ``_build_cells`` re-seeds ``default_rng(340)`` on every call and its plan is
 #: shard-independent, so in the ``kitchen_sink=False`` arm — whose declared
@@ -1400,11 +1400,13 @@ class TestUpgradeEndToEnd:
         assert set(upgraded) == set(native) and upgraded
         # Every artifact the recipe produces, not just the ladder: 9 overviews
         # (one per above-shard node the leaves reach — the fixed every-order
-        # ladder from order 3 down to 0 over two base cells), the 4 backfilled
-        # LEAF columns, and the 3 §4.6 stage columns the staged sweep gathers.
-        assert len(upgraded) == 16, sorted(upgraded)
+        # ladder from order 3 down to 0 over two base cells) and the 4
+        # backfilled LEAF columns. No stage column: nothing above the finest
+        # tuple gathers on this d = 1 ladder, and the merges cascade the
+        # artifacts (issue #620).
+        assert len(upgraded) == 13, sorted(upgraded)
         roles = [role for _p, role, _b, _g in _compared(off)]
-        assert (roles.count("overview"), roles.count("column")) == (9, 7)
+        assert (roles.count("overview"), roles.count("column")) == (9, 4)
         assert upgraded == native
         assert _overview_attrs(off) == _overview_attrs(on)
         # ...and so does the declaration's materialization inventory.

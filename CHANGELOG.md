@@ -11,6 +11,39 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-10-08
+
+### Merged pull requests
+
+- Staged ladder: merge levels cascade from their children's artifacts through one fold engine (issue #620) ([#621](https://github.com/englacial/zagg/pull/621)) by @espg
+- dggs attrs: ellipsoid key is semi_major_axis per the dggs v1 schema (issue #616) ([#619](https://github.com/englacial/zagg/pull/619)) by @espg
+- Build the Lambda zips from uv.lock, not from PyPI floors (issue #613) ([#614](https://github.com/englacial/zagg/pull/614)) by @espg
+- Icechunk repo root: conformant multiscales layout composed with dggs (issue #615) ([#618](https://github.com/englacial/zagg/pull/618)) by @espg
+
+## [0.58.0] - 2026-10-08
+
+### Merged pull requests
+
+- icechunk: hand icechunk a UTC expiry for refreshable credentials (issue #608) ([#609](https://github.com/englacial/zagg/pull/609)) by @espg
+- families sweep: one store handle per invoke, a leaf-count-sized partitioned tail, and a finisher that never reads a leaf (issue #610) ([#612](https://github.com/englacial/zagg/pull/612)) by @espg
+- cutover: the live ATL03 store is atl03_tdigest_o9_v3 (issue #560) ([#611](https://github.com/englacial/zagg/pull/611)) by @espg
+
+## [0.57.0] - 2026-10-02
+
+### Merged pull requests
+
+- small fixes 2026-08-26: refine's silent granule drop; reproject provenance passthrough; mypy over .github/scripts ([#539](https://github.com/englacial/zagg/pull/539)) by @espg
+- small fixes 2026-09-14: retry CMR-STAC 2xx-with-non-JSON bodies ([#568](https://github.com/englacial/zagg/pull/568)) by @espg
+- icechunk: per-order virtual-ref companion repo written by the fleet at leaf commit (issue #580) ([#581](https://github.com/englacial/zagg/pull/581)) by @espg
+- icechunk stage 2: two-plane contract, run finalize, versioned leaves (issue #582) ([#585](https://github.com/englacial/zagg/pull/585)) by @espg
+- Post-mortie-1.0 cleanup: drop the 1-D workarounds around mortie calls ([#563](https://github.com/englacial/zagg/pull/563)) by @espg
+- Worker stats record prices from the invocation wall (duration_total_s), not the aggregate clock ([#590](https://github.com/englacial/zagg/pull/590)) by @espg
+- The Icechunk companion repo gains a row dimension (zagg-icechunk/2) ([#595](https://github.com/englacial/zagg/pull/595)) by @espg
+- leaf temporal record: write the per-shard envelope word and counted cover at commit; the root tier 2 becomes the store-wide counted cover ([#578](https://github.com/englacial/zagg/pull/578)) by @espg
+- client facade chains the staged sweep under sweep: stages, plus an operator finalize op (issue #588) ([#591](https://github.com/englacial/zagg/pull/591)) by @espg
+- small fixes 2026-10-02: the sweep record names its uncounted shards (pass_uncounted); a failed Icechunk init re-saves the block's splits; a leaf temporal record is read whatever its fields list says ([#601](https://github.com/englacial/zagg/pull/601)) by @espg
+- windowed emit: bulk per-shard emit, derived cell word, (node, window) stage units and the streamed fold (issue #586) ([#587](https://github.com/englacial/zagg/pull/587)) by @espg
+
 ## [0.56.0] - 2026-10-02
 
 ### Merged pull requests

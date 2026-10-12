@@ -1230,18 +1230,29 @@ def read_granule_ids(leaf_path: str, spec: str | None = None, **store_kwargs) ->
     return json.loads(bytes(data))
 
 
-def read_sidecar(leaf_path: str, spec: str | None = None, **store_kwargs) -> dict | None:
-    """The leaf's stats sidecar record, or ``None`` when absent."""
+def read_sidecar(
+    leaf_path: str, spec: str | None = None, *, store=None, **store_kwargs
+) -> dict | None:
+    """The leaf's stats sidecar record, or ``None`` when absent.
+
+    With ``store`` (an open obstore handle at the store root, issue #610)
+    ``leaf_path`` is the leaf's key RELATIVE to it and no store is opened;
+    without, it is the leaf's absolute path and a store is opened at its
+    node prefix, as before.
+    """
     import obstore
     from obstore.exceptions import NotFoundError
 
     from zagg.store import open_object_store
 
     prefix, _, name = leaf_path.rstrip("/").rpartition("/")
+    key = sidecar_key(name, spec)
+    if store is None:
+        store = open_object_store(prefix, **store_kwargs)
+    else:
+        key = f"{prefix}/{key}"
     try:
-        data = obstore.get(
-            open_object_store(prefix, **store_kwargs), sidecar_key(name, spec)
-        ).bytes()
+        data = obstore.get(store, key).bytes()
     except (FileNotFoundError, NotFoundError):
         return None
     return json.loads(bytes(data))

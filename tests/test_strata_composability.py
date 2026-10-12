@@ -3,16 +3,19 @@
 Phase 1 — characterization. ``build_tdigest_where`` (the strata builder) and
 the packed composition word are both admitted by the SPILL fold gate
 (``_TDIGEST_SPILL_FUNCTIONS`` / the ``validate_spill_fold`` scalar branch,
-issues #370/#321) — the published CA store's 2,726 shards were built by k-way
+issues #370/#321) — the v1 CA store's 2,726 shards were built by k-way
 merging per-block strata partials under exactly those laws — yet D24
-classifies every one of their fields ``none``, so the live manifest promises
+classifies every one of their fields ``none``, so the v1 manifest promises
 no overview fold for the very payloads whose bytes rest on one. These tests
 pin that drift before the admission changes it:
 
-- the LIVE CA-manifest declaration, vendored byte-for-byte as an in-tree
-  fixture (``tests/data/ca_atl03_tdigest_o9_morton_hive.json``, fetched from
-  ``atl03_tdigest_o9.zarr/morton_hive.json`` on 2026-08-24) — the permanent
-  BEFORE record no later phase edits;
+- the then-LIVE CA-manifest declaration, vendored byte-for-byte as an
+  in-tree fixture (``tests/data/ca_atl03_tdigest_o9_morton_hive.json``,
+  fetched from ``atl03_tdigest_o9.zarr/morton_hive.json`` on 2026-08-24; that
+  v1 store is the comparison store since the issue #560 cutover to
+  ``atl03_tdigest_o9_v3.zarr``, whose manifest is vendored beside it as
+  ``ca_atl03_tdigest_o9_v3_morton_hive.json``) — the permanent BEFORE record
+  no later phase edits;
 - today's classifier verdicts and the spill-gate admissions — the pins later
   phases flip deliberately, one per admission.
 
@@ -36,7 +39,7 @@ from zagg.semantics import composability_classes, field_composability
 
 CA_MANIFEST = Path(__file__).parent / "data" / "ca_atl03_tdigest_o9_morton_hive.json"
 
-#: The live store's per-field declaration, exactly as published (issue #515):
+#: The v1 store's per-field declaration, exactly as published (issue #515):
 #: count folds, everything the store is FOR does not.
 CA_FIELDS_BEFORE = {
     "count": {
@@ -56,15 +59,15 @@ class TestLiveCaManifestFixture:
     """The vendored CA manifest is the historical BEFORE — never edited."""
 
     def test_fixture_pins_the_live_declaration(self):
-        # The known-answer half of the issue #515 before/after: the published
+        # The known-answer half of the issue #515 before/after: the v1
         # store declares its strata and composition non-composable while its
         # own bytes were built by their merge laws (spill fold, issue #370).
         manifest = json.loads(CA_MANIFEST.read_text())
         assert manifest["spec"] == "morton-hive/1"
         assert manifest["shard_order"] == 9
         assert manifest["cell_order"] == 19
-        # Identity of the RECORD: this hash names the store the issue is
-        # about. The shipped ``atl03_tdigest_strata_healpix`` template now
+        # Identity of the RECORD: this hash names the v1 store the issue
+        # is about. The shipped ``atl03_tdigest_strata_healpix`` template now
         # reproduces it (it IS the store's build config, recovered from the
         # run record — pinned in ``tests/test_live_store_templates.py``, issue
         # #547); the benchmark strata config (5ebf740f...) still does not. It
@@ -108,15 +111,18 @@ class TestLiveCaManifestFixture:
             k: v for k, v in published["overview"].items() if k != "fields"
         }
         # The per-field map is the ONLY divergence, and only in the ruled
-        # entries: count byte-identical, the two strata fields the phase-2
-        # admission, composition the phase-3 packed declaration.
+        # entries: count by its dtype alone (int64 since issue #626), the two
+        # strata fields the phase-2 admission, composition the phase-3 packed
+        # declaration.
         fields = block["overview"]["fields"]
         assert set(fields) == set(CA_FIELDS_BEFORE)
         assert [n for n in CA_FIELDS_BEFORE if fields[n] != CA_FIELDS_BEFORE[n]] == [
+            "count",
             "h_tdigest_signal",
             "h_tdigest_noise",
             "composition",
         ]
+        assert fields["count"] == {**CA_FIELDS_BEFORE["count"], "dtype": "int64"}
         assert fields["h_tdigest_signal"]["class"] == "approximate"
         assert fields["composition"]["class"] == "packed"
 
@@ -194,13 +200,13 @@ class TestD24Classification:
 
     def test_declared_fields_no_longer_reproduce_the_live_ca_declaration(self):
         # The before/after known-answer: phase 1 asserted ``fields ==
-        # CA_FIELDS_BEFORE`` (today's classifier reproduced the live store's
+        # CA_FIELDS_BEFORE`` (today's classifier reproduced the v1 store's
         # declaration exactly); the admissions change ONLY the ruled entries —
-        # count is untouched, the strata declare the digest fold (phase 2),
-        # composition the packed one (phase 3).
+        # count only by its width (int64 since issue #626), the strata declare
+        # the digest fold (phase 2), composition the packed one (phase 3).
         fields, excluded = declared_fields(default_config("atl03_tdigest_strata_healpix"))
         assert fields != CA_FIELDS_BEFORE
-        assert fields["count"] == CA_FIELDS_BEFORE["count"]
+        assert fields["count"] == {**CA_FIELDS_BEFORE["count"], "dtype": "int64"}
         assert fields["composition"] == {
             "class": "packed",
             "method": "composition_kway",
@@ -234,7 +240,7 @@ class TestD24Classification:
         # The class map is not just manifest text: ``column.composable_fields``
         # filters this same declaration to the composable classes, and
         # ``leaf_column_plan``/``fold_column`` carry only what survives. That
-        # is why the live CA store has no strata leaf COLUMNS to fold (class
+        # is why the v1 CA store has no strata leaf COLUMNS to fold (class
         # ``none`` at build time) and the retrofit must re-read leaves — and
         # it is the half phase 2 also flips: the admission turns worker-side
         # strata column writes ON for new runs.
@@ -867,15 +873,16 @@ class TestLeafFoldHalfPair:
 
 
 class TestStageMergeHalfPair:
-    """``_merge_slabs``' packed arm when a contributor carries half the pair.
+    """The k-way kernel's packed arm when a contributor carries half the pair.
 
-    The stage site's own behavior, which no other fold site has: the word and
-    its ``of`` divisor are DIFFERENT declared fields folded by different loops,
-    so skipping a half-paired contributor for the word alone would publish a
-    word whose lanes are over a strict subset of the level's ``N_signal``
-    (review finding: a ~29% skew). The covered output cells stay at the fill
-    word instead — absence over wrongness — and the contributor counts
-    unreadable.
+    The kernel under ``cascade_fold`` (``sweep_fold.merge_level``): the word
+    and its ``of`` divisor are DIFFERENT declared fields folded by different
+    loops, so skipping a half-paired contributor for the word alone would
+    publish a word whose lanes are over a strict subset of the level's
+    ``N_signal`` (review finding: a ~29% skew). The covered output cells stay
+    at the fill word instead — absence over wrongness — and the rail is per
+    FIELD: the contributor still folds its other fields and counts as folded
+    (the one rule of both sweeps since issue #620).
     """
 
     NODE_ORDER, CELL_ORDER, RES = 3, 5, 4
@@ -914,12 +921,13 @@ class TestStageMergeHalfPair:
         return _ColumnReader(path, run_id="A", run_started=_utcnow(), store_kwargs={})
 
     def _merge(self, paths):
-        from zagg.sweep_stage import _merge_slabs
+        from zagg.sweep_fold import _source_counts, merge_level
 
         rows = [[self._reader(p)] for p in paths]
         # One output cell over BOTH children: factor 8 == the two children's
-        # four source cells each, which is where a half-pair can mix.
-        return _merge_slabs(
+        # four source cells each, which is where a half-pair can mix (not a
+        # cascade shape, so the kernel is driven with its derived geometry).
+        slabs, broken, demotions = merge_level(
             rows,
             _STRATA_FIELDS,
             res_src=self.RES,
@@ -927,6 +935,7 @@ class TestStageMergeHalfPair:
             factor=8,
             n_out=1,
         )
+        return (slabs, *_source_counts(rows, broken), demotions)
 
     @staticmethod
     def _weight(slab, j):
@@ -976,7 +985,7 @@ class TestStageMergeHalfPair:
         # not be published over the surviving subset.
         shutil.rmtree(f"{paths[1]}/{self.RES}/composition")
         slabs, folded, missing, unreadable, demotions = self._merge(paths)
-        assert (folded, missing, unreadable) == (1, 0, 1)
+        assert (folded, missing, unreadable) == (2, 0, 0)  # per field: still a contributor
         assert int(slabs["composition"][0]) == 0, "the covered cell keeps the fill word"
         assert self._weight(slabs["h_sig"], 0) == pooled, "the divisor still folds both"
         # The rail's firing is returned for the artifact record (issue #518).
@@ -1009,10 +1018,11 @@ class TestStageMergeHalfPair:
         # itself and drops the child too, so the level's N_signal is 1111's
         # alone and 1111's word describes exactly those rows — consistent, so
         # nothing is poisoned and the shared cell keeps the surviving word.
-        # Still counted unreadable: the level did fold short.
+        # Still a folded contributor: the record is what says the field folded
+        # short of it.
         shutil.rmtree(f"{paths[1]}/{self.RES}/h_sig")
         slabs, folded, missing, unreadable, demotions = self._merge(paths)
-        assert (folded, missing, unreadable) == (1, 0, 1)
+        assert (folded, missing, unreadable) == (2, 0, 0)
         # Recorded without ``cells``: nothing was blanked, the contributor
         # simply folded short for the field (issue #518).
         assert demotions == [

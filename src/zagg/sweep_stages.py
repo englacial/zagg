@@ -31,6 +31,7 @@ from zagg.sweep_stage import (
     DEFAULT_TUPLE_WIDTH,
     aggregate_actuals,
     ladder_entries,
+    one_stage_tuple,
     stage_node,
     stage_tuples,
 )
@@ -135,6 +136,7 @@ def sweep_stage_pass(
     on_node=None,
     level_actuals: dict | None = None,
     only_dispatch: int | None = None,
+    only_child_order: int | None = None,
     dirt_only: dict | None = None,
     only_unit: str | None = None,
     only_window: str | None = None,
@@ -159,7 +161,7 @@ def sweep_stage_pass(
     order — what a fleet stage worker runs (issue #519). The in-process driver
     leaves it ``None`` and walks every tuple finest-first; the fleet transport
     walks the same tuples, one invoke fan-out per tuple, so the two differ in
-    grouping alone (the merge-source law: grouping changes no bytes). An order
+    grouping alone (the cascade, issue #620: grouping changes no values). An order
     that dispatches no tuple refuses BY NAME rather than sweeping nothing — a
     mistyped dispatch order must not read as a clean no-op.
 
@@ -186,13 +188,7 @@ def sweep_stage_pass(
     run_started = run_started or _utcnow()
     pyramid = manifest.get("pyramid") or {}
     shard_order = int(manifest["shard_order"])
-    cell_order = int(manifest["cell_order"])
     levels = ladder_entries(pyramid, shard_order)
-    # The merge-source member (issue #538): placed by the LEAF entry, which
-    # ``ladder_entries`` excludes, so it is derived from the full list here.
-    from zagg.column import relay_resolution
-
-    relay = relay_resolution(pyramid["overviews"], shard_order, cell_order)
     # The schedule and the ``only_dispatch`` refusal come FIRST — before the
     # ``fields``/``candidates`` gates below, which both return a clean empty
     # summary. A mistyped dispatch order against a store with nothing to sweep
@@ -200,7 +196,16 @@ def sweep_stage_pass(
     # stages, which the dispatcher's barrier accepts (review finding). It is a
     # pure function of shard_order and tuple_width and needs nothing on disk.
     schedule = stage_tuples(shard_order, tuple_width=tuple_width)
-    if only_dispatch is not None:
+    if only_dispatch is not None and only_child_order is not None:
+        # The dispatcher named this tuple's SPAN (issue #610). It has to:
+        # under a sized schedule the span is not derivable from one
+        # ``tuple_width``, since the dispatch orders are not multiples of it.
+        # ``one_stage_tuple`` carries the range refusal, and the node-order
+        # check in :func:`run_stage_worker` carries the rest of what the
+        # schedule filter below was guarding — a node that does not sit at
+        # ``dispatch`` is refused there whatever the span says.
+        schedule = [one_stage_tuple(shard_order, int(only_dispatch), int(only_child_order))]
+    elif only_dispatch is not None:
         picked = [t for t in schedule if int(t["dispatch"]) == int(only_dispatch)]
         if not picked:
             raise ValueError(
@@ -209,6 +214,11 @@ def sweep_stage_pass(
                 f"{[t['dispatch'] for t in schedule]}"
             )
         schedule = picked
+    elif only_child_order is not None:
+        raise ValueError(
+            f"a stage tuple span was named (child_order {only_child_order}) without the "
+            "dispatch order it starts at — send both or neither"
+        )
     decl = pyramid.get("overview") if isinstance(pyramid.get("overview"), dict) else {}
     # THE shared admission predicate (:func:`zagg.column._is_composable`), not a
     # literal class list: this map goes to ``stage_node`` unfiltered and reaches
@@ -260,7 +270,6 @@ def sweep_stage_pass(
         "manifest": manifest,
         "levels": levels,
         "fields": fields,
-        "relay": relay,
         "scope": scope,
         "candidates": candidates,
         "by_shard": by_shard,
@@ -306,6 +315,7 @@ def run_finisher(
     store_kwargs: dict | None = None,
     release=None,
     touch_policy: str = "auto",
+    withhold_levels=(),
 ) -> dict:
     """The designated finisher-worker (espg ruling): root singletons, once.
 
@@ -320,15 +330,19 @@ def run_finisher(
        of ``pyramid.overviews`` (#381 point (7); readers MUST tolerate the
        added key). The leaf entry records the ``leaf-column`` law
        (merges-from-raw 1); ladder entries record what this run observed —
-       ``stage-gather`` at 1, ``stage-merge`` at 2, never 3 (gen 3 is
-       append-later cascade territory only). This re-PUT also refreshes the
-       manifest's ``LastModified``, satisfying the PR #397 lifecycle
+       ``stage-gather`` at the gathered groups' depth, ``stage-merge`` at
+       the cascade depth, one more than its sources' (issue #620). This
+       re-PUT also refreshes the manifest's ``LastModified``, satisfying
+       the PR #397 lifecycle
        root-touch for ``morton_hive.json`` (and step 1 for the root MOC)
        WITHOUT duplicating it — only ``aggregation.yaml`` still needs the
        explicit touch, step 3. The family dict's order-keyed
        ``materialized`` is deliberately NOT written on ``/2`` stores: the
        per-entry actuals are the one source of truth (the flatten-ruling
-       principle; any /1-era inventory is preserved verbatim);
+       principle; any /1-era inventory is preserved verbatim). A level in
+       ``withhold_levels`` is SKIPPED — its entry keeps whatever actuals
+       stood: the orders a run did not observe in full must not be stamped as
+       if it had (issue #610), and the next pass records them;
     2b. the issue #394 multiscales companion refresh
         (:func:`zagg.multiscales.write_multiscales_group`, spec §4.10) —
         gated on ``by_shard`` like step 1, fail-open like step 3 (the
@@ -355,12 +369,14 @@ def run_finisher(
     from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
+    withheld = {int(node) for node in withhold_levels or ()}
     out = {
         "root_moc": False,
         "manifest_updated": False,
         "objects_touched": 0,
         "touch_failures": 0,
         "lease_released": False,
+        "actuals_withheld": sorted(withheld, reverse=True),
     }
     shard_order = int(manifest["shard_order"])
     if by_shard:
@@ -389,6 +405,12 @@ def run_finisher(
                 ),
                 "generated_at": now,
             }
+        elif node in withheld:
+            # Short, by the dispatcher's own count of the records it awaited.
+            # The entry keeps the actuals it had: a stale observation is a
+            # recoverable under-report, a fresh one claiming this run saw the
+            # level is not (issue #610).
+            continue
         elif node in level_actuals:
             a = level_actuals[node]
             actuals = {
@@ -773,10 +795,12 @@ def merge_level_actuals(target: dict, incoming: dict) -> dict:
     (:func:`zagg.sweep_stage._accumulate_actuals`), so merging across workers
     is a plain dict update: a coarse ancestor two batches both visited
     contributes its row ONCE, exactly as a partitioned in-process run
-    re-visiting it does. ``cells``/``regime``/``merges_from_raw`` are
-    first-wins per level, mirroring the in-process ``setdefault`` — they are
-    derived per level (:func:`zagg.sweep_stage.classify_level`), so every
-    worker computes the same values and the tie never has to be broken.
+    re-visiting it does. ``cells``/``regime`` are first-wins per level,
+    mirroring the in-process ``setdefault`` — they are derived per level
+    (:func:`zagg.sweep_stage.classify_level`), so every worker computes the
+    same values and the tie never has to be broken; ``merges_from_raw`` is
+    the level's maximum across workers, as it is across artifacts in process
+    (:func:`zagg.sweep_stage._accumulate_actuals`).
     """
     for k, entry in (incoming or {}).items():
         cur = target.setdefault(
@@ -784,10 +808,11 @@ def merge_level_actuals(target: dict, incoming: dict) -> dict:
             {
                 "cells": int(entry["cells"]),
                 "regime": entry["regime"],
-                "merges_from_raw": int(entry["merges_from_raw"]),
+                "merges_from_raw": 0,
                 "children": {},
             },
         )
+        cur["merges_from_raw"] = max(cur["merges_from_raw"], int(entry["merges_from_raw"]))
         for node_window, row in (entry.get("children") or {}).items():
             cur["children"][str(node_window)] = {
                 name: int(row.get(name) or 0) for name in ("folded", "missing", "unreadable")
@@ -880,6 +905,7 @@ def run_stage_worker(
     nodes,
     batch: int = 0,
     tuple_width: int = DEFAULT_TUPLE_WIDTH,
+    child_order: int | None = None,
     partition: dict | None = None,
     records_from: str,
     lease_ttl_s: int | None = None,
@@ -898,12 +924,20 @@ def run_stage_worker(
     restricted to ``nodes`` (this invoke's share of the tuple's dispatch
     nodes, spelled as decimals) at the ``dispatch`` order.
 
+    ``child_order`` is this tuple's SPAN — the order of the child columns it
+    reads — and is what the worker folds between, with ``dispatch``
+    (``zagg.sweep_stage.one_stage_tuple``). A sized schedule (issue #610)
+    dispatches at orders no single ``tuple_width`` lands on, so the span
+    cannot be re-derived here; ``None`` keeps the old derivation, where
+    ``tuple_width`` selects this tuple out of the fixed-width schedule and a
+    dispatch order that schedule does not hold is refused by name.
+
     ``nodes`` reaches the pass as the ordinary ``scope`` MOC, so a worker
     folds exactly the dispatch nodes it was handed and no others. Dispatch
     nodes at one order own disjoint subtrees and a tuple's folds read only
-    columns one tuple FINER, so the split across invokes is free of
+    what one tuple FINER wrote, so the split across invokes is free of
     cross-worker dependencies — the same disjointness the in-process pass
-    relies on, which is why the merge-source law makes the fleet build
+    relies on, which is why the cascade (issue #620) makes the fleet build
     byte-identical to the CLI build.
 
     The node set is validated BY NAME before anything is read or written: it
@@ -1010,6 +1044,7 @@ def run_stage_worker(
         on_node=_maybe_beat,
         level_actuals=level_actuals,
         only_dispatch=int(dispatch),
+        only_child_order=None if child_order is None else int(child_order),
         dirt_only=regather,
         only_unit=unit,
         only_window=window,
@@ -1055,6 +1090,7 @@ def run_stage_finisher(
     records_from: str | None = None,
     touch_policy: str = "auto",
     barrier_timed_out: bool = False,
+    short_orders=(),
     lease_ttl_s: int | None = None,
     store_kwargs: dict | None = None,
     record: bool = True,
@@ -1074,7 +1110,15 @@ def run_stage_finisher(
 
     ``barrier_timed_out`` is the dispatcher's verdict on its own soft barrier,
     threaded in so the RUN RECORD says the per-level actuals may be short — see
-    where it is recorded below. ``pipeline_run_id`` (issue #593) is the
+    where it is recorded below. ``short_orders`` says WHICH, and is the half
+    that keeps the manifest honest (issue #610, espg 2026-10-08): the orders
+    of every tuple the dispatcher is missing a unit record for. Their level
+    entries are left alone (``run_finisher(withhold_levels=...)``) while the
+    orders that did land are recorded as usual — the v3 ladder stamped actuals
+    for its walled ``[2,1,0]`` tuple exactly as it did for the complete
+    ``8..3``, so a reader could not tell the short levels from the whole ones.
+    Empty (an older dispatcher, or a run with every record in) records
+    everything, as before. ``pipeline_run_id`` (issue #593) is the
     pipeline run this sweep completes, recorded in the run record and the
     finisher record under its own key (``null`` when the dispatcher named none).
 
@@ -1168,11 +1212,19 @@ def run_stage_finisher(
     # only witness is the dispatcher's log, which does not outlive the process
     # — and the manifest would claim coverage it did not observe.
     summary["barrier_timed_out"] = bool(barrier_timed_out)
+    withheld = sorted({int(order) for order in short_orders or ()}, reverse=True)
+    summary["short_orders"] = withheld
     if barrier_timed_out:
         logger.warning(
             f"stage sweep {run_id}: the dispatcher reported an expired barrier — the "
             f"per-level actuals recorded from {len(records)} stage record(s) may "
             "under-report; the next pass heals them"
+        )
+    if withheld:
+        logger.warning(
+            f"stage sweep {run_id}: order(s) {withheld} are short a unit record — "
+            "their manifest actuals are left as they stood rather than stamped from "
+            "this run; re-run the staged sweep to record them"
         )
     summary["finisher"] = run_finisher(
         store_root,
@@ -1183,6 +1235,7 @@ def run_stage_finisher(
         store_kwargs=store_kwargs,
         release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
         touch_policy=touch_policy,
+        withhold_levels=withheld,
     )
     summary["lease"] = {"released": bool(summary["finisher"].get("lease_released"))}
     summary["duration_s"] = time.perf_counter() - t0

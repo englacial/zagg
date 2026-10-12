@@ -43,9 +43,9 @@ conformance tests assert decoded values, never object bytes.
   SIBLING attrs key beside the ``ragged`` block, ``gain`` provenance attrs)
   + `count`. Payload weights are fractional positive reals built through the
   real merge algebra, so per-cell weight sums are NOT integers — the pin
-  that a flux reader must not round-trip weights through counts. The
-  committed ``minimal/`` (which predates §2.0 and is not regenerated) is the
-  absent-key ⇒ counts pin.
+  that a flux reader must not round-trip weights through counts.
+  ``minimal/`` declares no ``weights`` key, so it is the absent-key ⇒ counts
+  pin.
 - ``column/`` — the ``minimal`` inputs plus an explicit
   ``output.pyramid.overviews: 5`` knob, so the SAME worker invocation also
   writes the §4.6 leaf column (issue #383): ``all.pyramid.zarr`` beside the
@@ -62,8 +62,9 @@ conformance tests assert decoded values, never object bytes.
   ``pyramid.expected.json`` record of the raw config knob, the leaf-list
   form of the declaration the expansion was derived from. Since issue #392
   the same manifest also carries the §4.9 ``multiscales`` discovery mirror
-  installed beside every ``/2`` block (``column/``, committed earlier and
-  unregenerated, is the absent-key ⇒ pre-convention pin). No store beneath
+  installed beside every ``/2`` block (``column/``'s builder drops the key
+  — STALE BY DESIGN below — as the absent-key ⇒ pre-convention pin). No
+  store beneath
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone; the ``/2`` artifacts a fleet writes are the
   ``column/`` fixture's job (issue #383 — sweep-side levels are issue #384).
@@ -75,6 +76,13 @@ conformance tests assert decoded values, never object bytes.
   group per coarse ladder order, member refs by store-root-relative path,
   no arrays and no data bytes. No leaves or overview artifacts on purpose
   (§4.10: references claim ownership, never presence).
+- ``icechunk/`` — the §11.1 Icechunk repo-root surface (issue #615):
+  METADATA ONLY — the group documents the once-per-run init commits on
+  ``pyramid/``'s grid and knob: the root (``zagg_icechunk`` block, the
+  ``zarr_conventions`` registration, the ``multiscales`` object with its
+  dggs-composed ``layout``) plus one document per level group. No
+  repository, no arrays, no refs; validated against the vendored
+  multiscales v0.1 / dggs v1 schemas (``tests/data/conventions/``).
 - ``raster_toc/`` — the §8 temporal-declaration surface (issue #443): a
   RASTER ``(time, cells)`` hive leaf (two bands + ``morton`` + ``time``, the
   one unsharded fixture — raster never shards) whose ``time`` coordinate is
@@ -97,10 +105,9 @@ conformance tests assert decoded values, never object bytes.
   multi-observation cell and merged centroid a conservative RANGE. The words
   are computed here from the generator's inputs and handed to the write path
   — the aggregation kernel that will produce them is #410's next PR — so the
-  expectations stay input-derived. ``kitchen_sink/``'s two
-  ``*_locations/zarr.json`` siblings, committed before §9 and deliberately
-  NOT refreshed (``git checkout --`` them after a regen), are the
-  absent-``located`` ⇒ §2.2 pin.
+  expectations stay input-derived. ``kitchen_sink/``'s two leaf
+  ``*_locations/zarr.json`` siblings, whose ``located`` block its builder
+  strips (STALE BY DESIGN below), are the absent-``located`` ⇒ §2.2 pin.
   ``temporal/`` is ALSO the only fixture carrying a **root ``coverage.moc``**
   (issue #480): the §10 ``zagg-coverage-toc/1`` section, written here by the
   production sweep writer (``MocFamily``'s leaf read + finisher) — and, from
@@ -134,16 +141,18 @@ conformance tests assert decoded values, never object bytes.
   composition cleanly (no ``demotions`` key — the absence pin), the
   cascaded level fires ``divisor-missing`` and records it.
 
-STALE BY DESIGN: some committed bytes deliberately pin an older writer era
-and must NOT be refreshed by a regen — currently ``kitchen_sink/``'s two
-``*_locations/zarr.json`` siblings (the pre-§9 absent-``located`` pin
-above). Running this script rewrites them; ``git checkout --`` those files
-after a targeted regen. ``kitchen_sink/`` was otherwise refreshed for issue
-#515 (its manifest now declares the strata ``approximate`` + ``composition``
-``packed``, and its ``all.pyramid.zarr`` column carries the strata,
-locations and composition groups through the real fold). When regenerating
-for one fixture only, ``git checkout --`` the others; a deliberate refresh
-of an older-era fixture is its own commit.
+STALE BY DESIGN: two builders deliberately produce an older writer era
+on top of the production write — :func:`build_kitchen_sink` strips the
+``located`` block from its two leaf ``*_locations/zarr.json`` siblings (the
+pre-§9 absent-``located`` pin above) and :func:`build_column` drops the
+``multiscales`` key from its ``morton_hive.json`` (the pre-§4.9 absent-key
+pin above), so a bare regen reproduces both pins
+(``tests/test_spec_conformance.py`` asserts all three absences). Every
+count-bearing fixture was otherwise regenerated for issue #626 (``count``
+is ``int64``), so the committed stamps, manifests and stats records are the
+current writer's. When regenerating for one fixture only,
+``git checkout --`` the others; a deliberate refresh of an older-era fixture
+is its own commit.
 """
 
 from __future__ import annotations
@@ -184,25 +193,27 @@ PYRAMID_GRID = {
 }
 #: The synthetic per-level stage actuals the ``pyramid/`` fixture's finisher
 #: RMW records (issue #384): the §4.5 regimes this geometry derives — d = 1,
-#: node 2 a gather of gen-1 members, nodes 1/0 merges of the relayed gen-1
-#: partials (merges-from-raw 2, never 3 for an upfront level).
+#: node 2 a gather of the leaf columns' member 3, below the raw-fold
+#: boundary 5 (merges-from-raw 2, the leaf entry's own), node 1 a cascade of
+#: the node-2 artifacts (3), node 0 a cascade of node 1's (4): the depth
+#: grows by one per merge level (issue #620).
 PYRAMID_STAGE_ACTUALS = {
     2: {
         "cells": 3,
         "regime": "stage-gather",
-        "merges_from_raw": 1,
+        "merges_from_raw": 2,
         "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
     },
     1: {
         "cells": 2,
         "regime": "stage-merge",
-        "merges_from_raw": 2,
+        "merges_from_raw": 3,
         "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
     },
     0: {
         "cells": 1,
         "regime": "stage-merge",
-        "merges_from_raw": 2,
+        "merges_from_raw": 4,
         "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
     },
 }
@@ -223,6 +234,10 @@ PYRAMID_V1_ACTUALS = {1: "leaves", 0: "cascade"}
 #: the §4.10 ancestor sets collapse (one node per coarse order — "-311",
 #: "-31", "-3") and the member maps stay one entry each.
 MULTISCALES_SHARDS = ("-3111", "-3112")
+
+#: The ``icechunk/`` fixture's store root: the virtual chunk container's
+#: ``url_prefix`` is that root with a trailing slash (§11.3).
+ICECHUNK_STORE_ROOT = "s3://fixture/product"
 
 #: The ``flux/`` fixture's §2.0 calibration provenance (issue #424): flux
 #: weights are meaningless without the gain constant that produced them, so
@@ -282,7 +297,7 @@ def _config(kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False)
     from zagg.config import PipelineConfig
 
     variables: dict = {
-        "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0}
+        "count": {"function": "len", "source": "h", "dtype": "int64", "fill_value": 0}
     }
     if flux:
         variables["rx_flux"] = {
@@ -447,7 +462,7 @@ def _fake_process_shard(grid, by_chunk, kitchen_sink: bool, ragged_field: str = 
             n = grid.cells_per_chunk
             df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
             df["count"] = np.array(
-                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64
             )
             ragged: dict = {}
             if kitchen_sink:
@@ -672,6 +687,39 @@ def _column_expected(column_dir: Path, basename: str) -> dict:
     }
 
 
+def build_kitchen_sink(out: Path) -> None:
+    """``kitchen_sink/``, its leaf ``*_locations`` siblings in the pre-§9 era.
+
+    The production write stamps a ``located`` block on each sibling; this
+    fixture strips it deliberately so a regen reproduces the committed
+    absent-``located`` ⇒ §2.2 pin (STALE BY DESIGN in the module docstring).
+    The chunk bytes and O11 hashes are the writer's, untouched.
+    """
+    build(out, kitchen_sink=True)
+    leaf = out / json.loads((out.parent / f"{out.name}.expected.json").read_text())["leaf"]
+    for path in sorted(leaf.glob("*/*_locations/zarr.json")):
+        doc = json.loads(path.read_text())
+        del doc["attributes"]["located"]
+        path.write_text(json.dumps(doc, indent=2))
+
+
+def build_column(out: Path) -> None:
+    """``column/``, its ``/2`` manifest in the pre-§4.9 era (no mirror).
+
+    ``build_manifest`` installs the §4.9 ``multiscales`` mirror beside every
+    ``/2`` block; this fixture drops it deliberately so a regen reproduces
+    the committed absent-key ⇒ pre-convention pin (STALE BY DESIGN in the
+    module docstring), the same read/PUT pattern ``build_demoted`` uses.
+    """
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.store import open_object_store, put_object
+
+    build(out, kitchen_sink=False, pyramid={"overviews": 5})
+    manifest = read_manifest(str(out))
+    del manifest["multiscales"]
+    put_object(open_object_store(str(out)), MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
+
+
 def _expected_multiscales(levels: list, s: int) -> list:
     """The §4.9 discovery mirror, spelled from the generator's INPUTS.
 
@@ -748,6 +796,9 @@ def build_demoted(out: Path) -> None:
             "fields": fields,
         },
     }
+    # §4.9: a /1 manifest carries no mirror — drop the one ``build`` derived
+    # from its /2 block, as ``declare_pyramid``'s retrofit does.
+    manifest.pop("multiscales", None)
     put_object(open_object_store(str(out)), MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
     counts = sweep_overviews(str(out), manifest, {SHARD_KEY: {None}})
     assert counts["failed"] == 0 and counts["written"] == 2, counts
@@ -829,8 +880,9 @@ def build_pyramid(out: Path) -> None:
     # Per-entry actuals (issue #384): the finisher's manifest RMW is the
     # production writer. The per-level inputs are synthetic (no leaves exist
     # here) but their regimes are the §4.5 law for this geometry — d = 1, so
-    # node 2 gathers (cells 3 == shard) and nodes 1/0 merge the relayed
-    # gen-1 partials at exactly 2 merges from raw.
+    # node 2 gathers (cells 3 == shard) the leaf columns' depth-2 member 3,
+    # node 1 cascades those artifacts at 3 merges from raw and node 0
+    # cascades node 1's at 4 (issue #620).
     from zagg.sweep_stages import run_finisher
 
     run_finisher(
@@ -980,6 +1032,100 @@ def build_multiscales(out: Path) -> None:
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     n = sum(len(v["members"]) for v in companion.values())
     print(f"{out.name}: companion group, {len(companion)} coarse orders, {n} member refs")
+
+
+def build_icechunk(out: Path) -> None:
+    """The §11.1 Icechunk repo-root fixture: the group documents, no repository.
+
+    A ``/2`` store on the ``pyramid/`` fixture's grid and knob
+    (:data:`PYRAMID_GRID`, :data:`PYRAMID_KNOB`), its repo hierarchy built
+    by the production spec builder (``icechunk_refs.repo_group_spec`` —
+    what the once-per-run init commits, §11.4) and written to a plain zarr
+    store so the committed documents are exactly what zarr serializes: the
+    root ``zarr.json`` (the ``zagg_icechunk`` block, the ``zarr_conventions``
+    registration, the ``multiscales`` object with its ``layout``) and one
+    ``{cells}/zarr.json`` per level group (the artifact's ``dggs`` block and
+    ``zarr_conventions``, verbatim). No Icechunk repository, no arrays, no
+    refs — the golden pins the documents a conformant reader validates
+    against the vendored multiscales v0.1 / dggs v1 schemas
+    (``tests/data/conventions/``), issue #615.
+
+    The expected ``layout`` is spelled HERE from the generator's INPUTS by
+    the §11.1 rules over the expanded levels — the column members fold the
+    leaves (base), every cascaded overview folds the next-finer level,
+    ``scale = 4 ** (c_from - c)`` — never read back out of the store.
+    """
+    import zarr
+    from zarr.storage import MemoryStore
+
+    from zagg import hive
+    from zagg.grids import HealpixGrid
+    from zagg.grids.base import vlen_dtype_warning_suppressed
+    from zagg.icechunk_refs import repo_group_spec, resolve_options
+
+    cfg = _config(False, pyramid=PYRAMID_KNOB)
+    cfg.aggregation["variables"].update(PYRAMID_EXTRA_VARIABLES)
+    cfg.output["grid"] = dict(PYRAMID_GRID)
+    grid = HealpixGrid(3, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    manifest = hive.build_manifest(grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"})
+    options = resolve_options(cfg, grid.parent_order, grid=grid)
+    spec = repo_group_spec(grid, ICECHUNK_STORE_ROOT, options, manifest)
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        spec.to_zarr(store, "", overwrite=False)
+    root = zarr.open_group(store, mode="r")
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    (out / "zarr.json").write_text(json.dumps(root.metadata.to_dict(), indent=1) + "\n")
+    levels = sorted((name for name, m in root.members() if isinstance(m, zarr.Group)), key=int)
+    for name in levels:
+        (out / name).mkdir()
+        doc = root[name].metadata.to_dict()
+        (out / name / "zarr.json").write_text(json.dumps(doc, indent=1) + "\n")
+    # Expectations from the inputs: the expanded levels (§4.5/§4.4), the
+    # base's dggs block spelled out (§11.1 copies it whole), the layout by §11.1.
+    s, base = PYRAMID_GRID["parent_order"], PYRAMID_GRID["child_order"]
+    resolutions = list(PYRAMID_KNOB["overviews"])
+    d = resolutions[-1] - s
+    expanded = [(base, "leaf")] + [(c, "column") for c in resolutions]
+    expanded += [(k + d, "overview") for k in range(s - 1, -1, -1)]
+    ellipsoid = {"name": "WGS84", "semi_major_axis": 6378137.0, "inverse_flattening": 298.257223563}
+    base_dggs = {
+        "name": "morton",
+        "refinement_level": base,
+        "spatial_dimension": "cells",
+        "ellipsoid": ellipsoid,
+        "compression": "none",
+        "latitude": "authalic-wgs84",
+        "coordinate": "morton",
+    }
+    layout = [{"asset": str(base), "dggs": base_dggs}]
+    for (cells, artifact), (finer, _) in zip(expanded[1:], expanded):
+        source = base if artifact == "column" else finer  # cascade, exact_levels 1
+        layout.append(
+            {
+                "asset": str(cells),
+                "derived_from": str(source),
+                "transform": {"scale": [float(4 ** (source - cells))]},
+                "dggs": {"refinement_level": cells},
+            }
+        )
+    expected = {
+        "shard_order": s,
+        "cell_order": base,
+        "url_prefix": ICECHUNK_STORE_ROOT + "/",
+        "levels": [str(c) for c, _ in expanded],
+        "artifacts": {str(c): a for c, a in expanded},
+        "multiscales": _expected_multiscales(
+            [{"node": s, "cells": resolutions}]
+            + [{"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)],
+            s,
+        )[0],
+        "layout": layout,
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(f"{out.name}: repo root + {len(levels)} level group documents")
 
 
 #: The ``raster_toc/`` fixture's acquisition groups (§8, issue #443). Three
@@ -1321,7 +1467,7 @@ def _temporal_config():
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
             "variables": {
-                "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0},
+                "count": {"function": "len", "source": "h", "dtype": "int64", "fill_value": 0},
                 "h_tdigest": {
                     "kind": "ragged",
                     "function": "zagg.stats.tdigest.build_tdigest",
@@ -1373,7 +1519,7 @@ def _fake_temporal_shard(grid, by_chunk):
             n = grid.cells_per_chunk
             df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
             df["count"] = np.array(
-                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64
             )
             # §8.2: an unobserved cell keeps the reserved 0 fill.
             df["observed"] = np.array(
@@ -1534,10 +1680,13 @@ def build_temporal(out: Path) -> None:
         quantize_words,
         read_cover,
     )
+    from zagg.store import open_object_store
     from zagg.sweep import MocFamily
 
     family = MocFamily()
-    contribution, _written_at = family.read_leaf(root, SHARD_KEY, None, "morton-hive/1", {})
+    contribution, _written_at = family.read_leaf(
+        open_object_store(root), SHARD_KEY, None, "morton-hive/1"
+    )
     family.finish(root, [{"payload": contribution}], 4, {})
     envelope = hive.read_root_coverage(root)
     # The shard envelope word is DERIVED from the generator's inputs — the
@@ -1769,6 +1918,7 @@ def build_uncounted(out: Path) -> None:
         read_cover,
     )
     from zagg.leaf_temporal import LEAF_TEMPORAL_NAME, count_words, cover_from_counts
+    from zagg.store import open_object_store
     from zagg.sweep import MocFamily
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1781,7 +1931,7 @@ def build_uncounted(out: Path) -> None:
             (scratch / name).unlink()
         family = MocFamily()
         contribution, _written_at = family.read_leaf(
-            str(scratch), SHARD_KEY, None, "morton-hive/1", {}
+            open_object_store(str(scratch)), SHARD_KEY, None, "morton-hive/1"
         )
         family.finish(str(scratch), [{"payload": contribution}], 4, {})
         assert family.summary()["temporal_routes"] == {"records": 0, "raw": 1}
@@ -1872,7 +2022,7 @@ def _windowed_config():
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
             "variables": {
-                "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0},
+                "count": {"function": "len", "source": "h", "dtype": "int64", "fill_value": 0},
                 "h_tdigest": {
                     "kind": "ragged",
                     "function": "zagg.stats.tdigest.build_tdigest",
@@ -1921,7 +2071,7 @@ def _fake_windowed_shard(grid, by_chunk, time_range):
             n = grid.cells_per_chunk
             df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
             df["count"] = np.array(
-                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64
             )
             ids = sorted(cells)
             ragged = {
@@ -2120,10 +2270,11 @@ def main() -> None:
     args = parser.parse_args()
     builders = {
         "minimal": lambda: build(args.out / "minimal", kitchen_sink=False),
-        "kitchen_sink": lambda: build(args.out / "kitchen_sink", kitchen_sink=True),
-        "column": lambda: build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5}),
+        "kitchen_sink": lambda: build_kitchen_sink(args.out / "kitchen_sink"),
+        "column": lambda: build_column(args.out / "column"),
         "pyramid": lambda: build_pyramid(args.out / "pyramid"),
         "multiscales": lambda: build_multiscales(args.out / "multiscales"),
+        "icechunk": lambda: build_icechunk(args.out / "icechunk"),
         "demoted": lambda: build_demoted(args.out / "demoted"),
         "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
         "versioned": lambda: build(

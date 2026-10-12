@@ -51,7 +51,7 @@ them is meaningless (mortie spec §9 is where the prohibition binds). The
 token — `"latitude": "authalic-wgs84"`, mandatory for a writer at the current
 mortie spec version, since [#580](https://github.com/englacial/zagg/issues/580)
 (folding #549's resolution; `zagg.grids.morton.LATITUDE_CONVENTION`) —
-beside `ellipsoid: {name: WGS84, semimajor_axis: 6378137.0,
+beside `ellipsoid: {name: WGS84, semi_major_axis: 6378137.0,
 inverse_flattening: 298.257223563}` and no sphere radius: that entry is the
 **ingress datum** (the geodetic coordinates fed to `geo2mort`, equal-area on
 that ellipsoid by construction), not an instruction to compute cell geometry
@@ -66,6 +66,16 @@ rewritten, do not — and each artifact's own `dggs` block is authoritative for
 that artifact. A reader reproducing cell geometry
 (e.g. a viewer's boundary golden test) needs the geodetic ↔ authalic
 conversion at every geodetic seam, exactly as mortie spec §9 prescribes.
+
+The ellipsoid key spelling follows the same per-artifact vintage rule
+(issue [#616](https://github.com/englacial/zagg/issues/616)): artifacts
+written by zagg through 0.58.0 spell it `semimajor_axis`, which the
+[dggs v1 schema](https://raw.githubusercontent.com/zarr-conventions/dggs/refs/tags/v1/schema.json)
+rejects (its `ellipsoidObject` is `additionalProperties: false` and
+spells `semi_major_axis`); artifacts written or re-templated by zagg after
+0.58.0 carry `semi_major_axis`. No `spec` marker records the rename — the
+key belongs to the convention block the schema governs, and zagg readers
+never consult the ellipsoid.
 
 Design *rationale* — why each decision was made, with trade studies and
 ratification records — lives in
@@ -1008,15 +1018,17 @@ regionally heterogeneous resolution).
     in any overview or column, so every contributor fires this arm and the
     field silently never folds upward.
 
-  On `zagg-overview/2` the record survives only a level that materializes.
-  The stage fold counts a contributor the rail fired on as `unreadable`, and
-  a level where **no** contributor folded cleanly is not written at all — so
-  the mis-declared-divisor shape above, which fires on *every* contributor,
-  leaves no artifact and therefore no `demotions`. A reader MUST NOT read the
-  key's absence at a `/2` level as evidence the rail did not fire there; the
-  absent level is the evidence. The `/1` fold paths do not share this: a
-  demoted contributor is still a counted leaf (or child), so the level
-  materializes and carries the record.
+  A demoted contributor is still a counted leaf (or child) on every fold
+  path (since [issue #620](https://github.com/englacial/zagg/issues/620),
+  which put the `/1` cascade and the `/2` ladder on one fold engine): its
+  other fields fold, the level materializes and carries the record, and
+  `source_children` counts the contributor as `folded`. The
+  mis-declared-divisor shape above therefore lands as a level whose packed
+  array is all fill beside a record naming every contributor. (Before #620
+  the `/2` stage fold counted a fired contributor `unreadable` and dropped a
+  level on which every contributor fired; a `/2` store swept before then may
+  lack such a level, and a reader MUST NOT read its absence as evidence the
+  rail stayed quiet.)
 
   `field`/`class`/`reason`/`contributors` are always present. A
   **contributor** is one *source read* the fold performed: a `(child,
@@ -1027,11 +1039,12 @@ regionally heterogeneous resolution).
   the §3.3 linkage; `cells` is keyed whenever the demotion left output cells
   at the fill word that no surviving contributor covers — always in the
   `word-missing` direction, and in the `divisor-missing` direction only where
-  contributors own **disjoint** spans of the level (the `/1` cascade of child
-  overviews, where a child skipped for the field leaves its whole span fill).
-  Where many contributors share each output cell — a `/1` fold from leaves, a
-  `/2` stage merge — a dropped contributor blanks nothing and the key is
-  absent. A reader MUST NOT read its absence as "nothing was blanked".
+  contributors own **disjoint** spans of the level (a cascade of child
+  overviews, `/1` or `/2`, where a child skipped for the field leaves its
+  whole span fill). Where many contributors share each output cell — a `/1`
+  fold from leaves, the all-time fold across windows — a dropped contributor
+  blanks nothing and the key is absent. A reader MUST NOT read its absence as
+  "nothing was blanked".
   Readers MUST tolerate additional keys, MUST tolerate the key's absence (a
   clean fold, or any pre-#518 artifact — a clean fold's attrs are
   byte-identical to a pre-#518 writer's), and MUST NOT read absence as "no
@@ -1103,13 +1116,16 @@ group. Concretely, for a member `r` at an order-`k` node:
   **level member** `r > k` always, by the window and ladder rules above;
   the one recorded `r == k` group is the §4.6 column's **node-order
   member** (the whole-footprint aggregate of #381 point (2)), which is a
-  recorded group of that artifact and still never a manifest member. Since
-  [issue #538](https://github.com/englacial/zagg/issues/538) it is not the
-  ladder's merge source: that is the **relay member** — the leaf column's
-  coarsest group still folded from raw: its group at `shard_order + 2`
-  (§4.6's raw-fold boundary) when the column CARRIES that group, else the
-  node-order member — so that every above-shard merge stays exactly 2
-  merges from raw. No separate partial grammar or `partial/` path exists anywhere;
+  recorded group of that artifact and still never a manifest member. It is
+  the source of the coarsest **gather** level only: every level whose cells
+  are below the shard order is a **cascade** of its children's artifacts at
+  the next finer declared level, four children folded `4^(r' - r)`-to-one,
+  and nothing above the first merge reads the leaf tier again
+  ([issue #620](https://github.com/englacial/zagg/issues/620) — before it,
+  every merge re-read the leaf columns' res-`shard_order + 2` member, an
+  input of `4^(shard_order + 2 - k)` cells per node that put an order-0 node
+  at 18.9M cells and the dense order-1 node past the 900 s wall). No
+  separate partial grammar or `partial/` path exists anywhere;
 - each **included** field is the same array kind as at the leaves: dense
   fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
   arrays — §1–§3 of this page apply to overview arrays unchanged, **including
@@ -1132,12 +1148,18 @@ particular its single scalar `cell_order = c - (s - k)` — is specified for
 `cell_order` the entry's own `cells` member (`k + d`, not the constant-depth
 formula), the `fold_source`/`fold_from_order` pair replaced by the #381
 point (7) provenance — `regime` (`stage-gather` | `stage-merge`),
-`merges_from_raw` (1 for a gather of gen-1 members, 2 for a merge of the
-relayed gen-1 relay-member partials — never 3 for an upfront level, which
-is why the relay is the boundary member and not the node-order one; gen 3
-belongs only to the append-later cascade regime), and `source_children`
-(present in both
-stage regimes: a gather that under-covers says so exactly like a merge) —
+`merges_from_raw` (the **fold depth**: for a gather, the depth of the
+column groups it concatenates — 1 at or above the raw-fold boundary, 2
+below it (§4.6) — and for a merge **one more than the largest
+`merges_from_raw` among the children's artifacts it folded**, and so on
+down to the root; on the 19/13/9 reference geometry the ladder records 1,
+1, 2, 2 at orders 8–5 and 3, 4, 5, 6, 7 at orders 4–0. A reader MUST tolerate any value and MUST NOT bind to a ceiling: the
+value is a statement about the digest fold's generation, which `exact` and
+`packed` classes are indifferent to and `approximate` classes carry as
+their recorded accuracy — §4.4's accuracy doctrine below), and
+`source_children` (present in both stage regimes: a gather that
+under-covers says so exactly like a merge; a merge's counters are over its
+**children's artifacts**, a gather's over the child columns) —
 plus `run_id`, the sweep run that wrote the artifact, and a `generation`
 block summing the consumed children (the stage skip gate's ratchet key —
 `{n_leaves, max_leaf_timestamp, run_ids}`, composition in §4.5). §4.3's
@@ -1162,11 +1184,10 @@ subtree. Its `zagg-overview/2` attrs record:
 
 - `regime: "stage-merge"` at every level, a gather level included;
 - `merges_from_raw` **one more than its sources'**: `2` where the level's
-  per-window overviews are gathers of gen-1 members, and **`3`** where they
-  are themselves merges. This is the one stage-written artifact at 3: the
-  per-window ladder — every `{window}.zarr`, and an unwindowed store's
-  `all.zarr` — keeps the never-3 law above, and §4.5's per-entry `actuals`
-  describe that ladder, not the all-time fold;
+  per-window overviews are gathers of gen-1 members, and one more than
+  their cascade depth where they are themselves merges — the same rule a
+  merge level applies to its children. §4.5's per-entry `actuals` describe
+  the per-window ladder, not the all-time fold;
 - **`source_windows`** — `{"folded", "missing", "unreadable"}` over the
   window overviews it consumed. `missing` counts a window known to have data
   beneath the node whose overview was not committed when the fold ran (its
@@ -1197,7 +1218,15 @@ so, in every class.
 artifacts, no precision guarantee past the exact levels" posture is
 superseded (espg ruling on the declaring PR): **exact-class** fields are
 exactly correct at every order — the reductions are associative, so the
-pyramid is a true downsampling pyramid for them — and **approximate-class**
+pyramid is a true downsampling pyramid for them, **provided the declared
+`dtype` holds the coarse reductions**: every level carries the field's
+declared dtype (the per-field `dtype` of the §4.5 `pyramid` block below,
+copied from the build config), and a `sum` that exceeds it wraps rather than
+widens. zagg's packaged templates
+declare `count` as `int64` ([#626](https://github.com/englacial/zagg/issues/626):
+an `int32` count summed past 2^31 at orders 1 and 0 of a dense order-9
+store); a reader MUST take `count`'s dtype from the array metadata, never
+assume a width — and **approximate-class**
 fields are **analysis-grade at their recorded generation**: the per-entry
 merges-from-raw count (#381 point (7), recorded in the §4.5 `actuals` and
 per artifact in `zagg_overview`) is
@@ -1223,7 +1252,7 @@ overview family under the versioned `pyramid` block:
     "exact_levels": 1,
     "fields": {
       "count":     {"class": "exact", "method": "sum", "nan_policy": "skip",
-                    "dtype": "int32", "fill_value": 0},
+                    "dtype": "int64", "fill_value": 0},
       "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
                     "dtype": "float32", "inner_shape": [2], "delta": 512},
       "photon_ids": {"class": "none"}
@@ -1490,12 +1519,13 @@ staged sweep's finisher.
   of the §4.6 per-group value — 1 when every declared leaf resolution is at
   or above the raw-fold boundary, 2 when the entry declares a resolution
   below it; no `source_children` — its source is complete by construction),
-  `stage-gather` (a concatenation of gen-1 members, merges-from-raw 1) or
-  `stage-merge` (a k-way fold of the relayed gen-1 relay-member partials,
-  §4.4, merges-from-raw 2 — **never 3 for an upfront level**; gen 3 belongs
-  only to the append-later cascade regime, and to the all-time fold of a
-  windowed store, whose provenance rides its own attrs and never these
-  per-entry actuals — §4.4). `source_children`
+  `stage-gather` (a concatenation of the child columns' members, whose
+  `merges_from_raw` is the gathered groups' depth, §4.4) or
+  `stage-merge` (a cascade of the children's artifacts, §4.4, whose
+  `merges_from_raw` is the **maximum** over the level's artifacts of their
+  recorded depth — 2 at the first merge level, one more per level below it;
+  the all-time fold of a windowed store records its own depth in its own
+  attrs and never these per-entry actuals — §4.4). `source_children`
   accumulates the run's per-artifact coverage counts; `run_id` names the
   sweep run (stage entries only). The key is **additive**: a reader MUST
   tolerate additional keys on a level entry, and `actuals` says nothing
@@ -1615,8 +1645,8 @@ guessed at.
   (§4.4's contiguity rule; only the stage-merge levels below the shard
   order MAY gap). (There is no `partial/`
   grammar; a coarse level declared later never rewrites a leaf; the ladder's
-  merge source is the relay member named under **Fold laws**, not this
-  group). Each group holds the `morton`
+  merge levels cascade from the artifacts above them, §4.4, and read no
+  column group). Each group holds the `morton`
   coordinate (the node's order-`r` descendant words, ascending) and one
   array per **composable** field (§4.5 classes; `none` fields are absent),
   plus **every channel sibling** that field's §4.5 entry declares — the
@@ -1779,14 +1809,16 @@ shape at its dispatch nodes (`{window}.pyramid.zarr` under an ancestor
 node's prefix, `zagg-column/1` attrs, D4 order, one commit stamp last, D20
 sidecar after): every group is a **pure gather** of the child columns'
 members at the same resolution — `groups` entries record `regime:
-"stage-gather"` with `merges_from_raw: 1` — and the artifact MUST carry the
-**relay member** (the leaf columns' coarsest from-raw group for the whole
-subtree — `shard_order + 2`, the raw-fold-boundary partials, when the
-columns carry that group, else the node-order partials — the merge-source
-tier every coarser merge consumes: the espg
-merge-source ruling on the #384 thread, re-based onto the boundary member
-by issue #538 so that no upfront merge is ever 3 from raw). Stage-column
-attrs additionally
+"stage-gather"` with the gathered member's `merges_from_raw` (the deepest
+the child columns record for that group) — and the artifact carries
+exactly the members some coarser **gather** level consumes (the cells at or
+above the shard order declared at orders below the dispatch node's). It
+carries no member for the merge levels: those cascade from the ladder
+artifacts (§4.4), so a dispatch node below which nothing gathers writes no
+column at all. (Before [issue #620](https://github.com/englacial/zagg/issues/620)
+every stage column also relayed the leaf columns' res-`shard_order + 2`
+member upward for the merges; a `/2` store swept before then may still
+carry that group, which nothing reads.) Stage-column attrs additionally
 carry `generation` (`{n_leaves, max_leaf_timestamp, run_ids}` summed over
 the consumed children — the parent's skip-gate key, §4.5), `source_children` (a
 gather that under-covered says so in the artifact), and `run_id`; the
@@ -2392,23 +2424,28 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-The leaf fixtures were committed before this revision (`temporal/` was
-regenerated for §10.6 under issue #575, still before it) and are
-unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
-`dggs` block carries the §1 `latitude` token, so each fixture is the
-absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
-for both (the sidecar copy and §1's own evidence paragraph are the record
-for what those artifacts mean). The one **versioned** leaf (§1.5; a stamp
+Every fixture that declares `count` was regenerated for issue
+[#626](https://github.com/englacial/zagg/issues/626) (`count` is `int64`,
+§4.4/§4.5), so those stamps carry the §5.3 copy of `content_hashes`.
+Every committed `dggs` block carries the §1 `latitude` token (since
+[#616](https://github.com/englacial/zagg/issues/616)), so §1's absent-token
+rule has no committed golden; §1's evidence paragraph is its record.
+`raster_toc/` (no `count`) is unregenerated: its stamp without the §5.3 copy is the
+committed absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580)
+pin (the sidecar copy and §1's own evidence paragraph are the record for
+what that artifact means). The one **versioned** leaf (§1.5; a stamp
 naming `current`) is `versioned/` below, added standalone with the writer
 that produces it (issue [#582](https://github.com/englacial/zagg/issues/582));
-the older leaf fixtures stay legacy and pin the absent-`current` rule.
-Regeneration of those is deferred because it would
-also install the §4.9 `multiscales` mirror that `column/` pins the
-**absence** of, retiring an unrelated pin.
+the other leaf fixtures are unversioned and pin the absent-`current` rule.
+Two older-era pins are produced deliberately by the generator (its STALE
+BY DESIGN note): `column/`'s builder drops the §4.9 `multiscales` mirror
+from its manifest, and `kitchen_sink/`'s builder strips the §9 `located`
+attrs from its two leaf `*_locations` siblings, so a regeneration
+reproduces both.
 
-Nine tiny single-shard hive stores plus three metadata-only ones (the
-`pyramid/` declaration, the `multiscales/` companion and the `uncounted/`
-root objects), all on the same
+Nine tiny single-shard hive stores plus four metadata-only ones (the
+`pyramid/` declaration, the `multiscales/` companion, the `icechunk/` repo
+root and the `uncounted/` root objects), all on the same
 deliberately small geometry — shard order 4, inner-chunk order 5, cell
 order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
 default; `raster_toc/` is the one exception — a `(time, cells)` product is
@@ -2433,8 +2470,8 @@ never sharded, §8/#247):
   block, `gain` provenance attrs) plus `count`. Its payloads carry
   fractional positive weights whose per-cell sums are **not** integers —
   the pin that a flux reader must not round-trip weights through counts —
-  while `minimal/` (committed before this revision, unregenerated) pins the
-  absent-key ⇒ `"counts"` default.
+  while `minimal/`, which declares no `weights`, pins the absent-key ⇒
+  `"counts"` default.
 - **`kitchen_sink/`** — the full stratified-product surface: located
   signal/noise digest strata (payload + `{field}_locations` siblings,
   `stratum`/`signal_threshold` provenance attrs), the `composition` word
@@ -2458,8 +2495,8 @@ never sharded, §8/#247):
   alone — the `/2` artifacts a fleet writes are `column/`'s job below
   (sweep-side levels are #384's). The same manifest carries the §4.9
   `multiscales` discovery mirror the retrofit installs beside a `/2`
-  block; `column/`, committed before §4.9 and unregenerated, is the
-  absent-key ⇒ pre-convention pin.
+  block; `column/`'s manifest, whose mirror the generator drops on purpose
+  (stale by design), is the absent-key ⇒ pre-convention pin.
 - **`column/`** — the `minimal/` inputs plus an explicit
   `output.pyramid.overviews: 5` knob, so the same worker invocation that
   committed the leaf also wrote its §4.6 **column**: `all.pyramid.zarr`
@@ -2489,6 +2526,22 @@ never sharded, §8/#247):
   arrays, no leaves, no overview artifacts — the committed golden pins
   that §4.10 references claim ownership, never presence, and that the
   tree opens with stock zarr alone.
+- **`icechunk/`** — the §11.1 Icechunk repo-root surface
+  ([#615](https://github.com/englacial/zagg/issues/615)): METADATA ONLY —
+  the group documents the once-per-run init commits, written by the
+  production spec builder (`icechunk_refs.repo_group_spec`) on `pyramid/`'s
+  grid and knob: the root `zarr.json` (the `zagg_icechunk` block, the
+  `zarr_conventions` registration and the `multiscales` object with its
+  `layout`) plus one `{cells}/zarr.json` per level group (the artifact's
+  `dggs` block and `zarr_conventions`, verbatim). No Icechunk repository,
+  no arrays, no refs — the committed golden pins the documents a
+  conformant reader validates: the root group document against the
+  multiscales v0.1 schema, and every level group against the dggs v1
+  schema (the `semi_major_axis` spelling, since
+  [#616](https://github.com/englacial/zagg/issues/616)), both vendored
+  under `tests/data/conventions/`. `icechunk.expected.json` spells the
+  `layout` from the generator's inputs (the §11.1 rules over `pyramid/`'s
+  expanded levels), never read back through zagg.
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
   `(time, cells)` hive leaf whose `time` coordinate is `uint64` toc words
   carrying `temporal: {"spec": "zagg-toc/1", "shape": "coordinate", …}` and no CF
@@ -2500,8 +2553,8 @@ never sharded, §8/#247):
   decimal strings (JSON numbers cannot carry `uint64` faithfully) together
   with the `(start, end)` nanoseconds a conforming decode yields and the
   real acquisition spans they must contain, which is the §8 conservative
-  containment claim pinned on committed bytes. The other four fixtures,
-  which carry no `temporal` key anywhere, are the absent-key ⇒ legacy pin.
+  containment claim pinned on committed bytes. The leaf fixtures that
+  carry no `temporal` key anywhere are the absent-key ⇒ legacy pin.
 
 - **`temporal/`** — the §8.2/§8.3/§9 **companion** surface: `minimal/`'s
   geometry and cell plan with one digest field (`h_tdigest`) carrying both
@@ -2522,8 +2575,10 @@ never sharded, §8/#247):
   per-centroid envelope beneath it) on committed bytes. Its located sibling
   carries **heterogeneous orders** — order-29 point words on unmerged
   centroids, coarser ancestors on merged ones — which is §9.1's claim
-  pinned. `kitchen_sink/`, committed before §9 and unregenerated, is the
-  absent-`located` ⇒ §2.2 pin, exactly as `minimal/` is §2.0's.
+  pinned. `kitchen_sink/`, whose two located siblings the generator writes
+  without the §9 attrs on purpose (stale by design), is the
+  absent-`located` ⇒ §2.2 pin,
+  exactly as `minimal/` is §2.0's.
 
   Its §4.6 leaf column carries the **folded** companions: every resolution
   group holds `h_tdigest` with both siblings, each declaring `per-centroid`,
@@ -2562,8 +2617,8 @@ never sharded, §8/#247):
   transcribed from the object. The other leaf
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
-  trees are byte-identical to their pre-§10 selves — which is exactly §10's
-  absence rule, pinned as bytes. From issue #489 the same fixture also
+  trees carry no such object — which is exactly §10's absence rule, pinned
+  as bytes. From issue #489 the same fixture also
   carries the **§10.5 `coverage.toc` sibling**, PUT by the same production
   finisher beside the carrier (whose section now bears the §10.1 `cover`
   marker); `temporal.expected.json`'s `cover` block records the derived
@@ -4198,12 +4253,12 @@ level whose artifact a node never wrote (a column exists only under a `/2`
 declaration with composable fields; an overview only once swept) simply has
 no refs there and reads as fill. Every group is created by the once-per-run
 init (§11.4) from the manifest's declaration, and the repo's **root attrs
-mirror the manifest's `zagg-multiscales/1` block** verbatim as
-`multiscales`, so a reader opens one repo and discovers every level — its
-node order, cell order and artifact kind — from its root (the
-GeoZarr/OME-NGFF-style multiscales convention;
-earth-mover/icechunk-multiscales-demo; what gridlook's level resolver
-reads). `icechunk/` is a **reserved store-root child name** on the same
+carry the manifest's `zagg-multiscales/1` block** as the root `multiscales`
+object — its keys verbatim, plus the zarr-conventions `layout` below — so a
+reader opens one repo and discovers every level — its node order, cell order
+and artifact kind — from its root (the GeoZarr/OME-NGFF-style multiscales
+convention; earth-mover/icechunk-multiscales-demo; what gridlook's level
+resolver reads). `icechunk/` is a **reserved store-root child name** on the same
 footing as the §4.10 `multiscales/` companion: it is excluded from the **D19
 product-name grammar** (like the base-component exclusion), so a
 multi-product root walker can never classify it as a product, and
@@ -4228,7 +4283,23 @@ self-describing:
     "4":  {"node_order": 0, "artifact": "overview", "chunk_order": 0,  "cell_order": 4,  "split": {"chunks": 1,     "order": 0}}
   }
 },
-"multiscales": [ … the manifest's zagg-multiscales/1 block, verbatim … ]
+"zarr_conventions": [
+  {"schema_url": "https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json",
+   "spec_url": "https://github.com/zarr-conventions/multiscales/blob/v0.1/README.md",
+   "uuid": "d35379db-88df-4056-af3a-620245f8e347",
+   "name": "multiscales", "description": "Multiscale layout of zarr datasets"}
+],
+"multiscales": {
+  "spec": "zagg-multiscales/1",
+  "name": "…", "base": {"…": "…"}, "datasets": ["…"], "order2res": {"…": "…"}, "fields": {"…": "…"}, "fold": {"…": "…"},
+  "layout": [
+    {"asset": "19", "dggs": {"… the /19 level group's dggs block, verbatim …": "…"}},
+    {"asset": "13", "derived_from": "19", "transform": {"scale": [4096.0]}, "dggs": {"refinement_level": 13}},
+    {"asset": "12", "derived_from": "13", "transform": {"scale": [4.0]},    "dggs": {"refinement_level": 12}},
+    {"asset": "11", "derived_from": "12", "transform": {"scale": [4.0]},    "dggs": {"refinement_level": 11}},
+    {"…": "one entry per listed level, finest first, down to /4"}
+  ]
+}
 ```
 
 `shard_order` / `chunk_order` / `cell_order` mirror the manifest and the
@@ -4243,15 +4314,86 @@ operation has delisted a level (§11.4 **Operations**), maps each delisted
 level's cell order to its last `levels` entry, so its surviving group keeps
 its manifest split; `commit`, `commit_order` and `split_order` are
 the ladder's knobs (§11.4, §11.5), read back by every stage node so the
-sweep needs no config. The repo root group's attrs are exactly these two
-keys: `zagg_icechunk` and the `multiscales` mirror (the mirror is absent
-only on a store whose manifest declares no `zagg-multiscales/1` block), and
-its members exactly the level groups and the two row-coordinate arrays
-(§11.2). A
-leaf root group carries only its own commit stamp, which is a per-leaf fact
-and so has nothing to mirror. Each **level group** mirrors its artifact's
-resolution-group attrs verbatim (the `dggs` block, `zarr_conventions`), and
-**never the commit stamp**.
+sweep needs no config. The repo root group's attrs are exactly these three
+keys — `zagg_icechunk`, `zarr_conventions` and `multiscales` (the latter two
+are absent, together, only on a store whose manifest declares no
+`zagg-multiscales/1` block) — and its members exactly the level groups and
+the two row-coordinate arrays (§11.2). A leaf root group carries only its
+own commit stamp, which is a per-leaf fact and so has nothing to mirror.
+Each **level group** mirrors its artifact's resolution-group attrs verbatim
+(the `dggs` block, `zarr_conventions`), and **never the commit stamp**.
+
+**The root is a conformant `multiscales` group composed with `dggs`**
+([#615](https://github.com/englacial/zagg/issues/615)). The root group
+document validates against the [zarr-conventions `multiscales` v0.1
+schema](https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json)
+and composes with the [`dggs` convention](https://github.com/zarr-conventions/dggs)
+per the grammar of
+[zarr-conventions/dggs#25](https://github.com/zarr-conventions/dggs/pull/25).
+The level groups, and the base `layout` entry's `dggs` object, validate
+against the dggs v1 schema once
+[#616](https://github.com/englacial/zagg/issues/616) lands the
+`semi_major_axis` spelling (until then the `ellipsoid` key alone fails; the
+conformance test pins exactly that gap, pending #616). Both schemas are
+vendored under `tests/data/conventions/` (in CI only the hand checker runs:
+`jsonschema` is not in the `test` extra), and the `icechunk/` fixture (§7)
+pins the documents.
+
+- **`zarr_conventions`** — the convention's registration: the `multiscales`
+  v0.1 Convention Metadata Object, copied verbatim from the convention's
+  README (the schema pins every key as a `const`; the UUID
+  `d35379db-88df-4056-af3a-620245f8e347` is permanent across versions).
+  Only the `multiscales` entry rides the root: the tagged dggs v1 schema
+  requires a top-level `dggs` wherever its own entry is claimed, and the
+  root has none — the per-level `dggs` blocks live on the level groups.
+- **`multiscales`** — the manifest's single `zagg-multiscales/1` entry **as
+  an object** (the v0.1 schema requires an object with `layout`; its
+  `additionalProperties: true` admits the `/1` keys — `spec`, `name`,
+  `base`, `datasets`, `order2res`, `fields`, `fold` — which ride verbatim,
+  and §4.9's tolerate-extra-keys rule already covers readers of the mirror)
+  plus **`layout`**: one entry per **listed** level (a retired level's
+  surviving group has none), in **descending cell order** — which is the
+  base, then the manifest's `datasets` order, because §4.9 requires
+  `datasets` finest first — `asset` the level group's name
+  (`str(cell_order)`), so `asset` keys and `zagg_icechunk.levels` keys are
+  the same set in the same order.
+  - The **base** entry carries that level group's `dggs` block **whole**
+    (dggs#25: "specify the full `dggs` object for the original data") — a
+    verbatim copy of the **live** base level group's block, so whatever
+    that group's `dggs` says is what the layout says: a `set-attrs` on it
+    (§11.4) refreshes the entry in the same commit, and the init and
+    `declare-pyramid` rebuild it from the group, never from the grid.
+  - Every **derived** entry carries the reduced `{"refinement_level": c}`,
+    `derived_from` (another entry's `asset`) and
+    `transform: {"scale": [4^(c_from − c)]}` — a **single-element** `scale`
+    on the `cells` axis (nested order: four contiguous children per parent),
+    and **never** a `translation` (dggs#25: rotations are not representable).
+    The level arrays are `(window, cells)` (§11.2): `dggs.spatial_dimension`
+    names the spatial axis, and the one `scale` element indexes **that**
+    axis, not the leading row axis, whose extent every level shares.
+  - **`derived_from` is the declared fold provenance** (§4.5's `fold`
+    block, mirrored in the object's `fold` key): the column level folds the
+    base's own leaves within each leaf's footprint, so it derives from the
+    base; so does every level entry inside the `exact_levels` boundary and
+    every level under the `leaves` regime; a cascaded level derives from
+    the **next-finer level** (its `scale` is then `4.0` on the every-order
+    ladder). dggs#25's example derives every level from the base; a reader
+    resolving a level's absolute resolution needs only
+    `dggs.refinement_level` either way.
+  - No top-level `resampling_method`: it is one string, and zagg's
+    resampling is per field (`fields` is the class map — `count` an exact
+    sum, digests merged, `none`-class fields absent) — the `/1` keys carry
+    the per-field truth.
+- **Derived, never authoritative** — the same precedence as §4.9: the
+  object is computed from the manifest's `pyramid` block (through its
+  mirror) and the level groups' attrs at the init (§11.4) and by
+  `declare-pyramid` (which refreshes `multiscales` and `zarr_conventions`
+  together, and removes both when the manifest leaves `/2`); the manifest
+  wins any disagreement. The `zagg-icechunk/2` marker is **not** bumped by
+  the object shape: no reader breaks on it — gridlook's `parseMultiscales`
+  accepts an object or a list and branches on `spec`, and moczarr reads
+  `pyramid` and passes the mirror through — and the `zagg_icechunk` block
+  the compatibility check vets is unchanged.
 
 ### 11.2 Array model
 
@@ -4703,13 +4845,16 @@ that would write nothing commits nothing. The operations:
 - **`set-attrs <path> <json>`** merges the JSON object into the attrs of the
   root group (`/`), a level group (`/{cells}`) or an array
   (`/{cells}/{array}`); a `null` value deletes the key. The root's
-  `zagg_icechunk` block is the writer's and `multiscales` is
-  `declare-pyramid`'s: both are refused here. This is how a convention block
-  evolves — the `dggs` `latitude` token, a spec marker — without a leaf
-  rewrite; the leaf's own attrs stay as the leaf was stamped, by design
-  (the head of this section).
-- **`declare-pyramid <config>`** brings the repo's levels and `multiscales`
-  root attrs to the manifest's declaration (§4.9): every level of §11.1
+  `zagg_icechunk` block is the writer's and `multiscales` /
+  `zarr_conventions` are `declare-pyramid`'s: all three are refused here.
+  This is how a convention block evolves — the `dggs` `latitude` token, a
+  spec marker — without a leaf rewrite; the leaf's own attrs stay as the
+  leaf was stamped, by design (the head of this section). A base level
+  group's `dggs` change also refreshes the root `multiscales` base `layout`
+  entry in the same commit (§11.1).
+- **`declare-pyramid <config>`** brings the repo's levels and its
+  `multiscales` / `zarr_conventions` root attrs (§11.1) to the manifest's
+  declaration (§4.9): every level of §11.1
   (`level_grids` of the manifest — the base plus the `/2` block's datasets)
   that the block does not list gains its group, written from the same spec
   the init writes at the repo's rows (§11.2), and its manifest split (§11.5) is persisted with the

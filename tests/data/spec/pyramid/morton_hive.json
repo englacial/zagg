@@ -4,7 +4,7 @@
   "short_name": "SPEC_FIXTURE",
   "version": "1"
  },
- "semantic_hash": "55f495522d501e29c35363437e7bce3ca6bf3137eda6880493e53b9a854ff6bb",
+ "semantic_hash": "d4833b83e3c149a5e59d5e475c9f75e9a479e6f3023311103bdae39c36f08002",
  "cell_order": 6,
  "shard_order": 3,
  "split_schedule": [
@@ -25,7 +25,7 @@
     "actuals": {
      "regime": "leaf-column",
      "merges_from_raw": 2,
-     "generated_at": "2026-09-14T07:43:27+00:00"
+     "generated_at": "2026-10-12T01:21:09+00:00"
     }
    },
    {
@@ -35,14 +35,14 @@
     ],
     "actuals": {
      "regime": "stage-gather",
-     "merges_from_raw": 1,
+     "merges_from_raw": 2,
      "source_children": {
       "folded": 4,
       "missing": 0,
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-09-14T07:43:27+00:00"
+     "generated_at": "2026-10-12T01:21:09+00:00"
     }
    },
    {
@@ -52,14 +52,14 @@
     ],
     "actuals": {
      "regime": "stage-merge",
-     "merges_from_raw": 2,
+     "merges_from_raw": 3,
      "source_children": {
       "folded": 4,
       "missing": 0,
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-09-14T07:43:27+00:00"
+     "generated_at": "2026-10-12T01:21:09+00:00"
     }
    },
    {
@@ -69,14 +69,14 @@
     ],
     "actuals": {
      "regime": "stage-merge",
-     "merges_from_raw": 2,
+     "merges_from_raw": 4,
      "source_children": {
       "folded": 4,
       "missing": 0,
       "unreadable": 0
      },
      "run_id": "spec-fixture",
-     "generated_at": "2026-09-14T07:43:27+00:00"
+     "generated_at": "2026-10-12T01:21:09+00:00"
     }
    }
   ],
@@ -89,7 +89,7 @@
      "class": "exact",
      "method": "sum",
      "nan_policy": "skip",
-     "dtype": "int32",
+     "dtype": "int64",
      "fill_value": 0
     },
     "h_tdigest": {
@@ -122,11 +122,11 @@
      "1": "leaves",
      "0": "cascade"
     },
-    "generated_at": "2026-09-14T07:43:27+00:00"
+    "generated_at": "2026-10-12T01:21:09+00:00"
    }
   }
  },
- "generated_at": "2026-09-14T07:43:27+00:00",
+ "generated_at": "2026-10-12T01:21:09+00:00",
  "multiscales": [
   {
    "spec": "zagg-multiscales/1",

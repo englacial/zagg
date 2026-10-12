@@ -214,6 +214,43 @@ class TestACorrectStore:
         assert main([str(built[0])]) == 0
         assert "VERDICT: PASS" in capsys.readouterr().out
 
+    def test_the_report_is_identical_at_any_pool_size(self, built):
+        # The windowed arm's independent reads — the roster listing, the
+        # (node, window) and (leaf, window) probes, the per-cell legs of each
+        # window and of the all-time fold — run ``workers`` at a time (issue
+        # #434); the report, warnings included, cannot tell. ``--roster moc``
+        # is the listed roster, the one leg that pools per shard.
+        for kwargs in (
+            {"sample_windows": 2, "sample_nodes": 1, "sample_cells": 2, "roster": "moc"},
+            {"full": True},
+        ):
+            sequential = validate_pyramid(str(built[0]), workers=1, **kwargs)
+            assert sequential["passed"], format_report(sequential)
+            pooled = validate_pyramid(str(built[0]), workers=8, **kwargs)
+            assert json.dumps(pooled) == json.dumps(sequential), kwargs
+
+    def test_a_damaged_report_is_identical_at_any_pool_size(self, store):
+        # The clean twin above carries no mismatch lists and warns only outside
+        # the pool. Here every 2018 overview is 2019's under 2018's name, and a
+        # leaf's 2020 column is gone: the per-window and all-time cell legs
+        # fail by cell, and ``_WindowSources`` warns from inside them — the
+        # lists and heads a pool must keep in order, sampled and full.
+        for target in store.rglob("2018.zarr"):
+            shutil.rmtree(target)
+            shutil.copytree(target.parent / "2019.zarr", target)
+            _set_attrs(target, lambda a: a["zagg_overview"].update(window="2018"))
+        leaf = SHARDS[0]
+        shutil.rmtree(store / _rel(leaf[:-1], f"{leaf[-1]}/2020.pyramid.zarr"))
+        for kwargs in ({"sample_windows": 2, "sample_nodes": 2, "sample_cells": 3}, {"full": True}):
+            sequential = validate_pyramid(str(store), workers=1, **kwargs)
+            checks = sequential["checks"]
+            assert len(checks["all_time"]["mismatches"]) > 1
+            assert any("contributor" in w and "unreadable" in w for w in sequential["warnings"])
+            if kwargs.get("full"):  # the sample may not reach a 2018 window; full does
+                assert len(checks["counts"]["mismatches"]) > 1
+            pooled = validate_pyramid(str(store), workers=8, **kwargs)
+            assert json.dumps(pooled) == json.dumps(sequential), kwargs
+
     def test_a_nodes_windows_are_its_window_overviews_only(self, store):
         from zagg.pyramid_check_windowed import _node_window_labels
         from zagg.store import open_object_store
@@ -322,7 +359,12 @@ class TestDamage:
         report = validate_pyramid(str(store), full=True)
         assert not report["passed"]
         findings = report["checks"]["counts"]["mismatches"]
-        assert findings and all(f.startswith("window 2018: -5112[") for f in findings)
+        # The misfiled node against its own window's columns, and the merge
+        # above it, re-folded from the artifact it now finds there.
+        assert findings and {f.split("[")[0] for f in findings} == {
+            "window 2018: -5112",
+            "window 2018: -511",
+        }
         # ... and the all-time fold at that node no longer equals its windows' fold.
         assert report["checks"]["all_time"]["status"] == "fail"
 
@@ -375,9 +417,10 @@ class TestDamage:
     @pytest.mark.parametrize(
         ("node", "key", "value", "expect"),
         [
-            # node 5 is the gather level (cells 6 == the shard order): 2, not 3.
+            # node 5 is the gather level (cells 6 == the shard order): 2, not 3;
+            # the root's per-window overviews cascade to depth 6, so 7.
             ("-511233", "merges_from_raw", 3, "merges_from_raw 3 != 2"),
-            ("-5", "merges_from_raw", 2, "merges_from_raw 2 != 3"),
+            ("-5", "merges_from_raw", 2, "merges_from_raw 2 != 7"),
             ("-5", "regime", "stage-gather", "regime 'stage-gather' != 'stage-merge'"),
             ("-5", "source_children", {"folded": 0, "missing": 0, "unreadable": 0}, "summed"),
             ("-5", "source_windows", None, "lacks the folded/missing/unreadable counters"),

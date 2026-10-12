@@ -20,16 +20,20 @@ and spec text are pinned against each other through the committed bytes.
 import base64
 import hashlib
 import json
+import re
 import struct
 from pathlib import Path
 
+import jsonschema
 import numpy as np
 import pytest
 import zarr
 from numcodecs import Zstd
 from zarr.storage import LocalStore
 
+from zagg.config import default_config
 from zagg.coverage_toc import coverage_toc, coverage_toc_counts, coverage_toc_uncounted
+from zagg.grids import HealpixGrid
 from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
@@ -69,22 +73,25 @@ SENTINEL = 2**64 - 1
 #: with itself and sail through. These literals are what such a change has to
 #: get past — and §5 is the recipe moczarr adopts verbatim, so a silent zagg
 #: change is a silent cross-implementation divergence.
+#: Every combined digest below was re-pinned for issue #626: ``count`` is
+#: ``int64``, so each fixture's ``count`` array -- and only that array -- hashes
+#: differently (the per-array literals in ``FROZEN_ARRAYS`` are all untouched).
 FROZEN_COMBINED = {
-    "minimal": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    "minimal": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c",
     # kitchen_sink re-pinned under the authalic convention (mortie >=0.9.8,
     # issue #438): its located point words moved, so the fixture's two
     # ``*_locations`` arrays -- and only those -- hash differently.
-    "kitchen_sink": "7ee8ad9278eaa6ccbfa95aed978d09768ff0865b569c025b6f8e2b91e46843c7",
+    "kitchen_sink": "8752a3e02de12c4c8dedee7a5b743121f1d26c0b3686e041990cff6ad1b438da",
     # column/'s LEAF is minimal's, byte for byte — the same literal is the
     # cross-fixture pin that writing a column perturbs nothing.
-    "column": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    "column": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c",
     # versioned/'s arrays are minimal's, byte for byte, behind a pointer root
     # (§1.5, issue #582) — the same literal pins that versioning a leaf
     # perturbs nothing the §5 recipe hashes.
-    "versioned": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    "versioned": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c",
     # The §2.0 flux fixture (issue #424) — asserted by TestFluxDeclaration
     # (flux is not in FIXTURES: the leaf-shaped suite hardcodes h_tdigest).
-    "flux": "910a9b12d34b4d072f454b2dd1cc232a6a9a92b536a8d26f5395154a1c02bc32",
+    "flux": "0a7cf012f374249bb24d024aa4c428355c283b2453844838ce6eb0a35c48630a",
     # The §8 temporal fixture (issue #443) — asserted by
     # TestTemporalDeclaration (raster_toc is not in FIXTURES: it carries no
     # ragged array at all, so nothing the leaf-shaped suite asserts applies).
@@ -94,16 +101,16 @@ FROZEN_COMBINED = {
     # suite's digest assertions assume an UNLOCATED h_tdigest).
     # Re-pinned for the §10.5 gap cell (issue #489): the last cell's clock
     # moved, so its two toc companions -- and only those -- hash differently.
-    "temporal": "6c7a0c5a3f54684b67e7e2daa66e29ffcf1af102833e7b3c4a4f989e36752887",
+    "temporal": "e4921f1e6fc8d117a5f3b7d72f7451d4c82f842e7fc82eb94a8206909b2058ef",
     # The §1.5 derived-coordinate fixture (issue #586 phase 3) — asserted by
     # TestDerivedCellCoordinate. A WINDOWED leaf: the digest is over three
     # arrays, with no ``6/morton`` among them.
-    "windowed": "5b712e804d5120bac66031739483f319fb1bdf346d82e2d0b087f9bd2ddec170",
+    "windowed": "f828bc1be4cd8d01aa66de8833a620df9e92b9831bdcd8ac36cd6e1cbd069c8e",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
 #: shape is multi-group (``"5/h_tdigest"``, ``"4/morton"``, …).
-FROZEN_COMBINED_COLUMN = "061277118c8cc4c0b8ae3c62fe6515fefa8f9ccb717bd3104f4c8797edbcc918"
+FROZEN_COMBINED_COLUMN = "b28367197206f325ea9a43a51d6bc488273b2c605575d71a7b961cecde8731ba"
 #: FROZEN per-array digests, one per §5.2 element kind: a vlen digest payload
 #: array, a vlen uint64 locations sibling, and two fixed-width arrays.
 FROZEN_ARRAYS = {
@@ -195,6 +202,39 @@ def _digest_expectations(exp):
             if field.startswith("h_tdigest") and not field.endswith(("_locations", "_times")):
                 want = np.array(cell[field], dtype=np.float32).reshape(-1, 2)
                 yield field, cell["index"], want
+
+
+class TestDggsEllipsoid:
+    """§1 — every committed ``dggs`` block is what the writer emits today."""
+
+    def test_every_committed_dggs_block_matches_the_writer(self):
+        # Issue #616: every committed ``zarr.json`` carrying a ``dggs`` block
+        # — leaves, columns, overviews — equals ``HealpixGrid._dggs_attrs()``
+        # modulo the per-group ``refinement_level``, so it spells the schema's
+        # ``semi_major_axis`` (``ellipsoidObject`` is
+        # ``additionalProperties: false``) and carries the mortie §9
+        # ``latitude`` token. The pre-fix ``semimajor_axis`` vintage survives
+        # only in stores written through 0.58.0, never in these fixtures.
+        grid = HealpixGrid(
+            parent_order=4, child_order=6, layout="fullsphere", config=default_config("atl06")
+        )
+        want = {k: v for k, v in grid._dggs_attrs()["dggs"].items() if k != "refinement_level"}
+        seen = set()
+        for meta in SPEC_DATA.rglob("zarr.json"):
+            attrs = json.loads(meta.read_text()).get("attributes", {})
+            if "dggs" not in attrs:
+                continue
+            seen.add(meta.relative_to(SPEC_DATA).parts[0])
+            got = {k: v for k, v in attrs["dggs"].items() if k != "refinement_level"}
+            assert got == want, meta.relative_to(SPEC_DATA)
+        # Every fixture tree with a leaf contributes at least one block, so a
+        # regen that drops a tree's ``dggs`` stamp fails here, not silently.
+        leafed = {
+            p.name.removesuffix(".expected.json")
+            for p in SPEC_DATA.glob("*.expected.json")
+            if "leaf" in json.loads(p.read_text())
+        }
+        assert leafed <= seen, leafed - seen
 
 
 class TestRaggedAttrs:
@@ -366,9 +406,9 @@ class TestDigestPayload:
 class TestFluxDeclaration:
     """§2.0 — the weights declaration, pinned on the committed `flux/` store.
 
-    The counts side of the contract needs no new fixture: `minimal/` predates
-    §2.0 and is deliberately not regenerated, so its absent `weights` key IS
-    the committed absent-key ⇒ counts pin (issue #424).
+    The counts side of the contract needs no new fixture: `minimal/` declares
+    no `weights` key, so its absence IS the committed absent-key ⇒ counts pin
+    (issue #424).
     """
 
     def test_weights_key_is_a_sibling_of_the_ragged_block(self):
@@ -493,7 +533,14 @@ class TestCoordinateAndDense:
     def test_count_field_matches_expected(self, name):
         exp = _expected(name)
         arr = self._open(name, exp, "count")
-        assert arr.dtype == np.int32
+        # §4.4: a reader takes ``count``'s width from the array metadata, never
+        # a literal (issue #626) -- so cross-check it against the width the
+        # fixture's own manifest declares, which follows a regeneration.
+        manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
+        fields = (manifest.get("pyramid") or {}).get("overview", {}).get("fields", {})
+        assert arr.dtype.kind == "i"
+        if "count" in fields:
+            assert arr.dtype == np.dtype(fields["count"]["dtype"])
         counts = np.asarray(arr[:])
         by_cell = {c["index"]: c["count"] for c in exp["cells"]}
         for cell in range(counts.shape[0]):
@@ -786,22 +833,29 @@ class TestPyramidV2Declaration:
 
     def test_per_entry_actuals_decode_per_spec(self):
         # §4.5 (issue #384): materialization actuals nest inside the level
-        # entry that owns them — regime, merges-from-raw (2 for every
-        # upfront merge level, NEVER 3; 1 for gathers and the leaf column),
-        # `source_children` on the stage regimes only, and unpinned
-        # timestamp/run-id values a reader tolerates.
+        # entry that owns them — regime, merges-from-raw (the gathered
+        # groups' depth at a gather and the leaf column, the cascade depth at
+        # a merge: one more per merge level, so 3 then 4 here — issue #620),
+        # `source_children` on the
+        # stage regimes only, and unpinned timestamp/run-id values a reader
+        # tolerates.
         exp = _expected(PYRAMID)
+        depths = {}
         for entry in _pyramid_block()["overviews"]:
             expected = exp["actuals"][str(entry["node"])]
             actuals = entry["actuals"]
             assert actuals["regime"] == expected["regime"]
             assert actuals["merges_from_raw"] == expected["merges_from_raw"]
-            assert actuals["merges_from_raw"] <= 2  # gen 3 is append-later only
+            depths[entry["node"]] = actuals["merges_from_raw"]
             if expected["regime"] == "leaf-column":
                 assert "source_children" not in actuals
             else:
                 assert actuals["source_children"] == expected["source_children"]
             assert "generated_at" in actuals
+        # The depth rule, decoded from the committed bytes: the gather at its
+        # gathered groups' depth (2, member 3 is below the boundary), then
+        # one more per merge level down to the root.
+        assert depths == {3: 2, 2: 2, 1: 3, 0: 4}
 
     def test_fold_declaration_keys_ride_along(self):
         # PR #379's declaration keys are revision-independent (§4.5).
@@ -949,12 +1003,24 @@ class TestMultiscalesMirror:
 
     def test_absence_is_the_pre_convention_pin(self):
         # §4.9: the key is present exactly when the pyramid block is /2 —
-        # column/ (a /2 store committed before §4.9) pins absence as the
-        # legal pre-convention state, and raster_toc/ pins that /1 never
-        # carries it.
+        # column/ (a /2 manifest whose generator builder drops the key —
+        # stale by design, see the generator) pins absence as the legal
+        # pre-convention state, and raster_toc/ pins that /1 never carries it.
         for name in ("column", "raster_toc"):
             manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
             assert "multiscales" not in manifest
+
+    def test_every_committed_mirror_is_the_writers_derivation(self):
+        # §4.9 suite-wide: every committed manifest carries the key exactly
+        # when its block is /2, equal to the production derivation — column/
+        # is the one named exception (the absence pin above).
+        from zagg.multiscales import manifest_multiscales
+
+        for path in sorted(SPEC_DATA.glob("*/morton_hive.json")):
+            if path.parent.name == "column":
+                continue
+            manifest = json.loads(path.read_text())
+            assert manifest.get("multiscales") == manifest_multiscales(manifest), path
 
 
 #: The §4.10 companion-group fixture (issue #394): a /2 manifest + root
@@ -1067,6 +1133,138 @@ class TestMultiscalesCompanion:
 #: explicit ``output.pyramid.overviews: 5`` knob, so the committed store holds
 #: a leaf AND the column its worker wrote beside it.
 COLUMN = "column"
+
+
+ICECHUNK = "icechunk"
+CONVENTIONS = Path(__file__).parent / "data" / "conventions"
+MULTISCALES_SCHEMA = "multiscales-v0.1.schema.json"
+DGGS_SCHEMA = "dggs-v1.schema.json"
+
+
+def _schema(name: str) -> dict:
+    return json.loads((CONVENTIONS / name).read_text())
+
+
+class TestIcechunkRootConventions:
+    """§11.1 — the Icechunk repo root as a conformant ``multiscales`` group (issue #615).
+
+    The committed documents are what the once-per-run init commits (the
+    production spec builder, written through stock zarr); expectations come
+    from the generator's INPUTS (the §11.1 rules over the ``pyramid/``
+    levels). The grammar checks are spelled from the vendored schemas by
+    hand and ALSO run against the real validator (``jsonschema`` is a test
+    dependency since issue #626, espg ruling on PR #629).
+    """
+
+    def _root(self) -> dict:
+        return json.loads((SPEC_DATA / ICECHUNK / "zarr.json").read_text())
+
+    def _level(self, name: str) -> dict:
+        return json.loads((SPEC_DATA / ICECHUNK / name / "zarr.json").read_text())
+
+    def test_metadata_only_group_documents(self):
+        # No repository, no arrays: the root document and one per level group.
+        exp = _expected(ICECHUNK)
+        objects = sorted(
+            str(p.relative_to(SPEC_DATA / ICECHUNK))
+            for p in (SPEC_DATA / ICECHUNK).rglob("*")
+            if p.is_file()
+        )
+        assert objects == sorted([f"{c}/zarr.json" for c in exp["levels"]] + ["zarr.json"])
+
+    def test_root_document(self):
+        exp = _expected(ICECHUNK)
+        doc = self._root()
+        assert doc["zarr_format"] == 3 and doc["node_type"] == "group"
+        attrs = doc["attributes"]
+        # Exactly the three root keys (§11.1).
+        assert set(attrs) == {"zagg_icechunk", "zarr_conventions", "multiscales"}
+        block = attrs["zagg_icechunk"]
+        assert block["spec"] == "zagg-icechunk/2" and block["url_prefix"] == exp["url_prefix"]
+        assert (
+            block["shard_order"] == exp["shard_order"] and block["cell_order"] == exp["cell_order"]
+        )
+        assert list(block["levels"]) == exp["levels"]
+        assert {k: v["artifact"] for k, v in block["levels"].items()} == exp["artifacts"]
+        # The manifest's /1 entry as an OBJECT, its keys verbatim, plus the layout.
+        multiscales = dict(attrs["multiscales"])
+        assert multiscales.pop("layout") == exp["layout"]
+        assert multiscales == exp["multiscales"]
+
+    def test_registration_is_the_convention_metadata_object(self):
+        # Every key is a schema ``const``: the entry is the README's, verbatim.
+        consts = _schema(MULTISCALES_SCHEMA)["$defs"]["conventionMetadata"]["properties"]
+        assert self._root()["attributes"]["zarr_conventions"] == [
+            {k: v["const"] for k, v in consts.items()}
+        ]
+
+    def test_layout_grammar_by_hand(self):
+        # multiscales v0.1 ``layoutObject`` + the dggs#25 composition rules,
+        # asserted from the spec text: ``asset`` per the schema's path
+        # pattern, ``transform`` iff ``derived_from``, a single-element
+        # ``scale`` of 4 ** (c_from - c) and no ``translation``, the base's
+        # ``dggs`` whole and the derived ones reduced to the level.
+        schema = _schema(MULTISCALES_SCHEMA)
+        pattern = re.compile(schema["$defs"]["layoutObject"]["properties"]["asset"]["pattern"])
+        attrs = self._root()["attributes"]
+        multiscales = attrs["multiscales"]
+        assert isinstance(multiscales, dict) and "resampling_method" not in multiscales
+        layout = multiscales["layout"]
+        assert len(layout) >= 1
+        assets = [e["asset"] for e in layout]
+        assert assets == list(attrs["zagg_icechunk"]["levels"])  # one per level group, finest first
+        assert all(pattern.match(a) for a in assets)
+        base, *derived = layout
+        assert not {"derived_from", "transform"} & set(base)
+        assert base["dggs"] == self._level(base["asset"])["attributes"]["dggs"]
+        for entry in derived:
+            source, cells = entry["derived_from"], entry["asset"]
+            assert source in assets[: assets.index(cells)]  # a finer level, already listed
+            assert set(entry["transform"]) == {"scale"}
+            assert entry["transform"]["scale"] == [4.0 ** (int(source) - int(cells))]
+            assert entry["dggs"] == {"refinement_level": int(cells)}
+            level = self._level(cells)["attributes"]["dggs"]
+            assert level["refinement_level"] == int(cells) and level["spatial_dimension"] == "cells"
+
+    def test_derived_from_is_the_fold_provenance(self):
+        # ``cascade`` with ``exact_levels: 1`` on the pyramid/ knob: the column
+        # members fold the leaves (base), each overview the next-finer level.
+        exp = _expected(ICECHUNK)
+        layout = self._root()["attributes"]["multiscales"]["layout"]
+        assert exp["multiscales"]["fold"] == {"fold_source": "cascade", "exact_levels": 1}
+        base = layout[0]["asset"]
+        chain = [(e["asset"], e["derived_from"]) for e in layout[1:]]
+        column = [c for c, a in exp["artifacts"].items() if a == "column"]
+        assert [s for c, s in chain if c in column] == [base] * len(column)
+        overviews = [(c, s) for c, s in chain if c not in column]
+        assert [s for _, s in overviews] == [column[-1]] + [c for c, _ in overviews[:-1]]
+
+    def test_level_groups_carry_the_dggs_convention(self):
+        # Each level group: the dggs registration entry and a ``dggs`` block
+        # with the schema's required keys, at that level's order.
+        consts = _schema(DGGS_SCHEMA)["$defs"]["conventionMetadata"]["properties"]
+        required = _schema(DGGS_SCHEMA)["$defs"]["dggsProperties"]["required"]
+        for cells in _expected(ICECHUNK)["levels"]:
+            attrs = self._level(cells)["attributes"]
+            assert {k: v["const"] for k, v in consts.items()} in attrs["zarr_conventions"]
+            assert set(required) <= set(attrs["dggs"])
+            assert attrs["dggs"]["refinement_level"] == int(cells)
+
+    def test_root_validates_against_the_multiscales_schema(self):
+        jsonschema.validate(self._root(), _schema(MULTISCALES_SCHEMA))
+
+    def test_levels_validate_against_the_dggs_schema(self):
+        # Every level group and the base layout entry validate clean: zagg
+        # spells dggs v1's ``semi_major_axis`` since issue #616 closed the
+        # one gap (``ellipsoidObject`` is ``additionalProperties: false``).
+        schema = _schema(DGGS_SCHEMA)
+        docs = [(self._level(c), schema) for c in _expected(ICECHUNK)["levels"]]
+        # The base layout entry's ``dggs`` is a full dggsProperties object.
+        base = self._root()["attributes"]["multiscales"]["layout"][0]["dggs"]
+        sub = {"$schema": schema["$schema"], "$ref": "#/$defs/dggsProperties"}
+        docs.append((base, {**sub, "$defs": schema["$defs"]}))
+        for doc, against in docs:
+            assert [e.message for e in jsonschema.Draft7Validator(against).iter_errors(doc)] == []
 
 
 def _column_dir(exp) -> Path:
@@ -1887,10 +2085,10 @@ class TestTemporalCompanions:
 class TestLocatedDeclaration:
     """§9 — the located declaration, pinned on the committed `temporal/`.
 
-    The absent-key ⇒ §2.2 side is pinned by `kitchen_sink/`, which predates
-    this revision and is deliberately not regenerated: its located siblings
-    carry no `located` key, and a reader must read them as §2.2 verbatim
-    rather than refuse them.
+    The absent-key ⇒ §2.2 side is pinned by `kitchen_sink/`, whose two located
+    siblings its generator builder writes in the pre-§9 era (stale by design,
+    see the generator): they carry no `located` key, and a reader must read
+    them as §2.2 verbatim rather than refuse them.
     """
 
     def test_declaration_rides_the_sibling_that_holds_the_words(self):

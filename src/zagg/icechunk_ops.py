@@ -75,6 +75,7 @@ from zagg.icechunk_refs import (
     BRANCH,
     ICECHUNK_ATTR,
     MULTISCALES_ATTR,
+    ZARR_CONVENTIONS_ATTR,
     _check_block,
     _commit,
     _is_local,
@@ -87,11 +88,14 @@ from zagg.icechunk_refs import (
 )
 from zagg.icechunk_rows import array_model as _array_model
 from zagg.icechunk_rows import check_array_model, stored_rows_per_manifest
+from zagg.multiscales import live_conventions
 
 logger = logging.getLogger(__name__)
 
-#: Root attrs no ``set-attrs`` may touch: the writer's block and the mirror.
-RESERVED_ROOT_KEYS = (ICECHUNK_ATTR, MULTISCALES_ATTR)
+#: Root attrs no ``set-attrs`` may touch: the writer's block, the mirror and
+#: its convention registration (§11.1).
+RESERVED_ROOT_KEYS = (ICECHUNK_ATTR, MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)
+_CONVENTION_KEYS = (MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)
 
 #: Block keys an operation may never move (the array model and the container).
 _FIXED_BLOCK_KEYS = ("spec", "shard_order", "chunk_order", "cell_order", "url_prefix")
@@ -211,6 +215,11 @@ def set_attrs(
         if wanted == current:
             return {**details, "unchanged": True}
         node.attrs.put(wanted)
+        # The root layout copies the base group's ``dggs`` (§11.1): same commit.
+        root = zarr.open_group(session.store, mode="r+")
+        mirror = {MULTISCALES_ATTR: root.attrs.get(MULTISCALES_ATTR)}
+        if (live := live_conventions(root, mirror)) != mirror:
+            root.attrs[MULTISCALES_ATTR] = live[MULTISCALES_ATTR]
         return details
 
     return _operation(
@@ -260,7 +269,8 @@ def declare_pyramid(
     # A newly declared level's arrays are built at the repo's rows (§11.2).
     spec = repo_group_spec(grid, store_root, options, manifest, block["rows"])
     levels = spec.attributes[ICECHUNK_ATTR]["levels"]
-    mirror = spec.attributes.get(MULTISCALES_ATTR)
+    conventions = {k: spec.attributes.get(k) for k in _CONVENTION_KEYS}
+    mirror = conventions[MULTISCALES_ATTR]
     recorded = dict(block.get("levels") or {})
     for order in levels.keys() & recorded.keys():
         if levels[order] != recorded[order]:
@@ -298,12 +308,13 @@ def declare_pyramid(
             with vlen_dtype_warning_suppressed():
                 members[order].to_zarr(session.store, order, overwrite=False)
         attrs = root.attrs.asdict()
+        live = live_conventions(root, conventions)  # a set-attrs dggs change holds (§11.4)
         new_block = {**attrs[ICECHUNK_ATTR], "levels": levels, "retired": retired}
         if not retired:
             new_block.pop("retired")
         unchanged = (
             new_block == attrs[ICECHUNK_ATTR]
-            and attrs.get(MULTISCALES_ATTR) == mirror
+            and all(attrs.get(k) == v for k, v in live.items())
             and not added
         )
         details = {
@@ -315,10 +326,11 @@ def declare_pyramid(
         if unchanged:
             return {**details, "unchanged": True}
         attrs[ICECHUNK_ATTR] = new_block
-        if mirror is None:
-            attrs.pop(MULTISCALES_ATTR, None)
-        else:
-            attrs[MULTISCALES_ATTR] = mirror
+        for key, value in live.items():
+            if value is None:
+                attrs.pop(key, None)
+            else:
+                attrs[key] = value
         root.attrs.put(attrs)
         return details
 

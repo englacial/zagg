@@ -395,8 +395,15 @@ def _temporal_probe(monkeypatch):
 
     seen = []
 
-    def fake(leaf_root, cell_order, fields, **_kw):
-        zarr.open_group(leaf_root, path=str(cell_order), mode="r")["count"]
+    def fake(leaf_root, cell_order, fields, store=None, **_kw):
+        # The families sweep hands a RELATIVE key under its one handle (issue
+        # #610); the coverage refresh still hands an absolute leaf path.
+        if store is None:
+            zarr.open_group(leaf_root, path=str(cell_order), mode="r")["count"]
+        else:
+            from zagg.store import zarr_view
+
+            zarr.open_group(zarr_view(store), path=f"{leaf_root}/{cell_order}", mode="r")["count"]
         seen.append(leaf_root)
 
     monkeypatch.setattr(coverage_toc, "read_leaf_temporal", fake)
@@ -420,13 +427,15 @@ class TestReaders:
         return root, leaf, f"{leaf}/{meta['leaf_version']}"
 
     def test_moc_sweep_temporal_reads_the_version(self, monkeypatch, cfg, tmp_path):
+        from zagg.store import open_object_store
         from zagg.sweep import MocFamily
 
         root, _leaf, version = self._store(monkeypatch, cfg, tmp_path)
         seen = _temporal_probe(monkeypatch)
         family = MocFamily()
-        assert family.read_leaf(root, _LEAVES[0], None, None, {}) is not None
-        assert seen == [version] and not family._temporal_failed
+        assert family.read_leaf(open_object_store(root), _LEAVES[0], None, None) is not None
+        # The sweep reads by key relative to its one store handle (issue #610).
+        assert seen == [version.removeprefix(root + "/")] and not family._temporal_failed
 
     def test_coverage_refresh_temporal_reads_the_version(self, monkeypatch, cfg, tmp_path):
         from zagg.coverage import refresh_root_coverage
@@ -473,7 +482,7 @@ class TestReaders:
 
         root, _shards_ = self._bad_pointer_store(monkeypatch, cfg, tmp_path)
         counts = {"failed": 0}
-        fields = {"count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0}}
+        fields = {"count": {"class": "exact", "method": "sum", "dtype": "int64", "fill_value": 0}}
         result = _fold_node(root, "1111", 3, [None], list(_LEAVES[:2]), fields, 6, 4, counts, {})
         assert counts["failed"] == 1  # the bad leaf, not the whole node
         assert np.asarray(result["slabs"]["count"]).sum() > 0  # the good leaf folded
@@ -486,7 +495,7 @@ class TestReaders:
 
         root, shards = self._bad_pointer_store(monkeypatch, cfg, tmp_path)
         monkeypatch.setattr(sweep, "discover_leaves", lambda *_a, **_k: [(s, None) for s in shards])
-        block = {"overview": {"fields": {"count": {"class": "exact", "dtype": "int32"}}}}
+        block = {"overview": {"fields": {"count": {"class": "exact", "dtype": "int64"}}}}
         got = _validate_block_against_store(root, {"cell_order": 6}, block, {})
         good = hive.shard_leaf_path(root, shards[1])
         assert got == f"leaf {good}/{hive.read_commit(good)['current']}"

@@ -1,0 +1,260 @@
+{
+ "spec": "morton-hive/1",
+ "dataset": {
+  "short_name": "ATL03",
+  "version": "007"
+ },
+ "semantic_hash": "aacfe1e387d2289276572ac941449d4042a174ccc9976528af530d2993b2258a",
+ "cell_order": 19,
+ "shard_order": 9,
+ "split_schedule": [
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1
+ ],
+ "path_grouping": 1,
+ "pyramid": {
+  "spec": "zagg-pyramid/2",
+  "overviews": [
+   {
+    "node": 9,
+    "cells": [
+     13
+    ]
+   },
+   {
+    "node": 8,
+    "cells": [
+     12
+    ]
+   },
+   {
+    "node": 7,
+    "cells": [
+     11
+    ]
+   },
+   {
+    "node": 6,
+    "cells": [
+     10
+    ]
+   },
+   {
+    "node": 5,
+    "cells": [
+     9
+    ]
+   },
+   {
+    "node": 4,
+    "cells": [
+     8
+    ]
+   },
+   {
+    "node": 3,
+    "cells": [
+     7
+    ]
+   },
+   {
+    "node": 2,
+    "cells": [
+     6
+    ]
+   },
+   {
+    "node": 1,
+    "cells": [
+     5
+    ]
+   },
+   {
+    "node": 0,
+    "cells": [
+     4
+    ]
+   }
+  ],
+  "overview": {
+   "all_time": false,
+   "fold_source": "cascade",
+   "exact_levels": 1,
+   "fields": {
+    "count": {
+     "class": "exact",
+     "method": "sum",
+     "nan_policy": "skip",
+     "dtype": "int32",
+     "fill_value": 0
+    },
+    "h_tdigest_signal": {
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 4096,
+     "overview_delta": 512,
+     "location": "leaf_id",
+     "temporal": "per-centroid"
+    },
+    "h_tdigest_noise": {
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 4096,
+     "overview_delta": 512,
+     "location": "leaf_id",
+     "temporal": "per-centroid"
+    },
+    "composition": {
+     "class": "packed",
+     "method": "composition_kway",
+     "dtype": "uint64",
+     "fill_value": 0,
+     "of": "h_tdigest_signal",
+     "threshold": 2
+    }
+   }
+  }
+ },
+ "generated_at": "2026-10-08T01:45:47+00:00",
+ "multiscales": [
+  {
+   "spec": "zagg-multiscales/1",
+   "name": "ATL03",
+   "base": {
+    "order": 9,
+    "cells": [
+     19
+    ]
+   },
+   "datasets": [
+    {
+     "order": 9,
+     "cells": [
+      13
+     ],
+     "artifact": "column"
+    },
+    {
+     "order": 8,
+     "cells": [
+      12
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 7,
+     "cells": [
+      11
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 6,
+     "cells": [
+      10
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 5,
+     "cells": [
+      9
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 4,
+     "cells": [
+      8
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 3,
+     "cells": [
+      7
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 2,
+     "cells": [
+      6
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 1,
+     "cells": [
+      5
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 0,
+     "cells": [
+      4
+     ],
+     "artifact": "overview"
+    }
+   ],
+   "order2res": {
+    "9": [
+     13
+    ],
+    "8": [
+     12
+    ],
+    "7": [
+     11
+    ],
+    "6": [
+     10
+    ],
+    "5": [
+     9
+    ],
+    "4": [
+     8
+    ],
+    "3": [
+     7
+    ],
+    "2": [
+     6
+    ],
+    "1": [
+     5
+    ],
+    "0": [
+     4
+    ]
+   },
+   "fields": {
+    "count": "exact",
+    "h_tdigest_signal": "approximate",
+    "h_tdigest_noise": "approximate",
+    "composition": "packed"
+   },
+   "fold": {
+    "fold_source": "cascade",
+    "exact_levels": 1
+   }
+  }
+ ]
+}

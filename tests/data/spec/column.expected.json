@@ -205,11 +205,11 @@
  ],
  "content_hashes": {
   "arrays": {
-   "6/count": "29458cad5550071cc942b81809aa26becc67c09a3e2e209e4876d8782224757b",
+   "6/count": "4aec3cf06563de006246f3c30a7e1e4688e8a8b0171185371cdf4203d6f7c88d",
    "6/h_tdigest": "ba43774865b69f60aaf42875c9c4a72edaca6058bd9a4fb95760d43f203c9d4c",
    "6/morton": "f6282635e373d534ef4d91166d306441049e7bbed3d7d2ec8add306f62274d06"
   },
-  "combined": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e"
+  "combined": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c"
  },
  "declared": {
   "overviews": 5
@@ -253,13 +253,24 @@
     }
    },
    "cells_with_data_order": 5,
-   "generated_at": "2026-08-11T00:43:29+00:00"
+   "generated_at": "2026-10-12T01:50:14+00:00"
   },
   "commit": {
    "spec": "morton-hive/1",
    "complete": true,
    "cells_with_data": 3,
-   "granule_count": 1
+   "granule_count": 1,
+   "content_hashes": {
+    "arrays": {
+     "4/count": "c7929c9c12d5874a9169e0676c1425a1f0feaa58f23d173c625d5d2791e03d11",
+     "4/h_tdigest": "426e08cf5ffff12ae644bfede36cf45904ad79a128d9686053b0dc08f6dede9e",
+     "4/morton": "92cedd52796c6c0844af1ce3e7e7636ed28804f6bf8f9d10ceab93edf1a29805",
+     "5/count": "c4654f97d4d1c0e0bb78fb05b14d189fe8b4d5ec7921ff4acc0860952b9b8769",
+     "5/h_tdigest": "2850bd5d0e8ea6c4273a771ce6e0377a30bfe4a6dee083c08758fdf0afbe4bf4",
+     "5/morton": "2d7a07b3e2db265b2050fedfd968fb6763f5b012c87033526852bffc90b059d2"
+    },
+    "combined": "b28367197206f325ea9a43a51d6bc488273b2c605575d71a7b961cecde8731ba"
+   }
   },
   "groups": {
    "5": {
@@ -540,14 +551,14 @@
   },
   "content_hashes": {
    "arrays": {
-    "4/count": "71f269d578d413efdf624d699f2d8430be995bd75dba859bd9a782e7c89c3118",
+    "4/count": "c7929c9c12d5874a9169e0676c1425a1f0feaa58f23d173c625d5d2791e03d11",
     "4/h_tdigest": "426e08cf5ffff12ae644bfede36cf45904ad79a128d9686053b0dc08f6dede9e",
     "4/morton": "92cedd52796c6c0844af1ce3e7e7636ed28804f6bf8f9d10ceab93edf1a29805",
-    "5/count": "6380596d3ca826d3ccda1b07f368ca3b43b486b7aaa0ca17e055ac8bf0b2c064",
+    "5/count": "c4654f97d4d1c0e0bb78fb05b14d189fe8b4d5ec7921ff4acc0860952b9b8769",
     "5/h_tdigest": "2850bd5d0e8ea6c4273a771ce6e0377a30bfe4a6dee083c08758fdf0afbe4bf4",
     "5/morton": "2d7a07b3e2db265b2050fedfd968fb6763f5b012c87033526852bffc90b059d2"
    },
-   "combined": "061277118c8cc4c0b8ae3c62fe6515fefa8f9ccb717bd3104f4c8797edbcc918"
+   "combined": "b28367197206f325ea9a43a51d6bc488273b2c605575d71a7b961cecde8731ba"
   }
  }
 }

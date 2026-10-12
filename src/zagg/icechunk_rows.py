@@ -369,7 +369,13 @@ def grow_rows(session, rows: list, labels: Iterable[str], temporal: dict | None)
 
 
 def commit_rows(
-    repo, existing: dict, updates: dict, labels: list, temporal: dict | None, commit
+    repo,
+    existing: dict,
+    updates: dict,
+    labels: list,
+    temporal: dict | None,
+    commit,
+    root_attrs: Mapping | None = None,
 ) -> tuple:
     """A reopened repo's init commit: block ``updates`` + the run's new rows; ``(snapshot, rows)``.
 
@@ -383,11 +389,18 @@ def commit_rows(
     ``updates`` themselves (the winner made the same ones) — raises instead:
     re-applying them would overwrite the winner's ratchet or knobs, and the
     caller fails open as it did when such a race raised before the rows.
+
+    ``root_attrs`` are other root keys this init refreshes (the §11.1
+    convention keys; ``None`` removes one), each written only where it
+    differs — an up-to-date repo's init stays the empty commit — with the
+    base layout entry's ``dggs`` read from the live group, so the init never
+    reverts a ``set-attrs`` change (:func:`zagg.multiscales.live_conventions`).
     """
     import icechunk
     import zarr
 
     from zagg.icechunk_refs import BRANCH, ICECHUNK_ATTR
+    from zagg.multiscales import live_conventions
 
     based_on = ({**existing, "rows": None}, {**existing, **updates, "rows": None})
     tries = 0
@@ -405,6 +418,12 @@ def commit_rows(
         rows = grow_rows(session, list(block["rows"]), labels, temporal)
         if {**block, **updates, "rows": rows} != block:
             root.attrs[ICECHUNK_ATTR] = {**block, **updates, "rows": rows}
+        for key, value in live_conventions(root, dict(root_attrs or {})).items():
+            if root.attrs.get(key) != value:
+                if value is None:
+                    del root.attrs[key]
+                else:
+                    root.attrs[key] = value
         try:
             return commit(session), rows
         except icechunk.RebaseFailedError:

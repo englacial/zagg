@@ -601,7 +601,45 @@ coarse rollup levels, the root `coverage.moc` refresh, and the manifest's
 `pyramid.materialized` bookkeeping all span partitions and are left to a
 coarse-level finisher (issue #377).
 
-Until that finisher lands, the coarse levels of the **JSON rollup families**
+**The run tail partitions this itself** on the Lambda backends ([issue
+#610](https://github.com/englacial/zagg/issues/610)): the end-of-run
+families pass is split `4^k` ways from the run's own leaf count — `k` from
+`ceil(log4(leaves / 128))`, then refined until no partition holds more than
+128 leaves, because a regional store's leaves cluster (the 2,959-leaf
+California store's 64-way split held 1,050 in one) — fired one `mode="sweep"`
+invoke per non-empty partition, awaited on the copy of each one's record it
+drops as `families-p<i>of<n>.json` under the run's status prefix
+(`<store>.status/run-<run_id>/`; the `sweep_stats_<ts>_p<i>of<n>.json` at the
+store root still lands), and then finished by a partition-less invoke
+awaited on its own `families-finisher.json`; a run of at most 128 leaves is
+the one pass it always was. The outcome rides the run summary and the
+`zagg.client` handle as `families_sweep: {partitions, fired, landed,
+finisher, accumulators, run_id, records_from, duration_s}`, with `finisher` `"ok"`,
+`"records_short"` (a partition's record never landed), `"timed_out"` (the
+finisher's did not) or `"dispatch_failed"` (an invoke raised after others
+fired; `error` says why), so a short root temporal section is reported
+rather than discovered later. **The finisher reads no leaf for the
+`stats`/`moc`/`submap` families** (the `overview` family's own fold on a
+`/1` store is unchanged and still opens its leaves; a `/2` store refuses it
+first): each
+partition's record carries, under `families.moc.accumulator`, the §10
+contributions it read — every visited shard's envelope word and counted cover
+per window leaf (the §10.3 block grammar), the uncounted set, the declared
+fields and the route tally — and when every record landed the finisher event
+names them (`finisher: {of, records_from, accumulators}`; `accumulators` in
+the outcome is how many), the worker folds the blocks, and its walk starts
+from the split-order rollups the partitions wrote, so the coarse levels, the
+root `coverage.moc` and `coverage.toc` compose from rollup reads and `n`
+record GETs, byte-identical to a single pass. A missing or unusable record,
+or a work set holding a shard no partition visited, sends it back to the
+leaf walk, which its own record says (`finisher.fallback`); an event too
+large to carry its leaves inline (`discover: true`) carries no `finisher`
+block at all, since the discovered work set is the store's, not this run's. The local backend sweeps in-process and needs none of
+this.
+
+On the Lambda backends the tail fires that finisher itself. For hand
+`--partitions` passes (the local CLI, or a tail whose finisher did not land),
+until a finisher lands, the coarse levels of the **JSON rollup families**
 (`stats`, `moc`, `submap`) can be picked up by following a partitioned sweep
 with a plain `python -m zagg.sweep <root> --families stats,moc,submap`: the
 partitions' work is skip-if-current, and an interior fold reads its children's
@@ -661,14 +699,72 @@ operator's steps are in
 
 **Cadence.** Ladder orders are grouped into dispatch tuples of
 `tuple_width` consecutive orders (default 3: `[8,7,6] → [5,4,3] → [2,1,0]`
-on an o9 store). Each stage worker reads exactly its `4^width` immediate
-child columns, emits its tuple's level artifacts, and writes its own column
-carrying — as a pure gather — the **relayed gen-1 leaf partials** for its
-subtree. Every merge, at every level, consumes only that relayed gen-1
-tier (the espg merge-source ruling), so **the cadence changes no bytes**:
-`--tuple-width 1` and `--tuple-width 3` build byte-identical ladders, and
-every upfront merge level is uniformly 2 merges from raw (gathers are 1;
-gen 3 is append-later cascade territory only).
+on an o9 store). A stage worker folds its tuple's levels finest first: a
+**gather** level (cells at or above the shard order) concatenates its
+children's column members, a **merge** level **cascades** its four
+children's artifacts at the level one order finer — the ones the same
+worker has just folded, from memory, or the previous tuple's, read back off
+the store ([issue #620](https://github.com/englacial/zagg/issues/620)). A
+merge node therefore reads four slabs whatever its subtree holds (1,024
+cells in, 256 out at the reference geometry), where it used to re-read its
+whole footprint at the leaf columns' relay resolution (18.9M cells at
+order 0, past the 900 s wall at the dense order-1 node). The worker's own
+column carries only the members a coarser gather consumes — nothing for
+the merges, so a dispatch node below which nothing gathers writes none. The
+values are a fixed function of the ladder, so **the cadence changes no
+values**: `--tuple-width 1` and `--tuple-width 3` build the same ladder,
+and `merges_from_raw` records the fold depth (at a gather, the depth of the
+column groups it concatenates; one more than its children's at a merge).
+
+**The run tail sizes the cadence itself** ([issue
+#610](https://github.com/englacial/zagg/issues/610)). A dispatch node folds
+its *whole* subtree down to its tuple's child order inside one invoke, so a
+fixed width puts `1 + 4 + … + 4^(width-1)` nodes on one worker wherever the
+store is dense — 21 at width 3, which is what walled the v3 ladder: the
+`[2,1,0]` tuple's base-cell-`3` invoke hit the 900 s wall after 12 of its 16
+order-2 nodes, no record landed, and the barrier was waited out. Capping the
+*nodes* an invoke is handed (`max_nodes_per_invoke`, already 1) does not help:
+the subtree is one node's work. (The two compose rather than substitute — `n`
+nodes on one invoke fold up to `n ×` a node's own subtree — so the schedule is
+sized against the target shared out per node.) So the Lambda tail asks for a **sized**
+schedule — each fixed-width tuple is subdivided inside its own span until its
+fattest dispatch node folds at most `STAGE_TARGET_NODES` (8) nodes. The tail
+hands the dispatcher no coverage MOC (a dispatcher may not read one itself,
+D8), so the fold is the **dense bound** `(4^width − 1) / 3` — 21 at width 3,
+5 at width 2 — which never under-estimates; a caller that *does* hand a
+coverage MOC in gets the fold measured over the set the worker folds (the
+run's leaves ∪ that coverage), and may keep the full width where the store is
+genuinely sparse. Nothing is read from the store either way. A dense o9
+ladder's three width-3 tuples folding 21 nodes an invoke become **six tuples
+— width 2 then width 1 inside each** — folding 5; a store that needs no
+narrowing keeps the fixed-width schedule outright, at every `shard_order`,
+because the sizing only ever adds a boundary inside a fixed tuple and never
+moves one. Because a subtree's node count steps by powers of four, any target
+in `[5, 20]` picks the same schedule there. Such a tuple dispatches at an order no single width
+lands on, so its events carry their span (`child_order`) outright; a worker
+deployed before this refuses one by name rather than folding the wrong span.
+The cadence is still a dispatch knob like `--tuple-width` itself — a sized
+build's ladder **overviews** are the fixed-width build's, which is what the
+oracle pins. Not every byte: the group attrs carry per-run provenance that
+is grouping-dependent by design (`source_children`, the summed child
+`generation`), and a sized build may write stage columns a wider grouping
+never needs. `python -m zagg.sweep --stages` is unchanged (the CLI has no
+900 s wall).
+
+**A short tuple does not stamp the manifest.** The finisher records per-level
+`actuals` from the run's stage records; a tuple whose unit record never landed
+has none, and before issue #610 the levels it owned were stamped from
+whatever the run *did* observe, exactly like the complete ones — the v3 run
+wrote actuals complete for orders 8..3 and short for 2..0 with nothing to
+tell them apart. The dispatcher now names the short orders to the finisher
+(`short_orders`, from the tuples it is missing a unit record for), and their
+level entries are **left as they stood** while the orders that landed are
+recorded as usual. A tuple is short on either fan-out, so a lost all-time
+**close** record withholds that tuple's window levels too, even where their
+per-window records all landed — the safe direction: a withheld level keeps
+the actuals it had until a pass observes it in full. The finisher's record says which it withheld
+(`short_orders`, `finisher.actuals_withheld`), the tail warns, and the next
+staged pass records them.
 
 **Units.** The unit of stage work is the dispatch node on an unwindowed
 store and the **`(node, window)` pair** on a windowed one
@@ -817,15 +913,16 @@ window's objects, and every finding names the node and the window
   on every artifact, not a sample — the all-time folds' `window: all` too,
   reported under `all_time`), plus the per-window regime, `merges_from_raw`
   and `source_children` of §4.4 on the sampled nodes.
-- `counts` / `digests` / `composition` — a window's overview re-folded from
-  **that window's** leaf columns, and its columns from **that window's**
-  leaves, for `--sample-windows` windows (default 3). An overview built
+- `counts` / `digests` / `composition` — a window's gather levels re-folded
+  from **that window's** leaf columns, its merge levels from their children's
+  artifacts in that window, and its columns from **that window's** leaves,
+  for `--sample-windows` windows (default 3). An overview built
   from another window's leaves fails here.
 - `all_time` — where the manifest declares `pyramid.overview.all_time`: a
   committed `all.zarr` at every ladder node, and for the sampled nodes its
   values against the k-way fold of the node's own `{window}.zarr` overviews,
-  `regime: stage-merge`, `merges_from_raw` 2 at a gather level and 3 at a
-  merge level, `source_windows` equal to the windows the node holds, and
+  `regime: stage-merge`, `merges_from_raw` one more than the deepest of
+  those overviews', `source_windows` equal to the windows the node holds, and
   `source_children` / `generation` equal to those overviews' blocks summed.
   A fold that consumed fewer windows than the node now holds is reported
   `STALE`. Where the store declares no all-time fold the check is reported
@@ -1469,8 +1566,9 @@ produce the same leaves" wrongly (a relocated index cache read as a
 different product), and a wrong answer cannot be preserved for
 compatibility. No leaf byte moves; only the label is restated.
 
-**Who it hits.** Both live stores were built with an index block, so their
-frozen manifest hashes are pre-epoch:
+**Who it hits.** Both stores that were live at the epoch were built with an index block,
+so their frozen manifest hashes are pre-epoch (the ATL03 v3 rebuild of
+2026-10-08 was born post-epoch — see [The live stores](#the-live-stores-issue-560-cutover-2026-10-08)):
 
 | store | `data_source.index` | frozen `semantic_hash` today | migrates to |
 |---|---|---|---|
@@ -1531,7 +1629,8 @@ the config *is* the store's own before it writes.
 
 **Skip-gate consequence — deliberate, not fixed.** `zagg.dedup` compares the
 hash strings stamped in run records and leaf sidecars against the current
-digest, and those stamps on the two live stores are pre-epoch. After the
+digest, and those stamps on the two stores in the table above
+(`atl03_tdigest_o9`, `gedi_flux_o9`) are pre-epoch. After the
 epoch they read as **stale**: a same-shard re-dispatch into either store
 **rewrites** the leaf instead of skipping it (the `semantic-mismatch`
 classification), exactly the D19 epoch's "first post-epoch run is a full
@@ -2123,7 +2222,9 @@ storage = icechunk.s3_storage(
 )
 repo = icechunk.Repository.open(
     storage,
-    authorize_virtual_chunk_access={root_prefix: icechunk.s3_anonymous_credentials()},
+    authorize_virtual_chunk_access={
+        root_prefix: icechunk.Credentials.S3(icechunk.s3_anonymous_credentials())
+    },
 )
 group = zarr.open_group(repo.readonly_session("main").store, mode="r")
 group.attrs["multiscales"]         # the manifest's zagg-multiscales/1 block: every level
@@ -2147,7 +2248,11 @@ reader in a browser takes. A private store swaps `anonymous=True` for
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` **environment variables only** —
 not the botocore chain, so an `AWS_PROFILE` reader wants `get_credentials=`
 and `icechunk.s3_refreshable_credentials(...)` instead (which is what the
-writer itself does, `icechunk_refs._boto3_credentials`). Pass `region=`
+writer itself does, `icechunk_refs._boto3_credentials`). That callable must
+hand icechunk an `expires_after` whose tzinfo is `datetime.timezone.utc`
+itself; botocore's refreshable expiry is a dateutil tzinfo (`tzutc()` or a
+`tzoffset`), which icechunk rejects, so convert it with
+`.astimezone(datetime.timezone.utc)` as `_boto3_credentials` does. Pass `region=`
 either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `us-west-2`. Nothing here imports zagg — the repo opens from its own recorded
 `url_prefix` and the paths above, which is what makes the same two calls
@@ -2264,6 +2369,43 @@ Incremental runs union with the existing object; concurrent runs race
 benignly (GET-union-PUT is not atomic: last writer wins, and its union may
 miss the loser's shards until the sweep or the next run re-unions — accepted
 under D9/O7). The §7 sweep remains the authoritative rebuilder.
+
+## The live stores (issue #560 cutover, 2026-10-08)
+
+The ATL03 demo store was rebuilt from scratch on the 0.57.0 fleet as
+`atl03_tdigest_o9_v3.zarr` and is the store every ATL03 reader in this tree
+now names ([issue #560](https://github.com/englacial/zagg/issues/560); the
+runbook is the operator's `demo/15_rebuild_2026-10.ipynb`, kept outside the
+tree). It was built from the packaged `atl03_tdigest_strata_healpix` template
+(plus `output.pyramid: {overviews: 13}`) against the frozen operator-local
+shardmaps `shardmap_california_o9.json` (2,726 shards) and
+`shardmap_neon_aop_o9.json` (251 shards, 13 overlapping), not in the tree, so its manifest is born at the post-epoch digest
+`aacfe1e387d2…` (no [index-exclusion migration](#migration-the-index-exclusion-epoch-issue-499)
+applies) and carries: cell 19 / shard 9 / `chunk_inner` 13; the dense
+`zagg-pyramid/2` ladder 13..4 declared at init together with its
+`multiscales` mirror; versioned leaves (pointer roots, spec §1.5); four-field
+leaf columns from birth; and an Icechunk companion repo at
+`…/atl03_tdigest_o9_v3.zarr/icechunk` (`zagg-icechunk/2`, rows `["all"]`,
+tagged `run-9f01f911935a4b6184e3ac87ec843895` for the CA run and
+`run-9a12b233146049f399ae34cc66e7ec2f` for the NEON append). Its manifest
+is vendored as `tests/data/ca_atl03_tdigest_o9_v3_morton_hive.json` and is
+the anchor `tests/test_live_store_templates.py` pins the template to. Two
+gaps were known at cutover: the root temporal section is short (the run
+tail's families sweep dies at the 900 s wall on a store-scale run,
+[issue #610](https://github.com/englacial/zagg/issues/610)), and five NEON
+shards OOMed on the 4 GB tier and await a re-dispatch (coverage was 2,959
+shards; the ladder sweep was still running). `atl03_tdigest_o9_v2.zarr`
+was deleted on 2026-10-07 and is referenced nowhere. All stores below sit
+under `s3://us-west-2.opendata.source.coop/englacial/zagg/demo/` and are
+anonymously readable.
+
+| store | role | built | frozen `semantic_hash` |
+|---|---|---|---|
+| `atl03_tdigest_o9_v3.zarr` | **live ATL03** | 0.57.0 fleet, 2026-10-08 | `aacfe1e387d2…` (post-epoch) |
+| `gedi_flux_o9.zarr` | **live GEDI** — unchanged, no GEDI rebuild this round | 0.52.0, 2026-08 | `4f8287947a83…` (pre-epoch) |
+| `atl03_tdigest_o9.zarr` | v1 ATL03, retained as the comparison store | 2026-08-19 | `b9b15fdde78f…` (pre-epoch) |
+| `serc_atl03_v3.zarr` | current SERC canary (4 shards; ladder swept, `pyramid_check` PASS, tagged `run-e10d7d83f79d46d8913cd41d88ff54c3`) | 0.57.0 | — |
+| `serc_atl03_v2.zarr` | the 0.55.0 fleet's SERC canary | 0.55.0 | — |
 
 ## Status
 

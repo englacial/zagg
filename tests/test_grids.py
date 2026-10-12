@@ -1228,6 +1228,23 @@ class TestCellIdsEncoding:
         g.emit_shard_template(store)
         assert open_group(store, path="8", mode="r").attrs["dggs"]["latitude"] == "authalic-wgs84"
 
+    def test_dggs_ellipsoid_keys_match_the_v1_schema(self):
+        # Issue #616: the dggs v1 schema's ``ellipsoidObject`` is
+        # ``additionalProperties: false`` and spells ``semi_major_axis``; the
+        # ``semi_major_axis`` + ``inverse_flattening`` branch of its ``oneOf``
+        # forbids ``radius`` and a semi-minor axis. Pin the EXACT key set, off
+        # the return value and off the written leaf group.
+        schema_keys = {"name", "semi_major_axis", "inverse_flattening"}
+        g = self._grid()
+        assert set(g._dggs_attrs()["dggs"]["ellipsoid"]) == schema_keys
+        store = MemoryStore()
+        g.emit_shard_template(store)
+        ellipsoid = open_group(store, path="8", mode="r").attrs["dggs"]["ellipsoid"]
+        assert set(ellipsoid) == schema_keys
+        assert ellipsoid["name"] == "WGS84"
+        assert ellipsoid["semi_major_axis"] == 6378137.0
+        assert ellipsoid["inverse_flattening"] == 298.257223563
+
     def test_morton_convention_constants_pinned(self):
         # The self-declared convention identity (issue #305): the UUID is
         # minted once and PERMANENT — this pin makes an accidental regeneration

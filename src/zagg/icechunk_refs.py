@@ -47,6 +47,7 @@ object stores use conditional writes and need no lock.
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 import math
 import threading
@@ -75,6 +76,7 @@ from zagg.icechunk_rows import (
     unit_row,
     write_bounds,
 )
+from zagg.windows import parse_utc
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +85,12 @@ logger = logging.getLogger(__name__)
 ICECHUNK_SPEC = "zagg-icechunk/2"
 #: Root-group attrs key carrying the block.
 ICECHUNK_ATTR = "zagg_icechunk"
-#: Root-group attrs key carrying the manifest's multiscales mirror (§11.1).
+#: Root-group attrs key carrying the manifest's multiscales mirror (§11.1) —
+#: the ``zagg-multiscales/1`` block as an OBJECT plus the zarr-conventions
+#: ``multiscales`` v0.1 ``layout`` composed with ``dggs`` (issue #615).
 MULTISCALES_ATTR = "multiscales"
+#: Root-group attrs key carrying the convention registration (§11.1).
+ZARR_CONVENTIONS_ATTR = "zarr_conventions"
 #: The one branch every commit lands on (§11.4).
 BRANCH = "main"
 #: Icechunk's configurable default ``min_num_chunks`` below which a manifest
@@ -333,11 +339,14 @@ def _boto3_credentials():
     if creds is None:
         raise RuntimeError("no AWS credentials resolved for the icechunk repo")
     frozen = creds.get_frozen_credentials()
+    expiry = getattr(creds, "_expiry_time", None)
     return S3StaticCredentials(
         access_key_id=frozen.access_key,
         secret_access_key=frozen.secret_key,
         session_token=frozen.token,
-        expires_after=getattr(creds, "_expiry_time", None),
+        # icechunk requires tzinfo to be ``datetime.timezone.utc`` itself; botocore's
+        # is a dateutil ``tzutc()``/``tzoffset``, so normalize it (issue #608).
+        expires_after=None if expiry is None else parse_utc(expiry),
     )
 
 
@@ -405,7 +414,10 @@ def _container(store_root: str, store_kwargs: dict):
         allow_http=bool(endpoint and endpoint.startswith("http://")),
         force_path_style=bool(endpoint),
     )
-    return icechunk.VirtualChunkContainer(prefix, store), _s3_credentials(store_kwargs)
+    # Issue #606: the authorization dict takes ``Credentials`` members, so the
+    # bare ``S3Credentials`` (static or refreshable) is wrapped here, at the one seam.
+    creds = icechunk.Credentials.S3(_s3_credentials(store_kwargs))
+    return icechunk.VirtualChunkContainer(prefix, store), creds
 
 
 def _repo_config(store_root: str, splits: dict, store_kwargs: dict):
@@ -550,6 +562,75 @@ def level_grids(manifest: dict, grid) -> dict:
     return levels
 
 
+def multiscales_layout(manifest: dict, dggs: dict) -> list[dict]:
+    """The zarr-conventions ``multiscales`` v0.1 ``layout``, composed with ``dggs`` (§11.1).
+
+    One entry per level group (``dggs`` maps each level's cell order to that
+    group's ``dggs`` attrs block), finest first, ``asset`` the group name.
+    The base carries its ``dggs`` object whole (zarr-conventions/dggs#25:
+    "specify the full ``dggs`` object for the original data"); every derived
+    level carries the reduced ``{"refinement_level": c}`` plus ``derived_from``
+    and the single-element ``scale`` — ``4 ** (c_from - c)`` on the cells
+    axis (nested order: four children per parent), never a ``translation``.
+    ``derived_from`` is the manifest's declared fold provenance (§4.5
+    ``fold``): the column level folds the base's own leaves, as does every
+    level inside the ``exact_levels`` boundary or under the ``leaves``
+    regime; a cascaded level folds the next-finer level. Pure: the manifest
+    wins any disagreement (§4.9), and this is recomputed from it at every
+    init and ``declare-pyramid``.
+    """
+    from zagg.multiscales import ARTIFACT_COLUMN
+
+    (block,) = manifest[MULTISCALES_ATTR]
+    base = int(block["base"]["cells"][0])
+    fold = block.get("fold") or {}
+    cascade = fold.get("fold_source") == "cascade"
+    exact = int(fold.get("exact_levels") or 0)
+    entry_of: dict = {}  # first entry wins a duplicated cell order, as in level_grids
+    for i, e in enumerate(block["datasets"]):
+        for c in e["cells"]:
+            entry_of.setdefault(int(c), (i, e))
+    layout = [{"asset": str(base), "dggs": copy.deepcopy(dggs[base])}]
+    finer = base
+    for cells in sorted((int(c) for c in dggs), reverse=True):
+        if cells == base:
+            continue
+        i, entry = entry_of[cells]
+        from_leaves = not cascade or entry["artifact"] == ARTIFACT_COLUMN or i < exact
+        source = base if from_leaves else finer
+        layout.append(
+            {
+                "asset": str(cells),
+                "derived_from": str(source),
+                "transform": {"scale": [float(4 ** (source - cells))]},
+                "dggs": {"refinement_level": cells},
+            }
+        )
+        finer = cells
+    return layout
+
+
+def root_conventions(manifest: dict, dggs: dict) -> dict:
+    """The root's convention attrs (§11.1): ``{}`` on a store with no mirror.
+
+    ``dggs`` maps each level's cell order to its group's ``dggs`` attrs
+    block (as :func:`multiscales_layout` takes it). The manifest's
+    single ``zagg-multiscales/1`` entry becomes the root ``multiscales``
+    OBJECT (its keys verbatim — the v0.1 schema's ``additionalProperties``)
+    plus :func:`multiscales_layout`; ``zarr_conventions`` registers the
+    convention. Absent exactly when the manifest declares no mirror.
+    """
+    from zagg.multiscales import MULTISCALES_CONVENTION
+
+    mirror = manifest.get(MULTISCALES_ATTR)
+    if not mirror:
+        return {}
+    return {
+        ZARR_CONVENTIONS_ATTR: [dict(MULTISCALES_CONVENTION)],
+        MULTISCALES_ATTR: {**mirror[0], "layout": multiscales_layout(manifest, dggs)},
+    }
+
+
 def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(ALL_ROW,)):
     """The repo's hierarchy: the root attrs, a group per level, the row coordinate (``rows``)."""
     from pydantic_zarr.experimental.v3 import GroupSpec
@@ -587,15 +668,13 @@ def repo_group_spec(grid, store_root: str, options: dict, manifest: dict, rows=(
         # compatibility key.
         **{k: options[k] for k in ("commit", "commit_order", "split_order", "rows_per_manifest")},
     }
-    attributes: dict = {ICECHUNK_ATTR: block}
-    mirror = manifest.get(MULTISCALES_ATTR)
-    if mirror is not None:
-        # The §4.9 discovery mirror, verbatim: one repo, every level findable
-        # from its root attrs (the icechunk-multiscales convention).
-        attributes[MULTISCALES_ATTR] = mirror
     members = {
         str(cells): level_group_spec(level["grid"], len(rows)) for cells, level in grids.items()
     }
+    # The §4.9 discovery mirror as a conformant multiscales group (§11.1):
+    # one repo, every level findable from its root attrs.
+    dggs = {int(name): spec.attributes["dggs"] for name, spec in members.items()}
+    attributes: dict = {ICECHUNK_ATTR: block, **root_conventions(manifest, dggs)}
     members.update(coordinate_specs(len(rows), manifest.get("temporal")))
     return GroupSpec(members=members, attributes=attributes)
 
@@ -808,6 +887,10 @@ def init_repo(
             lambda s: _commit(
                 s, message, local=local, path=path, metadata={"run_id": run_id}, allow_empty=True
             )[0],
+            # A repo built before the §11.1 object shape upgrades on the fleet path.
+            root_attrs={
+                k: spec.attributes.get(k) for k in (MULTISCALES_ATTR, ZARR_CONVENTIONS_ATTR)
+            },
         )
     return {
         "path": path,
@@ -1268,6 +1351,7 @@ __all__ = [
     "LOCATION_DICT_MIN_CHUNKS",
     "MULTISCALES_ATTR",
     "REBASE_TRIES",
+    "ZARR_CONVENTIONS_ATTR",
     "commit_units",
     "container_prefix",
     "finest_dispatch_order",
@@ -1277,6 +1361,7 @@ __all__ = [
     "level_grids",
     "leaf_ref_plan",
     "level_group_spec",
+    "multiscales_layout",
     "object_ref_plan",
     "open_repo",
     "open_vetted",
@@ -1285,6 +1370,7 @@ __all__ = [
     "repo_group_spec",
     "repo_path",
     "resolve_options",
+    "root_conventions",
     "block_splits",
     "split_block",
     "split_exponent",

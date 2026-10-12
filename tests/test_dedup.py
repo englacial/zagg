@@ -143,7 +143,7 @@ class TestShardStatus:
         cfg = _cfg()
         _write_leaf(str(tmp_path), cfg)
         other = copy.deepcopy(cfg)
-        other.aggregation["variables"]["count"]["dtype"] = "int64"
+        other.aggregation["variables"]["count"]["dtype"] = "int32"  # the pre-#626 width
         status = shard_status(
             str(tmp_path), WORD, semantic_hash=semantic_hash(other), granule_ids=GRANULES
         )

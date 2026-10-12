@@ -8,6 +8,7 @@ against real shard objects, never against a hand-built index.
 
 from __future__ import annotations
 
+import datetime
 import json
 import threading
 import time
@@ -16,11 +17,13 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from dateutil.tz import tzoffset, tzutc
 
 from zagg import hive, icechunk_refs, icechunk_rows
 from zagg.config import default_config, get_data_vars
 from zagg.grids.healpix import HealpixGrid
 from zagg.grids.morton import morton_decimal, morton_word
+from zagg.multiscales import MULTISCALES_CONVENTION
 
 icechunk = pytest.importorskip("icechunk")
 
@@ -400,8 +403,15 @@ class TestInit:
             "2": {"chunks": 4, "order": 0, "rows": 1},
             "1": {"chunks": 1, "order": 0, "rows": 1},
         }
-        # The manifest's §4.9 multiscales mirror rides the root attrs.
-        assert group.attrs["multiscales"] == hive.build_manifest(grid)["multiscales"]
+        # The manifest's §4.9 multiscales mirror rides the root attrs as the
+        # conformant multiscales OBJECT: its keys verbatim plus the layout.
+        (mirror,) = hive.build_manifest(grid)["multiscales"]
+        assert group.attrs["multiscales"] == {
+            **mirror,
+            "layout": group.attrs["multiscales"]["layout"],
+        }
+        assert [e["asset"] for e in group.attrs["multiscales"]["layout"]] == list(block["levels"])
+        assert group.attrs["zarr_conventions"] == [MULTISCALES_CONVENTION]
         # The level groups plus the root row coordinate, nothing else.
         assert {str(o) for o in out["ladder"]} | set(icechunk_rows.ROW_COORDS) == {
             k for k, _ in group.members()
@@ -1994,7 +2004,10 @@ class TestLadder:
         # from the SAME repo, discoverable from its multiscales root attrs.
         manifest = hive.read_manifest(root)
         levels = {int(e["node"]): int(e["cells"][0]) for e in manifest["pyramid"]["overviews"]}
-        assert group.attrs["multiscales"] == manifest["multiscales"]
+        assert group.attrs["multiscales"] == {
+            **manifest["multiscales"][0],
+            "layout": group.attrs["multiscales"]["layout"],
+        }
         from pathlib import Path
 
         from mortie import mort2healpix
@@ -2300,8 +2313,9 @@ class TestLadder:
         grid, root, _ = _ladder_run(monkeypatch, cfg, tmp_path, icechunk_block={}, shards=shards)
         # A leaf's directory holds its tree, sidecars and declared column.
         leaves = [str(Path(hive.shard_leaf_path(root, s)).parent) for s in shards]
-        # The node-level stage artifacts (overviews, stage columns, their
-        # stamps): everything under a node outside the leaf directories.
+        # The node-level stage artifacts (overviews and their stamps; this
+        # d = 1 ladder needs no stage column, issue #620): everything under a
+        # node outside the leaf directories.
         folded = {
             str(f): (f.stat().st_mtime_ns, f.read_bytes())
             for f in Path(root).rglob("*")
@@ -2309,7 +2323,7 @@ class TestLadder:
             and "all." in str(f.relative_to(root))
             and not any(str(f).startswith(leaf + "/") for leaf in leaves)
         }
-        assert any("all.zarr" in f for f in folded) and any("pyramid" in f for f in folded)
+        assert any("all.zarr" in f for f in folded)
         stats = {leaf: Path(leaf, "stats.json").read_bytes() for leaf in leaves}
         import zagg.sweep_stages as sweep_stages
 
@@ -2398,7 +2412,11 @@ class TestLadder:
         )
         assert summary["finisher"]["landed"] and summary["n_dirt_only"] == 2
         rows = _stage_rows(root)
-        assert [(r["icechunk_regathered"], r["written"]) for r in rows] == [(1, 0), (1, 0)]
+        # One row per tuple, each regathering its dirt-only node and writing
+        # nothing. Three tuples, not two: the tail sizes its schedule to the
+        # per-invoke fold (issue #610), which refines this shard-order-4
+        # ladder's coarse width-3 tuple into width 2 + width 1.
+        assert [(r["icechunk_regathered"], r["written"]) for r in rows] == [(1, 0)] * 3
         group, _repo = _open(root)
         group["5"]["count"][:]  # the touched column's level reads (no stale checksum)
         for shard in shards:
@@ -2546,9 +2564,10 @@ class TestS3Kwargs:
     takes, and the one every other test in this file sidesteps by running on
     ``local_filesystem_storage``.
 
-    Pure kwargs assembly: the four icechunk constructors are captured, never
-    called for real, so this pins the claim that the module mirrors
-    :mod:`zagg.store`'s credential and ACL rules (issue #495).
+    Kwargs assembly: the four icechunk constructors are captured; only
+    ``s3_storage`` is faked, the other three also build the real object, so
+    this pins the claim that the module mirrors :mod:`zagg.store`'s
+    credential and ACL rules (issue #495).
     """
 
     @pytest.fixture
@@ -2562,13 +2581,18 @@ class TestS3Kwargs:
 
             return fake
 
+        real_static = icechunk.s3_static_credentials
+        real_refreshable = icechunk.s3_refreshable_credentials
+
         def static(**kwargs):
+            # The credential constructors record AND build: ``_container``
+            # wraps the result as a ``Credentials.S3`` (issue #606).
             seen["static"] = kwargs
-            return "<static>"
+            return real_static(**kwargs)
 
         def refreshable(fn):
             seen["refreshable"] = fn
-            return "<refreshable>"
+            return real_refreshable(fn)
 
         real_store = icechunk.s3_store
 
@@ -2601,7 +2625,7 @@ class TestS3Kwargs:
         store = captured["s3_store"]
         assert store["region"] == "us-west-2" and store["endpoint_url"] is None
         assert store["allow_http"] is False and store["force_path_style"] is False
-        assert creds == "<refreshable>"
+        assert isinstance(creds._0, icechunk.S3Credentials.Refreshable)
         assert captured["refreshable"] is icechunk_refs._boto3_credentials
         assert isinstance(container, icechunk.VirtualChunkContainer)
 
@@ -2616,7 +2640,7 @@ class TestS3Kwargs:
         assert kwargs["write_headers"] == {"x-amz-acl": "bucket-owner-full-control"}
 
         _container, cred = icechunk_refs._container("s3://theirs", {"credentials": creds})
-        assert cred == "<static>"
+        assert isinstance(cred._0, icechunk.S3Credentials.Static)
         assert captured["static"] == {
             "access_key_id": "AK",
             "secret_access_key": "SK",
@@ -2650,6 +2674,97 @@ class TestS3Kwargs:
         assert store["allow_http"] is True and store["force_path_style"] is True
 
 
+class TestBoto3Credentials:
+    """``_boto3_credentials`` hands icechunk the botocore chain's snapshot.
+
+    icechunk validates ``expires_after`` by identity against
+    ``datetime.timezone.utc``; botocore's refreshable credentials (an assumed
+    role, SSO) carry dateutil's ``tzutc()`` instead, so the construction
+    itself raised on every laptop-side repo open with a profile (issue #608).
+    """
+
+    @staticmethod
+    def _chain(monkeypatch, expiry):
+        import boto3
+
+        class Frozen:
+            access_key, secret_key, token = "AK", "SK", "TOK"
+
+        class Creds:
+            _expiry_time = expiry
+
+            def get_frozen_credentials(self):
+                return Frozen()
+
+        class Session:
+            def get_credentials(self):
+                return Creds()
+
+        monkeypatch.setattr(boto3, "Session", Session)
+
+    # A ``credential_process`` reporting ``+02:00`` reaches botocore's dateutil
+    # parse as a ``tzoffset``: converted to the same instant, not relabeled.
+    @pytest.mark.parametrize(
+        "tz, utc_hour", [(tzutc(), 12), (tzoffset(None, 7200), 10)], ids=["tzutc", "tzoffset"]
+    )
+    def test_aware_expiry_is_handed_over_as_timezone_utc(self, monkeypatch, tz, utc_hour):
+        self._chain(monkeypatch, datetime.datetime(2026, 10, 8, 12, 30, tzinfo=tz))
+        creds = icechunk_refs._boto3_credentials()
+        assert creds.access_key_id == "AK" and creds.secret_access_key == "SK"
+        assert creds.session_token == "TOK"
+        assert creds.expires_after.tzinfo is datetime.timezone.utc
+        assert creds.expires_after == datetime.datetime(
+            2026, 10, 8, utc_hour, 30, tzinfo=datetime.timezone.utc
+        )
+
+    @pytest.fixture
+    def non_utc_host(self, monkeypatch):
+        # Pin local time off UTC so the naive case cannot pass on a UTC host by
+        # luck; ``time.tzset`` is Unix-only, as are CI and the dev machines.
+        monkeypatch.setenv("TZ", "EST+05")
+        time.tzset()
+        yield
+        monkeypatch.undo()
+        time.tzset()
+
+    @pytest.mark.usefixtures("non_utc_host")
+    def test_naive_expiry_is_read_as_utc(self, monkeypatch):
+        self._chain(monkeypatch, datetime.datetime(2026, 10, 8, 12, 30))
+        expires = icechunk_refs._boto3_credentials().expires_after
+        assert expires.tzinfo is datetime.timezone.utc
+        assert expires == datetime.datetime(2026, 10, 8, 12, 30, tzinfo=datetime.timezone.utc)
+
+    def test_static_keys_keep_no_expiry(self, monkeypatch):
+        self._chain(monkeypatch, None)
+        assert icechunk_refs._boto3_credentials().expires_after is None
+
+
+class TestS3Auth:
+    """The S3 container's credential reaches the open as a ``Credentials.S3``
+    (issue #606): icechunk types ``authorize_virtual_chunk_access`` values as
+    ``Credentials`` members and refuses a bare ``S3Credentials``. A local repo
+    carrying the S3 container exercises the seam with no AWS in reach — the
+    refreshable form's callable is never invoked at open.
+    """
+
+    @pytest.mark.parametrize(
+        "store_kwargs",
+        [
+            {"region": "us-west-2"},
+            {"region": "us-west-2", "credentials": {"accessKeyId": "AK", "secretAccessKey": "SK"}},
+        ],
+        ids=["refreshable", "static"],
+    )
+    def test_opens_with_the_s3_container_authorized(self, tmp_path, store_kwargs):
+        root = "s3://bucket/product"
+        repo = icechunk.Repository.open_or_create(
+            icechunk.local_filesystem_storage(str(tmp_path)),
+            config=icechunk_refs._repo_config(root, {}, store_kwargs),
+            authorize_virtual_chunk_access=icechunk_refs._auth(root, store_kwargs),
+        )
+        assert list(repo.config.virtual_chunk_containers) == [icechunk_refs.container_prefix(root)]
+
+
 def test_container_prefix_forms():
     assert icechunk_refs.container_prefix("s3://b/p/") == "s3://b/p/"
     assert icechunk_refs.container_prefix("s3://b/p") == "s3://b/p/"
@@ -2659,6 +2774,127 @@ def test_container_prefix_forms():
 
 def test_repo_path():
     assert icechunk_refs.repo_path("s3://b/p/") == "s3://b/p/icechunk"
+
+
+def _mirror_manifest(datasets, fold, base=6):
+    """A manifest carrying just the ``zagg-multiscales/1`` keys the layout reads."""
+    block = {"spec": "zagg-multiscales/1", "base": {"order": 4, "cells": [base]}}
+    block["datasets"] = [
+        {"order": o, "cells": list(c), "artifact": "column" if o == 4 else "overview"}
+        for o, c in datasets
+    ]
+    return {"multiscales": [{**block, "fold": fold}]}
+
+
+_DGGS = {"name": "morton", "spatial_dimension": "cells", "coordinate": "morton"}
+
+
+def _dggs(*cells):
+    return {c: {**_DGGS, "refinement_level": c} for c in cells}
+
+
+class TestMultiscalesLayout:
+    """§11.1 — the zarr-conventions ``multiscales`` layout composed with ``dggs`` (issue #615)."""
+
+    def test_cascade_chains_from_the_column(self):
+        # Production shape: the column from the base, every overview from the
+        # next-finer level; scale = 4 ** (c_from - c) on the cells axis.
+        manifest = _mirror_manifest(
+            [(4, [5]), (3, [4]), (2, [3])], {"fold_source": "cascade", "exact_levels": 1}
+        )
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(6, 5, 4, 3))
+        assert layout[0] == {"asset": "6", "dggs": {**_DGGS, "refinement_level": 6}}
+        assert [(e["asset"], e["derived_from"], e["transform"]) for e in layout[1:]] == [
+            ("5", "6", {"scale": [4.0]}),
+            ("4", "5", {"scale": [4.0]}),
+            ("3", "4", {"scale": [4.0]}),
+        ]
+        assert [e["dggs"] for e in layout[1:]] == [{"refinement_level": c} for c in (5, 4, 3)]
+        assert all("translation" not in e["transform"] for e in layout[1:])
+
+    def test_leaves_regime_derives_every_level_from_the_base(self):
+        manifest = _mirror_manifest([(4, [5]), (3, [4]), (2, [3])], {"fold_source": "leaves"})
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(6, 5, 4, 3))
+        assert [(e["derived_from"], e["transform"]["scale"]) for e in layout[1:]] == [
+            ("6", [4.0]),
+            ("6", [16.0]),
+            ("6", [64.0]),
+        ]
+
+    @pytest.mark.parametrize("fold", [{"fold_source": None, "exact_levels": 1}, {}])
+    def test_missing_fold_source_reads_as_leaves(self, fold):
+        # §4.5: no ``fold_source`` reads as ``leaves`` — every level from the base.
+        manifest = _mirror_manifest([(4, [5]), (3, [4]), (2, [3])], fold)
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(6, 5, 4, 3))
+        assert [e["derived_from"] for e in layout[1:]] == ["6", "6", "6"]
+
+    def test_exact_levels_boundary_and_multi_member_column(self):
+        # Two exact entries: the column's members AND the first overview fold
+        # the leaves; the cascade starts past the boundary. The layout order
+        # is finest first regardless of the dggs map's order.
+        manifest = _mirror_manifest(
+            [(4, [5, 4]), (3, [3]), (2, [2])], {"fold_source": "cascade", "exact_levels": 2}
+        )
+        layout = icechunk_refs.multiscales_layout(manifest, _dggs(2, 3, 4, 5, 6))
+        assert [e["asset"] for e in layout] == ["6", "5", "4", "3", "2"]
+        assert [(e["derived_from"], e["transform"]["scale"]) for e in layout[1:]] == [
+            ("6", [4.0]),
+            ("6", [16.0]),
+            ("6", [64.0]),
+            ("3", [4.0]),
+        ]
+
+    def test_base_dggs_is_a_copy(self):
+        dggs = _dggs(6, 5)
+        layout = icechunk_refs.multiscales_layout(
+            _mirror_manifest([(4, [5])], {"fold_source": "cascade"}), dggs
+        )
+        layout[0]["dggs"]["name"] = "x"
+        assert dggs[6]["name"] == "morton"
+
+    def test_root_conventions_take_the_dggs_map(self):
+        manifest = _mirror_manifest([(4, [5])], {"fold_source": "cascade"})
+        attrs = icechunk_refs.root_conventions(manifest, _dggs(6, 5))
+        assert attrs["zarr_conventions"] == [MULTISCALES_CONVENTION]
+        assert attrs["multiscales"]["layout"] == icechunk_refs.multiscales_layout(
+            manifest, _dggs(6, 5)
+        )
+        assert icechunk_refs.root_conventions({}, _dggs(6, 5)) == {}
+
+    def test_root_attrs_compose_the_mirror_and_the_registration(self, cfg, tmp_path):
+        grid = _grid(cfg)
+        manifest = hive.build_manifest(grid)
+        options = icechunk_refs.resolve_options(cfg, 4)
+        attrs = icechunk_refs.repo_group_spec(grid, str(tmp_path), options, manifest).attributes
+        assert set(attrs) == {"zagg_icechunk", "multiscales", "zarr_conventions"}
+        assert attrs["zarr_conventions"] == [MULTISCALES_CONVENTION]
+        (mirror,) = manifest["multiscales"]
+        layout = attrs["multiscales"].pop("layout")
+        assert attrs["multiscales"] == mirror  # the /1 keys verbatim, as an object
+        # The base entry IS the level group's dggs block; one entry per level.
+        spec = icechunk_refs.repo_group_spec(grid, str(tmp_path), options, manifest)
+        assert layout[0]["dggs"] == spec.members["6"].attributes["dggs"]
+        assert [e["asset"] for e in layout] == ["6", "5", "4", "3", "2", "1"]
+        assert layout[1]["dggs"] == {"refinement_level": 5}
+        # The built manifest's default fold (cascade, exact_levels 1): the
+        # column from the base, every overview from the next-finer level.
+        assert manifest["multiscales"][0]["fold"]["fold_source"] == "cascade"
+        assert [(e["derived_from"], e["transform"]["scale"]) for e in layout[1:]] == [
+            ("6", [4.0]),
+            ("5", [4.0]),
+            ("4", [4.0]),
+            ("3", [4.0]),
+            ("2", [4.0]),
+        ]
+
+    def test_no_mirror_no_convention_keys(self, cfg, tmp_path):
+        cfg.output["pyramid"] = False
+        grid = _grid(cfg)
+        manifest = hive.build_manifest(grid)
+        assert "multiscales" not in manifest
+        options = icechunk_refs.resolve_options(cfg, 4)
+        attrs = icechunk_refs.repo_group_spec(grid, str(tmp_path), options, manifest).attributes
+        assert set(attrs) == {"zagg_icechunk"}
 
 
 def test_block_json_round_trips(cfg, tmp_path):

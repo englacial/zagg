@@ -871,7 +871,7 @@ class HealpixGrid:
             "spatial_dimension": "cells",
             "ellipsoid": {
                 "name": "WGS84",
-                "semimajor_axis": 6378137.0,
+                "semi_major_axis": 6378137.0,
                 "inverse_flattening": 298.257223563,
             },
             "compression": "none",

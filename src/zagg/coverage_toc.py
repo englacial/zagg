@@ -151,7 +151,9 @@ def temporal_cell_order(manifest: dict | None) -> int | None:
         return None
 
 
-def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kwargs):
+def read_leaf_temporal(
+    leaf_root: str, cell_order: int, fields: dict, *, store=None, **store_kwargs
+):
     """One leaf's COVERAGE from its raw companions: ``(word, counts)`` or ``None``.
 
     The sweep's RAW route, for a leaf with no usable ``temporal.toc`` record
@@ -180,16 +182,26 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     only (a cell whose companion and centroid counts disagree is refused).
     ``None`` when the leaf holds no temporal row at all (an unpopulated or
     pre-companion leaf), which is absence, not failure.
+
+    With ``store`` (the pass's open obstore handle at the store root, issue
+    #610) ``leaf_root`` is the leaf's key RELATIVE to it and the group is
+    opened through that handle; without, a store is opened at the absolute
+    leaf path, as before.
     """
     import zarr
 
     from zagg.leaf_temporal import LeafTemporalAccumulator
-    from zagg.store import open_store
+    from zagg.store import open_store, zarr_view
     from zagg.sweep_overview import decode_digest
 
-    group = zarr.open_group(
-        open_store(leaf_root, **store_kwargs), path=str(cell_order), mode="r", zarr_format=3
-    )
+    if store is None:
+        group = zarr.open_group(
+            open_store(leaf_root, **store_kwargs), path=str(cell_order), mode="r", zarr_format=3
+        )
+    else:
+        group = zarr.open_group(
+            zarr_view(store), path=f"{leaf_root}/{cell_order}", mode="r", zarr_format=3
+        )
     acc = LeafTemporalAccumulator()
     for name in sorted(fields):
         meta = fields[name]

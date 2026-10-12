@@ -464,20 +464,30 @@ def write_leaf_temporal(leaf_root: str, record: dict, **store_kwargs) -> None:
     )
 
 
-def read_leaf_temporal_record(leaf_root: str, **store_kwargs) -> dict | None:
+def read_leaf_temporal_record(leaf_root: str, *, store=None, **store_kwargs) -> dict | None:
     """The leaf's record as stored, or ``None`` when absent.
 
     Raw: the spec gate is :func:`load_leaf_temporal`'s. A body that is not
-    JSON raises, which the caller treats as debris.
+    JSON raises, which the caller treats as debris. With ``store`` (an open
+    obstore handle at the store root, issue #610) ``leaf_root`` is the
+    leaf's key RELATIVE to it and no store is opened.
     """
     from zagg.hive import _read_json
     from zagg.store import open_object_store
 
-    return _read_json(open_object_store(leaf_root, **store_kwargs), LEAF_TEMPORAL_NAME)
+    if store is None:
+        return _read_json(open_object_store(leaf_root, **store_kwargs), LEAF_TEMPORAL_NAME)
+    return _read_json(store, f"{leaf_root}/{LEAF_TEMPORAL_NAME}")
 
 
 def leaf_contribution(
-    leaf_root: str, cell_order: int, fields: dict, *, stamp: dict | None = None, **store_kwargs
+    leaf_root: str,
+    cell_order: int,
+    fields: dict,
+    *,
+    stamp: dict | None = None,
+    store=None,
+    **store_kwargs,
 ):
     """One leaf's ``(word, counts)`` — record first — and the route it took.
 
@@ -503,7 +513,11 @@ def leaf_contribution(
     :func:`zagg.hive.resolve_leaf`). The record and the arrays are read from
     where the stamp says the leaf's data lives (spec §1.5): the root of a
     legacy leaf, the ``current`` version of a versioned one, beside its
-    ``coverage.moc``.
+    ``coverage.moc``. With ``store`` — the pass's one open obstore handle at
+    the store root (issue #610) — ``leaf_root`` is the leaf's key RELATIVE
+    to it, every read goes through that handle, and ``store_kwargs`` are
+    unused; without, it is the absolute leaf path and each read opens its
+    own store, as before.
 
     Every record that cannot be used is BYPASSED and left exactly as found:
     one at a foreign revision, an unparsable or inconsistent one, and one
@@ -512,14 +526,20 @@ def leaf_contribution(
     its next replacement, whose worker writes a fresh record.
     """
     from zagg.coverage_toc import read_leaf_temporal
-    from zagg.hive import leaf_data_path, resolve_leaf
+    from zagg.hive import leaf_data_path, read_commit, resolve_leaf
 
     if stamp is None:
-        data_path, stamp = resolve_leaf(leaf_root, **store_kwargs)
-    else:
-        data_path = leaf_data_path(leaf_root, stamp)
+        if store is None:
+            stamp = resolve_leaf(leaf_root, **store_kwargs)[1]
+        else:
+            from zarr.storage import StorePath
+
+            from zagg.store import zarr_view
+
+            stamp = read_commit(StorePath(zarr_view(store), leaf_root))
+    data_path = leaf_data_path(leaf_root, stamp)
     try:
-        raw = read_leaf_temporal_record(data_path, **store_kwargs)
+        raw = read_leaf_temporal_record(data_path, store=store, **store_kwargs)
     except Exception as e:
         # Not JSON, or the GET itself failed (a 403 on the key, a 5xx, a
         # timeout): the record is not the truth about the leaf's coverage, so
@@ -532,7 +552,7 @@ def leaf_contribution(
             return leaf_temporal_contribution(record), "record"
         except (KeyError, TypeError, ValueError) as e:
             logger.warning(f"leaf temporal: {data_path} record is debris ({e}) — reading the leaf")
-    return read_leaf_temporal(data_path, cell_order, fields, **store_kwargs), "raw"
+    return read_leaf_temporal(data_path, cell_order, fields, store=store, **store_kwargs), "raw"
 
 
 __all__ = [
