@@ -586,20 +586,28 @@ class TestStoreLadderGate:
         assert _fired(client) == {d: dispatch_nodes(by_shard, d) for d in (2, 1, 0)}
         assert summary["finisher"]["fired"] is True
 
-    def test_a_manifest_that_is_not_an_object_fires_nothing(self, tmp_path):
+    @pytest.mark.parametrize("body", [["not", "a", "manifest"], 5, "hello"])
+    def test_a_manifest_that_is_not_an_object_fires_nothing(self, tmp_path, body):
         # The corrupt-manifest arm of the same finding: ``read_manifest``
         # parses whatever JSON is there, so a non-object manifest reaches the
         # gate as an AttributeError on ``manifest.get`` rather than as a
         # refusal — still a decline, never a traceback out of the dispatcher.
+        # The REASON is pinned too (review finding): this shape has no
+        # ``return`` of its own and so inherited the retrofit remedy, which
+        # ``declare_pyramid`` refuses on a malformed manifest — the wrong-
+        # remedy class the per-arm fold fixed for its three siblings.
         from zagg.hive import MANIFEST_NAME
 
         root = tmp_path / "s"
         _stage_store(root)
-        (root / MANIFEST_NAME).write_text(json.dumps(["not", "a", "manifest"]))
+        (root / MANIFEST_NAME).write_text(json.dumps(body))
         client = _FakeLambda(None)
         summary = _tail_fleet(root, client)
         assert client.events == [] and summary["invokes"] == 0
         assert summary["skipped"].startswith(NO_LADDER_SKIP)
+        assert f"is not a JSON object (a {type(body).__name__})" in summary["skipped"]
+        assert "restore or rewrite the manifest" in summary["skipped"]
+        assert "(re-)declare it with" not in summary["skipped"]  # not the retrofit's
 
     def test_a_manifest_that_does_not_parse_fires_nothing(self, tmp_path):
         # A truncated manifest is the store's own content, not an access
