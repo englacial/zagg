@@ -1147,6 +1147,48 @@ class TestRasterWindowedAllTimeFold:
         assert block["overview"]["orders"] == [8, 6, 4, 2, 0]
         assert block["overview"]["all_time"] is True
 
+    def test_the_declared_fold_materializes_no_overview_at_any_order(self, manifest, caplog):
+        # The gap the resolved default leaves on the raster arm, pinned as
+        # TODAY's contract rather than as a law: the fold is declared at every
+        # scheduled order and materialized at none of them. Raster leaves are
+        # column-less by construction (spec §4.6; issue #399 owns their
+        # overview regime), so a raster config — ``data_source.bands``, no
+        # ``aggregation.variables`` — declares ``fields: {}`` and
+        # ``sweep_overviews`` returns at its "no composable fields" gate
+        # before any leaf read. Issue #399's reducer-keyed folds are what
+        # flips this arm; until then an ``all.zarr`` here would be debris.
+        import logging
+        from pathlib import Path
+
+        from zagg import hive
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep import _node_rel, run_sweep
+        from zagg.sweep_overview import _node_at
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        store_path = cfg.output["store"]
+        decl = hive.read_manifest(store_path)["pyramid"]["overview"]
+        assert decl["all_time"] is True and decl["fields"] == {}
+        refs = [(shard, "20260713"), (shard, "20260718")]
+        with caplog.at_level(logging.INFO, logger="zagg.sweep_overview"):
+            result = run_sweep(store_path, refs, families=("overview",))
+        counts = result["families"]["overview"]
+        assert counts["declared"] is True and counts["sweepable"] is True
+        assert counts["written"] == 0 and counts["failed"] == 0
+        assert "no composable fields declared" in caplog.text
+        # Nothing at ANY declared order — neither the all-time fold nor the
+        # per-window overviews it would sit beside — and nothing anywhere.
+        root, decimal = Path(store_path), morton_decimal(shard)
+        for order in decl["orders"]:
+            node = root / _node_rel(_node_at(decimal, order))
+            assert node.is_dir()  # the node prefix is real, so the absence is
+            assert not (node / "all.zarr").exists()
+            assert not (node / "overview.rollup.json").exists()
+        assert not list(root.rglob("all.zarr"))
+
     def test_an_unwindowed_raster_config_declares_no_fold(self, tmp_path):
         # The load-bearing control for the arm above: the SAME raster config
         # without ``output.windowing`` resolves no fold, so that arm's
