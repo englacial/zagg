@@ -91,6 +91,11 @@ class TestAggValidatesConfig:
         # The issue #472 shape: temporal variables grafted onto a validated
         # base after default_config's own validation already ran.
         base = default_config("atl03_tdigest_healpix_hive")
+        # The observed graft predates issue #638: the hive template now
+        # carries the yearly windowing block and the ``delta_time`` column it
+        # bins on, either of which would satisfy the clock the graft lacked.
+        del base.output["windowing"]
+        del base.data_source["variables"]["delta_time"]
         located = default_config("atl03_tdigest_located_healpix")
         base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
         return base

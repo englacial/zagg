@@ -783,14 +783,21 @@ class TestIndexExclusionEpoch:
     def test_the_two_atl03_templates_collapse(self):
         # The packaged surface the epoch also moves: `index: {backend: inline}`
         # (the absent-key default since #170) was the ONLY core-visible
-        # difference between these two templates, so post-epoch they name one
+        # difference between these two templates, so post-epoch they named one
         # D19 product identity — intended, and recorded in `hive_layout.md`.
+        # Since issue #638 the hive template is windowed yearly and declares
+        # the ``delta_time`` column it bins on — both hashed (D13; variables)
+        # — so as shipped the two are different products, and the collapse
+        # holds exactly once those two keys are taken back out.
         from zagg.semantics import semantic_hash_legacy
 
         flat, hive = (
             default_config("atl03_tdigest_healpix"),
             default_config("atl03_tdigest_healpix_hive"),
         )
+        assert semantic_hash(flat) != semantic_hash(hive)
+        del hive.output["windowing"]
+        del hive.data_source["variables"]["delta_time"]
         assert semantic_hash(flat) == semantic_hash(hive)
         assert semantic_hash_legacy(flat) != semantic_hash_legacy(hive)
 
