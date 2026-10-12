@@ -4653,7 +4653,16 @@ A native chunk carries **no** checksum, the bytes being the repository's
 own, so the copy vets the object it reads against the form the plan recorded
 and **refuses** it when they differ: another writer re-folded that overview
 between the plan and the copy, so the gather describes a state that no
-longer exists. The node's whole gather is dropped — fail-open (D9), counted
+longer exists. On a sharded object the copy vets it **byte-exactly** as
+well, which a reference structurally cannot: the shard index is at the end
+of the object (§1.5), so it is inside the bytes the copy already holds, and
+the offsets, lengths and presence pattern it records are compared against
+the ones the plan read. A reference has only the checksum, and a checksum
+can agree across a rewrite — an `ETag` is whatever the container mints, and
+a `file://` `last_modified` is ceiled to the whole second — so a re-fold
+inside that window is invisible to it; the index is not, and a re-fold that
+**shrank** a chunk would otherwise be sliced short and committed, which on a
+tag is permanent. Either refusal drops the node's whole gather — fail-open (D9), counted
 `icechunk_failed` on its stage row — and the next staged sweep re-gathers it.
 
 Chunk keys are the array's own, under the `chunk_key_encoding` its
