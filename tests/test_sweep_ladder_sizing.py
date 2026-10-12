@@ -541,13 +541,13 @@ class TestShortOrders:
         root = tmp_path / "s"
         _stage_store(root)
         # The sized schedule at o3 is ``1:[2,1]`` then ``0:[0]`` (top-aligned,
-        # issue #637). The FINE tuple's record is lost (its invoke never
-        # wrote one), so orders 2 and 1 are short while order 0's record
-        # stands.
-        client = _FakeLambda(_handler(), drop={stage_record_name(1, 0)})
+        # issue #637). The COARSE tuple's record is lost (its invoke never
+        # wrote one), so order 0 is short while orders 2 and 1 stand; the
+        # short tuple sits at the top, so nothing folds from it.
+        client = _FakeLambda(_handler(), drop={stage_record_name(0, 0)})
         summary = _fleet(root, client, stage_target_nodes=5, tuple_width=2, barrier_timeout_s=0.05)
-        assert summary["short_orders"] == [2, 1]
-        assert _finisher_block(client)["short_orders"] == [2, 1]
+        assert summary["short_orders"] == [0]
+        assert _finisher_block(client)["short_orders"] == [0]
 
     def test_the_finisher_withholds_the_short_levels_and_records_the_rest(self, tmp_path):
         from test_sweep_stage_fleet import _FakeLambda, _fleet
@@ -560,17 +560,17 @@ class TestShortOrders:
         # A prior run's actuals stand on every ladder level, so "withheld"
         # is visibly "left as it stood" rather than "never written".
         _stamp_prior_actuals(root, run_id="PRIOR")
-        client = _FakeLambda(_handler(), drop={stage_record_name(1, 0)})
+        client = _FakeLambda(_handler(), drop={stage_record_name(0, 0)})
         summary = _fleet(root, client, stage_target_nodes=5, tuple_width=2, barrier_timeout_s=0.05)
-        assert summary["short_orders"] == [2, 1]
+        assert summary["short_orders"] == [0]
         entries = {
             int(e["node"]): e
             for e in json.loads((root / MANIFEST_NAME).read_text())["pyramid"]["overviews"]
         }
-        # The order that landed is stamped by THIS run; the short ones are not.
-        assert entries[0]["actuals"]["run_id"] == summary["run_id"]
+        # The orders that landed are stamped by THIS run; the short one is not.
         for node in (2, 1):
-            assert entries[node]["actuals"]["run_id"] == "PRIOR", node
+            assert entries[node]["actuals"]["run_id"] == summary["run_id"], node
+        assert entries[0]["actuals"]["run_id"] == "PRIOR"
         # And the leaf tier's own law is not an observation, so it still lands.
         assert entries[3]["actuals"]["regime"] == "leaf-column"
 
