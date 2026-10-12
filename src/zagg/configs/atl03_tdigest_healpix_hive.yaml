@@ -105,11 +105,13 @@ output:
   # so the template carries the schedule the product is meant to have;
   # monthly is a deliberate per-store choice (~6.5x the compute). Windowed
   # emit is what scales: worker peak memory 3.7 -> 1.56 GB (issue #586),
-  # and a window invoke reads only its year's granules. ``windowing`` is a
-  # D13 leaf-shaping key, so this moves the template's ``semantic_hash``
-  # (pinned in tests/test_live_store_templates.py): a windowed store is a
-  # different product from the unwindowed live one. Delete the block to
-  # build an unwindowed store; ``unit`` stays at its default ``shard``.
+  # and a window invoke reads only its year's granules. This template's
+  # ``semantic_hash`` moved for two reasons (it is not pinned; the strata
+  # template is, in tests/test_live_store_templates.py): ``windowing`` is a
+  # D13 leaf-shaping key, and the new ``data_source.variables.delta_time``
+  # is D19 core -- a windowed store is a different product from the
+  # unwindowed one. Delete the block to build an unwindowed store; ``unit``
+  # stays at its default ``shard``.
   windowing:
     schedule: yearly
     time_field: delta_time       # the per-photon clock, declared under
