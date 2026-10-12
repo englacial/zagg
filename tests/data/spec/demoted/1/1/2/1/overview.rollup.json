@@ -8,9 +8,9 @@
    "object": "all.zarr",
    "generation": {
     "n_leaves": 1,
-    "max_leaf_timestamp": "2026-09-11T01:23:29+00:00"
+    "max_leaf_timestamp": "2026-10-12T01:21:09+00:00"
    },
-   "content_hash": "639cdfd464ab3a871399a0835ece947654ffc5eb869f0b31212a925ca83bd4e5",
+   "content_hash": "77047e0cec806a1c690c3fbdce23e19203aa295e037e45ffba4ad034612c3c2a",
    "fold_source": "leaves"
   }
  }

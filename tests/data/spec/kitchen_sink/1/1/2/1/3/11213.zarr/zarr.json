@@ -5,7 +5,7 @@
       "complete": true,
       "cells_with_data": 4,
       "granule_count": 1,
-      "written_at": "2026-08-24T21:24:54+00:00",
+      "written_at": "2026-10-12T01:21:08+00:00",
       "coverage": {
         "spec": "morton-moc/1",
         "box": [
@@ -20,6 +20,18 @@
         "sidecar": "coverage.moc",
         "nbytes": 11,
         "raw_nbytes": 2
+      },
+      "content_hashes": {
+        "arrays": {
+          "6/composition": "04886a9dfb60c8a53de48202dc3d5ac694698864825426f084be961aa678acd5",
+          "6/count": "4aec3cf06563de006246f3c30a7e1e4688e8a8b0171185371cdf4203d6f7c88d",
+          "6/h_tdigest_noise": "201816825f7fce3daaa77c2375c00ed996f67f3ca1e626fce8fa263be97a8191",
+          "6/h_tdigest_noise_locations": "c4f7ad04676c14620794d6437ddb2ae75ad968c46eb7d735022190eb0f695c3a",
+          "6/h_tdigest_signal": "1de09e1b805883d1427c77bd46540a2f2771a6c5a2566b187b50e9192e0de078",
+          "6/h_tdigest_signal_locations": "11e0a598b7f695d7fe816ecc853deba86d2006b8470bb94a49acc36db9de8af9",
+          "6/morton": "f6282635e373d534ef4d91166d306441049e7bbed3d7d2ec8add306f62274d06"
+        },
+        "combined": "8752a3e02de12c4c8dedee7a5b743121f1d26c0b3686e041990cff6ad1b438da"
       }
     }
   },

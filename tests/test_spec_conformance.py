@@ -72,22 +72,25 @@ SENTINEL = 2**64 - 1
 #: with itself and sail through. These literals are what such a change has to
 #: get past — and §5 is the recipe moczarr adopts verbatim, so a silent zagg
 #: change is a silent cross-implementation divergence.
+#: Every combined digest below was re-pinned for issue #626: ``count`` is
+#: ``int64``, so each fixture's ``count`` array -- and only that array -- hashes
+#: differently (the per-array literals in ``FROZEN_ARRAYS`` are all untouched).
 FROZEN_COMBINED = {
-    "minimal": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    "minimal": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c",
     # kitchen_sink re-pinned under the authalic convention (mortie >=0.9.8,
     # issue #438): its located point words moved, so the fixture's two
     # ``*_locations`` arrays -- and only those -- hash differently.
-    "kitchen_sink": "7ee8ad9278eaa6ccbfa95aed978d09768ff0865b569c025b6f8e2b91e46843c7",
+    "kitchen_sink": "8752a3e02de12c4c8dedee7a5b743121f1d26c0b3686e041990cff6ad1b438da",
     # column/'s LEAF is minimal's, byte for byte — the same literal is the
     # cross-fixture pin that writing a column perturbs nothing.
-    "column": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    "column": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c",
     # versioned/'s arrays are minimal's, byte for byte, behind a pointer root
     # (§1.5, issue #582) — the same literal pins that versioning a leaf
     # perturbs nothing the §5 recipe hashes.
-    "versioned": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    "versioned": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c",
     # The §2.0 flux fixture (issue #424) — asserted by TestFluxDeclaration
     # (flux is not in FIXTURES: the leaf-shaped suite hardcodes h_tdigest).
-    "flux": "910a9b12d34b4d072f454b2dd1cc232a6a9a92b536a8d26f5395154a1c02bc32",
+    "flux": "0a7cf012f374249bb24d024aa4c428355c283b2453844838ce6eb0a35c48630a",
     # The §8 temporal fixture (issue #443) — asserted by
     # TestTemporalDeclaration (raster_toc is not in FIXTURES: it carries no
     # ragged array at all, so nothing the leaf-shaped suite asserts applies).
@@ -97,16 +100,16 @@ FROZEN_COMBINED = {
     # suite's digest assertions assume an UNLOCATED h_tdigest).
     # Re-pinned for the §10.5 gap cell (issue #489): the last cell's clock
     # moved, so its two toc companions -- and only those -- hash differently.
-    "temporal": "6c7a0c5a3f54684b67e7e2daa66e29ffcf1af102833e7b3c4a4f989e36752887",
+    "temporal": "e4921f1e6fc8d117a5f3b7d72f7451d4c82f842e7fc82eb94a8206909b2058ef",
     # The §1.5 derived-coordinate fixture (issue #586 phase 3) — asserted by
     # TestDerivedCellCoordinate. A WINDOWED leaf: the digest is over three
     # arrays, with no ``6/morton`` among them.
-    "windowed": "5b712e804d5120bac66031739483f319fb1bdf346d82e2d0b087f9bd2ddec170",
+    "windowed": "f828bc1be4cd8d01aa66de8833a620df9e92b9831bdcd8ac36cd6e1cbd069c8e",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
 #: shape is multi-group (``"5/h_tdigest"``, ``"4/morton"``, …).
-FROZEN_COMBINED_COLUMN = "061277118c8cc4c0b8ae3c62fe6515fefa8f9ccb717bd3104f4c8797edbcc918"
+FROZEN_COMBINED_COLUMN = "b28367197206f325ea9a43a51d6bc488273b2c605575d71a7b961cecde8731ba"
 #: FROZEN per-array digests, one per §5.2 element kind: a vlen digest payload
 #: array, a vlen uint64 locations sibling, and two fixed-width arrays.
 FROZEN_ARRAYS = {
@@ -402,9 +405,9 @@ class TestDigestPayload:
 class TestFluxDeclaration:
     """§2.0 — the weights declaration, pinned on the committed `flux/` store.
 
-    The counts side of the contract needs no new fixture: `minimal/` predates
-    §2.0 and is deliberately not regenerated, so its absent `weights` key IS
-    the committed absent-key ⇒ counts pin (issue #424).
+    The counts side of the contract needs no new fixture: `minimal/` declares
+    no `weights` key, so its absence IS the committed absent-key ⇒ counts pin
+    (issue #424).
     """
 
     def test_weights_key_is_a_sibling_of_the_ragged_block(self):
@@ -999,9 +1002,9 @@ class TestMultiscalesMirror:
 
     def test_absence_is_the_pre_convention_pin(self):
         # §4.9: the key is present exactly when the pyramid block is /2 —
-        # column/ (a /2 store committed before §4.9) pins absence as the
-        # legal pre-convention state, and raster_toc/ pins that /1 never
-        # carries it.
+        # column/ (a /2 manifest whose key is removed by hand after a regen —
+        # stale by design, see the generator) pins absence as the legal
+        # pre-convention state, and raster_toc/ pins that /1 never carries it.
         for name in ("column", "raster_toc"):
             manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
             assert "multiscales" not in manifest
@@ -2078,10 +2081,10 @@ class TestTemporalCompanions:
 class TestLocatedDeclaration:
     """§9 — the located declaration, pinned on the committed `temporal/`.
 
-    The absent-key ⇒ §2.2 side is pinned by `kitchen_sink/`, which predates
-    this revision and is deliberately not regenerated: its located siblings
-    carry no `located` key, and a reader must read them as §2.2 verbatim
-    rather than refuse them.
+    The absent-key ⇒ §2.2 side is pinned by `kitchen_sink/`, whose two located
+    siblings are held at their pre-§9 bytes (stale by design, see the
+    generator): they carry no `located` key, and a reader must read them as
+    §2.2 verbatim rather than refuse them.
     """
 
     def test_declaration_rides_the_sibling_that_holds_the_words(self):
