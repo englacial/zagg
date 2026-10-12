@@ -51,6 +51,19 @@ conformance tests assert decoded values, never object bytes.
   writes the §4.6 leaf column (issue #383): ``all.pyramid.zarr`` beside the
   leaf, groups {5, 4} (declared base + the node-order member), `role:
   column` + ``zagg_column`` attrs, its own commit stamp and O11 record.
+- ``column_fine/`` — the §4.6 FINE-TIER layout surface (issue #631): the
+  ``minimal`` fields on a DEEPER leaf — shard order 4 / inner-chunk order 7
+  / cell order 10 (4,096 cells, K = 64 inner chunks of 64 cells; see
+  :data:`FINE_GRID`) — under ``output.pyramid.overviews: 9``, so the column
+  carries groups {9, 8, 7, 6, 5, 4} and group 9 is 4^5 cells: ONE
+  ``sharding_indexed`` object per array on four 256-cell inner chunks (the
+  layout rule), with group 8 and below one whole unsharded chunk as every
+  earlier column. The populated leaf chunks (0, 17, 50) land group 9's rows
+  in inner chunks 0, 1 and 3, leaving inner chunk 2 ABSENT from the
+  ``count`` and ``h_tdigest`` shard indexes (the §1.5 sentinel on a column;
+  the dense ``morton`` coordinate is written whole). ``column_fine.expected.json``
+  additionally records ``column.layout`` — per group ``{sharded,
+  chunk_cells}`` spelled from the §4.6 formula, never read back.
 - ``pyramid/`` — MANIFEST ONLY: the §4.5 ``zagg-pyramid/2`` declaration
   (issue #382, collapsed grammar), produced by the production declaration
   paths end to end (``/1`` template -> production sweep bookkeeping ->
@@ -244,6 +257,33 @@ ICECHUNK_STORE_ROOT = "s3://fixture/product"
 #: the spec requires name + version in the payload array's attrs.
 FLUX_GAIN = {"name": "spec-fixture-gain", "version": "1"}
 
+#: The ``column_fine/`` fixture's grid (issue #631): the leaf fixtures' shard
+#: order 4 and shard key, a cell order deep enough for a DECLARABLE fine
+#: column tier — ``overviews: [9]`` is ``node + 5`` (group 9 is 4^5 cells,
+#: the first sharded width) and ``2 * node + 1`` (the §4.4 ladder's
+#: contiguity ceiling) at once, so node 4 is the smallest shard order that
+#: has one. Inner-chunk order 7: 64 leaf chunks of 64 cells.
+FINE_GRID = {
+    "type": "healpix",
+    "parent_order": 4,
+    "child_order": 10,
+    "chunk_inner": 7,
+    "sharded": True,
+}
+#: ``column_fine/``'s ``output.pyramid`` knob.
+FINE_KNOB = {"overviews": 9}
+#: ``column_fine/``'s cell plan, ``(leaf chunk ordinal, local cell, n obs,
+#: kind)`` as :func:`_build_cells` reads it: leaf cells 0, 2, 1089 and 3263
+#: fold to group-9 rows 0, 0, 272 and 815 — inner chunks 0, 1 and 3 of the
+#: four 256-cell chunks, so inner chunk 2 is the committed ABSENT one (in
+#: the data arrays; the ``morton`` coordinate is dense).
+FINE_PLAN = [
+    (0, 0, 40, "mixed"),
+    (0, 2, 1, "golden"),
+    (17, 1, 5, "noise_only"),
+    (50, 63, 300, "mixed"),
+]
+
 
 def _cell_photons(rng, n, *, signal_frac=0.6):
     """Synthetic photons: heights + 5 confidence columns, ``n`` rows."""
@@ -293,7 +333,9 @@ def _flux_digest(h, rng):
     return merge_tdigests_kway([sub[0::2], sub[1::2]], delta=DELTA)
 
 
-def _config(kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False):
+def _config(
+    kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False, fine: bool = False
+):
     from zagg.config import PipelineConfig
 
     variables: dict = {
@@ -363,7 +405,9 @@ def _config(kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False)
         }
     output: dict = {
         "store_layout": "hive",
-        "grid": {
+        "grid": dict(FINE_GRID)
+        if fine
+        else {
             "type": "healpix",
             "parent_order": 4,
             "child_order": 6,
@@ -383,7 +427,7 @@ def _config(kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False)
     )
 
 
-def _build_cells(grid, shard, kitchen_sink: bool, flux: bool = False):
+def _build_cells(grid, shard, kitchen_sink: bool, flux: bool = False, plan=None):
     """Per-cell synthetic inputs and their expected decoded values.
 
     Returns ``(by_chunk, expected_cells)`` where ``by_chunk`` maps a chunk
@@ -395,7 +439,7 @@ def _build_cells(grid, shard, kitchen_sink: bool, flux: bool = False):
     rng = np.random.default_rng(340)
     children = grid.children(shard)
     # (chunk ordinal, local cell, n obs, kind) — kind only used kitchen-sink.
-    plan = [
+    plan = plan or [
         (0, 0, 40, "mixed"),
         (0, 2, 1, "golden"),
         (1, 1, 5, "noise_only"),
@@ -559,16 +603,27 @@ def build(
     pyramid: dict | None = None,
     flux: bool = False,
     run_id: str | None = None,
+    fine: bool = False,
 ) -> None:
+    """One leaf fixture; ``fine`` is the ``column_fine/`` geometry (:data:`FINE_GRID`)."""
     import zagg.processing as processing
     from zagg import hive
     from zagg.grids import HealpixGrid
     from zagg.grids.morton import morton_word
 
-    cfg = _config(kitchen_sink, pyramid=pyramid, flux=flux)
-    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    cfg = _config(kitchen_sink, pyramid=pyramid, flux=flux, fine=fine)
+    orders = (
+        (FINE_GRID["parent_order"], FINE_GRID["child_order"], FINE_GRID["chunk_inner"])
+        if fine
+        else (4, 6, 5)
+    )
+    grid = HealpixGrid(
+        orders[0], orders[1], layout="fullsphere", config=cfg, chunk_inner=orders[2], sharded=True
+    )
     shard = morton_word(SHARD_KEY)
-    by_chunk, expected_cells = _build_cells(grid, shard, kitchen_sink, flux=flux)
+    by_chunk, expected_cells = _build_cells(
+        grid, shard, kitchen_sink, flux=flux, plan=FINE_PLAN if fine else None
+    )
     assert EMPTY_CHUNK not in by_chunk
 
     if out.exists():
@@ -612,9 +667,9 @@ def build(
         "shard": SHARD_KEY,
         "leaf": leaf_rel,
         "group": grid.group_path,
-        "shard_order": 4,
-        "chunk_order": 5,
-        "cell_order": 6,
+        "shard_order": orders[0],
+        "chunk_order": orders[2],
+        "cell_order": orders[1],
         "cells_per_chunk": grid.cells_per_chunk,
         "chunks_per_shard": grid.chunks_per_shard,
         "empty_chunk": EMPTY_CHUNK,
@@ -644,6 +699,20 @@ def build(
         expected["column"] = _column_expected(
             out / leaf_rel.rsplit("/", 1)[0] / meta["leaf_column"], meta["leaf_column"]
         )
+        if fine:
+            # The §4.6 layout rule spelled from the INPUTS (issue #631): a
+            # group of fewer than 4^5 cells is one unsharded chunk; a wider
+            # one is sharded on min(4^5, n / 4)-cell inner chunks.
+            node = orders[0]
+            expected["column"]["layout"] = {
+                str(res): {
+                    "sharded": res - node >= 5,
+                    "chunk_cells": min(4**5, 4 ** (res - node) // 4)
+                    if res - node >= 5
+                    else 4 ** (res - node),
+                }
+                for res in range(pyramid["overviews"], node - 1, -1)
+            }
     expected_path = out.parent / f"{out.name}.expected.json"
     expected_path.write_text(json.dumps(expected, indent=1) + "\n")
     print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells")
@@ -2272,6 +2341,9 @@ def main() -> None:
         "minimal": lambda: build(args.out / "minimal", kitchen_sink=False),
         "kitchen_sink": lambda: build_kitchen_sink(args.out / "kitchen_sink"),
         "column": lambda: build_column(args.out / "column"),
+        "column_fine": lambda: build(
+            args.out / "column_fine", kitchen_sink=False, pyramid=dict(FINE_KNOB), fine=True
+        ),
         "pyramid": lambda: build_pyramid(args.out / "pyramid"),
         "multiscales": lambda: build_multiscales(args.out / "multiscales"),
         "icechunk": lambda: build_icechunk(args.out / "icechunk"),
