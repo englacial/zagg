@@ -602,7 +602,10 @@ coarse rollup levels, the root `coverage.moc` refresh, and the manifest's
 coarse-level finisher (issue #377).
 
 **The run tail partitions this itself** on the Lambda backends ([issue
-#610](https://github.com/englacial/zagg/issues/610)): the end-of-run
+#610](https://github.com/englacial/zagg/issues/610)) — for a run that walks
+**no** `/2` ladder, the `/1` retrofit regime; a run that walks one fires no
+families pass at all and its families ride the staged sweep instead (see
+"The rollup families ride the same walk", below): the end-of-run
 families pass is split `4^k` ways from the run's own leaf count — `k` from
 `ceil(log4(leaves / 128))`, then refined until no partition holds more than
 128 leaves, because a regional store's leaves cluster (the 2,959-leaf
@@ -796,7 +799,14 @@ CLI would.
 are the *same* bottom-up walk the ladder does — a `(node, window)` unit
 already reads the leaves under its node — so they no longer need a fan-out
 of their own. Named with `--families` on `--stages` (or `families=` on
-`run_stage_sweep` / `run_stage_sweep_fleet`), they fold in each dispatch
+`run_stage_sweep` / `run_stage_sweep_fleet`) — and by **every run tail that
+walks the `/2` ladder**: `runner._cascade_families`, the same config-only
+gate as the Icechunk commit pin (`output.sweep: "stages"` plus a `/2`
+declaration with a composable field), hands `CASCADE_FAMILIES` to the staged
+sweep on the local backend, `agg` on Lambda and the `client` facade alike,
+and the tail then fires no families pass; a run that walks none (a `/1`
+store, or `"stages"` on a config that declares no ladder) keeps the separate
+pass exactly as before — they fold in each dispatch
 node's **close**, over that tuple's own span: the finest tuple's span starts
 at the leaves (the stats sidecar, the D4 stamp, the leaf sub-map, the §10
 `temporal.toc` record — all through the invoke's one store handle), and

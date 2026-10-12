@@ -495,6 +495,55 @@ class TestRecordPlumbing:
 # ---------------------------------------------------------------------------
 
 
+class TestRunTailSeams:
+    """The two chaining seams the run tails call forward ``families=`` (issue #610 phase 4).
+
+    ``runner._run_local`` chains through ``stage_sweep_after_run`` and the
+    Lambda tails through ``runner._invoke_lambda_stage_sweep``; the tail tests
+    (``tests/test_runner.py``, ``tests/test_client.py``) stub those seams, so
+    this is what pins that the knob reaches the driver and the dispatcher.
+    """
+
+    def test_the_local_chaining_folds_the_families(self, tmp_path):
+        from zagg.sweep_stages import stage_sweep_after_run
+
+        root = tmp_path / "s"
+        _store(root)
+        summary = stage_sweep_after_run(str(root), _refs(), families=CASCADE_FAMILIES)
+        assert summary is not None and set(CASCADE_FAMILIES) <= set(summary["families"])
+        written = {Path(p).name.split(".")[0] for p in _families_only(_rollups(root))}
+        assert written == set(CASCADE_FAMILIES)
+
+    def test_the_local_chaining_default_is_the_ladder_alone(self, tmp_path):
+        from zagg.sweep_stages import stage_sweep_after_run
+
+        root = tmp_path / "s"
+        _store(root)
+        summary = stage_sweep_after_run(str(root), _refs())
+        assert summary is not None and "families" not in summary
+        assert not _families_only(_rollups(root))
+
+    def test_the_fleet_seam_forwards_the_families(self, monkeypatch):
+        import zagg.sweep_fleet as fleet_mod
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            fleet_mod,
+            "run_stage_sweep_fleet",
+            lambda *a, **k: (
+                seen.update(k)
+                or {"run_id": "r", "invokes": 0, "stages": [], "finisher": {"landed": False}}
+            ),
+        )
+        _invoke_lambda_stage_sweep(object(), "fn", "s3://b/s", [], shard_order=3)
+        assert seen["families"] == ()
+        _invoke_lambda_stage_sweep(
+            object(), "fn", "s3://b/s", [], shard_order=3, families=CASCADE_FAMILIES
+        )
+        assert seen["families"] == CASCADE_FAMILIES
+
+
 class TestFleetDispatch:
     """The dispatcher puts the families where a node has one writer."""
 

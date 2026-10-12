@@ -758,16 +758,25 @@ intent, not an open store.
 ### Running it
 
 Opt in with `output.sweep: "stages"` — the same knob the spatial local
-dispatcher reads — and both **spatial** Lambda tails chain the fleet sweep
-after the rollup-families leg, auto-scoped to the run's own footprint:
-`runner._run_lambda` (`python -m zagg` / `agg`) and the `client` facade's
-`Run.dispatch` (issue #588, either transport), through the one seam
-`runner._invoke_lambda_stage_sweep`.
+dispatcher reads — and both **spatial** Lambda tails chain the fleet sweep,
+auto-scoped to the run's own footprint: `runner._run_lambda` (`python -m
+zagg` / `agg`) and the `client` facade's `Run.dispatch` (issue #588, either
+transport), through the one seam `runner._invoke_lambda_stage_sweep`. When
+the run **walks a `/2` ladder** — `runner._cascade_families`, the same
+config-only gate the Icechunk commit pin reads (`output.sweep: "stages"` and
+a `/2` declaration with a composable field) — the tail hands that seam
+`families=zagg.sweep_families.CASCADE_FAMILIES` and fires **no**
+rollup-families leg of its own: the `stats`/`moc`/`submap` rollups ride the
+cascade's node closes and the §10 root section composes in its finisher, so
+the end of the run is one fan-out
+([issue #610](https://github.com/englacial/zagg/issues/610) phase 4). A run
+that walks none keeps the separate families leg exactly as before.
 
 !!! warning "Only the spatial Lambda tails chain it"
     `output.sweep: "stages"` validates on any hive config, and every tail
-    reads it as truthy and runs the rollup-families sweep — but only the
-    spatial Lambda tails go on to dispatch the staged one. Two tails do not:
+    reads it as truthy and runs the rollup-families sweep where no staged
+    sweep carries the families — but only the spatial Lambda tails go on to
+    dispatch the staged one. Two tails do not:
 
     * **raster** (`data_source.reader: raster`) does not chain, and is right
       not to. A raster store is column-less by construction — there are no
@@ -876,9 +885,11 @@ run and simply drops the finisher's reporting from the summary.
     are folded in, never dropped.
 
 !!! warning "The tail blocks while the sweeps run"
-    Unlike every other end-of-run invoke, the two sweep legs are not
+    Unlike every other end-of-run invoke, the sweep legs are not
     fire-and-forget. The families leg ([issue #610](https://github.com/englacial/zagg/issues/610))
-    waits on two barriers — its partitions', then its finisher's — of up to
+    — fired only by a run that walks no `/2` ladder; a `/2` run's families
+    ride the staged sweep — waits on two barriers — its partitions', then
+    its finisher's — of up to
     `DEFAULT_BARRIER_TIMEOUT_S` (2,700 s) each. The staged sweep's tuple
     ordering has to be held by somebody, and the dispatcher is the only party
     that sees each tuple finish; its barrier waits are bounded by a total
@@ -954,8 +965,8 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 | End-of-run step | What lands | If the launcher dies before it |
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
-| 2. rollup sweep | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
-| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits — and, where the dispatcher is given `families=` ([issue #610](https://github.com/englacial/zagg/issues/610) phase 4), the rollup families riding the same walk, folded in each node's close and composed into the §10 root section by this run's own finisher, so step 2 is not needed at all — over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 2. rollup sweep (only when the run walks **no** `/2` ladder — the `/1` retrofit regime; a `/2` run's families ride step 3 and this step is not fired, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4) | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits — and, when the run walks the `/2` ladder (the tail then passes `families=zagg.sweep_families.CASCADE_FAMILIES`, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4), the rollup families riding the same walk, folded in each node's close and composed into the §10 root section by this run's own finisher, in place of step 2; on a windowed store that declares no all-time fold there is no close to carry them, which the dispatcher warns about and reports (`families_unswept`) rather than refusing — over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 
 Shards the launcher had not dispatched yet never run. Work through the steps
@@ -1056,7 +1067,13 @@ one overwrites its record; leave a second between them.
 
 The families pass is idempotent; run it even when `tail.json` exists, since
 the launcher may have died before the families invoke (attach then runs no
-tail). *The sweeps* run in the calling process and write the store from it, so
+tail). On a run that walked the `/2` ladder the families rode the staged
+sweep, so the `--stages` pass above regenerates them too (`--families
+stats,moc,submap` names them explicitly) — and so does a plain pass scoped
+to those three, `python -m zagg.sweep <store> --families stats,moc,submap`,
+which is also the backstop when a windowed store declared no all-time fold
+and the staged sweep reported them `families_unswept`. *The sweeps* run in
+the calling process and write the store from it, so
 they need the store's write credentials and a host in the store's region.
 Where the operator cannot write the store (a Source Cooperative–published
 one), drive the staged sweep's fleet form instead — `run_stage_sweep_fleet`,
