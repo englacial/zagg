@@ -943,7 +943,12 @@ Both failures are quiet rather than loud. A missing list grant reads in the run
 log exactly like slow workers — "the prefix is empty" and "the LIST failed" are
 the same empty set — until the dispatcher gives up after five consecutive
 faulted LISTs and proceeds fail-open. A missing `s3:GetObject` completes the
-run and simply drops the finisher's reporting from the summary.
+run and simply drops the finisher's reporting from the summary — on the
+`.status/` sibling. On the **store root** the same missing grant also
+disables the ladder gate, which is fail-open by design (one warning, then the
+fan-out it had before the gate): a `/1`-manifest store then goes back to
+billing one dying invoke per dispatch node, which is the whole cost the gate
+exists to avoid.
 
 !!! note "Dispatch nodes come from the work set, not from the store"
     The dispatcher reads the manifest for the ladder gate and nothing else —
