@@ -94,16 +94,14 @@ def _sources(first_run: bool):
     return fakes, records
 
 
-def _run(
-    monkeypatch, tmp_path, root, *, first_run, all_time=True, composition=False, temporal=False
-):
+def _run(monkeypatch, tmp_path, root, *, first_run, composition=False, temporal=False):
     cfg = emit._digest_cfg()
     if composition:
         _composition(cfg)
     if temporal:
         cfg.aggregation["variables"]["h_tdigest"]["temporal"] = "per-centroid"
     cfg.output["sweep"] = "stages"
-    cfg.output["pyramid"] = {"overviews": 7, "all_time": all_time}
+    cfg.output["pyramid"] = {"overviews": 7, "all_time": True}
     validate_config(cfg)
     fakes, records = _sources(first_run)
     catalog = {
@@ -283,8 +281,17 @@ class TestACorrectStore:
     def test_without_the_declaration_the_all_time_check_is_not_applicable(
         self, built, tmp_path, monkeypatch
     ):
+        # A windowed config cannot be built without the fold any more (issue
+        # #610 phase 4: ``all_time: false`` is refused at validation), so the
+        # undeclared store is one written BEFORE that rule — modelled by
+        # withdrawing the declaration from the manifest and removing its folds.
         root = tmp_path / "store"
-        _run(monkeypatch, tmp_path, root, first_run=False, all_time=False)
+        _run(monkeypatch, tmp_path, root, first_run=False)
+        manifest = json.loads((root / MANIFEST_NAME).read_text())
+        manifest["pyramid"]["overview"]["all_time"] = False
+        (root / MANIFEST_NAME).write_text(json.dumps(manifest))
+        for fold in root.rglob("all.zarr"):
+            shutil.rmtree(fold)
         report = validate_pyramid(str(root), full=True)
         assert report["passed"], format_report(report)
         entry = report["checks"]["all_time"]

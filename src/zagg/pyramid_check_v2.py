@@ -488,6 +488,7 @@ def _tier_checks(
         attrs = col_probes[dec]
         errors["readback"].extend(_column_attrs_errors(dec, s, attrs, resolutions, boundary))
         for q in resolutions:
+            errors["readback"].extend(_column_layout_errors(harness, dec, s, q))
             from_raw = boundary is None or q >= boundary
             # Bound the fold: one cell of a from-raw group at ``q`` covers
             # ``4 ** (cell_order - q)`` leaf cells, whatever ``sample_cells``
@@ -661,6 +662,47 @@ def _stage_provenance_errors(node, k, r, s, prov, gather, depth) -> list:
     if not prov.get("run_id"):
         errs.append(f"{node}: no run_id in the zagg-overview/2 attrs (§4.4)")
     return errs
+
+
+def _column_layout_errors(harness, dec, s, q) -> list:
+    """One column group's arrays against the §4.6 layout rule (issue #631).
+
+    Every array the group carries — the ``morton`` coordinate, the declared
+    fields, their companions — is held to :func:`zagg.column_shards.layout_mismatch`:
+    one unsharded chunk below ``4^5`` cells, a ``sharding_indexed`` object on
+    the rule's inner chunk at or above it — one line per array, or one per
+    group when every array fails the same way (a legacy fine group, until the
+    column backfill re-lays it). The handles are memoized
+    (:meth:`_Harness.array`): one metadata GET per array the value legs did
+    not already open — in sampled mode with the payload re-fold declined, a
+    digest field without a companion — and none for the rest. An absent group
+    or array is the read-back leg's finding, not this one's; any other open
+    failure declines the leg BY NAME (:meth:`_Harness.warn`), never silently.
+    """
+    from zarr.errors import GroupNotFoundError
+
+    from zagg.column_shards import layout_mismatch
+
+    try:
+        group = harness.column_group(dec, q)
+    except (GroupNotFoundError, FileNotFoundError, KeyError):
+        return []  # absent group: _check_node's read-back leg names it
+    except Exception as exc:
+        harness.warn(f"{dec}[{q}]: §4.6 layout not checked: {type(exc).__name__}: {exc}")
+        return []
+    found, checked = {}, 0
+    for name in ("morton", *harness.fields, *harness.companions):
+        arr = harness.array(group, name)
+        if arr is None:
+            continue
+        checked += 1
+        why = layout_mismatch(s, q, arr.metadata.to_dict())
+        if why:
+            found[name] = why
+    # A legacy fine group fails every array the same way: one line per group.
+    if len(found) > 1 and len(found) == checked and len(set(found.values())) == 1:
+        return [f"{dec}[{q}] (every array: {', '.join(found)}): {next(iter(found.values()))}"]
+    return [f"{dec}[{q}]/{name}: {why}" for name, why in found.items()]
 
 
 def _column_attrs_errors(dec, s, attrs, resolutions, boundary) -> list:

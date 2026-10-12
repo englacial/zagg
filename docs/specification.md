@@ -264,7 +264,7 @@ chunk shape:
 
 | geometry | on disk | single-cell read |
 |---|---|---|
-| **sharded** (`ShardingCodec`; every hive leaf and the sharded flat path) | ONE object per shard; the shard's K inner chunks live inside it with an internal index | 2 ranged GETs (index suffix + one ranged inner chunk) |
+| **sharded** (`ShardingCodec`; every hive leaf, the sharded flat path, and a leaf column group of `4^5` cells or more — §4.6) | ONE object per shard; the shard's K inner chunks live inside it with an internal index | 2 ranged GETs (index suffix + one ranged inner chunk) |
 | **per-inner-chunk** (regular array; the unsharded streaming path) | one object per inner chunk | 1 GET (the object) |
 
 When sharded, the §1.3 chain rides INSIDE a `sharding_indexed` codec whose
@@ -1466,7 +1466,16 @@ staged sweep's finisher.
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time). On a `/2` store it is folded from the
   node's per-window overviews (§4.4 "The all-time fold of a windowed
-  store").
+  store"). A windowed store that declares an overview schedule (a
+  non-empty `overviews` list or `orders`) MUST declare it `true`
+  ([issue #610](https://github.com/englacial/zagg/issues/610) phase 4: the
+  per-node rollups and the §4.10 companion ride the node's all-time close,
+  so a windowed config that omits the key resolves to `true` and one that
+  spells `false` is refused). A windowed store that declares none
+  (`pyramid: false`, written as `orders: []`) declares no fold and carries
+  no `all_time` key. A reader MUST still tolerate `false` on a
+  windowed store written before that rule — it is §4.10's gated case, with
+  no `all.zarr` to find.
 - **`summarize`** (optional) — the opt-in **declared derived summary** for
   `none`-class fields: a mapping from a new, *different* field name to its
   derivation (e.g. an auto-digest of a roster field's raw values), living in
@@ -1657,13 +1666,42 @@ guessed at.
   words are exact only *given* the centroid partition the payload describes
   (§9.1, §8.3), so a group holding a populated payload against an empty
   sibling is non-conformant, not merely short.
-  A group's arrays are **single-chunk and unsharded** — `chunk_shape` equals
-  `shape` (`4^(r - node)` cells), no `sharding_indexed` codec — whatever the
-  leaf's own `chunk_inner`/sharding: a column group is small by construction,
-  and a reader sizes its GETs accordingly (§1.5's per-inner-chunk geometry,
-  read from the array metadata as §1.5 requires).
+- **Layout.** Every array of a group is **one object per leaf**, and its
+  chunking is a function of the group's own geometry `(node, r)` alone —
+  never of the leaf's `chunk_inner` or of any manifest key — so a writer,
+  a checker and an external reader with only the manifest derive it the
+  same way (issue [#631](https://github.com/englacial/zagg/issues/631);
+  `zagg.column_shards`):
+  - a group of **fewer than `4^5` cells** (`r - node < 5`) is **single-chunk
+    and unsharded**: `chunk_shape` equals `shape` (`4^(r - node)` cells), no
+    `sharding_indexed` codec. This is every column written before the rule
+    and the whole default tier below — unchanged byte for byte;
+  - a group of **`4^5` cells or more** (`r - node ≥ 5`) is **sharded**: its
+    arrays carry the `sharding_indexed` codec with the outer chunk equal to
+    `shape` (still one object), `index_location: end`, index codecs
+    `[bytes(endian=little), crc32c]` — the §1.5 leaf shard layout — and an
+    **inner chunk of `min(4^5, 4^(r - node) / 4)` cells**: at most 1,024
+    cells (the largest power of four whose saturated signal digest stays
+    under ~0.5 MB at the 128-centroid `overview_delta` cap — ~470 B per
+    cell, measured on the v4 ATL03 rebuild) and at least four inner chunks
+    per object (an object that is one inner chunk has no piece to fetch).
+    The inner codec chain is the member's own: §1.3's `vlen-bytes` +
+    `zstd` for a ragged payload or companion, the leaves' bytes-only chain
+    for a dense array. An inner chunk holding only fill is **absent** from
+    the index (the §1.5 sentinel), for dense arrays as for ragged ones.
+
+  On the 19/13/9 reference geometry with `overviews: [16, 15, 14, 13]`:
+  order 16 is 16 inner chunks of 1,024 cells, 15 four of 1,024, 14 four of
+  256, and 13 one whole 256-cell chunk. The inner chunk is always a power
+  of four, so an aligned subtree span (§1.5) never straddles one, and a
+  reader sizes its GETs from the array metadata exactly as §1.5 requires
+  for a leaf (whole object below `4^5` cells; index suffix plus covering
+  inner chunks above). The rule is pinned on committed bytes by the §7
+  `column_fine/` fixture; a column whose fine group is laid whole (a
+  writer predating the rule) is **non-conformant** and is re-laid by the
+  column backfill, which reads the layout as structure drift.
   Under the default `[chunk_inner]` declaration on the 19/13/9 reference
-  geometry a column carries groups {13, 12, 11, 10, 9}.
+  geometry a column carries groups {13, 12, 11, 10, 9}, all below `4^5`.
 - **Fold laws.** The leaf tier has a **raw-fold boundary** at resolution
   `order + 2` (the constant `zagg.column.RAW_MEMBER_DEPTH = 2`; a constant,
   never a per-store knob —
@@ -1828,9 +1866,11 @@ orchestration, never contract — a reader binds to the ladder artifacts of
 §4.4, not to stage columns. The root tuple writes no column (nothing
 consumes it). A stage column's **chunking** is orchestration too
 ([issue #586](https://github.com/englacial/zagg/issues/586)): a resolution
-group of at most `4^5` cells is one chunk per array, as a leaf column's is;
-a wider group is laid on regular inner chunks of `4^5` cells, one object per
-chunk and no ShardingCodec, because the staged sweep gathers, writes and
+group of at most `4^5` cells (`res − node ≤ 5`) is one chunk per array — as
+a leaf column's is below `4^5` cells; at exactly `4^5` the leaf column shards
+(§4.6 Layout) while the stage column stays one chunk; a wider group is laid
+on regular inner chunks of `4^5` cells, one object per chunk and no
+ShardingCodec, because the staged sweep gathers, writes and
 reads such a group one chunk at a time (it never holds a level whole). The
 arrays, their values, the attrs and the §5 record are the same either way —
 the O11 hash is over decoded values. On a windowed store every window has
@@ -1883,6 +1923,19 @@ stated here:
   `pyramid.overview.all_time`). The fleet dispatcher fires the close units
   from it, not from its run config: `pyramid` is not a frozen manifest key,
   so the two can disagree, and the store is the source of truth.
+- A stage record's **`families`**
+  ([issue #610](https://github.com/englacial/zagg/issues/610)) is present
+  when the rollup families rode the same walk as the ladder (§4.7's first
+  paragraph: they add no byte layouts). It maps each family's name to that
+  family's block — its per-pass counts, the dispatch nodes whose span failed
+  (`node_failures`), and, for `moc`, the §10 accumulator block the run's
+  finisher composes the root §10.2/§10.3 section and its §10.5 sibling from,
+  the same block a families-pass partition record carries, in the same
+  currency. Every key of the mapping is a family name, so a reader may walk
+  it without an allow-list.
+  Still telemetry: the objects it composes are normative, this record is not,
+  and the finisher reads which families rode off these records rather than
+  off its own invoke.
 
 ### 4.8 The sweep-admission lease (`zagg-sweep-lease/1`)
 
@@ -2443,13 +2496,14 @@ from its manifest, and `kitchen_sink/`'s builder strips the §9 `located`
 attrs from its two leaf `*_locations` siblings, so a regeneration
 reproduces both.
 
-Nine tiny single-shard hive stores plus four metadata-only ones (the
+Ten tiny single-shard hive stores plus four metadata-only ones (the
 `pyramid/` declaration, the `multiscales/` companion, the `icechunk/` repo
-root and the `uncounted/` root objects), all on the same
+root and the `uncounted/` root objects), all but one on the same
 deliberately small geometry — shard order 4, inner-chunk order 5, cell
 order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
 default; `raster_toc/` is the one exception — a `(time, cells)` product is
-never sharded, §8/#247):
+never sharded, §8/#247; `column_fine/` keeps the shard order and deepens
+the cell order to 10, the smallest leaf that can declare a §4.6 fine tier):
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
@@ -2515,6 +2569,34 @@ never sharded, §8/#247):
   pinned zagg-side by `tests/test_column.py`; a committed multi-rung golden
   arrives with the sweep-side fixtures of
   [#384](https://github.com/englacial/zagg/issues/384).
+- **`column_fine/`** — the §4.6 **fine-tier layout** surface
+  ([#631](https://github.com/englacial/zagg/issues/631)): the `minimal/`
+  fields on a **deeper** leaf — the one fixture not on the 4/5/6 geometry:
+  shard order 4 (the same `11213` key), inner-chunk order 7, cell order 10
+  (4,096 cells, K = 64 inner chunks of 64 cells) — under
+  `output.pyramid.overviews: 9`, the smallest declarable fine tier (a base
+  at `node + 5` is a `4^5`-cell group, and §4.4's contiguity rule caps the
+  base at `2 · node + 1`; both hold only from node 4 up). The column
+  carries groups `{9, 8, 7, 6, 5, 4}`; **group 9 is sharded** — each array
+  one `sharding_indexed` object on four 256-cell inner chunks, index at the
+  end — and group 8 and below are one whole unsharded chunk each. The four
+  populated leaf cells (0, 2, 1,089, 3,263) fold to group-9 rows 0, 0, 272
+  and 815, so in the `count` and `h_tdigest` objects inner chunks 0, 1 and 3
+  are present and **inner chunk 2 is absent** from the shard index (the §1.5
+  sentinel on a column, for the dense array as for the ragged one), while
+  the `morton` coordinate — written for every cell — holds all four.
+  `column_fine.expected.json`
+  carries the `column/` record plus `column.layout` — per group `{sharded,
+  chunk_cells}` spelled from the §4.6 formula, never read back — and the
+  conformance tests decode group 9 from the committed bytes by the §1.5
+  index recipe alone (suffix, ranged inner chunks, `zstd` + §1.4 framing
+  for the digest, raw little-endian words for `morton` and `count`) and
+  hold every group's `zarr.json` to the rule. Its groups 5 and 4 are
+  byte-identical to `column/`'s (the same observations fold to the same
+  res-5 rows), which pins that the deeper leaf and the fine-tier fold leave
+  the coarse groups' values unchanged (groups 5 and 4 fold flat from the
+  unsharded member 6 and never read group 9, so layout parity is pinned
+  zagg-side by `tests/test_column_shards.py::TestLayoutParity`).
 
 - **`multiscales/`** — the §4.10 companion-group surface: METADATA ONLY —
   a `zagg-pyramid/2` manifest on `pyramid/`'s grid, a production root
@@ -4239,7 +4321,7 @@ manifest's `zagg-multiscales/1` datasets (§4.9) plus the base:
 | level (group) | artifact per node | node order `n` | cells per object `4^(c−n)` | object arrays |
 |---|---|---|---|---|
 | `/19` | `{leaf}.zarr/19/…` | 9 (shard) | 4^10, as K = 256 inner chunks of 4^6 (§1.5, sharded) | the leaf template's |
-| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column) | 9 | 256, ONE unsharded chunk | the column's declared member |
+| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column) | 9 | 256, ONE unsharded chunk (a column member of `4^5` cells or more — `/14`–`/16` under `overviews: [16, 15, 14, 13]` — is one sharded object on the §4.6 inner chunk; its level is chunked at that inner chunk) | the column's declared member |
 | `/12` … `/4` | `{node}/all.zarr/{c}/…` (the ancestor's overview) | 8 … 0 (= c − 4) | 256, ONE unsharded chunk | the overview's |
 
 (production geometry: shard 9 / chunk 13 / cell 19, declared leaf-node
@@ -4409,7 +4491,7 @@ the level's global cell extent `12·4^c`, `n_rows` the length of the block's
 | field | repo array | derivation |
 |---|---|---|
 | `shape` | `(n_rows, n_shards · L₀, *L[1:])` | `L` the level's per-node object array's shape (the leaf's for the base); `n_shards = 12·4^n`, `n` the level's node order; `n_rows` the same for every array of the repo |
-| chunk shape | `(1, *inner)` — one row deep, the object's **inner** chunk shape across | `inner` is the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5), else its own `chunk_grid` — the whole object for a column or overview level, one chunk per node |
+| chunk shape | `(1, *inner)` — one row deep, the object's **inner** chunk shape across | `inner` is the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5, and every fine column level, §4.6 — its inner chunk), else its own `chunk_grid` — the whole object for an overview level or a column level below `4^5` cells, one chunk per node |
 | `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
 | `dimension_names` | `("window", *names)` | the object array's names behind the row dimension's |
 | `data_type`, `fill_value`, `attributes` | verbatim from the object array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
@@ -4483,19 +4565,25 @@ and an all-time overview), at global chunk index
 (w, r · C + j)   (trailing axes keep their object-local chunk index, 0 for a single-chunk payload dim)
 ```
 
-For the base level `C = 4^(chunk_order − shard_order)` inner chunks; for a
-column or overview level the object is ONE chunk, `C = 1`, and the cell-axis
-index is the node's rank itself. The row index is the repo's, not the
-object's: a writer names an object's row by **label** and the commit
-resolves it against the block's `rows` (§11.4), so the same object bytes
+For the base level `C = 4^(chunk_order − shard_order)` inner chunks; for an
+overview level, and for a column level of fewer than `4^5` cells, the object
+is ONE chunk, `C = 1`, and the cell-axis index is the node's rank itself; for
+a **fine column level** (`cells − shard_order ≥ 5`, §4.6) the object is
+sharded and `C` is its inner-chunk count — the level's `chunk_order` is the
+inner chunk's order (`cells − 5`, or `shard_order + 1` at exactly `4^5`
+cells), so the same `r · C + j` law applies with the base level's
+`C = 4^(chunk_order − shard_order)` (16 / 4 / 4 at /16 / /15 / /14 on
+19/13/9). The row index is the repo's, not the object's: a writer names an
+object's row by **label** and the commit resolves it against the block's `rows` (§11.4), so the same object bytes
 land at whatever row the repo allocated that label.
 
 At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
 
 Each **populated** inner chunk is recorded as one virtual reference:
 
-- **sharded leaf array** (every hive leaf, §1.5): `location` is the leaf's
-  single shard object — the array's **outer**-chunk key, `{leaf}/{p}/c/0` for
+- **sharded array** (every hive leaf, §1.5, and every fine column level,
+  §4.6): `location` is the array's
+  single shard object — its **outer**-chunk key, `{leaf}/{p}/c/0` for
   the 1-D cells arrays the hive writes — and `offset`/`length` are the
   chunk's entry in the shard index suffix, the same two `u64` words the §1.5
   2-GET recipe reads — the writer fetches that suffix itself, once per array
@@ -4503,7 +4591,8 @@ Each **populated** inner chunk is recorded as one virtual reference:
   `2^64 − 1` sentinel in both words) gets **no reference** and reads as
   `fill_value`.
 - **regular (unsharded) array** — a leaf array on a `chunk_inner`-less
-  grid, and every column and overview array (one chunk per object):
+  grid, every overview array, and every column array of fewer than `4^5`
+  cells (one chunk per object):
   `location` is the chunk object (`{leaf}/{p}/c/{j}`; `{object}/{p}/c/0` for
   a single-chunk array), `offset` 0, `length` the object size (§11.4); a
   missing object gets no reference.
@@ -4961,9 +5050,10 @@ stage node) the writer issues:
   recipe's second read, which yields every inner chunk's `(offset, length)`
   at once) **and** one `HEAD` of the shard object, for its checksum — the
   `ETag`, or `last_modified` on a local store (§11.3);
-- **single-chunk array** — every column and overview array (one chunk per
-  object): one `HEAD` of its one chunk object, for its size (the ref's
-  `length`) and checksum;
+- **single-chunk array** — every overview array and every column array of
+  fewer than `4^5` cells (one chunk per object): one `HEAD` of its one chunk
+  object, for its size (the ref's `length`) and checksum; a fine column
+  array (§4.6) is a sharded array and takes the suffix read above;
 - **multi-chunk regular (unsharded) array** — a leaf array on a
   `chunk_inner`-less grid: one `LIST` of the array's `c/` chunk prefix, which
   yields every chunk object's key, size and checksum in one request — and,
@@ -5019,9 +5109,9 @@ exactly the chunks of one HEALPix cell at order `split_order`, so the split
 is stated as "one base manifest per order-`split_order` cell". Every other
 level holds the same **number of chunks** per manifest — not one
 `split_order` cell — capped at its own chunk axis (`chunk_order` is the
-group's own: the inner-chunk order for the base, 13 at production; the node
-order for a column or overview group, one chunk per node). At the defaults
-that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
+group's own: the inner-chunk order for the base, 13 at production, and for
+a fine column level, §11.3; the node order for any other column or overview
+group, one chunk per node). At the defaults that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
 and one base cell (12 manifests per array) at `/11` and every coarser level;
 no manifest ever spans more than a base cell. Holding the chunk count
 constant is what keeps the manifest count — and with it the snapshot, which

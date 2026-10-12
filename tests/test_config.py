@@ -3620,3 +3620,112 @@ class TestPackagedConfigsAreDispatchable:
         ]
         for name in companions:
             assert cfg.aggregation["variables"][name]["fill_value"] == "NaN"
+
+
+def _windowed_cfg(pyramid="absent"):
+    """A hive healpix config with a yearly window schedule; ``pyramid`` is the raw knob."""
+    cfg = _cfg_with_grid_knobs()
+    cfg.data_source["variables"]["delta_time"] = "/delta_time"
+    cfg.output["store_layout"] = "hive"
+    cfg.output["windowing"] = {
+        "schedule": "yearly",
+        "time_field": "delta_time",
+        "epoch": "2018-01-01T00:00:00Z",
+    }
+    if pyramid != "absent":
+        cfg.output["pyramid"] = pyramid
+    return cfg
+
+
+class TestWindowedStoresDeclareTheAllTimeFold:
+    """``output.windowing`` requires ``pyramid.all_time`` (issue #610 phase 4).
+
+    espg's ruling on PR #623 question (16): the rollup families and the
+    multiscales companion ride each node's all-time close, so a windowed
+    store must declare it — the absent key resolves to ``true``, an explicit
+    ``false`` is refused at validation, and the run tails no longer branch on
+    it (``runner._cascade_families``).
+    """
+
+    REFUSAL = "output.windowing requires the all-time fold"
+
+    @pytest.mark.parametrize(
+        "pyramid",
+        [
+            {"all_time": False},
+            {"overviews": 9, "all_time": False},
+            {"spacing": 2, "all_time": False},
+        ],
+        ids=["bare", "v2-grammar", "v1-grammar"],
+    )
+    def test_an_explicit_false_is_refused(self, pyramid):
+        with pytest.raises(ValueError, match=self.REFUSAL):
+            validate_config(_windowed_cfg(pyramid))
+
+    def test_the_refusal_names_the_issue_and_the_fix(self):
+        with pytest.raises(ValueError, match=r"issue #610.*resolves to true"):
+            validate_config(_windowed_cfg({"all_time": False}))
+
+    @pytest.mark.parametrize(
+        "pyramid",
+        ["absent", {}, {"overviews": 9}, {"spacing": 2}],
+        ids=["no-knob", "empty", "v2-grammar", "v1-grammar"],
+    )
+    def test_an_absent_key_resolves_to_true(self, pyramid):
+        from zagg.config import get_pyramid
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = _windowed_cfg(pyramid)
+        validate_config(cfg)
+        assert get_pyramid(cfg)["all_time"] is True
+        # ...read through the accessor, not written back: the knob the
+        # config spells is intact, and the manifest block carries the fold.
+        assert cfg.output.get("pyramid") == (None if pyramid == "absent" else pyramid)
+        assert build_pyramid_block(cfg, shard_order=6)["overview"]["all_time"] is True
+
+    def test_an_explicit_true_is_what_it_always_was(self):
+        from zagg.config import get_pyramid
+
+        cfg = _windowed_cfg({"overviews": 9, "all_time": True})
+        validate_config(cfg)
+        assert get_pyramid(cfg) == {"overviews": 9, "all_time": True}
+
+    def test_an_unwindowed_store_keeps_its_default(self):
+        from zagg.config import get_pyramid
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = _cfg_with_grid_knobs()
+        cfg.output["store_layout"] = "hive"
+        validate_config(cfg)
+        assert get_pyramid(cfg) == {}  # no fold declared: the single fold IS all-time
+        assert build_pyramid_block(cfg, shard_order=6)["overview"]["all_time"] is False
+        # An explicit false is legal there, and ``schedule: none`` is unwindowed too.
+        cfg.output["pyramid"] = {"all_time": False}
+        cfg.output["windowing"] = {"schedule": "none"}
+        validate_config(cfg)
+        assert get_pyramid(cfg) == {"all_time": False}
+
+    @pytest.mark.parametrize("schedule", ["yearlyy", "quarterly", None])
+    def test_a_bad_schedule_is_refused_by_the_schedule_check(self, schedule):
+        # _validate_pyramid runs before _validate_windowing, so a schedule that
+        # is not a known one must not read as windowed there: the operator gets
+        # the schedule refusal, never the all-time one it would mask.
+        cfg = _windowed_cfg({"all_time": False})
+        cfg.output["windowing"]["schedule"] = schedule
+        with pytest.raises(ValueError, match=r"output\.windowing\.schedule") as err:
+            validate_config(cfg)
+        assert self.REFUSAL not in str(err.value)
+
+    def test_pyramid_off_stays_legal(self):
+        from zagg.config import get_pyramid
+
+        # ``pyramid: false`` declares the overview family OFF: no ladder, no
+        # close, and no fold to require — the rollups keep the whole-tree pass
+        # there, as on any store that walks no ladder.
+        cfg = _windowed_cfg(False)
+        validate_config(cfg)
+        assert get_pyramid(cfg) is None
+
+    def test_a_non_boolean_is_still_refused_by_type(self):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            validate_config(_windowed_cfg({"all_time": "yes"}))

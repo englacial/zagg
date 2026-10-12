@@ -43,7 +43,10 @@ SPEC_DATA = Path(__file__).parent / "data" / "spec"
 #: same production path: the column writer must leave that leaf untouched
 #: (it holds the same payload ``bytes`` objects the leaf staged), and running
 #: the suite over both is what asserts it.
-FIXTURES = ("minimal", "kitchen_sink", "column", "versioned")
+#: ``column_fine`` (issue #631) is the one leaf on another geometry (4/7/10):
+#: every leaf-shaped assertion reads its orders off the expected file, so the
+#: deeper sharded leaf (64 inner chunks of 64 cells) runs the suite too.
+FIXTURES = ("minimal", "kitchen_sink", "column", "versioned", "column_fine")
 #: The manifest-only §4.5 declaration fixture (issue #382) — deliberately NOT
 #: in ``FIXTURES``: it has no leaf, so nothing leaf-shaped applies to it.
 PYRAMID = "pyramid"
@@ -89,6 +92,10 @@ FROZEN_COMBINED = {
     # (§1.5, issue #582) — the same literal pins that versioning a leaf
     # perturbs nothing the §5 recipe hashes.
     "versioned": "4d1157b14e0956b0744a4f36926711666fc55d6a75683e07438541f00b9f9a5c",
+    # The §4.6 fine-tier fixture (issue #631): minimal's fields on a deeper
+    # 4/7/10 leaf (4,096 cells, four populated), its own digest; its COLUMN
+    # is pinned by tests/test_spec_conformance_column_fine.py.
+    "column_fine": "735e38b5258327fe6fca4de42ccd9f414525557eff4f8c353c5e1fbac266ab3e",
     # The §2.0 flux fixture (issue #424) — asserted by TestFluxDeclaration
     # (flux is not in FIXTURES: the leaf-shaped suite hardcodes h_tdigest).
     "flux": "0a7cf012f374249bb24d024aa4c428355c283b2453844838ce6eb0a35c48630a",
@@ -522,12 +529,17 @@ class TestCoordinateAndDense:
         exp = _expected(name)
         per_chunk = exp["cells_per_chunk"]
         words = [int(w) for w in np.asarray(self._open(name, exp, "morton")[:])]
+        # The written chunks are the ones the plan populated; every other
+        # one (the declared ``empty_chunk`` among them — on the 4/5/6 leaves
+        # it is the only one, ``column_fine/`` leaves 61 unwritten) is fill.
+        written = {cell["index"] // per_chunk for cell in exp["cells"]}
+        assert exp["empty_chunk"] not in written
         for ordinal in range(exp["chunks_per_shard"]):
             chunk = words[ordinal * per_chunk : (ordinal + 1) * per_chunk]
-            if ordinal == exp["empty_chunk"]:
-                assert chunk == [0] * per_chunk
-            else:
+            if ordinal in written:
                 assert all(b > a for a, b in zip(chunk, chunk[1:], strict=False))
+            else:
+                assert chunk == [0] * per_chunk
 
     @pytest.mark.parametrize("name", FIXTURES)
     def test_count_field_matches_expected(self, name):
@@ -1424,6 +1436,7 @@ class TestFixtureSemanticHash:
         "minimal",
         "kitchen_sink",
         "column",
+        "column_fine",
         "versioned",
         "flux",
         PYRAMID,
@@ -1441,6 +1454,10 @@ class TestFixtureSemanticHash:
             ("minimal", {"kitchen_sink": False}),
             ("kitchen_sink", {"kitchen_sink": True}),
             ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+            # The §4.6 fine-tier fixture (issue #631): minimal's fields on
+            # the deeper 4/7/10 grid under ``overviews: 9`` — the grid is
+            # leaf-shaping, so this is its own identity.
+            ("column_fine", {"kitchen_sink": False, "pyramid": {"overviews": 9}, "fine": True}),
             # versioned/ is minimal's config: leaf versioning is layout, not
             # semantics (the run identity names the version, never the hash).
             ("versioned", {"kitchen_sink": False}),
@@ -2816,6 +2833,15 @@ class TestDerivedCellCoordinate:
             == (exp["content_hashes"]["arrays"])
         )
         assert exp["content_hashes"]["combined"] == FROZEN_COMBINED[self.NAME]
+
+    def test_the_manifest_declares_the_all_time_fold(self):
+        # §4.5 `all_time`: a windowed store that declares an overview schedule
+        # MUST declare the fold `true` (issue #610 phase 4). The fixture is a
+        # leaf-tier one, so it commits no `all.zarr`: declared-but-unmaterialized
+        # is legal, and this pins the declaration a regenerator could drop.
+        manifest = json.loads((SPEC_DATA / self.NAME / "morton_hive.json").read_text())
+        assert manifest["pyramid"]["overviews"]
+        assert manifest["pyramid"]["overview"]["all_time"] is True
 
     def test_the_unwindowed_fixtures_still_store_theirs(self):
         # The other half of the rule: every unwindowed leaf keeps its array,

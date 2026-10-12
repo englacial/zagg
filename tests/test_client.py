@@ -23,6 +23,7 @@ import zagg.client
 import zagg.concurrency
 from zagg.client import Run, RunHandle, ShardError
 from zagg.config import PipelineConfig, default_config
+from zagg.sweep_families import CASCADE_FAMILIES
 
 # -- fixtures ----------------------------------------------------------------
 
@@ -1491,15 +1492,19 @@ class TestStagedSweepTail:
 
         run, handle, stub, seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
         modes = stub.modes()
-        # CLI parity (issue #588 question (1), ruled): the rollup trigger still
-        # fires, then the staged sweep, then the finalize — all after the stats
-        # invoke wrote the tail marker, exactly as ``_run_lambda``'s tail.
-        assert modes.index("stats") < modes.index("sweep")
+        # CLI parity (issue #588 question (1), ruled): the staged sweep, then
+        # the finalize — all after the stats invoke wrote the tail marker,
+        # exactly as ``_run_lambda``'s tail. This run walks the /2 ladder, so
+        # the rollup families ride the staged sweep's node closes and no
+        # separate families fan-out is fired (issue #610 phase 4).
+        assert "sweep" not in modes
         before = seen["modes_at_stage"]
-        assert "stats" in before and "sweep" in before  # the tail marker and rollup precede
+        assert "stats" in before  # the tail marker precedes
         assert "icechunk_finalize" not in before  # ...and the finalize follows
         assert seen["order"] == ["stage", "finalize"] and modes[-1] == "icechunk_finalize"
         ((args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
+        assert handle.families_sweep is None  # nothing separate was fired
         # The staged tail runs on the 8,192 MB tier of the run's own function
         # family, as on ``_run_lambda`` (issue #586).
         assert args[0] is stub and args[1:3] == ("process-shard-test-8192-disk", _STORE)
@@ -1513,6 +1518,26 @@ class TestStagedSweepTail:
         assert kwargs["touch_policy"] == get_touch_policy(run.config)
         assert kwargs["output_creds_event"] is None and "store_kwargs" in kwargs
         assert handle.stage_sweep is self._COMPLETE
+        # The finalize carries the init record and the pinned ladder config.
+        assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
+        (fin,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
+        assert fin["icechunk_init"] == run._icechunk_init and "newest_only" not in fin
+        assert fin["config"]["output"]["icechunk"]["commit"] == "ladder"
+
+    def test_a_run_that_walks_no_ladder_keeps_the_families_pass(self, catalog, monkeypatch):
+        # ``sweep: "stages"`` on a config that declares no /2 ladder (the /1
+        # retrofit regime): the stage worker would refuse such a store at the
+        # /2 gate, so the families take their own pass exactly as before —
+        # the rollup trigger fires after the tail marker, before the staged
+        # sweep, and the staged sweep carries no family (issue #610 phase 4).
+        _run_, handle, stub, seen = self._drive(
+            catalog, monkeypatch, staged=self._COMPLETE, ladder=False
+        )
+        modes = stub.modes()
+        assert modes.index("stats") < modes.index("sweep")
+        assert "sweep" in seen["modes_at_stage"]
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == ()
         # The families outcome rides the handle (issue #610): conftest's stub dict.
         assert handle.families_sweep == {
             "partitions": 1,
@@ -1520,11 +1545,6 @@ class TestStagedSweepTail:
             "landed": 1,
             "finisher": "ok",
         }
-        # The finalize carries the init record and the pinned ladder config.
-        assert "unexpected icechunk_finalize body" in handle.icechunk_finalize["error"]
-        (fin,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
-        assert fin["icechunk_init"] == run._icechunk_init and "newest_only" not in fin
-        assert fin["config"]["output"]["icechunk"]["commit"] == "ladder"
 
     def test_the_families_seam_gets_the_run_id_and_output_store(self, catalog, monkeypatch):
         from zagg import runner
@@ -1533,10 +1553,25 @@ class TestStagedSweepTail:
         monkeypatch.setattr(
             runner, "_invoke_lambda_families_sweep", lambda *a, **k: seam.update(k) or {"x": 1}
         )
-        run, handle, stub, _seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
+        run, handle, stub, _seen = self._drive(
+            catalog, monkeypatch, staged=self._COMPLETE, ladder=False
+        )
         (cell,) = {e["run_id"] for _, _, e in stub.cell_events()}
         assert seam["run_id"] == cell and handle.families_sweep == {"x": 1}
         assert seam["store_kwargs"]["region"] == run.region == "us-west-2"
+
+    def test_the_cascade_decides_with_the_runners_gate(self, catalog, monkeypatch):
+        # Shared, not copied (as the seam and the completion gate are): the
+        # facade asks ``runner._cascade_families`` which families ride, so it
+        # cannot drift from ``_run_lambda`` on when the separate pass fires.
+        # A ladder-walking drive whose gate says "none ride" fires the pass.
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_cascade_families", lambda *a, **k: ())
+        _run_, _handle, stub, seen = self._drive(catalog, monkeypatch, staged=self._COMPLETE)
+        assert "sweep" in stub.modes()
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == ()
 
     @pytest.mark.parametrize(
         "staged, reason",

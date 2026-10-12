@@ -60,6 +60,7 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
+from zagg.column_shards import check_column_entry, column_grid, stale_column_levels
 from zagg.icechunk_rows import (
     ALL_ROW,
     DEFAULT_ROWS_PER_MANIFEST,
@@ -171,12 +172,12 @@ def split_exponent(base_chunk_order: int, split_order: int, chunk_order: int | N
     The exponent is fixed ONCE from the base level: ``m_base = base_chunk_order
     − split_order`` (7 at production — 16,384 inner chunks, one order-6 cell
     of the base). Every level then holds the same ``4^m`` CHUNKS per manifest,
-    capped at its own chunk axis (``chunk_order``: one chunk per node at a
-    column or overview level), so a coarse level's manifests span coarser
-    cells — ``/13`` one order-2 cell, ``/12`` one order-1 cell, ``/11`` and
-    coarser one base cell — rather than one ``split_order`` cell apiece, which
-    would multiply the manifest count (and the snapshot) by the number of
-    levels. Never above a whole base cell.
+    capped at its own chunk axis (``chunk_order``: one chunk per node at an
+    overview or a coarse column level, the inner chunk at a fine column, §4.6),
+    so a coarse level's manifests span coarser cells — ``/13`` one order-2
+    cell, ``/12`` one order-1 cell, ``/11`` and coarser one base cell — rather
+    than one ``split_order`` cell apiece, which would multiply the manifest
+    count (and the snapshot) by the number of levels. Never above a base cell.
     """
     m = max(int(base_chunk_order) - int(split_order), 0)
     return min(m, int(base_chunk_order if chunk_order is None else chunk_order))
@@ -517,10 +518,10 @@ def level_grids(manifest: dict, grid) -> dict:
     artifact ``leaf``), the §4.6 leaf column's declared member (``node ==
     shard_order``, artifact ``column``) and one overview level per declared
     ancestor order (artifact ``overview``). Each level's grid is the one its
-    artifact is written with — ``grid`` itself for the base, the
-    ``sweep_stage`` / ``column`` writers' ``HealpixGrid(node, cells,
-    config=_overview_config(fields), sharded=True)`` for the rest — so the
-    array model cannot drift from the objects. A column's OTHER members (its
+    artifact is written with — ``grid`` itself for the base,
+    :func:`zagg.column_shards.column_grid` for a column level, the overview
+    writer's ``HealpixGrid(node, cells, sharded=True)`` — so the array model
+    cannot drift from the objects. A column's OTHER members (its
     within-footprint intermediates and node-order partial) are sweep inputs,
     not levels: they overlap the overview levels for the same cells and are
     deliberately not indexed. A store with no ``/2`` declaration has the base
@@ -557,7 +558,13 @@ def level_grids(manifest: dict, grid) -> dict:
                 # indexed.
                 continue
             levels[cells] = {
-                "grid": HealpixGrid(node, cells, config=config, sharded=True),
+                # A column level carries the §4.6 layout rule (a fine one is
+                # chunked at its inner chunk, issue #631); an overview is not.
+                "grid": (
+                    column_grid(node, cells, config)
+                    if artifact == "column"
+                    else HealpixGrid(node, cells, config=config, sharded=True)
+                ),
                 "node": node,
                 "artifact": artifact,
             }
@@ -722,6 +729,12 @@ def _check_block(block: dict, want: dict, path: str) -> None:
             f"icechunk repo {path} keys its levels {sorted(block.get('levels') or {}, key=int)} "
             f"by node order, not cell order (pre-§11.1-amendment): every commit into it would "
             f"raise NodeNotFound. Clear {path} and re-init (spec §11.1, issue #580)."
+        )
+    stale = stale_column_levels(block.get("levels")) if "cell_order" in want else []
+    if stale:
+        raise ValueError(
+            f"icechunk repo {path} chunks column levels {stale} against the §4.6 layout rule "
+            f"(pre-#631): every fine column ref would land out of place. Clear {path} and re-init."
         )
 
 
@@ -1030,7 +1043,7 @@ def object_ref_plan(
         chunks = []
         listing: list[Any]
         if n == 1:
-            # A single-chunk array (every column and overview array, §11.2):
+            # A single-chunk array (every overview and coarse column array):
             # one HEAD of the one key — the whole object is the ref (offset
             # 0, length = size), no LIST and no index read.
             key = key_prefix + "/".join("0" for _ in shape)
@@ -1128,7 +1141,8 @@ def open_vetted(store_root: str, *, store_kwargs: dict, want: dict | None = None
 
 def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
     """Write ``units`` into ``session`` (nothing committed); ``(refs, levels)`` staged."""
-    rows = (_session_block(session) or {}).get("rows") or []
+    block = _session_block(session) or {}
+    rows, levels = block.get("rows") or [], block.get("levels") or {}
     refs = 0
     orders: set = set()
     for unit in units:
@@ -1151,6 +1165,7 @@ def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
                 if rejected:
                     raise RuntimeError(f"{array_path}: {len(rejected)} virtual refs rejected")
             else:
+                check_column_entry(levels.get(str(order)), entry, array_path)
                 for key, location, length, chunk_checksum in entry["chunks"]:
                     session.store.set_virtual_ref(
                         f"{order}/{row_key(key, row)}",
@@ -1300,11 +1315,9 @@ def leaf_units(
     cells (:func:`zagg.column.leaf_level_cells` — ``[13]`` at production),
     never the within-footprint intermediates (``12, 11, 10``) or the
     node-order partial, which are sweep inputs that overlap the overview
-    levels (:func:`level_grids`). Each column array is one unsharded chunk,
-    so its ref is the whole object.
+    levels (:func:`level_grids`), laid out by :func:`zagg.column_shards.column_grid`.
     """
     from zagg.column import leaf_column_plan, leaf_level_cells
-    from zagg.grids.healpix import HealpixGrid
     from zagg.hive import shard_leaf_path
     from zagg.sweep_overview import _overview_config
 
@@ -1337,9 +1350,12 @@ def leaf_units(
     for res in leaf_level_cells(config, grid):
         if int(res) >= int(grid.child_order):
             continue  # a member at the store's own cell order duplicates the base (level_grids)
-        column_grid = HealpixGrid(int(grid.parent_order), int(res), config=cfg, sharded=True)
         entries = object_ref_plan(
-            column_grid, f"{node_rel}/{column}", rank, store_root, store_kwargs=store_kwargs
+            column_grid(grid.parent_order, res, cfg),
+            f"{node_rel}/{column}",
+            rank,
+            store_root,
+            store_kwargs=store_kwargs,
         )
         if entries:
             units.append({"level": int(res), "row": row, "entries": entries})

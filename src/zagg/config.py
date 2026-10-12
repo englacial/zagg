@@ -3500,7 +3500,8 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     ``output.pyramid`` shapes the manifest's template-time pyramid block
     (``zagg.sweep_overview.build_pyramid_block``): absent/null returns ``{}``
     — the defaults apply (an every-2-orders overview schedule below the shard
-    order, the espg-ratified display default; no all-time fold) — and
+    order, the espg-ratified display default; the all-time fold only on a
+    windowed store, where it is required and resolved true) — and
     ``false`` returns ``None``, declaring the overview family OFF for the
     store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
     (explicit ancestor orders, winning over ``spacing``), ``overviews`` (the
@@ -3509,7 +3510,10 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     ``orders``/``spacing`` wholesale — the fixed every-order ladder above
     the shard is law, see :mod:`zagg.pyramid`),
     ``all_time`` (bool: also maintain the ``all.zarr`` cross-window fold on
-    windowed stores), ``fold_source`` (``"cascade"`` — the default — or the
+    windowed stores — **resolved to** ``True`` **on a windowed store that
+    omits it**, issue #610 phase 4: a windowed store must declare the fold,
+    and :func:`_validate_pyramid` refuses an explicit ``false`` there),
+    ``fold_source`` (``"cascade"`` — the default — or the
     deprecated ``"leaves"``, issue #376) with ``exact_levels`` (how many of
     the finest declared levels fold exactly from the leaves), and
     ``summarize`` (the D24 opt-in derived-summary declarations,
@@ -3520,10 +3524,34 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     if raw is False:
         return None
     if raw is None:
-        return {}
-    if not isinstance(raw, dict):
+        knob: dict = {}
+    elif isinstance(raw, dict):
+        knob = dict(raw)
+    else:
         raise ValueError(f"output.pyramid must be a mapping or false (got {raw!r})")
-    return dict(raw)
+    if _declares_windowing(config):
+        knob.setdefault("all_time", True)
+    return knob
+
+
+def _declares_windowing(config: PipelineConfig) -> bool:
+    """Whether ``output.windowing`` declares a known window schedule, read off the raw block.
+
+    The same test :func:`get_windowing` opens with, without the normalization
+    — so it is safe before :func:`_validate_windowing` has run. A non-mapping
+    block, or a schedule that is not a known one (a typo, a reserved name,
+    ``null``), answers ``False`` here and is refused by name there, so the
+    windowing refusal is never masked by the all-time one.
+    """
+    from zagg import windows as _windows
+
+    block = config.output.get("windowing")
+    if not isinstance(block, dict):
+        return False
+    try:
+        return _windows.check_schedule(block.get("schedule", "none")) != "none"
+    except (TypeError, ValueError):
+        return False
 
 
 def _validate_pyramid(config: PipelineConfig) -> None:
@@ -3590,6 +3618,18 @@ def _validate_pyramid(config: PipelineConfig) -> None:
     all_time = knob.get("all_time")
     if all_time is not None and not isinstance(all_time, bool):
         raise ValueError(f"output.pyramid.all_time must be a boolean (got {all_time!r})")
+    if all_time is False and _declares_windowing(config):
+        # espg's ruling on PR #623 question (16): a windowed store must
+        # declare the all-time fold. The rollup families and the §4.10
+        # companion ride each node's all-time CLOSE, so a windowed store
+        # without one has nowhere to fold them; the absent key resolves to
+        # true (get_pyramid), and only the explicit refusal is an error.
+        raise ValueError(
+            "output.windowing requires the all-time fold: output.pyramid.all_time: false "
+            "is refused on a windowed store (the rollup families and the multiscales "
+            "companion fold in each node's all-time close, issue #610 phase 4) — omit the "
+            "key, which resolves to true on a windowed store, or set it true"
+        )
     summarize = knob.get("summarize")
     if summarize is None:
         return

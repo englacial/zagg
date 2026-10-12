@@ -557,9 +557,15 @@ class TestWindowedStoresAreInScope:
         window_units = [(1, [], {"label": "2020"}), (2, [], {"label": "2019"})]
         assert runner._unit_window_labels(window_units, "window") == ["2020", "2019"]
         # ``unit: shard`` is the default, so the shard-major units are read.
-        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020"]
+        # A windowed store maintains the cross-window fold unless its pyramid
+        # is off (PR #623: an absent ``all_time`` resolves true), so ``all``
+        # is allocated at birth; spelling the key changes nothing.
+        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020", "all"]
         cfg.output["pyramid"] = {"all_time": True}
         assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020", "all"]
+        cfg.output["pyramid"] = False
+        assert runner._icechunk_rows(cfg, shard_units) == ["2019", "2020"]
+        cfg.output.pop("pyramid")
         # An unwindowed run is the one ``all`` row, whatever the units are.
         cfg.output.pop("windowing")
         assert runner._icechunk_rows(cfg, shard_units) == ["all"]
@@ -849,10 +855,12 @@ class TestTheLadderWalksAWindowedStore:
         assert group[level]["count"][fold, :].sum() > group[level]["count"][window, :].sum()
 
     def test_a_tag_cut_before_an_append_still_reads_every_level(self, monkeypatch, cfg, tmp_path):
-        # Plan phase 2 acceptance (3). The fold is left off here: ``all.zarr``
-        # is the one overview object an append REWRITES, so a pre-append tag's
-        # virtual ref to it is stale until the fold is written natively
-        # (plan phase 3). Every per-window row is immutable and reads.
+        # Plan phase 2 acceptance (3). A windowed store maintains the fold
+        # (PR #623), and ``all.zarr`` is the one overview object an append
+        # REWRITES, so a pre-append tag's virtual ref to the ``all`` row is
+        # stale until the fold is written natively (plan phase 3): the tag is
+        # read at its window row only. Every per-window row is immutable and
+        # reads.
         from test_icechunk_refs import _ladder_run
 
         shards = _shards(_grid(cfg), 2)
@@ -867,13 +875,16 @@ class TestTheLadderWalksAWindowedStore:
         tag = first["icechunk_finalize"]["tag"]
         assert first["icechunk_finalize"]["tagged"]
         repo = icechunk_refs.open_repo(root, store_kwargs={})
+        rows = icechunk_refs.read_block(root, store_kwargs={})["rows"]
+        assert sorted(rows) == ["2019", "all"]  # the one window and the fold's row
+        window = rows.index("2019")
         before = {
             level: zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")[level]["count"][
-                :
+                window
             ]
             for level in icechunk_refs.read_block(root, store_kwargs={})["levels"]
         }
-        assert before and all(v.shape[0] == 1 for v in before.values())  # the one 2019 row
+        assert before
         _grid_, _root, second = _ladder_run(
             monkeypatch,
             cfg,
@@ -883,18 +894,18 @@ class TestTheLadderWalksAWindowedStore:
             **run,
         )
         assert second["cells_error"] == 0
-        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == ["2019", "2020"]
-        # The tag reads what it was cut with: one row, every level, the same
-        # values -- the append added a row and moved no ref.
+        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == [*rows, "2020"]
+        # The tag reads what it was cut with: its window row, every level, the
+        # same values -- the append added a row and moved no window ref.
         repo = icechunk_refs.open_repo(root, store_kwargs={})
         tagged = zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")
         for level, values in before.items():
-            np.testing.assert_array_equal(tagged[level]["count"][:], values)
-        # And the branch tip carries both rows, row 0 unchanged.
+            np.testing.assert_array_equal(tagged[level]["count"][window], values)
+        # And the branch tip carries the new row, the window row unchanged.
         tip, _repo = _open(root)
         for level, values in before.items():
-            assert tip[level]["count"].shape[0] == 2
-            np.testing.assert_array_equal(tip[level]["count"][:1], values)
+            assert tip[level]["count"].shape[0] == 3
+            np.testing.assert_array_equal(tip[level]["count"][window], values)
 
 
 class TestRowGrowthUnderStagedRefs:

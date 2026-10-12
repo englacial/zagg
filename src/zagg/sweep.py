@@ -1172,33 +1172,23 @@ def _sweep_family(
     rollup missing there (a partition that never ran) contributes nothing,
     exactly as an emptied child does.
     """
-    from zagg.hive import _decimal_base
+    from zagg.sweep_families import fold_span
 
     counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
-    computed: dict[str, dict | None] = {}
-    if above:
-        for node in sorted({d[: len(_decimal_base(d)) + above] for d in by_shard}):
-            computed[node] = _read_rollup(store, fam, node)
-            if computed[node] is None:
-                counts["empty"] += 1
-        top = above - 1
-    else:
-        for decimal in sorted(by_shard):
-            computed[decimal] = _rollup_shard_node(
-                store, fam, decimal, by_shard[decimal], shard_order, spec, counts
-            )
-        top = shard_order - 1
-    frontier = [d for d in sorted(computed) if computed[d] is not None]
-    for _order in range(top, min_order - 1, -1):
-        parents = sorted({a for d in frontier if (a := _ancestor(d)) is not None})
-        frontier = []
-        for node in parents:
-            computed[node] = _rollup_interior(store, fam, node, computed, counts)
-            if computed[node] is not None:
-                frontier.append(node)
-        if not frontier:
-            break
-    tops = [computed[d] for d in frontier]
+    tops = fold_span(
+        store,
+        fam,
+        by_shard,
+        shard_order=shard_order,
+        spec=spec,
+        counts=counts,
+        # ``above`` is falsy for an unpartitioned pass and is otherwise the
+        # finisher's floor — INCLUDING ``shard_order`` itself, where the
+        # partitions wrote the shard nodes' own rollups and no leaf is owed.
+        from_order=above or shard_order,
+        to_order=min_order,
+        from_leaves=not above,
+    )
     result = dict(counts)
     result.update(fam.summary())
     if min_order:
@@ -1629,6 +1619,8 @@ def main(argv=None) -> int:
     """
     import argparse
 
+    from zagg.sweep_families import CASCADE_FAMILIES
+
     parser = argparse.ArgumentParser(
         description="zagg unified rollup sweep: fold leaf artifacts into interior-node "
         "rollups (issue #300). Work is discovered from the store's run records."
@@ -1638,7 +1630,9 @@ def main(argv=None) -> int:
         "--families",
         default=None,
         help=f"Comma-separated families (default: {','.join(DEFAULT_FAMILIES)}; "
-        f"registered: {', '.join(sorted(FAMILIES))})",
+        f"registered: {', '.join(sorted(FAMILIES))}). With --stages, only "
+        f"{', '.join(CASCADE_FAMILIES)} may ride (issue #610 phase 4) and any other "
+        f"name is refused",
     )
     parser.add_argument(
         "--stages",
@@ -1646,7 +1640,11 @@ def main(argv=None) -> int:
         help="Run the STAGED pyramid sweep for zagg-pyramid/2 stores (issue #384): "
         "tuple-grouped stage workers over the leaf columns, lease-admitted, with the "
         "designated finisher. Composes with --partitions (swept under one lease). "
-        "The families sweep does not run in this mode.",
+        "The rollup families do not ride this mode unless --families names them, and "
+        f"then it must name only {', '.join(CASCADE_FAMILIES)} — the overview family IS "
+        "the cascade here, so it is refused by name (issue #610 phase 4: the named "
+        "families fold in each dispatch node's close, in the one cascade, instead of "
+        "needing a pass of their own).",
     )
     parser.add_argument(
         "--pipeline-run-id",
@@ -1771,6 +1769,9 @@ def main(argv=None) -> int:
             partitions=args.partitions if args.partitions != 1 else None,
             store_kwargs=store_kwargs,
             pipeline_run_id=args.pipeline_run_id,
+            # Named families ride the cascade (issue #610 phase 4); unnamed,
+            # the ladder sweeps alone, as --stages always has.
+            families=() if families is None else families,
         )
         print(json.dumps(summary, indent=2))
         return 0

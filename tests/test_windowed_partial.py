@@ -4,9 +4,10 @@ The shard is a failed cell on every backend — its 500, its ``failed`` status
 object, an error naming the window — but the leaves that landed are in the
 store, so the post-run tail reads LEAVES, not invokes:
 
-- the sweep work set (the families sweep, the staged sweep's ``(node,
-  window)`` units and the node close) is every result's stats records, each
-  on its own ``success``;
+- the sweep work set (the staged sweep's ``(node, window)`` units and the
+  node close, which the rollup families ride where the store declares one —
+  issue #610 phase 4 — and the families pass otherwise) is every result's
+  stats records, each on its own ``success``;
 - a shard enters the root ``coverage.moc`` when at least one of its leaves
   stands, and the time-range union takes those leaves' ranges alone;
 - the failed window is in none of them, and a re-run redoes it while the gate
@@ -47,6 +48,8 @@ from zagg.config import validate_config
 from zagg.grids.morton import morton_decimal
 from zagg.runner import _landed_coverage, _reported_units
 from zagg.sweep import discover_leaves
+from zagg.sweep_families import CASCADE_FAMILIES
+from zagg.sweep_units import UNIT_CLOSE
 
 #: The failed window is the LAST one, so the landed leaves' time-range union
 #: stops short of it and a coverage that counted it would show.
@@ -59,10 +62,11 @@ ERROR = f"window {FAILED}: RuntimeError: PUT failed"
 _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
 
-def _cfg():
+def _cfg(all_time=True):
+    """A windowed ``"stages"`` config; ``all_time=None`` omits the key (the resolved default)."""
     cfg = emit._digest_cfg()
     cfg.output["sweep"] = "stages"
-    cfg.output["pyramid"] = {"overviews": 7, "all_time": True}
+    cfg.output["pyramid"] = {"overviews": 7, **({} if all_time is None else {"all_time": all_time})}
     validate_config(cfg)
     return cfg
 
@@ -132,6 +136,7 @@ def _run_local(monkeypatch, tmp_path, cfg, root=None):
 
     def stage(store, leaves, **kw):
         seen["stage"] = list(leaves)
+        seen["families"] = [tuple(kw.get("families") or ())]
         return real_stage(store, leaves, **kw)
 
     real_cover = hive.write_root_coverage
@@ -148,6 +153,7 @@ def _run_local(monkeypatch, tmp_path, cfg, root=None):
         patch.setattr(stages_mod, "stage_sweep_after_run", stage)
         patch.setattr(hive, "write_root_coverage", cover)
         summary = runner.agg(cfg, catalog=catalog_path, store=str(root), backend="local")
+    seen.setdefault("sweep", [])  # the families pass, when the tail fired one
     return root, shard, summary, seen
 
 
@@ -211,6 +217,11 @@ def _run_fleet(monkeypatch, tmp_path, cfg, invocation, root=None):
         )
     families = [e for e in stub.modes("sweep") if "stage" not in e]
     seen["sweep"] = [tuple(leaf) for e in families for leaf in e["leaves"]]
+    # The families the cascade carried: on a windowed store, the close events'
+    # (every windowed store has them — the all-time fold is required).
+    stages = [e["stage"] for e in stub.modes("sweep") if "stage" in e]
+    closes = [s for s in stages if s.get("unit") == UNIT_CLOSE] or stages
+    seen["families"] = sorted({tuple(c.get("families") or ()) for c in closes})
     seen["coverage"] = [_cover(e["coverage"]) for e in stub.modes("coverage")]
     return root, shard, summary, seen, stub
 
@@ -237,6 +248,30 @@ def _coverage(root):
 def _rows(summary):
     rows = pd.read_parquet(summary["run_stats_path"], engine="fastparquet")
     return sorted(zip(rows["window"], rows["success"].astype(bool), strict=True))
+
+
+#: Per-run and per-host values a rollup body carries: ids, clocks, memory.
+_VOLATILE = {
+    "run_id",
+    "max_leaf_timestamp",
+    "timestamp",
+    "duration_s",
+    "duration_total_s",
+    "phase_timings",
+    "container_hwm_mb",
+    "max_memory_mb",
+}
+
+
+def _rollup(root, family, node="-5"):
+    """The node's ``family`` rollup body, its volatile values dropped."""
+
+    def scrub(v):
+        if isinstance(v, dict):
+            return {k: scrub(x) for k, x in v.items() if k not in _VOLATILE}
+        return [scrub(x) for x in v] if isinstance(v, list) else v
+
+    return scrub(json.loads(Path(root, node, f"{family}.rollup.json").read_text()))
 
 
 def _overviews(root, name):
@@ -295,11 +330,19 @@ class TestBackendsAgree:
         }
         assert _coverage(local_root) == _coverage(fleet_root) == expected
 
-        # The tail's inputs on both backends: the landed windows, in the
-        # families sweep and the staged one alike, and the dispatcher's
-        # coverage above; the failed window in none.
+        # The tail's inputs on both backends: the landed windows in the staged
+        # sweep, the rollup families riding its closes with no families pass
+        # fired (issue #610 phase 4), and the dispatcher's coverage above; the
+        # failed window in none.
         assert (
-            local_seen == fleet_seen == {"sweep": landed, "stage": landed, "coverage": [expected]}
+            local_seen
+            == fleet_seen
+            == {
+                "sweep": [],
+                "stage": landed,
+                "coverage": [expected],
+                "families": [CASCADE_FAMILIES],
+            }
         )
 
         # The run parquet: one row per leaf on both, the failed one unsuccessful.
@@ -320,6 +363,12 @@ class TestBackendsAgree:
             ]
             block = dict(_artifact(root, "-5/all.zarr").attrs)["zagg_overview"]
             assert block["source_windows"] == {"folded": 2, "missing": 0, "unreadable": 0}
+            # ... and the rollup families, built by the ride, not by a pass.
+            rollups = {p.name.split(".")[0] for p in Path(root, "-5").glob("*.rollup.json")}
+            assert rollups == set(CASCADE_FAMILIES)
+        # ... with the same bodies: what the landed windows fold, nothing more.
+        for family in CASCADE_FAMILIES:
+            assert _rollup(local_root, family) == _rollup(fleet_root, family)
         # The staged sweep ran its (node, window) units for the landed windows.
         windows = {
             e["stage"]["window"]
@@ -327,6 +376,38 @@ class TestBackendsAgree:
             if e.get("stage", {}).get("unit") == "window"
         }
         assert windows == set(LANDED)
+
+    def test_a_windowed_store_without_the_fold_is_refused_at_validation(self):
+        # espg's ruling on question (16): a windowed store must declare the
+        # all-time fold, so the closeless store (whose families had nowhere
+        # to ride — review round 3 (1)) cannot be built at all.
+        with pytest.raises(ValueError, match="output.windowing requires the all-time fold"):
+            _cfg(all_time=False)
+
+    @pytest.mark.parametrize("invocation", ["sync", "event"])
+    def test_an_omitted_all_time_rides_the_cascade_on_both(self, monkeypatch, tmp_path, invocation):
+        # The absent key resolves to the fold, so a windowed config that never
+        # spells ``all_time`` closes its nodes and rides the families there on
+        # both backends — no whole-tree pass, the same rollups.
+        cfg = _cfg(all_time=None)
+        assert cfg.output["pyramid"] == {"overviews": 7}  # unspelled, resolved
+        emit._patch(monkeypatch)
+        _fail_one_window(monkeypatch)
+        local_root, shard, _local, local_seen = _run_local(monkeypatch, tmp_path, cfg)
+        fleet_root, _shard, _fleet, fleet_seen, _stub = _run_fleet(
+            monkeypatch, tmp_path, cfg, invocation
+        )
+        landed = [(shard, w) for w in LANDED]
+        for seen in (local_seen, fleet_seen):
+            assert (seen["sweep"], seen["stage"], seen["families"]) == (
+                [],
+                landed,
+                [CASCADE_FAMILIES],
+            )
+        for root in (local_root, fleet_root):
+            assert len(_overviews(root, "all")) == 6  # the close ran at every ladder node
+            rollups = {p.name.split(".")[0] for p in Path(root, "-5").glob("*.rollup.json")}
+            assert rollups == set(CASCADE_FAMILIES)
 
     @pytest.mark.parametrize("backend", ["local", "sync"])
     def test_a_rerun_redoes_the_failed_window_and_skips_the_landed_ones(
@@ -353,7 +434,8 @@ class TestBackendsAgree:
         # The gate skipped the landed windows; only the failed one is redone,
         # swept, and unioned into the root summary.
         assert (second["cells_current"], second["cells_error"]) == (2, 0)
-        assert (seen["sweep"], seen["stage"]) == ([(shard, FAILED)], [(shard, FAILED)])
+        assert (seen["sweep"], seen["stage"]) == ([], [(shard, FAILED)])
+        assert seen["families"] == [CASCADE_FAMILIES]  # the families rode the redo's sweep
         # The dispatcher covers the shard through the redone window alone (a
         # current window carries no range); the root union keeps the rest.
         (cover,) = seen["coverage"]
@@ -535,9 +617,7 @@ class TestClientTail:
         self._assert_tail(stub, shard)
 
     @pytest.mark.parametrize("slim", [False, True])
-    def test_attach_reads_the_same_set_off_the_status_object(
-        self, failed_body, status_store, slim
-    ):
+    def test_attach_reads_the_same_set_off_the_status_object(self, failed_body, status_store, slim):
         # ``slim``: a large run's manifest names no shards (issue #588), so
         # attach takes them from the status objects — the same tail follows.
         shard, body = failed_body

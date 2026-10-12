@@ -3630,14 +3630,18 @@ def _run_local(
         from zagg.sweep import dirt_only_leaves, leaves_from_stats_records, sweep_after_run
 
         leaves = leaves_from_stats_records([m.get("stats") for m in report.results])
-        if leaves:
+        # One walk, not two (issue #610 phase 4): a run that walks the /2
+        # ladder folds the rollup families in the staged sweep below; the
+        # whole-tree pass is the /1 retrofit regime's, as it always was.
+        riding = _cascade_families(config, grid)
+        if leaves and not riding:
             sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
         # Post-fleet staged chaining (issue #384) — OPT-IN via
         # `output.sweep: "stages"` (the recorded lean for open question
-        # (c); flipping it to the default is espg's call). Runs AFTER the
-        # families sweep, auto-scoped to this run's footprint; fail-open.
-        # Touched current units ride as dirt-only (issue #580): their nodes
-        # re-gather the rewritten ref sidecars, nothing is re-folded.
+        # (c); flipping it to the default is espg's call). Auto-scoped to
+        # this run's footprint; fail-open. Touched current units ride as
+        # dirt-only (issue #580): their nodes re-gather the rewritten ref
+        # sidecars, nothing is re-folded.
         dirt_only = dirt_only_leaves(report.results)
         if (leaves or dirt_only) and config.output.get("sweep") == "stages":
             from zagg.sweep_stages import stage_sweep_after_run
@@ -3650,6 +3654,7 @@ def _run_local(
                 touch_policy=get_touch_policy(config),
                 # The run this sweep completes (issue #593).
                 pipeline_run_id=run_id,
+                families=riding,
             )
     # Icechunk run finalize (issue #582, spec §11.4): AFTER every commit of
     # the run — the staged sweep's ladder commits included — tag the tip
@@ -4568,7 +4573,13 @@ def _run_lambda(
 
                 bodies = [r.get("body") or {} for r in report.results]
                 leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
-                if leaves:
+                # One fan-out, not two (issue #610 phase 4): when this run
+                # walks the /2 ladder the rollup families ride the staged
+                # sweep's node closes below, and the separate families pass
+                # is not fired; otherwise (the /1 retrofit regime) it is, as
+                # it always was.
+                riding = _cascade_families(config, grid)
+                if leaves and not riding:
                     summary["families_sweep"] = _invoke_lambda_families_sweep(
                         state["lambda_client"],
                         function_name,
@@ -4612,7 +4623,11 @@ def _run_lambda(
                         all_time=bool((get_pyramid(config) or {}).get("all_time")),
                         # The run this sweep completes (issue #593).
                         pipeline_run_id=run_id,
+                        # The rollup families, riding the cascade's node
+                        # closes in place of their own fan-out (issue #610).
+                        families=riding,
                     )
+                    _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
@@ -5922,6 +5937,57 @@ def _fleet_skip_hash(config, overwrite) -> str | None:
     return _semantic_hash(config)
 
 
+def _cascade_families(config, grid) -> tuple:
+    """The rollup families this run's staged sweep carries (issue #610 phase 4).
+
+    :data:`zagg.sweep_families.CASCADE_FAMILIES` when the run WALKS the
+    ``/2`` ladder — :func:`zagg.icechunk_refs.ladder_walks`, the same
+    config-only gate the Icechunk commit pin hangs on: ``output.sweep:
+    "stages"`` and a ``/2`` declaration with a composable field — so the
+    ``stats``/``moc``/``submap`` rollups fold in the cascade's node closes and
+    the tail fires no families fan-out of its own (espg's phase-4 ruling: one
+    fan-out, one cascade). ``()`` otherwise, and the tail runs the whole-tree
+    families pass exactly as before: the ``/1`` retrofit regime, and a
+    ``"stages"`` config whose store declares no walkable ladder — there the
+    stage worker refuses at the ``/2`` gate and would fold nothing, so the
+    separate pass is the only one that reaches the rollups. A windowed store
+    needs no branch of its own: a rollup object is per node and merges every
+    window, so only the node's all-time close can fold it, and a windowed
+    config declares that close — ``output.pyramid.all_time`` resolves to true
+    when omitted and is refused when spelled false
+    (:func:`zagg.config._validate_pyramid`, espg's ruling on PR #623 question
+    (16)). Every tail that chains the staged sweep decides with this (the
+    CLI's two backends and the ``client`` facade), so the backends agree; the
+    dispatcher's store-side ``closes`` check remains the warning path for a
+    store whose manifest withdrew the close its config declares.
+    """
+    from zagg.icechunk_refs import ladder_walks
+    from zagg.sweep_families import CASCADE_FAMILIES
+
+    return tuple(CASCADE_FAMILIES) if ladder_walks(config, grid) else ()
+
+
+def _warn_families_unswept(riding, staged) -> None:
+    """Warn when the families handed to the staged sweep were folded by nothing (issue #610).
+
+    ``riding`` non-empty means the tail fired no families pass; a staged
+    dispatch that failed open (``staged is None``) or reported
+    ``families_unswept`` then left the rollups unswept, so name the backstop
+    and the migration: a windowed store templated before the fold was required
+    declares ``all_time: false``, closes nothing, and stays that way until the
+    one-time ``--declare-pyramid`` retrofit rewrites its manifest.
+    """
+    if riding and (staged is None or staged.get("families_unswept")):
+        logger.warning(
+            f"rollup families {list(riding)} rode no node close this run; sweep them with "
+            "`python -m zagg.sweep <store> --families stats,moc,submap`. A windowed store "
+            "whose manifest declares `all_time: false` (templated before the fold was "
+            "required) never closes: retrofit it once with `python -m zagg.sweep <store> "
+            "--declare-pyramid <config.yaml>` (add `--overviews <resolutions>` for a "
+            "zagg-pyramid/2 store whose config spells none)"
+        )
+
+
 def _pin_icechunk_commit(config, grid, *, stages: bool):
     """``config`` with an unset ``output.icechunk.commit`` pinned to what the run does (issue #580).
 
@@ -6370,6 +6436,13 @@ def _invoke_lambda_families_sweep(
     run summary and the client handle carry as ``families_sweep``, never
     swallowed. The local backend keeps its in-process single pass
     (:func:`zagg.sweep.sweep_after_run`).
+
+    Since issue #610 phase 4 this is the ``/1`` regime's leg only: a run that
+    walks the ``/2`` ladder (:func:`_cascade_families`) folds the same
+    families in the staged sweep's node closes and does not fire this, so
+    its ``families_sweep`` is ``None`` and the staged summary's ``families``
+    names what rode. The hand form, ``python -m zagg.sweep <store>``, is
+    unchanged.
     """
     from zagg.sweep_fleet import run_families_sweep_fleet
 
@@ -6414,6 +6487,7 @@ def _invoke_lambda_stage_sweep(
     windowed=False,
     all_time=False,
     pipeline_run_id=None,
+    families=(),
 ) -> dict | None:
     """End-of-run STAGED sweep over the fleet (issue #519); its summary.
 
@@ -6503,6 +6577,18 @@ def _invoke_lambda_stage_sweep(
     ``function_name`` is the function the STAGE invokes go to — the caller
     resolves it (:func:`_resolve_stage_function_name`: the 8,192 MB variant
     of the run's family, the issue #586 interim).
+
+    ``families`` (issue #610 phase 4) is which rollup families ride this
+    sweep's node closes — forwarded verbatim to the dispatcher, where ``()``
+    is the ladder alone. The tails pass :func:`_cascade_families`: the
+    cascade's families when the run walks the ``/2`` ladder, in which case
+    they fire no :func:`_invoke_lambda_families_sweep`, so the end of a run
+    is one fan-out. They ride the node close, which a windowed config always
+    declares (``output.pyramid.all_time``, required at validation); a store
+    whose manifest withdrew it is reported by the dispatcher
+    (``families_unswept``, from the store's own answer) rather than refused —
+    the rollups are regenerable (D9), and ``python -m zagg.sweep <store>
+    --families stats,moc,submap`` is the backstop.
     """
     from zagg.sweep_fleet import run_stage_sweep_fleet
 
@@ -6537,6 +6623,7 @@ def _invoke_lambda_stage_sweep(
             windowed=bool(windowed),
             all_time=bool(all_time),
             pipeline_run_id=pipeline_run_id,
+            families=families,
             **knobs,
         )
     except Exception as e:
