@@ -641,6 +641,24 @@ class TestStoreLadderGate:
             _warn_families_unswept(["stats"], summary)
         assert any("rode no node close" in r.getMessage() for r in caplog.records)
 
+    def test_a_declined_run_leaves_the_icechunk_finalize_free_to_tag(self, tmp_path):
+        # The gate MOVES this verdict and it is deliberate (review finding).
+        # Before it, such a run fanned out, no stage record landed and the
+        # barriers expired — ``barrier_timed_out`` — so
+        # ``_staged_sweep_incomplete`` skipped the finalize and left the run
+        # untagged. A declined run fires nothing, so nothing is in flight:
+        # that function's own rule ("a sweep that fired nothing has nothing
+        # in flight") returns None and the run is tagged. The tag is honest —
+        # the leaves are complete and the store declares no ladder to sweep.
+        from zagg.runner import _staged_sweep_incomplete
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        self._redeclare(root, {"spec": "zagg-pyramid/1", "overview": {"orders": [2, 1]}})
+        summary = _tail_fleet(root, _FakeLambda(None))
+        assert summary["barrier_timed_out"] is False
+        assert _staged_sweep_incomplete(summary) is None
+
     def test_the_run_tail_seam_shares_the_gate(self, tmp_path):
         # The dispatcher's two callers are the runner's tail seam and the
         # hand-called form above; the gate is in the dispatcher, so one gate
