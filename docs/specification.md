@@ -1866,9 +1866,11 @@ orchestration, never contract — a reader binds to the ladder artifacts of
 §4.4, not to stage columns. The root tuple writes no column (nothing
 consumes it). A stage column's **chunking** is orchestration too
 ([issue #586](https://github.com/englacial/zagg/issues/586)): a resolution
-group of at most `4^5` cells is one chunk per array, as a leaf column's is;
-a wider group is laid on regular inner chunks of `4^5` cells, one object per
-chunk and no ShardingCodec, because the staged sweep gathers, writes and
+group of at most `4^5` cells (`res − node ≤ 5`) is one chunk per array — as
+a leaf column's is below `4^5` cells; at exactly `4^5` the leaf column shards
+(§4.6 Layout) while the stage column stays one chunk; a wider group is laid
+on regular inner chunks of `4^5` cells, one object per chunk and no
+ShardingCodec, because the staged sweep gathers, writes and
 reads such a group one chunk at a time (it never holds a level whole). The
 arrays, their values, the attrs and the §5 record are the same either way —
 the O11 hash is over decoded values. On a windowed store every window has
@@ -4487,7 +4489,7 @@ the level's global cell extent `12·4^c`, `n_rows` the length of the block's
 | field | repo array | derivation |
 |---|---|---|
 | `shape` | `(n_rows, n_shards · L₀, *L[1:])` | `L` the level's per-node object array's shape (the leaf's for the base); `n_shards = 12·4^n`, `n` the level's node order; `n_rows` the same for every array of the repo |
-| chunk shape | `(1, *inner)` — one row deep, the object's **inner** chunk shape across | `inner` is the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5), else its own `chunk_grid` — the whole object for a column or overview level, one chunk per node |
+| chunk shape | `(1, *inner)` — one row deep, the object's **inner** chunk shape across | `inner` is the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5, and every fine column level, §4.6 — its inner chunk), else its own `chunk_grid` — the whole object for an overview level or a column level below `4^5` cells, one chunk per node |
 | `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
 | `dimension_names` | `("window", *names)` | the object array's names behind the row dimension's |
 | `data_type`, `fill_value`, `attributes` | verbatim from the object array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
@@ -5067,9 +5069,9 @@ exactly the chunks of one HEALPix cell at order `split_order`, so the split
 is stated as "one base manifest per order-`split_order` cell". Every other
 level holds the same **number of chunks** per manifest — not one
 `split_order` cell — capped at its own chunk axis (`chunk_order` is the
-group's own: the inner-chunk order for the base, 13 at production; the node
-order for a column or overview group, one chunk per node). At the defaults
-that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
+group's own: the inner-chunk order for the base, 13 at production, and for
+a fine column level, §11.3; the node order for any other column or overview
+group, one chunk per node). At the defaults that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
 and one base cell (12 manifests per array) at `/11` and every coarser level;
 no manifest ever spans more than a base cell. Holding the chunk count
 constant is what keeps the manifest count — and with it the snapshot, which
