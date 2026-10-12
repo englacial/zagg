@@ -670,7 +670,9 @@ def _column_layout_errors(harness, dec, s, q) -> list:
     Every array the group carries — the ``morton`` coordinate, the declared
     fields, their companions — is held to :func:`zagg.column_shards.layout_mismatch`:
     one unsharded chunk below ``4^5`` cells, a ``sharding_indexed`` object on
-    the rule's inner chunk at or above it. The handles are the memoized ones
+    the rule's inner chunk at or above it — one line per array, or one per
+    group when every array fails the same way (a legacy fine group, until the
+    column backfill re-lays it). The handles are the memoized ones
     the value legs open anyway (:meth:`_Harness.array`), so the leg costs no
     extra GET; an absent group or array is the read-back leg's finding, not
     this one's.
@@ -681,15 +683,19 @@ def _column_layout_errors(harness, dec, s, q) -> list:
         group = harness.column_group(dec, q)
     except Exception:
         return []  # absent group: _check_node's read-back leg names it
-    errs = []
+    found, checked = {}, 0
     for name in ("morton", *harness.fields, *harness.companions):
         arr = harness.array(group, name)
         if arr is None:
             continue
+        checked += 1
         why = layout_mismatch(s, q, arr.metadata.to_dict())
         if why:
-            errs.append(f"{dec}[{q}]/{name}: {why}")
-    return errs
+            found[name] = why
+    # A legacy fine group fails every array the same way: one line per group.
+    if len(found) > 1 and len(found) == checked and len(set(found.values())) == 1:
+        return [f"{dec}[{q}] (every array: {', '.join(found)}): {next(iter(found.values()))}"]
+    return [f"{dec}[{q}]/{name}: {why}" for name, why in found.items()]
 
 
 def _column_attrs_errors(dec, s, attrs, resolutions, boundary) -> list:
