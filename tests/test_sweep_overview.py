@@ -2105,6 +2105,28 @@ class TestOverviewWriter:
         ]
         assert read_commit(open_store(str(tmp_path / "-3" / "1" / "2019.zarr")))["window"] == "2019"
 
+    def test_a_v1_windowed_config_omitting_all_time_folds_all_zarr(self, tmp_path):
+        from zagg.sweep_overview import build_pyramid_block
+
+        # Issue #610 phase 4: the resolved default is not scoped to /2. A
+        # windowed config with an explicit /1 schedule that never spells
+        # ``all_time`` now templates the fold, so every /1 sweep also writes
+        # ``all.zarr`` beside the per-window overviews (before: opt-in).
+        cfg = _leaf_cfg()
+        cfg.output["windowing"] = {"schedule": "yearly", "time_field": "t"}
+        cfg.output["pyramid"] = {"orders": [1]}
+        block = build_pyramid_block(cfg, SHARD_ORDER)
+        assert block["spec"] == PYRAMID_SPEC and block["overview"]["all_time"] is True
+        manifest = _write_manifest(tmp_path, windowed=True)
+        manifest["pyramid"] = block
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]}, window="2019")
+        _make_leaf(tmp_path, "-311", {0: [10.0]}, window="2020")
+        word = morton_word("-311")
+        result = run_sweep(str(tmp_path), [(word, "2019"), (word, "2020")], families=("overview",))
+        assert result["families"]["overview"]["written"] == 3  # 2019, 2020, all
+        assert _overview_group(tmp_path, "-3/1", "all.zarr", 3)["count"][0] == 3
+
     def test_window_named_all_folds_into_the_all_time_overview(self, tmp_path, caplog):
         # Review finding, issue #201: a window labeled with the reserved token
         # resolves to the same basename AND envelope key as the all-time fold,
