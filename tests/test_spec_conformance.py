@@ -1009,6 +1009,18 @@ class TestMultiscalesMirror:
             manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
             assert "multiscales" not in manifest
 
+    def test_every_committed_mirror_is_the_writers_derivation(self):
+        # §4.9 suite-wide: every committed manifest carries the key exactly
+        # when its block is /2, equal to the production derivation — column/
+        # is the one named exception (the absence pin above).
+        from zagg.multiscales import manifest_multiscales
+
+        for path in sorted(SPEC_DATA.glob("*/morton_hive.json")):
+            if path.parent.name == "column":
+                continue
+            manifest = json.loads(path.read_text())
+            assert manifest.get("multiscales") == manifest_multiscales(manifest), path
+
 
 #: The §4.10 companion-group fixture (issue #394): a /2 manifest + root
 #: coverage + the metadata-only companion tree at the reserved root path.

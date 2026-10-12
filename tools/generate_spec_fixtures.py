@@ -764,6 +764,9 @@ def build_demoted(out: Path) -> None:
             "fields": fields,
         },
     }
+    # §4.9: a /1 manifest carries no mirror — drop the one ``build`` derived
+    # from its /2 block, as ``declare_pyramid``'s retrofit does.
+    manifest.pop("multiscales", None)
     put_object(open_object_store(str(out)), MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
     counts = sweep_overviews(str(out), manifest, {SHARD_KEY: {None}})
     assert counts["failed"] == 0 and counts["written"] == 2, counts

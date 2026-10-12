@@ -8,7 +8,7 @@
    "object": "all.zarr",
    "generation": {
     "n_leaves": 1,
-    "max_leaf_timestamp": "2026-10-12T01:21:09+00:00"
+    "max_leaf_timestamp": "2026-10-12T01:49:16+00:00"
    },
    "content_hash": "d2ed722614e9d1488752ff6b08e4601f1813ab3ecf42ddcefe453f8a8129693e",
    "fold_source": "cascade",
