@@ -1502,8 +1502,12 @@ def record_leaf(
     )
     arrays = sum(1 for unit in units for entry in unit["entries"] if entry["refs"])
     # ``native_bytes`` belongs to the overview levels (§11.3) and a leaf's
-    # units name none of them, so it is 0 on every leaf and stays off the
-    # record §11.4 documents; the ladder's stage row is where it is read.
+    # units name none of them, so it is 0 here and stays off the record §11.4
+    # documents; the ladder's stage row is where it is read. The property is
+    # not local: ``multiscales._mirror_block`` gives the shard-order entry
+    # the COLUMN artifact and every coarser entry the overview one, and
+    # ``pyramid.expand_overviews`` gives each entry its own cell orders, so
+    # no cell order a leaf's column unit names is an overview level.
     outcome = {key: value for key, value in outcome.items() if key != "native_bytes"}
     return {**outcome, "arrays": arrays, "checksum": checksum}
 
