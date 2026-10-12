@@ -510,6 +510,31 @@ class TestStoreLadderGate:
         assert len(warnings) == 1
         assert "--declare-pyramid" in warnings[0] and named in warnings[0]
 
+    def test_the_gate_filters_at_the_manifest_shard_order(self, tmp_path):
+        # The leaf exclusion is the workers' own, and every worker takes
+        # ``int(manifest["shard_order"])`` — so a caller value that disagrees
+        # must not decide the verdict (review finding). Pinned on the one
+        # declaration where the two differ: a malformed entry at order 2 is
+        # validated only when the gate filters at the store's 3, where a
+        # caller's 2 would exclude it and pass a declaration every worker
+        # refuses by name.
+        from zagg.sweep_fleet import no_ladder_reason
+
+        root = tmp_path / "s"
+        _stage_store(root)  # shard_order 3, ladder at orders 2..0
+        self._redeclare(
+            root,
+            {
+                "spec": PYRAMID_SPEC_V2,
+                "overviews": [
+                    {"node": 2, "cells": [4, 5]},
+                    {"node": 1, "cells": [3]},
+                    {"node": 0, "cells": [2]},
+                ],
+            },
+        )
+        assert "carries 2 members" in (no_ladder_reason(str(root), 2, {}) or "")
+
     def test_a_leaf_only_ladder_still_fans_out(self, tmp_path):
         # A /2 declaration whose only entry is the leaf one (the fleet's own
         # column) filters to an EMPTY ladder, and every worker accepts it:
