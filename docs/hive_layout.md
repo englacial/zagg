@@ -735,8 +735,14 @@ the one pass it always was. The outcome rides the run summary and the
 finisher, accumulators, run_id, records_from, duration_s}`, with `finisher` `"ok"`,
 `"records_short"` (a partition's record never landed), `"timed_out"` (the
 finisher's did not) or `"dispatch_failed"` (an invoke raised after others
-fired; `error` says why), so a short root temporal section is reported
-rather than discovered later. **The finisher reads no leaf for the
+fired, or the pass was fired and never dispatched at all — `fired: 0`;
+`error` says why), so a short root temporal section is reported
+rather than discovered later. The staged leg reports the same way —
+`stage_sweep`, the dispatcher's whole summary, `barrier_timed_out` and
+`short_orders` included — and `tail_sweep_short` is the verdict over both: one
+reason per shortfall, `[]` when the tail left nothing short, logged as one
+warning and printed by `python -m zagg` as `TAIL SHORT:` lines. **The
+finisher reads no leaf for the
 `stats`/`moc`/`submap` families** (the `overview` family's own fold on a
 `/1` store is unchanged and still opens its leaves; a `/2` store refuses it
 first): each
