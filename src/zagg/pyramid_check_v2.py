@@ -488,6 +488,7 @@ def _tier_checks(
         attrs = col_probes[dec]
         errors["readback"].extend(_column_attrs_errors(dec, s, attrs, resolutions, boundary))
         for q in resolutions:
+            errors["readback"].extend(_column_layout_errors(harness, dec, s, q))
             from_raw = boundary is None or q >= boundary
             # Bound the fold: one cell of a from-raw group at ``q`` covers
             # ``4 ** (cell_order - q)`` leaf cells, whatever ``sample_cells``
@@ -660,6 +661,34 @@ def _stage_provenance_errors(node, k, r, s, prov, gather, depth) -> list:
         )
     if not prov.get("run_id"):
         errs.append(f"{node}: no run_id in the zagg-overview/2 attrs (§4.4)")
+    return errs
+
+
+def _column_layout_errors(harness, dec, s, q) -> list:
+    """One column group's arrays against the §4.6 layout rule (issue #631).
+
+    Every array the group carries — the ``morton`` coordinate, the declared
+    fields, their companions — is held to :func:`zagg.column_shards.layout_mismatch`:
+    one unsharded chunk below ``4^5`` cells, a ``sharding_indexed`` object on
+    the rule's inner chunk at or above it. The handles are the memoized ones
+    the value legs open anyway (:meth:`_Harness.array`), so the leg costs no
+    extra GET; an absent group or array is the read-back leg's finding, not
+    this one's.
+    """
+    from zagg.column_shards import layout_mismatch
+
+    try:
+        group = harness.column_group(dec, q)
+    except Exception:
+        return []  # absent group: _check_node's read-back leg names it
+    errs = []
+    for name in ("morton", *harness.fields, *harness.companions):
+        arr = harness.array(group, name)
+        if arr is None:
+            continue
+        why = layout_mismatch(s, q, arr.metadata.to_dict())
+        if why:
+            errs.append(f"{dec}[{q}]/{name}: {why}")
     return errs
 
 
