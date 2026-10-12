@@ -637,18 +637,21 @@ def column_structure(fields: dict, *, node_order: int, resolutions: list) -> dic
       ``class``/``method``/``nan_policy`` and nothing else for that class),
       yet ``fill_value`` is what :func:`zagg.sweep_overview.fold_dense`
       reduces to and ``dtype`` is the stored element type. Moving either moves
-      the column's bytes.
+      the column's bytes;
+    - each member's **chunk grid and codec chain** — the §4.6 layout rule
+      (issue #631, :mod:`zagg.column_shards`): a fine group written whole by a
+      pre-#631 worker differs here from the sharded layout this run writes,
+      so the backfill is the upgrade pass that re-lays such a column (the
+      values are the same; the objects are not).
     """
-    from zagg.grids.healpix import HealpixGrid
+    from zagg.column_shards import column_grid
     from zagg.sweep_overview import _overview_config
 
     cfg = _overview_config(composable_fields(fields))
     return {
         str(int(res)): {
             name: _member_metadata(member.model_dump())
-            for name, member in HealpixGrid(int(node_order), int(res), config=cfg, sharded=True)
-            .shard_spec()
-            .members.items()
+            for name, member in column_grid(node_order, res, cfg).shard_spec().members.items()
         }
         for res in resolutions
     }

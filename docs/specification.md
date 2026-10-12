@@ -264,7 +264,7 @@ chunk shape:
 
 | geometry | on disk | single-cell read |
 |---|---|---|
-| **sharded** (`ShardingCodec`; every hive leaf and the sharded flat path) | ONE object per shard; the shard's K inner chunks live inside it with an internal index | 2 ranged GETs (index suffix + one ranged inner chunk) |
+| **sharded** (`ShardingCodec`; every hive leaf, the sharded flat path, and a leaf column group of `4^5` cells or more — §4.6) | ONE object per shard; the shard's K inner chunks live inside it with an internal index | 2 ranged GETs (index suffix + one ranged inner chunk) |
 | **per-inner-chunk** (regular array; the unsharded streaming path) | one object per inner chunk | 1 GET (the object) |
 
 When sharded, the §1.3 chain rides INSIDE a `sharding_indexed` codec whose
@@ -1666,13 +1666,42 @@ guessed at.
   words are exact only *given* the centroid partition the payload describes
   (§9.1, §8.3), so a group holding a populated payload against an empty
   sibling is non-conformant, not merely short.
-  A group's arrays are **single-chunk and unsharded** — `chunk_shape` equals
-  `shape` (`4^(r - node)` cells), no `sharding_indexed` codec — whatever the
-  leaf's own `chunk_inner`/sharding: a column group is small by construction,
-  and a reader sizes its GETs accordingly (§1.5's per-inner-chunk geometry,
-  read from the array metadata as §1.5 requires).
+- **Layout.** Every array of a group is **one object per leaf**, and its
+  chunking is a function of the group's own geometry `(node, r)` alone —
+  never of the leaf's `chunk_inner` or of any manifest key — so a writer,
+  a checker and an external reader with only the manifest derive it the
+  same way (issue [#631](https://github.com/englacial/zagg/issues/631);
+  `zagg.column_shards`):
+  - a group of **fewer than `4^5` cells** (`r - node < 5`) is **single-chunk
+    and unsharded**: `chunk_shape` equals `shape` (`4^(r - node)` cells), no
+    `sharding_indexed` codec. This is every column written before the rule
+    and the whole default tier below — unchanged byte for byte;
+  - a group of **`4^5` cells or more** (`r - node ≥ 5`) is **sharded**: its
+    arrays carry the `sharding_indexed` codec with the outer chunk equal to
+    `shape` (still one object), `index_location: end`, index codecs
+    `[bytes(endian=little), crc32c]` — the §1.5 leaf shard layout — and an
+    **inner chunk of `min(4^5, 4^(r - node) / 4)` cells**: at most 1,024
+    cells (the largest power of four whose saturated signal digest stays
+    under ~0.5 MB at the 128-centroid `overview_delta` cap — ~470 B per
+    cell, measured on the v4 ATL03 rebuild) and at least four inner chunks
+    per object (an object that is one inner chunk has no piece to fetch).
+    The inner codec chain is the member's own: §1.3's `vlen-bytes` +
+    `zstd` for a ragged payload or companion, the leaves' bytes-only chain
+    for a dense array. An inner chunk holding only fill is **absent** from
+    the index (the §1.5 sentinel), for dense arrays as for ragged ones.
+
+  On the 19/13/9 reference geometry with `overviews: [16, 15, 14, 13]`:
+  order 16 is 16 inner chunks of 1,024 cells, 15 four of 1,024, 14 four of
+  256, and 13 one whole 256-cell chunk. The inner chunk is always a power
+  of four, so an aligned subtree span (§1.5) never straddles one, and a
+  reader sizes its GETs from the array metadata exactly as §1.5 requires
+  for a leaf (whole object below `4^5` cells; index suffix plus covering
+  inner chunks above). The rule is pinned on committed bytes by the §7
+  `column_fine/` fixture; a column whose fine group is laid whole (a
+  writer predating the rule) is **non-conformant** and is re-laid by the
+  column backfill, which reads the layout as structure drift.
   Under the default `[chunk_inner]` declaration on the 19/13/9 reference
-  geometry a column carries groups {13, 12, 11, 10, 9}.
+  geometry a column carries groups {13, 12, 11, 10, 9}, all below `4^5`.
 - **Fold laws.** The leaf tier has a **raw-fold boundary** at resolution
   `order + 2` (the constant `zagg.column.RAW_MEMBER_DEPTH = 2`; a constant,
   never a per-store knob —
@@ -1837,9 +1866,11 @@ orchestration, never contract — a reader binds to the ladder artifacts of
 §4.4, not to stage columns. The root tuple writes no column (nothing
 consumes it). A stage column's **chunking** is orchestration too
 ([issue #586](https://github.com/englacial/zagg/issues/586)): a resolution
-group of at most `4^5` cells is one chunk per array, as a leaf column's is;
-a wider group is laid on regular inner chunks of `4^5` cells, one object per
-chunk and no ShardingCodec, because the staged sweep gathers, writes and
+group of at most `4^5` cells (`res − node ≤ 5`) is one chunk per array — as
+a leaf column's is below `4^5` cells; at exactly `4^5` the leaf column shards
+(§4.6 Layout) while the stage column stays one chunk; a wider group is laid
+on regular inner chunks of `4^5` cells, one object per chunk and no
+ShardingCodec, because the staged sweep gathers, writes and
 reads such a group one chunk at a time (it never holds a level whole). The
 arrays, their values, the attrs and the §5 record are the same either way —
 the O11 hash is over decoded values. On a windowed store every window has
@@ -2465,13 +2496,14 @@ from its manifest, and `kitchen_sink/`'s builder strips the §9 `located`
 attrs from its two leaf `*_locations` siblings, so a regeneration
 reproduces both.
 
-Nine tiny single-shard hive stores plus four metadata-only ones (the
+Ten tiny single-shard hive stores plus four metadata-only ones (the
 `pyramid/` declaration, the `multiscales/` companion, the `icechunk/` repo
-root and the `uncounted/` root objects), all on the same
+root and the `uncounted/` root objects), all but one on the same
 deliberately small geometry — shard order 4, inner-chunk order 5, cell
 order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the hive
 default; `raster_toc/` is the one exception — a `(time, cells)` product is
-never sharded, §8/#247):
+never sharded, §8/#247; `column_fine/` keeps the shard order and deepens
+the cell order to 10, the smallest leaf that can declare a §4.6 fine tier):
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
@@ -2537,6 +2569,34 @@ never sharded, §8/#247):
   pinned zagg-side by `tests/test_column.py`; a committed multi-rung golden
   arrives with the sweep-side fixtures of
   [#384](https://github.com/englacial/zagg/issues/384).
+- **`column_fine/`** — the §4.6 **fine-tier layout** surface
+  ([#631](https://github.com/englacial/zagg/issues/631)): the `minimal/`
+  fields on a **deeper** leaf — the one fixture not on the 4/5/6 geometry:
+  shard order 4 (the same `11213` key), inner-chunk order 7, cell order 10
+  (4,096 cells, K = 64 inner chunks of 64 cells) — under
+  `output.pyramid.overviews: 9`, the smallest declarable fine tier (a base
+  at `node + 5` is a `4^5`-cell group, and §4.4's contiguity rule caps the
+  base at `2 · node + 1`; both hold only from node 4 up). The column
+  carries groups `{9, 8, 7, 6, 5, 4}`; **group 9 is sharded** — each array
+  one `sharding_indexed` object on four 256-cell inner chunks, index at the
+  end — and group 8 and below are one whole unsharded chunk each. The four
+  populated leaf cells (0, 2, 1,089, 3,263) fold to group-9 rows 0, 0, 272
+  and 815, so in the `count` and `h_tdigest` objects inner chunks 0, 1 and 3
+  are present and **inner chunk 2 is absent** from the shard index (the §1.5
+  sentinel on a column, for the dense array as for the ragged one), while
+  the `morton` coordinate — written for every cell — holds all four.
+  `column_fine.expected.json`
+  carries the `column/` record plus `column.layout` — per group `{sharded,
+  chunk_cells}` spelled from the §4.6 formula, never read back — and the
+  conformance tests decode group 9 from the committed bytes by the §1.5
+  index recipe alone (suffix, ranged inner chunks, `zstd` + §1.4 framing
+  for the digest, raw little-endian words for `morton` and `count`) and
+  hold every group's `zarr.json` to the rule. Its groups 5 and 4 are
+  byte-identical to `column/`'s (the same observations fold to the same
+  res-5 rows), which pins that the deeper leaf and the fine-tier fold leave
+  the coarse groups' values unchanged (groups 5 and 4 fold flat from the
+  unsharded member 6 and never read group 9, so layout parity is pinned
+  zagg-side by `tests/test_column_shards.py::TestLayoutParity`).
 
 - **`multiscales/`** — the §4.10 companion-group surface: METADATA ONLY —
   a `zagg-pyramid/2` manifest on `pyramid/`'s grid, a production root
@@ -4261,7 +4321,7 @@ manifest's `zagg-multiscales/1` datasets (§4.9) plus the base:
 | level (group) | artifact per node | node order `n` | cells per object `4^(c−n)` | object arrays |
 |---|---|---|---|---|
 | `/19` | `{leaf}.zarr/19/…` | 9 (shard) | 4^10, as K = 256 inner chunks of 4^6 (§1.5, sharded) | the leaf template's |
-| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column) | 9 | 256, ONE unsharded chunk | the column's declared member |
+| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column) | 9 | 256, ONE unsharded chunk (a column member of `4^5` cells or more — `/14`–`/16` under `overviews: [16, 15, 14, 13]` — is one sharded object on the §4.6 inner chunk; its level is chunked at that inner chunk) | the column's declared member |
 | `/12` … `/4` | `{node}/all.zarr/{c}/…` (the ancestor's overview) | 8 … 0 (= c − 4) | 256, ONE unsharded chunk | the overview's |
 
 (production geometry: shard 9 / chunk 13 / cell 19, declared leaf-node
@@ -4431,7 +4491,7 @@ the level's global cell extent `12·4^c`, `n_rows` the length of the block's
 | field | repo array | derivation |
 |---|---|---|
 | `shape` | `(n_rows, n_shards · L₀, *L[1:])` | `L` the level's per-node object array's shape (the leaf's for the base); `n_shards = 12·4^n`, `n` the level's node order; `n_rows` the same for every array of the repo |
-| chunk shape | `(1, *inner)` — one row deep, the object's **inner** chunk shape across | `inner` is the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5), else its own `chunk_grid` — the whole object for a column or overview level, one chunk per node |
+| chunk shape | `(1, *inner)` — one row deep, the object's **inner** chunk shape across | `inner` is the `sharding_indexed` codec's `chunk_shape` when the object array is sharded (every base leaf, §1.5, and every fine column level, §4.6 — its inner chunk), else its own `chunk_grid` — the whole object for an overview level or a column level below `4^5` cells, one chunk per node |
 | `codecs` | the **inner** codec chain | the `sharding_indexed` wrapper is absent; `[bytes]` for dense fields, `[vlen-bytes, zstd]` for `zagg-ragged/1` (§1.3) |
 | `dimension_names` | `("window", *names)` | the object array's names behind the row dimension's |
 | `data_type`, `fill_value`, `attributes` | verbatim from the object array | so a §1.2 `ragged` block, §2.0 `weights`, §8/§9 declarations bind identically |
@@ -4505,19 +4565,25 @@ and an all-time overview), at global chunk index
 (w, r · C + j)   (trailing axes keep their object-local chunk index, 0 for a single-chunk payload dim)
 ```
 
-For the base level `C = 4^(chunk_order − shard_order)` inner chunks; for a
-column or overview level the object is ONE chunk, `C = 1`, and the cell-axis
-index is the node's rank itself. The row index is the repo's, not the
-object's: a writer names an object's row by **label** and the commit
-resolves it against the block's `rows` (§11.4), so the same object bytes
+For the base level `C = 4^(chunk_order − shard_order)` inner chunks; for an
+overview level, and for a column level of fewer than `4^5` cells, the object
+is ONE chunk, `C = 1`, and the cell-axis index is the node's rank itself; for
+a **fine column level** (`cells − shard_order ≥ 5`, §4.6) the object is
+sharded and `C` is its inner-chunk count — the level's `chunk_order` is the
+inner chunk's order (`cells − 5`, or `shard_order + 1` at exactly `4^5`
+cells), so the same `r · C + j` law applies with the base level's
+`C = 4^(chunk_order − shard_order)` (16 / 4 / 4 at /16 / /15 / /14 on
+19/13/9). The row index is the repo's, not the object's: a writer names an
+object's row by **label** and the commit resolves it against the block's `rows` (§11.4), so the same object bytes
 land at whatever row the repo allocated that label.
 
 At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
 
 Each **populated** inner chunk is recorded as one virtual reference:
 
-- **sharded leaf array** (every hive leaf, §1.5): `location` is the leaf's
-  single shard object — the array's **outer**-chunk key, `{leaf}/{p}/c/0` for
+- **sharded array** (every hive leaf, §1.5, and every fine column level,
+  §4.6): `location` is the array's
+  single shard object — its **outer**-chunk key, `{leaf}/{p}/c/0` for
   the 1-D cells arrays the hive writes — and `offset`/`length` are the
   chunk's entry in the shard index suffix, the same two `u64` words the §1.5
   2-GET recipe reads — the writer fetches that suffix itself, once per array
@@ -4525,7 +4591,8 @@ Each **populated** inner chunk is recorded as one virtual reference:
   `2^64 − 1` sentinel in both words) gets **no reference** and reads as
   `fill_value`.
 - **regular (unsharded) array** — a leaf array on a `chunk_inner`-less
-  grid, and every column and overview array (one chunk per object):
+  grid, every overview array, and every column array of fewer than `4^5`
+  cells (one chunk per object):
   `location` is the chunk object (`{leaf}/{p}/c/{j}`; `{object}/{p}/c/0` for
   a single-chunk array), `offset` 0, `length` the object size (§11.4); a
   missing object gets no reference.
@@ -4612,17 +4679,22 @@ columns do:
    container prefix, which is vetted at the repo) and the entries (≈40 KB per
    leaf at production geometry), grouped into units that each name the
    **row** they land in by **label** (`row`: `all` for an unwindowed leaf
-   and its column; a carrier written before `/2` names none and is read as
-   `all`) — never a row index, which only the repo knows (§11.2), so a
+   and its column, the window's label for a windowed leaf — one leaf, and
+   so one carrier, per window; a carrier written before `/2` names none and
+   is read as `all`) — never a row index, which only the repo knows (§11.2), so a
    carrier stays valid whatever rows other runs allocate. It is a
    **writer-internal carrier**, not part of the reader contract — the repo
    is. No Icechunk session is opened on the leaf path.
 2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
    `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
-   the finest tuple, its children's **node ref columns** (the same carrier at
+   the finest tuple, one per `(leaf, window)` on a windowed store, its
+   children's **node ref columns** (the same carrier at
    `{node}/icechunk_refs.json`) above — and adds the refs of the overview
    objects at every order of its tuple beneath it (read the same way a
-   leaf's are). A missing carrier is counted (`icechunk_missing`) and
+   leaf's are). What it reads and plans is scoped to the rows THIS RUN
+   writes under the node — the window labels dirty beneath it plus `all`
+   when it closes — so an append costs the new rows, not the store's
+   history. A missing carrier is counted (`icechunk_missing`) and
    tolerated — under-coverage, never a failure — and a carrier whose
    recorded geometry disagrees with the repo's block is refused.
 3. **One tuple commits.** Let `c` be `commit_order`, `d` a tuple's dispatch
@@ -4642,11 +4714,29 @@ columns do:
      commit nothing.
 
    Commits rebase on conflict exactly as before (`ConflictDetector`; nodes
-   touch disjoint chunk ranges), and each stage row records
-   `icechunk_commits`, `icechunk_rebases`, `icechunk_commit_s`,
-   `icechunk_refs`, `icechunk_missing`, `icechunk_failed`,
-   `icechunk_skipped_levels`, `icechunk_clean`, `icechunk_regathered` and
-   `icechunk_s` — every one
+   touch disjoint chunk ranges). One conflict no rebase reconciles is
+   **another run's row growth** (its `init`, below) landing while a node
+   holds staged refs: Icechunk reports `Chunks updated in updated array` on
+   every array the node touched and the rebase fails. That class, and only
+   that class — every conflict of the failed rebase is one, nothing else,
+   **and** no commit between the session's base snapshot and the branch tip
+   updated a chunk the session staged (the rebase stops at the first commit
+   it cannot reconcile, so a double update landing after the growth is
+   caught by that diff, not by the conflict list) —
+   is **replayed**: the node writes the same units into a fresh session
+   based on the grown arrays and commits them there (each label resolves to
+   the same row index, §11.2 — a row never moves; the ladder streams the
+   subtree again rather than holding it), at most once (`REPLAY_TRIES`),
+   after which the failure propagates to the fail-open hook. A double update
+   of the same chunks by two writers is never replayed over, whichever of it
+   and the growth landed first; the rebase failure propagates. A replayed
+   node's rebases and commit time sum every session's, the defeated one
+   included, and a replay counts whether or not its re-read then staged
+   anything to commit. Each stage row
+   records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
+   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
+   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
+   `icechunk_regathered` and `icechunk_s` — every one
    pre-seeded, so a row's key set does not depend on whether a node did work
    — plus `icechunk_nodes`, one entry per node that did, carrying the
    snapshot it committed (the leaf→snapshot join).
@@ -4712,7 +4802,9 @@ event names, and a window label on an unwindowed store — or one its
 schedule does not declare — is refused. Two runs allocating at once both
 resize every array, which Icechunk's rebase does not reconcile: the loser's
 init retries in a fresh session (5 attempts in all), re-reads the rows the winner
-recorded and appends after them. A retry re-applies the loser's own block
+recorded and appends after them. The other side of that race — a node of a
+run already committing when the growth lands — replays its units in a fresh
+session (**One tuple commits**, above). A retry re-applies the loser's own block
 changes (a ratchet, the per-run knobs) only when the winner changed nothing
 else, or made the same changes: a block the winner moved otherwise — a
 different ratchet, other knobs — is not overwritten with changes computed
@@ -4958,9 +5050,10 @@ stage node) the writer issues:
   recipe's second read, which yields every inner chunk's `(offset, length)`
   at once) **and** one `HEAD` of the shard object, for its checksum — the
   `ETag`, or `last_modified` on a local store (§11.3);
-- **single-chunk array** — every column and overview array (one chunk per
-  object): one `HEAD` of its one chunk object, for its size (the ref's
-  `length`) and checksum;
+- **single-chunk array** — every overview array and every column array of
+  fewer than `4^5` cells (one chunk per object): one `HEAD` of its one chunk
+  object, for its size (the ref's `length`) and checksum; a fine column
+  array (§4.6) is a sharded array and takes the suffix read above;
 - **multi-chunk regular (unsharded) array** — a leaf array on a
   `chunk_inner`-less grid: one `LIST` of the array's `c/` chunk prefix, which
   yields every chunk object's key, size and checksum in one request — and,
@@ -4976,36 +5069,49 @@ fails the sweep — the leaf is normative, the index is regenerable (a later
 staged sweep re-gathers). The leaf's `icechunk` block records the sidecar it
 wrote — `{sidecar, bytes, refs, arrays, checksum}` — or, under
 `commit: "leaf"`, its commit `{path, snapshot, arrays, refs, rebases,
-commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
+replays, commit_s, checksum}`; `{skipped: reason}` for a unit stage 1 does not index
 (§11.6); `{error: message}` on failure. The run parquet flattens the same
 fields to `icechunk_*` columns.
 
 ### 11.5 Manifest splitting
 
-**Contract.** Manifests are split along the **cell** axis into runs of
-`4^m` chunks — and along no other: one manifest spans **every row** of its
-run (§11.2) — and `m` is fixed **once, from the base level**:
+**Contract.** Manifests are split along **both** axes of a level array: the
+**cell** axis into runs of `4^m` chunks, and the **row** axis into blocks of
+`rows_per_manifest` rows (§11.2), default **one row per manifest**. `m` is
+fixed **once, from the base level**:
 
 ```text
 m_base = chunk_order_base − split_order          (7 at production: 4^7 = 16,384 chunks)
 m      = min(m_base, chunk_order_level)          (per level)
 ```
 
-The split therefore names **both** axes of a level array: the cell axis at
-`4^m`, and the row axis at a run length no row count reaches (`2^31 − 1`).
-Naming the row axis is required, not decorative — Icechunk splits an axis
-its config does not name at **one** chunk, which would cut a manifest per
-(row, cell run) and multiply the manifest count, and the snapshot that lists
-every manifest, by the number of rows.
+Both axes are named explicitly, which is required rather than decorative:
+Icechunk splits an axis its config does not name at **one** chunk, so an
+unnamed cell axis would cut a manifest per chunk.
+
+**Why the row axis is split.** With one manifest per row an append only
+**adds** manifest files: the rows already written are never rewritten, so a
+reader's cached manifests stay valid and a reader after one window
+downloads that window's refs alone. The alternative — one manifest spanning
+every row of its cell run — makes each append rewrite the whole manifest of
+every cell it touches (at 7 yearly windows, ≈1.05 MB rewritten per order-6
+cell per array to add a row's refs) and makes a one-window read download
+every window's refs. The cost of splitting is the **snapshot**, which lists
+every manifest and so grows with the row count: negligible at regional
+scale, and the reason the cut is a knob
+(`output.icechunk.rows_per_manifest`, default 1) rather than a law — a
+global store sets blocks of several rows. One row per manifest is the
+**finest** cut a store can carry, which is the side a later coarsening can
+still move from.
 
 Because the chunk axis is in nested order, one run of the **base** is
 exactly the chunks of one HEALPix cell at order `split_order`, so the split
 is stated as "one base manifest per order-`split_order` cell". Every other
 level holds the same **number of chunks** per manifest — not one
 `split_order` cell — capped at its own chunk axis (`chunk_order` is the
-group's own: the inner-chunk order for the base, 13 at production; the node
-order for a column or overview group, one chunk per node). At the defaults
-that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
+group's own: the inner-chunk order for the base, 13 at production, and for
+a fine column level, §11.3; the node order for any other column or overview
+group, one chunk per node). At the defaults that is one order-2 cell per manifest at `/13`, one order-1 cell at `/12`,
 and one base cell (12 manifests per array) at `/11` and every coarser level;
 no manifest ever spans more than a base cell. Holding the chunk count
 constant is what keeps the manifest count — and with it the snapshot, which
@@ -5016,9 +5122,14 @@ levels (≈5× at production).
 The split is configured **per order group** (Icechunk's path-matched split
 conditions, `^/{order}/`) and recorded per level as `levels.{order}.split`
 (`chunks` = `4^m`, `order` = `chunk_order − m` — the cell order one
-manifest spans, which differs per level by design) and once as
-`split_order` in the `zagg_icechunk` block (§11.1), never assumed by
-readers. `split_order` MUST satisfy `commit_order ≤ split_order ≤
+manifest spans, which differs per level by design — and `rows`, the row-axis
+block, the same for every level) and once each as `split_order` and
+`rows_per_manifest` in the `zagg_icechunk` block (§11.1), never assumed by
+readers. A `/2` repo whose block carries **no** `rows_per_manifest` was
+written before this rule — an interim repo, never published — and is
+**refused** with the remedy (clear it; the next run's init re-creates it),
+never operated on: its `rows`-less level records are compared with nothing.
+`split_order` MUST satisfy `commit_order ≤ split_order ≤
 shard_order`: the committing node (§11.4) owns every leaf under its order,
 so a **base** manifest keyed to a cell at or below it is written by that one
 commit and no other — **zero rewrite amplification** at the only heavy
@@ -5035,15 +5146,18 @@ keeps its id. Refs written into a new row rewrite, per array, exactly the
 manifests of the split cells they touch — **whole**, the earlier rows'
 refs included — and no other; every earlier reference stays byte-identical.
 The one-row case costs nothing over a row-less array (2.10 MB of manifests
-for 147,456 refs against 2.14 MB). A windowed store's 14 windows, each
-leaf's window holding ≈20 % of its inner chunks, are 2.8× the refs and
-≈3.0× the manifest bytes of one dense row, in the **same** manifest count —
-the snapshot does not grow with the rows. The price is the append: adding
-one window to that cell rewrites its 5.8 MB of manifests to add ≈0.4 MB of
-refs (the superseded manifests are what retention collects, §11.4).
-Splitting the row axis too would write only the new refs, at one manifest
-per (row, cell run) — 14× the manifests and the snapshot entries here —
-which is the trade the cell-axis-only rule declines.
+for 147,456 refs against 2.14 MB). Under the default
+one-row cut, refs written into a new row therefore touch only that row's
+manifests and no earlier one. Measured on the issue #586 Sierra stores, a
+yearly-windowed leaf occupies ≈62 % of its 256 inner chunks (mean 158,
+min 34, max 234), so one shard's 7 yearly windows carry ≈4.3× the occupied
+chunks of one dense row — ≈8.4 MB of manifests for one order-6 cell: 8
+files of ≈1.05 MB spanning every row, against 56 files of ≈150 KB at one
+manifest per row. Row-spanning manifests rewrite that 1.05 MB per append;
+the one-row cut writes only the new row's ≈150 KB and supersedes nothing,
+paying ≈33 B of snapshot per manifest (≈4.8 KB per order-6 cell against
+≈1.4 KB). Occupancy did not track a leaf's pass count, so these numbers do
+not project to finer schedules — issue #602 measures those.
 
 **Contract — the ratchet.** The store's recorded `split_order` is
 authoritative and moves **one way, toward coarser**. At `init`, the run
@@ -5061,6 +5175,17 @@ the run's finalize (§11.4) reports as `rewrite_pending` for an **operator**
 by finalize; mixed cuts are valid — each manifest carries its own extents). A repo is never re-split finer. `split_order` is
 a layout knob outside the D19 semantic core: it changes no leaf byte.
 `commit_order` is per-run and unchecked beyond `split_order ≥ commit_order`.
+
+`rows_per_manifest` does **not** ratchet: it is fixed at the repo's
+creation, because it is baked into every manifest already written. A later
+config value is not applied — the init adopts the store's and logs a
+warning naming both — and moving it on an existing repo is an operator
+`rewrite_manifests` pass. It MUST be at least 1. Adoption governs the
+**repository handle** the run then writes through, not only the value it
+reports: an Icechunk config supplied when a repository is opened overrides
+the saved one, so an init whose config differs from the store reopens at
+the store's cut before any commit. The block and the manifests a run writes
+therefore always name the same cut.
 
 At the defaults (`split_order = commit_order = 6` at production) a
 shard-order manifest is `4^7` = 16,384 chunks — one order-6 cell, 64 leaves —
@@ -5089,14 +5214,28 @@ having precisely because all refs of one leaf array carry the **same**
 
 Windowed leaves (`{id}_{window}.zarr`, `morton-hive/2`) share a shard rank
 across windows, which is what the `/2` row dimension is for: each window is
-a row (§11.2), so the array model holds them. The **writer** does not index
-them yet: it records no refs for a windowed leaf (the sidecar says
-`skipped: windowed`), the ladder does not run on a windowed store, and
-`output.icechunk` resolves off there (an explicit `true` is refused), so no
-windowed store has a repo. Raster hive products (`(time, cells)` arrays,
-never sharded — one row per acquisition, in append order) are likewise out
-of the writer's scope. Both are tracked on issue
-[#584](https://github.com/englacial/zagg/issues/584) (its phases 2 and 4);
+a row (§11.2), so the array model holds them — and the writer now indexes
+them (issue #584 phase 2). A windowed hive store is **in** scope, and
+`output.icechunk` defaults ON there as it does for an unwindowed hive
+store:
+
+- the run's init allocates one row per window label its dispatch units
+  carry, plus the reserved `all` row when the store maintains the
+  cross-window fold (`pyramid.overview.all_time`);
+- each window leaf's refs land at its window's row. A leaf unit that names
+  **no** window label is refused: `all` is the fold's own row, it IS
+  allocated whenever the fold is maintained, so nothing downstream would
+  catch a base ref written over it;
+- the ladder's node units plan one overview object per row **this run
+  writes** (`{window}.zarr` per window unit beneath the node, and
+  `all.zarr` when the node closes), never per row the repo holds — which
+  would re-plan and re-commit every window ever allocated, rewriting those
+  rows' manifests on every append.
+
+Raster hive products (`(time, cells)` arrays, never sharded — one row per
+acquisition, in append order) remain out of the writer's scope: the knob
+resolves off there and an explicit `true` is refused. They are tracked on
+issue [#584](https://github.com/englacial/zagg/issues/584) (its phase 4);
 the finalize and tags of §11.4 apply to them unchanged once they have a
 repo. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview

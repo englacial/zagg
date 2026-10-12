@@ -507,6 +507,29 @@ declaration that wrote it — which is why an absent column is not by itself
 a fault: under a declaration known to carry leaf columns it is a torn
 worker, and the repair is re-invoking the idempotent leaf, never a
 sweep-side fold from raw cells.
+
+**Layout** ([issue #631](https://github.com/englacial/zagg/issues/631),
+`zagg.column_shards`). Every column array is one object per leaf, and its
+chunking is a function of the group's own `(node, resolution)`: a group of
+fewer than `4^5` cells is one whole unsharded chunk — every column written
+before #631, and the whole default tier `{13, 12, 11, 10, 9}` — while a
+group of `4^5` cells or more (orders 14–16 under the v4 ATL03 rebuild's
+`overviews: [16, 15, 14, 13]`) is one `sharding_indexed` object on inner
+chunks of `min(4^5, cells / 4)` cells: 16 inner chunks of 1,024 at order
+16, four of 1,024 at 15, four of 256 at 14. The inner chunk is ~0.5 MB of
+saturated signal digest at the 128-centroid cap, is a power of four (a
+viewer's window block never straddles one), and never exceeds the staged
+sweep's fold block, so a stage gather over a fine column reads at most one
+inner chunk's worth of cells per block read through the shard index — one
+1,024-cell inner chunk above `4^5` cells, the whole four-inner-chunk object
+at exactly `4^5`. The Icechunk companion indexes a fine column level at its
+inner chunk; a companion repo initialized before #631 still chunks those
+levels whole, and every open that vets the geometry — the per-run init, the
+leaf vet, the ladder and `declare_pyramid` — refuses it until it is cleared
+and re-initialized (the finalize, mutate and history opens do not vet the
+level geometry), the `/1 → /2` backfill
+re-lays a whole-chunk fine column as structure drift, and `pyramid_check`
+holds every column array to the rule.
 Byte grammar: [`specification.md`](specification.md) §4.6.
 
 ### Retrofitting the pyramid declaration
@@ -2035,8 +2058,9 @@ other members are sweep intermediates and are not indexed) — each carrying
 the artifact's resolution-group attrs — `dggs` included — with every array
 re-rooted on the whole sphere at that cell order — `count`, `morton`, every field, the ragged vlen arrays and
 their siblings — chunked at the object's **inner** chunk (the leaf's inner
-chunk for the base; the whole object, one chunk per node, for a column or
-overview level) and coded with the inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
+chunk for the base and the §4.6 inner chunk for a fine column level; the
+whole object, one chunk per node, for an overview level or a column level
+below `4^5` cells) and coded with the inner chain (no `sharding_indexed`), so `icechunk` + `zarr` open the hive as
 ordinary arrays without moczarr.
 
 Every level array is **`(n_rows, n_cells)`**, chunked one row deep
@@ -2097,18 +2121,23 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
 - **The leaf's ref sidecar**: after the leaf's stamp — last in the unit,
   behind the granule-id sibling and the [issue #383](https://github.com/englacial/zagg/issues/383)
   column fold — the worker sizes the objects it wrote (one HEAD + one ranged
-  GET of the shard-index suffix per sharded leaf array; one HEAD per
-  single-chunk column array, whose ref is the whole object) and writes the plan as a JSON sibling beside the leaf's stats
+  GET of the shard-index suffix per sharded leaf array and per fine column
+  array; one HEAD per single-chunk column array below `4^5` cells, whose
+  ref is the whole object) and writes the plan as a JSON sibling beside the leaf's stats
   sidecar (`icechunk_refs.json`, ≈40 KB at production geometry). No
   Icechunk session on the leaf path. The outcome rides the leaf's stats sidecar as `icechunk` —
-  `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "windowed" |
-  "empty"}`, or `{error}` — and the run parquet as `icechunk_*` columns. Its
+  `{sidecar, bytes, refs, arrays, checksum}`, `{skipped: "empty"}`, or
+  `{error}` — and the run parquet as `icechunk_*` columns. A windowed leaf
+  is indexed like any other, at its window's row (spec §11.2). Its
   cost is its own `phase_timings["icechunk"]`, not `write`.
 - **The ladder commits** (`zagg.icechunk_ladder`, hooked into every node of
   the [staged sweep](#the-staged-sweep-issue-384)): a stage node gathers its
-  subtree's carriers — leaf sidecars at the finest tuple, its children's
+  subtree's carriers — leaf sidecars at the finest tuple (one per
+  `(leaf, window)` on a windowed store, each naming its own row), its children's
   node ref columns above — adds the refs of the overview objects at its
-  tuple's orders, and either writes its own node column or **commits**. The
+  tuple's orders, and either writes its own node column or **commits**. On a
+  windowed store the hook runs once per node, after that node's window units
+  and its close, so each row's refs are gathered and committed together. The
   tuple whose order range contains `commit_order` commits everything
   gathered in **one commit per node** covering every order in its subtree
   (`node {decimal}`, refs into `/19/…`, `/13/…`, `/12/…`, … of the one repo); coarser
@@ -2119,6 +2148,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   few manifests are shared across nodes and rebased, which keeps the
   manifest count at the base's (spec §11.5).
   Each stage row records `icechunk_commits`, `icechunk_rebases`,
+  `icechunk_replays` (commits replayed in a fresh session because another
+  run's init grew the row axis under the node's staged refs, spec §11.4),
   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
   `icechunk_regathered` (dirt-only nodes, re-gathered without a fold) and
@@ -2325,15 +2356,16 @@ either way: `s3_storage` leaves it to a guess otherwise, and zagg's stores are
 `url_prefix` and the paths above, which is what makes the same two calls
 writable in icechunk-js.
 
-The manifest split (spec §11.5) is on the cell axis alone — one manifest
-spans every row of its cell run, so the manifest count does not grow with
-the rows — at one base manifest per order-`split_order`
-cell — at the defaults an order-6 cell, 16,384 chunks, 64 leaves — and the
-same number of chunks per manifest at every coarser level (so a coarse
-manifest spans a coarser cell: order 2 at `/13`, a base cell at `/11` and
-above), recorded in the repo root's `zagg_icechunk` block as `split_order`,
-and per order group as `levels.{order}.split` (`chunks`, `order`), so a
-reader never assumes it.
+The manifest split (spec §11.5) cuts **both** axes: the cell axis at one
+base manifest per order-`split_order` cell — at the defaults an order-6
+cell, 16,384 chunks, 64 leaves — and the same number of chunks per manifest
+at every coarser level (so a coarse manifest spans a coarser cell: order 2
+at `/13`, a base cell at `/11` and above); and the row axis at
+`rows_per_manifest` rows, **one row per manifest** by default, so an append
+adds manifest files and rewrites none of the rows already written. Both are
+recorded in the repo root's `zagg_icechunk` block (`split_order`,
+`rows_per_manifest`) and per order group as `levels.{order}.split`
+(`chunks`, `order`, `rows`), so a reader never assumes them.
 
 ## Raster hive stores (issue #247)
 

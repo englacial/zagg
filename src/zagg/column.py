@@ -613,9 +613,9 @@ def write_column(
     from zarr import open_array
     from zarr.core.sync import sync
 
+    from zagg.column_shards import column_grid
     from zagg.content_hash import staged_record
     from zagg.grids.base import vlen_dtype_warning_suppressed
-    from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_decimal
     from zagg.hive import _utcnow, shard_leaf_path, stamp_commit
     from zagg.store import open_store
@@ -638,10 +638,10 @@ def write_column(
     basename = column_name(window)
     path = f"{node_prefix}/{basename}"
     cfg = _overview_config(fields)
-    # `sharded=True` is INERT here (as in `_write_overview`): with no
-    # `chunk_inner`, `HealpixGrid` computes chunks_per_shard == 1 and turns
-    # sharding back off for every group — one chunk per group, no shard index.
-    grids = {res: HealpixGrid(node_order, res, config=cfg, sharded=True) for res in resolutions}
+    # The §4.6 layout rule (issue #631): a group narrower than 4^5 cells is
+    # one unsharded chunk per array; a wider one is ONE ShardingCodec object
+    # per array on power-of-four inner chunks (:mod:`zagg.column_shards`).
+    grids = {res: column_grid(node_order, res, cfg) for res in resolutions}
     spec = GroupSpec(
         members={str(res): grids[res].shard_spec() for res in resolutions}, attributes={}
     )

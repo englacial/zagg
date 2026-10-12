@@ -580,13 +580,16 @@ class TestDeclarePyramid:
         other.output["grid"] = {**cfg.output["grid"], "child_order": 7}
         with pytest.raises(ValueError, match="was built for"):
             icechunk_ops.declare_pyramid(root, other, store_kwargs={})
-        # A recorded level whose geometry the manifest would move.
+        # A recorded level whose geometry the manifest would move: an overview
+        # level (a column level's chunking is the §4.6 rule's, vetted on open).
         icechunk_ops.declare_pyramid(root, cfg, store_kwargs={})
         group, repo = _open(root)
         session = repo.writable_session("main")
         root_group = zarr.open_group(session.store, mode="r+")
         block = dict(root_group.attrs[ICECHUNK_ATTR])
-        block["levels"] = {**block["levels"], "5": {**block["levels"]["5"], "chunk_order": 3}}
+        assert block["levels"]["4"]["artifact"] == "overview"
+        moved = {**block["levels"]["4"], "chunk_order": block["levels"]["4"]["chunk_order"] + 1}
+        block["levels"] = {**block["levels"], "4": moved}
         root_group.attrs.put({**root_group.attrs.asdict(), ICECHUNK_ATTR: block})
         session.commit("tamper")
         with pytest.raises(ValueError, match="a new revision, not an operation"):
