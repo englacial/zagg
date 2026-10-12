@@ -698,6 +698,15 @@ def stage_memory(ladder: dict, stages: dict) -> dict:
     is not the same as having used none. The peak is an UPPER bound per tuple,
     not a per-unit peak (``zagg.sweep_units.container_hwm_mb``), so headroom
     read off it is the pessimistic side — a tier that looks roomy here is roomy.
+
+    ``tier_mb`` is ASSUMED, not read: :data:`STAGE_TIER_GB` mirrors
+    ``runner._resolve_stage_function_name``, which sends every stage invoke to
+    the run family's ``-8192-disk`` variant, and no stage record carries the
+    function's memory (a leaf row has ``lambda_memory_mb``; the stage record of
+    ``zagg.sweep_stages.run_stage_worker`` has no such field). On a run that set
+    ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME`` to another tier the headroom is wrong
+    rather than absent — reading it off the record would take the record
+    carrying the tier.
     """
     peaks = [s["container_hwm_mb"] for s in ladder.get("stages") or []]
     peaks += [r.get("container_hwm_mb") for r in (stages or {}).get("runs") or []]
