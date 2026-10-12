@@ -4633,7 +4633,7 @@ bytes in the manifest rather than a chunk object — Icechunk's own threshold,
 and nothing above depends on which it chose. The cost is the overview bytes a
 second time, in the repo, at the levels **above** the base — each coarser
 level holding a quarter of the cells of the one below it, and only the
-composable fields (§4.4) — plus one GET per array per overview object at the
+composable fields (§4.5) — plus one GET per array per overview object at the
 commit.
 
 A native chunk carries **no** checksum, the bytes being the repository's
