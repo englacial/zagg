@@ -34,6 +34,7 @@ from test_sweep_stage import (
 from test_sweep_stage_fleet import _FakeLambda
 
 from zagg.pyramid import PYRAMID_SPEC_V2
+from zagg.sweep_fleet import NO_LADDER_SKIP
 from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW
 
 WINDOWS = TestWindowedStageSweep.WINDOWS
@@ -504,7 +505,7 @@ class TestStoreLadderGate:
         assert client.events == [] and summary["invokes"] == 0
         # The constant is the matchable prefix; the reason the gate saw rides
         # behind it, so the run record is self-explaining.
-        assert summary["skipped"].startswith("no sweepable zagg-pyramid/2 ladder: ")
+        assert summary["skipped"].startswith(f"{NO_LADDER_SKIP}: ")
         assert named in summary["skipped"]
         assert summary["stages"] == []
         assert summary["finisher"] == {"landed": False, "fired": False}
@@ -597,7 +598,7 @@ class TestStoreLadderGate:
         client = _FakeLambda(None)
         summary = _tail_fleet(root, client)
         assert client.events == [] and summary["invokes"] == 0
-        assert summary["skipped"].startswith("no sweepable zagg-pyramid/2 ladder")
+        assert summary["skipped"].startswith(NO_LADDER_SKIP)
 
     def test_a_manifest_that_does_not_parse_fires_nothing(self, tmp_path):
         # A truncated manifest is the store's own content, not an access
@@ -620,9 +621,7 @@ class TestStoreLadderGate:
         root.mkdir()
         client = _FakeLambda(None)
         summary = _tail_fleet(root, client)
-        assert client.events == [] and summary["skipped"].startswith(
-            "no sweepable zagg-pyramid/2 ladder"
-        )
+        assert client.events == [] and summary["skipped"].startswith(NO_LADDER_SKIP)
 
     def test_a_two_store_is_untouched(self, tmp_path):
         # Acceptance: no change to what a /2 store does. The same fan-out,
@@ -726,6 +725,4 @@ class TestStoreLadderGate:
             store_kwargs={},
             barrier_timeout_s=0.01,
         )
-        assert client.events == [] and summary["skipped"].startswith(
-            "no sweepable zagg-pyramid/2 ladder"
-        )
+        assert client.events == [] and summary["skipped"].startswith(NO_LADDER_SKIP)
