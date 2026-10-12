@@ -4907,6 +4907,10 @@ class TestLambdaSkipAndDirtOnly:
         summary, seen = self._drive(monkeypatch, atl06_config, body=self._DIRTY)
         assert seen["stage"] == [] and seen["sweep"] == 0
         assert summary["stage_sweep"] is None and summary["families_sweep"] is None
+        # ... and the raise itself is the verdict: nothing was swept, so the
+        # emptiest report would be the most misleading one (review finding).
+        ((reason,)) = summary["tail_sweep_short"]
+        assert "sweep block raised (RuntimeError: no leaves for you)" in reason
 
 
 class TestLambdaFamiliesRideTheCascade:
@@ -5126,6 +5130,16 @@ class TestTailSweepShort:
         assert runner._tail_sweep_short(None, None, stage_chained=True) == [
             "staged sweep dispatch failed, so the ladder may be partly unfolded"
         ]
+
+    def test_a_raised_tail_leads_the_verdict(self):
+        from zagg import runner
+
+        reasons = runner._tail_sweep_short(
+            None, None, stage_chained=True, tail_error="ValueError: malformed stats record"
+        )
+        assert "sweep block raised (ValueError: malformed stats record)" in reasons[0]
+        # The staged leg still speaks for itself after it.
+        assert len(reasons) == 2 and "staged sweep dispatch failed" in reasons[1]
 
     def test_a_fired_families_pass_that_failed_is_not_the_none_of_no_pass(self):
         from zagg import runner

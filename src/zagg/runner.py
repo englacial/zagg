@@ -1681,7 +1681,7 @@ class RasterStrategy:
         # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
         # mirroring the aggregation lambda path — partitioned from the leaf
         # count and awaited (issue #610), fail-open (D9; the CLI backstops).
-        families_sweep = None
+        families_sweep, families_error = None, None
         if store_layout == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import leaves_from_stats_records
@@ -1701,6 +1701,7 @@ class RasterStrategy:
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+                families_error = f"{type(e).__name__}: {e}"
         # Precedence note (issue #335): the all-failed verdict still raises
         # FIRST — it is the run's own root cause, not a tail crash, and a stale
         # manifest is moot when no shard wrote anything. The finalize failure is
@@ -1783,7 +1784,9 @@ class RasterStrategy:
         # The raster tail's verdict (issue #610): the families leg is the only
         # one it fires — a raster run walks no /2 ladder, so it chains no
         # staged sweep and has no second leg to read.
-        summary["tail_sweep_short"] = _tail_sweep_short(families_sweep, None, stage_chained=False)
+        summary["tail_sweep_short"] = _tail_sweep_short(
+            families_sweep, None, stage_chained=False, tail_error=families_error
+        )
         _warn_tail_sweep_short(summary["tail_sweep_short"])
         logger.info(
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
@@ -4596,6 +4599,12 @@ def _run_lambda(
         # The condensed verdict is a key of its own beside it, not a
         # replacement.
         summary["stage_sweep"] = None
+        # The tail's fail-open arm is a shortfall of its own (review finding):
+        # ``stage_chained`` is set INSIDE the try, so a raise before it leaves
+        # both legs' keys None and nothing else to report — a run whose
+        # rollups were never swept would otherwise read as a whole tail. The
+        # facade decides its gate before its own try and already says so.
+        tail_error = None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -4666,12 +4675,16 @@ def _run_lambda(
                     _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+                tail_error = f"{type(e).__name__}: {e}"
         # The run's verdict on its own tail (issue #610): one reason per
         # shortfall, empty when the tail left nothing short. Both legs' full
         # outcomes are above; this is what a caller reads without knowing
         # which field of which dict means "the store is short".
         summary["tail_sweep_short"] = _tail_sweep_short(
-            summary["families_sweep"], staged, stage_chained=stage_chained
+            summary["families_sweep"],
+            staged,
+            stage_chained=stage_chained,
+            tail_error=tail_error,
         )
         _warn_tail_sweep_short(summary["tail_sweep_short"])
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
@@ -6338,7 +6351,9 @@ def _families_sweep_reported(outcome: dict | None) -> dict:
     return {"partitions": None, "fired": 0, "landed": 0, "finisher": "dispatch_failed"}
 
 
-def _tail_sweep_short(families_sweep, stage_sweep, *, stage_chained: bool) -> list:
+def _tail_sweep_short(
+    families_sweep, stage_sweep, *, stage_chained: bool, tail_error: str | None = None
+) -> list:
     """Why this run's tail left the store short of its rollups; ``[]`` when it did not.
 
     The run's one-line verdict on its own tail (issue #610). Both legs report
@@ -6356,8 +6371,17 @@ def _tail_sweep_short(families_sweep, stage_sweep, *, stage_chained: bool) -> li
     order is a shortfall of its own: the ladder wrote what it could and the
     finisher deliberately left those levels' manifest actuals standing, which
     is the honest record of a walled tuple and not a complete sweep.
+
+    ``tail_error`` is what the tail's own fail-open ``except`` swallowed, and
+    it leads the list: a block that raised before either leg fired reports
+    neither outcome, so without it the worst case — nothing swept at all —
+    would be the emptiest verdict (review finding).
     """
     reasons = []
+    if tail_error:
+        reasons.append(
+            f"the tail's sweep block raised ({tail_error}), so what it had not yet fired is unswept"
+        )
     families = families_sweep or {}
     fired, landed = families.get("fired") or 0, families.get("landed") or 0
     if (finisher := families.get("finisher")) == "dispatch_failed":

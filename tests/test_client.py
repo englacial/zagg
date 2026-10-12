@@ -1700,6 +1700,11 @@ class TestStagedSweepTail:
         assert seen["order"] == [] and "icechunk_finalize" not in stub.modes()
         assert handle.stage_sweep is None
         assert handle.icechunk_finalize == {"skipped": "staged sweep dispatch failed"}
+        # The raise leads the verdict here too (issue #610): nothing was swept.
+        assert (
+            "sweep block raised (ValueError: malformed stats record)"
+            in (handle.tail_sweep_short[0])
+        )
 
     def test_a_leaf_pinned_run_still_chains_and_gates(self, catalog, monkeypatch):
         # No ``/2`` ladder declared, so the dispatch pins ``commit: "leaf"``,
