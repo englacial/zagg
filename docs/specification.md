@@ -4613,8 +4613,14 @@ reference's checksum — and on a windowed store `all.zarr` is rewritten by
 contract is to read the store as that run left it (§11.4). Copied in, an
 overview level reads from a tag exactly as it was committed, while the
 store's overview objects stay authoritative for a path reader and for the
-ladder's own gather (§4.5). A `leaf` or `column` level is referenced,
-unchanged.
+ladder's own gather (§4.5). A `leaf` level is referenced, unchanged — it is
+write-once, and versioned (§1.5) it is never rewritten at all. A `column`
+level is referenced too, and there the exposure stands: a leaf's §4.6 column
+object sits **beside** the leaf rather than under its version subgroup, so a
+re-run of that leaf rewrites it under the same keys and a tag's column refs
+are valid only while that leaf is not rewritten. Bringing the column under
+the leaf's version root, or copying it in as the overviews are, is open on
+issue [#584](https://github.com/englacial/zagg/issues/584).
 
 The copy is byte-for-byte — the object's inner chunk IS the repo array's
 `(1, C)` chunk (§11.2) — so nothing is re-encoded and the index law above is
