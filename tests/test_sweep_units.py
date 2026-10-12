@@ -1397,3 +1397,26 @@ class TestStageTier:
         assert seen["function_name"] == "process-shard-8192-disk"
         assert (seen["windowed"], seen["all_time"]) == (True, True)
         assert seen["pipeline_run_id"] == "pipeline-5"
+
+    def test_every_stage_row_carries_the_tuple_memory_high_water(self, tmp_path):
+        # The tier verdict issue #602 asks for ("can the stage tier come back
+        # down from 8 GB") needs a memory figure in the DURABLE record: a stage
+        # invoke's response body is discarded on the async fan-out, so the row
+        # carries the tuple's own high-water.
+        manifest = _wide_store(tmp_path)
+        summary = sweep_stage_pass(
+            str(tmp_path), manifest, {d: {None} for d in LEAVES}, run_id="A", tuple_width=1
+        )
+        peaks = [row["container_hwm_mb"] for row in summary["stages"]]
+        assert peaks and all(isinstance(p, float) and p > 0 for p in peaks)
+        # It is a high-water, not a sum: the whole process's peak RSS, so no
+        # row can report less than this test process already holds.
+        assert min(peaks) >= units_mod.container_hwm_mb() * 0.5
+
+    def test_an_unavailable_rusage_records_none_not_zero(self, monkeypatch):
+        import resource
+
+        monkeypatch.setattr(
+            resource, "getrusage", lambda _who: (_ for _ in ()).throw(OSError("no rusage"))
+        )
+        assert units_mod.container_hwm_mb() is None
