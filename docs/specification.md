@@ -4272,9 +4272,9 @@ their bytes.
 "Backfill" is therefore not a category: an evolving fact is written to the
 repo in a commit, never by rewriting leaves — the §11.4 **operations**
 (`zagg.icechunk_ops`: `set-attrs`, `declare-pyramid`) are how an operator
-writes one. Stage 2's remaining items are tracked on issue #582: native
-overview chunks (issue #584 phase 3, on the `/2` array model), moczarr's
-reads through the repo (phase 6) and the browser (phase 7).
+writes one. Native overview chunks landed with the `/2` array model (issue
+#584 phase 3, §11.3); stage 2's remaining items are tracked on issue #582:
+moczarr's reads through the repo (phase 6) and the browser (phase 7).
 
 **Succession.** A change to the repo's ARRAY MODEL is a new revision,
 declared in the `zagg_icechunk.spec` token (§11.1), so a reader
@@ -4300,7 +4300,8 @@ A morton hive is many leaf zarrs. The companion presents every leaf of one
 order as **one zarr hierarchy** by recording each leaf's inner chunks as
 [Icechunk](https://icechunk.io) **virtual chunk references** —
 `(location, offset, length)` byte ranges into the leaf objects that already
-exist — so an Icechunk reader (icechunk-py, icechunk-js in a browser) opens
+exist (the §4 overview levels, whose objects a later run rewrites in place,
+are copied in as the repo's own chunks instead — §11.3) — so an Icechunk reader (icechunk-py, icechunk-js in a browser) opens
 the hive as a single array per field without moczarr's hand-built virtual
 store, and every hive commit maps onto an Icechunk snapshot.
 
@@ -4597,6 +4598,45 @@ Each **populated** inner chunk is recorded as one virtual reference:
   a single-chunk array), `offset` 0, `length` the object size (§11.4); a
   missing object gets no reference.
 
+**Native chunks: the overview levels (contract).** Every level's chunks are
+virtual references, **except** at an `artifact: "overview"` level (the
+block's `levels`, §11.1), whose chunks are the repository's **own bytes** —
+copied in by the commit that would otherwise have referenced them (issue
+[#584](https://github.com/englacial/zagg/issues/584) phase 3). The reason is
+mutability, not size. A leaf is write-once (§1.5) and a versioned leaf's
+objects are never rewritten at all, so a reference into one stays valid; a §4
+overview object (`{window}.zarr`, `all.zarr`) is **re-folded under its own
+key** by every later run whose subtree gained a leaf, which invalidates the
+reference's checksum — and on a windowed store `all.zarr` is rewritten by
+*every* append. A failed reference is the honest outcome on the branch tip
+(the next staged sweep re-plans it) and defeats a **run tag**, whose whole
+contract is to read the store as that run left it (§11.4). Copied in, an
+overview level reads from a tag exactly as it was committed, while the
+store's overview objects stay authoritative for a path reader and for the
+ladder's own gather (§4.5). A `leaf` or `column` level is referenced,
+unchanged.
+
+The copy is byte-for-byte — the object's inner chunk IS the repo array's
+`(1, C)` chunk (§11.2) — so nothing is re-encoded and the index law above is
+untouched: a native chunk lands at the same `(w, r·C + j)` a reference
+would have, in the same manifest (§11.5), and a reader sees one array
+whatever the mixture (Icechunk resolves both; a repo written before this rule
+keeps the references it holds, each row superseded when a later run
+re-commits it). A chunk small enough for Icechunk to **inline** carries its
+bytes in the manifest rather than a chunk object — Icechunk's own threshold,
+and nothing above depends on which it chose. The cost is the overview bytes a
+second time, in the repo, at the levels **above** the base — each coarser
+level holding a quarter of the cells of the one below it, and only the
+composable fields (§4.4) — plus one GET per array per overview object at the
+commit.
+
+A native chunk carries **no** checksum, the bytes being the repository's
+own, so the copy vets the object it reads against the form the plan recorded
+and **refuses** it when they differ: another writer re-folded that overview
+between the plan and the copy, so the gather describes a state that no
+longer exists. The node's whole gather is dropped — fail-open (D9), counted
+`icechunk_failed` on its stage row — and the next staged sweep re-gathers it.
+
 Chunk keys are the array's own, under the `chunk_key_encoding` its
 `zarr.json` declares — zagg emits the `default` encoding with the `/`
 separator throughout — so the chunk at grid index `(i₀, i₁, …)` is
@@ -4859,7 +4899,11 @@ tags it once the ladder is complete). One finalize, in order:
    therefore reads one snapshot per run only up to the oldest retained tag,
    and per commit after it. Neither step touches a virtual target: Icechunk
    manages none of the leaf objects (the virtual-target collector below is
-   the operator's tool for those). Retention is fail-open inside finalize: an error (two
+   the operator's tool for those). It does collect the **native** overview
+   chunks (§11.3) that no retained snapshot references — they are the
+   repository's own objects, so they go exactly in step with the snapshots
+   that could have read them, and the store's own overview objects are
+   untouched. Retention is fail-open inside finalize: an error (two
    finalizes racing on one tag delete, a collection cut off by the invoke's
    ceiling) is recorded as `retention_error` and steps 2 and 3 still run;
 2. one content-free **`finalize {run_id}` commit** whose commit metadata
@@ -5239,7 +5283,10 @@ issue [#584](https://github.com/englacial/zagg/issues/584) (its phase 4);
 the finalize and tags of §11.4 apply to them unchanged once they have a
 repo. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview
-level has its group in the store's one repo, and its refs. None of these change the leaf format, the
+level has its group in the store's one repo, and its chunks — **copied in**
+rather than referenced, since those objects are the ones a later run
+rewrites in place (§11.3), which is what lets a run tag read the `all` row
+it was cut with. None of these change the leaf format, the
 t-digest storage or the moczarr reader.
 
 **Scale (informative).** Snapshot size is proportional to the manifest

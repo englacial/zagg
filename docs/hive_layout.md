@@ -2208,6 +2208,17 @@ object's `last_modified` ceiled to the next whole second on a local store —
 so a leaf replaced in place fails loudly instead of decoding stale offsets
 (locally, only a replacement landing inside the same second slips through).
 
+The **overview** levels are the exception: their chunks are the repo's own
+bytes, copied in by the commit that would otherwise have referenced them
+(spec §11.3). A leaf is write-once and a versioned leaf is never rewritten
+at all, but an overview object (`{window}.zarr`, `all.zarr`) is re-folded
+under its own key by every later run whose subtree gained a leaf — and on a
+windowed store `all.zarr` is rewritten by every append — so a reference into
+one goes stale and a run tag could not read the level it was cut with. The
+store's overview objects are untouched by this and stay authoritative for a
+path reader and for the sweep's own gather; what the repo stops doing is
+pointing at them.
+
 Four writes, all worker-side (the dispatcher never writes, D8), all
 **fail-open** — the repo is a regenerable index, never load-bearing:
 
@@ -2247,8 +2258,12 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   the [staged sweep](#the-staged-sweep-issue-384)): a stage node gathers its
   subtree's carriers — leaf sidecars at the finest tuple (one per
   `(leaf, window)` on a windowed store, each naming its own row), its children's
-  node ref columns above — adds the refs of the overview objects at its
-  tuple's orders, and either writes its own node column or **commits**. On a
+  node ref columns above — adds the overview objects at its
+  tuple's orders, whose chunks the committing session **copies in** rather
+  than referencing (spec §11.3), and either writes its own node column or
+  **commits**. A copy whose object moved since it was sized is refused, and
+  the node fails open (`icechunk_failed`) rather than committing a gather of
+  a state that no longer exists. On a
   windowed store the hook runs once per node, after that node's window units
   and its close, so each row's refs are gathered and committed together. The
   tuple whose order range contains `commit_order` commits everything
