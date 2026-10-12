@@ -5027,9 +5027,11 @@ conditions, `^/{order}/`) and recorded per level as `levels.{order}.split`
 manifest spans, which differs per level by design — and `rows`, the row-axis
 block, the same for every level) and once each as `split_order` and
 `rows_per_manifest` in the `zagg_icechunk` block (§11.1), never assumed by
-readers. A `/2` repo whose block carries **no** `rows_per_manifest` predates
-this rule and keeps its every-row-in-one cut; the key's absence is what
-names it. `split_order` MUST satisfy `commit_order ≤ split_order ≤
+readers. A `/2` repo whose block carries **no** `rows_per_manifest` was
+written before this rule — an interim repo, never published — and is
+**refused** with the remedy (clear it; the next run's init re-creates it),
+never operated on: its `rows`-less level records are compared with nothing.
+`split_order` MUST satisfy `commit_order ≤ split_order ≤
 shard_order`: the committing node (§11.4) owns every leaf under its order,
 so a **base** manifest keyed to a cell at or below it is written by that one
 commit and no other — **zero rewrite amplification** at the only heavy

@@ -422,69 +422,39 @@ class TestRefsLandAtTheirRow:
         assert "fixed at creation" in caplog.text
         assert _saved_row_splits(root)["6"] == 4
 
-    def test_a_repo_written_before_the_ruling_keeps_its_every_row_cut(
-        self, monkeypatch, cfg, tmp_path, caplog
+    def test_a_repo_recording_no_row_cut_is_refused_with_the_remedy(
+        self, monkeypatch, cfg, tmp_path
     ):
-        # A ``/2`` repo whose block carries no ``rows_per_manifest`` predates
-        # the row split; the absent key names it and its cut is kept.
+        # A ``/2`` repo written before the row-split ruling records no
+        # ``rows_per_manifest`` and its levels no ``rows``. Interim repos are
+        # disposable (ruling of 2026-10-12, issue #584): every operation
+        # refuses it with the remedy — ahead of the level check and of any
+        # save — and nothing keeps an every-row-in-one cut alive for it.
+        from zagg import icechunk_ops
+
         grid, root, manifest = _windowed(cfg, tmp_path)
-        (shard,) = _shards(grid, 1)
-        self._two_versions(monkeypatch, grid, root, shard)
         _init(root, grid, cfg, manifest, ["2019"])
         _group, repo = _open(root)
         session = repo.writable_session(icechunk_refs.BRANCH)
         group = zarr.open_group(session.store, mode="a")
         block = dict(group.attrs[ICECHUNK_ATTR])
         block.pop("rows_per_manifest")
-        group.attrs[ICECHUNK_ATTR] = block
-        session.commit("drop the row cut")
-        with caplog.at_level("WARNING"):
-            out = _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
-        assert out["options"]["rows_per_manifest"] == icechunk_rows.LEGACY_ROW_SPLIT
-        assert "fixed at creation" in caplog.text
-
-    def _legacy(self, root, grid, cfg, manifest):
-        """Strip the row cut from the committed block: a repo written before the ruling."""
-        _group, repo = _open(root)
-        session = repo.writable_session(icechunk_refs.BRANCH)
-        group = zarr.open_group(session.store, mode="a")
-        block = dict(group.attrs[ICECHUNK_ATTR])
-        block.pop("rows_per_manifest")
-        # Its per-level splits name the cell axis alone, as that writer cut them.
         block["levels"] = {
             o: {**lvl, "split": {k: v for k, v in lvl["split"].items() if k != "rows"}}
             for o, lvl in block["levels"].items()
         }
         group.attrs[ICECHUNK_ATTR] = block
-        session.commit("drop the row cut")
-
-    def test_a_legacy_cut_survives_the_re_save_of_a_raising_init(
-        self, monkeypatch, cfg, tmp_path, caplog
-    ):
-        # ``block_splits`` is what ``_save_splits`` PERSISTS, so the absent
-        # key has to read as the legacy cut there too: the issue #597 re-save
-        # re-cuts from main's block, and resolving the absence to the
-        # one-row default would flip a pre-ruling repo's saved config to a
-        # cut none of its manifests were written at (issue #584 review).
-        grid, root, manifest = _windowed(cfg, tmp_path)
-        cfg.output["icechunk"] = {"split_order": 3, "commit_order": 3}
-        _init(root, grid, cfg, manifest, ["2019"])
-        self._legacy(root, grid, cfg, manifest)
-
-        def boom(*args, **kwargs):
-            raise RuntimeError("boom")
-
-        monkeypatch.setattr(icechunk_refs, "_commit", boom)
-        cfg.output["icechunk"] = {"split_order": 2, "commit_order": 2}
-        with caplog.at_level("WARNING"), pytest.raises(RuntimeError, match="boom"):
+        session.commit("a pre-ruling block")
+        saved = _saved_row_splits(root)
+        remedy = r"records no rows_per_manifest.*Clear .*icechunk and re-run"
+        with pytest.raises(ValueError, match=remedy):
             _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
-        monkeypatch.undo()
-        # Both the ratchet's own save and the re-save from the block cut at
-        # the legacy value, never at the default the config asked for.
-        block = icechunk_refs.read_block(root, store_kwargs={})
-        legacy = icechunk_rows.LEGACY_ROW_SPLIT
-        assert icechunk_rows.stored_rows_per_manifest(block) == legacy
-        assert _saved_row_splits(root) == dict.fromkeys(block["levels"], legacy)
+        with pytest.raises(ValueError, match=remedy):
+            icechunk_ops.declare_pyramid(root, cfg, store_kwargs={}, manifest=manifest, grid=grid)
+        # Nothing was written, grown or re-saved on its account.
+        assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == ["2019"]
+        assert _saved_row_splits(root) == saved
+        assert not hasattr(icechunk_rows, "LEGACY_ROW_SPLIT")
 
     def test_the_adopted_cut_reaches_the_handle_the_run_writes_through(
         self, monkeypatch, cfg, tmp_path

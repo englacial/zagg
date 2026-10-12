@@ -57,12 +57,6 @@ ROW_COORD_CHUNK = 1024
 #: store at one row per manifest is the finest cut it can ever carry, which is
 #: the side the ratchet can still move from.
 DEFAULT_ROWS_PER_MANIFEST = 1
-#: The row cut a ``/2`` repo written BEFORE the 2026-10-02 ruling carries —
-#: every row in one manifest, a run length no row count reaches. Such a repo
-#: is recognized by the absent ``rows_per_manifest`` block key and keeps this
-#: cut: it is baked into the manifests it has already written. No published
-#: store has one (issue #584 question (1): interim repos are disposable).
-LEGACY_ROW_SPLIT = 2**31 - 1
 #: Fresh-session retries of an init whose row allocation lost to another run's.
 ROW_ALLOC_TRIES = 5
 
@@ -96,18 +90,26 @@ def resolve_rows_per_manifest(raw: Mapping) -> int:
     return value
 
 
-def stored_rows_per_manifest(block: Mapping) -> int:
+def stored_rows_per_manifest(block: Mapping, path: str = "") -> int:
     """The row cut a RECORDED block carries — the ONE reading of an absent key (§11.5).
 
-    A block that names ``rows_per_manifest`` carries that cut; one that does
-    not predates the 2026-10-02 ruling and keeps its every-row-in-one cut
-    (:data:`LEGACY_ROW_SPLIT`), which is baked into the manifests it has
-    already written. Every reader of a recorded block goes through here —
-    :func:`adopt_row_cut`, ``icechunk_refs.block_splits`` and
-    ``icechunk_ops.declare_pyramid`` — so the absence cannot mean one thing
-    to the value a run adopts and another to the config it persists.
+    A block that names ``rows_per_manifest`` carries that cut. One that does
+    not is a ``/2`` repo written before the 2026-10-02 row-split ruling — an
+    interim repo, never published — and is REFUSED with the remedy (ruling
+    of 2026-10-12, issue #584): cleared and re-created by the next run's
+    init, never operated on. Every reader of a recorded block goes through
+    here — :func:`adopt_row_cut`, ``icechunk_refs.block_splits`` and
+    ``icechunk_ops.declare_pyramid`` — so the absence means one thing.
     """
-    return int(block.get("rows_per_manifest") or LEGACY_ROW_SPLIT)
+    rows = block.get("rows_per_manifest")
+    if rows is None:
+        where = path or "this icechunk repo"
+        raise ValueError(
+            f"{where} records no rows_per_manifest: a /2 repo written before the row-split "
+            f"rule is not operated on. Clear {where} and re-run — the init re-creates it "
+            f"(spec §11.5, issue #584)."
+        )
+    return int(rows)
 
 
 def adopt_row_cut(existing: Mapping, options: dict, path: str) -> dict:
@@ -117,10 +119,9 @@ def adopt_row_cut(existing: Mapping, options: dict, path: str) -> dict:
     already written, so a later config value is adopted the way a finer
     ``split_order`` is, and moving it on an existing repo is an operator
     ``rewrite_manifests`` pass. Unlike ``split_order`` it does NOT ratchet.
-    An absent key is a repo written before the row split: it keeps its
-    every-row-in-one cut (:data:`LEGACY_ROW_SPLIT`).
+    A block recording no cut is refused (:func:`stored_rows_per_manifest`).
     """
-    stored = stored_rows_per_manifest(existing)
+    stored = stored_rows_per_manifest(existing, path)
     if int(options["rows_per_manifest"]) == stored:
         return options
     logger.warning(
@@ -544,7 +545,6 @@ __all__ = [
     "ROW_END",
     "ROW_FILL",
     "DEFAULT_ROWS_PER_MANIFEST",
-    "LEGACY_ROW_SPLIT",
     "ROW_START",
     "array_model",
     "level_split",

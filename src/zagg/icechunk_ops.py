@@ -262,10 +262,10 @@ def declare_pyramid(
     want = {"shard_order": int(grid.parent_order), **level_geometry(grid)}
     repo, block = open_vetted(store_root, store_kwargs=store_kwargs, want=want)
     options = {k: block[k] for k in ("commit", "commit_order", "split_order")}
-    # The row cut follows the repo as it stands, never this caller's config:
-    # an absent key is a repo written before the §11.5 row split and keeps
-    # its every-row-in-one cut (issue #584).
-    options["rows_per_manifest"] = stored_rows_per_manifest(block)
+    # The row cut follows the repo as it stands, never this caller's config
+    # (§11.5); a repo recording none — written before the row split — is
+    # refused here, with the remedy, ahead of the level check (issue #584).
+    options["rows_per_manifest"] = stored_rows_per_manifest(block, repo_path(store_root))
     # A newly declared level's arrays are built at the repo's rows (§11.2).
     spec = repo_group_spec(grid, store_root, options, manifest, block["rows"])
     levels = spec.attributes[ICECHUNK_ATTR]["levels"]

@@ -63,7 +63,6 @@ import numpy as np
 from zagg.icechunk_rows import (
     ALL_ROW,
     DEFAULT_ROWS_PER_MANIFEST,
-    LEGACY_ROW_SPLIT,
     adopt_row_cut,
     check_revision,
     commit_rows,
@@ -212,9 +211,9 @@ def block_splits(block: dict) -> dict:
     splits follow the block as it stands (a ratchet included), not the one a
     caller read earlier. The row cut is the block's own
     (:func:`~zagg.icechunk_rows.stored_rows_per_manifest`): what this
-    function persists through ``_save_splits`` is what the block records,
-    and an absent key is the legacy every-row-in-one cut — never the
-    default, which would silently flip a pre-ruling repo to the new cut.
+    function persists through ``_save_splits`` is what the block records —
+    never the config's default — and a block recording none (an interim
+    pre-ruling repo, issue #584) is refused there.
     """
     base, split_order = int(block["chunk_order"]), int(block["split_order"])
     rows = stored_rows_per_manifest(block)
@@ -445,11 +444,7 @@ def _repo_config(store_root: str, splits: dict, store_kwargs: dict):
     config.set_virtual_chunk_container(container)
     sizes = {
         C.path_matches(regex=rf"^/{int(order)}/.*"): level_split(
-            # A ``split`` block recorded before the row split names no
-            # ``rows``, and means the legacy cut — the same reading
-            # ``stored_rows_per_manifest`` gives the block's own key.
-            split["chunks"],
-            int(split.get("rows") or LEGACY_ROW_SPLIT),
+            split["chunks"], int(split["rows"])
         )
         for order, split in sorted(splits.items(), key=lambda kv: -int(kv[0]))
     }
