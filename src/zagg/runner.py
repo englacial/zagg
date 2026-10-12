@@ -6408,7 +6408,17 @@ def _tail_sweep_short(
 
 
 def _warn_tail_sweep_short(reasons) -> None:
-    """One warning naming every shortfall of the tail, and the backstop (issue #610)."""
+    """One warning naming every shortfall of the tail, and the backstop (issue #610).
+
+    Deliberately a THIRD line on a timed-out ladder barrier, after the
+    dispatcher's own (:func:`zagg.sweep_fleet.run_stage_sweep_fleet`) and the
+    seam's (:func:`_invoke_lambda_stage_sweep`) — do not tidy it away (review
+    finding). Those two are the detail at the moment it happens, one leg at a
+    time; this one is the RUN's verdict, the only line that spans both legs
+    and the only one carrying the remedy, and it is what the CLI prints and
+    the summary's ``tail_sweep_short`` holds. Silent when the tail left
+    nothing short, so a whole run's console is unchanged.
+    """
     if not reasons:
         return
     logger.warning(
