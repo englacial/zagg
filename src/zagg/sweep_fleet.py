@@ -96,6 +96,11 @@ _LIST_FAULT_LIMIT = 5
 #: count a real fan-out reaches, so the measured payload is never smaller than
 #: the one that ships (the index is assigned after packing).
 _BATCH_INDEX_PROBE = 9_999_999
+#: The ``skipped`` prefix a run declines with when the store's manifest
+#: declares no sweepable ladder (issue #635). A CONSTANT because it is the
+#: stable part callers match on — the gate's own verdict rides behind it, so
+#: the reason varies and the prefix does not (review finding).
+NO_LADDER_SKIP = "no sweepable zagg-pyramid/2 ladder"
 #: How many unseen units one tuple's row NAMES (``missing_units``); the count
 #: (``missing_unit_count``) is always exact. A wholesale barrier failure on a
 #: wide tuple would otherwise put tens of thousands of rows in the summary.
@@ -1073,20 +1078,19 @@ def run_stage_sweep_fleet(
     no_ladder = no_ladder_reason(store_path, shard_order, store_kwargs)
     if no_ladder is not None:
         logger.warning(
-            f"stage fleet: {store_path} has no sweepable zagg-pyramid/2 ladder "
+            f"stage fleet: {store_path} has {NO_LADDER_SKIP} "
             f"({no_ladder}) — run {run_id} fires nothing: no stage invoke, no finisher, no "
             "barrier. The ladder is the MANIFEST's and a manifest is written once, at init: "
             "(re-)declare it with `python -m zagg.sweep <store> --declare-pyramid "
             "<config.yaml>` (plus `--overviews <resolutions>` where the config spells none), "
             "or append with `output.pyramid` set to what the manifest declares"
         )
-        # "no SWEEPABLE ladder", not "no /2 declaration" (review finding): a
-        # malformed ``/2`` block declines here too, and a headline — or a
-        # prefix a caller matches on — calling such a store a ``/1`` store
-        # would send the operator to the wrong remedy. The reason rides
-        # behind the prefix, so the run RECORD says which declaration the
-        # gate saw and not only the log line does.
-        summary["skipped"] = f"no sweepable zagg-pyramid/2 ladder: {no_ladder}"
+        # :data:`NO_LADDER_SKIP`, not "no /2 declaration" (review finding): a
+        # malformed ``/2`` block declines here too, and a prefix calling such
+        # a store a ``/1`` store would send the operator to the wrong remedy.
+        # The reason rides behind it, so the run RECORD says which
+        # declaration the gate saw and not only the log line does.
+        summary["skipped"] = f"{NO_LADDER_SKIP}: {no_ladder}"
         # The families ride a node CLOSE (issue #610 phase 4) and nothing
         # closes in a run that fires nothing, so the rollups handed to this
         # sweep are unswept — which is what the runner's backstop warning
