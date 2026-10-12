@@ -151,12 +151,11 @@ def test_the_icechunk_repo_holds_one_row_per_window_plus_all(built):
     assert os.path.isdir(repo_path(str(root)))
     block = read_block(str(root), store_kwargs={})
     assert block is not None
-    # Per leaf, not up the ladder: the Icechunk commit default keys on the
+    # Up the ladder, not per leaf: the Icechunk commit default keys on the
     # EXPLICIT output.sweep: "stages" (icechunk_refs.ladder_walks,
-    # PR #622 ruling (1)), and the templates leave sweep unset so the
-    # staged sweep is the resolved default. Whether the templates should
-    # spell it is a PR #639 review question.
-    assert block["commit"] == "leaf"
+    # PR #622 ruling (1)), and the templates spell it (espg, PR #639) so a
+    # templated run commits one node at a time -- the regime that scales.
+    assert block["commit"] == "ladder"
     assert ALL_ROW in block["rows"] and set(WINDOWS) <= set(block["rows"])
     assert block["rows_per_manifest"] == 1
 
