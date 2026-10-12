@@ -1953,7 +1953,10 @@ class TestSummaryKeysByteIdentical:
         # was swept. LAMBDA-only — the local backend sweeps in-process.
         "families_sweep",
         # The tail's staged-sweep summary (issue #610); None when no staged
-        # sweep was chained or its dispatch failed open. LAMBDA-only, as above.
+        # sweep was chained or its dispatch failed open. This is the SPATIAL /
+        # temporal lambda summary's set: the raster lambda tail reports
+        # ``families_sweep`` and chains no staged sweep at all, so it carries
+        # no such key.
         "stage_sweep",
     } | _IDENTITY_KEYS
 
