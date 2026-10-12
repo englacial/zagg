@@ -106,4 +106,10 @@ def test_the_header_cites_only_repo_paths_that_exist(arm):
     # the commands, the readout and this test at least
     assert f"tools/configs/atl03_windowed_measure_{arm}.yaml" in cited
     assert "tools/windowed_emit_measure.py" in cited
-    assert [path for path in cited if not (repo / path).exists()] == []
+    missing = [path for path in cited if not (repo / path).exists()]
+    assert missing == [], (
+        f"{arm}: the header cites {missing}, which the tree does not have. This guard "
+        f"covers SOURCE-SUFFIXED paths in the header only ({CITED.pattern}) — a cited "
+        "directory, a suffix-less path, or anything below the template marker is not "
+        "checked, since the template body's store paths are not repo files."
+    )
