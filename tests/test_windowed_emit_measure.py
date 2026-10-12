@@ -412,8 +412,11 @@ def test_the_table_prints_the_headroom_and_dashes_when_unmeasured(arms, capsys):
     (tier,) = [ln for ln in out.splitlines() if ln.startswith("stage tier MB / container hwm")]
     assert "8,192.0 / - / -" in tier  # the baseline arm: not measured
     assert "8,192.0 / 3,400.0 / 4,792.0" in tier
-    (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  container hwm as a fraction")]
-    assert fraction.split()[-2:] == ["-", "0.4"]
+    # percentage points, not a bare fraction: 3,400 / 8,192 at one decimal
+    (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  container hwm as %")]
+    assert fraction.split()[-2:] == ["-", "41.5"]
+    # and a peak well under 5% of the tier still reads as a number, not 0.0
+    assert tool._pct(300.0 / 8192.0) == "3.7" and tool._pct(None) == "-"
     # per tuple (root record, finest order first) and per order (fleet records)
     (per_tuple,) = [
         ln for ln in out.splitlines() if ln.startswith("stage container hwm MB per tuple")
@@ -437,7 +440,7 @@ def test_every_memory_row_says_which_currency_it_is_in(arms, capsys):
         "stage container hwm MB per tuple (lifetime)",
         "stage container hwm MB per order (lifetime)",
         "stage tier MB / container hwm MB / headroom MB",
-        "  container hwm as a fraction of the tier",
+        "  container hwm as % of the tier",
     ]
     # and the footnote, which says what each currency is and which way the
     # upper bound cuts: it can keep the tier, never bring it down

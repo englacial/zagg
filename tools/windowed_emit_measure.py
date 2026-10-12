@@ -844,6 +844,16 @@ def _fmt(v) -> str:
     return f"{v:,}"
 
 
+def _pct(v) -> str:
+    """A fraction as percentage points at one decimal.
+
+    ``_fmt``'s one decimal is right for the counts and the seconds but loses a
+    fraction of a tier: ``0.146`` prints ``0.1`` and anything under 5% prints
+    ``0.0``, which reads like the ``-`` this readout means for "not measured".
+    """
+    return "-" if v is None else f"{v * 100:,.1f}"
+
+
 def _stage_sum(result: dict, key: str):
     """``key`` summed over the newest record's per-order rows; ``None`` (printed
     ``-``) when no row carries it — a windowed store's ladder runs without Icechunk."""
@@ -1047,8 +1057,8 @@ def table_rows(results: list[dict]) -> list[tuple]:
             ),
         ),
         (
-            "  container hwm as a fraction of the tier",
-            lambda r: _fmt(r.get("stage_memory", {}).get("peak_fraction")),
+            "  container hwm as % of the tier",
+            lambda r: _pct(r.get("stage_memory", {}).get("peak_fraction")),
         ),
         ("all-time probe orders", lambda r: _levels(r, lambda lv: lv["order"])),
         (
