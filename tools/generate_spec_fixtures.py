@@ -1052,7 +1052,7 @@ def build_icechunk(out: Path) -> None:
     d = resolutions[-1] - s
     expanded = [(base, "leaf")] + [(c, "column") for c in resolutions]
     expanded += [(k + d, "overview") for k in range(s - 1, -1, -1)]
-    ellipsoid = {"name": "WGS84", "semimajor_axis": 6378137.0, "inverse_flattening": 298.257223563}
+    ellipsoid = {"name": "WGS84", "semi_major_axis": 6378137.0, "inverse_flattening": 298.257223563}
     base_dggs = {
         "name": "morton",
         "refinement_level": base,
