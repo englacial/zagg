@@ -1061,7 +1061,10 @@ def run_stage_sweep_fleet(
             "<config.yaml>` (plus `--overviews <resolutions>` where the config spells none), "
             "or append with `output.pyramid` set to what the manifest declares"
         )
-        summary["skipped"] = "no zagg-pyramid/2 ladder"
+        # The constant is the stable prefix a caller matches on; the reason
+        # rides behind it, so the run RECORD says which declaration it saw
+        # and not only the log line does (review finding).
+        summary["skipped"] = f"no zagg-pyramid/2 ladder: {no_ladder}"
         # The families ride a node CLOSE (issue #610 phase 4) and nothing
         # closes in a run that fires nothing, so the rollups handed to this
         # sweep are unswept — which is what the runner's backstop warning
