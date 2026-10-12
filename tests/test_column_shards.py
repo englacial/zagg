@@ -418,14 +418,17 @@ class TestStaleCompanionRepo:
 # Phase 2: the readers — the cascade's range reads, the backfill upgrade.
 # ---------------------------------------------------------------------------
 
-#: A cascade that READS a sharded member: the ladder's finest gather is at
-#: ``base - 1``, so a sharded member there needs ``base >= node + 6``, and a
-#: contiguous ladder ``base <= 2 * node + 1`` — node 5 is the smallest. Node
-#: 5 / cell 12 / ``overviews: [11]``: the ``(4, [10])`` gather reads the leaf
-#: columns' member 10 — 4^5 cells, four 256-cell inner chunks — by range;
-#: member 11 (4,096 cells, four inner chunks of 1,024) is the finest group.
-CASCADE_NODE, CASCADE_CELL, CASCADE_BASE = 5, 12, 11
-CASCADE_LEAVES = ["111111", "111112"]
+#: A cascade that RANGE-reads a sharded member: a gather reads a child member
+#: by range only when the member is wider than one fold block (4^5 cells), so
+#: the finest gather — at ``base - 1`` — needs ``base >= node + 7``, and a
+#: contiguous ladder ``base <= 2 * node + 1``: node 6 is the smallest. Node 6
+#: / cell 14 / ``overviews: [13]``: the ``(5, [12])`` gather reads the leaf
+#: columns' member 12 — 4^6 cells, four 1,024-cell inner chunks — one block,
+#: one inner chunk, per range read; the ``(4, [11])`` gather reads member 11
+#: (4^5 cells, four 256-cell inner chunks) whole; member 13 (16 inner chunks
+#: of 1,024) is the finest group. The leaf cells stay sparse (one in 257).
+CASCADE_NODE, CASCADE_CELL, CASCADE_BASE = 6, 14, 13
+CASCADE_LEAVES = ["1111111", "1111112"]
 
 
 def _cascade_store(root, *, fields=FIELDS):
@@ -501,20 +504,34 @@ class TestCascadeReadsShardedMembers:
     """The staged sweep over sharded leaf columns is the sweep over whole ones."""
 
     def test_both_layouts_fold_to_the_same_ladder(self, tmp_path, monkeypatch):
+        from zagg import sweep_fold
         from zagg.sweep_stages import sweep_stage_pass
 
         fine = tmp_path / "fine"
         manifest = _cascade_store(fine)
-        # The member the (4, [10]) gather reads IS sharded here.
+        # The member the (5, [12]) gather reads IS sharded, four inner chunks.
         col = f"{_node_prefix(fine, CASCADE_LEAVES[0])}/all.pyramid.zarr"
-        assert stored_layout(_array_meta(col, CASCADE_BASE - 1, "h_tdigest")) == {
-            "sharded": True,
-            "chunk_cells": 256,
-        }
-        assert stored_layout(_array_meta(col, CASCADE_BASE, "h_tdigest")) == {
+        gathered = CASCADE_BASE - 1
+        assert stored_layout(_array_meta(col, gathered, "h_tdigest")) == {
             "sharded": True,
             "chunk_cells": 1024,
         }
+        assert 4 ** (gathered - CASCADE_NODE) == 4 * sweep_fold.block_cells()
+        # Spy on the range path: the gather must reach the sharded member by
+        # range, one block — one inner chunk — per read (review finding).
+        ranges = []
+        read_range = sweep_fold._ColumnReader.read_range
+        leaf_cols = [
+            str(Path(f"{_node_prefix(fine, d)}/all.pyramid.zarr").relative_to(fine))
+            for d in CASCADE_LEAVES
+        ]
+
+        def spy(self, res, name, start, stop):
+            if any(str(self.path).endswith(rel) for rel in leaf_cols):
+                ranges.append((res, name, int(start), int(stop)))
+            return read_range(self, res, name, start, stop)
+
+        monkeypatch.setattr(sweep_fold._ColumnReader, "read_range", spy)
         by_shard = {d: {None} for d in CASCADE_LEAVES}
         summary = sweep_stage_pass(
             str(fine), manifest, by_shard, run_id="A", tuple_width=3, scope=None
@@ -522,15 +539,25 @@ class TestCascadeReadsShardedMembers:
         assert sum(row["failed"] for row in summary["stages"]) == 0
         assert sum(row["written"] for row in summary["stages"]) > 0
         fine_ladder = _ladder_arrays(fine)
-        assert any(rel.startswith("1/1/1/1/1/all") for rel in fine_ladder), sorted(fine_ladder)
+        assert any(rel.startswith("1/1/1/1/1/1/all") for rel in fine_ladder), sorted(fine_ladder)
+        member = {(res, name) for res, name, _, _ in ranges}
+        assert (gathered, "h_tdigest") in member and (gathered, "count") in member, ranges
+        for res, _name, start, stop in ranges:
+            assert stored_layout(_array_meta(col, res, "count"))["sharded"] is True
+            chunk = inner_chunk_cells(CASCADE_NODE, res)
+            assert start % chunk == 0 and stop - start == chunk, (res, start, stop)
+        # Both leaves, both arrays, each read as its four inner chunks.
+        assert len(ranges) == len(CASCADE_LEAVES) * 2 * 4, ranges
+        assert {start for res, _, start, _ in ranges if res == gathered} == {0, 1024, 2048, 3072}
+        monkeypatch.undo()
 
         monkeypatch.setattr(column_shards, "inner_chunk_order", lambda node, res: None)
         whole = tmp_path / "whole"
         manifest = _cascade_store(whole)
         whole_col = f"{_node_prefix(whole, CASCADE_LEAVES[0])}/all.pyramid.zarr"
-        assert stored_layout(_array_meta(whole_col, CASCADE_BASE - 1, "count")) == {
+        assert stored_layout(_array_meta(whole_col, gathered, "count")) == {
             "sharded": False,
-            "chunk_cells": 1024,
+            "chunk_cells": 4096,
         }
         sweep_stage_pass(str(whole), manifest, by_shard, run_id="A", tuple_width=3, scope=None)
         whole_ladder = _ladder_arrays(whole)
@@ -552,20 +579,25 @@ class TestCascadeReadsShardedMembers:
             tuple_width=3,
             scope=None,
         )
-        # The (2, [8]) node above leaf 1111: its cells are the leaf column's
-        # member 8, assigned — read through the shard index, byte for byte.
+        # The (5, [12]) node above leaf 1111111: its cells are the leaf
+        # column's member 12, assigned — a SHARDED member (four 1,024-cell
+        # inner chunks), read through the shard index, byte for byte.
+        gathered = CASCADE_BASE - 1
+        col = f"{_node_prefix(tmp_path, CASCADE_LEAVES[0])}/all.pyramid.zarr"
+        for name in ("count", "h_tdigest"):
+            assert stored_layout(_array_meta(col, gathered, name)) == {
+                "sharded": True,
+                "chunk_cells": 1024,
+            }
         node = zarr.open_group(
-            open_store(f"{tmp_path}/1/1/1/all.zarr", read_only=True), path="8", mode="r"
-        )
-        column = zarr.open_group(
-            open_store(
-                f"{_node_prefix(tmp_path, CASCADE_LEAVES[0])}/all.pyramid.zarr", read_only=True
-            ),
-            path="8",
+            open_store(f"{tmp_path}/1/1/1/1/1/1/all.zarr", read_only=True),
+            path=str(gathered),
             mode="r",
         )
-        n = 4 ** (8 - CASCADE_NODE)
-        # Leaf 1111 is the first child of node 111: rows [0, n) of the gather.
+        column = zarr.open_group(open_store(col, read_only=True), path=str(gathered), mode="r")
+        n = 4 ** (gathered - CASCADE_NODE)
+        # Leaf 1111111 is the first child of node 111111: rows [0, n) of the gather.
+        assert np.count_nonzero(column["count"][:]) > 0
         np.testing.assert_array_equal(node["count"][0:n], column["count"][:])
         assert [bytes(p or b"") for p in node["h_tdigest"][0:n]] == [
             bytes(p or b"") for p in column["h_tdigest"][:]
