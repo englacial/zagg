@@ -148,6 +148,21 @@ class TestRule:
             for member in spec.members.values():
                 assert stored_layout(member.model_dump()) == expected_layout(9, res)
 
+    def test_a_sharded_array_split_across_shard_objects_is_a_mismatch(self):
+        # 4,096 cells on 1,024-cell inner chunks (order 15 at node 9): one
+        # shard object passes, two objects of 2,048 do not (review finding).
+        for shards, objects in ((4096, 1), (2048, 2)):
+            arr = zarr.create_array(
+                store={}, shape=(4096,), shards=(shards,), chunks=(1024,), dtype="int64"
+            )
+            meta = arr.metadata.to_dict()
+            assert stored_layout(meta) == expected_layout(9, 15)
+            why = column_shards.layout_mismatch(9, 15, meta)
+            if objects == 1:
+                assert why is None
+            else:
+                assert why.startswith("layout is 2 shard objects; §4.6 requires one object"), why
+
 
 class TestWrittenLayout:
     """The writer lays the fine group on inner chunks, one object per array."""
