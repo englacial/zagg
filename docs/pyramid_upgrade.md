@@ -199,7 +199,14 @@ dtype, fill value and attrs, compared against the template the run would write
 `granule_count`. The structure term is what catches the two drifts the
 recorded `zagg_column` grammar cannot carry, both of which a re-declaration
 really can move: a companion channel added or dropped (`location` /
-`temporal`, neither recorded), and an exact field's `dtype` / `fill_value`. Both stamps resolve to whole seconds, so a leaf rewritten in
+`temporal`, neither recorded), and an exact field's `dtype` / `fill_value`.
+It also carries each member's chunk grid and codec chain, so the backfill is
+the pass that **re-lays** a fine column group (`4^5` cells or more, spec §4.6
+— orders 14–16 under `overviews: [16, 15, 14, 13]`) written whole by a worker
+predating the sharded layout ([issue #631](https://github.com/englacial/zagg/issues/631)):
+the values are unchanged, the objects are rewritten on inner chunks, and
+`pyramid_check`'s `readback` leg fails such a store by name until the pass has
+run. Both stamps resolve to whole seconds, so a leaf rewritten in
 the same second as its column, at an unchanged granule count, reads as
 current. On a quiesced store — the precondition above — that window is not
 reachable; `backfill_columns(..., force=True)` is the unconditional rewrite if

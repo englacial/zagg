@@ -506,6 +506,24 @@ declaration that wrote it — which is why an absent column is not by itself
 a fault: under a declaration known to carry leaf columns it is a torn
 worker, and the repair is re-invoking the idempotent leaf, never a
 sweep-side fold from raw cells.
+
+**Layout** ([issue #631](https://github.com/englacial/zagg/issues/631),
+`zagg.column_shards`). Every column array is one object per leaf, and its
+chunking is a function of the group's own `(node, resolution)`: a group of
+fewer than `4^5` cells is one whole unsharded chunk — every column written
+before #631, and the whole default tier `{13, 12, 11, 10, 9}` — while a
+group of `4^5` cells or more (orders 14–16 under the v4 ATL03 rebuild's
+`overviews: [16, 15, 14, 13]`) is one `sharding_indexed` object on inner
+chunks of `min(4^5, cells / 4)` cells: 16 inner chunks of 1,024 at order
+16, four of 1,024 at 15, four of 256 at 14. The inner chunk is ~0.5 MB of
+saturated signal digest at the 128-centroid cap, is a power of four (a
+viewer's window block never straddles one), and equals the staged sweep's
+fold block, so a stage gather over a fine column reads one inner chunk per
+block through the shard index. The Icechunk companion indexes a fine
+column level at its inner chunk (a companion repo initialized before #631
+refuses to open until cleared and re-initialized), the `/1 → /2` backfill
+re-lays a whole-chunk fine column as structure drift, and `pyramid_check`
+holds every column array to the rule.
 Byte grammar: [`specification.md`](specification.md) §4.6.
 
 ### Retrofitting the pyramid declaration
