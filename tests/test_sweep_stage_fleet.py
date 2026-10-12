@@ -1079,7 +1079,9 @@ class TestCoverageComputedAssignment:
         _stage_store(root)
         words = root_coverage_words(read_root_coverage(str(root)))
         client = _FakeLambda(None)
-        summary = _fleet(root, client, tuple_width=1, coverage=words, barrier_timeout_s=0.01)
+        summary = _fleet(
+            root, client, tuple_width=1, coverage=words, scope="all", barrier_timeout_s=0.01
+        )
         assert summary["coverage_computed"] is True
         # One invoke per dispatch node at the default, so the fired node sets
         # ARE the computed assignment, tuple by tuple:
@@ -1982,15 +1984,41 @@ class TestRunnerSeam:
         assert "staged sweep dispatch failed" in caplog.text
 
     def test_the_tail_gate_is_the_stages_knob(self):
-        # The seam is reached only under `output.sweep: "stages"` — the same
-        # opt-in the local dispatcher reads (issue #384's recorded lean).
+        # The seam is reached only in the "stages" mode — resolved through
+        # the ONE resolver the local dispatcher also reads (issue #620:
+        # `get_sweep_mode`, default-on for a ladder-declaring hive store),
+        # behind `chains_stages`, which is that comparison made fail-open the
+        # way every other leg of this tail is (D9, review finding).
+        # The GRID is passed: the default claims a ladder only where the leaf
+        # column gate does, and that gate needs the grid's chunk order.
         import inspect
 
         from zagg import runner
 
         src = inspect.getsource(runner._run_lambda)
-        assert 'config.output.get("sweep") == "stages"' in src
+        assert "chains_stages(config, grid)" in src
         assert "_invoke_lambda_stage_sweep(" in src
+        gate = inspect.getsource(runner.chains_stages)
+        assert "get_sweep_mode(config, grid) == SWEEP_STAGES" in gate
+        assert "except Exception" in gate and "return False" in gate
+
+    def test_the_tail_gate_is_fail_open(self, caplog):
+        # It replaced a dict lookup that could not fail, and it now reaches
+        # `leaf_column_plan` -> `declared_fields` -> `agg[name]`. A raise here
+        # would land after every leaf is written and before the Icechunk
+        # finalize, failing a run whose data is complete — where its
+        # neighbours all swallow and warn (review finding, issue #620).
+        from zagg.config import chains_stages
+
+        class Boom:
+            output = {"store_layout": "hive"}  # the DEFAULT path, which consults the declaration
+
+            @property
+            def data_source(self):
+                raise KeyError("reader")  # not the ValueError `_declares_ladder` catches
+
+        assert chains_stages(Boom(), object()) is False
+        assert "fail-open" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -2120,7 +2148,7 @@ def _write_discovery_record(root, leaves=LEAVES, windows=(None,)):
 def _cli_sweep(root, *, tuple_width=3):
     from zagg.sweep import main
 
-    argv = [str(root), "--stages"]
+    argv = [str(root), "--stages", "--scope", "all"]
     if tuple_width != 3:
         argv += ["--tuple-width", str(tuple_width)]
     assert main(argv) == 0

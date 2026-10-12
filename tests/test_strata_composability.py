@@ -101,7 +101,10 @@ class TestLiveCaManifestFixture:
         from zagg.sweep_overview import build_pyramid_block
 
         config = default_config("atl03_tdigest_strata_healpix")
-        config.output["pyramid"] = {}  # the template ships ``pyramid: false``
+        # The v3 store was declared with the DEFAULT ladder (`{overviews: 13}`,
+        # the chunk order); the template has since declared the v4 ladder
+        # `[16, 15, 14, 13]` (issue #620), so the default is restored here.
+        config.output["pyramid"] = {}
         config.output["grid"]["parent_order"] = 9  # the CA store's shard order
         block = build_pyramid_block(config, 9, chunk_order=13)
         published = json.loads(CA_MANIFEST.read_text())["pyramid"]

@@ -895,6 +895,11 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     # The leaf-store object model is what stage 1 leaves unchanged (spec §11,
     # "Not changed"), so the companion repo stays out of the count (issue #580).
     cfg.output["icechunk"] = False
+    # Same reason, for the staged ladder: since issue #620 a ladder-declaring
+    # hive store chains the staged sweep in the tail by default, and its stage
+    # columns at interior nodes are sweep-time artifacts the WRITE-PATH model
+    # this test audits does not carry. The families pass still runs.
+    cfg.output["sweep"] = "families"
     if not pyramid:
         cfg.output["pyramid"] = False
     cfg.aggregation["variables"]["h"] = {

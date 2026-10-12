@@ -296,6 +296,10 @@ class TestSubmissionValidation:
         field = cfg.output["time_source"]["field"]
         cfg.data_source["variables"][field] = located.data_source["variables"][field]
         cfg.output["grid"] = dict(_ATL06_SIG)
+        # The template's ladder is declared against ITS grid (cells 19 / shard
+        # 9, issue #620); the ATL06 signature replaces the grid, so the
+        # declaration goes with it (absent = the default).
+        cfg.output.pop("pyramid")
         run = Run.from_config(
             cfg,
             shardmap=catalog,
@@ -1453,7 +1457,17 @@ class TestStagedSweepTail:
 
     _COMPLETE = {"barrier_timed_out": False, "finisher": {"fired": True, "landed": True}}
 
-    def _drive(self, catalog, monkeypatch, *, staged, record=True, current=False, ladder=True):
+    def _drive(
+        self,
+        catalog,
+        monkeypatch,
+        *,
+        staged,
+        record=True,
+        current=False,
+        ladder=True,
+        sweep="stages",
+    ):
         from zagg import runner
 
         seen: dict = {"stage": [], "order": [], "modes_at_stage": None}
@@ -1475,7 +1489,10 @@ class TestStagedSweepTail:
         monkeypatch.setattr(runner, "_invoke_lambda_stage_sweep", stage)
         monkeypatch.setattr(runner, "_invoke_lambda_icechunk_finalize", finalize)
         cfg = default_config("atl06")
-        cfg.output["sweep"] = "stages"
+        if sweep is None:
+            cfg.output.pop("sweep", None)  # unset: the issue #620 default
+        else:
+            cfg.output["sweep"] = sweep
         if ladder:
             cfg.output["grid"] = {**cfg.output["grid"], "chunk_inner": 9}
         stub = StubLambdaClient(record=record, current=current)
@@ -1523,6 +1540,20 @@ class TestStagedSweepTail:
         (fin,) = [e for _, _, e in stub.events if e.get("mode") == "icechunk_finalize"]
         assert fin["icechunk_init"] == run._icechunk_init and "newest_only" not in fin
         assert fin["config"]["output"]["icechunk"]["commit"] == "ladder"
+
+    def test_the_default_rides_the_cascade(self, catalog, monkeypatch):
+        # Issue #620: an UNSET sweep on a ladder-declaring hive config chains
+        # the staged sweep, and the facade's own ``stage_chained`` gate lets
+        # the families ride it -- one walk, as on ``_run_lambda``.
+        run, handle, stub, seen = self._drive(
+            catalog, monkeypatch, staged=self._COMPLETE, sweep=None
+        )
+        assert "sweep" not in run.config.output
+        assert "sweep" not in stub.modes()  # no families invoke
+        assert handle.families_sweep is None
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
+        assert seen["order"] == ["stage", "finalize"]
 
     def test_a_run_that_walks_no_ladder_keeps_the_families_pass(self, catalog, monkeypatch):
         # ``sweep: "stages"`` on a config that declares no /2 ladder (the /1

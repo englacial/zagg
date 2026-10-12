@@ -89,7 +89,14 @@ output:
     sharded: true                # one ShardingCodec object per array per leaf
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive             # each dispatched shard writes its own leaf zarr
-  pyramid: false                 # overview sweep off (untested at demo scale, issue #201)
+  pyramid:
+    overviews: [16, 15, 14, 13]  # the leaf ladder, following atl03_tdigest_strata_healpix
+                                 # exactly (issue #620, espg's ruling on PR #622 question
+                                 # (2)): a contiguous column tier from cells 16 down to
+                                 # 13 = shard order 9 + 4, the fixed every-order ladder
+                                 # above the shard. Hash-invisible (D11). A hive store that
+                                 # declares a ladder chains the staged sweep by default
+                                 # (`output.sweep` unset resolves to "stages").
 
 worker:
   memory: 4096                   # pre-provisioned Lambda variant, MB (2048|4096|8192) --
