@@ -63,9 +63,10 @@ _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
 
 def _cfg(all_time=True):
+    """A windowed ``"stages"`` config; ``all_time=None`` omits the key (the resolved default)."""
     cfg = emit._digest_cfg()
     cfg.output["sweep"] = "stages"
-    cfg.output["pyramid"] = {"overviews": 7, **({"all_time": True} if all_time else {})}
+    cfg.output["pyramid"] = {"overviews": 7, **({} if all_time is None else {"all_time": all_time})}
     validate_config(cfg)
     return cfg
 
@@ -216,8 +217,8 @@ def _run_fleet(monkeypatch, tmp_path, cfg, invocation, root=None):
         )
     families = [e for e in stub.modes("sweep") if "stage" not in e]
     seen["sweep"] = [tuple(leaf) for e in families for leaf in e["leaves"]]
-    # The families the cascade carried: on a windowed store, the close events';
-    # a closeless one (no ``all_time``) rides none, so its stage events say so.
+    # The families the cascade carried: on a windowed store, the close events'
+    # (every windowed store has them — the all-time fold is required).
     stages = [e["stage"] for e in stub.modes("sweep") if "stage" in e]
     closes = [s for s in stages if s.get("unit") == UNIT_CLOSE] or stages
     seen["families"] = sorted({tuple(c.get("families") or ()) for c in closes})
@@ -376,14 +377,20 @@ class TestBackendsAgree:
         }
         assert windows == set(LANDED)
 
+    def test_a_windowed_store_without_the_fold_is_refused_at_validation(self):
+        # espg's ruling on question (16): a windowed store must declare the
+        # all-time fold, so the closeless store (whose families had nowhere
+        # to ride — review round 3 (1)) cannot be built at all.
+        with pytest.raises(ValueError, match="output.windowing requires the all-time fold"):
+            _cfg(all_time=False)
+
     @pytest.mark.parametrize("invocation", ["sync", "event"])
-    def test_a_closeless_windowed_store_keeps_the_families_pass_on_both(
-        self, monkeypatch, tmp_path, invocation
-    ):
-        # No ``all_time``: no node close for the families to ride, so both
-        # tails fire the whole-tree pass over the landed windows, hand the
-        # staged sweep no family, and build the same rollups (review round 3 (1)).
-        cfg = _cfg(all_time=False)
+    def test_an_omitted_all_time_rides_the_cascade_on_both(self, monkeypatch, tmp_path, invocation):
+        # The absent key resolves to the fold, so a windowed config that never
+        # spells ``all_time`` closes its nodes and rides the families there on
+        # both backends — no whole-tree pass, the same rollups.
+        cfg = _cfg(all_time=None)
+        assert cfg.output["pyramid"] == {"overviews": 7}  # unspelled, resolved
         emit._patch(monkeypatch)
         _fail_one_window(monkeypatch)
         local_root, shard, _local, local_seen = _run_local(monkeypatch, tmp_path, cfg)
@@ -392,8 +399,13 @@ class TestBackendsAgree:
         )
         landed = [(shard, w) for w in LANDED]
         for seen in (local_seen, fleet_seen):
-            assert (seen["sweep"], seen["stage"], seen["families"]) == (landed, landed, [()])
+            assert (seen["sweep"], seen["stage"], seen["families"]) == (
+                [],
+                landed,
+                [CASCADE_FAMILIES],
+            )
         for root in (local_root, fleet_root):
+            assert len(_overviews(root, "all")) == 6  # the close ran at every ladder node
             rollups = {p.name.split(".")[0] for p in Path(root, "-5").glob("*.rollup.json")}
             assert rollups == set(CASCADE_FAMILIES)
 

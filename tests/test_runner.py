@@ -4911,11 +4911,14 @@ class TestLambdaFamiliesRideTheCascade:
         atl06_config.output["sweep"] = True
         assert runner._cascade_families(atl06_config, grid) == ()  # no staged sweep to ride
 
-    def test_a_windowed_store_rides_only_with_its_all_time_close(self, atl06_config):
+    def test_a_windowed_store_rides_the_cascade_like_any_other(self, atl06_config):
         # A rollup object is per node and merges every window, so only the
-        # all-time close can fold it; a windowed store without that close
-        # keeps the separate pass on every backend (review round 3 (1)).
+        # all-time close can fold it — and a windowed config DECLARES that
+        # close (``all_time`` resolves to true, false is refused at
+        # validation; espg's ruling on question (16)), so the gate has no
+        # windowed branch: it does not read ``all_time`` at all.
         from zagg import runner
+        from zagg.config import get_pyramid
         from zagg.sweep_families import CASCADE_FAMILIES
 
         grid = _stub_grid()
@@ -4926,8 +4929,13 @@ class TestLambdaFamiliesRideTheCascade:
             "time_field": "delta_time",
             "epoch": "2018-01-01T00:00:00Z",
         }
-        assert runner._cascade_families(atl06_config, grid) == ()
+        assert get_pyramid(atl06_config) == {"all_time": True}  # the resolved default
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
         atl06_config.output["pyramid"] = {"all_time": True}
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
+        # An unvalidated config spelling false changes nothing here: the
+        # refusal is validation's, not the tail's.
+        atl06_config.output["pyramid"] = {"all_time": False}
         assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
 
 

@@ -1466,7 +1466,13 @@ staged sweep's finisher.
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time). On a `/2` store it is folded from the
   node's per-window overviews (§4.4 "The all-time fold of a windowed
-  store").
+  store"). A windowed store's writer MUST declare it `true`
+  ([issue #610](https://github.com/englacial/zagg/issues/610) phase 4: the
+  per-node rollups and the §4.10 companion ride the node's all-time close,
+  so a windowed config that omits the key resolves to `true` and one that
+  spells `false` is refused). A reader MUST still tolerate `false` on a
+  windowed store written before that rule — it is §4.10's gated case, with
+  no `all.zarr` to find.
 - **`summarize`** (optional) — the opt-in **declared derived summary** for
   `none`-class fields: a mapping from a new, *different* field name to its
   derivation (e.g. an auto-digest of a roster field's raw values), living in
