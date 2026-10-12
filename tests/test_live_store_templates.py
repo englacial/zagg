@@ -202,6 +202,60 @@ def test_template_pins_the_live_orders_and_fold_knobs(name, digests, orders, ove
         assert meta.get("overview_delta") == overview_delta
 
 
+#: The hive templates that declare the leaf ladder (issue #620 phase 4, espg's
+#: ruling on PR #622 question (2)): the v4 ATL03 tier ``[16, 15, 14, 13]`` —
+#: contiguous from cells 16 down to shard order 9 + 4 — the plain hive
+#: template following it exactly, and GEDI carrying the same relation to its
+#: own shard order (its cells are order 18, so its finest member is two orders
+#: above the base where ATL03's is three).
+LADDER_TEMPLATES = [
+    "atl03_tdigest_strata_healpix",
+    "atl03_tdigest_healpix_hive",
+    "gedi01b_waveform_healpix_hive",
+]
+LADDER = [16, 15, 14, 13]
+
+
+@pytest.mark.parametrize("name", LADDER_TEMPLATES)
+def test_hive_templates_declare_the_ladder_and_chain_the_staged_sweep(name):
+    # The ladder is the zagg-pyramid/2 grammar as shipped — validated at load
+    # (default_config runs validate_config), expanded to the fixed every-order
+    # ladder above the shard, and a leaf column plan the worker writes — and
+    # because a hive store that declares a ladder chains the staged sweep by
+    # default (issue #620, ``zagg.config.get_sweep_mode``), a run from any of
+    # these templates folds its ladder in the run tail without ``sweep`` spelled.
+    from zagg.column import leaf_column_plan
+    from zagg.config import SWEEP_STAGES, get_pyramid, get_sweep_mode
+    from zagg.grids import from_config
+    from zagg.pyramid import expand_overviews
+    from zagg.sweep_overview import build_pyramid_block
+
+    cfg = default_config(name)
+    assert "sweep" not in cfg.output  # the default, not a spelled "stages"
+    assert get_pyramid(cfg) == {"overviews": LADDER}
+    grid = from_config(cfg)
+    shard = int(cfg.output["grid"]["parent_order"])
+    assert LADDER[-1] == shard + 4
+    assert get_sweep_mode(cfg, grid) == SWEEP_STAGES
+    block = build_pyramid_block(cfg, shard, chunk_order=grid.chunk_order)
+    assert block["spec"] == "zagg-pyramid/2"
+    assert block["overviews"] == expand_overviews(LADDER, parent_order=shard)
+    resolutions, fields = leaf_column_plan(cfg, grid)
+    assert resolutions == list(range(16, shard - 1, -1))  # the contiguous column tier
+    assert fields  # at least one composable field rides the ladder
+
+
+def test_the_ladder_is_hash_invisible():
+    # ``output.pyramid`` is outside the D19 semantic core, so declaring the
+    # ladder moved no template digest: SEMANTIC_PINS above still hold (their
+    # own test), and the declared-off config hashes identically.
+    for name in LADDER_TEMPLATES:
+        cfg = default_config(name)
+        off = default_config(name)
+        off.output["pyramid"] = False
+        assert semantic_hash(cfg) == semantic_hash(off)
+
+
 def test_atl03_template_reads_its_sidecars_from_source_coop():
     # Read machinery outside the semantic core (issue #499): the hash pins
     # above hold across the relocation. Pinned exactly: the value must stay

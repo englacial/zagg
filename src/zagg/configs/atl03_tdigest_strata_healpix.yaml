@@ -44,7 +44,9 @@
 # INT64 (issue #626). ``englacial/zagg/demo/atl03_tdigest_o9_v3.zarr`` (issue
 # #547; rebuilt from this template with only the hash-invisible
 # ``output.pyramid`` set to ``{overviews: 13}``, on the 0.57.0 fleet, issue
-# #560, 2026-10-08) was built with ``count: int32``; that config lives in the
+# #560, 2026-10-08 -- the template itself now declares the v4 ladder
+# ``{overviews: [16, 15, 14, 13]}``, see ``output.pyramid`` below) was built
+# with ``count: int32``; that config lives in the
 # store's run records, and its frozen hash in the vendored manifest
 # ``tests/data/ca_atl03_tdigest_o9_v3_morton_hive.json``.
 # Every other key in the D19 semantic core below is what that store's run
@@ -210,7 +212,18 @@ output:
     sharded: true
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive
-  pyramid: false                 # overview sweep opted out pending Phase E fleet sizing (issue #201)
+  pyramid:
+    overviews: [16, 15, 14, 13]  # the v4 store's leaf ladder (issue #620, espg's ruling on
+                                 # PR #622 question (2)): the zagg-pyramid/2 grammar, leaf
+                                 # cell resolutions finest first, a contiguous column tier
+                                 # from cells 16 down to 13 = shard order 9 + 4, so the
+                                 # fixed every-order ladder above the shard bottoms out at
+                                 # node 0 / cells 4 -- the same 13..4 dense ladder the v3
+                                 # store declared as `{overviews: 13}`, plus the two finer
+                                 # leaf members 16 and 15. Hash-invisible (D11): the pins in
+                                 # tests/test_live_store_templates.py do not move. A hive
+                                 # store that declares a ladder chains the staged sweep by
+                                 # default (`output.sweep` unset resolves to "stages").
 
 worker:
   memory: 4096                   # the live build's tier: 4096-disk (issue #460)

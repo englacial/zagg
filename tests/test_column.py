@@ -157,11 +157,14 @@ class TestWaveformEntersTheColumn:
     ``leaf_column_plan`` filters the declaration through the same
     ``composable_fields``, so an ``approximate`` rx_flux now enters the
     WORKER-side fold (:func:`zagg.column.fold_column` at the tail of
-    ``hive.process_and_write_hive``) the moment the shipped GEDI template
-    declares a pyramid — a consequence recorded here rather than discovered on
-    a fleet run. The memory envelope of that fold at GEDI scale is unvalidated
-    (see ``write_leaf_column``'s memory note), which is why the runbook builds
-    CA pyramids-off and retrofits the ladder sweep-only (``declare_pyramid``).
+    ``hive.process_and_write_hive``) now that the shipped GEDI template
+    declares a pyramid (``overviews: [16, 15, 14, 13]`` since issue #620) — a
+    consequence recorded here rather than discovered on a fleet run. The
+    memory envelope of that fold at GEDI scale is unvalidated (see
+    ``write_leaf_column``'s memory note); the live ``gedi_flux_o9`` store was
+    built pyramids-off and had its ladder retrofitted sweep-only
+    (``declare_pyramid``), so GEDI's next rebuild is the first build that
+    folds the column worker-side.
     """
 
     def _cfg(self):
@@ -169,20 +172,25 @@ class TestWaveformEntersTheColumn:
 
         return default_config("gedi01b_waveform_healpix_hive")
 
-    def test_shipped_template_declares_no_column(self):
+    def test_shipped_template_declares_the_column(self):
         from zagg.column import leaf_column_plan
         from zagg.grids import from_config
 
-        # ``pyramid: false`` as shipped: no declaration, so no column at all.
+        # The ladder as shipped (issue #620): the contiguous column tier from
+        # the finest declared member 16 down to the shard order, rx_flux in it.
         cfg = self._cfg()
-        assert leaf_column_plan(cfg, from_config(cfg)) is None
+        plan = leaf_column_plan(cfg, from_config(cfg))
+        assert plan is not None
+        resolutions, fields = plan
+        assert resolutions == [16, 15, 14, 13, 12, 11, 10, 9]
+        assert set(fields) == {"count", "rx_flux"}
 
     def test_pyramid_knob_folds_rx_flux_worker_side(self):
         from zagg.column import leaf_column_plan
         from zagg.grids import from_config
 
         cfg = self._cfg()
-        cfg.output["pyramid"] = {}  # the /2 default flip at chunk_inner 12
+        cfg.output["pyramid"] = {}  # the /2 DEFAULT flip at chunk_inner 12, not the shipped tier
         plan = leaf_column_plan(cfg, from_config(cfg))
         assert plan is not None
         resolutions, fields = plan

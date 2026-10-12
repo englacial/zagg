@@ -296,6 +296,10 @@ class TestSubmissionValidation:
         field = cfg.output["time_source"]["field"]
         cfg.data_source["variables"][field] = located.data_source["variables"][field]
         cfg.output["grid"] = dict(_ATL06_SIG)
+        # The template's ladder is declared against ITS grid (cells 19 / shard
+        # 9, issue #620); the ATL06 signature replaces the grid, so the
+        # declaration goes with it (absent = the default).
+        cfg.output.pop("pyramid")
         run = Run.from_config(
             cfg,
             shardmap=catalog,

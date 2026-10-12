@@ -1353,7 +1353,8 @@ class TestGediTemplate:
         assert (grid["parent_order"], grid["child_order"], grid["chunk_inner"]) == (9, 18, 12)
         assert grid["sharded"] is True
         assert cfg.output["store_layout"] == "hive"
-        assert cfg.output["pyramid"] is False
+        # The leaf ladder since issue #620 (pinned in test_live_store_templates).
+        assert cfg.output["pyramid"] == {"overviews": [16, 15, 14, 13]}
         flux = cfg.aggregation["variables"]["rx_flux"]
         assert flux["params"]["delta"] == 4096  # the live store's value (issue #547)
         assert "operating_point" in flux["attrs"]  # clip provenance

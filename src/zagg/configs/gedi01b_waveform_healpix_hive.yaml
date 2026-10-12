@@ -297,12 +297,21 @@ output:
     sharded: true
     child_order: 18              # leaf cell resolution (~20 m, ~GEDI footprint)
   store_layout: hive
-  pyramid: false                 # opt-in (runbook: CA builds pyramids-off on
-                                 # 0.49); rx_flux classifies approximate since
-                                 # issue #508, so pyramid: {} builds the ladder,
-                                 # and every level inherits rx_flux's
-                                 # `weights: flux` declaration + gain provenance
-                                 # via the manifest (declared_fields).
+  pyramid:
+    overviews: [16, 15, 14, 13]  # the leaf ladder (issue #620, espg's ruling on PR #622
+                                 # question (2): the same switch as the ATL03 templates,
+                                 # so GEDI's next rebuild carries a ladder too): the
+                                 # zagg-pyramid/2 grammar, leaf cell resolutions finest
+                                 # first, a contiguous column tier from cells 16 down to
+                                 # 13 = shard order 9 + 4 -- the same relation to the
+                                 # shard order as ATL03's, and the finest member sits two
+                                 # orders above these 18-order cells where ATL03's sits
+                                 # three above its 19-order ones. Hash-invisible (D11).
+                                 # rx_flux classifies approximate since issue #508, so
+                                 # every level inherits its `weights: flux` declaration +
+                                 # gain provenance via the manifest (declared_fields). A
+                                 # hive store that declares a ladder chains the staged
+                                 # sweep by default (`output.sweep` unset -> "stages").
 
 worker:
   memory: 4096                   # optimized probe (run 5d081b68, 4/4 green):
