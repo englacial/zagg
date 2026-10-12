@@ -1,0 +1,184 @@
+"""A store built from each windowed hive template is the v4 shape (issue #638).
+
+The packaged ATL03 hive templates are windowed yearly from birth, so a run
+from either — the local backend over ATL03-shaped fake granules, only the
+h5coro transport stubbed — must come out with one leaf per (shard, year), the
+``all`` row allocated beside them, the declared ladder folded by the staged
+sweep the template chains by default (issue #620), an Icechunk repo at the
+root with one row per window plus ``all`` (issue #604), and a clean
+``pyramid_check`` report. Nothing but the template's own ``data_source``
+paths is spelled here: a template that stopped validating, lost its
+``delta_time`` column or its windowing block, or declared a ladder the leaf
+worker cannot write would fail this file by name.
+"""
+
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pytest
+import test_windowed_emit as emit
+
+from zagg import hive, runner
+from zagg.config import default_config, get_windowing
+from zagg.grids.morton import morton_decimal
+from zagg.hive import MANIFEST_NAME
+from zagg.pyramid_check import format_report, validate_pyramid
+
+TEMPLATES = ["atl03_tdigest_strata_healpix", "atl03_tdigest_healpix_hive"]
+WINDOWS = ("2018", "2019", "2020")
+#: Two order-9 shards under one order-8 parent (Sierra Nevada; the issue
+#: #602 measurement cell is nearby), so the ladder has a shared node.
+SITES = ((37.80, -119.50), (37.81, -119.48))
+SURFACES = 5
+DAY = 86400.0
+
+
+def _shard(site, order):
+    from mortie import geo2mort
+
+    return int(geo2mort(np.array([site[0]]), np.array([site[1]]), order=order)[0])
+
+
+def _granule(site, days, seed, groups):
+    """An ATL03-shaped fake: six beam groups, photons linked from segments.
+
+    Every group carries the same photons — ``len(days) * 20`` of them at the
+    site, in three segments — under the template's own dataset paths, so the
+    read plan (``spatial_index: segments``, ``pad: 1``), the segment link
+    (``ph_index_beg`` origin 1), the 2-D ``signal_conf_ph`` column selector
+    and the TEP filter all run against the paths the template declares.
+    """
+    rng = np.random.default_rng(seed)
+    per_day = 20
+    n = len(days) * per_day
+    lat = np.full(n, site[0]) + rng.normal(0, 1e-4, n)
+    lon = np.full(n, site[1]) + rng.normal(0, 1e-4, n)
+    conf = rng.integers(0, 5, (n, SURFACES)).astype("i1")
+    conf[: n // 4, 0] = -2  # TEP photons, dropped by the template's filter
+    seg = n // 3
+    arrays = {}
+    for g in groups:
+        arrays.update(
+            {
+                f"/{g}/heights/lat_ph": lat,
+                f"/{g}/heights/lon_ph": lon,
+                f"/{g}/heights/h_ph": rng.normal(2000.0, 5.0, n).astype("f4"),
+                f"/{g}/heights/delta_time": np.repeat(np.asarray(days, dtype="f8") * DAY, per_day),
+                f"/{g}/heights/signal_conf_ph": conf,
+                f"/{g}/geolocation/reference_photon_lat": np.full(3, site[0]),
+                f"/{g}/geolocation/reference_photon_lon": np.full(3, site[1]),
+                f"/{g}/geolocation/ph_index_beg": np.array([1, seg + 1, 2 * seg + 1]),
+                f"/{g}/geolocation/segment_ph_cnt": np.array([seg, seg, n - 2 * seg]),
+            }
+        )
+    return emit._FakeH5(arrays)
+
+
+def _build(monkeypatch, tmp_path, name):
+    """Run the template over the fakes on the local backend; return the root."""
+    cfg = default_config(name)
+    groups = list(cfg.data_source["groups"])
+    grid = cfg.output["grid"]
+    fakes, records = {}, []
+    for i, site in enumerate(SITES):
+        recs = []
+        for j, (tag, days, start, end) in enumerate(
+            (
+                ("A", [300.0, 400.0], "2018-10-28T00:00:00Z", "2019-02-07T00:00:00Z"),
+                ("B", [800.0, 801.0], "2020-03-10T00:00:00Z", "2020-03-13T00:00:00Z"),
+                ("C", [729.5, 730.25], "2019-12-31T12:00:00Z", "2020-01-01T12:00:00Z"),
+            )
+        ):
+            rec = emit._timed_rec(f"{tag}{i}", start, end)
+            fakes[rec["s3"]] = _granule(site, days, seed=10 * i + j, groups=groups)
+            recs.append(rec)
+        records.append(recs)
+    catalog = {
+        "metadata": {"short_name": "ATL03", "version": "007"},
+        "grid_signature": {
+            "type": "healpix",
+            "indexing_scheme": "nested",
+            "parent_order": int(grid["parent_order"]),
+            "child_order": int(grid["child_order"]),
+            "layout": "fullsphere",
+        },
+        "shard_keys": [_shard(site, int(grid["parent_order"])) for site in SITES],
+        "granules": records,
+    }
+    path = tmp_path / f"{name}.catalog.json"
+    path.write_text(json.dumps(catalog))
+    monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+    emit._patch(monkeypatch, fakes)
+    root = tmp_path / name
+    runner.agg(cfg, catalog=str(path), store=str(root), backend="local")
+    return cfg, root, catalog["shard_keys"]
+
+
+@pytest.fixture(scope="module", params=TEMPLATES)
+def built(request, tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("template-store")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        cfg, root, shards = _build(monkeypatch, tmp_path, request.param)
+    return request.param, cfg, root, shards
+
+
+def test_every_window_has_its_leaf_and_the_all_row_is_allocated(built):
+    name, cfg, root, shards = built
+    assert get_windowing(cfg)["schedule"] == "yearly"
+    for shard in shards:
+        for label in WINDOWS:
+            leaf = hive.shard_leaf_path(str(root), shard, window=label)
+            stamp = hive.read_commit(_store(leaf))
+            assert stamp["window"] == label and stamp["spec"] == "morton-hive/2"
+    manifest = json.loads((root / MANIFEST_NAME).read_text())
+    assert manifest["temporal"]["schedule"] == "yearly"
+    assert manifest["pyramid"]["spec"] == "zagg-pyramid/2"
+    assert manifest["pyramid"]["overview"]["all_time"] is True
+    # The leaf tier is one column entry at the shard node; the rest is the
+    # fixed every-order ladder above it, down to node 0.
+    assert manifest["pyramid"]["overviews"][0]["cells"] == [16, 15, 14, 13]
+    assert [e["node"] for e in manifest["pyramid"]["overviews"]] == list(range(9, -1, -1))
+
+
+def test_the_icechunk_repo_holds_one_row_per_window_plus_all(built):
+    import os
+
+    from zagg.icechunk_refs import read_block, repo_path
+    from zagg.icechunk_rows import ALL_ROW
+
+    name, cfg, root, shards = built
+    assert os.path.isdir(repo_path(str(root)))
+    block = read_block(str(root), store_kwargs={})
+    assert block is not None
+    # Per leaf, not up the ladder: the Icechunk commit default keys on the
+    # EXPLICIT output.sweep: "stages" (icechunk_refs.ladder_walks,
+    # PR #622 ruling (1)), and the templates leave sweep unset so the
+    # staged sweep is the resolved default. Whether the templates should
+    # spell it is a PR #639 review question.
+    assert block["commit"] == "leaf"
+    assert ALL_ROW in block["rows"] and set(WINDOWS) <= set(block["rows"])
+    assert block["rows_per_manifest"] == 1
+
+
+def test_pyramid_check_passes(built):
+    name, cfg, root, shards = built
+    report = validate_pyramid(str(root), full=True)
+    assert report["passed"], format_report(report)
+    assert report["windows"] == list(WINDOWS)
+    assert report["roster"]["leaves"] == len(shards) * len(WINDOWS)
+    assert report["all_time_nodes"]["missing"] == []
+    assert report["columns"]["missing"] == [] and report["columns"]["partial"] == []
+
+
+def _store(leaf):
+    from zagg.store import open_store
+
+    return open_store(str(leaf))
+
+
+def _node(shard, order):
+    from zagg.sweep_overview import _node_at
+
+    return _node_at(morton_decimal(int(shard)), order)
