@@ -1131,8 +1131,15 @@ class TestRasterWindowedAllTimeFold:
         cfg.output["windowing"] = {"schedule": "daily"}
         assert "pyramid" not in cfg.output  # the default path: no knob at all
         assert get_pyramid(cfg) == {"all_time": True}
-        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
-        block = hive.read_manifest(cfg.output["store"])["pyramid"]
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        # The run is the premise, so pin that it IS windowed: two (shard,
+        # window) units and a /2 store carrying the daily schedule. Without
+        # this the block below would read the same for an unwindowed run,
+        # since it is templated from the config either way.
+        assert summary["total_cells"] == 2 and summary["cells_with_data"] == 2
+        m = hive.read_manifest(cfg.output["store"])
+        assert m["spec"] == "morton-hive/2" and m["temporal"]["schedule"] == "daily"
+        block = m["pyramid"]
         # Raster is exempt from the issue #384 ``/2`` default flip, so what the
         # run templates is the ``/1`` schedule the point arm folds: every two
         # orders below the shard order (10), with the resolved fold on it.
