@@ -480,6 +480,7 @@ def level_grids(manifest: dict, grid) -> dict:
     level only.
     """
     from zagg.column import composable_fields
+    from zagg.column_shards import column_grid
     from zagg.grids.healpix import HealpixGrid
     from zagg.sweep_overview import _overview_config
 
@@ -510,7 +511,16 @@ def level_grids(manifest: dict, grid) -> dict:
                 # indexed.
                 continue
             levels[cells] = {
-                "grid": HealpixGrid(node, cells, config=config, sharded=True),
+                # A column level's grid carries the §4.6 layout rule (issue
+                # #631): a fine member is sharded on power-of-four inner
+                # chunks, so its level is chunked at the inner chunk and its
+                # refs are byte ranges found through the shard index, exactly
+                # as a leaf's are. Overview levels stay one chunk per array.
+                "grid": (
+                    column_grid(node, cells, config)
+                    if artifact == "column"
+                    else HealpixGrid(node, cells, config=config, sharded=True)
+                ),
                 "node": node,
                 "artifact": artifact,
             }
@@ -1141,11 +1151,14 @@ def leaf_units(
     cells (:func:`zagg.column.leaf_level_cells` — ``[13]`` at production),
     never the within-footprint intermediates (``12, 11, 10``) or the
     node-order partial, which are sweep inputs that overlap the overview
-    levels (:func:`level_grids`). Each column array is one unsharded chunk,
-    so its ref is the whole object.
+    levels (:func:`level_grids`). A column array is one object either way;
+    its refs are the whole object for an unsharded group, or one byte range
+    per present inner chunk read off the shard index for a fine group (the
+    §4.6 layout rule, issue #631 — the same :func:`zagg.column_shards.column_grid`
+    the writer laid it out with).
     """
     from zagg.column import leaf_column_plan, leaf_level_cells
-    from zagg.grids.healpix import HealpixGrid
+    from zagg.column_shards import column_grid
     from zagg.hive import shard_leaf_path
     from zagg.sweep_overview import _overview_config
 
@@ -1169,9 +1182,12 @@ def leaf_units(
     for res in leaf_level_cells(config, grid):
         if int(res) >= int(grid.child_order):
             continue  # a member at the store's own cell order duplicates the base (level_grids)
-        column_grid = HealpixGrid(int(grid.parent_order), int(res), config=cfg, sharded=True)
         entries = object_ref_plan(
-            column_grid, f"{node_rel}/{column}", rank, store_root, store_kwargs=store_kwargs
+            column_grid(grid.parent_order, res, cfg),
+            f"{node_rel}/{column}",
+            rank,
+            store_root,
+            store_kwargs=store_kwargs,
         )
         if entries:
             units.append({"level": int(res), "row": row, "entries": entries})
