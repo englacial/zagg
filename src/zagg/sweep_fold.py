@@ -265,8 +265,12 @@ class _ColumnReader:
         """Cells ``[start, stop)`` of one group array — :meth:`read`, for a block.
 
         What the chunk-streamed fold reads (:mod:`zagg.sweep_fold`): only the
-        chunk objects covering the range are fetched, under the same stamp
-        validation and foreign-fresh guard as a whole-member read.
+        chunk objects covering the range are fetched — or, over a sharded
+        fine column member (spec §4.6, issue #631), the shard index plus the
+        covering inner chunks by byte range; every piece starts on a
+        power-of-four boundary and the inner chunk is one fold block, so a
+        block read is one inner chunk — under the same stamp validation and
+        foreign-fresh guard as a whole-member read.
         """
         return self._read(res, name, slice(int(start), int(stop)))
 

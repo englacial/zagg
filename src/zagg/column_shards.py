@@ -105,6 +105,24 @@ def expected_layout(node_order: int, res: int) -> dict:
     }
 
 
+def layout_mismatch(node_order: int, res: int, metadata: dict) -> str | None:
+    """How one stored column array departs from the rule, or ``None``.
+
+    The ``pyramid_check`` layout leg (spec §4.6 is normative on the layout,
+    so a fine group written whole — a pre-#631 worker, or a hand-built
+    column — fails read-back by name rather than passing on its values).
+    """
+    want, got = expected_layout(node_order, res), stored_layout(metadata)
+    if want == got:
+        return None
+
+    def _say(layout):
+        kind = "sharded" if layout["sharded"] else "unsharded"
+        return f"{kind}, {layout['chunk_cells']} cells per chunk"
+
+    return f"layout is {_say(got)}; §4.6 requires {_say(want)} for a group at order {int(res)}"
+
+
 def stored_layout(metadata: dict) -> dict:
     """:func:`expected_layout`'s twin, read off one array's zarr v3 metadata.
 
