@@ -43,9 +43,9 @@ conformance tests assert decoded values, never object bytes.
   SIBLING attrs key beside the ``ragged`` block, ``gain`` provenance attrs)
   + `count`. Payload weights are fractional positive reals built through the
   real merge algebra, so per-cell weight sums are NOT integers — the pin
-  that a flux reader must not round-trip weights through counts. The
-  committed ``minimal/`` (which predates §2.0 and is not regenerated) is the
-  absent-key ⇒ counts pin.
+  that a flux reader must not round-trip weights through counts.
+  ``minimal/`` declares no ``weights`` key, so it is the absent-key ⇒ counts
+  pin.
 - ``column/`` — the ``minimal`` inputs plus an explicit
   ``output.pyramid.overviews: 5`` knob, so the SAME worker invocation also
   writes the §4.6 leaf column (issue #383): ``all.pyramid.zarr`` beside the
@@ -62,8 +62,9 @@ conformance tests assert decoded values, never object bytes.
   ``pyramid.expected.json`` record of the raw config knob, the leaf-list
   form of the declaration the expansion was derived from. Since issue #392
   the same manifest also carries the §4.9 ``multiscales`` discovery mirror
-  installed beside every ``/2`` block (``column/``, committed earlier and
-  unregenerated, is the absent-key ⇒ pre-convention pin). No store beneath
+  installed beside every ``/2`` block (``column/``'s manifest has the key
+  removed by hand after a regen — STALE BY DESIGN below — as the absent-key
+  ⇒ pre-convention pin). No store beneath
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone; the ``/2`` artifacts a fleet writes are the
   ``column/`` fixture's job (issue #383 — sweep-side levels are issue #384).
@@ -144,13 +145,15 @@ conformance tests assert decoded values, never object bytes.
 STALE BY DESIGN: some committed bytes deliberately pin an older writer era
 and must NOT be refreshed by a regen — currently ``kitchen_sink/``'s two
 ``*_locations/zarr.json`` siblings (the pre-§9 absent-``located`` pin
-above). Running this script rewrites them; ``git checkout --`` those files
-after a targeted regen. ``kitchen_sink/`` was otherwise refreshed for issue
-#515 (its manifest now declares the strata ``approximate`` + ``composition``
-``packed``, and its ``all.pyramid.zarr`` column carries the strata,
-locations and composition groups through the real fold). When regenerating
-for one fixture only, ``git checkout --`` the others; a deliberate refresh
-of an older-era fixture is its own commit.
+above) and the ``multiscales`` key of ``column/``'s ``morton_hive.json``
+(the pre-§4.9 absent-key pin above). Running this script rewrites both;
+``git checkout --`` the two siblings and delete the one manifest key after a
+regen (``tests/test_spec_conformance.py`` asserts all three absences).
+Every count-bearing fixture was otherwise regenerated for issue #626
+(``count`` is ``int64``), so the committed stamps, manifests and stats
+records are the current writer's. When regenerating for one fixture only,
+``git checkout --`` the others; a deliberate refresh of an older-era fixture
+is its own commit.
 """
 
 from __future__ import annotations
@@ -295,7 +298,7 @@ def _config(kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False)
     from zagg.config import PipelineConfig
 
     variables: dict = {
-        "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0}
+        "count": {"function": "len", "source": "h", "dtype": "int64", "fill_value": 0}
     }
     if flux:
         variables["rx_flux"] = {
@@ -460,7 +463,7 @@ def _fake_process_shard(grid, by_chunk, kitchen_sink: bool, ragged_field: str = 
             n = grid.cells_per_chunk
             df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
             df["count"] = np.array(
-                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64
             )
             ragged: dict = {}
             if kitchen_sink:
@@ -1429,7 +1432,7 @@ def _temporal_config():
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
             "variables": {
-                "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0},
+                "count": {"function": "len", "source": "h", "dtype": "int64", "fill_value": 0},
                 "h_tdigest": {
                     "kind": "ragged",
                     "function": "zagg.stats.tdigest.build_tdigest",
@@ -1481,7 +1484,7 @@ def _fake_temporal_shard(grid, by_chunk):
             n = grid.cells_per_chunk
             df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
             df["count"] = np.array(
-                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64
             )
             # §8.2: an unobserved cell keeps the reserved 0 fill.
             df["observed"] = np.array(
@@ -1984,7 +1987,7 @@ def _windowed_config():
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
             "variables": {
-                "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0},
+                "count": {"function": "len", "source": "h", "dtype": "int64", "fill_value": 0},
                 "h_tdigest": {
                     "kind": "ragged",
                     "function": "zagg.stats.tdigest.build_tdigest",
@@ -2033,7 +2036,7 @@ def _fake_windowed_shard(grid, by_chunk, time_range):
             n = grid.cells_per_chunk
             df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
             df["count"] = np.array(
-                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64
             )
             ids = sorted(cells)
             ragged = {

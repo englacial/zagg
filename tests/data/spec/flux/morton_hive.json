@@ -4,7 +4,7 @@
   "short_name": "SPEC_FIXTURE",
   "version": "1"
  },
- "semantic_hash": "4ff4271b6ccc735e5f403d7b731a56efda4b806e11043d6d2b562f5cd8cc9d9e",
+ "semantic_hash": "9c5cf2031be2eef42c41d6b704fe10e436d3521b48957c8babfdba60059104ac",
  "cell_order": 6,
  "shard_order": 4,
  "split_schedule": [
@@ -57,7 +57,7 @@
      "class": "exact",
      "method": "sum",
      "nan_policy": "skip",
-     "dtype": "int32",
+     "dtype": "int64",
      "fill_value": 0
     },
     "rx_flux": {
@@ -78,5 +78,79 @@
    }
   }
  },
- "generated_at": "2026-08-17T03:34:05+00:00"
+ "generated_at": "2026-10-12T01:21:09+00:00",
+ "multiscales": [
+  {
+   "spec": "zagg-multiscales/1",
+   "name": "SPEC_FIXTURE",
+   "base": {
+    "order": 4,
+    "cells": [
+     6
+    ]
+   },
+   "datasets": [
+    {
+     "order": 4,
+     "cells": [
+      5
+     ],
+     "artifact": "column"
+    },
+    {
+     "order": 3,
+     "cells": [
+      4
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 2,
+     "cells": [
+      3
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 1,
+     "cells": [
+      2
+     ],
+     "artifact": "overview"
+    },
+    {
+     "order": 0,
+     "cells": [
+      1
+     ],
+     "artifact": "overview"
+    }
+   ],
+   "order2res": {
+    "4": [
+     5
+    ],
+    "3": [
+     4
+    ],
+    "2": [
+     3
+    ],
+    "1": [
+     2
+    ],
+    "0": [
+     1
+    ]
+   },
+   "fields": {
+    "count": "exact",
+    "rx_flux": "approximate"
+   },
+   "fold": {
+    "fold_source": "cascade",
+    "exact_levels": 1
+   }
+  }
+ ]
 }

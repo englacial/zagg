@@ -2424,19 +2424,21 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-The leaf fixtures were committed before this revision (`temporal/` was
-regenerated for §10.6 under issue #575, still before it) and are
-unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
-`dggs` block carries the §1 `latitude` token, so each fixture is the
-absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
-for both (the sidecar copy and §1's own evidence paragraph are the record
-for what those artifacts mean). The one **versioned** leaf (§1.5; a stamp
+Every fixture that declares `count` was regenerated for issue
+[#626](https://github.com/englacial/zagg/issues/626) (`count` is `int64`,
+§4.4/§4.5), so those stamps carry the §5.3 copy of `content_hashes` and
+every leaf `dggs` block carries the §1 `latitude` token. `raster_toc/`
+(no `count`) is unregenerated: its stamp without the §5.3 copy is the
+committed absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580)
+pin (the sidecar copy and §1's own evidence paragraph are the record for
+what that artifact means). The one **versioned** leaf (§1.5; a stamp
 naming `current`) is `versioned/` below, added standalone with the writer
 that produces it (issue [#582](https://github.com/englacial/zagg/issues/582));
-the older leaf fixtures stay legacy and pin the absent-`current` rule.
-Regeneration of those is deferred because it would
-also install the §4.9 `multiscales` mirror that `column/` pins the
-**absence** of, retiring an unrelated pin.
+the other leaf fixtures are unversioned and pin the absent-`current` rule.
+Two older-era pins survive a regeneration by hand (the generator's STALE BY
+DESIGN note): the §4.9 `multiscales` mirror is deleted from `column/`'s
+manifest, and `kitchen_sink/`'s two `*_locations` siblings keep their
+pre-§9 attrs.
 
 Nine tiny single-shard hive stores plus four metadata-only ones (the
 `pyramid/` declaration, the `multiscales/` companion, the `icechunk/` repo
@@ -2465,8 +2467,8 @@ never sharded, §8/#247):
   block, `gain` provenance attrs) plus `count`. Its payloads carry
   fractional positive weights whose per-cell sums are **not** integers —
   the pin that a flux reader must not round-trip weights through counts —
-  while `minimal/` (committed before this revision, unregenerated) pins the
-  absent-key ⇒ `"counts"` default.
+  while `minimal/`, which declares no `weights`, pins the absent-key ⇒
+  `"counts"` default.
 - **`kitchen_sink/`** — the full stratified-product surface: located
   signal/noise digest strata (payload + `{field}_locations` siblings,
   `stratum`/`signal_threshold` provenance attrs), the `composition` word
@@ -2490,8 +2492,8 @@ never sharded, §8/#247):
   alone — the `/2` artifacts a fleet writes are `column/`'s job below
   (sweep-side levels are #384's). The same manifest carries the §4.9
   `multiscales` discovery mirror the retrofit installs beside a `/2`
-  block; `column/`, committed before §4.9 and unregenerated, is the
-  absent-key ⇒ pre-convention pin.
+  block; `column/`'s manifest, whose mirror is deleted by hand after a
+  regeneration (stale by design), is the absent-key ⇒ pre-convention pin.
 - **`column/`** — the `minimal/` inputs plus an explicit
   `output.pyramid.overviews: 5` knob, so the same worker invocation that
   committed the leaf also wrote its §4.6 **column**: `all.pyramid.zarr`
@@ -2570,8 +2572,9 @@ never sharded, §8/#247):
   per-centroid envelope beneath it) on committed bytes. Its located sibling
   carries **heterogeneous orders** — order-29 point words on unmerged
   centroids, coarser ancestors on merged ones — which is §9.1's claim
-  pinned. `kitchen_sink/`, committed before §9 and unregenerated, is the
-  absent-`located` ⇒ §2.2 pin, exactly as `minimal/` is §2.0's.
+  pinned. `kitchen_sink/`, whose two located siblings keep their pre-§9
+  attrs by hand (stale by design), is the absent-`located` ⇒ §2.2 pin,
+  exactly as `minimal/` is §2.0's.
 
   Its §4.6 leaf column carries the **folded** companions: every resolution
   group holds `h_tdigest` with both siblings, each declaring `per-centroid`,
@@ -2610,8 +2613,8 @@ never sharded, §8/#247):
   transcribed from the object. The other leaf
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
-  trees are byte-identical to their pre-§10 selves — which is exactly §10's
-  absence rule, pinned as bytes. From issue #489 the same fixture also
+  trees carry no such object — which is exactly §10's absence rule, pinned
+  as bytes. From issue #489 the same fixture also
   carries the **§10.5 `coverage.toc` sibling**, PUT by the same production
   finisher beside the carrier (whose section now bears the §10.1 `cover`
   marker); `temporal.expected.json`'s `cover` block records the derived

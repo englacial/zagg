@@ -43,17 +43,27 @@
       ],
       "generation": {
         "n_leaves": 1,
-        "max_leaf_timestamp": "2026-09-11T01:23:29+00:00"
+        "max_leaf_timestamp": "2026-10-12T01:21:09+00:00"
       },
-      "content_hash": "f0f9c89eba2a6277f832450bb5753596aa2ea9d092d42cbf77c5c60ae6728330",
-      "generated_at": "2026-09-11T01:23:29+00:00"
+      "content_hash": "d2ed722614e9d1488752ff6b08e4601f1813ab3ecf42ddcefe453f8a8129693e",
+      "generated_at": "2026-10-12T01:21:09+00:00"
     },
     "morton_hive_commit": {
       "spec": "morton-hive/1",
       "complete": true,
       "cells_with_data": 1,
       "granule_count": 1,
-      "written_at": "2026-09-11T01:23:29+00:00"
+      "written_at": "2026-10-12T01:21:09+00:00",
+      "content_hashes": {
+        "arrays": {
+          "4/composition": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
+          "4/count": "884ff4c544e96b3236fe22b0464cf344675c0f9c1553c2c5a19f8a53f7cab6e7",
+          "4/h_tdigest_noise": "357a2958aa1ce8cef00481bad1f00de0de9bf53afcbb5b78d9de987d0dbab56f",
+          "4/h_tdigest_noise_locations": "3877481edaf71b194790086684cae3c4ccd2dd1c8fbf9baf8f0e68e4fba3f390",
+          "4/morton": "c598959cbddcd73a2ab667e5a75d7956d33f8d9f27104ee187b01324cecacfea"
+        },
+        "combined": "d05076a6f8889398c2cb0f28a9a370fe254550c48894692dce8d386e9887d6f6"
+      }
     }
   },
   "zarr_format": 3,
