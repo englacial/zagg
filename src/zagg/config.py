@@ -3500,7 +3500,8 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     ``output.pyramid`` shapes the manifest's template-time pyramid block
     (``zagg.sweep_overview.build_pyramid_block``): absent/null returns ``{}``
     — the defaults apply (an every-2-orders overview schedule below the shard
-    order, the espg-ratified display default; no all-time fold) — and
+    order, the espg-ratified display default; the all-time fold only on a
+    windowed store, where it is required and resolved true) — and
     ``false`` returns ``None``, declaring the overview family OFF for the
     store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
     (explicit ancestor orders, winning over ``spacing``), ``overviews`` (the
