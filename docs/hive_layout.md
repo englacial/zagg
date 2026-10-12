@@ -879,8 +879,12 @@ four, any target in `[5, 20]` picks width 2, `[21, 84]` width 3, under 5
 width 1. The default Icechunk `commit_order` is still the fixed schedule's
 finest dispatch order (6 at o9, `zagg.icechunk_refs.finest_dispatch_order`),
 and the ladder commit is made by the sized tuple whose span contains it —
-`5:[6,5]`, so by the order-5 dispatch nodes, each committing its four
-order-6 base manifests. Such a tuple dispatches at an order no single width
+`5:[6,5]`, so by the order-5 dispatch nodes, each committing up to four
+order-6 base manifests (four when dense) in the same invoke that folds its
+tuple. The per-invoke fold target counts ladder nodes only, not commits, so
+under `commit: "ladder"` a committing invoke carries up to four base
+manifests' refs beyond the folds it was sized for (one under the width-3
+grouping's `6:[6]`). Such a tuple dispatches at an order no single width
 lands on, so its events carry their span (`child_order`) outright; a worker
 deployed before this refuses one by name rather than folding the wrong span.
 The cadence is still a dispatch knob like `--tuple-width` itself — a sized
