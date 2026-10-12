@@ -48,6 +48,8 @@ read is exactly one inner chunk — one ranged GET, never a partial chunk.
 
 from __future__ import annotations
 
+from zagg.multiscales import ARTIFACT_COLUMN
+
 #: One inner chunk of a sharded column group, as a HEALPix order difference:
 #: ``4 ** 5 = 1,024`` cells, ~0.5 MB of saturated signal digest at the
 #: 128-centroid pyramid cap (~470 B per cell, measured on the v4 ATL03
@@ -138,3 +140,39 @@ def stored_layout(metadata: dict) -> dict:
         "sharded": False,
         "chunk_cells": int(metadata["chunk_grid"]["configuration"]["chunk_shape"][0]),
     }
+
+
+def stale_column_levels(levels: dict | None) -> list[str]:
+    """The Icechunk ``levels`` (spec §11.1) of a column chunked against the rule.
+
+    A companion repo initialized before the rule records a fine column level
+    at one chunk per node; a ref planned under the rule lands there at chunk
+    indices that mean something else (low ranks overwrite another node's
+    slots, high ranks fall out of bounds). Its vets refuse it: clear and
+    re-init (issue #631).
+    """
+    return sorted(
+        (
+            order
+            for order, level in (levels or {}).items()
+            if level.get("artifact") == ARTIFACT_COLUMN
+            and int(level["chunk_order"]) != _level_chunk_order(level["node_order"], order)
+        ),
+        key=int,
+    )
+
+
+def check_column_entry(level: dict | None, entry: dict, array_path: str) -> None:
+    """Refuse a whole-object ref (a pre-rule leaf-refs sidecar) for a sharded column level."""
+    if entry["sharded"] or not level or level.get("artifact") != ARTIFACT_COLUMN:
+        return
+    if inner_chunk_order(level["node_order"], level["cell_order"]) is not None:
+        raise ValueError(
+            f"{array_path}: a whole-object ref for a column level §4.6 shards (a leaf-refs "
+            f"sidecar written before issue #631): re-plan the leaf under the rule"
+        )
+
+
+def _level_chunk_order(node_order, res) -> int:
+    inner = inner_chunk_order(node_order, res)
+    return int(node_order) if inner is None else inner

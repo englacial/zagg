@@ -248,6 +248,44 @@ class TestLayoutParity:
         assert _array_meta(sharded, BASE, "count")["codecs"][0]["name"] == "sharding_indexed"
 
 
+def _companion():
+    """``(config, grid, manifest)`` of a store whose Icechunk companion indexes
+    the column's 4^5-cell member 9 (sharded), member 8 (whole) and overview 5."""
+    from zagg.config import PipelineConfig
+
+    cfg = PipelineConfig(
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "dtype": "int64", "fill_value": 0},
+                "h_tdigest": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest",
+                    "inner_shape": [2],
+                    "dtype": "float32",
+                    "fill_value": 0,
+                },
+            },
+        },
+        output={"grid": {"type": "healpix", "parent_order": NODE, "child_order": CELL}},
+    )
+    grid = HealpixGrid(NODE, CELL, config=cfg, chunk_inner=7, sharded=True)
+    manifest = {
+        "pyramid": {"overview": {"fields": FIELDS}},
+        "multiscales": [
+            {
+                "spec": "zagg-multiscales/1",
+                "base": {"order": NODE, "cells": [CELL]},
+                "datasets": [
+                    {"order": NODE, "cells": [9, 8], "artifact": "column"},
+                    {"order": 0, "cells": [5], "artifact": "overview"},
+                ],
+            }
+        ],
+    }
+    return cfg, grid, manifest
+
+
 class TestConsumersDeriveTheSameLayout:
     """The backfill gate and the Icechunk planner share the writer's grid."""
 
@@ -301,36 +339,8 @@ class TestConsumersDeriveTheSameLayout:
 
     def test_level_grids_shard_the_fine_column_level(self):
         from zagg import icechunk_refs
-        from zagg.config import PipelineConfig
 
-        cfg = PipelineConfig(
-            aggregation={
-                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
-                "variables": {
-                    "count": {"function": "len", "dtype": "int64", "fill_value": 0},
-                    "h_tdigest": {
-                        "kind": "ragged",
-                        "function": "zagg.stats.tdigest.build_tdigest",
-                        "inner_shape": [2],
-                        "dtype": "float32",
-                        "fill_value": 0,
-                    },
-                },
-            },
-            output={"grid": {"type": "healpix", "parent_order": NODE, "child_order": CELL}},
-        )
-        grid = HealpixGrid(NODE, CELL, config=cfg, chunk_inner=7, sharded=True)
-        manifest = {
-            "pyramid": {"overview": {"fields": FIELDS}},
-            "multiscales": [
-                {
-                    "datasets": [
-                        {"order": NODE, "cells": [9, 8], "artifact": "column"},
-                        {"order": 0, "cells": [5], "artifact": "overview"},
-                    ]
-                }
-            ],
-        }
+        _cfg, grid, manifest = _companion()
         levels = icechunk_refs.level_grids(manifest, grid)
         assert levels[9]["grid"].sharded and levels[9]["grid"].chunk_order == 5
         assert levels[9]["grid"].cells_per_chunk == 256
@@ -340,6 +350,55 @@ class TestConsumersDeriveTheSameLayout:
             "chunk_order": 5,
             "cell_order": 9,
         }
+
+
+class TestStaleCompanionRepo:
+    """A companion repo initialized before the rule is refused, not mis-indexed."""
+
+    def _init(self, root, run_id, manifest_cfg):
+        from zagg import icechunk_refs
+
+        cfg, grid, manifest = manifest_cfg
+        return icechunk_refs.init_repo(
+            str(root), grid, cfg, run_id=run_id, store_kwargs={}, manifest=manifest
+        )
+
+    def test_a_repo_with_whole_chunk_fine_column_levels_is_refused(self, tmp_path, monkeypatch):
+        from zagg import icechunk_refs
+
+        companion, root = _companion(), tmp_path / "store"
+        with monkeypatch.context() as m:  # the pre-#631 rule: every column group whole
+            m.setattr(column_shards, "inner_chunk_order", lambda node, res: None)
+            assert self._init(root, "old", companion)["levels"]["9"]["chunk_order"] == NODE
+        grid = companion[1]
+        stale = "chunks column levels \\['9'\\] against the §4.6 layout rule"
+        with pytest.raises(ValueError, match=stale):
+            self._init(root, "new", companion)
+        with pytest.raises(ValueError, match=stale):
+            icechunk_refs.vet_leaf_repo(str(root), grid, store_kwargs={})
+        with pytest.raises(ValueError, match=stale):  # the ladder's vet
+            icechunk_refs.open_vetted(str(root), store_kwargs={}, want={"cell_order": CELL})
+
+    def test_a_repo_initialized_under_the_rule_reopens(self, tmp_path):
+        companion, root = _companion(), tmp_path / "store"
+        assert self._init(root, "a", companion)["levels"]["9"]["chunk_order"] == 5
+        assert self._init(root, "b", companion)["created"] is False
+
+    def test_a_whole_object_ref_for_a_sharded_column_level_is_refused(self, tmp_path):
+        # A leaf-refs sidecar written before the rule carries the fine member
+        # as ``count/c/<rank>`` -- chunk ``rank`` of a K-chunks-per-node array.
+        from zagg import icechunk_refs
+
+        root = tmp_path / "store"
+        self._init(root, "a", _companion())
+        ref = ("count/c/1", f"{icechunk_refs.container_prefix(str(root))}x", 8, None)
+        entry = {"path": "count", "sharded": False, "chunks": [ref]}
+        unit = {"level": 9, "entries": [{**entry, "refs": 1}]}
+        with pytest.raises(ValueError, match="a whole-object ref for a column level"):
+            icechunk_refs.commit_units(str(root), [unit], "replay", store_kwargs={})
+        # The whole member below the rule still takes it.
+        unit = {"level": 8, "entries": [{**entry, "refs": 1}]}
+        assert icechunk_refs.commit_units(str(root), [unit], "ok", store_kwargs={})["refs"] == 1
 
 
 # ---------------------------------------------------------------------------
