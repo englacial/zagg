@@ -122,14 +122,14 @@ DECLARED_PINS = [
 #: inside the fleet execution role's source.coop grant.
 SIDECAR_STORE = "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/sidecar/ATL03/007"
 
-#: Every packaged template, plus the out-of-package measurement config that
-#: mirrors the strata template (issue #586).
+#: Every packaged template, plus the out-of-package measurement arm configs
+#: that mirror the strata template (issue #586; the four #602 arms).
 PACKAGED_TEMPLATES = sorted(
     f.name.removesuffix(".yaml")
     for f in resources.files(zagg.configs).iterdir()
     if f.name.endswith(".yaml")
 )
-MEASURE_CONFIG = Path(__file__).parents[1] / "tools" / "configs" / "atl03_windowed_measure.yaml"
+MEASURE_CONFIGS = sorted((Path(__file__).parents[1] / "tools" / "configs").glob("*.yaml"))
 
 #: Every packaged template carrying a digest field shares one centroid budget.
 DIGEST_TEMPLATES = [
@@ -223,7 +223,7 @@ def _count_fields(cfg):
     return [m for m in cfg.aggregation.get("variables", {}).values() if m.get("function") == "len"]
 
 
-@pytest.mark.parametrize("name", [*PACKAGED_TEMPLATES, MEASURE_CONFIG])
+@pytest.mark.parametrize("name", [*PACKAGED_TEMPLATES, *MEASURE_CONFIGS])
 def test_every_template_declares_count_int64(name):
     # Issue #626 ruling: ``count`` (the ``len`` field) is int64 in every
     # template, so no ladder of any packaged product wraps past 2^31. A
