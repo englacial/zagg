@@ -220,9 +220,9 @@ examples:
         # complete exits 0 by design — the rollups are regenerable caches (D9)
         # — so the shortfall has to be on the operator's last screen, not in
         # the log alone. The v3 California run printed nothing at all.
-        for reason in results.get("tail_sweep_short") or []:
-            print(f"  TAIL SHORT: {reason}")
-        if results.get("tail_sweep_short"):
+        if short := results.get("tail_sweep_short"):
+            for reason in short:
+                print(f"  TAIL SHORT: {reason}")
             print(
                 "  Regenerate with `python -m zagg.sweep <store>` and, for the ladder, "
                 "`python -m zagg.sweep <store> --stages --scope <subtree>`"
