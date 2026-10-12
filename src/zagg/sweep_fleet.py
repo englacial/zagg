@@ -1054,17 +1054,20 @@ def run_stage_sweep_fleet(
     no_ladder = no_ladder_reason(store_path, shard_order, store_kwargs)
     if no_ladder is not None:
         logger.warning(
-            f"stage fleet: {store_path} declares no zagg-pyramid/2 ladder to sweep "
+            f"stage fleet: {store_path} has no sweepable zagg-pyramid/2 ladder "
             f"({no_ladder}) — run {run_id} fires nothing: no stage invoke, no finisher, no "
             "barrier. The ladder is the MANIFEST's and a manifest is written once, at init: "
-            "retrofit the store with `python -m zagg.sweep <store> --declare-pyramid "
+            "(re-)declare it with `python -m zagg.sweep <store> --declare-pyramid "
             "<config.yaml>` (plus `--overviews <resolutions>` where the config spells none), "
             "or append with `output.pyramid` set to what the manifest declares"
         )
-        # The constant is the stable prefix a caller matches on; the reason
-        # rides behind it, so the run RECORD says which declaration it saw
-        # and not only the log line does (review finding).
-        summary["skipped"] = f"no zagg-pyramid/2 ladder: {no_ladder}"
+        # "no SWEEPABLE ladder", not "no /2 declaration" (review finding): a
+        # malformed ``/2`` block declines here too, and a headline — or a
+        # prefix a caller matches on — calling such a store a ``/1`` store
+        # would send the operator to the wrong remedy. The reason rides
+        # behind the prefix, so the run RECORD says which declaration the
+        # gate saw and not only the log line does.
+        summary["skipped"] = f"no sweepable zagg-pyramid/2 ladder: {no_ladder}"
         # The families ride a node CLOSE (issue #610 phase 4) and nothing
         # closes in a run that fires nothing, so the rollups handed to this
         # sweep are unswept — which is what the runner's backstop warning
