@@ -758,12 +758,15 @@ def run_stage_sweep_fleet(
     CLOSE a node — the unwindowed whole-node invoke and, on a windowed
     store, the close invoke — because a rollup object merges every window of
     its node; the finisher needs no key for it, since it takes which
-    families rode from the records. A windowed store that declares no
-    all-time fold has no close invoke and folds no rollup; since ``all_time``
-    here is only the caller's first guess, that is WARNED and reported
-    (``families_unswept``) rather than refused, and the store's own answer —
-    read back off the first landed window record, below — settles it in
-    either drift direction.
+    families rode from the records. A windowed caller must therefore say
+    ``all_time=True`` to ride them: a windowed config declares the fold
+    (``output.pyramid.all_time`` resolves to true and is refused when false,
+    issue #610 phase 4), so ``windowed`` without ``all_time`` is a caller
+    contract violation and is refused by name before anything fires. A
+    store whose MANIFEST withdrew the fold is a different matter — the
+    store's own answer, read back off the first landed window record below,
+    then fires no close, and that is reported (``families_unswept``) rather
+    than refused, since the artifacts are regenerable.
 
     Returns the dispatcher's own summary — what it fired and what it saw. The
     RUN's record is the finisher's (``sweep_stats_{ts}_stages.json`` at the
@@ -809,22 +812,18 @@ def run_stage_sweep_fleet(
     # by name here — before anything fires — so a misspelled family is not a
     # fan-out that quietly folds no rollup.
     family_names = normalize_families(families)
-    # Reported, not refused. This reads the CALLER's ``all_time``, which is
-    # only the first guess (see the docstring): a store that DOES declare the
-    # fold would fire its close invokes and fold the families fine, so
-    # refusing here refused a run that works. The outcome therefore starts
-    # pessimistic on the summary and the store's own answer — the per-tuple
-    # ``told`` check below, where the store has actually spoken — settles it
-    # in both drift directions (review finding).
-    families_closeless = bool(family_names and windowed and not all_time)
-    if families_closeless:
-        logger.warning(
-            f"stage fleet: families {list(family_names)} were asked to ride a windowed store "
-            "whose config declares no all-time fold: the rollups fold in a node's CLOSE (one "
-            "object per node, every window), and such a store fires no close invoke — unless "
-            "the store itself declares pyramid.overview.all_time, their rollups are NOT folded "
-            "by this run (reported as families_unswept); sweep them with their own pass, or "
-            "declare the fold (issue #610)"
+    # A caller contract, refused by name like a misspelled family: the
+    # families fold in a node's CLOSE, and a windowed config declares the
+    # all-time fold (issue #610 phase 4), so a windowed caller saying
+    # otherwise is a bug, not a store to be read. The store-side drift — a
+    # manifest that withdrew the fold — is the per-tuple ``told`` check below.
+    if family_names and windowed and not all_time:
+        raise ValueError(
+            f"stage fleet: families {list(family_names)} cannot ride a windowed store with "
+            "all_time=False — the rollups fold in a node's CLOSE (one object per node, every "
+            "window), and a windowed store declares the all-time fold (output.pyramid.all_time "
+            "is required on a windowed config, issue #610 phase 4); pass all_time=True, or "
+            "families=() for the ladder alone"
         )
     # The same canonicalization the in-process pass does (run_stage_sweep), so
     # every documented spelling — morton words, D1 decimals, a shardmap's keys
@@ -861,11 +860,9 @@ def run_stage_sweep_fleet(
         # ``short_orders``: a caller reading the summary should not have to
         # know which branch produced it.
         "families": list(family_names),
-        # Pessimistic until the store says otherwise: a windowed run whose
-        # config declares no close fires none, and no landed record ever
-        # arrives to correct the guess, so False here would be a silent claim
-        # that the rollups were folded (review finding).
-        "families_unswept": families_closeless,
+        # Flipped only by the store's own answer (the ``told`` check below):
+        # the caller's side was settled above, by refusal.
+        "families_unswept": False,
         "scope": None if scope is None else [str(int(w)) for w in scope],
         # Whether the per-tuple node sets were computed from the store's own
         # coverage (issue #547) or from the work set alone. The words
@@ -1146,11 +1143,9 @@ def run_stage_sweep_fleet(
                     )
                 if family_names:
                     # The STORE has now spoken, so this — not the caller's
-                    # config — is what the run reports. Both directions: a
-                    # store that declares the fold clears a pessimistic guess
-                    # (its close invokes fire from the recomputed units just
-                    # below), and one that withdraws it sets the flag (review
-                    # findings).
+                    # config — is what the run reports: a manifest that
+                    # withdrew the fold fires no close, so the families it was
+                    # asked to carry fold nowhere (review finding).
                     summary["families_unswept"] = not told
                 if family_names and not told:
                     # Loud rather than silent — the artifacts are regenerable,

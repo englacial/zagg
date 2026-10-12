@@ -646,13 +646,16 @@ ordering exactly:
    *scheduling* preference, not a correctness device: under-coverage is
    recorded in each artifact's own `source_children` and heals on the next
    pass, so an expired barrier logs loudly and the run proceeds;
-3. on a windowed store that declares `output.pyramid.all_time`, the tuple's
-   **close** units — one per node, the all-time fold over the node's
-   per-window overviews — are fired once its window units are in. The next
-   tuple reads only the window units' stage columns, so it is fired at the
-   same moment and the two share one barrier; the last tuple's closes get
-   their own before the finisher. A store that does not declare the fold
-   fires no close and waits for nothing;
+3. on a windowed store, the tuple's **close** units — one per node, the
+   all-time fold over the node's per-window overviews
+   (`output.pyramid.all_time`, which every windowed config declares: the key
+   resolves to true when omitted and is refused when false,
+   [issue #610](https://github.com/englacial/zagg/issues/610) phase 4) — are
+   fired once its window units are in. The next tuple reads only the window
+   units' stage columns, so it is fired at the same moment and the two share
+   one barrier; the last tuple's closes get their own before the finisher. A
+   store written before the fold was required, whose manifest does not
+   declare it, fires no close and waits for nothing;
 4. next tuple; then the **finisher** invoke last — root `coverage.moc`
    (the `moc` family's own finish when the families rode, otherwise the work
    set's), the families' §10 section and `coverage.toc` sibling composed from
@@ -764,16 +767,17 @@ zagg` / `agg`) and the `client` facade's `Run.dispatch` (issue #588, either
 transport), through the one seam `runner._invoke_lambda_stage_sweep`. When
 the run **walks a `/2` ladder** — `runner._cascade_families`, the same
 config-only gate the Icechunk commit pin reads (`output.sweep: "stages"` and
-a `/2` declaration with a composable field), and on a windowed store also
-declares the all-time fold (`output.pyramid.all_time`) — the tail hands that seam
+a `/2` declaration with a composable field) — the tail hands that seam
 `families=zagg.sweep_families.CASCADE_FAMILIES` and fires **no**
 rollup-families leg of its own: the `stats`/`moc`/`submap` rollups ride the
 cascade's node closes and the §10 root section composes in its finisher, so
 the end of the run is one fan-out
 ([issue #610](https://github.com/englacial/zagg/issues/610) phase 4). A run
-that walks none — or a windowed run without `all_time`, which has no node
-close for a per-node rollup to ride — keeps the separate families leg exactly
-as before.
+that walks none keeps the separate families leg exactly as before. A windowed
+run always has the node close the rollups ride: `output.pyramid.all_time` is
+required on a windowed config — resolved to true when omitted, refused when
+false (espg's ruling on
+[PR #623](https://github.com/englacial/zagg/pull/623#issuecomment-6116823949)).
 
 !!! warning "Only the spatial Lambda tails chain it"
     `output.sweep: "stages"` validates on any hive config, and every tail
@@ -810,7 +814,7 @@ summary = run_stage_sweep_fleet(
     # Omitted here, so the ruled default rides: one dispatch node per invoke.
     # max_nodes_per_invoke=None,   # payload-only packing instead
     # A windowed store: one invoke per (node, window), plus the per-node
-    # close when the store declares the all-time fold.
+    # close — the all-time fold, which a windowed config always declares.
     # windowed=True, all_time=True,
     # The aggregation run this sweep completes (issue #593), if any.
     # pipeline_run_id="<run id>",
@@ -968,8 +972,8 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 | End-of-run step | What lands | If the launcher dies before it |
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
-| 2. rollup sweep (only when the run walks **no** `/2` ladder — the `/1` retrofit regime — or is windowed without `pyramid.all_time`; any other `/2` run's families ride step 3 and this step is not fired, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4) | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
-| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits — and, when the run walks the `/2` ladder (the tail then passes `families=zagg.sweep_families.CASCADE_FAMILIES`, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4), the rollup families riding the same walk, folded in each node's close and composed into the §10 root section by this run's own finisher, in place of step 2; a windowed store that declares no all-time fold has no close to carry them, so the tail hands it none and step 2 runs (the dispatcher's `families_unswept` warning is left for a config whose store withdrew the fold) — over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 2. rollup sweep (only when the run walks **no** `/2` ladder — the `/1` retrofit regime; any other `/2` run's families ride step 3 and this step is not fired, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4) | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits — and, when the run walks the `/2` ladder (the tail then passes `families=zagg.sweep_families.CASCADE_FAMILIES`, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4), the rollup families riding the same walk, folded in each node's close and composed into the §10 root section by this run's own finisher, in place of step 2 (a windowed store always has the node close they ride — `pyramid.all_time` is required on a windowed config — and the dispatcher's `families_unswept` report is left for a store whose manifest withdrew the fold) — over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
 
 Shards the launcher had not dispatched yet never run. Work through the steps

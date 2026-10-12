@@ -5946,20 +5946,20 @@ def _cascade_families(config, grid) -> tuple:
     families pass exactly as before: the ``/1`` retrofit regime, and a
     ``"stages"`` config whose store declares no walkable ladder — there the
     stage worker refuses at the ``/2`` gate and would fold nothing, so the
-    separate pass is the only one that reaches the rollups. ``()`` too for a
-    windowed store without ``output.pyramid.all_time``: it has no node close,
-    and a rollup object is per node and merges every window, so only a close
-    can fold it — the separate pass keeps those stores on every backend.
-    Every tail that chains the staged sweep decides with this (the CLI's two
-    backends and the ``client`` facade), so the backends agree; the
+    separate pass is the only one that reaches the rollups. A windowed store
+    needs no branch of its own: a rollup object is per node and merges every
+    window, so only the node's all-time close can fold it, and a windowed
+    config declares that close — ``output.pyramid.all_time`` resolves to true
+    when omitted and is refused when spelled false
+    (:func:`zagg.config._validate_pyramid`, espg's ruling on PR #623 question
+    (16)). Every tail that chains the staged sweep decides with this (the
+    CLI's two backends and the ``client`` facade), so the backends agree; the
     dispatcher's store-side ``closes`` check remains the warning path for a
-    config that declares the close on a store that withdrew it.
+    store whose manifest withdrew the close its config declares.
     """
     from zagg.icechunk_refs import ladder_walks
     from zagg.sweep_families import CASCADE_FAMILIES
 
-    if get_windowing(config) is not None and not (get_pyramid(config) or {}).get("all_time"):
-        return ()
     return tuple(CASCADE_FAMILIES) if ladder_walks(config, grid) else ()
 
 
@@ -6499,11 +6499,12 @@ def _invoke_lambda_stage_sweep(
     is the ladder alone. The tails pass :func:`_cascade_families`: the
     cascade's families when the run walks the ``/2`` ladder, in which case
     they fire no :func:`_invoke_lambda_families_sweep`, so the end of a run
-    is one fan-out. On a windowed store that declares no all-time fold there
-    is no close for them to ride; the dispatcher WARNS and reports that
-    (``families_unswept``) rather than refusing — the rollups are regenerable
-    (D9), and ``python -m zagg.sweep <store> --families stats,moc,submap``
-    is the backstop.
+    is one fan-out. They ride the node close, which a windowed config always
+    declares (``output.pyramid.all_time``, required at validation); a store
+    whose manifest withdrew it is reported by the dispatcher
+    (``families_unswept``, from the store's own answer) rather than refused —
+    the rollups are regenerable (D9), and ``python -m zagg.sweep <store>
+    --families stats,moc,submap`` is the backstop.
     """
     from zagg.sweep_fleet import run_stage_sweep_fleet
 
