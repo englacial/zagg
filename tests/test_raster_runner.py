@@ -1173,6 +1173,10 @@ class TestRasterWindowedAllTimeFold:
         cfg.output["pyramid"] = knob
         with pytest.raises(ValueError, match="output.pyramid.all_time: false is refused"):
             validate_config(cfg)
+        # The refusal is the WINDOWING's: the same raster config without
+        # ``output.windowing`` keeps the knob as the caller spelled it.
+        cfg.output.pop("windowing")
+        validate_config(cfg)
 
 
 class TestRasterHiveLambdaBackend:
