@@ -1462,7 +1462,7 @@ def sweep_overviews(
         logger.info(
             f"sweep[overview]: the manifest pyramid declaration is {spec!r} — /2 "
             f"stores are swept by the staged sweep (issue #384: run_stage_sweep, "
-            f"`python -m zagg.sweep --stages`, or output.sweep 'stages'); the "
+            f"`python -m zagg.sweep --stages --scope …`, or output.sweep 'stages'); the "
             f"overview family generates nothing here"
         )
         return counts

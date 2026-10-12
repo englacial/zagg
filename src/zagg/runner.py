@@ -35,6 +35,7 @@ from zagg.concurrency import (
 )
 from zagg.config import (
     PipelineConfig,
+    chains_stages,
     get_child_order,
     get_consolidate_metadata,
     get_coverage_moc,
@@ -3636,17 +3637,19 @@ def _run_local(
         riding = _cascade_families(config, grid)
         if leaves and not riding:
             sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
-        # Post-fleet staged chaining (issue #384) — OPT-IN via
-        # `output.sweep: "stages"` (the recorded lean for open question
-        # (c); flipping it to the default is espg's call). Auto-scoped to
-        # this run's footprint; fail-open. Touched current units ride as
-        # dirt-only (issue #580): their nodes re-gather the rewritten ref
-        # sidecars, nothing is re-folded.
+        # Post-fleet staged chaining (issue #384), the DEFAULT for a hive
+        # store that declares a ladder since issue #620 ("the sweep belongs
+        # to the append"); `output.sweep: true`/`"families"` keeps the pass
+        # alone. Auto-scoped to this run's footprint — the scoping that makes
+        # it an append's cost and not the store's; fail-open. Carries the
+        # rollup families when they ride (one walk, issue #610 phase 4).
+        # Touched current units ride as dirt-only (issue #580): their nodes
+        # re-gather the rewritten ref sidecars, nothing is re-folded.
         dirt_only = dirt_only_leaves(report.results)
-        if (leaves or dirt_only) and config.output.get("sweep") == "stages":
+        if (leaves or dirt_only) and chains_stages(config, grid):
             from zagg.sweep_stages import stage_sweep_after_run
 
-            stage_sweep_after_run(
+            staged = stage_sweep_after_run(
                 store_path,
                 leaves,
                 dirt_only=dirt_only,
@@ -3656,6 +3659,10 @@ def _run_local(
                 pipeline_run_id=run_id,
                 families=riding,
             )
+            # Failed open (None) with the families riding — e.g. a /1
+            # manifest under a ladder-declaring config: name the backstop, as
+            # the fleet tail does.
+            _warn_families_unswept(riding, staged)
     # Icechunk run finalize (issue #582, spec §11.4): AFTER every commit of
     # the run — the staged sweep's ladder commits included — tag the tip
     # ``run-{run_id}`` and apply retention. In-process here, fail-open.
@@ -4589,9 +4596,10 @@ def _run_lambda(
                         store_kwargs=_output_store_kwargs(output_creds_event, region),
                         run_id=run_id,
                     )
-                # Post-fleet STAGED chaining (issues #384/#519) — OPT-IN via
-                # `output.sweep: "stages"`, the same knob the local dispatcher
-                # reads. Like the families leg this one blocks: the staged
+                # Post-fleet STAGED chaining (issues #384/#519) — the
+                # DEFAULT for a ladder-declaring hive store since issue #620,
+                # resolved from the same knob the local dispatcher reads
+                # (`zagg.config.get_sweep_mode`). Like the families leg this one blocks: the staged
                 # sweep is a fan-out with a soft barrier between tuples, so
                 # the ordering has to be driven
                 # from somewhere and the dispatcher is the only place that can
@@ -4602,7 +4610,7 @@ def _run_lambda(
                 # current units ride as dirt-only (issue #580), as on
                 # _run_local: their nodes re-gather refs, nothing is re-folded.
                 dirt_only = dirt_only_leaves(bodies)
-                if (leaves or dirt_only) and config.output.get("sweep") == "stages":
+                if (leaves or dirt_only) and chains_stages(config, grid):
                     stage_chained = True
                     staged = _invoke_lambda_stage_sweep(
                         state["lambda_client"],
@@ -5941,12 +5949,19 @@ def _cascade_families(config, grid) -> tuple:
     """The rollup families this run's staged sweep carries (issue #610 phase 4).
 
     :data:`zagg.sweep_families.CASCADE_FAMILIES` when the run WALKS the
-    ``/2`` ladder — :func:`zagg.icechunk_refs.ladder_walks`, the same
-    config-only gate the Icechunk commit pin hangs on: ``output.sweep:
-    "stages"`` and a ``/2`` declaration with a composable field — so the
+    ``/2`` ladder: the tail chains the staged sweep
+    (:func:`zagg.config.chains_stages` — the RESOLVED mode, so the issue #620
+    default for a ladder-declaring hive store counts, not only an explicit
+    ``output.sweep: "stages"``) and the config declares a ``/2`` ladder with
+    a composable field (:func:`zagg.icechunk_refs.walkable_ladder`) — so the
     ``stats``/``moc``/``submap`` rollups fold in the cascade's node closes and
     the tail fires no families fan-out of its own (espg's phase-4 ruling: one
-    fan-out, one cascade). ``()`` otherwise, and the tail runs the whole-tree
+    fan-out, one cascade). Keyed on the resolved mode rather than
+    :func:`zagg.icechunk_refs.ladder_walks` deliberately: that one stays on
+    the explicit key because the Icechunk commit default hangs on it (espg's
+    ruling on PR #622 question (1)), while a default-chained ladder that did
+    not carry the families would fire the pass AND the staged sweep — the two
+    walks phase 4 retired. ``()`` otherwise, and the tail runs the whole-tree
     families pass exactly as before: the ``/1`` retrofit regime, and a
     ``"stages"`` config whose store declares no walkable ladder — there the
     stage worker refuses at the ``/2`` gate and would fold nothing, so the
@@ -5961,10 +5976,12 @@ def _cascade_families(config, grid) -> tuple:
     dispatcher's store-side ``closes`` check remains the warning path for a
     store whose manifest withdrew the close its config declares.
     """
-    from zagg.icechunk_refs import ladder_walks
+    from zagg.icechunk_refs import walkable_ladder
     from zagg.sweep_families import CASCADE_FAMILIES
 
-    return tuple(CASCADE_FAMILIES) if ladder_walks(config, grid) else ()
+    if chains_stages(config, grid) and walkable_ladder(config, grid):
+        return tuple(CASCADE_FAMILIES)
+    return ()
 
 
 def _warn_families_unswept(riding, staged) -> None:

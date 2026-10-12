@@ -43,7 +43,16 @@ leaf.
   until they are rebuilt. Use each store's run-record config (vendored for
   the v1 ATL03 store and `gedi_flux_o9` as `tests/data/*.config.json`);
   `tests/test_live_store_templates.py` pins both digests and proves `count` is
-  the only divergence (issue #547).
+  the only divergence (issue #547). The templates also declare the leaf
+  ladder now — `output.pyramid: {overviews: [16, 15, 14, 13]}` since
+  [issue #620](https://github.com/englacial/zagg/issues/620), where the live
+  stores were built with `pyramid: false` (GEDI) or `{overviews: 13}` (the v3
+  ATL03 store) — and `pyramid` is hash-invisible, so the semantic guard does
+  **not** catch that difference: `declare_pyramid` derives the block from the
+  config it is handed and *replaces* a differing declaration (`previous:
+  replaced`). Hand it the run-record config, or the template with
+  `output.pyramid` set to what the store declares, unless re-declaring the
+  ladder is the intent.
   **A store built before the
   [index-exclusion epoch](hive_layout.md#migration-the-index-exclusion-epoch-issue-499)**
   (issue #499 — `data_source.index` left the semantic core) is accepted on
@@ -161,7 +170,7 @@ The gate is the **manifest's** declaration, and every refusal names itself:
 ### 3. Build the ladder with the staged sweep
 
 ```bash
-python -m zagg.sweep s3://bucket/prefix/product --stages
+python -m zagg.sweep s3://bucket/prefix/product --stages --scope all
 ```
 
 Nothing about this step is upgrade-specific — it is the ordinary `/2` staged

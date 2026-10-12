@@ -478,6 +478,57 @@ while the digit tree has any `{sign+base}` children (one delimiter-LIST):
 clear the store root, or pick a new one, before writing with a different
 configuration.
 
+### The templates declare the ladder (issue #620)
+
+The three packaged hive templates ship the `/2` ladder rather than
+`pyramid: false` (espg's ruling on
+[PR #622](https://github.com/englacial/zagg/pull/622#issuecomment-6116597451)):
+
+| template | `output.pyramid.overviews` | cells / shard | column tier |
+|---|---|---|---|
+| `atl03_tdigest_strata_healpix` | `[16, 15, 14, 13]` — the v4 store's | 19 / 9 | 16 … 9 |
+| `atl03_tdigest_healpix_hive` | `[16, 15, 14, 13]` — follows the strata one | 19 / 9 | 16 … 9 |
+| `gedi01b_waveform_healpix_hive` | `[16, 15, 14, 13]` — the same relation to its shard order | 18 / 9 | 16 … 9 |
+
+The coarsest member is the shard order + 4 in each, so the fixed every-order
+ladder above the shard bottoms out at node 0 / cells 4 — the same 13..4 dense
+ladder the v3 ATL03 store declared as `{overviews: 13}`, plus the finer leaf
+members. GEDI's cells are order 18, so its finest member sits two orders above
+the base data where ATL03's sits three; the tier is otherwise identical. The
+declaration is hash-invisible (D11), so no template's `semantic_hash` moved
+(`tests/test_live_store_templates.py` pins the digests and the ladder). Two
+consequences follow for an operator:
+
+- **A run from any of these templates chains the staged sweep by default.**
+  `output.sweep` is unset in all three, and an unset `sweep` on a hive config
+  that declares a ladder resolves to `"stages"` (`zagg.config.get_sweep_mode`,
+  [the staged sweep](#the-staged-sweep-issue-384)), so the ladder — and the
+  rollup families riding it — folds in the run tail, scoped to the run's own
+  footprint. `sweep: true` keeps the families pass alone; `false` keeps neither.
+- **A store templated before this may carry a different declaration, and its
+  manifest is the store's truth.** The older templates built `pyramid: false`
+  stores, and the v3 ATL03 store declares `{overviews: 13}`. `pyramid.spec`
+  is written once, at init; an append from the new template never rewrites
+  it, and the staged sweep refuses a `/1` manifest per invoke (see the
+  *Migration* notes on PR #622). **`sweep: true` is not the opt-out.** It
+  stops the staged fan-out, but the leaf side follows the *config's* ladder
+  and not the manifest. The leaf worker writes `[16..9]` columns
+  (`leaf_column_plan`) that the store declares nowhere. The Icechunk leaf seam
+  stages refs for the config's leaf levels (`leaf_level_cells`) into a repo
+  whose groups were built from the manifest. The `16` group does not exist
+  there, so every new leaf's commit fails, its base refs included, and the
+  leaf drops out of the index (fail-open: `icechunk.error` in its sidecar).
+  Append to an older store with **`output.pyramid` set to what its manifest
+  declares**: `false`, or `{overviews: 13}` for the v3 store. That config
+  writes no undeclared column and indexes only the store's own levels. A
+  `false` declaration also resolves the default sweep to the families pass.
+  Or retrofit the store first. The retrofit is
+  [`--declare-pyramid`](#retrofitting-the-pyramid-declaration) with the
+  config the store was built from; `declare_pyramid` replaces a differing
+  declaration, so the template as shipped re-declares an older store's ladder
+  as `[16, 15, 14, 13]` — intend that, or hand it the store's run-record config
+  ([pyramid_upgrade.md](pyramid_upgrade.md)).
+
 ### Leaf columns (`zagg-column/1`)
 
 Under a `/2` declaration the **leaf worker itself** writes the finest pyramid
@@ -697,18 +748,28 @@ A `zagg-pyramid/2` store's above-shard ladder is materialized by **stage
 workers over the leaf columns** — a raw leaf is never read above the shard:
 
 ```
-python -m zagg.sweep s3://bucket/store --stages            # CLI backstop
-python -m zagg.sweep s3://bucket/store --stages --partitions 16
-python -m zagg.sweep s3://bucket/store --stages --pipeline-run-id <run id>
+python -m zagg.sweep s3://bucket/store --stages --scope 3111,3112   # CLI backstop
+python -m zagg.sweep s3://bucket/store --stages --scope all --partitions 16
+python -m zagg.sweep s3://bucket/store --stages --scope all --pipeline-run-id <run id>
 ```
 
+`--scope` is **required** under `--stages` ([issue
+#620](https://github.com/englacial/zagg/issues/620)): this CLI is the recovery
+form, so it names the subtree being recovered, and the whole store is asked
+for by name (`--scope all`). An unscoped pass re-visits every node, and a node
+that is already current still costs its visit.
+
 or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
-chained immediately after a fleet run with the opt-in `output.sweep:
-"stages"` (auto-scoped to the run's own footprint) — from `python -m zagg`
+chained immediately after a fleet run by `output.sweep: "stages"`
+(auto-scoped to the run's own footprint) — from `python -m zagg`
 and from the `client` facade's `Run.dispatch` alike ([issue
 #588](https://github.com/englacial/zagg/issues/588); the facade's post-run
 tail chains it after the run record and the rollup sweep, and the summary
-rides the handle as `handle.stage_sweep`). Work is discovered from
+rides the handle as `handle.stage_sweep`). That chaining is **the default**
+for a hive store that declares a ladder since [issue
+#620](https://github.com/englacial/zagg/issues/620) — the sweep belongs to
+the append, not to an operator call; `sweep: true` (or `"families"`) keeps
+the families pass alone and `false` (or `"none"`) keeps neither. Work is discovered from
 the **run records** (listing-based; the root `coverage.moc` is an
 accelerator for sibling candidates, never the source of truth — a fleet
 append with no subsequent sweep leaves it stale, and discovery still finds
@@ -2226,7 +2287,8 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   run's sweep or an unnamed `--stages` pass landing after this run opened
   cannot tag it, and a later unnamed pass does not block the run's own
   record either. No `--force`: an incomplete sweep is completed with
-  `python -m zagg.sweep <store> --stages --pipeline-run-id <run_id>` first.
+  `python -m zagg.sweep <store> --stages --scope all --pipeline-run-id <run_id>`
+  first.
   **Where it runs.** On an `s3://` store all of that is the worker's: the
   command fires one synchronous `mode: "icechunk_finalize"` invoke —
   `{mode, store_path, run_id, newest_only: true, operator_checks: true}`,
@@ -2477,7 +2539,10 @@ The ATL03 demo store was rebuilt from scratch on the 0.57.0 fleet as
 now names ([issue #560](https://github.com/englacial/zagg/issues/560); the
 runbook is the operator's `demo/15_rebuild_2026-10.ipynb`, kept outside the
 tree). It was built from the packaged `atl03_tdigest_strata_healpix` template
-(plus `output.pyramid: {overviews: 13}`) against the frozen operator-local
+(plus `output.pyramid: {overviews: 13}`; the template then shipped
+`pyramid: false`, and since [issue #620](https://github.com/englacial/zagg/issues/620)
+declares the v4 ladder `{overviews: [16, 15, 14, 13]}` itself — see
+[the templates declare the ladder](#the-templates-declare-the-ladder-issue-620)) against the frozen operator-local
 shardmaps `shardmap_california_o9.json` (2,726 shards) and
 `shardmap_neon_aop_o9.json` (251 shards, 13 overlapping), not in the tree, so its manifest is born at the post-epoch digest
 `aacfe1e387d2…` (no [index-exclusion migration](#migration-the-index-exclusion-epoch-issue-499)

@@ -1836,6 +1836,34 @@ class TestLocalFamiliesRideTheCascade:
         seen = self._tail(monkeypatch, atl06_config, tmp_path, ladder=True, sweep=True)
         assert seen["pass"] == 1 and seen["stage"] == []
 
+    def test_the_default_rides_the_cascade_locally(self, monkeypatch, atl06_config, tmp_path):
+        # The issue #620 default (an unset sweep, a declared ladder) is one
+        # walk too: the gate reads the resolved mode, not the explicit key.
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        seen = self._tail(monkeypatch, atl06_config, tmp_path, ladder=True, sweep=None)
+        assert seen["pass"] == 0
+        (kwargs,) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
+
+    @pytest.mark.parametrize("staged", [None, {"stages": []}])
+    def test_a_failed_open_staged_tail_names_the_backstop(
+        self, monkeypatch, atl06_config, tmp_path, caplog, staged
+    ):
+        # The default on a /1-manifest store: the families ride, the staged
+        # sweep refuses and fails open (None), so the rollups went unswept —
+        # the local tail warns as the fleet tail does, never silently.
+        import zagg.sweep as sweep_mod
+        import zagg.sweep_stages as stages_mod
+
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [(1, None)])
+        monkeypatch.setattr(sweep_mod, "sweep_after_run", lambda *a, **k: None)
+        monkeypatch.setattr(stages_mod, "stage_sweep_after_run", lambda *a, **k: staged)
+        atl06_config.output["sweep"] = None  # unset: the issue #620 default
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            self._run(monkeypatch, atl06_config, tmp_path, touch=None, ladder=True)
+        assert ("--families stats,moc,submap" in caplog.text) == (staged is None)
+
 
 class TestSummaryKeysByteIdentical:
     """The dispatch refactor (#63) must leave the run-summary dict keys -- and
@@ -4912,6 +4940,37 @@ class TestLambdaFamiliesRideTheCascade:
         assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
         atl06_config.output["sweep"] = True
         assert runner._cascade_families(atl06_config, grid) == ()  # no staged sweep to ride
+
+    def test_the_gate_is_the_resolved_mode_not_the_explicit_key(self, atl06_config):
+        # Issue #620: an UNSET sweep on a ladder-declaring hive store chains
+        # the staged sweep by default, so the families ride it — were the gate
+        # ``ladder_walks`` (the explicit key, kept for the Icechunk commit
+        # default per espg's ruling on PR #622 question (1)) the tail would
+        # fire the pass AND the staged sweep: the two walks phase 4 retired.
+        from zagg import runner
+        from zagg.config import chains_stages
+        from zagg.icechunk_refs import ladder_walks
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        grid = _stub_grid()
+        grid.chunk_order = 7
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output.pop("sweep", None)
+        assert chains_stages(atl06_config, grid) and not ladder_walks(atl06_config, grid)
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
+        grid.chunk_order = 8  # no interior chunk order: the default is the pass alone
+        assert not chains_stages(atl06_config, grid)
+        assert runner._cascade_families(atl06_config, grid) == ()
+
+    def test_the_default_rides_the_cascade_on_the_fleet(self, monkeypatch, atl06_config):
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, staged={"finisher": {}}, ladder=True, sweep=None
+        )
+        assert seen["sweep"] == 0 and summary["families_sweep"] is None
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
 
     def test_a_windowed_store_rides_the_cascade_like_any_other(self, atl06_config):
         # A rollup object is per node and merges every window, so only the

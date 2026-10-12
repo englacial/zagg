@@ -238,29 +238,52 @@ def finest_dispatch_order(shard_order: int, tuple_width: int | None = None) -> i
     return int(stage_tuples(int(shard_order), tuple_width=width)[0]["dispatch"])
 
 
-def ladder_walks(config, grid) -> bool:
-    """Whether this run's staged sweep walks the ref ladder (§11.4).
+def walkable_ladder(config, grid) -> bool:
+    """Whether the config declares a ``/2`` ladder a staged sweep can walk.
 
-    The unset-``commit`` default hangs on it. True only when the dispatcher
-    chains the staged sweep (``output.sweep: "stages"``) AND the config
-    declares a ``/2`` ladder with at least one composable field — the same
-    derivation :func:`zagg.column.leaf_column_plan` runs; without either,
-    :func:`zagg.sweep_stages.sweep_stage_pass` returns before its first
-    node, and a ladder-mode run would leave the repo empty while every
-    leaf's sidecar reported success (review finding). Config-only, so the
-    init step and every worker resolve the same answer — every dispatcher
-    chains the staged sweep under ``stages`` (the CLI, the local backend and
-    the ``client`` facade alike, issue #588); one that does not would pin
-    ``commit: "leaf"`` in the config it ships instead.
+    The same derivation :func:`zagg.column.leaf_column_plan` runs: a ``/2``
+    declaration with at least one composable field. Without it
+    :func:`zagg.sweep_stages.sweep_stage_pass` returns before its first node,
+    so nothing keyed on "the ladder walks" — the Icechunk commit default
+    (:func:`ladder_walks`) or the rollup families riding the cascade
+    (``runner._cascade_families``, issue #610 phase 4) — may claim a walk here
+    returns False for. Config-only, so the init step, every worker and every
+    dispatcher resolve the same answer.
     """
-    if config.output.get("sweep") != "stages":
-        return False
     from zagg.column import leaf_column_plan
 
     try:
         return leaf_column_plan(config, grid) is not None
     except ValueError:
         return False  # a declaration the sweep would refuse walks no ladder either
+
+
+def ladder_walks(config, grid) -> bool:
+    """Whether this run's staged sweep walks the ref ladder (§11.4).
+
+    The unset-``commit`` default hangs on it. True only when the dispatcher
+    chains the staged sweep (``output.sweep: "stages"``) AND the config
+    declares a walkable ladder (:func:`walkable_ladder`); without either, a
+    ladder-mode run would leave the repo empty while every leaf's sidecar
+    reported success (review finding). Every dispatcher chains the staged
+    sweep under ``stages`` (the CLI, the local backend and the ``client``
+    facade alike, issue #588); one that does not would pin ``commit: "leaf"``
+    in the config it ships instead.
+
+    Deliberately the EXPLICIT key, not :func:`zagg.config.get_sweep_mode`
+    (issue #620, espg's ruling on PR #622 question (1)): the sweep's own
+    default moved to ``"stages"`` for a ladder-declaring hive store, but the
+    commit REGIME is what objects a leaf worker writes, and moving that by
+    default is a second behaviour change riding the first — v4's Icechunk
+    layout is still being settled (PR #604). ``commit: "leaf"`` composes with
+    a chained ladder already — those nodes commit their overview refs under
+    ``"leaf"`` too — so the default staying per-leaf is coherent, not a gap.
+    The families-ride gate is the one that follows the resolved mode
+    (``runner._cascade_families`` reads :func:`zagg.config.chains_stages`).
+    """
+    if config.output.get("sweep") != "stages":
+        return False
+    return walkable_ladder(config, grid)
 
 
 def resolve_options(config, shard_order: int, *, tuple_width: int | None = None, grid=None) -> dict:

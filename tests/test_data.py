@@ -34,4 +34,7 @@ class TestDemoHiveConfig:
         bench = load_config("tests/data/benchmark/configs/atl03_tdigest_healpix_o9_hive.yaml")
         assert from_config(packaged).spatial_signature() == from_config(bench).spatial_signature()
         assert packaged.output["store_layout"] == "hive"
-        assert packaged.output["pyramid"] is False
+        # The ladder is hash- and shardmap-invisible (issue #620): the spatial
+        # signature above is what pairs the two; the ladder itself is pinned
+        # in tests/test_live_store_templates.py.
+        assert packaged.output["pyramid"] == {"overviews": [16, 15, 14, 13]}

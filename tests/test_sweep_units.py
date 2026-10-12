@@ -1289,10 +1289,12 @@ class TestPipelineRunId:
         _stage_store(root)
         _write_discovery_record(root)
         base = _snapshot(root)
-        assert main([str(root), "--stages"]) == 0
+        assert main([str(root), "--stages", "--scope", "all"]) == 0
         assert _root_record(root)["pipeline_run_id"] is None  # vouches for no run
         _restore(root, base)
-        assert main([str(root), "--stages", "--pipeline-run-id", "pipeline-3"]) == 0
+        assert (
+            main([str(root), "--stages", "--scope", "all", "--pipeline-run-id", "pipeline-3"]) == 0
+        )
         assert _root_record(root)["pipeline_run_id"] == "pipeline-3"
         capsys.readouterr()
         with pytest.raises(SystemExit):

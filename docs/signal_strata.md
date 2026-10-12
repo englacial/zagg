@@ -39,7 +39,12 @@ each word, never from the centroid's weight (spec §2.2/§9.1). The
 five confidence columns are read from the single 2-D `signal_conf_ph` dataset
 via the per-variable `column` selector (`{path: ..., column: k}` — the
 variable analogue of the structured-filter `column`); the shared path is
-still read once.
+still read once. The template declares the leaf ladder too —
+`output.pyramid: {overviews: [16, 15, 14, 13]}`, the v4 store's tier
+([issue #620](https://github.com/englacial/zagg/issues/620); the two digest
+fields and `composition` ride it, see
+[hive_layout.md](hive_layout.md#the-templates-declare-the-ladder-issue-620)) —
+so a run from it chains the staged sweep in its tail by default.
 
 ## Why the presence floor
 
