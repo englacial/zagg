@@ -4581,6 +4581,13 @@ def _run_lambda(
         # how the v3 ladder's short orders reached nobody. ``None`` when no
         # staged sweep was chained or its dispatch failed open (D9), the same
         # meaning ``client.RunHandle.stage_sweep`` carries.
+        #
+        # The dispatcher's summary rides WHOLE, per-tuple rows and all, because
+        # the handle's key is documented as "the same dict ``_run_lambda``
+        # reports" — a condensed summary and a whole handle would disagree
+        # again, which is the defect this reporting closes (review finding).
+        # The condensed verdict is a key of its own beside it, not a
+        # replacement.
         summary["stage_sweep"] = None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
