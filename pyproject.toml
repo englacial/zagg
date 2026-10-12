@@ -209,6 +209,7 @@ benchmark = [
     "pyarrow",
 ]
 test = [
+    "jsonschema>=4.0",
     "pytest>=8.0",
     "stac-geoparquet>=0.7.0",
 ]
