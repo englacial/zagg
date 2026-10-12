@@ -502,7 +502,10 @@ class TestStoreLadderGate:
             summary = _tail_fleet(root, client)
         # ZERO invokes: not the finisher's either, and no barrier was waited.
         assert client.events == [] and summary["invokes"] == 0
-        assert summary["skipped"] == "no zagg-pyramid/2 ladder"
+        # The constant is the matchable prefix; the reason the gate saw rides
+        # behind it, so the run record is self-explaining.
+        assert summary["skipped"].startswith("no zagg-pyramid/2 ladder: ")
+        assert named in summary["skipped"]
         assert summary["stages"] == []
         assert summary["finisher"] == {"landed": False, "fired": False}
         # ONE warning, and it names the retrofit and what it saw.
@@ -575,7 +578,7 @@ class TestStoreLadderGate:
         root.mkdir()
         client = _FakeLambda(None)
         summary = _tail_fleet(root, client)
-        assert client.events == [] and summary["skipped"] == "no zagg-pyramid/2 ladder"
+        assert client.events == [] and summary["skipped"].startswith("no zagg-pyramid/2 ladder")
 
     def test_a_two_store_is_untouched(self, tmp_path):
         # Acceptance: no change to what a /2 store does. The same fan-out,
@@ -679,4 +682,4 @@ class TestStoreLadderGate:
             store_kwargs={},
             barrier_timeout_s=0.01,
         )
-        assert client.events == [] and summary["skipped"] == "no zagg-pyramid/2 ladder"
+        assert client.events == [] and summary["skipped"].startswith("no zagg-pyramid/2 ladder")
