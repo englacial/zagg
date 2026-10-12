@@ -1952,6 +1952,9 @@ class TestSummaryKeysByteIdentical:
         # The tail's families-sweep outcome (issue #610); None when nothing
         # was swept. LAMBDA-only — the local backend sweeps in-process.
         "families_sweep",
+        # The tail's staged-sweep summary (issue #610); None when no staged
+        # sweep was chained or its dispatch failed open. LAMBDA-only, as above.
+        "stage_sweep",
     } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -4859,6 +4862,30 @@ class TestLambdaSkipAndDirtOnly:
         )
         assert seen["order"] == ["stage", "finalize"]
         assert summary["icechunk_finalize"] == {"tag": "run-x"}
+
+    @pytest.mark.parametrize(
+        "staged",
+        [
+            None,  # the dispatch failed open (D9)
+            {
+                "run_id": "stage-x",
+                "barrier_timed_out": True,
+                "short_orders": [2, 1, 0],
+                "finisher": {"fired": True, "landed": True},
+            },
+        ],
+    )
+    def test_the_staged_outcome_rides_the_run_summary(self, monkeypatch, atl06_config, staged):
+        # The ladder's half of "not swallowed" (issue #610): a walled tuple is
+        # reported where the families leg is, not in the dispatcher's log alone.
+        summary, seen = self._drive(monkeypatch, atl06_config, body=self._DIRTY, staged=staged)
+        assert len(seen["stage"]) == 1 and summary["stage_sweep"] is staged
+
+    def test_no_staged_sweep_reports_none(self, monkeypatch, atl06_config):
+        # An unmarked current unit enters no sweep, so there is nothing to report.
+        body = {"current": True, "total_obs": 0}
+        summary, seen = self._drive(monkeypatch, atl06_config, body=body)
+        assert seen["stage"] == [] and summary["stage_sweep"] is None
 
 
 class TestLambdaFamiliesRideTheCascade:

@@ -4574,6 +4574,14 @@ def _run_lambda(
         # on every unit shape, so nothing that did not land gets in.
         stage_chained, staged = False, None
         summary["families_sweep"] = None
+        # The staged leg's outcome, reported beside the families leg's (issue
+        # #610): its barriers are soft, so a walled tuple comes back as
+        # ``barrier_timed_out`` / ``short_orders`` and the ladder is partly
+        # unfolded — a log line alone does not outlive the process, which is
+        # how the v3 ladder's short orders reached nobody. ``None`` when no
+        # staged sweep was chained or its dispatch failed open (D9), the same
+        # meaning ``client.RunHandle.stage_sweep`` carries.
+        summary["stage_sweep"] = None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -4635,6 +4643,7 @@ def _run_lambda(
                         # closes in place of their own fan-out (issue #610).
                         families=riding,
                     )
+                    summary["stage_sweep"] = staged
                     _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
