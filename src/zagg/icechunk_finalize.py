@@ -21,7 +21,11 @@ One finalize does, in order:
    are ever deleted, and only here. Objects a concurrent writer has in
    flight are never collected, but a writer session whose base predates the
    cutoff cannot commit (spec §11.4); virtual targets (the leaves) are never
-   touched by any of it (icechunk manages none of them). Fail-open: an error
+   touched by any of it (icechunk manages none of them). What collection
+   does reclaim of ours are the **native** overview chunks (§11.3) that no
+   retained snapshot references — the repo's own objects, so they go in step
+   with the snapshots that could have read them, while the store's own
+   overview objects stay as they are. Fail-open: an error
    is recorded as ``retention_error`` and steps 2 and 3 still run;
 2. one empty ``finalize {run_id}`` commit whose METADATA identifies the run
    (``run_id``, ``semantic_hash``, ``zagg_version``, the ladder knobs) and
