@@ -640,6 +640,14 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
 
     try:
         manifest = read_manifest(store_path, **store_kwargs)
+    except ValueError as e:
+        # A manifest that does not PARSE is the store's own content, like a
+        # ``/1`` spec — not an access failure (review finding).
+        # ``hive._read_json`` guards only the not-found shapes, so a truncated
+        # object arrives here as ``json.JSONDecodeError``; failing open would
+        # point the operator at an IAM grant and then bill one invoke per
+        # dispatch node, each re-raising the same parse error worker-side.
+        return f"the {MANIFEST_NAME} at the store root does not parse ({e})"
     except Exception as e:
         logger.warning(
             f"stage fleet: the {MANIFEST_NAME} at {store_path} could not be read ({e}) — the "
