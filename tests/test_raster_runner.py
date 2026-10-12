@@ -1157,7 +1157,6 @@ class TestRasterWindowedAllTimeFold:
         # ``sweep_overviews`` returns at its "no composable fields" gate
         # before any leaf read. Issue #399's reducer-keyed folds are what
         # flips this arm; until then an ``all.zarr`` here would be debris.
-        import logging
         from pathlib import Path
 
         from zagg import hive
