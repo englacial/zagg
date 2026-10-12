@@ -92,29 +92,35 @@ def _write(session, pairs: list[tuple[str, bytes]]) -> None:
 def _sharded_pairs(entry: dict, order: int, row: int, prefix: str, store, *, etags: bool) -> list:
     """``(chunk key, bytes)`` for every present chunk of a sharded entry.
 
-    The object is read ONCE and sliced by the index the plan already read:
-    the chunk at grid position ``j`` is ``[offset, offset + length)`` of the
-    shard object, byte-for-byte the ``(1, C)`` chunk the repo array holds
-    (``icechunk_rows.reroot``), so the copy re-encodes nothing.
+    The entry is ONE object — a sharded hive array is one shard object, which
+    is what its single ``checksum`` belongs to and what ``object_ref_plan``
+    refuses anything else for — so it is read once and sliced by the index
+    the plan already read: the chunk at grid position ``j`` is
+    ``[offset, offset + length)`` of that object, byte-for-byte the ``(1, C)``
+    chunk the repo array holds (``icechunk_rows.reroot``), so the copy
+    re-encodes nothing.
     """
+    objects = {location for location in entry["locations"] if location}
+    if len(objects) > 1:
+        raise ValueError(
+            f"{entry['path']}: a sharded entry names {len(objects)} objects but carries one "
+            f"checksum; a hive leaf array is one shard object (spec §11.3)"
+        )
+    if not objects:
+        return []
+    (location,) = objects
+    data = _object_bytes(store, location[len(prefix) :], entry.get("checksum"), etags=etags)
     grid = tuple(int(n) for n in entry["chunk_grid"])
     offsets = np.asarray(entry["offsets"], dtype="<u8")
     lengths = np.asarray(entry["lengths"], dtype="<u8")
-    locations = list(entry["locations"])
-    data: dict[str, bytes] = {}
     pairs = []
     for flat, index in enumerate(np.ndindex(grid)):
-        location = locations[flat]
-        if not location:
+        if not entry["locations"][flat]:
             continue  # absent from the shard index: that chunk was never written
-        if location not in data:
-            data[location] = _object_bytes(
-                store, location[len(prefix) :], entry.get("checksum"), etags=etags
-            )
         start, length = int(offsets[flat]), int(lengths[flat])
         cell = (int(o) + int(i) for o, i in zip(entry["arr_offset"], index))
         key = "/".join(str(c) for c in (row, *cell))
-        pairs.append((f"{order}/{entry['path']}/c/{key}", data[location][start : start + length]))
+        pairs.append((f"{order}/{entry['path']}/c/{key}", data[start : start + length]))
     return pairs
 
 
