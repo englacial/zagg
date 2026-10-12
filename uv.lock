@@ -4298,6 +4298,7 @@ lambda = [
     { name = "xarray" },
 ]
 test = [
+    { name = "jsonschema" },
     { name = "pytest" },
     { name = "stac-geoparquet" },
 ]
@@ -4343,6 +4344,7 @@ requires-dist = [
     { name = "icechunk", specifier = ">=2.2.2" },
     { name = "icechunk", marker = "extra == 'lambda'", specifier = "==2.2.2" },
     { name = "ipyleaflet", marker = "extra == 'viz'", specifier = ">=0.19" },
+    { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.0" },
     { name = "matplotlib", marker = "extra == 'analysis'", specifier = ">=3.10.8" },
     { name = "matplotlib", marker = "extra == 'benchmark'", specifier = ">=3.10.8" },
     { name = "mortie", specifier = ">=1.0.0" },

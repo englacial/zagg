@@ -24,6 +24,7 @@ import re
 import struct
 from pathlib import Path
 
+import jsonschema
 import numpy as np
 import pytest
 import zarr
@@ -1151,8 +1152,8 @@ class TestIcechunkRootConventions:
     production spec builder, written through stock zarr); expectations come
     from the generator's INPUTS (the §11.1 rules over the ``pyramid/``
     levels). The grammar checks are spelled from the vendored schemas by
-    hand — ``jsonschema`` is not a test dependency — and run against the
-    real validator when one is importable.
+    hand and ALSO run against the real validator (``jsonschema`` is a test
+    dependency since issue #626, espg ruling on PR #629).
     """
 
     def _root(self) -> dict:
@@ -1250,14 +1251,12 @@ class TestIcechunkRootConventions:
             assert attrs["dggs"]["refinement_level"] == int(cells)
 
     def test_root_validates_against_the_multiscales_schema(self):
-        jsonschema = pytest.importorskip("jsonschema")
         jsonschema.validate(self._root(), _schema(MULTISCALES_SCHEMA))
 
     def test_levels_validate_against_the_dggs_schema(self):
         # Every level group and the base layout entry validate clean: zagg
         # spells dggs v1's ``semi_major_axis`` since issue #616 closed the
         # one gap (``ellipsoidObject`` is ``additionalProperties: false``).
-        jsonschema = pytest.importorskip("jsonschema")
         schema = _schema(DGGS_SCHEMA)
         docs = [(self._level(c), schema) for c in _expected(ICECHUNK)["levels"]]
         # The base layout entry's ``dggs`` is a full dggsProperties object.
