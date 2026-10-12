@@ -139,7 +139,9 @@ def _whole_object_pairs(entry: dict, order: int, row: int, prefix: str, store, *
     return pairs
 
 
-def stage_entry(session, order: int, row: int, entry: dict, prefix: str, store, *, etags) -> int:
+def stage_entry(
+    session, order: int, row: int, entry: dict, prefix: str, store, *, etags: bool
+) -> int:
     """Copy one ref-plan ``entry``'s chunks into ``session`` natively; the bytes written.
 
     ``order`` is the level's cell order (its group in the repo), ``row`` the
