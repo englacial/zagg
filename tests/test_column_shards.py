@@ -26,6 +26,7 @@ from zagg.column_shards import (
     inner_chunk_order,
     stored_layout,
 )
+from zagg.content_hash import content_hashes_record, hash_arrays
 from zagg.grids.healpix import HealpixGrid
 from zagg.grids.morton import morton_word
 from zagg.hive import COMMIT_ATTR, shard_leaf_path
@@ -224,7 +225,7 @@ class TestWrittenLayout:
 
 
 class TestLayoutParity:
-    """Both layouts of the same leaf: identical values, attrs and §5 hashes."""
+    """Both layouts of the same leaf: identical values, and §5 hashes of the stored arrays."""
 
     def test_whole_chunk_and_sharded_layouts_fold_to_identical_bytes(self, tmp_path, monkeypatch):
         sharded, folded = _write(tmp_path / "sharded")
@@ -236,12 +237,15 @@ class TestLayoutParity:
             for name in ("morton", "count"):
                 np.testing.assert_array_equal(a[name][:], b[name][:])
             assert [bytes(p) for p in a["h_tdigest"][:]] == [bytes(p) for p in b["h_tdigest"][:]]
-        # The §5 recipe hashes decoded values, so the stamps' records agree;
-        # the one layout difference is the array metadata.
-        stamps = [
-            dict(zarr.open_group(open_store(p), mode="r", zarr_format=3).attrs[COMMIT_ATTR])
-            for p in (sharded, whole)
-        ]
+        # The stamps' §5 records hash the slabs the writer was HANDED (staged),
+        # so they agree by construction; the parity leg is the record
+        # recomputed from each layout's STORED arrays, read back through its
+        # codec chain, equal to the stamp. The one layout difference is the
+        # array metadata.
+        groups = [zarr.open_group(open_store(p), mode="r", zarr_format=3) for p in (sharded, whole)]
+        stamps = [dict(g.attrs[COMMIT_ATTR]) for g in groups]
+        for group, stamp in zip(groups, stamps):
+            assert content_hashes_record(hash_arrays(group)) == stamp["content_hashes"]
         assert stamps[0]["content_hashes"] == stamps[1]["content_hashes"]
         assert stamps[0]["cells_with_data"] == stamps[1]["cells_with_data"] == 4
         assert _array_meta(whole, BASE, "count")["codecs"][0]["name"] == "bytes"
