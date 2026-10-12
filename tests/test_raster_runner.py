@@ -1180,7 +1180,10 @@ class TestRasterWindowedAllTimeFold:
             result = run_sweep(store_path, refs, families=("overview",))
         counts = result["families"]["overview"]
         assert counts["declared"] is True and counts["sweepable"] is True
-        assert counts["written"] == 0 and counts["failed"] == 0
+        # The run tail swept once already, so ``current`` is the counter that
+        # would betray an overview this arm then failed to find on the store.
+        assert counts["written"] == 0 and counts["current"] == 0
+        assert counts["empty"] == 0 and counts["failed"] == 0
         assert "no composable fields declared" in caplog.text
         # Nothing at ANY declared order — neither the all-time fold nor the
         # per-window overviews it would sit beside — and nothing anywhere.
