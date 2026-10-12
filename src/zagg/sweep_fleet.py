@@ -618,6 +618,13 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     does, which is the one thing issue #635 asks not to move (review
     finding).
 
+    ``shard_order`` is the caller's as a FALLBACK only: the ladder is filtered
+    at the store's own ``shard_order`` where the manifest carries one, because
+    the leaf exclusion is the workers' and every worker takes
+    ``int(manifest["shard_order"])``. In the hand-driven recovery form the
+    caller's value is an operator's, and the store's truth wins over it — the
+    same posture ``declare_pyramid`` takes.
+
     An UNREADABLE manifest is fail-open (D9), not a refusal: a dispatcher
     role may legitimately hold nothing but ``lambda:InvokeFunction`` against
     the store itself — the same D8 posture ``shard_order`` is handed in for —
@@ -642,7 +649,14 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
     if manifest is None:
         return f"no {MANIFEST_NAME} at the store root"
     try:
-        entries = ladder_entries(manifest.get("pyramid") or {}, shard_order)
+        # The STORE's shard order where it has one, not the caller's (review
+        # finding): the leaf exclusion is the workers' own, and every worker
+        # takes ``int(manifest["shard_order"])``. In the hand-driven recovery
+        # form ``shard_order`` is the operator's, so a value that disagrees
+        # would otherwise decline a store the workers sweep — under a
+        # retrofit warning that hides the real mismatch.
+        order = int(manifest.get("shard_order") or shard_order)
+        entries = ladder_entries(manifest.get("pyramid") or {}, order)
     except (AttributeError, KeyError, TypeError, ValueError) as e:
         # Not ``ValueError`` alone (review finding): ``ladder_entries``
         # normalizes every entry (``int(e["node"])``, ``[int(c) for c in
@@ -658,7 +672,7 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # nothing folds nothing but still carries the finisher's work.
         logger.info(
             f"stage fleet: {store_path} declares a ladder with no level below shard_order "
-            f"{shard_order} — the fan-out folds no level, as the workers' own gate allows"
+            f"{order} — the fan-out folds no level, as the workers' own gate allows"
         )
     return None
 
