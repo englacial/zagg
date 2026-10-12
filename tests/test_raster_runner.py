@@ -1193,8 +1193,15 @@ class TestRasterWindowedAllTimeFold:
             # The node path is composed from private helpers, so prove the
             # prefix exists before reading anything into what is not under it.
             assert node.is_dir()
-            assert not (node / "all.zarr").exists()
+            # ``*.zarr``, not just ``all.zarr``: a per-window overview is
+            # named ``{window}.zarr`` (``_overview_basename``), so globbing
+            # makes the method name true. Safe at these nodes because the
+            # leaves sit at full depth (``43314244114_20260713.zarr``), and
+            # no ancestor at a declared order holds a zarr of any name.
+            assert not list(node.glob("*.zarr"))
             assert not (node / "overview.rollup.json").exists()
+        # Store-wide backstop, deliberately ``all.zarr`` and not ``*.zarr``:
+        # the latter would match the two windowed leaves.
         assert not list(root.rglob("all.zarr"))
 
     def test_an_unwindowed_raster_config_declares_no_fold(self, tmp_path):
