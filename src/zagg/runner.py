@@ -3649,7 +3649,7 @@ def _run_local(
         if (leaves or dirt_only) and chains_stages(config, grid):
             from zagg.sweep_stages import stage_sweep_after_run
 
-            stage_sweep_after_run(
+            staged = stage_sweep_after_run(
                 store_path,
                 leaves,
                 dirt_only=dirt_only,
@@ -3659,6 +3659,10 @@ def _run_local(
                 pipeline_run_id=run_id,
                 families=riding,
             )
+            # Failed open (None) with the families riding — e.g. a /1
+            # manifest under a ladder-declaring config: name the backstop, as
+            # the fleet tail does.
+            _warn_families_unswept(riding, staged)
     # Icechunk run finalize (issue #582, spec §11.4): AFTER every commit of
     # the run — the staged sweep's ladder commits included — tag the tip
     # ``run-{run_id}`` and apply retention. In-process here, fail-open.

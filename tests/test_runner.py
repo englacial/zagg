@@ -1846,6 +1846,24 @@ class TestLocalFamiliesRideTheCascade:
         (kwargs,) = seen["stage"]
         assert kwargs["families"] == CASCADE_FAMILIES
 
+    @pytest.mark.parametrize("staged", [None, {"stages": []}])
+    def test_a_failed_open_staged_tail_names_the_backstop(
+        self, monkeypatch, atl06_config, tmp_path, caplog, staged
+    ):
+        # The default on a /1-manifest store: the families ride, the staged
+        # sweep refuses and fails open (None), so the rollups went unswept —
+        # the local tail warns as the fleet tail does, never silently.
+        import zagg.sweep as sweep_mod
+        import zagg.sweep_stages as stages_mod
+
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [(1, None)])
+        monkeypatch.setattr(sweep_mod, "sweep_after_run", lambda *a, **k: None)
+        monkeypatch.setattr(stages_mod, "stage_sweep_after_run", lambda *a, **k: staged)
+        atl06_config.output["sweep"] = None  # unset: the issue #620 default
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            self._run(monkeypatch, atl06_config, tmp_path, touch=None, ladder=True)
+        assert ("--families stats,moc,submap" in caplog.text) == (staged is None)
+
 
 class TestSummaryKeysByteIdentical:
     """The dispatch refactor (#63) must leave the run-summary dict keys -- and
