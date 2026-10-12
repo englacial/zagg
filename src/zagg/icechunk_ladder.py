@@ -73,13 +73,17 @@ GEOMETRY_KEYS = ("shard_order", "chunk_order", "cell_order")
 #: not any node did work, so the row's key set does not depend on the pass.
 #: ``icechunk_commit_s`` is the commit's own wall time, ``icechunk_s`` the
 #: hook's (the gather included); ``icechunk_replays`` counts the commits
-#: replayed in a fresh session over another run's row growth (§11.4).
+#: replayed in a fresh session over another run's row growth (§11.4);
+#: ``icechunk_native_bytes`` the overview bytes the commits COPIED into the
+#: repo rather than referenced (§11.3) — the price of a tag that reads its
+#: own fold, measured rather than asserted.
 STAGE_COUNTS = (
     "icechunk_refs",
     "icechunk_commits",
     "icechunk_rebases",
     "icechunk_replays",
     "icechunk_commit_s",
+    "icechunk_native_bytes",
     "icechunk_missing",
     "icechunk_failed",
     "icechunk_skipped_levels",
@@ -608,6 +612,7 @@ def stage_node_refs(
     counts["icechunk_rebases"] += outcome["rebases"]
     counts["icechunk_replays"] += outcome["replays"]
     counts["icechunk_commit_s"] += outcome["commit_s"]
+    counts["icechunk_native_bytes"] += outcome["native_bytes"]
     return record
 
 
@@ -682,6 +687,7 @@ def node_row(record: dict) -> dict:
         row["rebases"] = int(commit["rebases"])
         row["replays"] = int(commit.get("replays") or 0)
         row["commit_s"] = float(commit["commit_s"])
+        row["native_bytes"] = int(commit.get("native_bytes") or 0)
     return row
 
 

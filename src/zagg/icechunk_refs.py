@@ -1501,6 +1501,10 @@ def record_leaf(
         repo=repo,
     )
     arrays = sum(1 for unit in units for entry in unit["entries"] if entry["refs"])
+    # ``native_bytes`` belongs to the overview levels (§11.3) and a leaf's
+    # units name none of them, so it is 0 on every leaf and stays off the
+    # record §11.4 documents; the ladder's stage row is where it is read.
+    outcome = {key: value for key, value in outcome.items() if key != "native_bytes"}
     return {**outcome, "arrays": arrays, "checksum": checksum}
 
 

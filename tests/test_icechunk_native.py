@@ -215,6 +215,32 @@ class TestTheLadderCommitsOverviewsNatively:
         assert sum(row["icechunk_failed"] for row in rows) >= 1
         assert sum(row["icechunk_commits"] for row in rows) == 0
 
+    def test_the_stage_rows_count_the_bytes_the_copy_wrote(self, monkeypatch, cfg, tmp_path):
+        # The price of a tag that reads its own fold, measured rather than
+        # asserted: the committing tuples' rows carry it, every row has the
+        # key (``STAGE_COUNTS`` is pre-seeded), and the total is the overview
+        # objects' chunk bytes — here, every byte of every overview object
+        # the run wrote, since this geometry's overview arrays are one chunk.
+        from pathlib import Path
+
+        from test_icechunk_refs import _stage_rows
+
+        _grid_, root, summary = _ladder_run(
+            monkeypatch, cfg, tmp_path, icechunk_block={}, shards=_shards(_grid(cfg), 6)
+        )
+        assert summary["cells_error"] == 0
+        rows = _stage_rows(root)
+        assert all("icechunk_native_bytes" in row for row in rows)
+        copied = sum(row["icechunk_native_bytes"] for row in rows)
+        objects = sum(
+            obj.stat().st_size for obj in Path(root).rglob("all.zarr/**/c/*") if obj.is_file()
+        )
+        assert copied == objects > 0, (copied, objects)
+        # A leaf's own record never carries it: its units name no overview
+        # level, so the counter lives on the ladder's rows alone.
+        for meta in summary["results"]:
+            assert "native_bytes" not in meta["icechunk"], meta["icechunk"]
+
     def test_the_overview_objects_values_survive_the_copy(self, monkeypatch, cfg, tmp_path):
         from pathlib import Path
 

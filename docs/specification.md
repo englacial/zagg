@@ -4780,7 +4780,9 @@ columns do:
    included, and a replay counts whether or not its re-read then staged
    anything to commit. Each stage row
    records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
-   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
+   `icechunk_commit_s`, `icechunk_native_bytes` (the overview bytes its
+   commits copied into the repo rather than referenced, §11.3),
+   `icechunk_refs`, `icechunk_missing`,
    `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
    `icechunk_regathered` and `icechunk_s` — every one
    pre-seeded, so a row's key set does not depend on whether a node did work
