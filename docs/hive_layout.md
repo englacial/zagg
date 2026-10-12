@@ -235,8 +235,9 @@ output:
   failed cell on every backend — its 500 and its `failed` status object on
   the fleet, `cells_error` on both — but the
   leaves that landed are in the store, and the run's tail treats them as the
-  per-window fan-out would have: the **sweep work set** (the families sweep,
-  the staged sweep's `(node, window)` units and the node close) is every
+  per-window fan-out would have: the **sweep work set** (the staged sweep's
+  `(node, window)` units and the node close, which the rollup families ride
+  where the store declares one — the families pass otherwise) is every
   result's stats **records**, each on its own `success`, never the invoke's
   status; a shard enters the root **`coverage.moc`** when at least one of
   its leaves stands (written by this run, or found current or refused by the
