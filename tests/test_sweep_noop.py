@@ -504,7 +504,7 @@ class TestStoreLadderGate:
         assert client.events == [] and summary["invokes"] == 0
         # The constant is the matchable prefix; the reason the gate saw rides
         # behind it, so the run record is self-explaining.
-        assert summary["skipped"].startswith("no zagg-pyramid/2 ladder: ")
+        assert summary["skipped"].startswith("no sweepable zagg-pyramid/2 ladder: ")
         assert named in summary["skipped"]
         assert summary["stages"] == []
         assert summary["finisher"] == {"landed": False, "fired": False}
@@ -571,14 +571,16 @@ class TestStoreLadderGate:
         client = _FakeLambda(None)
         summary = _tail_fleet(root, client)
         assert client.events == [] and summary["invokes"] == 0
-        assert summary["skipped"].startswith("no zagg-pyramid/2 ladder")
+        assert summary["skipped"].startswith("no sweepable zagg-pyramid/2 ladder")
 
     def test_a_root_with_no_manifest_fires_nothing(self, tmp_path):
         root = tmp_path / "empty"
         root.mkdir()
         client = _FakeLambda(None)
         summary = _tail_fleet(root, client)
-        assert client.events == [] and summary["skipped"].startswith("no zagg-pyramid/2 ladder")
+        assert client.events == [] and summary["skipped"].startswith(
+            "no sweepable zagg-pyramid/2 ladder"
+        )
 
     def test_a_two_store_is_untouched(self, tmp_path):
         # Acceptance: no change to what a /2 store does. The same fan-out,
@@ -682,4 +684,6 @@ class TestStoreLadderGate:
             store_kwargs={},
             barrier_timeout_s=0.01,
         )
-        assert client.events == [] and summary["skipped"].startswith("no zagg-pyramid/2 ladder")
+        assert client.events == [] and summary["skipped"].startswith(
+            "no sweepable zagg-pyramid/2 ladder"
+        )
