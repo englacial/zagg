@@ -1147,17 +1147,18 @@ class TestRasterWindowedAllTimeFold:
         assert block["overview"]["orders"] == [8, 6, 4, 2, 0]
         assert block["overview"]["all_time"] is True
 
-    def test_the_fold_is_the_windowings_not_rasters(self, tmp_path):
-        # The load-bearing control: the SAME raster config without
-        # ``output.windowing`` resolves no fold, so the assertion above reads
-        # the windowed default rather than a constant.
+    def test_an_unwindowed_raster_config_declares_no_fold(self, tmp_path):
+        # The load-bearing control for the arm above: the SAME raster config
+        # without ``output.windowing`` resolves no fold, so that arm's
+        # ``all_time is True`` reads the windowed default, not a constant.
         from zagg.config import get_pyramid
         from zagg.sweep_overview import build_pyramid_block
 
         cfg = _cfg(tmp_path)
         cfg.output["store_layout"] = "hive"
+        shard_order = cfg.output["grid"]["parent_order"]
         assert get_pyramid(cfg) == {}
-        assert build_pyramid_block(cfg, 10)["overview"]["all_time"] is False
+        assert build_pyramid_block(cfg, shard_order)["overview"]["all_time"] is False
 
     @pytest.mark.parametrize(
         "knob",
