@@ -1958,6 +1958,9 @@ class TestSummaryKeysByteIdentical:
         # ``families_sweep`` and chains no staged sweep at all, so it carries
         # no such key.
         "stage_sweep",
+        # The tail's verdict over both legs (issue #610): one reason per
+        # shortfall, [] when the tail left nothing short.
+        "tail_sweep_short",
     } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -5050,6 +5053,115 @@ class TestLambdaFamiliesRideTheCascade:
         assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
 
 
+class TestTailSweepShort:
+    """The run's verdict on its own tail (issue #610).
+
+    The v3 California run's tail died at the 900 s wall, left the root
+    temporal section covering 233 of 2,959 shards, and reported nothing: the
+    families leg was fire-and-forget and the staged leg's shortfall reached
+    only the dispatcher's log. Both legs report in full now; this is the one
+    verdict that says the store is short, on the run summary (both lambda
+    tails), on the client handle, and in the CLI's last lines.
+    """
+
+    _WHOLE = {"barrier_timed_out": False, "finisher": {"fired": True, "landed": True}}
+
+    def test_a_complete_tail_is_short_of_nothing(self):
+        from zagg import runner
+
+        families = {"partitions": 1, "fired": 1, "landed": 1, "finisher": "ok"}
+        assert runner._tail_sweep_short(families, self._WHOLE, stage_chained=True) == []
+        # Neither leg fired: a run that needed no sweep is not short either.
+        assert runner._tail_sweep_short(None, None, stage_chained=False) == []
+
+    @pytest.mark.parametrize(
+        "families, phrase",
+        [
+            ({"fired": 0, "landed": 0, "finisher": "dispatch_failed"}, "did not dispatch"),
+            ({"fired": 1, "landed": 0, "finisher": "timed_out"}, "landed no record"),
+            ({"fired": 22, "landed": 19, "finisher": "records_short"}, "short 3 of 22"),
+        ],
+    )
+    def test_each_families_shortfall_names_itself(self, families, phrase):
+        from zagg import runner
+
+        (reason,) = runner._tail_sweep_short(families, self._WHOLE, stage_chained=True)
+        assert phrase in reason
+
+    @pytest.mark.parametrize(
+        "staged, phrase",
+        [
+            (None, "staged sweep dispatch failed"),
+            ({"barrier_timed_out": True, "finisher": {"fired": True, "landed": True}}, "barrier"),
+            ({"barrier_timed_out": False, "finisher": {"fired": True, "landed": False}}, "land"),
+            ({**_WHOLE, "short_orders": [2, 1, 0]}, "withheld"),
+        ],
+    )
+    def test_each_staged_shortfall_names_itself(self, staged, phrase):
+        from zagg import runner
+
+        (reason,) = runner._tail_sweep_short(None, staged, stage_chained=True)
+        assert phrase in reason
+
+    def test_a_walled_tuple_is_two_reasons(self):
+        # The v3 ladder's shape: the barrier expired AND the finisher withheld
+        # the walled tuple's levels, which are two different facts about the
+        # store (issue #610, espg 2026-10-08).
+        from zagg import runner
+
+        staged = {
+            "barrier_timed_out": True,
+            "short_orders": [2, 1, 0],
+            "finisher": {"fired": True, "landed": True},
+        }
+        reasons = runner._tail_sweep_short(None, staged, stage_chained=True)
+        assert len(reasons) == 2 and "[2, 1, 0]" in reasons[1]
+
+    def test_an_unchained_staged_leg_is_not_read(self):
+        # ``stage_sweep is None`` means "dispatch failed" only when the tail
+        # CHAINED one; otherwise it means there was no staged sweep.
+        from zagg import runner
+
+        assert runner._tail_sweep_short(None, None, stage_chained=False) == []
+        assert runner._tail_sweep_short(None, None, stage_chained=True) == [
+            "staged sweep dispatch failed, so the ladder may be partly unfolded"
+        ]
+
+    def test_a_fired_families_pass_that_failed_is_not_the_none_of_no_pass(self):
+        from zagg import runner
+
+        outcome = {"partitions": 4, "fired": 1, "landed": 0, "finisher": "dispatch_failed"}
+        assert runner._families_sweep_reported(outcome) is outcome
+        reported = runner._families_sweep_reported(None)
+        assert reported["finisher"] == "dispatch_failed" and reported["fired"] == 0
+
+    def test_the_tail_reports_the_verdict_and_warns_once(self, monkeypatch, atl06_config, caplog):
+        staged = {
+            "barrier_timed_out": True,
+            "short_orders": [2, 1, 0],
+            "finisher": {"fired": True, "landed": True},
+        }
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            summary, _seen = TestLambdaFamiliesRideTheCascade._drive(
+                self, monkeypatch, atl06_config, staged=staged, ladder=True
+            )
+        assert len(summary["tail_sweep_short"]) == 2
+        assert caplog.text.count("left the store short of its rollups") == 1
+        assert "python -m zagg.sweep" in caplog.text
+
+    def test_a_families_dispatch_failure_reaches_the_summary(self, monkeypatch, atl06_config):
+        # The seam's ``None`` is "nothing was fired"; the tail knows it fired,
+        # so the summary says dispatch_failed and the verdict names it.
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_invoke_lambda_families_sweep", lambda *a, **k: None)
+        summary, _seen = TestLambdaFamiliesRideTheCascade._drive(
+            self, monkeypatch, atl06_config, ladder=False
+        )
+        assert summary["families_sweep"]["finisher"] == "dispatch_failed"
+        assert "did not dispatch" in summary["tail_sweep_short"][0]
+
+
 class TestFinalizeGuard:
     """Guarded finalize on agg's Lambda path (issue #335, (d)+(c)):
 
@@ -5552,6 +5664,46 @@ class TestLambdaResolverSeamRasterEvents:
             )
         assert seen["config"] is config
         assert seen["function_name"] == "pinned-raster"
+
+
+class TestCliTailShortSurface:
+    """The CLI's last lines name a short tail (issue #610).
+
+    A run whose rollup sweep did not complete exits 0 — the rollups are
+    regenerable caches (D9) — so without this the operator's screen reads as
+    a clean run, which is how the v3 California build's short root temporal
+    section went unnoticed until a reader hit the missing ``when=`` pruning.
+    """
+
+    _RESULTS = {
+        "cells_with_data": 1,
+        "total_obs": 1,
+        "cells_error": 0,
+        "wall_time_s": 1.0,
+        "store_path": "s3://b/x.zarr",
+    }
+
+    def _run_cli(self, monkeypatch, results):
+        import zagg.__main__ as cli
+
+        monkeypatch.setattr(cli, "agg", lambda config, **kwargs: results)
+        monkeypatch.setattr(cli, "load_config", lambda path: object())
+        monkeypatch.setattr(cli, "get_pipeline_type", lambda config: "spatial")
+        monkeypatch.setattr(cli, "max_cost_preview", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "confirm_max_cost", lambda *a, **k: True)
+        monkeypatch.setattr("sys.argv", ["zagg", "--config", "c.yaml"])
+        cli.main()
+
+    def test_a_short_tail_is_printed_with_its_backstop(self, monkeypatch, capsys):
+        short = ["the families sweep did not dispatch, so the rollups are unswept"]
+        self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": short})
+        out = capsys.readouterr().out
+        assert "TAIL SHORT: the families sweep did not dispatch" in out
+        assert "python -m zagg.sweep <store> --stages --scope <subtree>" in out
+
+    def test_a_whole_tail_prints_nothing_extra(self, monkeypatch, capsys):
+        self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": []})
+        assert "TAIL SHORT" not in capsys.readouterr().out
 
 
 class TestCliFunctionNameDefault:

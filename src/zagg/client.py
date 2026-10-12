@@ -207,8 +207,10 @@ class RunHandle:
         #: while the tail is in flight, when the run had no leaf to sweep,
         #: when the run walked the ``/2`` ladder (the families then rode the
         #: staged sweep's node closes and no separate pass was fired, issue
-        #: #610 phase 4), or when its dispatch failed before any invoke fired
-        #: (fail-open, D9). A ``finisher`` other than ``"ok"`` means the root
+        #: #610 phase 4). A pass that WAS fired and failed to dispatch is
+        #: ``{"finisher": "dispatch_failed", "fired": 0, ...}``, never
+        #: ``None`` — the three ``None`` cases all mean "no pass was needed".
+        #: A ``finisher`` other than ``"ok"`` means the root
         #: temporal section may be short. On a run that rode the cascade the
         #: families outcome is ``stage_sweep["families"]`` /
         #: ``stage_sweep["families_unswept"]``; ``stage_sweep is None`` there
@@ -216,6 +218,16 @@ class RunHandle:
         #: the backstop (``python -m zagg.sweep <store> --families
         #: stats,moc,submap``).
         self.families_sweep: dict | None = None
+        #: Why this run's tail left the store short of its rollups (issue
+        #: #610): one reason per shortfall from
+        #: ``runner._tail_sweep_short`` — a families pass that did not
+        #: dispatch or landed no record, a staged sweep whose barrier expired
+        #: or whose finisher did not land, orders whose manifest actuals were
+        #: withheld — and ``[]`` when the tail left nothing short, which is
+        #: also its value while the tail is in flight. The two keys above
+        #: carry the detail; this is the verdict, and the tail logs it as one
+        #: warning naming the ``python -m zagg.sweep`` backstop.
+        self.tail_sweep_short: list = []
         #: How the run's dispatch manifest went out (issue #588): ``"full"``;
         #: ``"slim"`` — the block did not fit the hive setup Event, so it
         #: rode without its shard list (the config is kept: :meth:`Run.attach`
@@ -1393,15 +1405,21 @@ class Run:
                 # families take the pass, as they always have.
                 riding = runner._cascade_families(self.config, self.grid) if stage_chained else ()
                 if leaves and not riding:
-                    # Partitioned from the leaf count and awaited (issue #610).
-                    handle.families_sweep = runner._invoke_lambda_families_sweep(
-                        client,
-                        self.function_name,
-                        self.store,
-                        leaves,
-                        output_creds_event=output_creds_event,
-                        store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
-                        run_id=run_id,
+                    # Partitioned from the leaf count and awaited (issue #610);
+                    # a pass that was fired and failed to dispatch is reported
+                    # as that, not as the "no pass was needed" None.
+                    handle.families_sweep = runner._families_sweep_reported(
+                        runner._invoke_lambda_families_sweep(
+                            client,
+                            self.function_name,
+                            self.store,
+                            leaves,
+                            output_creds_event=output_creds_event,
+                            store_kwargs=runner._output_store_kwargs(
+                                output_creds_event, self.region
+                            ),
+                            run_id=run_id,
+                        )
                     )
                 # Post-fleet STAGED chaining (issues #384/#519, here #588) —
                 # the same opt-in and the same seam as ``_run_lambda``'s
@@ -1447,6 +1465,12 @@ class Run:
                     runner._warn_families_unswept(riding, handle.stage_sweep)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # The handle's verdict on its own tail (issue #610), the same reasons
+        # ``runner._run_lambda`` reports as ``tail_sweep_short``.
+        handle.tail_sweep_short = runner._tail_sweep_short(
+            handle.families_sweep, handle.stage_sweep, stage_chained=stage_chained
+        )
+        runner._warn_tail_sweep_short(handle.tail_sweep_short)
         self._finalize_icechunk(
             handle,
             client,
