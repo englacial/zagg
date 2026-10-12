@@ -677,6 +677,19 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
             f"manifest finalize has not landed (re-run it; `--declare-pyramid` refuses a "
             f"store with no manifest)"
         )
+    if not isinstance(manifest, dict):
+        # The fourth broken-manifest shape, and the fourth remedy (review
+        # finding): a top level that PARSES but is not an object reaches
+        # ``manifest.get`` as an ``AttributeError`` and used to fall through
+        # to the shared ``except`` below, which hands out the RETROFIT remedy
+        # -- the one thing ``declare_pyramid`` refuses on a malformed manifest
+        # (``sweep_overview.py``). The verdict is unchanged (the workers refuse
+        # it too, on ``manifest["shard_order"]``); only the remedy was wrong.
+        return (
+            f"the {MANIFEST_NAME} at the store root is not a JSON object (a "
+            f"{type(manifest).__name__}) — restore or rewrite the manifest; "
+            f"`--declare-pyramid` refuses a malformed one"
+        )
     try:
         # The STORE's shard order, not the caller's: the leaf exclusion is the
         # workers' own and every worker takes ``int(manifest["shard_order"])``.
@@ -706,9 +719,11 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # Not ``ValueError`` alone (review finding): ``ladder_entries``
         # normalizes every entry (``int(e["node"])``, ``[int(c) for c in
         # e["cells"]]``), so a malformed declaration arrives as ``KeyError``
-        # or ``TypeError`` as readily as the named refusal, and a manifest
-        # whose top level is not an object as ``AttributeError``. The verdict
-        # is the same for all four — nothing a worker would fold — and a
+        # or ``TypeError`` as readily as the named refusal (a top level that
+        # is not an object declines above, with its own remedy — review
+        # finding; the catch stays wide because nothing malformed may leave
+        # this gate as a traceback). The verdict is the same — nothing a
+        # worker would fold — and a
         # decline is the whole point of reading first: the alternative is the
         # traceback this gate exists to replace.
         refused = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
