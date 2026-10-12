@@ -2109,7 +2109,10 @@ def build_windowed(out: Path) -> None:
     order-19 instance of the law (one stride across an order-9 shard, both
     hemispheres). The located sibling is what lets a reader CHECK the
     derivation on committed bytes: every location word of a cell lies inside
-    that cell's derived word.
+    that cell's derived word. Its manifest declares the all-time fold (the
+    resolved default on a windowed config, §4.5, issue #610 phase 4) yet
+    commits no ``all.zarr``: a leaf-tier fixture, declared-but-unmaterialized,
+    which §4.5 makes legal.
     """
     from mortie import clip2order, orders_of
 
