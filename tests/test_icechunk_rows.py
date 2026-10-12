@@ -1020,6 +1020,30 @@ class TestRowGrowthUnderStagedRefs:
         messages = [s.message for s in repo.ancestry(branch="main")]
         assert messages.count("node 1 (other)") == 1 and "node 1" not in messages
 
+    def test_a_double_update_after_the_growth_is_refused_not_replayed(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The rebase stops at the FIRST commit it cannot reconcile: with the
+        # growth first, its conflicts are growth only and the later double
+        # update is never examined. The diff since the session's base catches
+        # it, so the other writer's refs stand — the same outcome as the
+        # reverse order above (review finding, two all-time runs on one node).
+        grid, root, manifest, shard, unit = self._staged(monkeypatch, cfg, tmp_path)
+
+        def grow_then_other_writer():
+            _init(root, grid, cfg, manifest, ["2020"], run_id="run-2")
+            icechunk_refs.commit_units(root, [unit], "node 1 (other)", store_kwargs={})
+
+        with pytest.raises(icechunk.RebaseFailedError) as info:
+            icechunk_refs.commit_units(
+                root, self._grown_under(unit, grow_then_other_writer), "node 1", store_kwargs={}
+            )
+        kinds = {repr(c.conflict_type) for c in info.value.conflicts}
+        assert kinds == {"ChunksUpdatedInUpdatedArray"}
+        _group, repo = _open(root)
+        messages = [s.message for s in repo.ancestry(branch="main")]
+        assert messages[:2] == ["node 1 (other)", "init run-2"] and "node 1" not in messages
+
     def test_the_ladder_replays_a_node_and_counts_it(self, monkeypatch, cfg, tmp_path, caplog):
         # The fleet path: ``stage_node_refs`` streams the node's children into
         # one session; a run-2 init landing mid-stream grows the rows under

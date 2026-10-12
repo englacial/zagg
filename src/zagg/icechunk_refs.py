@@ -1157,19 +1157,32 @@ def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
     return refs, orders
 
 
-def _row_growth_only(exc) -> bool:
-    """Whether a failed rebase conflicts ONLY on chunks staged in arrays another commit resized.
+def _row_growth_only(exc, repo, session, base: str) -> bool:
+    """Whether a failed rebase lost to row growth ALONE — nothing landed on the staged chunks.
 
     ``ChunksUpdatedInUpdatedArray`` on every array touched and nothing else
     is the phase-0 spike's item (iii): the other commit changed the arrays'
     metadata — a run's init growing the rows — under this session's staged
-    chunks, which the rebase does not carry over. A double update of the same
-    chunks, or any mix, is another writer's refs and is never replayed over.
+    chunks, which the rebase does not carry over. But the rebase stops at the
+    FIRST commit it cannot reconcile, so its conflicts describe that commit
+    only: a double update landing AFTER the growth (another run's node
+    writing the same ``all``-row chunks) is never examined. So the
+    classification also diffs every commit between the session's ``base``
+    snapshot and the branch tip and requires that none of them updated a
+    chunk this session staged. A double update of the same chunks, in either
+    order, or any mix, is another writer's refs and is never replayed over.
     """
     import icechunk
 
     growth = icechunk.ConflictType.ChunksUpdatedInUpdatedArray  # unhashable: compared, not set
-    return bool(exc.conflicts) and all(c.conflict_type == growth for c in exc.conflicts)
+    if not exc.conflicts or any(c.conflict_type != growth for c in exc.conflicts):
+        return False
+    landed = repo.diff(from_snapshot_id=base, to_branch=BRANCH).updated_chunks
+    staged = session.status().updated_chunks  # chunk coordinates are lists: tupled to compare
+    return not any(
+        {tuple(c) for c in landed.get(array, ())}.intersection(map(tuple, chunks))
+        for array, chunks in staged.items()
+    )
 
 
 def commit_units(
@@ -1208,7 +1221,9 @@ def commit_units(
     session based on the grown arrays and committed, each unit's label
     resolving to the same row index (the row law, §11.2: a row never moves),
     at most :data:`REPLAY_TRIES` times, then the failure propagates to the
-    fail-open caller. The record's ``replays`` counts them.
+    fail-open caller. A growth with ANY commit since the session's base that
+    updated a staged chunk is refused, whichever landed first: the original
+    ``RebaseFailedError`` propagates. The record's ``replays`` counts them.
     """
     import icechunk
 
@@ -1219,6 +1234,7 @@ def commit_units(
     replays = 0
     while True:
         session = repo.writable_session(BRANCH)
+        base = session.snapshot_id
         refs, orders = _stage_units(session, source() if callable(source) else source)
         if not refs:
             return {
@@ -1234,7 +1250,7 @@ def commit_units(
         try:
             snapshot, rebases = _commit(session, message, local=_is_local(store_root), path=path)
         except icechunk.RebaseFailedError as exc:
-            if replays >= REPLAY_TRIES or not _row_growth_only(exc):
+            if replays >= REPLAY_TRIES or not _row_growth_only(exc, repo, session, base):
                 raise
             replays += 1
             logger.warning(

@@ -4629,13 +4629,18 @@ columns do:
    **another run's row growth** (its `init`, below) landing while a node
    holds staged refs: Icechunk reports `Chunks updated in updated array` on
    every array the node touched and the rebase fails. That class, and only
-   that class — every conflict of the failed rebase is one, nothing else —
+   that class — every conflict of the failed rebase is one, nothing else,
+   **and** no commit between the session's base snapshot and the branch tip
+   updated a chunk the session staged (the rebase stops at the first commit
+   it cannot reconcile, so a double update landing after the growth is
+   caught by that diff, not by the conflict list) —
    is **replayed**: the node writes the same units into a fresh session
    based on the grown arrays and commits them there (each label resolves to
    the same row index, §11.2 — a row never moves; the ladder streams the
    subtree again rather than holding it), at most once (`REPLAY_TRIES`),
    after which the failure propagates to the fail-open hook. A double update
-   of the same chunks by two writers is never replayed over. Each stage row
+   of the same chunks by two writers is never replayed over, whichever of it
+   and the growth landed first; the rebase failure propagates. Each stage row
    records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
    `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
    `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
