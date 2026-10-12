@@ -761,6 +761,7 @@ def stage_sweep_after_run(
     touch_policy: str = "auto",
     dirt_only=(),
     pipeline_run_id: str | None = None,
+    families=(),
 ):
     """Post-fleet chaining: the ``output.sweep: "stages"`` opt-in, fail-open.
 
@@ -781,7 +782,11 @@ def stage_sweep_after_run(
     that governs the finisher's touch — an operator who declared ``never`` on an
     archival destination must not get one new root-core version per staged sweep.
     ``dirt_only`` (issue #580) joins the scope and rides to :func:`run_stage_sweep`,
-    as does ``pipeline_run_id`` (issue #593): the run this sweep completes.
+    as does ``pipeline_run_id`` (issue #593): the run this sweep completes,
+    and ``families`` (issue #610 phase 4): the rollup families riding this
+    sweep's node closes in place of the tail's separate
+    :func:`zagg.sweep.sweep_after_run` pass — the local dispatcher passes
+    ``runner._cascade_families``, so a run that walks the ladder is one walk.
     """
     from zagg.grids.morton import morton_decimal
 
@@ -798,6 +803,7 @@ def stage_sweep_after_run(
             touch_policy=touch_policy,
             dirt_only=dirt_only,
             pipeline_run_id=pipeline_run_id,
+            families=families,
         )
         logger.info(
             f"Post-run staged sweep: {[(s['dispatch_order'], s['written']) for s in summary['stages']]}"

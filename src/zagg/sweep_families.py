@@ -143,10 +143,11 @@ def normalize_families(families) -> tuple:
 def rider_for(families):
     """A :class:`FamiliesRider` for the named families, or ``None`` when none ride.
 
-    ``()`` — the ladder-only default of every staged entry point until the
-    run tail stops firing the separate families fan-out — is ``None``;
-    ``None`` is :data:`CASCADE_FAMILIES`, the same spelling
-    :func:`zagg.sweep.run_sweep` gives it.
+    ``()`` — the ladder-only default of every staged entry point; the run
+    tails pass :data:`CASCADE_FAMILIES` when the run walks the ``/2`` ladder
+    (``zagg.runner._cascade_families``) — is ``None``; ``None`` is
+    :data:`CASCADE_FAMILIES`, the same spelling :func:`zagg.sweep.run_sweep`
+    gives it.
     """
     names = normalize_families(families)
     return FamiliesRider(names) if names else None
