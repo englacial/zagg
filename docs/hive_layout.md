@@ -815,20 +815,33 @@ order-2 nodes, no record landed, and the barrier was waited out. Capping the
 the subtree is one node's work. (The two compose rather than substitute — `n`
 nodes on one invoke fold up to `n ×` a node's own subtree — so the schedule is
 sized against the target shared out per node.) So the Lambda tail asks for a **sized**
-schedule — each fixed-width tuple is subdivided inside its own span until its
-fattest dispatch node folds at most `STAGE_TARGET_NODES` (8) nodes. The tail
+schedule — tuples laid from `shard_order − 1` **downward**, each the widest
+width whose fattest dispatch node folds at most `STAGE_TARGET_NODES` (8)
+nodes, with the remainder at order 0
+([issue #637](https://github.com/englacial/zagg/issues/637)). The tail
 hands the dispatcher no coverage MOC (a dispatcher may not read one itself,
 D8), so the fold is the **dense bound** `(4^width − 1) / 3` — 21 at width 3,
 5 at width 2 — which never under-estimates; a caller that *does* hand a
 coverage MOC in gets the fold measured over the set the worker folds (the
 run's leaves ∪ that coverage), and may keep the full width where the store is
 genuinely sparse. Nothing is read from the store either way. A dense o9
-ladder's three width-3 tuples folding 21 nodes an invoke become **six tuples
-— width 2 then width 1 inside each** — folding 5; a store that needs no
-narrowing keeps the fixed-width schedule outright, at every `shard_order`,
-because the sizing only ever adds a boundary inside a fixed tuple and never
-moves one. Because a subtree's node count steps by powers of four, any target
-in `[5, 20]` picks the same schedule there. Such a tuple dispatches at an order no single width
+ladder's three width-3 tuples folding 21 nodes an invoke become **five tuples
+of uniform width 2** — `7:[8,7] 5:[6,5] 3:[4,3] 1:[2,1]`, then the one-order
+remainder `0:[0]` — folding 5. Alignment matters more than width: on the
+California o9 shardmap (731, 205, 64, 23, 10, 6, 2, 1, 1 interior nodes at
+orders 8..0) that is 236 tail invokes, where the earlier rule — subdividing
+each fixed width-3 tuple inside its own span, so the widths alternated 2/1
+across six tuples — cost 287, and a bottom-aligned width 2
+(`stage_tuples(9, tuple_width=2)`, remainder `8:[8]` on 731 nodes) would cost
+808. A store sparse enough to carry the full width keeps it, top-aligned, so
+a sized schedule equals the fixed-width one exactly when `shard_order` is a
+multiple of the width. Because a subtree's node count steps by powers of
+four, any target in `[5, 20]` picks width 2, `[21, 84]` width 3, under 5
+width 1. The default Icechunk `commit_order` is still the fixed schedule's
+finest dispatch order (6 at o9, `zagg.icechunk_refs.finest_dispatch_order`),
+and the ladder commit is made by the sized tuple whose span contains it —
+`5:[6,5]`, so by the order-5 dispatch nodes, each committing its four
+order-6 base manifests. Such a tuple dispatches at an order no single width
 lands on, so its events carry their span (`child_order`) outright; a worker
 deployed before this refuses one by name rather than folding the wrong span.
 The cadence is still a dispatch knob like `--tuple-width` itself — a sized

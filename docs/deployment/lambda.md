@@ -614,11 +614,14 @@ ordering exactly:
 
 0. **size the schedule** to the per-invoke fold, when the caller asked for
    it — the run tail does, the dispatcher's own default does not
-   ([issue #610](https://github.com/englacial/zagg/issues/610)). Each
-   fixed-width tuple is subdivided inside its own `[dispatch, child_order)`
-   span until its fattest dispatch node folds at most
-   `zagg.sweep_partition.STAGE_TARGET_NODES` nodes, so a store that needs no
-   narrowing keeps the fixed-width schedule itself. The fold is the **dense
+   ([issue #610](https://github.com/englacial/zagg/issues/610)). Tuples are
+   laid from `shard_order − 1` downward, each the widest width whose fattest
+   dispatch node folds at most `zagg.sweep_partition.STAGE_TARGET_NODES`
+   nodes, with the remainder at order 0
+   ([issue #637](https://github.com/englacial/zagg/issues/637)) — on an o9
+   store `7:[8,7] 5:[6,5] 3:[4,3] 1:[2,1] 0:[0]`, 236 invokes on the
+   California shardmap at one node an invoke. A store sparse enough to carry
+   the full width keeps it, top-aligned. The fold is the **dense
    bound** `(4^width − 1) / 3` unless a `coverage` MOC was handed in, in
    which case it is measured over the set a worker folds (the run's leaves ∪
    that coverage); nothing is read from the store either way. A dispatch node

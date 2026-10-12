@@ -6557,9 +6557,10 @@ def _invoke_lambda_stage_sweep(
     when payload-only packing leaves the count unknown (review finding). At
     this seam's default cap — one node an invoke — the two are one number.
     The tail therefore asks for the SIZED schedule
-    (:data:`zagg.sweep_partition.STAGE_TARGET_NODES`): each fixed-width tuple
-    is subdivided inside its own span until its fattest dispatch node stays
-    within the target. This seam hands in no ``coverage`` MOC — a dispatcher
+    (:data:`zagg.sweep_partition.STAGE_TARGET_NODES`): tuples laid from the
+    top down, each the widest width whose fattest dispatch node stays within
+    the target, the remainder at order 0 (issue #637). This seam hands in no
+    ``coverage`` MOC — a dispatcher
     may not read one for itself (D8) — so the sizing takes the DENSE
     ``(4 ** width - 1) // 3`` bound rather than measuring the store, which is
     the conservative direction (a measurement over the run's own work set

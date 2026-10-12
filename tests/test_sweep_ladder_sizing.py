@@ -6,9 +6,11 @@ Standing claims:
   inside one invoke, so a fixed ``tuple_width`` puts ``1 + 4 + ... +
   4**(width-1)`` nodes on one worker wherever the store is dense — the 21 that
   walled the v3 ladder's coarsest tuple at 900 s;
-- :func:`zagg.sweep_partition.sized_stage_tuples` narrows each tuple to the
-  widest width whose fattest dispatch node stays within the target, and leaves
-  a sparse ladder on the fixed-width schedule outright;
+- :func:`zagg.sweep_partition.sized_stage_tuples` lays tuples from the top
+  down, each the widest width whose fattest dispatch node stays within the
+  target, with the remainder at order 0 (issue #637) — uniform width 2 on a
+  dense ladder under the default target, the fixed width where the store is
+  sparse enough to carry it;
 - the grouping changes no bytes: a sized fleet build's ladder overviews are the
   fixed-width build's (``TestSizedByteIdentity``, the cascade, issue #620);
 - a tuple missing a unit record names its ORDERS to the finisher, which then
@@ -55,19 +57,87 @@ class TestSizing:
     def test_a_dense_ladder_narrows_off_the_width_that_walled_the_v3_run(self):
         # The measured shape: at width 3 an order-0 dispatch node folds its
         # 1 + 4 + 16 covered descendants in one invoke. The sizing refuses
-        # that and takes width 2, where a dispatch node folds 1 + 4.
-        #
-        # The schedule is a REFINEMENT of the fixed-width one, so each of the
-        # three width-3 tuples splits inside its own span — width 2 then the
-        # width-1 remainder — rather than the boundaries sliding down the
-        # ladder: 6 tuples, not 5 (review finding).
+        # that and takes width 2, where a dispatch node folds 1 + 4 — laid
+        # from the top down with the one-order remainder at the base (issue
+        # #637): five tuples of uniform width, not the six alternating 2/1
+        # that subdividing each width-3 tuple inside its own span gave.
         schedule = sized_stage_tuples(9, nodes_at=_dense())
-        assert [int(st["width"]) for st in schedule] == [2, 1, 2, 1, 2, 1]
-        assert _spans(schedule) == [(7, 9), (6, 7), (4, 6), (3, 4), (1, 3), (0, 1)]
+        assert [int(st["width"]) for st in schedule] == [2, 2, 2, 2, 1]
+        assert _spans(schedule) == [(7, 9), (5, 7), (3, 5), (1, 3), (0, 1)]
         assert all(int(st["fold_max"]) <= STAGE_TARGET_NODES for st in schedule)
-        assert max(int(st["fold_max"]) for st in schedule) == 5
+        assert [int(st["fold_max"]) for st in schedule] == [5, 5, 5, 5, 1]
         # And the width the run actually used would have folded 21.
         assert _fold_max(9, 0, 3, _dense()) == 21
+
+    def test_the_dense_o9_schedule_is_the_issue_637_target(self):
+        # The acceptance line of issue #637, item for item: dispatch orders
+        # 7, 5, 3, 1, 0 and the orders each folds.
+        schedule = sized_stage_tuples(9)
+        assert [(st["dispatch"], st["orders"]) for st in schedule] == [
+            (7, [8, 7]),
+            (5, [6, 5]),
+            (3, [4, 3]),
+            (1, [2, 1]),
+            (0, [0]),
+        ]
+        assert [st["child_order"] for st in schedule] == [9, 7, 5, 3, 1]
+        assert [st["fold_max"] for st in schedule] == [5, 5, 5, 5, 1]
+
+    @pytest.mark.parametrize(
+        "shard_order,spans",
+        (
+            (6, [(4, 6), (2, 4), (0, 2)]),
+            (7, [(5, 7), (3, 5), (1, 3), (0, 1)]),
+            (8, [(6, 8), (4, 6), (2, 4), (0, 2)]),
+            (9, [(7, 9), (5, 7), (3, 5), (1, 3), (0, 1)]),
+        ),
+    )
+    def test_the_schedule_is_top_aligned_with_the_remainder_at_order_zero(self, shard_order, spans):
+        # Width 2 from ``shard_order - 1`` down; an odd shard order leaves one
+        # order over, and it lands at the BASE — one dispatch node — never at
+        # the top, where it would be the ladder's fattest order.
+        schedule = sized_stage_tuples(shard_order)
+        assert _spans(schedule) == spans
+        assert int(schedule[0]["child_order"]) == shard_order
+        assert int(schedule[-1]["dispatch"]) == 0
+        assert [int(st["width"]) for st in schedule[:-1]] == [2] * (len(schedule) - 1)
+        assert int(schedule[-1]["width"]) == (2 if shard_order % 2 == 0 else 1)
+
+    @pytest.mark.parametrize(
+        "target,width",
+        ((1, 1), (4, 1), (5, 2), (8, 2), (20, 2), (21, 3), (84, 3), (85, 4)),
+    )
+    def test_the_target_bands_pick_the_width_whose_dense_bound_fits(self, target, width):
+        # ``(4**w - 1) / 3`` is 1, 5, 21, 85 for widths 1..4, so a target
+        # under 5 gives width 1, ``[5, 20]`` width 2, ``[21, 84]`` width 3.
+        # Every full tuple carries that width; no tuple's bound exceeds the
+        # target.
+        schedule = sized_stage_tuples(12, tuple_width=4, target=target)
+        assert {int(st["width"]) for st in schedule[:-1]} <= {width}
+        assert int(schedule[0]["width"]) == width
+        assert all(int(st["fold_max"]) <= target for st in schedule)
+
+    def test_the_california_tail_is_236_invokes(self):
+        # The measured o9 shardmap (issue #637): interior nodes per order
+        # 8..0 on 2,721 shards. One dispatch node is one invoke at the tail's
+        # ``max_nodes_per_invoke=1``, so a schedule's cost is the sum of its
+        # dispatch orders' node counts. Alignment is what moves the number:
+        # the bottom-aligned fixed width 2 puts its one-order tuple at order
+        # 8 — 731 invokes for one order — where the top-aligned schedule
+        # puts it at order 0.
+        nodes = dict(zip(range(8, -1, -1), (731, 205, 64, 23, 10, 6, 2, 1, 1)))
+
+        def invokes(schedule):
+            return sum(nodes[int(st["dispatch"])] for st in schedule)
+
+        assert invokes(sized_stage_tuples(9)) == 236
+        assert invokes(stage_tuples(9, tuple_width=2)) == 808
+        assert invokes(stage_tuples(9, tuple_width=3)) == 71  # the walled reference
+        # The alternating schedule the refinement rule gave, for the record.
+        old = [
+            one_stage_tuple(9, d, c) for d, c in ((7, 9), (6, 7), (4, 6), (3, 4), (1, 3), (0, 1))
+        ]
+        assert invokes(old) == 287
 
     def test_a_sparse_ladder_keeps_the_fixed_width_schedule(self):
         # Nothing to narrow: the whole o3 work set's fattest order-0 subtree is
@@ -120,18 +190,17 @@ class TestSizing:
 
     @pytest.mark.parametrize("shard_order", (7, 8, 10, 11))
     @pytest.mark.parametrize("width", (3, 4))
-    def test_a_ragged_ladder_keeps_the_fixed_width_schedule(self, shard_order, width):
-        # The sizing REFINES the fixed-width schedule — it subdivides a tuple
-        # inside its own span and never moves a boundary — so a ladder that
-        # needs no narrowing reproduces ``stage_tuples`` item for item at a
-        # ragged ``shard_order`` too. A walk that took full widths down from
-        # ``shard_order`` instead anchored its ragged tuple at the COARSE end
-        # and reshaped every boundary here (review finding).
-        keys = ("dispatch", "orders", "child_order")
+    def test_a_ragged_sparse_ladder_puts_its_short_tuple_at_the_base(self, shard_order, width):
+        # A sparse ladder keeps the full width, but top-aligned (issue #637):
+        # the tuples are the fixed width from ``shard_order - 1`` down and the
+        # short one is at order 0, where ``stage_tuples`` puts it at the TOP.
+        # The two agree exactly when the shard order is a multiple of the width.
         sized = sized_stage_tuples(shard_order, nodes_at=lambda order: [], tuple_width=width)
-        assert [{k: st[k] for k in keys} for st in sized] == stage_tuples(
-            shard_order, tuple_width=width
-        )
+        full, short = divmod(shard_order, width)
+        assert [int(st["width"]) for st in sized] == [width] * full + ([short] if short else [])
+        assert int(sized[-1]["dispatch"]) == 0
+        fixed = stage_tuples(shard_order, tuple_width=width)
+        assert (_spans(sized) == _spans(fixed)) is (short == 0)
 
     @pytest.mark.parametrize("width,bound", ((1, 1), (2, 5), (3, 21), (4, 85)))
     def test_the_dense_bound_is_what_a_blind_dispatcher_assumes(self, width, bound):
@@ -148,8 +217,8 @@ class TestSizing:
         # One node under the width-3 bound and the dense arm refuses it: the
         # schedule the tail now gets without reading anything.
         schedule = sized_stage_tuples(9, target=STAGE_TARGET_NODES)
-        assert [int(st["width"]) for st in schedule] == [2, 1] * 3
-        assert [int(st["fold_max"]) for st in schedule] == [5, 1] * 3
+        assert [int(st["width"]) for st in schedule] == [2, 2, 2, 2, 1]
+        assert [int(st["fold_max"]) for st in schedule] == [5, 5, 5, 5, 1]
 
     @pytest.mark.parametrize(
         "kwargs,message",
@@ -471,12 +540,14 @@ class TestShortOrders:
 
         root = tmp_path / "s"
         _stage_store(root)
-        # The COARSE tuple's record is lost (its invoke never wrote one), so
-        # orders 1 and 0 are short while order 2's record stands.
-        client = _FakeLambda(_handler(), drop={stage_record_name(0, 0)})
+        # The sized schedule at o3 is ``1:[2,1]`` then ``0:[0]`` (top-aligned,
+        # issue #637). The FINE tuple's record is lost (its invoke never
+        # wrote one), so orders 2 and 1 are short while order 0's record
+        # stands.
+        client = _FakeLambda(_handler(), drop={stage_record_name(1, 0)})
         summary = _fleet(root, client, stage_target_nodes=5, tuple_width=2, barrier_timeout_s=0.05)
-        assert summary["short_orders"] == [1, 0]
-        assert _finisher_block(client)["short_orders"] == [1, 0]
+        assert summary["short_orders"] == [2, 1]
+        assert _finisher_block(client)["short_orders"] == [2, 1]
 
     def test_the_finisher_withholds_the_short_levels_and_records_the_rest(self, tmp_path):
         from test_sweep_stage_fleet import _FakeLambda, _fleet
@@ -489,16 +560,16 @@ class TestShortOrders:
         # A prior run's actuals stand on every ladder level, so "withheld"
         # is visibly "left as it stood" rather than "never written".
         _stamp_prior_actuals(root, run_id="PRIOR")
-        client = _FakeLambda(_handler(), drop={stage_record_name(0, 0)})
+        client = _FakeLambda(_handler(), drop={stage_record_name(1, 0)})
         summary = _fleet(root, client, stage_target_nodes=5, tuple_width=2, barrier_timeout_s=0.05)
-        assert summary["short_orders"] == [1, 0]
+        assert summary["short_orders"] == [2, 1]
         entries = {
             int(e["node"]): e
             for e in json.loads((root / MANIFEST_NAME).read_text())["pyramid"]["overviews"]
         }
         # The order that landed is stamped by THIS run; the short ones are not.
-        assert entries[2]["actuals"]["run_id"] == summary["run_id"]
-        for node in (1, 0):
+        assert entries[0]["actuals"]["run_id"] == summary["run_id"]
+        for node in (2, 1):
             assert entries[node]["actuals"]["run_id"] == "PRIOR", node
         # And the leaf tier's own law is not an observation, so it still lands.
         assert entries[3]["actuals"]["regime"] == "leaf-column"
