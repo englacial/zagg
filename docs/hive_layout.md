@@ -509,10 +509,16 @@ config resolves `pyramid.all_time` to true (the `all` row is allocated at
 birth, [issue #623](https://github.com/englacial/zagg/issues/623)) and a
 windowed hive store gets its Icechunk repo at birth, one manifest per row
 ([issue #604](https://github.com/englacial/zagg/issues/604)). So a run from
-either template builds the complete v4 shape — per-year leaves, the `all`
-row, the ladder, the repo — with no flags
+either template builds the v4 shape — per-year leaves, the `all` row, the
+ladder, the repo — with no flags
 (`tests/test_template_windowed_build.py` builds one from each on the local
-backend and runs `pyramid_check` over it). A windowed store is the one that
+backend and runs `pyramid_check` over it). One part is not the v4 regime
+yet: such a run commits Icechunk refs **per leaf**, because the commit
+default keys on the *explicit* `output.sweep: "stages"`
+(`zagg.icechunk_refs.ladder_walks`) and the templates leave `sweep` unset;
+spell it to commit up the ladder (spec §11.4). Which way the templates go is
+question (2) on [PR #639](https://github.com/englacial/zagg/pull/639), open
+until ruled. A windowed store is the one that
 scales (windowed emit cut worker peak memory 3.7 → 1.56 GB,
 [issue #586](https://github.com/englacial/zagg/issues/586); a window invoke
 reads only its year's granules), and the schedule is fixed at birth and only
