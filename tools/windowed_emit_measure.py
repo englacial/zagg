@@ -686,9 +686,11 @@ def stage_memory(ladder: dict, stages: dict) -> dict:
     """The staged sweep's memory high-water against the tier it ran on.
 
     The peak is the largest ``container_hwm_mb`` any stage row carries, over
-    BOTH legs — the root run record's per-order rows and the newest fleet stage
-    run's — since a store may hold one, the other or both. ``headroom_mb`` is
-    what the 8 GB tier (:data:`STAGE_TIER_GB`) was never asked for, the number
+    BOTH legs — the root run record's per-order rows and EVERY fleet stage run,
+    not just the newest — since a store may hold one, the other or both, and
+    the question is whether the tier was ever needed, not what its last sweep
+    needed (the cost leg counts every run for the same reason). ``headroom_mb``
+    is what the tier (:data:`STAGE_TIER_GB`) was never asked for, the number
     issue #602 reads to decide whether that tier can come back down.
 
     Every value is ``None`` (printed ``-``, never ``0``) when no row carries a
@@ -698,7 +700,7 @@ def stage_memory(ladder: dict, stages: dict) -> dict:
     read off it is the pessimistic side — a tier that looks roomy here is roomy.
     """
     peaks = [s["container_hwm_mb"] for s in ladder.get("stages") or []]
-    peaks.append(((stages or {}).get("latest") or {}).get("container_hwm_mb"))
+    peaks += [r.get("container_hwm_mb") for r in (stages or {}).get("runs") or []]
     recorded = [float(p) for p in peaks if p is not None]
     tier_mb = STAGE_TIER_GB * 1024.0
     peak = max(recorded) if recorded else None

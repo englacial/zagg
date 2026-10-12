@@ -220,10 +220,14 @@ def _stage_records(root: Path, windows) -> None:
         "duration_s": 2.0,
     }
     (status / "finisher.json").write_text(json.dumps(finisher))
-    # an older stage run with one record: the newest is what the table prints
+    # an older stage run with one record: the newest is what the table's
+    # per-order rows print, but its cost and its memory high-water still count
+    # (the windowed arm's older run peaked higher than its newest one did)
     older = Path(str(root) + ".status") / "run-stage-20251231T000000Z-000000"
     older.mkdir()
-    (older / "stage-00-0000.json").write_text(json.dumps(rec(0, 0, None, None, 99.0, 1, 1, 1)))
+    (older / "stage-00-0000.json").write_text(
+        json.dumps(rec(0, 0, None, None, 99.0, 1, 1, 1, hwm=3000.0 if windows else None))
+    )
 
 
 @pytest.fixture
@@ -377,11 +381,12 @@ def test_the_stage_memory_high_water_and_the_tier_headroom(arms):
     assert (o3["container_hwm_mb"], o0["container_hwm_mb"]) == (1800.0, 2600.0)
     assert win["stage_runs"]["latest"]["container_hwm_mb"] == 2600.0
     assert base["stage_runs"]["latest"]["container_hwm_mb"] is None
-    # the headroom: the tier less the largest high-water EITHER leg carries
+    # the headroom: the tier less the largest high-water ANY leg carries, over
+    # every stage run — here the older run's 3,000.0, not the newest's 2,600.0
     mem = win["stage_memory"]
     assert mem["tier_mb"] == tool.STAGE_TIER_GB * 1024
-    assert mem["peak_mb"] == 2600.0 and mem["headroom_mb"] == mem["tier_mb"] - 2600.0
-    assert mem["peak_fraction"] == pytest.approx(2600.0 / mem["tier_mb"])
+    assert mem["peak_mb"] == 3000.0 and mem["headroom_mb"] == mem["tier_mb"] - 3000.0
+    assert mem["peak_fraction"] == pytest.approx(3000.0 / mem["tier_mb"])
     # a run that recorded none measured no memory, which is not "used none"
     assert base["stage_memory"] == {
         "tier_mb": tool.STAGE_TIER_GB * 1024,
@@ -397,9 +402,9 @@ def test_the_table_prints_the_headroom_and_dashes_when_unmeasured(arms, capsys):
     out = capsys.readouterr().out
     (tier,) = [ln for ln in out.splitlines() if ln.startswith("stage tier MB / peak MB")]
     assert "8,192.0 / - / -" in tier  # the baseline arm: not measured
-    assert "8,192.0 / 2,600.0 / 5,592.0" in tier
+    assert "8,192.0 / 3,000.0 / 5,192.0" in tier
     (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  peak as a fraction")]
-    assert fraction.split()[-2:] == ["-", "0.3"]
+    assert fraction.split()[-2:] == ["-", "0.4"]
     # per tuple (root record, finest order first) and per order (fleet records)
     (per_tuple,) = [ln for ln in out.splitlines() if ln.startswith("stage peak RSS MB per tuple")]
     assert per_tuple.split()[-3:] == ["2,300.5", "/", "900.0"]
