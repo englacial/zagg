@@ -1172,6 +1172,9 @@ class TestRasterWindowedAllTimeFold:
         store_path = cfg.output["store"]
         decl = hive.read_manifest(store_path)["pyramid"]["overview"]
         assert decl["all_time"] is True and decl["fields"] == {}
+        # Pinned here as well as in the arm above, deliberately: it is what
+        # keeps the per-order loop at the bottom from going vacuous.
+        assert decl["orders"] == [8, 6, 4, 2, 0]
         refs = [(shard, "20260713"), (shard, "20260718")]
         with caplog.at_level(logging.INFO, logger="zagg.sweep_overview"):
             result = run_sweep(store_path, refs, families=("overview",))
