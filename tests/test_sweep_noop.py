@@ -705,6 +705,29 @@ class TestStoreLadderGate:
         assert summary["barrier_timed_out"] is False
         assert _staged_sweep_incomplete(summary) is None
 
+    def test_the_other_no_op_return_reports_unswept_families_too(self, tmp_path):
+        # The dispatcher's two no-op returns are the same situation for the
+        # rollups: no node closed (review finding). This one is reached with
+        # a work set whose refs all drop out of ``_normalize_leaves``, so no
+        # tuple produces a dispatch node.
+        from zagg.sweep_fleet import run_stage_sweep_fleet
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        summary = run_stage_sweep_fleet(
+            client,
+            "fn",
+            str(root),
+            [],
+            shard_order=3,
+            store_kwargs={},
+            families=["stats"],
+            barrier_timeout_s=0.01,
+        )
+        assert summary["skipped"] == "no dispatch nodes"
+        assert client.events == [] and summary["families_unswept"] is True
+
     def test_the_run_tail_seam_shares_the_gate(self, tmp_path):
         # The dispatcher's two callers are the runner's tail seam and the
         # hand-called form above; the gate is in the dispatcher, so one gate
