@@ -37,14 +37,29 @@
         }
       },
       "cells_with_data_order": 5,
-      "generated_at": "2026-09-18T04:22:19+00:00"
+      "generated_at": "2026-10-12T01:21:09+00:00"
     },
     "morton_hive_commit": {
       "spec": "morton-hive/1",
       "complete": true,
       "cells_with_data": 3,
       "granule_count": 1,
-      "written_at": "2026-09-18T04:22:19+00:00"
+      "written_at": "2026-10-12T01:21:09+00:00",
+      "content_hashes": {
+        "arrays": {
+          "4/count": "c7929c9c12d5874a9169e0676c1425a1f0feaa58f23d173c625d5d2791e03d11",
+          "4/h_tdigest": "5d0ed5f48cd76f4ba11b8eea66e9b30b1a8c3aebc266164d95c6c8e9129d97a3",
+          "4/h_tdigest_locations": "19a334339a7f39cb61b79065841fcdac2cb94423e872bcb571543cfafea215c1",
+          "4/h_tdigest_times": "9759974bc155fa77e11f150bb6511ba736d0d71790d94cba92d06b74d542ec42",
+          "4/morton": "92cedd52796c6c0844af1ce3e7e7636ed28804f6bf8f9d10ceab93edf1a29805",
+          "5/count": "c4654f97d4d1c0e0bb78fb05b14d189fe8b4d5ec7921ff4acc0860952b9b8769",
+          "5/h_tdigest": "990da3f3e099e188748a022e7205d25b3b33114ccb7188245aa456a9c4133497",
+          "5/h_tdigest_locations": "f0f2ef5c0dee840a58c1bde560d39ca265016df125ef01dae816c3a5e6898f40",
+          "5/h_tdigest_times": "ec365b96e26f2b79394b4815498c1d1d95e6691d3722fd02ea005bf9801b83dc",
+          "5/morton": "2d7a07b3e2db265b2050fedfd968fb6763f5b012c87033526852bffc90b059d2"
+        },
+        "combined": "7ed942ef57ed8251b0d25563a59b7f1f036ef413826d2ec48b7935d63a5a695e"
+      }
     }
   },
   "zarr_format": 3,

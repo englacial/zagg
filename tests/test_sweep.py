@@ -1275,7 +1275,10 @@ class TestSweepMode:
         from zagg.config import SWEEP_STAGES, get_sweep_mode, load_config
         from zagg.grids import from_config
 
-        path = Path(__file__).resolve().parents[1] / "tools/configs/atl03_windowed_measure.yaml"
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "tools/configs/atl03_windowed_measure_monthly.yaml"
+        )
         cfg = load_config(str(path))
         assert get_sweep_mode(cfg, from_config(cfg)) == SWEEP_STAGES
 

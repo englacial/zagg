@@ -1664,11 +1664,13 @@ def _window_work(decl, windowed, dirty_windows, entries) -> list:
     """``(envelope key, [windows to fold])`` work items for one node.
 
     Per-window overviews inherit window naming (D23); the reserved ``all``
-    token is the unwindowed leaf AND the opt-in all-time fold on a windowed
-    store (``all_time`` in the declaration; a preexisting all-time entry stays
-    maintained even if the declaration later drops the flag). A window whose
-    label IS that token can therefore never own a separate overview — same
-    basename, same envelope key — so it yields the all-time item alone.
+    token is the unwindowed leaf AND the all-time fold on a windowed store
+    (``all_time`` in the declaration, required — resolved true — on a windowed
+    store since issue #610 phase 4, though a pre-rule store may still declare
+    ``false``; a preexisting all-time entry stays maintained even if the
+    declaration later drops the flag). A window whose label IS that token can
+    therefore never own a separate overview — same basename, same envelope
+    key — so it yields the all-time item alone.
     """
     from zagg.windows import SCHEDULE_NONE_TOKEN
 

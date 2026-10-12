@@ -482,7 +482,7 @@ class TestReaders:
 
         root, _shards_ = self._bad_pointer_store(monkeypatch, cfg, tmp_path)
         counts = {"failed": 0}
-        fields = {"count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0}}
+        fields = {"count": {"class": "exact", "method": "sum", "dtype": "int64", "fill_value": 0}}
         result = _fold_node(root, "1111", 3, [None], list(_LEAVES[:2]), fields, 6, 4, counts, {})
         assert counts["failed"] == 1  # the bad leaf, not the whole node
         assert np.asarray(result["slabs"]["count"]).sum() > 0  # the good leaf folded
@@ -495,7 +495,7 @@ class TestReaders:
 
         root, shards = self._bad_pointer_store(monkeypatch, cfg, tmp_path)
         monkeypatch.setattr(sweep, "discover_leaves", lambda *_a, **_k: [(s, None) for s in shards])
-        block = {"overview": {"fields": {"count": {"class": "exact", "dtype": "int32"}}}}
+        block = {"overview": {"fields": {"count": {"class": "exact", "dtype": "int64"}}}}
         got = _validate_block_against_store(root, {"cell_order": 6}, block, {})
         good = hive.shard_leaf_path(root, shards[1])
         assert got == f"leaf {good}/{hive.read_commit(good)['current']}"

@@ -204,9 +204,17 @@ class RunHandle:
         #: "duration_s"}`` (plus ``"error"`` on ``"dispatch_failed"``) from
         #: ``runner._invoke_lambda_families_sweep``, the same dict
         #: ``runner._run_lambda`` reports as ``families_sweep``; ``None``
-        #: while the tail is in flight, when the run had no leaf to sweep, or
-        #: when its dispatch failed before any invoke fired (fail-open, D9). A ``finisher`` other than
-        #: ``"ok"`` means the root temporal section may be short.
+        #: while the tail is in flight, when the run had no leaf to sweep,
+        #: when the run walked the ``/2`` ladder (the families then rode the
+        #: staged sweep's node closes and no separate pass was fired, issue
+        #: #610 phase 4), or when its dispatch failed before any invoke fired
+        #: (fail-open, D9). A ``finisher`` other than ``"ok"`` means the root
+        #: temporal section may be short. On a run that rode the cascade the
+        #: families outcome is ``stage_sweep["families"]`` /
+        #: ``stage_sweep["families_unswept"]``; ``stage_sweep is None`` there
+        #: means the rollups are unswept, and the tail logs a warning naming
+        #: the backstop (``python -m zagg.sweep <store> --families
+        #: stats,moc,submap``).
         self.families_sweep: dict | None = None
         #: How the run's dispatch manifest went out (issue #588): ``"full"``;
         #: ``"slim"`` — the block did not fit the hive setup Event, so it
@@ -1370,7 +1378,13 @@ class Run:
                 # (issue #586), as on runner._run_lambda and _run_local.
                 bodies = [r.get("body") or {} for r in results]
                 leaves = leaves_from_stats_records([b.get("stats") for b in bodies])
-                if leaves:
+                # One fan-out (issue #610 phase 4), as on ``_run_lambda``: a
+                # run that walks the /2 ladder folds the rollup families in
+                # the staged sweep's node closes below and fires no families
+                # pass; a reattached handle chains no staged sweep, so its
+                # families take the pass, as they always have.
+                riding = runner._cascade_families(self.config, self.grid) if stage_chained else ()
+                if leaves and not riding:
                     # Partitioned from the leaf count and awaited (issue #610).
                     handle.families_sweep = runner._invoke_lambda_families_sweep(
                         client,
@@ -1419,7 +1433,10 @@ class Run:
                         # ``icechunk_ops.finalize_run`` matches the stage
                         # record against.
                         pipeline_run_id=run_id,
+                        # The rollup families ride the closes (issue #610).
+                        families=riding,
                     )
+                    runner._warn_families_unswept(riding, handle.stage_sweep)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         self._finalize_icechunk(

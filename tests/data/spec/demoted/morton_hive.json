@@ -4,7 +4,7 @@
   "short_name": "SPEC_FIXTURE",
   "version": "1"
  },
- "semantic_hash": "12756f7a17b97861d7216325ccaf827d51e09dc00f89ae0a1e46e36b6de380d1",
+ "semantic_hash": "b19f369e89e7b8fc8de36459e38f99d381f07190816b9bf4d7e7104b30f6cb11",
  "cell_order": 6,
  "shard_order": 4,
  "split_schedule": [
@@ -30,7 +30,7 @@
      "class": "exact",
      "method": "sum",
      "nan_policy": "skip",
-     "dtype": "int32",
+     "dtype": "int64",
      "fill_value": 0
     },
     "h_tdigest_signal": {
@@ -65,9 +65,9 @@
      "3": "leaves",
      "2": "cascade"
     },
-    "generated_at": "2026-09-11T01:23:29+00:00"
+    "generated_at": "2026-10-12T01:49:16+00:00"
    }
   }
  },
- "generated_at": "2026-09-11T01:23:29+00:00"
+ "generated_at": "2026-10-12T01:49:16+00:00"
 }

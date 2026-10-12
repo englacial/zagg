@@ -1218,7 +1218,15 @@ so, in every class.
 artifacts, no precision guarantee past the exact levels" posture is
 superseded (espg ruling on the declaring PR): **exact-class** fields are
 exactly correct at every order — the reductions are associative, so the
-pyramid is a true downsampling pyramid for them — and **approximate-class**
+pyramid is a true downsampling pyramid for them, **provided the declared
+`dtype` holds the coarse reductions**: every level carries the field's
+declared dtype (the per-field `dtype` of the §4.5 `pyramid` block below,
+copied from the build config), and a `sum` that exceeds it wraps rather than
+widens. zagg's packaged templates
+declare `count` as `int64` ([#626](https://github.com/englacial/zagg/issues/626):
+an `int32` count summed past 2^31 at orders 1 and 0 of a dense order-9
+store); a reader MUST take `count`'s dtype from the array metadata, never
+assume a width — and **approximate-class**
 fields are **analysis-grade at their recorded generation**: the per-entry
 merges-from-raw count (#381 point (7), recorded in the §4.5 `actuals` and
 per artifact in `zagg_overview`) is
@@ -1244,7 +1252,7 @@ overview family under the versioned `pyramid` block:
     "exact_levels": 1,
     "fields": {
       "count":     {"class": "exact", "method": "sum", "nan_policy": "skip",
-                    "dtype": "int32", "fill_value": 0},
+                    "dtype": "int64", "fill_value": 0},
       "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
                     "dtype": "float32", "inner_shape": [2], "delta": 512},
       "photon_ids": {"class": "none"}
@@ -1458,7 +1466,16 @@ staged sweep's finisher.
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time). On a `/2` store it is folded from the
   node's per-window overviews (§4.4 "The all-time fold of a windowed
-  store").
+  store"). A windowed store that declares an overview schedule (a
+  non-empty `overviews` list or `orders`) MUST declare it `true`
+  ([issue #610](https://github.com/englacial/zagg/issues/610) phase 4: the
+  per-node rollups and the §4.10 companion ride the node's all-time close,
+  so a windowed config that omits the key resolves to `true` and one that
+  spells `false` is refused). A windowed store that declares none
+  (`pyramid: false`, written as `orders: []`) declares no fold and carries
+  no `all_time` key. A reader MUST still tolerate `false` on a
+  windowed store written before that rule — it is §4.10's gated case, with
+  no `all.zarr` to find.
 - **`summarize`** (optional) — the opt-in **declared derived summary** for
   `none`-class fields: a mapping from a new, *different* field name to its
   derivation (e.g. an auto-digest of a roster field's raw values), living in
@@ -1875,6 +1892,19 @@ stated here:
   `pyramid.overview.all_time`). The fleet dispatcher fires the close units
   from it, not from its run config: `pyramid` is not a frozen manifest key,
   so the two can disagree, and the store is the source of truth.
+- A stage record's **`families`**
+  ([issue #610](https://github.com/englacial/zagg/issues/610)) is present
+  when the rollup families rode the same walk as the ladder (§4.7's first
+  paragraph: they add no byte layouts). It maps each family's name to that
+  family's block — its per-pass counts, the dispatch nodes whose span failed
+  (`node_failures`), and, for `moc`, the §10 accumulator block the run's
+  finisher composes the root §10.2/§10.3 section and its §10.5 sibling from,
+  the same block a families-pass partition record carries, in the same
+  currency. Every key of the mapping is a family name, so a reader may walk
+  it without an allow-list.
+  Still telemetry: the objects it composes are normative, this record is not,
+  and the finisher reads which families rode off these records rather than
+  off its own invoke.
 
 ### 4.8 The sweep-admission lease (`zagg-sweep-lease/1`)
 
@@ -2416,19 +2446,24 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-The leaf fixtures were committed before this revision (`temporal/` was
-regenerated for §10.6 under issue #575, still before it) and are
-unregenerated: no stamp carries the §5.3 copy of `content_hashes`, and no
-`dggs` block carries the §1 `latitude` token, so each fixture is the
-absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580) pin
-for both (the sidecar copy and §1's own evidence paragraph are the record
-for what those artifacts mean). The one **versioned** leaf (§1.5; a stamp
+Every fixture that declares `count` was regenerated for issue
+[#626](https://github.com/englacial/zagg/issues/626) (`count` is `int64`,
+§4.4/§4.5), so those stamps carry the §5.3 copy of `content_hashes`.
+Every committed `dggs` block carries the §1 `latitude` token (since
+[#616](https://github.com/englacial/zagg/issues/616)), so §1's absent-token
+rule has no committed golden; §1's evidence paragraph is its record.
+`raster_toc/` (no `count`) is unregenerated: its stamp without the §5.3 copy is the
+committed absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580)
+pin (the sidecar copy and §1's own evidence paragraph are the record for
+what that artifact means). The one **versioned** leaf (§1.5; a stamp
 naming `current`) is `versioned/` below, added standalone with the writer
 that produces it (issue [#582](https://github.com/englacial/zagg/issues/582));
-the older leaf fixtures stay legacy and pin the absent-`current` rule.
-Regeneration of those is deferred because it would
-also install the §4.9 `multiscales` mirror that `column/` pins the
-**absence** of, retiring an unrelated pin.
+the other leaf fixtures are unversioned and pin the absent-`current` rule.
+Two older-era pins are produced deliberately by the generator (its STALE
+BY DESIGN note): `column/`'s builder drops the §4.9 `multiscales` mirror
+from its manifest, and `kitchen_sink/`'s builder strips the §9 `located`
+attrs from its two leaf `*_locations` siblings, so a regeneration
+reproduces both.
 
 Nine tiny single-shard hive stores plus four metadata-only ones (the
 `pyramid/` declaration, the `multiscales/` companion, the `icechunk/` repo
@@ -2457,8 +2492,8 @@ never sharded, §8/#247):
   block, `gain` provenance attrs) plus `count`. Its payloads carry
   fractional positive weights whose per-cell sums are **not** integers —
   the pin that a flux reader must not round-trip weights through counts —
-  while `minimal/` (committed before this revision, unregenerated) pins the
-  absent-key ⇒ `"counts"` default.
+  while `minimal/`, which declares no `weights`, pins the absent-key ⇒
+  `"counts"` default.
 - **`kitchen_sink/`** — the full stratified-product surface: located
   signal/noise digest strata (payload + `{field}_locations` siblings,
   `stratum`/`signal_threshold` provenance attrs), the `composition` word
@@ -2482,8 +2517,8 @@ never sharded, §8/#247):
   alone — the `/2` artifacts a fleet writes are `column/`'s job below
   (sweep-side levels are #384's). The same manifest carries the §4.9
   `multiscales` discovery mirror the retrofit installs beside a `/2`
-  block; `column/`, committed before §4.9 and unregenerated, is the
-  absent-key ⇒ pre-convention pin.
+  block; `column/`'s manifest, whose mirror the generator drops on purpose
+  (stale by design), is the absent-key ⇒ pre-convention pin.
 - **`column/`** — the `minimal/` inputs plus an explicit
   `output.pyramid.overviews: 5` knob, so the same worker invocation that
   committed the leaf also wrote its §4.6 **column**: `all.pyramid.zarr`
@@ -2524,9 +2559,9 @@ never sharded, §8/#247):
   no arrays, no refs — the committed golden pins the documents a
   conformant reader validates: the root group document against the
   multiscales v0.1 schema, and every level group against the dggs v1
-  schema once [#616](https://github.com/englacial/zagg/issues/616) lands
-  the `semi_major_axis` spelling (a test pins that one gap until then), both
-  vendored under `tests/data/conventions/`. `icechunk.expected.json` spells the
+  schema (the `semi_major_axis` spelling, since
+  [#616](https://github.com/englacial/zagg/issues/616)), both vendored
+  under `tests/data/conventions/`. `icechunk.expected.json` spells the
   `layout` from the generator's inputs (the §11.1 rules over `pyramid/`'s
   expanded levels), never read back through zagg.
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
@@ -2540,8 +2575,8 @@ never sharded, §8/#247):
   decimal strings (JSON numbers cannot carry `uint64` faithfully) together
   with the `(start, end)` nanoseconds a conforming decode yields and the
   real acquisition spans they must contain, which is the §8 conservative
-  containment claim pinned on committed bytes. The other four fixtures,
-  which carry no `temporal` key anywhere, are the absent-key ⇒ legacy pin.
+  containment claim pinned on committed bytes. The leaf fixtures that
+  carry no `temporal` key anywhere are the absent-key ⇒ legacy pin.
 
 - **`temporal/`** — the §8.2/§8.3/§9 **companion** surface: `minimal/`'s
   geometry and cell plan with one digest field (`h_tdigest`) carrying both
@@ -2562,8 +2597,10 @@ never sharded, §8/#247):
   per-centroid envelope beneath it) on committed bytes. Its located sibling
   carries **heterogeneous orders** — order-29 point words on unmerged
   centroids, coarser ancestors on merged ones — which is §9.1's claim
-  pinned. `kitchen_sink/`, committed before §9 and unregenerated, is the
-  absent-`located` ⇒ §2.2 pin, exactly as `minimal/` is §2.0's.
+  pinned. `kitchen_sink/`, whose two located siblings the generator writes
+  without the §9 attrs on purpose (stale by design), is the
+  absent-`located` ⇒ §2.2 pin,
+  exactly as `minimal/` is §2.0's.
 
   Its §4.6 leaf column carries the **folded** companions: every resolution
   group holds `h_tdigest` with both siblings, each declaring `per-centroid`,
@@ -2602,8 +2639,8 @@ never sharded, §8/#247):
   transcribed from the object. The other leaf
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
-  trees are byte-identical to their pre-§10 selves — which is exactly §10's
-  absence rule, pinned as bytes. From issue #489 the same fixture also
+  trees carry no such object — which is exactly §10's absence rule, pinned
+  as bytes. From issue #489 the same fixture also
   carries the **§10.5 `coverage.toc` sibling**, PUT by the same production
   finisher beside the carrier (whose section now bears the §10.1 `cover`
   marker); `temporal.expected.json`'s `cover` block records the derived

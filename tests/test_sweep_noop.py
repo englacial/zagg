@@ -84,7 +84,7 @@ def swept_windowed(tmp_path):
 
     ``_stage_column_current``'s ``window`` argument is what picks the key
     (``column_name(window)``), and the config phase 1 pins to ``"stages"``
-    (``tools/configs/atl03_windowed_measure.yaml``) is a windowed store — so
+    (``tools/configs/atl03_windowed_measure_monthly.yaml``) is a windowed store — so
     the windowed arm is the production arm, and espg's acceptance wording
     asks for the per-node read bound on windowed units too
     (https://github.com/englacial/zagg/issues/620#issuecomment-6068583904).

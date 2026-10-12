@@ -204,9 +204,10 @@ def validate_pyramid(
 
     ``full=True`` is REFUSED for ``s3://`` roots, like ``resweep``: it voids
     every bound in the module header — ``_ladder_totals`` alone reads every
-    leaf's whole ``count`` array (~12 GB across the ATL03 o9 roster, whose
-    leaves are ``4**10`` int32 each) before the per-cell arm walks every
-    populated cell of every node (review finding).
+    leaf's whole ``count`` array (~24 GB across the ATL03 o9 roster, whose
+    leaves are ``4**10`` int64 each — issue #626; ~12 GB on the int32 v3
+    store) before the per-cell arm walks every populated cell of every node
+    (review finding).
     """
     from zagg.hive import read_manifest
 

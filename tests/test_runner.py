@@ -1705,7 +1705,7 @@ class TestDeclaredTouchPolicyReachesTheRootTouch:
     (review finding on PR #496).
     """
 
-    def _run(self, monkeypatch, atl06_config, tmp_path, *, touch):
+    def _run(self, monkeypatch, atl06_config, tmp_path, *, touch, ladder=False):
         import zagg.grids as grids_mod
         import zagg.hive as hive_mod
         from zagg import runner
@@ -1715,7 +1715,10 @@ class TestDeclaredTouchPolicyReachesTheRootTouch:
             "get_nsidc_s3_credentials",
             lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
         )
-        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        grid = _stub_grid()
+        if ladder:
+            grid.chunk_order = 7  # a /2 ladder the run walks (issue #610)
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid)
         monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
         # Every unit is CURRENT: the run writes nothing, which is exactly when
         # the root objects would otherwise age out from under fresh leaves.
@@ -1786,6 +1789,62 @@ class TestDeclaredTouchPolicyReachesTheRootTouch:
         assert summary["cells_current"] == 4
         assert summary["objects_touched"] > 0 and summary["touch_failures"] == 0
         assert "touch_skipped_paths" not in summary
+
+
+class TestLocalFamiliesRideTheCascade:
+    """The local tail is one walk too (issue #610 phase 4): a run that walks
+    the /2 ladder hands the rollup families to ``stage_sweep_after_run`` and
+    skips the in-process ``sweep_after_run`` pass; one that walks none keeps
+    the pass and hands the staged chaining no family — CLAUDE.md: the fleet
+    path and the local path ship the same behaviour in the same commit."""
+
+    _run = TestDeclaredTouchPolicyReachesTheRootTouch._run
+
+    def _tail(self, monkeypatch, atl06_config, tmp_path, *, ladder, sweep="stages"):
+        import zagg.sweep as sweep_mod
+        import zagg.sweep_stages as stages_mod
+
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [(1, None)])
+        seen: dict = {"pass": 0, "stage": []}
+        monkeypatch.setattr(
+            sweep_mod, "sweep_after_run", lambda *a, **k: seen.update({"pass": seen["pass"] + 1})
+        )
+        monkeypatch.setattr(
+            stages_mod, "stage_sweep_after_run", lambda *a, **k: seen["stage"].append(k)
+        )
+        atl06_config.output["sweep"] = sweep
+        self._run(monkeypatch, atl06_config, tmp_path, touch=None, ladder=ladder)
+        return seen
+
+    def test_a_ladder_run_rides_the_cascade_and_skips_the_pass(
+        self, monkeypatch, atl06_config, tmp_path
+    ):
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        seen = self._tail(monkeypatch, atl06_config, tmp_path, ladder=True)
+        assert seen["pass"] == 0
+        (kwargs,) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
+
+    def test_a_run_that_walks_no_ladder_keeps_the_pass(self, monkeypatch, atl06_config, tmp_path):
+        seen = self._tail(monkeypatch, atl06_config, tmp_path, ladder=False)
+        assert seen["pass"] == 1
+        (kwargs,) = seen["stage"]
+        assert kwargs["families"] == ()
+
+    def test_a_plain_sweep_is_the_pass_alone(self, monkeypatch, atl06_config, tmp_path):
+        seen = self._tail(monkeypatch, atl06_config, tmp_path, ladder=True, sweep=True)
+        assert seen["pass"] == 1 and seen["stage"] == []
+
+    def test_the_default_rides_the_cascade_locally(self, monkeypatch, atl06_config, tmp_path):
+        # The issue #620 default (an unset sweep, a declared ladder) is one
+        # walk too: the gate reads the resolved mode, not the explicit key.
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        seen = self._tail(monkeypatch, atl06_config, tmp_path, ladder=True, sweep=None)
+        assert seen["pass"] == 0
+        (kwargs,) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
 
 
 class TestSummaryKeysByteIdentical:
@@ -4586,10 +4645,23 @@ class TestLambdaSkipAndDirtOnly:
     when that sweep completed.
     """
 
-    def _drive(self, monkeypatch, atl06_config, *, body, overwrite=False, init=None, staged=None):
+    def _drive(
+        self,
+        monkeypatch,
+        atl06_config,
+        *,
+        body,
+        overwrite=False,
+        init=None,
+        staged=None,
+        ladder=False,
+        sweep="stages",
+    ):
         """``init`` is the stubbed icechunk init record (``None``: no repo);
         ``staged`` the stubbed staged sweep's summary. ``seen["order"]`` logs
-        the stage sweep and the icechunk finalize in call order (issue #582)."""
+        the stage sweep and the icechunk finalize in call order (issue #582).
+        ``ladder`` gives the stub grid a strictly-interior chunk order, so the
+        run's ``sweep: "stages"`` config walks a /2 ladder (issue #610)."""
         from unittest.mock import MagicMock
 
         import boto3
@@ -4614,9 +4686,12 @@ class TestLambdaSkipAndDirtOnly:
             "get_nsidc_s3_credentials",
             lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
         )
-        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        grid = _stub_grid()
+        if ladder:
+            grid.chunk_order = 7  # parent 6 < 7 < child 8: the /2 default flip
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid)
         atl06_config.output["store_layout"] = "hive"
-        atl06_config.output["sweep"] = "stages"
+        atl06_config.output["sweep"] = sweep
         atl06_config.output["coverage_moc"] = False
         monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
         monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **k: None)
@@ -4761,6 +4836,150 @@ class TestLambdaSkipAndDirtOnly:
         )
         assert seen["order"] == ["stage", "finalize"]
         assert summary["icechunk_finalize"] == {"tag": "run-x"}
+
+
+class TestLambdaFamiliesRideTheCascade:
+    """The fleet tail is ONE fan-out (issue #610 phase 4, espg's ruling on PR #623).
+
+    A run that walks the /2 ladder hands the rollup families to the staged
+    sweep's dispatcher (``families=CASCADE_FAMILIES``) and does not fire the
+    separate families pass; a run that walks none — the /1 retrofit regime —
+    fires the pass exactly as before and hands the dispatcher no family. The
+    gate is ``runner._cascade_families``, which reads the config alone.
+    """
+
+    def _drive(self, monkeypatch, atl06_config, **kwargs):
+        # The stub bodies carry no ``stats`` record, so the tail would find no
+        # leaf; one leaf is what makes both legs reachable (as TestFinalizeGuard).
+        import zagg.sweep as sweep_mod
+
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [(10, None)])
+        return TestLambdaSkipAndDirtOnly._drive(
+            self, monkeypatch, atl06_config, body={"total_obs": 1}, **kwargs
+        )
+
+    def test_a_ladder_run_rides_the_cascade_and_fires_no_families_pass(
+        self, monkeypatch, atl06_config
+    ):
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        summary, seen = self._drive(monkeypatch, atl06_config, staged={"finisher": {}}, ladder=True)
+        assert seen["sweep"] == 0  # no mode="sweep" families invoke
+        assert summary["families_sweep"] is None  # nothing separate was fired
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
+
+    def test_a_run_that_walks_no_ladder_keeps_the_separate_pass(self, monkeypatch, atl06_config):
+        # ``sweep: "stages"`` with no walkable /2 ladder: the stage worker
+        # would refuse at the /2 gate, so the families pass is the one that
+        # reaches the rollups — unchanged, and the dispatcher gets no family.
+        summary, seen = self._drive(monkeypatch, atl06_config, ladder=False)
+        assert seen["sweep"] == 1
+        assert summary["families_sweep"] == {
+            "partitions": 1,
+            "fired": 1,
+            "landed": 1,
+            "finisher": "ok",
+        }
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == ()
+
+    def test_a_plain_sweep_is_the_pass_alone(self, monkeypatch, atl06_config):
+        # ``sweep: true`` chains no staged sweep, so a ladder declaration is
+        # moot: the pass fires, and nothing rides anything.
+        summary, seen = self._drive(monkeypatch, atl06_config, ladder=True, sweep=True)
+        assert seen["sweep"] == 1 and seen["stage"] == []
+        assert summary["families_sweep"]["finisher"] == "ok"
+
+    def test_a_failed_staged_dispatch_fires_no_fallback_pass(self, monkeypatch, atl06_config):
+        # "One fan-out, one cascade, nothing else": when the staged dispatch
+        # fails open (None) the families are unswept with the ladder, and the
+        # backstop is the hand pass — not a second fan-out from the tail.
+        summary, seen = self._drive(monkeypatch, atl06_config, staged=None, ladder=True)
+        assert seen["sweep"] == 0 and len(seen["stage"]) == 1
+        assert summary["families_sweep"] is None
+
+    @pytest.mark.parametrize(
+        "staged", [None, {"finisher": {}, "families_unswept": True}, {"finisher": {}}]
+    )
+    def test_unswept_families_name_the_backstop(self, monkeypatch, atl06_config, caplog, staged):
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            self._drive(monkeypatch, atl06_config, staged=staged, ladder=True)
+        warned = "--families stats,moc,submap" in caplog.text
+        assert warned == (staged is None or bool(staged.get("families_unswept")))
+        # The migration for a pre-rule windowed store rides the same warning.
+        assert ("--declare-pyramid <config.yaml>" in caplog.text) == warned
+
+    def test_the_gate_is_the_ladder_walk(self, atl06_config):
+        from zagg import runner
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        grid = _stub_grid()
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output["sweep"] = "stages"
+        assert runner._cascade_families(atl06_config, grid) == ()  # no interior chunk order
+        grid.chunk_order = 7
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
+        atl06_config.output["sweep"] = True
+        assert runner._cascade_families(atl06_config, grid) == ()  # no staged sweep to ride
+
+    def test_the_gate_is_the_resolved_mode_not_the_explicit_key(self, atl06_config):
+        # Issue #620: an UNSET sweep on a ladder-declaring hive store chains
+        # the staged sweep by default, so the families ride it — were the gate
+        # ``ladder_walks`` (the explicit key, kept for the Icechunk commit
+        # default per espg's ruling on PR #622 question (1)) the tail would
+        # fire the pass AND the staged sweep: the two walks phase 4 retired.
+        from zagg import runner
+        from zagg.config import chains_stages
+        from zagg.icechunk_refs import ladder_walks
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        grid = _stub_grid()
+        grid.chunk_order = 7
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output.pop("sweep", None)
+        assert chains_stages(atl06_config, grid) and not ladder_walks(atl06_config, grid)
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
+        grid.chunk_order = 8  # no interior chunk order: the default is the pass alone
+        assert not chains_stages(atl06_config, grid)
+        assert runner._cascade_families(atl06_config, grid) == ()
+
+    def test_the_default_rides_the_cascade_on_the_fleet(self, monkeypatch, atl06_config):
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        summary, seen = self._drive(
+            monkeypatch, atl06_config, staged={"finisher": {}}, ladder=True, sweep=None
+        )
+        assert seen["sweep"] == 0 and summary["families_sweep"] is None
+        ((_args, kwargs),) = seen["stage"]
+        assert kwargs["families"] == CASCADE_FAMILIES
+
+    def test_a_windowed_store_rides_the_cascade_like_any_other(self, atl06_config):
+        # A rollup object is per node and merges every window, so only the
+        # all-time close can fold it — and a windowed config DECLARES that
+        # close (``all_time`` resolves to true, false is refused at
+        # validation; espg's ruling on question (16)), so the gate has no
+        # windowed branch: it does not read ``all_time`` at all.
+        from zagg import runner
+        from zagg.config import get_pyramid
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        grid = _stub_grid()
+        grid.chunk_order = 7
+        atl06_config.output.update(store_layout="hive", sweep="stages")
+        atl06_config.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00Z",
+        }
+        assert get_pyramid(atl06_config) == {"all_time": True}  # the resolved default
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
+        atl06_config.output["pyramid"] = {"all_time": True}
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
+        # An unvalidated config spelling false changes nothing here: the
+        # refusal is validation's, not the tail's.
+        atl06_config.output["pyramid"] = {"all_time": False}
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
 
 
 class TestFinalizeGuard:

@@ -235,8 +235,9 @@ output:
   failed cell on every backend — its 500 and its `failed` status object on
   the fleet, `cells_error` on both — but the
   leaves that landed are in the store, and the run's tail treats them as the
-  per-window fan-out would have: the **sweep work set** (the families sweep,
-  the staged sweep's `(node, window)` units and the node close) is every
+  per-window fan-out would have: the **sweep work set** (the staged sweep's
+  `(node, window)` units and the node close, which the rollup families ride
+  where the store declares one — the families pass otherwise) is every
   result's stats **records**, each on its own `success`, never the invoke's
   status; a shard enters the root **`coverage.moc`** when at least one of
   its leaves stands (written by this run, or found current or refused by the
@@ -602,7 +603,10 @@ coarse rollup levels, the root `coverage.moc` refresh, and the manifest's
 coarse-level finisher (issue #377).
 
 **The run tail partitions this itself** on the Lambda backends ([issue
-#610](https://github.com/englacial/zagg/issues/610)): the end-of-run
+#610](https://github.com/englacial/zagg/issues/610)) — for a run that walks
+**no** `/2` ladder, the `/1` retrofit regime; any other `/2` run fires no
+families pass at all and its families ride the staged sweep instead (see
+"The rollup families ride the same walk", below): the end-of-run
 families pass is split `4^k` ways from the run's own leaf count — `k` from
 `ceil(log4(leaves / 128))`, then refined until no partition holds more than
 128 leaves, because a regional store's leaves cluster (the 2,959-leaf
@@ -785,20 +789,76 @@ per window per node; the CLI and the local backend run the same units
 serially. A node's window units share no object — each writes only its own
 `{window}.zarr` / `{window}.pyramid.zarr` and reads its skip key off the
 artifact itself — so one that fails costs its own window and nothing else,
-and is named in the stage record (`unit_errors`). Where the store declares
-`output.pyramid.all_time`, each node then gets one **close**: the all-time
+and is named in the stage record (`unit_errors`). Each node then gets one
+**close** (`output.pyramid.all_time`, which a windowed config declares —
+resolved to true when omitted, refused when false, [issue
+#610](https://github.com/englacial/zagg/issues/610) phase 4): the all-time
 fold, a k-way merge of the node's per-window overviews into `all.zarr`
 (overview-sized objects at the same node, never leaves — its cost follows
 the window count, not the subtree). It covers every window the node has,
 not only the ones the run touched, records the windows it folded
 (`source_windows`), and is one more merge from raw than its sources — 2 at a
 gather level, 3 at a merge level
-([specification §4.4](specification.md)). A store without the declaration
-has no close and pays no unit for it. The declaration is the store's: the
+([specification §4.4](specification.md)). A store written before the fold
+was required, whose manifest does not declare it, has no close and pays no
+unit for it. The declaration is the store's: the
 fleet dispatcher reads it back from the first window unit's stage record
 (`closes`, taken from the manifest the worker ran against), so a run whose
 config omits or contradicts `all_time` still closes exactly the nodes the
 CLI would.
+
+**The rollup families ride the same walk** ([issue
+#610](https://github.com/englacial/zagg/issues/610) phase 4). The
+`stats` / `moc` / `submap` rollups and the §10 per-shard TOC contribution
+are the *same* bottom-up walk the ladder does — a `(node, window)` unit
+already reads the leaves under its node — so they no longer need a fan-out
+of their own. Named with `--families` on `--stages` (or `families=` on
+`run_stage_sweep` / `run_stage_sweep_fleet`) — and by **every run tail that
+walks the `/2` ladder**: `runner._cascade_families`, the same config-only
+gate as the Icechunk commit pin (`output.sweep: "stages"` plus a `/2`
+declaration with a composable field), hands `CASCADE_FAMILIES` to the staged
+sweep on the local backend, `agg` on Lambda and the `client` facade alike,
+and the tail then fires no families pass; a run that walks none (a `/1`
+store, or `"stages"` on a config that declares no ladder) keeps the separate
+pass exactly as before — they fold in each dispatch
+node's **close**, over that tuple's own span: the finest tuple's span starts
+at the leaves (the stats sidecar, the D4 stamp, the leaf sub-map, the §10
+`temporal.toc` record — all through the invoke's one store handle), and
+every coarser tuple's starts from the rollups the tuple below it wrote. The
+span decomposition is exact, so the rollups are byte-identical to a
+whole-tree `python -m zagg.sweep` pass at any `tuple_width`. The close is
+where they ride because a rollup object merges **every window** of its node
+(its `windows` key): the node's window units run concurrently and would
+read-modify-write one object. A windowed store without the all-time fold
+would have nowhere to put them, which is why a windowed config must declare
+it — `pyramid.all_time` resolves to true when omitted and is refused when
+false (espg's ruling on [PR
+#623](https://github.com/englacial/zagg/pull/623#issuecomment-6116823949),
+[issue #610](https://github.com/englacial/zagg/issues/610) phase 4) — and
+the fleet dispatcher refuses a windowed caller that says otherwise before
+anything fires. Its `all_time` is still only the caller's first guess about
+the *store*: a manifest that withdrew the fold is reported
+(`families_unswept`) from the store's own answer, read back off the first
+landed window record, and those rollups are then swept by hand. That is
+the case for every append to a windowed store written before the fold was
+required (its manifest says `all_time: false`, and `ensure_manifest` never
+rewrites the block): the dispatcher fires no close, warns that the rollups
+went unswept, and the fix is the one-time `python -m zagg.sweep <store>
+--declare-pyramid <config.yaml>` retrofit (or the hand `--families
+stats,moc,submap` pass), per the recovery runbook in
+[Recovering a run whose launcher died](deployment/lambda.md#recovering-a-run).
+The run's finisher then composes the families' store-root singletons once —
+the §10 temporal section inside `coverage.moc` and its `coverage.toc`
+sibling — from the base-node rollups (≤ 1 GET per base cell) plus the
+accumulator blocks the stage records carry, reading **no leaf**. Where the
+`moc` family rode *and* found base-node rollups to compose from, its own
+finish owns the root `coverage.moc` refresh and the finisher's step 1 stands
+down (`root_moc_from: "families"`); otherwise step 1 runs from the work set
+as it always has, because only that family writes the object. Which families rode is
+taken from the *records*, like `closes`, never from the finisher's event. On
+the 64-leaf local fixture the reads are the same 192 leaf reads either way:
+192 in the one families invoke before, ≤ 12 per close unit across 16 units
+after, and two fewer end-of-run invokes.
 
 **Memory.** A stage worker folds a level **one block of output cells at a
 time** — read the child members covering the block, fold, write, drop — and
