@@ -11,6 +11,19 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.60.0] - 2026-10-12
+
+### Merged pull requests
+
+- hhdc_viewer: read the GEDI flux tensor as float32 on moczarr ≥ 0.9 ([#625](https://github.com/englacial/zagg/pull/625)) by @espg
+- Schedule measurement kit: four arm configs, the N-arm readout with occupancy, stage records and the all-time accuracy leg (issue #602) ([#628](https://github.com/englacial/zagg/pull/628)) by @espg
+- count is int64 in every packaged template: the int32 ladder wrapped past 2^31 at the coarse orders ([#629](https://github.com/englacial/zagg/pull/629)) by @espg
+- staged sweep: the stats/moc/submap rollups and the §10 TOC contribution ride the one cascade (issue #610) ([#623](https://github.com/englacial/zagg/pull/623)) by @espg
+- Fine leaf columns (orders 14-16) are sharded with inner chunks of ~0.5 MB ([#632](https://github.com/englacial/zagg/pull/632)) by @espg
+- Windowed hive stores get an Icechunk repo: manifests split on the row axis, leaves indexed at their window's row ([#604](https://github.com/englacial/zagg/pull/604)) by @espg
+- The sweep is the append's: sweep: "stages" on by default, the operator forms require a scope, and a current node costs stamps ([#622](https://github.com/englacial/zagg/pull/622)) by @espg
+- Sized stage schedule is uniform width 2, top-aligned (236 tail invokes on California, not 287); hive templates default to windowed yearly ([#639](https://github.com/englacial/zagg/pull/639)) by @espg
+
 ## [0.59.0] - 2026-10-08
 
 ### Merged pull requests
