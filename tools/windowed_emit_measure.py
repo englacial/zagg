@@ -703,8 +703,9 @@ def stage_memory(ladder: dict, stages: dict) -> dict:
     """The staged sweep's memory high-water against the tier it ran on.
 
     The peak is the largest ``container_hwm_mb`` any stage row carries, over
-    BOTH legs — the root run record's per-order rows and EVERY fleet stage run,
-    not just the newest — since a store may hold one, the other or both, and
+    BOTH legs and every run of each — EVERY root run record's per-order rows
+    and EVERY fleet stage run, not just the newest of either — since a store
+    may hold one leg, the other or both, and
     the question is whether the tier was ever needed, not what its last sweep
     needed (the cost leg counts every run for the same reason). ``headroom_mb``
     is what the tier (:data:`STAGE_TIER_GB`) was never asked for, the number
@@ -730,7 +731,13 @@ def stage_memory(ladder: dict, stages: dict) -> dict:
     rather than absent — reading it off the record would take the record
     carrying the tier.
     """
-    peaks = [s["container_hwm_mb"] for s in ladder.get("stages") or []]
+    # Every root record, not only ``ladder["stages"]`` (the NEWEST one's rows,
+    # ``ladder_numbers``): a re-sweep of narrower tuples would otherwise read as
+    # headroom the first sweep disproves, and on a ``--backend local`` arm the
+    # root records are the only artifacts there are.
+    peaks = [
+        s.get("container_hwm_mb") for rows in (ladder.get("records") or {}).values() for s in rows
+    ]
     peaks += [r.get("container_hwm_mb") for r in (stages or {}).get("runs") or []]
     recorded = [float(p) for p in peaks if p is not None]
     tier_mb = STAGE_TIER_GB * 1024.0

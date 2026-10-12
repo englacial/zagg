@@ -158,8 +158,13 @@ def _store(tmp_path, *, windows, versioned_first=False):
     (root / "sweep_stats_20260101T000000Z_stages.json").write_text(
         json.dumps({"stages": stages, "barrier_timed_out": False, "short_orders": []})
     )
-    # an older sweep record: kept apart, not mixed into the newest one's sums
-    older = {"stages": [{"dispatch_order": 0, "written": 99, "icechunk_commits": 99}]}
+    # an older sweep record: kept apart, not mixed into the newest one's sums.
+    # Its high-water is the store's highest (the windowed arm's 3,400.0 is above
+    # every newer row on either leg), so dropping it would read as headroom.
+    older_row = {"dispatch_order": 0, "written": 99, "icechunk_commits": 99}
+    if windows:
+        older_row["container_hwm_mb"] = 3400.0
+    older = {"stages": [older_row]}
     (root / "sweep_stats_20251231T000000Z_stages.json").write_text(json.dumps(older))
     _stage_records(root, windows)
     return str(root)
@@ -382,11 +387,15 @@ def test_the_stage_memory_high_water_and_the_tier_headroom(arms):
     assert win["stage_runs"]["latest"]["container_hwm_mb"] == 2600.0
     assert base["stage_runs"]["latest"]["container_hwm_mb"] is None
     # the headroom: the tier less the largest high-water ANY leg carries, over
-    # every stage run — here the older run's 3,000.0, not the newest's 2,600.0
+    # EVERY run of both legs — here the older ROOT record's 3,400.0, above the
+    # older fleet run's 3,000.0 and the newest run's 2,600.0
     mem = win["stage_memory"]
     assert mem["tier_mb"] == tool.STAGE_TIER_GB * 1024
-    assert mem["peak_mb"] == 3000.0 and mem["headroom_mb"] == mem["tier_mb"] - 3000.0
-    assert mem["peak_fraction"] == pytest.approx(3000.0 / mem["tier_mb"])
+    assert mem["peak_mb"] == 3400.0 and mem["headroom_mb"] == mem["tier_mb"] - 3400.0
+    assert mem["peak_fraction"] == pytest.approx(3400.0 / mem["tier_mb"])
+    # the newest root record alone would read 2,300.5, i.e. 2,891.5 MB of
+    # headroom the earlier sweep disproves
+    assert max(s["container_hwm_mb"] for s in win["ladder"]["stages"]) == 2300.5
     # a run that recorded none measured no memory, which is not "used none"
     assert base["stage_memory"] == {
         "tier_mb": tool.STAGE_TIER_GB * 1024,
@@ -402,7 +411,7 @@ def test_the_table_prints_the_headroom_and_dashes_when_unmeasured(arms, capsys):
     out = capsys.readouterr().out
     (tier,) = [ln for ln in out.splitlines() if ln.startswith("stage tier MB / container hwm")]
     assert "8,192.0 / - / -" in tier  # the baseline arm: not measured
-    assert "8,192.0 / 3,000.0 / 5,192.0" in tier
+    assert "8,192.0 / 3,400.0 / 4,792.0" in tier
     (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  container hwm as a fraction")]
     assert fraction.split()[-2:] == ["-", "0.4"]
     # per tuple (root record, finest order first) and per order (fleet records)
