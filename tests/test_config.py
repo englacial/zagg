@@ -2276,22 +2276,23 @@ class TestPackagedDeltaRaise:
 
     Leaf δ = 4,096 is the live stores' value (espg ruling 2026-09-13, issue
     #547): issue #422's statewide CA tail scan puts 1e-5 of cells above it, all
-    atmospheric storm artifacts. overview_delta = 512 is the pyramid-fold
-    accuracy budget. The packaged configs are EXPLICIT so ``_DEFAULT_DELTA``
-    never decides an output value for them (the silent-change-under-stable-hash
+    atmospheric storm artifacts. overview_delta is the pyramid-fold accuracy
+    budget: 128 on the hive (v4 store) templates since issue #638, 512 on the
+    flat ones. The packaged configs are EXPLICIT so ``_DEFAULT_DELTA`` never
+    decides an output value for them (the silent-change-under-stable-hash
     trap).
     """
 
     @pytest.mark.parametrize(
-        "name",
+        "name,overview_delta",
         [
-            "atl03_tdigest_healpix",
-            "atl03_tdigest_healpix_hive",
-            "atl03_tdigest_located_healpix",
-            "atl03_tdigest_strata_healpix",
+            ("atl03_tdigest_healpix", 512),
+            ("atl03_tdigest_healpix_hive", 128),
+            ("atl03_tdigest_located_healpix", 512),
+            ("atl03_tdigest_strata_healpix", 128),
         ],
     )
-    def test_digest_fields_declare_the_split_budgets(self, name):
+    def test_digest_fields_declare_the_split_budgets(self, name, overview_delta):
         cfg = default_config(name)
         ragged = {
             f: meta
@@ -2301,7 +2302,7 @@ class TestPackagedDeltaRaise:
         assert ragged  # every one of these templates carries digest fields
         for meta in ragged.values():
             assert meta["params"]["delta"] == 4096  # the live stores' value (issue #547)
-            assert meta["overview_delta"] == 512
+            assert meta["overview_delta"] == overview_delta
 
 
 # ---------------------------------------------------------------------------
@@ -2793,6 +2794,11 @@ class TestTemporalClockAtSubmission:
         import copy
 
         base = default_config("atl03_tdigest_healpix_hive", validate=False)
+        # The observed graft predates issue #638: the hive template now
+        # carries the yearly windowing block and the ``delta_time`` column it
+        # bins on, both of which would satisfy the clock the graft lacked.
+        del base.output["windowing"]
+        del base.data_source["variables"]["delta_time"]
         located = default_config("atl03_tdigest_located_healpix", validate=False)
         base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
         return base, located
