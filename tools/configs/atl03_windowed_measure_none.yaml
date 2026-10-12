@@ -99,7 +99,10 @@
 #       --store s3://<scratch-bucket>/<prefix>/_measure_none.zarr
 #   # 3. the ``unit: window`` re-run does not apply to this arm: it has one leaf
 #   #    per shard and no window unit. See a windowed arm's header for that step.
-#   # 4. readout, all four arms at once
+#   # 4. readout, all four arms at once. For any arm whose step (3) ran,
+#   #    pass that arm's ``_<arm>_window.zarr`` store in place of the line
+#   #    below -- step (3) abandoned the store named there -- or alongside
+#   #    it, to keep the attempt that did not fit as its own column.
 #   uv run python tools/windowed_emit_measure.py \
 #       s3://<scratch-bucket>/<prefix>/_measure_none.zarr \
 #       s3://<scratch-bucket>/<prefix>/_measure_yearly.zarr \

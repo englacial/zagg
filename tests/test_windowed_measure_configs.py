@@ -85,6 +85,25 @@ def test_the_quarterly_arm_is_an_explicit_contiguous_list_in_the_reserved_spelli
     assert months == {("01", "04"), ("04", "07"), ("07", "10"), ("10", "01")}
 
 
+@pytest.mark.parametrize("arm", ARMS)
+def test_the_header_sends_the_readout_at_the_store_the_re_run_wrote(arm):
+    """Step (3) re-runs an arm that did not fit into its OWN
+    ``_measure_<arm>_window.zarr`` store, but step (4)'s command lists the bulk
+    stores, so the header has to say to swap it in — otherwise a copy-paste run
+    reads the store step (3) abandoned. Not hypothetical for the monthly arm:
+    this header's own cost block rules it out of the bulk form."""
+    header = (
+        (CONFIGS / f"atl03_windowed_measure_{arm}.yaml")
+        .read_text()
+        .split("# ---- template follows")[0]
+    )
+    step_3, step_4 = header.split("#   # 4. ")
+    if arm != "none":  # the unwindowed arm has no window unit to re-run
+        assert f"_measure_{arm}_window.zarr" in step_3
+    assert "``_<arm>_window.zarr`` store in place of the line" in step_4
+    assert f"_measure_{arm}.zarr" in step_4  # the bulk line it replaces
+
+
 #: Repo files a header may name: the runbook is the header itself (issue #602),
 #: so a path it cites has to resolve — a cited notebook nobody wrote sends the
 #: operator nowhere. Store paths in the template body are not repo files, hence

@@ -105,7 +105,10 @@
 #   uv run python -m zagg --config /tmp/atl03_windowed_measure_yearly_window.yaml \
 #       --catalog /tmp/o6_sierra.json --backend lambda --profile \
 #       --store s3://<scratch-bucket>/<prefix>/_measure_yearly_window.zarr
-#   # 4. readout, all four arms at once
+#   # 4. readout, all four arms at once. For any arm whose step (3) ran,
+#   #    pass that arm's ``_<arm>_window.zarr`` store in place of the line
+#   #    below -- step (3) abandoned the store named there -- or alongside
+#   #    it, to keep the attempt that did not fit as its own column.
 #   uv run python tools/windowed_emit_measure.py \
 #       s3://<scratch-bucket>/<prefix>/_measure_none.zarr \
 #       s3://<scratch-bucket>/<prefix>/_measure_yearly.zarr \
