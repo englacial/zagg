@@ -400,16 +400,41 @@ def test_the_table_prints_the_headroom_and_dashes_when_unmeasured(arms, capsys):
     base, win = arms
     tool.print_table([base, win])
     out = capsys.readouterr().out
-    (tier,) = [ln for ln in out.splitlines() if ln.startswith("stage tier MB / peak MB")]
+    (tier,) = [ln for ln in out.splitlines() if ln.startswith("stage tier MB / container hwm")]
     assert "8,192.0 / - / -" in tier  # the baseline arm: not measured
     assert "8,192.0 / 3,000.0 / 5,192.0" in tier
-    (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  peak as a fraction")]
+    (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  container hwm as a fraction")]
     assert fraction.split()[-2:] == ["-", "0.4"]
     # per tuple (root record, finest order first) and per order (fleet records)
-    (per_tuple,) = [ln for ln in out.splitlines() if ln.startswith("stage peak RSS MB per tuple")]
+    (per_tuple,) = [
+        ln for ln in out.splitlines() if ln.startswith("stage container hwm MB per tuple")
+    ]
     assert per_tuple.split()[-3:] == ["2,300.5", "/", "900.0"]
-    (per_order,) = [ln for ln in out.splitlines() if ln.startswith("stage peak RSS MB per order")]
+    (per_order,) = [
+        ln for ln in out.splitlines() if ln.startswith("stage container hwm MB per order")
+    ]
     assert per_order.split()[-3:] == ["1,800.0", "/", "2,600.0"]
+
+
+def test_every_memory_row_says_which_currency_it_is_in(arms, capsys):
+    """Issue #141: the table prints a CONTAINER-LIFETIME `ru_maxrss` beside the
+    leaf side's SAMPLED per-invocation peak, so no memory label may be bare."""
+    tool.print_table(list(arms))
+    out = capsys.readouterr().out
+    labels = [label for label, _ in tool.table_rows(list(arms))]
+    memory = [lb for lb in labels if "hwm" in lb or "memory_mb" in lb]
+    assert memory == [
+        "max_memory_mb p50/p90/max (sampled per invoke)",
+        "stage container hwm MB per tuple (lifetime)",
+        "stage container hwm MB per order (lifetime)",
+        "stage tier MB / container hwm MB / headroom MB",
+        "  container hwm as a fraction of the tier",
+    ]
+    # and the footnote, which says what each currency is and which way the
+    # upper bound cuts: it can keep the tier, never bring it down
+    assert tool.MEMORY_CURRENCY_NOTE in out
+    assert "SAMPLED per-invocation peak" in out and "CONTAINER's whole lifetime" in out
+    assert "can never show that the tier may come down" in out
 
 
 def test_cost_sums_leaf_and_stage_gb_seconds(arms):

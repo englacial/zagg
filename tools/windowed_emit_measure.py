@@ -22,10 +22,15 @@ Given one or more hive store roots — the arms of one order-6 cell built with
   under ``<store>.status/run-stage-*/`` (``stage-<order>-<batch>.json`` per
   invoke and the ``finisher.json``): invokes per order, wall per invoke by unit
   kind, worker seconds, ``fold_cells_read`` per node-unit, ``fold_peak_cells``,
-  the peak RSS per tuple and the **8 GB tier's memory headroom** — what the
-  tier was never asked for, an upper bound since ``container_hwm_mb`` is a
-  per-process high-water, ``-`` on a run whose workers predate the stamp —
-  ``barrier_timed_out`` / ``short_orders``, failed units;
+  the CONTAINER high-water per tuple and the **8 GB tier's memory headroom**
+  — what the tier was never asked for. Every ``container hwm`` row is
+  ``ru_maxrss``, a CONTAINER-LIFETIME high-water, NOT a sampled per-tuple peak
+  like the leaf side's ``max_memory_mb`` (issue #141): it carries the earlier
+  tuples of its own pass and, on a warm container, earlier invokes, so it can
+  support KEEPING the 8 GB tier and can never show that the tier may come down
+  (:data:`MEMORY_CURRENCY_NOTE`, printed under the table). ``-`` on a run whose
+  workers predate the stamp — ``barrier_timed_out`` / ``short_orders``, failed
+  units;
 - the all-time accuracy leg (``windowed_emit_accuracy.py``): the all-time
   overview at one node per ladder level against a flat fold of the same leaves
   — exact ``count`` and the digests' rank error in units of 1/δ;
@@ -512,6 +517,18 @@ _LADDER_KEYS = (
     "fold_cells_read",
     "nodes",
 )
+#: Printed under the table (issue #141): the table carries TWO memory
+#: currencies and a reader must not take one for the other.
+MEMORY_CURRENCY_NOTE = (
+    "memory currencies: `max_memory_mb` is the leaf worker's SAMPLED per-invocation peak\n"
+    "(`_PeakRSSSampler`). Every `container hwm` row is `ru_maxrss`, the process high-water over\n"
+    "the CONTAINER's whole lifetime, so it carries the earlier tuples of its own pass (the stage\n"
+    "path runs `run_tuple` in a loop) and, on a warm container, earlier invokes' peaks: the stage\n"
+    "path has neither the leaf path's sampler nor its reclaim, and under `--backend local` the\n"
+    "leaf phase's peak lands in the first tuple's row. It is an UPPER BOUND, so it can support\n"
+    "KEEPING the stage tier and can never show that the tier may come down (issue #141, #602)."
+)
+
 #: Stage-row counters that are a HIGH-WATER, not a sum, across a dispatch
 #: order's rows: the streamed fold's largest single block of inputs, in source
 #: cells (``zagg.sweep_fold.FoldMeter``), and the tuple's peak RSS in MB
@@ -695,9 +712,14 @@ def stage_memory(ladder: dict, stages: dict) -> dict:
 
     Every value is ``None`` (printed ``-``, never ``0``) when no row carries a
     high-water: a run whose workers predate the stamp measured no memory, which
-    is not the same as having used none. The peak is an UPPER bound per tuple,
-    not a per-unit peak (``zagg.sweep_units.container_hwm_mb``), so headroom
-    read off it is the pessimistic side — a tier that looks roomy here is roomy.
+    is not the same as having used none.
+
+    The peak is a CONTAINER-LIFETIME high-water, not a sampled per-tuple peak
+    (``zagg.sweep_units.container_hwm_mb``; issue #141), so the headroom is
+    one-sided: a tier that looks roomy against it IS roomy, but an inflated
+    peak can only ever support KEEPING the tier — it can never show that the
+    tier may come down, which is the other half of what issue #602 asks. See
+    :data:`MEMORY_CURRENCY_NOTE`, printed under the table.
 
     ``tier_mb`` is ASSUMED, not read: :data:`STAGE_TIER_GB` mirrors
     ``runner._resolve_stage_function_name``, which sends every stage invoke to
@@ -877,7 +899,10 @@ def table_rows(results: list[dict]) -> list[tuple]:
         ("windows per shard p50/p90/max", lambda r: _fmt(r["fleet"].get("windows_per_shard"))),
         ("duration_s p50/p90/max", lambda r: _fmt(r["fleet"].get("duration_s"))),
         ("duration_total_s p50/p90/max", lambda r: _fmt(r["fleet"].get("duration_total_s"))),
-        ("max_memory_mb p50/p90/max", lambda r: _fmt(r["fleet"].get("max_memory_mb"))),
+        (
+            "max_memory_mb p50/p90/max (sampled per invoke)",
+            lambda r: _fmt(r["fleet"].get("max_memory_mb")),
+        ),
         (
             "errors / timeouts / fits 1 invoke",
             lambda r: (
@@ -961,7 +986,10 @@ def table_rows(results: list[dict]) -> list[tuple]:
         ),
         ("stage worker_s per tuple", lambda r: _stage_orders(r, "duration_s")),
         ("stage fold peak cells per tuple", lambda r: _stage_orders(r, "fold_peak_cells")),
-        ("stage peak RSS MB per tuple", lambda r: _stage_orders(r, "container_hwm_mb")),
+        (
+            "stage container hwm MB per tuple (lifetime)",
+            lambda r: _stage_orders(r, "container_hwm_mb"),
+        ),
         ("stage failed (sum)", lambda r: _fmt(_stage_sum(r, "failed"))),
         (
             "barrier timed out / short orders",
@@ -995,7 +1023,7 @@ def table_rows(results: list[dict]) -> list[tuple]:
             lambda r: _run_orders(r, lambda o: o["fold_cells_read_per_node_unit"]),
         ),
         (
-            "stage peak RSS MB per order (latest run)",
+            "stage container hwm MB per order (lifetime)",
             lambda r: _run_orders(r, lambda o: o.get("container_hwm_mb")),
         ),
         (
@@ -1005,14 +1033,14 @@ def table_rows(results: list[dict]) -> list[tuple]:
             ),
         ),
         (
-            "stage tier MB / peak MB / headroom MB",
+            "stage tier MB / container hwm MB / headroom MB",
             lambda r: " / ".join(
                 _fmt(r.get("stage_memory", {}).get(k))
                 for k in ("tier_mb", "peak_mb", "headroom_mb")
             ),
         ),
         (
-            "  peak as a fraction of the tier",
+            "  container hwm as a fraction of the tier",
             lambda r: _fmt(r.get("stage_memory", {}).get("peak_fraction")),
         ),
         ("all-time probe orders", lambda r: _levels(r, lambda lv: lv["order"])),
@@ -1042,10 +1070,12 @@ def table_rows(results: list[dict]) -> list[tuple]:
 
 def print_table(results: list[dict]) -> None:
     width = max(max(len(r["store"]) for r in results), 28)
-    label_w = 44
+    label_w = 48
     print(f"{'':{label_w}s}" + "".join(f"{r['store']:>{width + 2}s}" for r in results))
     for label, fn in table_rows(results):
         print(f"{label:{label_w}s}" + "".join(f"{fn(r):>{width + 2}s}" for r in results))
+    print()
+    print(MEMORY_CURRENCY_NOTE)
 
 
 def main(argv=None) -> int:
