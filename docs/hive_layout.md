@@ -2263,7 +2263,11 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   than referencing (spec §11.3), and either writes its own node column or
   **commits**. A copy whose object moved since it was sized is refused, and
   the node fails open (`icechunk_failed`) rather than committing a gather of
-  a state that no longer exists. On a
+  a state that no longer exists. That copy is the one cost that scales with
+  the node's **subtree** rather than its own tuple: a committing node GETs
+  every overview object below it, inside its open session, in gathered
+  windows (spec §11.3 sizes it; the per-invoke wall time is unmeasured and
+  wants a fleet run). On a
   windowed store the hook runs once per node, after that node's window units
   and its close, so each row's refs are gathered and committed together. The
   tuple whose order range contains `commit_order` commits everything

@@ -1174,17 +1174,25 @@ def _stage_units(
     repo's own ``levels`` block, never the unit's: a carrier written before
     this writer carries exactly the same entries (§11.3, issue #584).
 
-    Two things a native level adds to the session, both bounded by one
-    overview ARRAY (the levels above the base, not a leaf): a GET inside the
-    session, which lengthens the window in which a sibling node's commit can
-    force this one to rebase, and that object's bytes in memory while its
-    chunks are written — so the §11.4 streaming peak is one child's carriers
-    plus one overview array. A copy whose object moved since the plan raises
-    (:func:`zagg.icechunk_native.stage_entry`), which costs the node its
-    whole gather: the gather describes a state that no longer exists, so the
-    hook counts it failed (D9) and the next sweep re-gathers it.
+    Two things a native level adds to the session. **IO**, which is the part
+    that scales: a GET of every overview object the unit names, and a
+    committing node's units are its children's columns recursively, so the
+    count is its whole SUBTREE's — at the global setting (``commit_order``
+    3, ``shard_order`` 9) of order 10⁴ objects inside one open session,
+    where the virtual arm did none. They are gathered
+    ``icechunk_native.READ_BATCH`` at a time, but they still lengthen the
+    window in which a sibling node's commit can force this one to rebase,
+    and the per-invoke wall time against the 900 s ceiling is **unmeasured**
+    (issue #584 review: a fleet run before the v4 build). **Memory**, which
+    is bounded: one read window's objects plus the slices taken from them,
+    so the §11.4 streaming peak is one child's carriers plus
+    ``READ_BATCH`` overview objects. A copy whose object moved since the
+    plan raises (:func:`zagg.icechunk_native.stage_unit`), which costs the
+    node its whole gather: the gather describes a state that no longer
+    exists, so the hook counts it failed (D9) and the next sweep re-gathers
+    it.
     """
-    from zagg.icechunk_native import native_level, stage_entry
+    from zagg.icechunk_native import native_level, stage_unit
     from zagg.store import open_object_store
 
     block = _session_block(session) or {}
@@ -1197,38 +1205,43 @@ def _stage_units(
     for unit in units:
         order = int(unit["level"])
         row = row_index(rows, unit.get("row", ALL_ROW))
-        for entry in unit["entries"]:
-            if not entry["refs"]:
-                continue
-            array_path = f"{order}/{entry['path']}"
-            if native_level(levels.get(str(order))):
-                if store is None:
-                    store = open_object_store(store_root, **store_kwargs)
-                native += stage_entry(session, order, row, entry, prefix, store, etags=etags)
-            elif entry["sharded"]:
-                rejected = session.store.set_virtual_refs_arr(
-                    array_path,
-                    (1, *entry["chunk_grid"]),
-                    list(entry["locations"]),
-                    np.asarray(entry["offsets"], dtype="<u8"),
-                    np.asarray(entry["lengths"], dtype="<u8"),
-                    arr_offset=(row, *entry["arr_offset"]),
-                    checksum=entry["checksum"],
-                )
-                if rejected:
-                    raise RuntimeError(f"{array_path}: {len(rejected)} virtual refs rejected")
-            else:
-                check_column_entry(levels.get(str(order)), entry, array_path)
-                for key, location, length, chunk_checksum in entry["chunks"]:
-                    session.store.set_virtual_ref(
-                        f"{order}/{row_key(key, row)}",
-                        location,
-                        offset=0,
-                        length=int(length),
-                        checksum=chunk_checksum,
+        entries = [entry for entry in unit["entries"] if entry["refs"]]
+        if not entries:
+            continue
+        # The decision is the LEVEL's, so it is the whole unit's: every entry
+        # of a unit lives at one cell order and a level is native or virtual.
+        # Hoisted so the native arm sees the unit and can batch its reads.
+        if native_level(levels.get(str(order))):
+            if store is None:
+                store = open_object_store(store_root, **store_kwargs)
+            native += stage_unit(session, order, row, entries, prefix, store, etags=etags)
+        else:
+            for entry in entries:
+                array_path = f"{order}/{entry['path']}"
+                if entry["sharded"]:
+                    rejected = session.store.set_virtual_refs_arr(
+                        array_path,
+                        (1, *entry["chunk_grid"]),
+                        list(entry["locations"]),
+                        np.asarray(entry["offsets"], dtype="<u8"),
+                        np.asarray(entry["lengths"], dtype="<u8"),
+                        arr_offset=(row, *entry["arr_offset"]),
+                        checksum=entry["checksum"],
                     )
-            refs += int(entry["refs"])
-            orders.add(order)
+                    if rejected:
+                        raise RuntimeError(f"{array_path}: {len(rejected)} virtual refs rejected")
+                else:
+                    check_column_entry(levels.get(str(order)), entry, array_path)
+                    for key, location, length, chunk_checksum in entry["chunks"]:
+                        session.store.set_virtual_ref(
+                            f"{order}/{row_key(key, row)}",
+                            location,
+                            offset=0,
+                            length=int(length),
+                            checksum=chunk_checksum,
+                        )
+        refs += sum(int(entry["refs"]) for entry in entries)
+        orders.add(order)
     return refs, orders, native
 
 

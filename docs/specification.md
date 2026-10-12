@@ -4633,8 +4633,20 @@ bytes in the manifest rather than a chunk object — Icechunk's own threshold,
 and nothing above depends on which it chose. The cost is the overview bytes a
 second time, in the repo, at the levels **above** the base — each coarser
 level holding a quarter of the cells of the one below it, and only the
-composable fields (§4.5) — plus one GET per array per overview object at the
-commit.
+composable fields (§4.5).
+
+The commit also pays **one GET per overview object**, and the committing
+node pays it for its whole **subtree**, not for its own tuple: its units are
+its children's node columns recursively (§11.4), so every overview object
+under it at every finer overview order is read inside the open session.
+At the global setting (`commit_order` 3, `split_order`/`shard_order` 9) the
+overview nodes under one committing node number 4⁵+4⁴+4³+4²+4+1 = 1,365
+across the orders, times the composable arrays per node — of order 10⁴
+objects in one invoke, where the virtual arm did **no** IO at commit time.
+The reads are issued concurrently in fixed windows (`icechunk_native.READ_BATCH`),
+which bounds the memory at one window's objects and takes the round trips
+off the wall clock, but the per-invoke wall time against the Lambda ceiling
+is **unmeasured** — a fleet measurement is owed before a global-scale build.
 
 A native chunk carries **no** checksum, the bytes being the repository's
 own, so the copy vets the object it reads against the form the plan recorded
@@ -5113,6 +5125,14 @@ stage node) the writer issues:
 
 Plus, per stage node, one small `GET` per child carrier. Small beside the
 leaf write, but not nothing.
+
+Plus, at a **committing** node and **inside its open session**, one
+full-object `GET` of every overview object its units name — its whole
+subtree's, at every finer overview order — because an `artifact: "overview"`
+level's chunks are copied in rather than referenced (§11.3, which sizes it).
+This is the one request cost on this page that scales with the subtree
+rather than with the node's own tuple, and the only one paid between
+`writable_session` and `commit`.
 
 Writing refs is **fail-open** (D9) at every rung: a leaf's sidecar failure
 is logged and recorded in its D20 stats sidecar (`icechunk.error`) and never

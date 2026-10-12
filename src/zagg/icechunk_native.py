@@ -18,9 +18,15 @@ carried by this issue's plan as its phase 3). The store's objects stay
 exactly as they are — authoritative for the ladder's own gather
 (``sweep_overview`` reads and re-folds them) and for a path reader — and the
 repo simply stops pointing at them. The cost is the overview bytes a second
-time, in the repo, plus one GET per array per overview object at the commit;
-what it buys is a tag that reads every level it was cut with, the ``all``
-row included.
+time, in the repo, plus a GET of every overview object in the committing
+node's **whole subtree** — not one array's: the node's units carry its
+children's columns recursively, so at the global setting (``commit_order``
+3, ``shard_order`` 9) that is of order 10⁴ objects inside one session, where
+the virtual arm did no IO at commit time at all. They are read in gathers of
+:data:`READ_BATCH` to keep that off the wall clock (issue #584 review); the
+per-invoke figure is unmeasured and wants a fleet run before the v4 build.
+What it buys is a tag that reads every level it was cut with, the ``all`` row
+included.
 
 The decision is the LEVEL's, read off the repo's own ``zagg_icechunk`` block
 (:func:`native_level`): an ``overview`` level is native, a ``leaf`` or
@@ -38,6 +44,12 @@ import numpy as np
 
 #: The repo level artifact whose chunks are the repo's own bytes (§11.3).
 NATIVE_ARTIFACT = "overview"
+#: Objects read concurrently inside one commit (§11.3). The reads are this
+#: commit's whole IO cost and a unit names the committing node's whole
+#: subtree at one order, so they are gathered the way ``_write`` gathers its
+#: writes — but in windows, so the memory peak stays this many objects
+#: rather than the subtree's (issue #584 review).
+READ_BATCH = 16
 
 
 def native_level(level: dict | None) -> bool:
@@ -45,8 +57,8 @@ def native_level(level: dict | None) -> bool:
     return level is not None and level.get("artifact") == NATIVE_ARTIFACT
 
 
-def _object_bytes(store, key: str, checksum, *, etags: bool) -> bytes:
-    """One object's bytes, refusing it if it moved since the plan read it (§11.3).
+def _vet_meta(key: str, meta, checksum, *, etags: bool) -> None:
+    """Refuse an object that moved since the plan read it (§11.3).
 
     The staleness guard a virtual ref gets for free: a native chunk carries
     no checksum (the bytes are the repo's own), so the object is vetted HERE
@@ -54,21 +66,41 @@ def _object_bytes(store, key: str, checksum, *, etags: bool) -> bytes:
     ceiled ``last_modified`` on ``file://``. A mismatch means another writer
     re-folded this overview between the plan and the copy, so the gather
     describes a state that no longer exists: it raises, the ladder's hook
-    counts the node failed (D9), and the next pass re-plans. One GET, which
-    is also the read that serves every chunk of the object.
+    counts the node failed (D9), and the next pass re-plans.
     """
-    import obstore
-
     from zagg.icechunk_refs import _ceil_second
 
-    result = obstore.get(store, key)
-    have = result.meta["e_tag"] if etags else _ceil_second(result.meta["last_modified"])
+    have = meta["e_tag"] if etags else _ceil_second(meta["last_modified"])
     if checksum is not None and have != checksum:
         raise ValueError(
             f"{key} moved between the ref plan and the native copy (plan {checksum!r}, "
             f"now {have!r}): another writer re-folded this overview (spec §11.3)"
         )
-    return bytes(result.bytes())
+
+
+def _read(store, tasks: list[tuple], *, etags: bool) -> list[bytes]:
+    """Every task's object bytes, in ONE gather, each vetted as it lands (§11.3).
+
+    One GET per object, which is also the read that serves every chunk of
+    it — and the committing node pays one for every overview object in its
+    whole subtree (:func:`stage_unit`), so they are issued concurrently
+    rather than serially. The first object that moved raises out of the
+    gather, which costs the node its whole gather by design.
+    """
+    import asyncio
+
+    import obstore
+    from zarr.core.sync import sync
+
+    async def one(key: str, checksum) -> bytes:
+        result = await obstore.get_async(store, key)
+        _vet_meta(key, result.meta, checksum, etags=etags)
+        return bytes(await result.bytes_async())
+
+    async def read():
+        return await asyncio.gather(*(one(key, checksum) for _e, key, checksum, _c in tasks))
+
+    return list(sync(read()))
 
 
 def _write(session, pairs: list[tuple[str, bytes]]) -> None:
@@ -135,27 +167,42 @@ def _vet_shard_index(data: bytes, entry: dict, location: str) -> None:
         )
 
 
-def _sharded_pairs(entry: dict, order: int, row: int, prefix: str, store, *, etags: bool) -> list:
-    """``(chunk key, bytes)`` for every present chunk of a sharded entry.
+def _tasks(entries: list[dict], prefix: str) -> list[tuple]:
+    """``(entry, object key, checksum, chunk)`` per OBJECT a unit's entries need.
 
-    The entry is ONE object — a sharded hive array is one shard object, which
-    is what its single ``checksum`` belongs to and what ``object_ref_plan``
-    refuses anything else for — so it is read once, vetted against its own
-    index (:func:`_vet_shard_index`) and sliced by the index the plan already
-    read: the chunk at grid position ``j`` is ``[offset, offset + length)`` of
-    that object, byte-for-byte the ``(1, C)`` chunk the repo array holds
-    (``icechunk_rows.reroot``), so the copy re-encodes nothing.
+    Flattening both plan shapes to the object is what makes the reads
+    batchable, and the reads are the commit's whole cost. A sharded entry is
+    ONE object — a sharded hive array is one shard object, which is what its
+    single ``checksum`` belongs to and what ``object_ref_plan`` refuses
+    anything else for — whose index yields every chunk of the array, so its
+    ``chunk`` is ``None``; a regular entry is one object per chunk.
     """
-    objects = {location for location in entry["locations"] if location}
-    if len(objects) > 1:
-        raise ValueError(
-            f"{entry['path']}: a sharded entry names {len(objects)} objects but carries one "
-            f"checksum; a hive leaf array is one shard object (spec §11.3)"
-        )
-    if not objects:
-        return []
-    (location,) = objects
-    data = _object_bytes(store, location[len(prefix) :], entry.get("checksum"), etags=etags)
+    tasks: list[tuple] = []
+    for entry in entries:
+        if entry["sharded"]:
+            objects = {location for location in entry["locations"] if location}
+            if len(objects) > 1:
+                raise ValueError(
+                    f"{entry['path']}: a sharded entry names {len(objects)} objects but carries "
+                    f"one checksum; a hive leaf array is one shard object (spec §11.3)"
+                )
+            for location in objects:
+                tasks.append((entry, location[len(prefix) :], entry.get("checksum"), None))
+        else:
+            for chunk in entry["chunks"]:
+                tasks.append((entry, chunk[1][len(prefix) :], chunk[3], chunk))
+    return tasks
+
+
+def _sharded_pairs(entry: dict, order: int, row: int, data: bytes, location: str) -> list:
+    """``(chunk key, bytes)`` for every present chunk of a sharded entry's one object.
+
+    The object is vetted against its own index (:func:`_vet_shard_index`) and
+    sliced by the index the plan already read: the chunk at grid position
+    ``j`` is ``[offset, offset + length)`` of that object, byte-for-byte the
+    ``(1, C)`` chunk the repo array holds (``icechunk_rows.reroot``), so the
+    copy re-encodes nothing.
+    """
     _vet_shard_index(data, entry, location)
     grid = tuple(int(n) for n in entry["chunk_grid"])
     offsets = np.asarray(entry["offsets"], dtype="<u8")
@@ -171,39 +218,51 @@ def _sharded_pairs(entry: dict, order: int, row: int, prefix: str, store, *, eta
     return pairs
 
 
-def _whole_object_pairs(entry: dict, order: int, row: int, prefix: str, store, *, etags: bool):
-    """``(chunk key, bytes)`` for a regular entry — one object per chunk (§11.3)."""
+def _pairs(entry: dict, order: int, row: int, data: bytes, chunk) -> list[tuple[str, bytes]]:
+    """``(chunk key, bytes)`` one read object yields: a shard's slices, or one chunk."""
     from zagg.icechunk_rows import row_key
 
-    pairs = []
-    for key, location, length, checksum in entry["chunks"]:
-        data = _object_bytes(store, location[len(prefix) :], checksum, etags=etags)
-        if len(data) != int(length):
-            raise ValueError(
-                f"{location} is {len(data)} bytes, the plan read {int(length)} (spec §11.3)"
-            )
-        pairs.append((f"{order}/{row_key(key, row)}", data))
-    return pairs
+    if chunk is None:
+        return _sharded_pairs(entry, order, row, data, next(c for c in entry["locations"] if c))
+    key, location, length, _checksum = chunk
+    if len(data) != int(length):
+        raise ValueError(
+            f"{location} is {len(data)} bytes, the plan read {int(length)} (spec §11.3)"
+        )
+    return [(f"{order}/{row_key(key, row)}", data)]
 
 
-def stage_entry(
-    session, order: int, row: int, entry: dict, prefix: str, store, *, etags: bool
+def stage_unit(
+    session, order: int, row: int, entries: list[dict], prefix: str, store, *, etags: bool
 ) -> int:
-    """Copy one ref-plan ``entry``'s chunks into ``session`` natively; the bytes written.
+    """Copy a ref-plan unit's ``entries`` into ``session`` natively; the bytes written.
 
     ``order`` is the level's cell order (its group in the repo), ``row`` the
     resolved row index, ``prefix`` the container's ``url_prefix`` (a plan
     location carries it, §11.3) and ``store`` an obstore handle on the store
     root. Both plan shapes are copied: a sharded array's one object sliced
     by its index, and a regular array's one object per chunk.
+
+    A UNIT at a time, not an entry at a time, because the reads batch and
+    they are the only IO the commit does. One overview unit names every node
+    of the committing node's subtree at that order — at the global setting
+    (``commit_order`` 3, ``shard_order`` 9) the subtree's overview nodes
+    number 1,365 across the orders, times the composable arrays per node — so
+    the objects are read :data:`READ_BATCH` at a time, concurrently, and
+    written before the next window is read: the round trips come off the wall
+    clock while the peak stays that many objects rather than the subtree's
+    (issue #584 review).
     """
-    pairs = (
-        _sharded_pairs(entry, order, row, prefix, store, etags=etags)
-        if entry["sharded"]
-        else _whole_object_pairs(entry, order, row, prefix, store, etags=etags)
-    )
-    _write(session, pairs)
-    return sum(len(data) for _key, data in pairs)
+    tasks = _tasks(entries, prefix)
+    written = 0
+    for start in range(0, len(tasks), READ_BATCH):
+        batch = tasks[start : start + READ_BATCH]
+        pairs: list[tuple[str, bytes]] = []
+        for (entry, _key, _checksum, chunk), data in zip(batch, _read(store, batch, etags=etags)):
+            pairs.extend(_pairs(entry, order, row, data, chunk))
+        _write(session, pairs)
+        written += sum(len(data) for _key, data in pairs)
+    return written
 
 
-__all__ = ["NATIVE_ARTIFACT", "native_level", "stage_entry"]
+__all__ = ["NATIVE_ARTIFACT", "READ_BATCH", "native_level", "stage_unit"]

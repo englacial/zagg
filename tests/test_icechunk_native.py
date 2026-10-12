@@ -47,7 +47,7 @@ class TestWhichLevelsAreNative:
 
 
 class TestTheCopy:
-    """:func:`icechunk_native.stage_entry` against real leaf objects."""
+    """:func:`icechunk_native.stage_unit` against real leaf objects."""
 
     def _staged(self, monkeypatch, cfg, tmp_path, *, row="2019"):
         grid, root, manifest = _windowed(cfg, tmp_path)
@@ -68,10 +68,14 @@ class TestTheCopy:
         session = repo.writable_session(icechunk_refs.BRANCH)
         store = open_object_store(root, **{})
         prefix = icechunk_refs.container_prefix(root)
-        written = sum(
-            icechunk_native.stage_entry(session, order, row, entry, prefix, store, etags=etags)
-            for entry in plan
-            if entry["refs"]
+        written = icechunk_native.stage_unit(
+            session,
+            order,
+            row,
+            [entry for entry in plan if entry["refs"]],
+            prefix,
+            store,
+            etags=etags,
         )
         session.commit("native copy")
         return repo, written
@@ -92,6 +96,36 @@ class TestTheCopy:
         # Not a virtual ref: the bytes are the repo's own, so no location and
         # no checksum of the object they came from.
         assert VIRTUAL not in _kinds(repo, "6", "count")
+
+    def test_the_objects_are_read_in_gathered_windows_not_one_at_a_time(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # These GETs are the commit's whole IO cost and a committing node
+        # pays one for every overview object in its SUBTREE, not for one
+        # array (issue #584 review), so a unit's reads are gathered rather
+        # than issued serially — and gathered in fixed windows, which is what
+        # keeps the memory peak at a window rather than the subtree. Pinned:
+        # more than one window, none wider than ``READ_BATCH``, and every
+        # object still copied.
+        grid, root, shard, plan = self._staged(monkeypatch, cfg, tmp_path)
+        entries = [entry for entry in plan if entry["refs"]]
+        prefix = icechunk_refs.container_prefix(root)
+        assert len(icechunk_native._tasks(entries, prefix)) > 2, "nothing to batch here"
+        windows: list[int] = []
+        real = icechunk_native._read
+
+        def counted(store, tasks, **kwargs):
+            windows.append(len(tasks))
+            return real(store, tasks, **kwargs)
+
+        monkeypatch.setattr(icechunk_native, "READ_BATCH", 2)
+        monkeypatch.setattr(icechunk_native, "_read", counted)
+        _repo, written = self._copy(root, entries)
+        assert len(windows) > 1 and max(windows) <= 2, windows
+        assert sum(windows) == len(icechunk_native._tasks(entries, prefix))
+        assert written == sum(
+            int(n) for entry in entries if entry["sharded"] for n in entry["lengths"]
+        ) + sum(int(c[2]) for entry in entries if not entry["sharded"] for c in entry["chunks"])
 
     def test_an_object_that_moved_since_the_plan_is_refused(self, monkeypatch, cfg, tmp_path):
         grid, root, shard, plan = self._staged(monkeypatch, cfg, tmp_path)
@@ -140,6 +174,8 @@ class TestTheCopy:
         # silently, and permanently into a tag (issue #584 review).
         from pathlib import Path
 
+        import obstore
+
         from zagg.store import open_object_store
 
         grid, root, shard, plan = self._staged(monkeypatch, cfg, tmp_path)
@@ -155,8 +191,11 @@ class TestTheCopy:
         path.write_bytes(path.read_bytes()[: int(offsets[last]) + int(lengths[last]) - short_by])
         os.utime(path, (stat.st_atime, stat.st_mtime))
         # The checksum does NOT catch it — that is the hole the index closes.
-        icechunk_native._object_bytes(
-            open_object_store(root), location[len(prefix) :], entry.get("checksum"), etags=False
+        icechunk_native._vet_meta(
+            location,
+            obstore.head(open_object_store(root), location[len(prefix) :]),
+            entry.get("checksum"),
+            etags=False,
         )
         with pytest.raises(ValueError, match="a slice of it would be SHORT"):
             self._copy(root, [entry])
