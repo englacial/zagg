@@ -2426,9 +2426,11 @@ gates (espg/moczarr#19/#20).
 
 Every fixture that declares `count` was regenerated for issue
 [#626](https://github.com/englacial/zagg/issues/626) (`count` is `int64`,
-§4.4/§4.5), so those stamps carry the §5.3 copy of `content_hashes` and
-every leaf `dggs` block carries the §1 `latitude` token. `raster_toc/`
-(no `count`) is unregenerated: its stamp without the §5.3 copy is the
+§4.4/§4.5), so those stamps carry the §5.3 copy of `content_hashes`.
+Every committed `dggs` block carries the §1 `latitude` token (since
+[#616](https://github.com/englacial/zagg/issues/616)), so §1's absent-token
+rule has no committed golden; §1's evidence paragraph is its record.
+`raster_toc/` (no `count`) is unregenerated: its stamp without the §5.3 copy is the
 committed absent-key ⇒ pre-[#580](https://github.com/englacial/zagg/issues/580)
 pin (the sidecar copy and §1's own evidence paragraph are the record for
 what that artifact means). The one **versioned** leaf (§1.5; a stamp
@@ -2551,8 +2553,8 @@ never sharded, §8/#247):
   decimal strings (JSON numbers cannot carry `uint64` faithfully) together
   with the `(start, end)` nanoseconds a conforming decode yields and the
   real acquisition spans they must contain, which is the §8 conservative
-  containment claim pinned on committed bytes. The other four fixtures,
-  which carry no `temporal` key anywhere, are the absent-key ⇒ legacy pin.
+  containment claim pinned on committed bytes. The leaf fixtures that
+  carry no `temporal` key anywhere are the absent-key ⇒ legacy pin.
 
 - **`temporal/`** — the §8.2/§8.3/§9 **companion** surface: `minimal/`'s
   geometry and cell plan with one digest field (`h_tdigest`) carrying both
