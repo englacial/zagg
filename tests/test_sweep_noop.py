@@ -573,6 +573,22 @@ class TestStoreLadderGate:
         assert client.events == [] and summary["invokes"] == 0
         assert summary["skipped"].startswith("no sweepable zagg-pyramid/2 ladder")
 
+    def test_a_manifest_that_does_not_parse_fires_nothing(self, tmp_path):
+        # A truncated manifest is the store's own content, not an access
+        # failure (review finding): ``hive._read_json`` guards only the
+        # not-found shapes, so this reaches the gate as a JSONDecodeError —
+        # and failing open would bill one invoke per dispatch node, each
+        # re-raising the same parse error worker-side.
+        from zagg.hive import MANIFEST_NAME
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        (root / MANIFEST_NAME).write_text('{"shard_order": 3, "pyr')
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert client.events == [] and summary["invokes"] == 0
+        assert "does not parse" in summary["skipped"]
+
     def test_a_root_with_no_manifest_fires_nothing(self, tmp_path):
         root = tmp_path / "empty"
         root.mkdir()
