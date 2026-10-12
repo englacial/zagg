@@ -654,7 +654,10 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # object arrives here as ``json.JSONDecodeError``; failing open would
         # point the operator at an IAM grant and then bill one invoke per
         # dispatch node, each re-raising the same parse error worker-side.
-        return f"the {MANIFEST_NAME} at the store root does not parse ({e})"
+        return (
+            f"the {MANIFEST_NAME} at the store root does not parse ({e}) — restore or rewrite "
+            f"the manifest; `--declare-pyramid` refuses a malformed one"
+        )
     except Exception as e:
         logger.warning(
             f"stage fleet: the {MANIFEST_NAME} at {store_path} could not be read ({e}) — the "
@@ -664,7 +667,16 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         )
         return None
     if manifest is None:
-        return f"no {MANIFEST_NAME} at the store root"
+        # NOT the retrofit's remedy (review finding): ``declare_pyramid``
+        # raises on a missing manifest. The root manifest is the run's own
+        # finalize write (issue #252), and that write's failure is DEFERRED
+        # past the tail — so this is reachable on a store whose finalize has
+        # not landed, where re-running it is the fix.
+        return (
+            f"no {MANIFEST_NAME} at the store root — not a hive store root, or the run's "
+            f"manifest finalize has not landed (re-run it; `--declare-pyramid` refuses a "
+            f"store with no manifest)"
+        )
     try:
         # The STORE's shard order, not the caller's: the leaf exclusion is the
         # workers' own and every worker takes ``int(manifest["shard_order"])``.
@@ -675,7 +687,10 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # exactly what reading first exists to make free.
         order = manifest.get("shard_order")
         if order is None:
-            return f"the {MANIFEST_NAME} at the store root declares no shard_order"
+            return (
+                f"the {MANIFEST_NAME} at the store root declares no shard_order — the manifest "
+                f"is malformed (every worker reads that key unguarded); restore or rewrite it"
+            )
         if int(order) != int(shard_order):
             return (
                 f"its manifest declares shard_order {int(order)}, not the {int(shard_order)} "
@@ -692,7 +707,17 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # is the same for all four — nothing a worker would fold — and a
         # decline is the whole point of reading first: the alternative is the
         # traceback this gate exists to replace.
-        return str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+        refused = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+        # THIS arm is the retrofit's: the manifest is readable and declares a
+        # pyramid the sweep cannot walk, which is what ``declare_pyramid``
+        # rewrites (the arms above are a broken or absent manifest, which it
+        # refuses — review finding).
+        return (
+            f"{refused} — the ladder is the MANIFEST's and a manifest is written once, at "
+            "init: (re-)declare it with `python -m zagg.sweep <store> --declare-pyramid "
+            "<config.yaml>` (plus `--overviews <resolutions>` where the config spells none), "
+            "or append with `output.pyramid` set to what the manifest declares"
+        )
     if not entries:
         # Accepted, like every worker accepts it: a ladder that filters to
         # nothing folds nothing but still carries the finisher's work.
@@ -1077,13 +1102,14 @@ def run_stage_sweep_fleet(
     # untouched.
     no_ladder = no_ladder_reason(store_path, shard_order, store_kwargs)
     if no_ladder is not None:
+        # The remedy is the REASON's, not this line's (review finding): the
+        # gate declines a missing, unparseable or order-less manifest as well
+        # as a ladder-less one, and ``declare_pyramid`` raises on the first
+        # three — so each arm of :func:`no_ladder_reason` names what fixes it
+        # and this warning names only what happened.
         logger.warning(
-            f"stage fleet: {store_path} has {NO_LADDER_SKIP} "
-            f"({no_ladder}) — run {run_id} fires nothing: no stage invoke, no finisher, no "
-            "barrier. The ladder is the MANIFEST's and a manifest is written once, at init: "
-            "(re-)declare it with `python -m zagg.sweep <store> --declare-pyramid "
-            "<config.yaml>` (plus `--overviews <resolutions>` where the config spells none), "
-            "or append with `output.pyramid` set to what the manifest declares"
+            f"stage fleet: {store_path} has {NO_LADDER_SKIP} ({no_ladder}) — run {run_id} "
+            "fires nothing: no stage invoke, no finisher, no barrier"
         )
         # :data:`NO_LADDER_SKIP`, not "no /2 declaration" (review finding): a
         # malformed ``/2`` block declines here too, and a prefix calling such
