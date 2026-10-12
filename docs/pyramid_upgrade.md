@@ -74,6 +74,22 @@ leaf.
 
 ## The four steps
 
+**An append to the store mid-upgrade needs no `sweep:` workaround.** A hive
+config that declares a ladder chains the staged sweep in its run tail by
+default ([issue #620](https://github.com/englacial/zagg/issues/620)), and
+until step 1 has run this store's manifest declares none — the two disagree,
+which is the state this page exists for. The fleet dispatcher reads the
+store's own declaration once before it fans out ([issue
+#635](https://github.com/englacial/zagg/issues/635)), so such a run **fires
+nothing**: one manifest GET, one warning naming `--declare-pyramid`, zero
+invokes, where it used to bill one dying invoke per dispatch node. The run's
+`stats`/`moc`/`submap` rollups ride that sweep's node closes, so they are not
+folded either — the run warns and `python -m zagg.sweep <store> --families
+stats,moc,submap` is the backstop. The leaf side is the half that still needs
+care: it follows the *config's* ladder, not the manifest, so append with
+`output.pyramid` set to what the store declares until the upgrade is done
+([hive_layout.md](hive_layout.md#the-templates-declare-the-ladder-issue-620)).
+
 ### 1. Re-declare the manifest to `zagg-pyramid/2`
 
 ```bash

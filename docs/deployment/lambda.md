@@ -692,8 +692,9 @@ are separate invokes over separate objects — and the close records the gap
 (`source_windows.missing` on the all-time artifact).
 
 The declaration is handed to the dispatcher (`windowed=`, `all_time=`), like
-`shard_order`, because it never reads the manifest; the runner's tail takes
-both from the config. A caller that says neither gets whole-node events,
+`shard_order`: the dispatcher's one manifest read is the ladder gate's
+([issue #635](https://github.com/englacial/zagg/issues/635)) and resolves
+nothing else. The runner's tail takes both from the config. A caller that says neither gets whole-node events,
 which are correct on every store — the worker then runs a windowed node's
 windows serially.
 
@@ -858,9 +859,37 @@ hand-driven recovery form, and the whole store has to be asked for by name.
 The two compose by intersection, so a scoped pass cannot widen. The tail
 passes no coverage and stays unscoped.
 
-The read happens **operator-side**, like `shard_order`: the dispatcher itself
-never touches the store (D8). The run summary records `coverage_computed` so
-the run says which derivation it used.
+The read happens **operator-side**, like `shard_order`: the dispatcher does
+not read a coverage MOC for itself (D8). The run summary records
+`coverage_computed` so the run says which derivation it used.
+
+**The one object the dispatcher does read: the manifest, for the ladder gate**
+([issue #635](https://github.com/englacial/zagg/issues/635)). D8 is about
+*writes*, and it is amended for exactly this single GET and nothing else.
+`sweep: "stages"` is the default for a hive store whose **config** declares a
+ladder ([issue #620](https://github.com/englacial/zagg/issues/620),
+`zagg.config.get_sweep_mode`), while `pyramid.spec` is written once, at init,
+and no append rewrites it — so a store initialized before the
+[#384](https://github.com/englacial/zagg/issues/384) flip, or from a config
+whose `orders`/`spacing` schedule was later dropped, carries a `/1` manifest
+under a config that now resolves to `"stages"`. Before this gate the
+dispatcher fanned out one stage invoke per dispatch node (287 on the
+California o9 shardmap) and *every one of them* died in
+`zagg.sweep_stage.ladder_entries`: billed invokes, zero writes. Now
+`zagg.sweep_fleet.no_ladder_reason` spends one GET before anything fires and
+the run **no-ops with one warning** naming `--declare-pyramid` —
+`summary["skipped"]` carries which declaration it saw, `invokes` is 0, no
+finisher, no barrier. The gate is the workers' own `ladder_entries`, so it
+declines exactly what every invoke would have refused and nothing besides: a
+`/2` ladder that merely filters to nothing above the shard order still fans
+out, because the workers accept it. Nothing else is resolved from that read —
+`shard_order`, `windowed` and `all_time` are still handed in, so a `/2`
+store's run is unchanged.
+
+An **unreadable** manifest is fail-open (D9): a dispatcher role that holds
+nothing but `lambda:InvokeFunction` against the store cannot spend the read,
+so the gate warns, names the grant, and the fan-out proceeds as it did before
+the gate.
 
 **Permissions.** Nothing new on the worker side — the execution role already
 writes the store and the `<store>.status/` sibling (the issue #151 async result
@@ -869,11 +898,26 @@ channel), which is where the stage records land. The dispatcher needs
 `s3:ListBucket` for the barrier's poll and `s3:GetObject` for the finisher
 record it reports (`stage_records`, `levels`, `lease`, `record`,
 `duration_s`). The v2 Event transport already both lists and gets that prefix,
-so a correctly scoped dispatcher role needs no new grant, and no
-CloudFormation, layer, or IAM template change ships with this transport. The
-run tail's families barrier ([issue #610](https://github.com/englacial/zagg/issues/610))
+so a correctly scoped dispatcher role needs no new grant for the barrier, and
+no CloudFormation, layer, or IAM template change ships with this transport.
+The run tail's families barrier ([issue #610](https://github.com/englacial/zagg/issues/610))
 polls the same prefix — `<store>.status/run-<run_id>/` — so it needs no new
 grant either.
+
+**One grant the ladder gate does want:** `s3:GetObject` on the store root's
+`morton_hive.json`, for the one manifest read above ([issue
+#635](https://github.com/englacial/zagg/issues/635)). It is the dispatcher's
+only read outside the `.status/` sibling, and a role scoped to that sibling
+alone does not carry it. Nothing breaks without it — a denied read is
+fail-open, with a warning naming the grant — but the gate is what stops a
+`/1`-manifest store billing one no-op invoke per dispatch node, so a
+dispatcher role that drives the staged sweep should have it:
+
+```yaml
+- Effect: Allow
+  Action: s3:GetObject
+  Resource: arn:aws:s3:::bucket/prefix.zarr/morton_hive.json
+```
 
 Mind the shape if you are writing the policy by hand: `s3:ListBucket` is a
 **bucket-level** action, so its `Resource` is the bucket ARN and the prefix
@@ -902,8 +946,9 @@ faulted LISTs and proceeds fail-open. A missing `s3:GetObject` completes the
 run and simply drops the finisher's reporting from the summary.
 
 !!! note "Dispatch nodes come from the work set, not from the store"
-    The dispatcher cannot read the root `coverage.moc`, so it derives dispatch
-    nodes from the leaves it holds. The in-process pass derives them from work
+    The dispatcher reads the manifest for the ladder gate and nothing else —
+    not the root `coverage.moc` — so it derives dispatch nodes from the
+    leaves it holds. The in-process pass derives them from work
     set ∪ root MOC, so a node whose *only* leaves are untouched siblings
     recorded in the MOC is not invoked. That is the same scoped-sweep posture
     `stage_sweep_after_run` already has (#381 point (11)); a worker still folds
