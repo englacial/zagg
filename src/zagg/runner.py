@@ -4638,6 +4638,18 @@ def _run_lambda(
                     _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # The staged leg's dispatcher summary rides the RETURNED summary, like
+        # the families leg's above (review finding). A DECLINED fan-out (issue
+        # #635) fires nothing, so `_staged_sweep_incomplete` returns None and
+        # `icechunk_finalize` below records a tag where it used to record
+        # `{"skipped": "staged sweep barrier timed out"}` -- which leaves this
+        # dict's `skipped` reason and `families_unswept` as the run record's
+        # only durable trace that the declared ladder went unswept, and a
+        # WARNING does not outlive this process (issue #610). Set once HERE,
+        # outside the chaining gate, so the key is present on every path --
+        # no hive sweep, or a dispatch that failed open -- exactly as
+        # `families_sweep` is.
+        summary["stage_sweep"] = staged
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
         # worker invoke AFTER the staged sweep returned (its finisher is the
         # last ladder commit) — the dispatcher never writes (D8). Fail-open.
@@ -6529,10 +6541,13 @@ def _invoke_lambda_stage_sweep(
     store's own declaration once before it fans out
     (:func:`zagg.sweep_fleet.no_ladder_reason`, issue #635): a store carrying
     no ``zagg-pyramid/2`` ladder costs this tail one manifest GET and zero
-    invokes, reported as ``skipped`` on the summary, where it used to bill one
-    no-op invoke per dispatch node. Such a run rode no node close, so the
-    summary's ``families_unswept`` sends the rollups to
-    :func:`_warn_families_unswept`'s backstop.
+    invokes, reported as ``skipped`` on the summary this returns, where it used
+    to bill one no-op invoke per dispatch node. That summary is what the run
+    summary and the client handle carry as ``stage_sweep`` (the families leg's
+    posture, :func:`_invoke_lambda_families_sweep`), so the decline's reason is
+    durable on the run record and not only in a log line (review finding).
+    Such a run rode no node close, so the summary's ``families_unswept`` sends
+    the rollups to :func:`_warn_families_unswept`'s backstop.
 
     **How long the tail can block.** One barrier per tuple plus the finisher's,
     each bounded by ``barrier_timeout_s``
