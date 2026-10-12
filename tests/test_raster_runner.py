@@ -1108,6 +1108,66 @@ class TestRasterHiveLocalBackend:
         assert cov["time_range"] == [T0, T1]
 
 
+class TestRasterWindowedAllTimeFold:
+    """The all-time fold default on a windowed RASTER store (issue #633).
+
+    PR #623 phase 4 made a windowed store declare the all-time fold:
+    ``zagg.config.get_pyramid`` resolves an ABSENT ``output.pyramid.all_time``
+    to true on any windowed config, and ``_validate_pyramid`` refuses an
+    explicit false there. espg's ruling on question (20) of that PR scopes the
+    default to EVERY windowed store, raster included. The ``/1`` point arm is
+    ``test_sweep_overview.py::TestOverviewWriter``'s
+    ``test_a_v1_windowed_config_omitting_all_time_folds_all_zarr``; this is its
+    raster twin, built through ``agg(backend="local")`` — the normal run path —
+    rather than from hand-written leaves.
+    """
+
+    def test_a_windowed_raster_config_omitting_all_time_declares_the_fold(self, manifest):
+        from zagg import hive
+        from zagg.config import get_pyramid
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        assert "pyramid" not in cfg.output  # the default path: no knob at all
+        assert get_pyramid(cfg) == {"all_time": True}
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        block = hive.read_manifest(cfg.output["store"])["pyramid"]
+        # Raster is exempt from the issue #384 ``/2`` default flip, so what the
+        # run templates is the ``/1`` schedule the point arm folds: every two
+        # orders below the shard order (10), with the resolved fold on it.
+        assert block["spec"] == "zagg-pyramid/1"
+        assert block["overview"]["orders"] == [8, 6, 4, 2, 0]
+        assert block["overview"]["all_time"] is True
+
+    def test_the_fold_is_the_windowings_not_rasters(self, tmp_path):
+        # The load-bearing control: the SAME raster config without
+        # ``output.windowing`` resolves no fold, so the assertion above reads
+        # the windowed default rather than a constant.
+        from zagg.config import get_pyramid
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = _cfg(tmp_path)
+        cfg.output["store_layout"] = "hive"
+        assert get_pyramid(cfg) == {}
+        assert build_pyramid_block(cfg, 10)["overview"]["all_time"] is False
+
+    @pytest.mark.parametrize(
+        "knob",
+        [{"all_time": False}, {"orders": [8, 6], "all_time": False}],
+        ids=["bare", "with-a-schedule"],
+    )
+    def test_all_time_false_is_refused_on_a_windowed_raster_config(self, tmp_path, knob):
+        # Refused BY NAME on both pyramid grammars, so a raster store cannot
+        # be configured to withdraw the fold its windows require.
+        cfg = _cfg(tmp_path)
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        cfg.output["pyramid"] = knob
+        with pytest.raises(ValueError, match="output.pyramid.all_time: false is refused"):
+            validate_config(cfg)
+
+
 class TestRasterHiveLambdaBackend:
     """Lambda raster hive dispatch (issue #247 phase 4): lifecycle + events.
 
