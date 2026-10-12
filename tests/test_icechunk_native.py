@@ -128,25 +128,27 @@ class TestTheCopy:
         with pytest.raises(ValueError, match="moved between the ref plan"):
             self._copy(root, [{**entry, "checksum": f"{etag}-stale"}], etags=True)
 
-    def test_a_truncated_whole_object_chunk_is_refused(self, monkeypatch, cfg, tmp_path):
-        # The regular (unsharded) plan shape carries the object's size as the
-        # chunk length; a copy whose GET returns fewer bytes would write a
-        # short chunk that decodes as garbage.
+    def test_a_whole_object_chunk_whose_object_changed_size_is_refused(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The regular (unsharded) plan shape — every overview and coarse
+        # column array — records the object's SIZE as the chunk length, so a
+        # rewrite that changed the size is a short or long chunk that would
+        # decode as garbage. The fixture is a real object whose recorded
+        # length is one byte off, which is what such a rewrite looks like
+        # (issue #584 review).
         grid, root, shard, plan = self._staged(monkeypatch, cfg, tmp_path)
+        prefix = icechunk_refs.container_prefix(root)
         entry = next(e for e in plan if e["sharded"] and e["refs"])
-        key, location, length, checksum = (
-            "count/c/0",
-            next(loc for loc in entry["locations"] if loc),
-            10**9,
-            None,
-        )
+        location = next(loc for loc in entry["locations"] if loc)
+        size = os.path.getsize(f"{root}/{location[len(prefix) :]}")
         whole = {
             "path": "count",
             "sharded": False,
-            "chunks": [(key, location, length, checksum)],
+            "chunks": [("count/c/0", location, size - 1, None)],
             "refs": 1,
         }
-        with pytest.raises(ValueError, match="the plan read"):
+        with pytest.raises(ValueError, match=f"is {size} bytes, the plan read {size - 1}"):
             self._copy(root, [whole])
 
 
