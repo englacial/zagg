@@ -1157,6 +1157,10 @@ class TestRasterWindowedAllTimeFold:
         # ``sweep_overviews`` returns at its "no composable fields" gate
         # before any leaf read. Issue #399's reducer-keyed folds are what
         # flips this arm; until then an ``all.zarr`` here would be debris.
+        # §4.5's ``all_time`` bullet still reads as a materialization promise
+        # and its column-less carve-out sits in §4.6, so an external reader
+        # decoding from the spec alone would look for objects this arm proves
+        # are absent; scoping that sentence is question (1) on the PR.
         from pathlib import Path
 
         from zagg import hive
