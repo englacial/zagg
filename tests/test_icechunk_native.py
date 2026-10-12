@@ -252,12 +252,14 @@ class TestTheReplayRePaysTheCopy:
         """Declare ``level`` an ``overview`` level, so its chunks are copied in (§11.3)."""
         from zagg.icechunk_refs import ICECHUNK_ATTR
 
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        assert block, "the repo is not initialized"
+        levels = dict(block["levels"])
+        levels[level] = {**levels[level], "artifact": icechunk_native.NATIVE_ARTIFACT}
         repo = icechunk_refs.open_repo(root, store_kwargs={})
         session = repo.writable_session(icechunk_refs.BRANCH)
         group = zarr.open_group(session.store, mode="r+")
-        block = dict(group.attrs[ICECHUNK_ATTR])
-        native = {**block["levels"][level], "artifact": icechunk_native.NATIVE_ARTIFACT}
-        group.attrs[ICECHUNK_ATTR] = {**block, "levels": {**block["levels"], level: native}}
+        group.attrs[ICECHUNK_ATTR] = {**block, "levels": levels}
         session.commit(f"level {level} is native")
 
     def test_the_record_counts_every_attempts_copied_bytes(self, monkeypatch, cfg, tmp_path):
