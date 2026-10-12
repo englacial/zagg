@@ -4545,9 +4545,10 @@ is ONE chunk, `C = 1`, and the cell-axis index is the node's rank itself; for
 a **fine column level** (`cells − shard_order ≥ 5`, §4.6) the object is
 sharded and `C` is its inner-chunk count — the level's `chunk_order` is the
 inner chunk's order (`cells − 5`, or `shard_order + 1` at exactly `4^5`
-cells), so the same `r · C + j` law applies with `C = 4^(cells − chunk_order)`. The row index is the repo's, not the
-object's: a writer names an object's row by **label** and the commit
-resolves it against the block's `rows` (§11.4), so the same object bytes
+cells), so the same `r · C + j` law applies with the base level's
+`C = 4^(chunk_order − shard_order)` (16 / 4 / 4 at /16 / /15 / /14 on
+19/13/9). The row index is the repo's, not the object's: a writer names an
+object's row by **label** and the commit resolves it against the block's `rows` (§11.4), so the same object bytes
 land at whatever row the repo allocated that label.
 
 At the production geometry (shard 9 / chunk 13 / cell 19) `C = 256`.
