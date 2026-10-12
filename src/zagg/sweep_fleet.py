@@ -681,10 +681,12 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         # The STORE's shard order, not the caller's: the leaf exclusion is the
         # workers' own and every worker takes ``int(manifest["shard_order"])``.
         # The two are checked rather than reconciled (review finding) — the
-        # gate is the one place holding both numbers, and a run every worker
-        # would refuse by name ("stage tuple [3, 5) is not a span of this
-        # ladder", or a bare ``KeyError`` with no order declared at all) is
-        # exactly what reading first exists to make free.
+        # gate is the one place holding both numbers. A span ABOVE the
+        # manifest's order is refused per invoke by name ("stage tuple
+        # [3, 5) is not a span of this ladder"), one BELOW it is accepted by
+        # the workers and folds the wrong levels, and no order declared at
+        # all is a bare ``KeyError`` per invoke: all three are what reading
+        # first exists to make free.
         order = manifest.get("shard_order")
         if order is None:
             return (
@@ -694,7 +696,9 @@ def no_ladder_reason(store_path: str, shard_order: int, store_kwargs: dict) -> s
         if int(order) != int(shard_order):
             return (
                 f"its manifest declares shard_order {int(order)}, not the {int(shard_order)} "
-                "this dispatch was handed — every worker would refuse the tuple span"
+                "this dispatch was handed — the workers fold at the MANIFEST's order, so this "
+                "fan-out would be sized to a ladder the store does not have (a span above it is "
+                f"refused by name, one below folds the wrong levels); dispatch at {int(order)}"
             )
         order = int(order)
         entries = ladder_entries(manifest.get("pyramid") or {}, order)

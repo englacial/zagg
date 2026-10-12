@@ -540,10 +540,11 @@ class TestStoreLadderGate:
     @pytest.mark.parametrize("handed, named", [(5, "not the 5"), (2, "not the 2")])
     def test_a_shard_order_the_manifest_denies_declines_by_name(self, tmp_path, handed, named):
         # The gate is the one place holding both numbers, so it refuses the
-        # divergence rather than reconciling it (review finding): a worker
-        # handed such a tuple refuses by name ("stage tuple [3, 5) is not a
-        # span of this ladder"), which is one billed invoke per dispatch node
-        # for a run that cannot start.
+        # divergence rather than reconciling it (review finding). The two
+        # directions cost differently, which is why the reason claims neither
+        # outright: a span ABOVE the manifest's order is refused per invoke by
+        # name ("stage tuple [3, 5) is not a span of this ladder"), while one
+        # BELOW it is accepted by the workers and folds the wrong levels.
         from zagg.sweep_fleet import no_ladder_reason
 
         root = tmp_path / "s"
