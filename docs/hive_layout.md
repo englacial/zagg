@@ -603,7 +603,8 @@ coarse-level finisher (issue #377).
 
 **The run tail partitions this itself** on the Lambda backends ([issue
 #610](https://github.com/englacial/zagg/issues/610)) — for a run that walks
-**no** `/2` ladder, the `/1` retrofit regime; a run that walks one fires no
+**no** `/2` ladder, the `/1` retrofit regime, and a windowed run without
+`pyramid.all_time` (no node close to ride); any other `/2` run fires no
 families pass at all and its families ride the staged sweep instead (see
 "The rollup families ride the same walk", below): the end-of-run
 families pass is split `4^k` ways from the run's own leaf count — `k` from
@@ -805,8 +806,8 @@ gate as the Icechunk commit pin (`output.sweep: "stages"` plus a `/2`
 declaration with a composable field), hands `CASCADE_FAMILIES` to the staged
 sweep on the local backend, `agg` on Lambda and the `client` facade alike,
 and the tail then fires no families pass; a run that walks none (a `/1`
-store, or `"stages"` on a config that declares no ladder) keeps the separate
-pass exactly as before — they fold in each dispatch
+store, or `"stages"` on a config that declares no ladder), or a windowed run
+without `pyramid.all_time`, keeps the separate pass exactly as before — they fold in each dispatch
 node's **close**, over that tuple's own span: the finest tuple's span starts
 at the leaves (the stats sidecar, the D4 stamp, the leaf sub-map, the §10
 `temporal.toc` record — all through the invoke's one store handle), and
@@ -816,8 +817,9 @@ whole-tree `python -m zagg.sweep` pass at any `tuple_width`. The close is
 where they ride because a rollup object merges **every window** of its node
 (its `windows` key): the node's window units run concurrently and would
 read-modify-write one object. A windowed store that declares no all-time
-fold therefore has nowhere to put them. The fleet dispatcher's `all_time` is
-only the caller's first guess, so it *warns* up front and reports the outcome
+fold therefore has nowhere to put them, which is why the run tails keep its
+separate pass. The fleet dispatcher's `all_time` is only the caller's first
+guess, so a config that declares the fold on a store that withdrew it *warns* up front and reports the outcome
 (`families_unswept`) from the store's own answer, read back off the first
 landed window record — which settles both drift directions rather than
 refusing a store that does declare the fold.

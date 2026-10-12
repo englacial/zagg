@@ -4902,6 +4902,25 @@ class TestLambdaFamiliesRideTheCascade:
         atl06_config.output["sweep"] = True
         assert runner._cascade_families(atl06_config, grid) == ()  # no staged sweep to ride
 
+    def test_a_windowed_store_rides_only_with_its_all_time_close(self, atl06_config):
+        # A rollup object is per node and merges every window, so only the
+        # all-time close can fold it; a windowed store without that close
+        # keeps the separate pass on every backend (review round 3 (1)).
+        from zagg import runner
+        from zagg.sweep_families import CASCADE_FAMILIES
+
+        grid = _stub_grid()
+        grid.chunk_order = 7
+        atl06_config.output.update(store_layout="hive", sweep="stages")
+        atl06_config.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00Z",
+        }
+        assert runner._cascade_families(atl06_config, grid) == ()
+        atl06_config.output["pyramid"] = {"all_time": True}
+        assert runner._cascade_families(atl06_config, grid) == CASCADE_FAMILIES
+
 
 class TestFinalizeGuard:
     """Guarded finalize on agg's Lambda path (issue #335, (d)+(c)):
