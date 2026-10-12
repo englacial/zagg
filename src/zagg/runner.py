@@ -4623,6 +4623,7 @@ def _run_lambda(
                         # closes in place of their own fan-out (issue #610).
                         families=riding,
                     )
+                    _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
@@ -5960,6 +5961,20 @@ def _cascade_families(config, grid) -> tuple:
     if get_windowing(config) is not None and not (get_pyramid(config) or {}).get("all_time"):
         return ()
     return tuple(CASCADE_FAMILIES) if ladder_walks(config, grid) else ()
+
+
+def _warn_families_unswept(riding, staged) -> None:
+    """Warn when the families handed to the staged sweep were folded by nothing (issue #610).
+
+    ``riding`` non-empty means the tail fired no families pass; a staged
+    dispatch that failed open (``staged is None``) or reported
+    ``families_unswept`` then left the rollups unswept, so name the backstop.
+    """
+    if riding and (staged is None or staged.get("families_unswept")):
+        logger.warning(
+            f"rollup families {list(riding)} rode no node close this run; sweep them with "
+            "`python -m zagg.sweep <store> --families stats,moc,submap`"
+        )
 
 
 def _pin_icechunk_commit(config, grid, *, stages: bool):

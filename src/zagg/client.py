@@ -205,10 +205,15 @@ class RunHandle:
         #: ``runner._run_lambda`` reports as ``families_sweep``; ``None``
         #: while the tail is in flight, when the run had no leaf to sweep,
         #: when the run walked the ``/2`` ladder (the families then rode the
-        #: staged sweep's node closes — ``stage_sweep["families"]`` names
-        #: them — and no separate pass was fired, issue #610 phase 4), or
-        #: when its dispatch failed before any invoke fired (fail-open, D9). A ``finisher`` other than
-        #: ``"ok"`` means the root temporal section may be short.
+        #: staged sweep's node closes and no separate pass was fired, issue
+        #: #610 phase 4), or when its dispatch failed before any invoke fired
+        #: (fail-open, D9). A ``finisher`` other than ``"ok"`` means the root
+        #: temporal section may be short. On a run that rode the cascade the
+        #: families outcome is ``stage_sweep["families"]`` /
+        #: ``stage_sweep["families_unswept"]``; ``stage_sweep is None`` there
+        #: means the rollups are unswept, and the tail logs a warning naming
+        #: the backstop (``python -m zagg.sweep <store> --families
+        #: stats,moc,submap``).
         self.families_sweep: dict | None = None
         #: How the run's dispatch manifest went out (issue #588): ``"full"``;
         #: ``"slim"`` — the block did not fit the hive setup Event, so it
@@ -1432,6 +1437,7 @@ class Run:
                         # The rollup families ride the closes (issue #610).
                         families=riding,
                     )
+                    runner._warn_families_unswept(riding, handle.stage_sweep)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         self._finalize_icechunk(
