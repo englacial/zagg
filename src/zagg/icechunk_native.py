@@ -32,11 +32,7 @@ committing node decides.
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 #: The repo level artifact whose chunks are the repo's own bytes (§11.3).
 NATIVE_ARTIFACT = "overview"
