@@ -5171,6 +5171,24 @@ class TestTailSweepShort:
         # The staged leg still speaks for itself after it.
         assert len(reasons) == 2 and "staged sweep dispatch failed" in reasons[1]
 
+    def test_a_verdict_that_cannot_be_computed_fails_open(self, monkeypatch, caplog):
+        # Both call sites sit outside their tail's fail-open arm, so the
+        # reporting helper must not take down a run whose leaves are written
+        # (D9) — it reports that it could not report instead, and the summary
+        # key stays on the dict the key-set test pins by name.
+        from zagg import runner
+
+        def boom(_staged):
+            raise RuntimeError("unreadable staged summary")
+
+        monkeypatch.setattr(runner, "_staged_sweep_incomplete", boom)
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            (reason,) = runner._tail_sweep_short(None, self._WHOLE, stage_chained=True)
+        assert "could not be computed (RuntimeError: unreadable staged summary)" in reason
+        assert "fail-open" in caplog.text
+        # And the warning helper still speaks for it.
+        runner._warn_tail_sweep_short([reason])
+
     def test_a_fired_families_pass_that_failed_is_not_the_none_of_no_pass(self):
         from zagg import runner
 

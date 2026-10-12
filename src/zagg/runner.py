@@ -6394,7 +6394,31 @@ def _tail_sweep_short(
     it leads the list: a block that raised before either leg fired reports
     neither outcome, so without it the worst case — nothing swept at all —
     would be the emptiest verdict (review finding).
+
+    Fail-open itself, and deliberately: both call sites sit OUTSIDE their
+    tail's fail-open arm, so a raise in here would take down a run whose
+    leaves are all written — inverting D9 for a REPORTING helper, and
+    dropping the summary key the key-set test pins by name (review finding).
+    A verdict that cannot be computed says THAT, which is the fail-open
+    answer that still reports something; the reasons live in
+    :func:`_tail_sweep_reasons`.
     """
+    try:
+        return _tail_sweep_reasons(
+            families_sweep, stage_sweep, stage_chained=stage_chained, tail_error=tail_error
+        )
+    except Exception as e:
+        logger.warning(f"the tail's verdict could not be computed (fail-open, D9): {e}")
+        return [
+            f"the tail's verdict could not be computed ({type(e).__name__}: {e}), so whether "
+            "the rollups are whole is unknown — sweep them to be sure"
+        ]
+
+
+def _tail_sweep_reasons(
+    families_sweep, stage_sweep, *, stage_chained: bool, tail_error: str | None = None
+) -> list:
+    """The reasons themselves; :func:`_tail_sweep_short` is the fail-open wrapper."""
     reasons = []
     if tail_error:
         reasons.append(
