@@ -1330,8 +1330,12 @@ class TestD8Audit:
         # The dispatcher's ONE store read (issue #635): it declines a store
         # whose manifest declares no `/2` ladder before firing anything, so
         # the audited run needs a manifest to pass that gate — and the audit
-        # is about PUTs, which this one is not. Written through the same
-        # routed factory, before the counter is installed.
+        # is about PUTs, which this one is not. `hive` binds the store factory
+        # at import, so route it THERE too, or `read_manifest` reaches for the
+        # real `s3://test-bucket` and the gate's verdict depends on what the
+        # network answers: a 404 on a CI runner declines the run, no network
+        # at all fails open. Written before the PUT counter is installed.
+        monkeypatch.setattr(hive, "open_object_store", lambda path, *a, **k: status_store)
         obstore.put(
             status_store,
             hive.MANIFEST_NAME,
