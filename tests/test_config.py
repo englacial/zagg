@@ -3705,6 +3705,17 @@ class TestWindowedStoresDeclareTheAllTimeFold:
         validate_config(cfg)
         assert get_pyramid(cfg) == {"all_time": False}
 
+    @pytest.mark.parametrize("schedule", ["yearlyy", "quarterly", None])
+    def test_a_bad_schedule_is_refused_by_the_schedule_check(self, schedule):
+        # _validate_pyramid runs before _validate_windowing, so a schedule that
+        # is not a known one must not read as windowed there: the operator gets
+        # the schedule refusal, never the all-time one it would mask.
+        cfg = _windowed_cfg({"all_time": False})
+        cfg.output["windowing"]["schedule"] = schedule
+        with pytest.raises(ValueError, match=r"output\.windowing\.schedule") as err:
+            validate_config(cfg)
+        assert self.REFUSAL not in str(err.value)
+
     def test_pyramid_off_stays_legal(self):
         from zagg.config import get_pyramid
 
