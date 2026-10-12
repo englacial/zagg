@@ -185,7 +185,7 @@ Target coverage: ~1,300 cells covering Antarctic grounded ice drainage basins (e
 │   s3://bucket/prefix/                                │
 │   └── 12/                                            │
 │       ├── morton     (uint64, fill=0)                │
-│       ├── count      (int32,  fill=0)                │
+│       ├── count      (int64,  fill=0)                │
 │       ├── h_min      (float32, fill=NaN)             │
 │       ├── h_max      (float32, fill=NaN)             │
 │       ├── h_mean     (float32, fill=NaN)             │

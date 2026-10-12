@@ -63,7 +63,7 @@ aggregation:
     count:
       function: len
       source: h_ph
-      dtype: int32
+      dtype: int64
       fill_value: 0
     h_tdigest:
       # Per-cell t-digest of photon heights: a ragged (vlen-bytes) field whose payload

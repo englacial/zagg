@@ -4,7 +4,7 @@
   "short_name": "SPEC_FIXTURE",
   "version": "1"
  },
- "semantic_hash": "55f495522d501e29c35363437e7bce3ca6bf3137eda6880493e53b9a854ff6bb",
+ "semantic_hash": "d4833b83e3c149a5e59d5e475c9f75e9a479e6f3023311103bdae39c36f08002",
  "cell_order": 6,
  "shard_order": 3,
  "split_schedule": [
@@ -51,7 +51,7 @@
      "class": "exact",
      "method": "sum",
      "nan_policy": "skip",
-     "dtype": "int32",
+     "dtype": "int64",
      "fill_value": 0
     },
     "h_tdigest": {
@@ -77,7 +77,7 @@
    }
   }
  },
- "generated_at": "2026-09-11T01:38:44+00:00",
+ "generated_at": "2026-10-12T01:25:47+00:00",
  "multiscales": [
   {
    "spec": "zagg-multiscales/1",

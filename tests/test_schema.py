@@ -92,7 +92,7 @@ class TestCreateZarrTemplate:
         xdggs_zarr_template(store, parent_order=6, child_order=8)
 
         group = open_group(store, path="8", mode="r")
-        assert group["count"].dtype == np.int32
+        assert group["count"].dtype == np.int64  # issue #626
 
     def test_statistical_vars_dtype(self, data_vars):
         store = MemoryStore()
