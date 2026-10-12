@@ -4870,22 +4870,35 @@ class TestLambdaSkipAndDirtOnly:
         assert summary["icechunk_finalize"] == {"tag": "run-x"}
 
     @pytest.mark.parametrize(
-        "staged",
+        "staged, phrase",
         [
-            None,  # the dispatch failed open (D9)
-            {
-                "run_id": "stage-x",
-                "barrier_timed_out": True,
-                "short_orders": [2, 1, 0],
-                "finisher": {"fired": True, "landed": True},
-            },
+            (None, "staged sweep dispatch failed"),  # the dispatch failed open (D9)
+            (
+                {
+                    "run_id": "stage-x",
+                    "barrier_timed_out": True,
+                    "short_orders": [2, 1, 0],
+                    "finisher": {"fired": True, "landed": True},
+                },
+                "order(s) [2, 1, 0]",
+            ),
         ],
     )
-    def test_the_staged_outcome_rides_the_run_summary(self, monkeypatch, atl06_config, staged):
+    def test_the_staged_outcome_rides_the_run_summary(
+        self, monkeypatch, atl06_config, staged, phrase
+    ):
         # The ladder's half of "not swallowed" (issue #610): a walled tuple is
         # reported where the families leg is, not in the dispatcher's log alone.
+        #
+        # The VERDICT is what each arm turns on, because the key alone cannot
+        # tell the ``None`` arm's dispatch FAILURE from a run that chained no
+        # staged sweep (``summary["stage_sweep"]`` is initialized to ``None``,
+        # so that arm held either way — review finding). This is also the only
+        # end-to-end cover of the dispatcher's ``stage_chained`` reaching the
+        # verdict on the failed-dispatch path.
         summary, seen = self._drive(monkeypatch, atl06_config, body=self._DIRTY, staged=staged)
         assert len(seen["stage"]) == 1 and summary["stage_sweep"] is staged
+        assert any(phrase in reason for reason in summary["tail_sweep_short"])
 
     def test_no_staged_sweep_reports_none(self, monkeypatch, atl06_config):
         # An unmarked current unit enters no sweep, so there is nothing to report.
