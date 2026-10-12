@@ -4604,7 +4604,10 @@ def _run_lambda(
         # both legs' keys None and nothing else to report — a run whose
         # rollups were never swept would otherwise read as a whole tail. The
         # facade decides its gate before its own try and already says so.
-        tail_error = None
+        # Named for the concept, not ``tail_error``: this function's outer
+        # handler binds that name to the exception OBJECT (review finding),
+        # and the raster tail already calls this one ``families_error``.
+        families_error = None
         if get_store_layout(config) == "hive" and get_sweep(config):
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
@@ -4675,7 +4678,7 @@ def _run_lambda(
                     _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
-                tail_error = f"{type(e).__name__}: {e}"
+                families_error = f"{type(e).__name__}: {e}"
         # The run's verdict on its own tail (issue #610): one reason per
         # shortfall, empty when the tail left nothing short. Both legs' full
         # outcomes are above; this is what a caller reads without knowing
@@ -4684,7 +4687,7 @@ def _run_lambda(
             summary["families_sweep"],
             staged,
             stage_chained=stage_chained,
-            tail_error=tail_error,
+            tail_error=families_error,
         )
         _warn_tail_sweep_short(summary["tail_sweep_short"])
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous

@@ -1389,7 +1389,9 @@ class Run:
         # ``handle.stage_sweep`` None, so the finalize records ``{skipped}``
         # rather than tagging a tip the staged sweep never reached. Cleared
         # only on the explicit no-work branch below.
-        tail_error = None
+        # ``families_error``, matching the raster tail, so the name is not the
+        # handle's ``_tail_error`` exception object (review finding).
+        families_error = None
         sweeps = layout == "hive" and get_sweep(self.config)
         stage_chained = sweeps and chains_stages(self.config, self.grid) and not self._attached
         if sweeps:
@@ -1467,7 +1469,7 @@ class Run:
                     runner._warn_families_unswept(riding, handle.stage_sweep)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
-                tail_error = f"{type(e).__name__}: {e}"
+                families_error = f"{type(e).__name__}: {e}"
         # The handle's verdict on its own tail (issue #610), the same reasons
         # ``runner._run_lambda`` reports as ``tail_sweep_short`` — the raised
         # block included, so the two tails agree on the worst case too.
@@ -1475,7 +1477,7 @@ class Run:
             handle.families_sweep,
             handle.stage_sweep,
             stage_chained=stage_chained,
-            tail_error=tail_error,
+            tail_error=families_error,
         )
         runner._warn_tail_sweep_short(handle.tail_sweep_short)
         self._finalize_icechunk(
