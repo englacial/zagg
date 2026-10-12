@@ -128,6 +128,59 @@ class TestTheCopy:
         with pytest.raises(ValueError, match="moved between the ref plan"):
             self._copy(root, [{**entry, "checksum": f"{etag}-stale"}], etags=True)
 
+    def test_a_shrinking_rewrite_inside_the_checksum_window_is_refused(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The §11.3 same-second hole, which the COPY can close where a
+        # virtual ref structurally cannot: the object is re-folded shorter
+        # and its mtime restored, so the ceiled-second checksum still
+        # matches and only the object's own shard index shows the rewrite.
+        # Without the index guard ``data[start : start + length]`` cannot
+        # raise, so the last present chunk is sliced SHORT and committed —
+        # silently, and permanently into a tag (issue #584 review).
+        from pathlib import Path
+
+        from zagg.store import open_object_store
+
+        grid, root, shard, plan = self._staged(monkeypatch, cfg, tmp_path)
+        prefix = icechunk_refs.container_prefix(root)
+        entry = next(e for e in plan if e["sharded"] and e["refs"])
+        location = next(loc for loc in entry["locations"] if loc)
+        path = Path(f"{root}/{location[len(prefix) :]}")
+        offsets, lengths = np.asarray(entry["offsets"]), np.asarray(entry["lengths"])
+        present = [i for i, loc in enumerate(entry["locations"]) if loc]
+        last = max(present, key=lambda i: int(offsets[i]) + int(lengths[i]))
+        short_by = min(30, int(lengths[last]) - 1)
+        stat = path.stat()
+        path.write_bytes(path.read_bytes()[: int(offsets[last]) + int(lengths[last]) - short_by])
+        os.utime(path, (stat.st_atime, stat.st_mtime))
+        # The checksum does NOT catch it — that is the hole the index closes.
+        icechunk_native._object_bytes(
+            open_object_store(root), location[len(prefix) :], entry.get("checksum"), etags=False
+        )
+        with pytest.raises(ValueError, match="a slice of it would be SHORT"):
+            self._copy(root, [entry])
+
+    def test_a_shard_index_that_disagrees_with_the_plan_is_refused(
+        self, monkeypatch, cfg, tmp_path
+    ):
+        # The same guard on a real, intact object whose index simply is not
+        # the one the plan read — the shape a re-fold that re-compressed an
+        # inner chunk takes. Shortening a chunk the object does not END with
+        # leaves the payload extent untouched, so it is the index comparison
+        # itself that refuses, not the bounds arm above.
+        grid, root, shard, plan = self._staged(monkeypatch, cfg, tmp_path)
+        entry = next(e for e in plan if e["sharded"] and e["refs"] > 1)
+        offsets, lengths = np.asarray(entry["offsets"]), np.asarray(entry["lengths"])
+        first = min(
+            (i for i, loc in enumerate(entry["locations"]) if loc),
+            key=lambda i: int(offsets[i]) + int(lengths[i]),
+        )
+        stale = lengths.copy()
+        stale[first] -= 1
+        with pytest.raises(ValueError, match="no longer matches the ref plan"):
+            self._copy(root, [{**entry, "lengths": stale}])
+
     def test_a_whole_object_chunk_whose_object_changed_size_is_refused(
         self, monkeypatch, cfg, tmp_path
     ):

@@ -32,6 +32,8 @@ committing node decides.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 #: The repo level artifact whose chunks are the repo's own bytes (§11.3).
@@ -85,16 +87,64 @@ def _write(session, pairs: list[tuple[str, bytes]]) -> None:
     sync(write())
 
 
+def _vet_shard_index(data: bytes, entry: dict, location: str) -> None:
+    """Refuse a shard object whose own index no longer matches the plan's (§11.3).
+
+    The byte-exact staleness guard, and the one the virtual path structurally
+    cannot have: a checksum form can collide — an ETag is whatever the
+    container mints, and a ``file://`` ``last_modified`` is ceiled to the
+    whole second, so a re-fold inside that second is invisible to it — but a
+    re-fold that moved or resized ANY inner chunk shows up in the index. The
+    copy has the whole object in hand and ``_INDEX_LOCATION`` is ``end``, so
+    the index is simply read again from the bytes about to be sliced and
+    compared against the pairs :func:`~zagg.icechunk_refs.object_ref_plan`
+    recorded. Without it ``data[start : start + length]`` cannot raise, and a
+    shrinking rewrite inside that window is committed as a SHORT native
+    chunk — silently, and permanently in a tag (issue #584 review).
+    """
+    from zagg.icechunk_refs import _ABSENT, _INDEX_CRC_BYTES, _INDEX_ENTRY_BYTES
+
+    n = math.prod(int(c) for c in entry["chunk_grid"])
+    index_bytes = _INDEX_ENTRY_BYTES * n + _INDEX_CRC_BYTES
+    if len(data) < index_bytes:
+        raise ValueError(
+            f"{location} is {len(data)} bytes, too short to hold its own {n}-chunk shard index "
+            f"({index_bytes}), so it no longer matches the ref plan (spec §11.3)"
+        )
+    offsets = np.asarray(entry["offsets"], dtype="<u8")
+    lengths = np.asarray(entry["lengths"], dtype="<u8")
+    payload = len(data) - index_bytes
+    extent = int((offsets + lengths).max()) if n else 0
+    if extent > payload:
+        raise ValueError(
+            f"{location}: its {payload} payload bytes no longer hold the ref plan's chunks, "
+            f"which end at {extent} — a slice of it would be SHORT (spec §11.3)"
+        )
+    index = np.frombuffer(data[payload : len(data) - _INDEX_CRC_BYTES], dtype="<u8").reshape(n, 2)
+    present = index[:, 0] != _ABSENT
+    if not (
+        np.array_equal(np.where(present, index[:, 0], 0), offsets)
+        and np.array_equal(np.where(present, index[:, 1], 0), lengths)
+        and np.array_equal(present, [bool(loc) for loc in entry["locations"]])
+    ):
+        raise ValueError(
+            f"{location}: its shard index no longer matches the ref plan "
+            f"({int(present.sum())} chunks in the object against "
+            f"{sum(1 for loc in entry['locations'] if loc)} planned): another writer re-folded "
+            f"this overview (spec §11.3)"
+        )
+
+
 def _sharded_pairs(entry: dict, order: int, row: int, prefix: str, store, *, etags: bool) -> list:
     """``(chunk key, bytes)`` for every present chunk of a sharded entry.
 
     The entry is ONE object — a sharded hive array is one shard object, which
     is what its single ``checksum`` belongs to and what ``object_ref_plan``
-    refuses anything else for — so it is read once and sliced by the index
-    the plan already read: the chunk at grid position ``j`` is
-    ``[offset, offset + length)`` of that object, byte-for-byte the ``(1, C)``
-    chunk the repo array holds (``icechunk_rows.reroot``), so the copy
-    re-encodes nothing.
+    refuses anything else for — so it is read once, vetted against its own
+    index (:func:`_vet_shard_index`) and sliced by the index the plan already
+    read: the chunk at grid position ``j`` is ``[offset, offset + length)`` of
+    that object, byte-for-byte the ``(1, C)`` chunk the repo array holds
+    (``icechunk_rows.reroot``), so the copy re-encodes nothing.
     """
     objects = {location for location in entry["locations"] if location}
     if len(objects) > 1:
@@ -106,6 +156,7 @@ def _sharded_pairs(entry: dict, order: int, row: int, prefix: str, store, *, eta
         return []
     (location,) = objects
     data = _object_bytes(store, location[len(prefix) :], entry.get("checksum"), etags=etags)
+    _vet_shard_index(data, entry, location)
     grid = tuple(int(n) for n in entry["chunk_grid"])
     offsets = np.asarray(entry["offsets"], dtype="<u8")
     lengths = np.asarray(entry["lengths"], dtype="<u8")
