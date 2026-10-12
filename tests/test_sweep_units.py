@@ -1409,9 +1409,10 @@ class TestStageTier:
         )
         peaks = [row["container_hwm_mb"] for row in summary["stages"]]
         assert peaks and all(isinstance(p, float) and p > 0 for p in peaks)
-        # It is a high-water, not a sum: the whole process's peak RSS, so no
-        # row can report less than this test process already holds.
-        assert min(peaks) >= units_mod.container_hwm_mb() * 0.5
+        # It is a high-water, not a sum, and ``ru_maxrss`` is monotonic over
+        # the process: a reading taken now can only be >= every reading the
+        # pass took.
+        assert max(peaks) <= units_mod.container_hwm_mb()
 
     def test_an_unavailable_rusage_records_none_not_zero(self, monkeypatch):
         import resource
