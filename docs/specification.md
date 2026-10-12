@@ -2571,8 +2571,10 @@ the cell order to 10, the smallest leaf that can declare a §4.6 fine tier):
   for the digest, raw little-endian words for `morton` and `count`) and
   hold every group's `zarr.json` to the rule. Its groups 5 and 4 are
   byte-identical to `column/`'s (the same observations fold to the same
-  res-5 rows), which pins that the deeper leaf and the sharded layout move
-  no value.
+  res-5 rows), which pins that the deeper leaf and the fine-tier fold leave
+  the coarse groups' values unchanged (groups 5 and 4 fold flat from the
+  unsharded member 6 and never read group 9, so layout parity is pinned
+  zagg-side by `tests/test_column_shards.py::TestLayoutParity`).
 
 - **`multiscales/`** — the §4.10 companion-group surface: METADATA ONLY —
   a `zagg-pyramid/2` manifest on `pyramid/`'s grid, a production root

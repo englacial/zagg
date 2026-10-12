@@ -19,7 +19,8 @@ Run from a zagg checkout::
 
     uv run python tools/generate_spec_fixtures.py
 
-Geometry (both leaf fixtures): parent order 4 / chunk order 5 / cell order 6 —
+Geometry (every leaf fixture but ``column_fine/``, which is 4/7/10, see
+``FINE_GRID``): parent order 4 / chunk order 5 / cell order 6 —
 16 cells per shard, K = 4 inner chunks of 4 cells, `sharded` (the D17 hive
 default), deliberately tiny. Chunk ordinal 2 is left EMPTY to pin the
 shard-index absence sentinel (§1.5); populated chunks carry empty cells to
