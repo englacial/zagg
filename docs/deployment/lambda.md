@@ -1071,11 +1071,12 @@ one overwrites its record; leave a second between them.
 The families pass is idempotent; run it even when `tail.json` exists, since
 the launcher may have died before the families invoke (attach then runs no
 tail). On a run that walked the `/2` ladder the families rode the staged
-sweep, so the `--stages` pass above regenerates them too (`--families
-stats,moc,submap` names them explicitly) — and so does a plain pass scoped
-to those three, `python -m zagg.sweep <store> --families stats,moc,submap`,
-which is also the backstop when a windowed store declared no all-time fold
-and the staged sweep reported them `families_unswept`. *The sweeps* run in
+sweep, but the `--stages` pass above regenerates them only when given
+`--families stats,moc,submap` (unnamed, it folds the ladder alone); the
+first line's plain pass regenerates them either way, as does one scoped to
+those three, `python -m zagg.sweep <store> --families stats,moc,submap` —
+the backstop the tail's warning names when the staged dispatch failed or
+reported them `families_unswept`. *The sweeps* run in
 the calling process and write the store from it, so
 they need the store's write credentials and a host in the store's region.
 Where the operator cannot write the store (a Source Cooperative–published
