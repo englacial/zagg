@@ -268,6 +268,11 @@ class TestSubmissionValidation:
 
     def _graft(self):
         base = default_config("atl03_tdigest_healpix_hive", validate=False)
+        # The observed graft predates issue #638: the hive template now
+        # carries the yearly windowing block and the ``delta_time`` column it
+        # bins on, either of which would satisfy the clock the graft lacked.
+        del base.output["windowing"]
+        del base.data_source["variables"]["delta_time"]
         located = default_config("atl03_tdigest_located_healpix", validate=False)
         base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
         return base, located

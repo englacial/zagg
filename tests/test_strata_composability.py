@@ -105,6 +105,9 @@ class TestLiveCaManifestFixture:
         # the chunk order); the template has since declared the v4 ladder
         # `[16, 15, 14, 13]` (issue #620), so the default is restored here.
         config.output["pyramid"] = {}
+        # ...and the v3 store is unwindowed, where the template is windowed
+        # yearly since issue #638 (a windowed config resolves ``all_time``).
+        del config.output["windowing"]
         config.output["grid"]["parent_order"] = 9  # the CA store's shard order
         block = build_pyramid_block(config, 9, chunk_order=13)
         published = json.loads(CA_MANIFEST.read_text())["pyramid"]
@@ -228,10 +231,11 @@ class TestD24Classification:
                 "dtype": "float32",
                 "inner_shape": [2],
                 # The template's leaf budget (the live store's δ, issue #547)
-                # and its split pyramid-fold budget (issue #424), recorded
-                # RESOLVED.
+                # and its split pyramid-fold budget (issue #424; 128 since the
+                # v4 ruling, issue #638 — the live store declared 512),
+                # recorded RESOLVED.
                 "delta": 4096,
-                "overview_delta": 512,
+                "overview_delta": 128,
                 # Located strata IS the default (espg ruling on PR #334); the
                 # manifest entry is the only description the overview writer
                 # has, so both channels must ride it (issue #410).

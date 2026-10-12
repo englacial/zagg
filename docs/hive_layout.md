@@ -1776,9 +1776,14 @@ Two packaged templates do: `atl03_tdigest_healpix_hive` (`1d818cf6…` →
 `{backend: hierarchical}`). The first now shares its digest with
 `atl03_tdigest_healpix` (`818bdd69…`): the default-valued `index` block was
 their only core-visible difference, so post-epoch the two templates name one
-D19 product identity — the ruling working as intended, not a defect. No live
-store is built from either template's unmodified digest, so this is a record,
-not a migration.
+D19 product identity — the ruling working as intended, not a defect. (Since
+[issue #638](https://github.com/englacial/zagg/issues/638) the hive template
+is windowed yearly and declares the `delta_time` column it bins on, both
+hashed, so as shipped the two name different products again; the collapse
+holds once those two keys are removed, which is what
+`tests/test_semantics.py::test_the_two_atl03_templates_collapse` pins.) No
+live store is built from either template's unmodified digest, so this is a
+record, not a migration.
 
 **The migration — one tool, one write.** `zagg.semantics.semantic_hash_legacy`
 recomputes a config's *pre-epoch* digest (the current core with the index
