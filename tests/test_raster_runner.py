@@ -1228,8 +1228,13 @@ class TestRasterWindowedAllTimeFold:
         ids=["bare", "with-a-schedule"],
     )
     def test_all_time_false_is_refused_on_a_windowed_raster_config(self, tmp_path, knob):
-        # Refused BY NAME on both pyramid grammars, so a raster store cannot
-        # be configured to withdraw the fold its windows require.
+        # Refused BY NAME on both spellings of the knob — bare, and beside a
+        # schedule — so a raster store cannot be configured to withdraw the
+        # fold its windows require. Both are the ``/1`` shape: the ``/2``
+        # grammar spells the schedule ``overviews:`` (``overview_block_v2``)
+        # and is not exercised here.
+        from zagg.config import get_pyramid
+
         cfg = _cfg(tmp_path)
         cfg.output["store_layout"] = "hive"
         cfg.output["windowing"] = {"schedule": "daily"}
@@ -1237,9 +1242,12 @@ class TestRasterWindowedAllTimeFold:
         with pytest.raises(ValueError, match="output.pyramid.all_time: false is refused"):
             validate_config(cfg)
         # The refusal is the WINDOWING's: the same raster config without
-        # ``output.windowing`` keeps the knob as the caller spelled it.
+        # ``output.windowing`` validates clean, and the knob reads back
+        # verbatim — ``get_pyramid`` defaults ``all_time`` only under a
+        # windowed config, so nothing rewrites what the caller spelled.
         cfg.output.pop("windowing")
         validate_config(cfg)
+        assert get_pyramid(cfg) == knob
 
 
 class TestRasterHiveLambdaBackend:
