@@ -161,12 +161,12 @@ def split_exponent(base_chunk_order: int, split_order: int, chunk_order: int | N
     The exponent is fixed ONCE from the base level: ``m_base = base_chunk_order
     − split_order`` (7 at production — 16,384 inner chunks, one order-6 cell
     of the base). Every level then holds the same ``4^m`` CHUNKS per manifest,
-    capped at its own chunk axis (``chunk_order``: one chunk per node at a
-    column or overview level), so a coarse level's manifests span coarser
-    cells — ``/13`` one order-2 cell, ``/12`` one order-1 cell, ``/11`` and
-    coarser one base cell — rather than one ``split_order`` cell apiece, which
-    would multiply the manifest count (and the snapshot) by the number of
-    levels. Never above a whole base cell.
+    capped at its own chunk axis (``chunk_order``: one chunk per node at an
+    overview or a coarse column level, the inner chunk at a fine column, §4.6),
+    so a coarse level's manifests span coarser cells — ``/13`` one order-2
+    cell, ``/12`` one order-1 cell, ``/11`` and coarser one base cell — rather
+    than one ``split_order`` cell apiece, which would multiply the manifest
+    count (and the snapshot) by the number of levels. Never above a base cell.
     """
     m = max(int(base_chunk_order) - int(split_order), 0)
     return min(m, int(base_chunk_order if chunk_order is None else chunk_order))
@@ -471,10 +471,10 @@ def level_grids(manifest: dict, grid) -> dict:
     artifact ``leaf``), the §4.6 leaf column's declared member (``node ==
     shard_order``, artifact ``column``) and one overview level per declared
     ancestor order (artifact ``overview``). Each level's grid is the one its
-    artifact is written with — ``grid`` itself for the base, the
-    ``sweep_stage`` / ``column`` writers' ``HealpixGrid(node, cells,
-    config=_overview_config(fields), sharded=True)`` for the rest — so the
-    array model cannot drift from the objects. A column's OTHER members (its
+    artifact is written with — ``grid`` itself for the base,
+    :func:`zagg.column_shards.column_grid` for a column level, the overview
+    writer's ``HealpixGrid(node, cells, sharded=True)`` — so the array model
+    cannot drift from the objects. A column's OTHER members (its
     within-footprint intermediates and node-order partial) are sweep inputs,
     not levels: they overlap the overview levels for the same cells and are
     deliberately not indexed. A store with no ``/2`` declaration has the base
@@ -969,7 +969,7 @@ def object_ref_plan(
         chunks = []
         listing: list[Any]
         if n == 1:
-            # A single-chunk array (every column and overview array, §11.2):
+            # A single-chunk array (every overview and coarse column array):
             # one HEAD of the one key — the whole object is the ref (offset
             # 0, length = size), no LIST and no index read.
             key = key_prefix + "/".join("0" for _ in shape)
