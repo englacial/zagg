@@ -427,10 +427,13 @@ def _store_fatal_types() -> tuple:
 def classify_store_error(error: BaseException | str | None) -> str:
     """``error``'s class: :data:`STORE_BENIGN`, :data:`STORE_FATAL` or :data:`STORE_TRANSIENT`.
 
-    Takes the exception when the caller has it (its type and cause chain
-    classify first) or the recorded error string (``leaf column: ...``, the
-    unit-failure channel ``_LeafUnit.finish`` reports through). The order is
-    benign string, fatal type anywhere in the cause chain, credentials
+    Takes the exception when the caller has it (its type and ``raise ...
+    from`` chain classify first; ``__context__`` is not followed, so a fault
+    raised inside an ``except NotSupportedError:`` fallback -- zarr's
+    suffix-range ``get`` -- keeps its own class) or the recorded error string
+    (``leaf column: ...``, the unit-failure channel ``_LeafUnit.finish``
+    reports through). The order is
+    benign string, fatal type anywhere in the ``from`` chain, credentials
     (:func:`zagg.processing.worker.is_auth_failure`), HTTP status (4xx fatal
     but throttling / request timeout, 5xx transient), fatal token, and
     transient for whatever is left -- see :data:`STORE_FATAL`.
@@ -441,12 +444,12 @@ def classify_store_error(error: BaseException | str | None) -> str:
     if isinstance(error, BaseException):
         fatal = _store_fatal_types()
         exc: BaseException | None = error
-        for _ in range(8):  # the cause chain, bounded
+        for _ in range(8):  # the ``from`` chain, bounded
             if exc is None:
                 break
             if isinstance(exc, fatal):
                 return STORE_FATAL
-            exc = exc.__cause__ or exc.__context__
+            exc = exc.__cause__
     from zagg.processing.worker import is_auth_failure
 
     if is_auth_failure(error if isinstance(error, BaseException) else Exception(text)):
