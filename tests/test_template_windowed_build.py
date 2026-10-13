@@ -192,6 +192,13 @@ def _build(monkeypatch, tmp_path, name, *, refuse_chunk_deletes):
     emit._patch(monkeypatch, fakes)
     if refuse_chunk_deletes:
         _refuse_chunk_deletes(monkeypatch)
+    else:
+        # The pre-#653 writers: the guard off, so every all-fill slab goes to
+        # zarr, which deletes its key. Every call site looks ``all_fill`` up
+        # on this module at call time, so one patch reaches them all.
+        import zagg.processing.write
+
+        monkeypatch.setattr(zagg.processing.write, "all_fill", lambda array, values: False)
     root = tmp_path / name
     runner.agg(cfg, catalog=str(path), store=str(root), backend="local")
     return cfg, root, catalog["shard_keys"]
@@ -206,7 +213,8 @@ class _Built(NamedTuple):
     attempted: list
     #: the deletes it allowed (prefix clears, sidecars)
     deletes: list
-    #: the same build through a permissive store, for the key-set match
+    #: the same build with the guard off through a permissive store (zarr's
+    #: own delete-on-all-fill, as before #653), for the key-set match
     permissive: object
 
 
@@ -408,5 +416,10 @@ def test_the_build_never_asks_the_store_to_delete_a_chunk(built):
 
 def test_skipped_blocks_leave_no_object_either_way(built):
     """A skipped all-fill block and zarr's delete of it both leave no key — and
-    the guard never skipped a block zarr would have written."""
+    the guard never skipped a block zarr would have written.
+
+    The twin runs with ``all_fill`` patched to ``False``, so it is zarr's own
+    pre-#653 behaviour (delete-on-all-fill); key-set equality therefore means
+    the guard skipped exactly the blocks zarr would have deleted, no more.
+    """
     assert _objects(built.root) == _objects(built.permissive)
