@@ -66,13 +66,13 @@ ZARR_ENTRY = (
 #: GETs < 10, metadata PUTs one per ``zarr.json``, total <= 250). A kind with
 #: no entry (data GET, HEAD, ``list``, ``list_prefix``) is pinned at zero.
 CEILINGS = {
-    "metadata GET": 285,
-    "metadata PUT": 100,
+    "metadata GET": 200,
+    "metadata PUT": 99,
     "data PUT": 82,
     "data DELETE": 28,
-    "delete_dir": 14,
+    "delete_dir": 5,
     "list_dir": 12,
-    "total": 490,
+    "total": 395,
 }
 
 

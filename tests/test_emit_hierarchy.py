@@ -1,0 +1,89 @@
+"""``grids.base.emit_hierarchy``: one ``create_hierarchy`` pass, the same bytes (issue #657).
+
+The leaf and column writers template through this helper instead of
+pydantic-zarr's node-at-a-time ``to_zarr``. The contract it has to keep is
+byte identity — every metadata document the one-pass route writes equals the
+one ``to_zarr`` writes for the same spec — plus a handle for every node, so
+the data writes that follow never re-open an array.
+"""
+
+from __future__ import annotations
+
+import pytest
+import zarr
+from pydantic_zarr.experimental.v3 import GroupSpec
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.sync import sync
+from zarr.errors import ContainsGroupError
+from zarr.storage import MemoryStore
+
+from zagg.config import default_config
+from zagg.grids import HealpixGrid
+from zagg.grids.base import emit_hierarchy, vlen_dtype_warning_suppressed
+
+
+def _documents(store: MemoryStore) -> dict[str, bytes]:
+    async def _keys():
+        return [key async for key in store.list()]
+
+    prototype = default_buffer_prototype()
+    return {key: sync(store.get(key, prototype)).to_bytes() for key in sync(_keys())}
+
+
+def _leaf_spec(**kwargs) -> tuple[HealpixGrid, GroupSpec]:
+    grid = HealpixGrid(
+        9, 19, layout="fullsphere", config=default_config("atl03_tdigest_strata_healpix"), **kwargs
+    )
+    spec = GroupSpec(
+        members={grid.group_path: grid.shard_spec(cell_coordinate=False)}, attributes={}
+    )
+    return grid, spec
+
+
+@pytest.mark.parametrize("sharded", [True, False])
+def test_one_pass_writes_the_same_bytes_as_to_zarr(sharded):
+    """Dense sharded, dense unsharded, vlen ragged + located/timed siblings, vector attrs."""
+    _grid, spec = _leaf_spec(sharded=sharded)
+    via_to_zarr, via_one_pass = MemoryStore(), MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        spec.to_zarr(via_to_zarr, "", overwrite=True)
+        emit_hierarchy(via_one_pass, spec)
+    expected, got = _documents(via_to_zarr), _documents(via_one_pass)
+    assert set(got) == set(expected)
+    assert [k for k in expected if expected[k] != got[k]] == []
+
+
+def test_every_node_comes_back_as_a_handle():
+    grid, spec = _leaf_spec()
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        nodes = emit_hierarchy(store, spec)
+    flat = {key.lstrip("/") for key in spec.to_flat()}
+    assert set(nodes) == flat
+    assert isinstance(nodes[""], zarr.Group) and isinstance(nodes[grid.group_path], zarr.Group)
+    arrays = {k: v for k, v in nodes.items() if isinstance(v, zarr.Array)}
+    assert set(arrays) == {k for k in flat if k.count("/") == 1}
+    # The handle is the array on the store: a write through it lands there.
+    count = arrays[f"{grid.group_path}/count"]
+    count[:4] = 7
+    assert zarr.open_array(store, path=f"{grid.group_path}/count", mode="r")[:4].tolist() == [7] * 4
+
+
+def test_a_nested_root_path_keys_the_handles_from_the_store_root():
+    grid, spec = _leaf_spec()
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        nodes = emit_hierarchy(store, spec, path="a/b")
+    assert "a/b" in nodes and f"a/b/{grid.group_path}/count" in nodes
+    # Implicit parents get explicit group documents (issue #189's note).
+    assert "a" in nodes and "" in nodes
+
+
+def test_an_occupied_prefix_is_refused_not_overwritten():
+    """The writers clear the prefix themselves; the pass never ``delete_dir``s per node."""
+    _grid, spec = _leaf_spec()
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        emit_hierarchy(store, spec)
+        with pytest.raises(ContainsGroupError):
+            emit_hierarchy(store, spec)
