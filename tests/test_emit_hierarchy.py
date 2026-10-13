@@ -141,3 +141,16 @@ def test_the_leaf_writer_writes_through_the_template_handles(monkeypatch):
     for local, values in dense.items():
         start = local * grid.cells_per_chunk
         assert written[start : start + grid.cells_per_chunk].tolist() == values.tolist()
+
+
+def test_a_path_missing_from_the_handle_map_raises_not_reopens(monkeypatch):
+    """A template/writer key mismatch is loud: no silent ``open_array`` fallback."""
+    from zagg.processing import write as write_mod
+
+    grid, _spec = _leaf_spec()
+    store = MemoryStore()
+    nodes = grid.emit_shard_nodes(store, overwrite=True)
+    monkeypatch.setattr(write_mod, "open_array", lambda *a, **k: pytest.fail("re-opened"))
+    with pytest.raises(KeyError, match="did not declare"):
+        write_mod._leaf_array(store, grid, "not_a_field", nodes)
+    assert write_mod._leaf_array(store, grid, "count", nodes) is nodes[f"{grid.group_path}/count"]

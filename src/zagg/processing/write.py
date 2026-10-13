@@ -118,12 +118,19 @@ def _leaf_array(store, grid, name, arrays):
 
     ``arrays`` is the ``{path: handle}`` map the leaf template pass returned
     (``HealpixGrid.emit_shard_nodes``, issue #657); a writer holding it never
-    re-opens an array (each ``open_array`` is an ancestor-probing GET). A
-    caller without it — the flat path, a bare store in a test — opens as
-    before.
+    re-opens an array (each ``open_array`` is an ancestor-probing GET), and a
+    path missing from it is a template/writer mismatch, raised as a
+    ``KeyError`` rather than hidden behind a re-open. Only a caller without
+    the map (``arrays=None``) — the flat path, a bare store in a test — opens
+    as before.
     """
     path = f"{grid.group_path}/{name}"
-    if arrays is not None and path in arrays:
+    if arrays is not None:
+        if path not in arrays:
+            raise KeyError(
+                f"{path!r}: the leaf template did not declare this array (issue #657); "
+                f"it declares {sorted(k for k in arrays if k.startswith(grid.group_path))}"
+            )
         return arrays[path]
     return open_array(store, path=path, zarr_format=3, consolidated=False)
 
