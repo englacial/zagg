@@ -1872,6 +1872,17 @@ class TestSkipFillWrites:
         assert self._keys(store, grid, "h_raw") == []
         assert store.deleted == []
 
+    def test_all_fill_compares_in_the_array_dtype(self):
+        """zarr casts before its fill test, so a float64 slab that rounds to the
+        float32 fill is all fill (it would have been deleted, not written)."""
+        import zarr
+
+        from zagg.processing.write import all_fill
+
+        arr = zarr.create_array(MemoryStore(), shape=(4,), dtype="f4", fill_value=0.0)
+        assert all_fill(arr, np.full(4, 1e-50))
+        assert not all_fill(arr, np.full(4, 1e-3))
+
     @staticmethod
     def _companion_case():
         """A dense ``count`` plus a ``resolution: chunk`` companion ``anchor_h``,

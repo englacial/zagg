@@ -145,14 +145,19 @@ def all_fill(array, values) -> bool:
     overviews); the flat writers (:func:`write_shard_to_zarr`,
     :func:`write_ragged_to_zarr`) keep zarr's delete, since a rerun onto an
     existing flat store must not leave a stale object behind.
-    The comparison is zarr's own (``NDBuffer.all_equal``: NaN equals the NaN
-    fill, signed zeros stay distinct), so a slab skipped here is exactly one
-    zarr would have deleted — never one it would have written.
+    The comparison is the one zarr makes (``NDBuffer.all_equal`` on the values
+    cast to the array's dtype: NaN equals the NaN fill, signed zeros stay
+    distinct), taken slab-wide: a skipped slab is fill in every chunk it spans,
+    each of which zarr would have deleted. The converse need not hold — a slab
+    mixing data and fill chunks is written, and on a multi-object target zarr
+    still deletes its fill chunks — so the test errs toward an unneeded delete,
+    never a lost write.
     """
     fill = array.metadata.fill_value
     if fill is None:
         return False
-    values = default_buffer_prototype().nd_buffer.from_numpy_array(np.asarray(values))
+    values = np.asarray(values, dtype=array.dtype)  # zarr casts before comparing
+    values = default_buffer_prototype().nd_buffer.from_numpy_array(values)
     return bool(values.all_equal(fill))
 
 
