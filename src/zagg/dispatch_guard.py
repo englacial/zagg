@@ -272,6 +272,7 @@ class DispatchGuard:
         self._cap = self.config.cap if workers is None else min(self.config.cap, int(workers))
         self.width = min(self.config.start, self._cap)
         self._records: list[ResultRecord] = []
+        self._timed_out: set = set()  # shard keys already recorded as a timeout
         self._widened_at = 0  # result count when the current width took effect
         self._baseline: float | None = None
         self.ramp: list[dict] = [{"width": self.width, "at_result": 0}]
@@ -284,6 +285,13 @@ class DispatchGuard:
         """Fold one completed result in; re-evaluate the breaker, then the ramp."""
         cfg = self.config
         rec = classify_result(result, function_timeout_s=self._timeout_s)
+        key = result.get("shard_key")
+        if rec.timeout and key is not None:
+            # A dropped shard re-fires once: it counts one timeout, recorded at
+            # its first drop; a later ok/failed completion still counts.
+            if key in self._timed_out:
+                return
+            self._timed_out.add(key)
         self._records.append(rec)
         n = len(self._records)
         if self.tripped is not None:

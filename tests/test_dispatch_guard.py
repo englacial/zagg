@@ -240,6 +240,17 @@ class TestBreaker:
     def test_the_fallback_mirrors_the_658_string_path(self, error, expected):
         assert _classify_fallback(error) == expected
 
+    def test_a_shard_counts_one_timeout_across_its_refire(self):
+        # 10 timeouts of 50 is at the threshold; the re-fired k9 dropping
+        # again must not make it 11 of the last 50.
+        drops = [{**_timeout(), "shard_key": f"k{i}"} for i in range(10)]
+        g = _feed(_guard(), [_ok()] * 40 + drops + [{**_timeout(), "shard_key": "k9"}])
+        assert g.tripped is None
+        # A later ok completion for the same shard still counts: the 50th
+        # write sample lands at result 60, not 61.
+        _feed(g, [{**_ok(), "shard_key": "k9"}] + [_ok()] * 9)
+        assert g.width == 1000 and g.ramp[-1]["at_result"] == 60
+
     def test_a_trip_is_sticky_and_records_keep_counting(self):
         g = _feed(_guard(), [_ok()] * 39 + [_timeout()] * 11)
         verdict = dict(g.tripped)
