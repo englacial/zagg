@@ -122,6 +122,36 @@ class TestClassifyStoreError:
             "transient"
         )
         assert classify_store_error(TimeoutError("timed out")) == "transient"
+        # object_store 0.12's retry shape names the status after the URL.
+        assert (
+            classify_store_error(
+                "Error performing PUT https://bucket.s3.amazonaws.com/k in 180s, after 12 retries, "
+                "max_retries:12, retry_timeout:180s - Server returned non-2xx status code: "
+                "503 Service Unavailable"
+            )
+            == "transient"
+        )
+
+    def test_bare_words_are_not_refusals(self):
+        # ``Connection refused`` is a connection fault, and a ``KeyError``'s
+        # ``not found`` is not the store's: the tokens name the refusal.
+        assert (
+            classify_store_error(
+                "Error after 3 retries in 1s, source: error sending request: "
+                "tcp connect error: Connection refused (os error 111)"
+            )
+            == "transient"
+        )
+        assert classify_store_error(ConnectionRefusedError("Connection refused")) == "transient"
+        assert classify_store_error("leaf column: KeyError: variable not found in group") == (
+            "transient"
+        )
+        assert classify_store_error("NoSuchKey: The specified key does not exist.") == (
+            "store-fatal"
+        )
+        assert classify_store_error(ValueError("refusing to overwrite manifest.json")) == (
+            "store-fatal"
+        )
 
     def test_the_unnamed_failure_keeps_per_window_isolation(self):
         # Not a store error at all (a window's own reduce): isolated, as
