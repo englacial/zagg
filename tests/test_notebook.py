@@ -46,6 +46,26 @@ def _windowed_cfg(unit=None):
     return cfg
 
 
+def _raster_cfg(store):
+    """A windowed hive raster config -- the ``RasterStrategy.run`` call site."""
+    from zagg.config import load_config_from_dict
+
+    return load_config_from_dict(
+        {
+            "data_source": {
+                "reader": "raster",
+                "bands": {"red": {"asset": "red", "dtype": "uint16"}},
+            },
+            "output": {
+                "grid": {"type": "healpix", "parent_order": 9, "child_order": 19},
+                "store": store,
+                "store_layout": "hive",
+                "windowing": {"schedule": "monthly"},
+            },
+        }
+    )
+
+
 #: s3 store for the lambda-backend drives below (the backend refuses a local path).
 _STORE = "s3://out/x.zarr"
 
@@ -262,18 +282,53 @@ class TestMaxCostPreview:
         dispatched = len(runner._expand_units(cells, cfg))
         assert notebook.max_cost_preview(cfg, SHARDMAP)["n_units"] == dispatched
 
-    def test_every_dispatch_path_expands_through_the_shared_helper(self):
-        # The identity above is only worth anything while the dispatch paths
-        # still route through _expand_units: a path that inlined its own fan
-        # would drift silently. Pin the call sites (issue #648).
-        import inspect
+    def test_every_dispatch_path_expands_through_the_shared_helper(self, monkeypatch, tmp_path):
+        # The identity above is only worth anything while EVERY path that
+        # counts units still routes through _expand_units: one that inlined
+        # its own fan would drift silently. Pinned behaviorally (issue #648
+        # fold) with a sentinel in place of the helper, aborting each path AT
+        # the expansion the way ``tests/test_client.py``'s ``_probe_fd_bound``
+        # aborts at the probe -- a source-text assertion passed on a
+        # commented-out or result-discarded call and failed on a rename.
+        # ``max_cost_preview`` is in the loop too: it is the call site that
+        # actually regressed.
+        from zagg import hive, runner
+        from zagg.processing import raster as raster_mod
 
-        from zagg import runner
+        class _Reached(Exception):
+            pass
 
-        for fn in (runner._run_local, runner._run_lambda):
-            assert "_expand_units(cells, config)" in inspect.getsource(fn), fn.__name__
-        raster = inspect.getsource(runner.RasterStrategy.run)
-        assert "_expand_units(cells, config)" in raster
+        seen = []
+
+        def _sentinel(cells, config):
+            seen.append(list(cells))
+            raise _Reached
+
+        monkeypatch.setattr(runner, "_expand_units", _sentinel)
+        _lambda_dispatch_env(monkeypatch)
+        # The local dispatcher writes the hive manifest before it expands, and
+        # the raster path reads the catalog's acquisition datetimes; neither is
+        # what this test is about.
+        monkeypatch.setattr(hive, "build_manifest", lambda *a, **k: {})
+        monkeypatch.setattr(hive, "ensure_manifest", lambda store, manifest, **k: manifest)
+        monkeypatch.setattr(raster_mod, "raster_time_index", lambda granules, **k: ({"dt": 0}, [0]))
+        drives = {
+            "preview": lambda: notebook.max_cost_preview(_windowed_cfg(), SHARDMAP),
+            "local": lambda: runner.agg(
+                _windowed_cfg(), catalog=SHARDMAP, store=str(tmp_path / "l.zarr"), backend="local"
+            ),
+            "lambda": lambda: runner.agg(
+                _windowed_cfg(), catalog=SHARDMAP, store=_STORE, backend="lambda"
+            ),
+            "raster": lambda: runner.agg(
+                _raster_cfg(str(tmp_path / "r.zarr")), catalog=SHARDMAP, backend="local"
+            ),
+        }
+        for name, drive in drives.items():
+            with pytest.raises(_Reached):
+                drive()
+            assert len(seen) == 1, name
+            assert len(seen.pop()) == 4, name  # the run's selected cells, unexpanded
 
 
 class TestProgressFactory:
