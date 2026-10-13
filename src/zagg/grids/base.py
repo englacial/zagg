@@ -253,6 +253,45 @@ def vlen_dtype_warning_suppressed():
         yield
 
 
+def emit_hierarchy(store: Store, spec, *, path: str = "") -> dict[str, Any]:
+    """Create ``spec``'s whole hierarchy under ``path`` in ONE pass; return its node handles.
+
+    pydantic-zarr's ``GroupSpec.to_zarr`` walks the tree one node at a time —
+    each member is its own probe of the node and its ancestors plus its own
+    PUT, so a leaf or column template costs ~2 metadata GETs per object
+    before a byte of data moves (issue #657; issue #189 is the upstream ask).
+    Here every node's metadata object is built exactly as ``to_zarr`` builds
+    it (``ArrayV3Metadata.from_dict`` / ``GroupMetadata.from_dict`` of the
+    spec's own dump — the same serialized bytes) and the whole set goes to
+    ``zarr.create_hierarchy`` once: one concurrent probe pass, one concurrent
+    PUT pass. The root group is explicit in the set, so its document is
+    written as before.
+
+    Returns ``{path: handle}`` keyed by each node's path relative to the
+    store root (``""`` is the root group): the array handles the writer then
+    writes through, instead of re-opening each array (``open_array`` is
+    another ancestor-probing GET per array).
+
+    A caller that means to overwrite clears the prefix first; the pass runs
+    with ``overwrite=False`` and raises zarr's ``ContainsGroupError`` /
+    ``ContainsArrayError`` on an occupied node rather than issuing a
+    ``delete_dir`` per node.
+    """
+    import zarr
+    from pydantic_zarr.experimental.v3 import ArraySpec
+    from zarr.core.group import GroupMetadata
+    from zarr.core.metadata.v3 import ArrayV3Metadata
+
+    nodes = {}
+    for key, node in spec.to_flat(root_path=path).items():
+        dump = node.model_dump()
+        if isinstance(node, ArraySpec):
+            nodes[key.lstrip("/")] = ArrayV3Metadata.from_dict(dump)
+        else:
+            nodes[key.lstrip("/")] = GroupMetadata.from_dict({**dump, "node_type": "group"})
+    return dict(zarr.create_hierarchy(store=store, nodes=nodes, overwrite=False))
+
+
 def ragged_array_spec(
     *,
     shape,
@@ -786,6 +825,7 @@ __all__ = [
     "ragged_times_name",
     "vector_array_spec",
     "vlen_dtype_warning_suppressed",
+    "emit_hierarchy",
     "chunk_array_spec",
     "sharded_array_spec",
 ]
