@@ -2506,19 +2506,28 @@ def _unit_kind(config: PipelineConfig) -> str:
     untouched. ``"shard"`` -- ``output.windowing.unit: shard``, the default
     since issue #586: one unit per shard, emitting every window its granules
     span. ``"shard-window"`` -- ``unit: window``, one unit per (shard,
-    window). ``"acquisition"`` -- the raster hive fan-out (issue #247), whose
-    membership is decided per acquisition at dispatch.
+    window). ``"raster-window"`` -- the raster hive fan-out (issue #247), one
+    unit per (shard, window) whose MEMBERSHIP is decided per acquisition
+    (earliest STAC datetime per group, explicit schedules drop groups), a
+    different rule from the spatial expansion's.
 
     Read apart from :func:`~zagg.config.get_windowing_unit` because that knob
-    is not the whole answer: it reads ``"window"`` for every raster config,
-    and the raster path fans out only on the hive layout.
+    reads ``"window"`` for every raster config, and a windowed raster config
+    must route to :func:`_raster_windowed_units` rather than to the spatial
+    :func:`_windowed_units` -- same word, different membership.
     """
     windowing = get_windowing(config)
     if windowing is None:
         return "cell"
     if (config.data_source or {}).get("reader") == "raster":
         # Mirror RasterStrategy.run: no windowed fan-out off the hive layout.
-        return "acquisition" if get_store_layout(config) == "hive" else "cell"
+        # Defense for an UNVALIDATED config, not a dispatch case: windowing
+        # requires hive for every active schedule (``_validate_windowing``),
+        # but ``zagg.notebook.max_cost_preview`` validates nothing and the CLI
+        # prices through it BEFORE ``agg`` validates (``zagg.__main__``), so a
+        # flat windowed raster config reaching here must count cells -- what
+        # the pre-#648 preview did -- not fan out on a layout that will refuse.
+        return "raster-window" if get_store_layout(config) == "hive" else "cell"
     return "shard-window" if get_windowing_unit(config) == "window" else "shard"
 
 
@@ -2528,7 +2537,7 @@ _UNIT_NOUN = {
     "cell": "shards",
     "shard": "shards",
     "shard-window": "shard-windows",
-    "acquisition": "shard-windows",
+    "raster-window": "shard-windows",
 }
 
 
@@ -2554,7 +2563,7 @@ def _expand_units(cells: list[tuple], config: PipelineConfig) -> list:
     if kind == "cell":
         return cells
     windowing = get_windowing(config)
-    if kind == "acquisition":
+    if kind == "raster-window":
         return _raster_windowed_units(cells, windowing)
     bounds_temporal = (config.bounds or {}).get("temporal")
     if kind == "shard-window":
