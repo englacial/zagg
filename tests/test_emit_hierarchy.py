@@ -9,6 +9,8 @@ the data writes that follow never re-open an array.
 
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
 import pytest
 import zarr
 from pydantic_zarr.experimental.v3 import GroupSpec
@@ -121,26 +123,164 @@ def test_an_occupied_prefix_is_refused_not_overwritten():
             emit_hierarchy(store, spec)
 
 
-def test_the_leaf_writer_writes_through_the_template_handles(monkeypatch):
-    """``emit_shard_nodes`` hands the leaf writer its arrays: no ``open_array`` follows."""
-    import test_processing
+def _companion_leaf(sharded: bool):
+    """A K=16 leaf carrying every writer branch the handle map must cover.
 
+    Dense ``h_min``, a ``resolution: chunk`` scalar companion ``h_anchor``, a
+    per-cell ragged ``h_raw`` and a ``resolution: chunk`` ragged companion
+    ``h_raw_chunk``; every 4th inner chunk empty. Returns ``(grid, shard_key,
+    chunk_results, expected)`` with blocks GLOBAL (the ``process_shard`` sink
+    shape) and ``expected[local] = (h_min, anchor, {cell: payload}, chunk_payload)``.
+    """
+    from mortie import geo2mort
+
+    from zagg.config import PipelineConfig
+
+    cfg = PipelineConfig(
+        data_source={"groups": ["g"]},
+        aggregation={
+            "chunk_precompute": {
+                "chunk_anchor": {"expression": "np.float32(0.0)", "source": "h_li"}
+            },
+            "variables": {
+                "h_min": {"function": "min", "source": "h_li", "dtype": "float32"},
+                "h_anchor": {
+                    "expression": "chunk_anchor",
+                    "source": "h_li",
+                    "resolution": "chunk",
+                    "dtype": "float32",
+                },
+                "h_raw": {
+                    "function": "np.sort",
+                    "source": "h_li",
+                    "kind": "ragged",
+                    "inner_shape": [1],
+                    "dtype": "float32",
+                },
+                "h_raw_chunk": {
+                    "function": "np.sort",
+                    "source": "h_li",
+                    "kind": "ragged",
+                    "resolution": "chunk",
+                    "inner_shape": [1],
+                    "dtype": "float32",
+                },
+            },
+        },
+    )
+    grid = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6, sharded=sharded)
+    shard_key = int(geo2mort(-78.5, -132.0, order=4)[0])
+    shard_block = grid.block_index(shard_key)[0]
+    rng = np.random.default_rng(11)
+    chunk_results: list = []
+    expected: dict = {}
+    for block, _children in grid.iter_chunks(shard_key):
+        local = int(block[0]) - shard_block * grid.chunks_per_shard
+        if local % 4 == 3:
+            chunk_results.append((block, pd.DataFrame(), {}))
+            continue
+        h_min = rng.standard_normal(grid.cells_per_chunk).astype(np.float32)
+        anchor = np.float32(local)
+        carrier = pd.DataFrame(
+            {"h_min": h_min, "h_anchor": np.full(grid.cells_per_chunk, anchor, np.float32)}
+        )
+        cells = sorted(int(c) for c in rng.choice(grid.cells_per_chunk, 2, replace=False))
+        raw = [rng.standard_normal((int(n), 1)).astype(np.float32) for n in (2, 3)]
+        chunk_payload = np.full((local + 1, 1), local, dtype=np.float32)
+        ragged = {"h_raw": (raw, cells), "h_raw_chunk": ([chunk_payload] * 2, cells)}
+        chunk_results.append((block, carrier, ragged))
+        expected[local] = (h_min, anchor, dict(zip(cells, raw)), chunk_payload)
+    return grid, shard_key, chunk_results, expected
+
+
+def _no_reopen(monkeypatch):
     from zagg.processing import write as write_mod
-
-    grid, shard_key, chunk_results, _payloads, dense = test_processing.TestWriteLeafToZarr._setup()
-    store = MemoryStore()
-    nodes = grid.emit_shard_nodes(store, overwrite=True)
-    assert nodes[f"{grid.group_path}/h_min"].shape == (grid.cells_per_shard,)
 
     def no_reopen(*_args, **_kwargs):
         raise AssertionError("the leaf path re-opened an array (issue #657)")
 
     monkeypatch.setattr(write_mod, "open_array", no_reopen)
-    write_mod.write_leaf_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key, arrays=nodes)
-    written = zarr.open_array(store, path=f"{grid.group_path}/h_min", mode="r")[:]
-    for local, values in dense.items():
-        start = local * grid.cells_per_chunk
-        assert written[start : start + grid.cells_per_chunk].tolist() == values.tolist()
+
+
+def _assert_leaf(store, grid, expected):
+    """Every branch's values landed: dense, both companions, the ragged slab."""
+    path = grid.group_path
+    h_min = zarr.open_array(store, path=f"{path}/h_min", mode="r")[:]
+    anchor = zarr.open_array(store, path=f"{path}/h_anchor", mode="r")[:]
+    raw = zarr.open_array(store, path=f"{path}/h_raw", mode="r")[:]
+    raw_chunk = zarr.open_array(store, path=f"{path}/h_raw_chunk", mode="r")[:]
+    n = grid.cells_per_chunk
+    for local, (dense, value, payloads, chunk_payload) in expected.items():
+        np.testing.assert_array_equal(h_min[local * n : (local + 1) * n], dense)
+        assert anchor[local] == value
+        for cell, payload in payloads.items():
+            got = np.frombuffer(raw[local * n + cell], np.float32).reshape(-1, 1)
+            np.testing.assert_array_equal(got, payload)
+        got = np.frombuffer(raw_chunk[local], np.float32).reshape(-1, 1)
+        np.testing.assert_array_equal(got, chunk_payload)
+    assert np.all(np.isnan(anchor[sorted(set(range(grid.chunks_per_shard)) - set(expected))]))
+
+
+@pytest.mark.parametrize("sharded", [True, False], ids=["sharded", "streaming"])
+def test_the_leaf_writers_write_through_the_template_handles(monkeypatch, sharded):
+    """``emit_shard_nodes`` hands every leaf writer its arrays: no ``open_array`` follows.
+
+    Sharded is ``write_leaf_to_zarr``; streaming (the default when
+    ``chunk_inner`` is unset) is ``write_dataframe_to_zarr`` per chunk +
+    ``write_ragged_leaf_to_zarr`` — each with both ``resolution: chunk`` kinds.
+    """
+    from zagg.hive import leaf_block_index
+    from zagg.processing import write as write_mod
+
+    grid, shard_key, chunk_results, expected = _companion_leaf(sharded)
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        nodes = grid.emit_shard_nodes(store, overwrite=True)
+    _no_reopen(monkeypatch)
+    if sharded:
+        write_mod.write_leaf_to_zarr(
+            chunk_results, store, grid=grid, shard_key=shard_key, arrays=nodes
+        )
+    else:
+        ragged_chunks = []
+        for block, carrier, ragged in chunk_results:
+            local = leaf_block_index(grid, block, shard_key)
+            write_mod.write_dataframe_to_zarr(
+                carrier, store, grid=grid, chunk_idx=local, arrays=nodes
+            )
+            ragged_chunks.append((local, ragged))
+        write_mod.write_ragged_leaf_to_zarr(ragged_chunks, store, grid=grid, arrays=nodes)
+    _assert_leaf(store, grid, expected)
+
+
+@pytest.mark.parametrize("sharded", [True, False], ids=["sharded", "streaming"])
+def test_the_hive_leaf_write_never_reopens_an_array(monkeypatch, tmp_path, sharded):
+    """``process_and_write_hive`` threads the template's map to every writer (issue #657)."""
+    from zarr.storage import LocalStore
+
+    import zagg.processing as processing
+    from zagg import hive
+
+    grid, shard_key, chunk_results, expected = _companion_leaf(sharded)
+    hive.ensure_manifest(str(tmp_path), hive.build_manifest(grid, dataset={"short_name": "T"}))
+
+    def fake(g, key, urls, **kwargs):
+        for entry in chunk_results:
+            if kwargs.get("write_chunk") is not None:
+                kwargs["write_chunk"](*entry)
+            else:
+                kwargs["chunk_results"].append(entry)
+        kwargs["occupied_out"].append(np.zeros(0, dtype=np.uint64))
+        return pd.DataFrame(), {"shard_key": int(key), "error": None, "total_obs": 1}
+
+    monkeypatch.setattr(processing, "process_shard", fake)
+    _no_reopen(monkeypatch)
+    meta = hive.process_and_write_hive(
+        shard_key, ["s3://fixture/a.h5"], grid, {}, str(tmp_path), grid.config, store_kwargs={}
+    )
+    assert meta.get("error") is None, meta
+    leaf = tmp_path / hive.shard_leaf_path("", shard_key).lstrip("/")
+    _assert_leaf(LocalStore(str(leaf)), grid, expected)
 
 
 def test_a_path_missing_from_the_handle_map_raises_not_reopens(monkeypatch):
