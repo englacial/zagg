@@ -2003,7 +2003,9 @@ class _LeafUnit:
             # trade stops being acceptable; it is not taken here because D4 makes
             # "replaced wholesale" the contract and a stamp must never block a
             # retry.
-            self.grid.emit_shard_template(store, overwrite=True, cell_coordinate=not self.omit)
+            self.box["arrays"] = self.grid.emit_shard_nodes(
+                store, overwrite=True, cell_coordinate=not self.omit
+            )
             self.box["store"] = store
         return self.box["store"]
 
@@ -2018,6 +2020,7 @@ class _LeafUnit:
             chunk_idx=local,
             staged_out=self.staged,
             omit=self.omit,
+            arrays=self.box.get("arrays"),
         )
         if ragged:
             self.ragged_chunks.append((local, ragged))
@@ -2084,6 +2087,7 @@ class _LeafUnit:
                 shard_key=int(shard_key),
                 staged_out=staged,
                 omit=self.omit,
+                arrays=box.get("arrays"),
             )
             self.write_elapsed += time.time() - _t0
         # Stamp ONLY a fully-written leaf: an errored shard (or one that
@@ -2098,7 +2102,11 @@ class _LeafUnit:
             _t0 = time.time()
             if not self.sharded:
                 write_ragged_leaf_to_zarr(
-                    self.ragged_chunks, box["store"], grid=grid, staged_out=staged
+                    self.ragged_chunks,
+                    box["store"],
+                    grid=grid,
+                    staged_out=staged,
+                    arrays=box.get("arrays"),
                 )
             self.write_elapsed += time.time() - _t0
             # O11 content hashes (issue #342, spec §5): computed in-worker at

@@ -87,3 +87,25 @@ def test_an_occupied_prefix_is_refused_not_overwritten():
         emit_hierarchy(store, spec)
         with pytest.raises(ContainsGroupError):
             emit_hierarchy(store, spec)
+
+
+def test_the_leaf_writer_writes_through_the_template_handles(monkeypatch):
+    """``emit_shard_nodes`` hands the leaf writer its arrays: no ``open_array`` follows."""
+    import test_processing
+
+    from zagg.processing import write as write_mod
+
+    grid, shard_key, chunk_results, _payloads, dense = test_processing.TestWriteLeafToZarr._setup()
+    store = MemoryStore()
+    nodes = grid.emit_shard_nodes(store, overwrite=True)
+    assert nodes[f"{grid.group_path}/h_min"].shape == (grid.cells_per_shard,)
+
+    def no_reopen(*_args, **_kwargs):
+        raise AssertionError("the leaf path re-opened an array (issue #657)")
+
+    monkeypatch.setattr(write_mod, "open_array", no_reopen)
+    write_mod.write_leaf_to_zarr(chunk_results, store, grid=grid, shard_key=shard_key, arrays=nodes)
+    written = zarr.open_array(store, path=f"{grid.group_path}/h_min", mode="r")[:]
+    for local, values in dense.items():
+        start = local * grid.cells_per_chunk
+        assert written[start : start + grid.cells_per_chunk].tolist() == values.tolist()

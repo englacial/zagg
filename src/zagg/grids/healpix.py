@@ -22,6 +22,7 @@ from zagg.grids.base import (
     InconsistentShardError,
     apply_field_attrs,
     chunk_array_spec,
+    emit_hierarchy,
     ragged_array_spec,
     ragged_locations_name,
     ragged_times_name,
@@ -615,6 +616,21 @@ class HealpixGrid:
         prefix_store``), which is what makes a name-prefix twin like
         ``<leaf>.status`` safe rather than merely unlikely.
         """
+        self.emit_shard_nodes(store, overwrite=overwrite, cell_coordinate=cell_coordinate)
+        return store
+
+    def emit_shard_nodes(
+        self, store: Store, *, overwrite: bool = False, cell_coordinate: bool = True
+    ) -> dict:
+        """:meth:`emit_shard_template`, returning the ``{path: handle}`` map it created.
+
+        The leaf template is ONE ``create_hierarchy`` pass
+        (:func:`zagg.grids.base.emit_hierarchy`, issue #657) and the leaf
+        writers write through the handles it returns, so no array is
+        re-opened on the data path. ``overwrite`` clears the prefix first (the
+        issue #341 semantics documented on :meth:`emit_shard_template`); an
+        occupied prefix without it raises.
+        """
         spec = GroupSpec(
             members={self.group_path: self.shard_spec(cell_coordinate=cell_coordinate)},
             attributes={},
@@ -626,8 +642,7 @@ class HealpixGrid:
                 from zarr.core.sync import sync
 
                 sync(store.delete_dir(""))
-            spec.to_zarr(store, "", overwrite=overwrite)
-        return store
+            return emit_hierarchy(store, spec)
 
     def spec(self) -> GroupSpec:
         """Return the pydantic-zarr GroupSpec for this grid's template."""
