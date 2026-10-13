@@ -16,6 +16,7 @@ from zagg.dispatch_guard import (
     DispatchGuard,
     FixedWindow,
     GuardConfig,
+    _classify_fallback,
     classify_result,
 )
 
@@ -220,6 +221,24 @@ class TestBreaker:
     def test_transient_error_strings_do_not_count(self, error):
         g = _feed(_guard(), [_failed(error=error)] * 10)
         assert g.tripped is None
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            # PR #658's own string cases, so the fallback cannot drift from it.
+            ("HTTP status client error (403 Forbidden) for url", "store-fatal"),
+            ("Client error with status 400 Bad Request: no body", "store-fatal"),
+            ("AccessDenied: no s3:PutObject", "store-fatal"),
+            ("Client error with status 400 Bad Request: <Code>RequestTimeout</Code>", "transient"),
+            ("Generic S3 error: Error parsing response", "store-fatal"),
+            ("ValueError: cannot replace it in place (spec §1.5)", "store-fatal"),
+            ("error decoding response body: failed to parse XML", "store-fatal"),
+            ("Too Many Requests", "transient"),
+            ("No granules found", "benign"),
+        ],
+    )
+    def test_the_fallback_mirrors_the_658_string_path(self, error, expected):
+        assert _classify_fallback(error) == expected
 
     def test_a_trip_is_sticky_and_records_keep_counting(self):
         g = _feed(_guard(), [_ok()] * 39 + [_timeout()] * 11)

@@ -49,24 +49,36 @@ from zagg.dispatch import BENIGN_ERRORS
 #: The worker's own store-error classifier and its fatal class (issue #651,
 #: PR #658) once they are on main; the fallback below until then.
 #: TODO(#658): drop ``_classify_fallback`` when ``zagg.dispatch`` carries
-#: ``classify_store_error`` -- it mirrors that classifier's string rules
-#: (status, S3 code, refusal tokens) minus the exception-type and credential
-#: checks, which need the exception object a status string no longer has.
+#: ``classify_store_error`` -- it mirrors that classifier's string path
+#: (benign, credentials, S3 code, status, refusal tokens) verbatim, dropping
+#: only the exception-type / ``from``-chain checks a status string has no
+#: object for.
 STORE_FATAL: str = getattr(_dispatch, "STORE_FATAL", "store-fatal")
 _STATUS_RE = re.compile(r"(?:status(?: code)?|http|error)\W{0,3}([45]\d\d)\b", re.I)
-_TRANSIENT_TOKENS = ("requesttimeout", "slowdown", "internalerror", "serviceunavailable")
+_TRANSIENT_TOKENS = (
+    "requesttimeout",
+    "slowdown",
+    "internalerror",
+    "serviceunavailable",
+    "too many requests",
+)
 _FATAL_TOKENS = (
     "got invalid",
     "malformed",
+    "error parsing",
+    "failed to parse",
     "bad request",
     "invalidargument",
+    "invalid argument",
     "nosuchbucket",
+    "no such bucket",
     "nosuchkey",
     "permission denied",
     "unauthenticated",
     "forbidden",
     "refusing to",
     "gate refused",
+    "spec §",
 )
 
 
@@ -74,6 +86,10 @@ def _classify_fallback(error) -> str:
     text = str(error) if error is not None else ""
     if text in BENIGN_ERRORS:
         return "benign"
+    from zagg.processing.worker import is_auth_failure  # lazy: keep this module light
+
+    if is_auth_failure(Exception(text)):
+        return STORE_FATAL
     low = text.lower()
     if any(t in low for t in _TRANSIENT_TOKENS):
         return "transient"
