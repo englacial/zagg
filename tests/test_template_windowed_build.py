@@ -162,9 +162,18 @@ def test_the_icechunk_repo_holds_one_row_per_window_plus_all(built):
     assert block["rows_per_manifest"] == 1
 
 
-def test_pyramid_check_passes(built):
+@pytest.fixture(scope="module")
+def report(built):
+    """One full-mode ``validate_pyramid`` per template, for the two tests that
+    read it: the walk is the slowest thing in this file and both want the same
+    store in the same state. Read-only -- neither test mutates the report -- so
+    sharing it couples nothing and can hide no failure.
+    """
+    return validate_pyramid(str(built[2]), full=True)
+
+
+def test_pyramid_check_passes(built, report):
     name, cfg, root, shards = built
-    report = validate_pyramid(str(root), full=True)
     # ``passed`` tolerates a skip; the value legs must actually run.
     for check in ("materialization", "columns", "readback", "counts", "digests"):
         assert report["checks"][check]["status"] == "pass", format_report(report)
@@ -197,11 +206,12 @@ def test_pyramid_check_passes(built):
     "levels have no all-time member and the issue #650 all_time leg fails by leaf. Flips to "
     "PASS when the shard-level close of #649 lands — delete the marker then.",
 )
-def test_the_all_time_leg_fails_until_649(built):
-    name, cfg, root, shards = built
-    report = validate_pyramid(str(root), full=True)
+def test_the_all_time_leg_fails_until_649(report):
+    # Only the leg the reason names. ``passed`` would widen the flip
+    # condition: if #649 landed while some other leg was red this would stay
+    # xfailed and the marker undeleted. "No other leg is red" is
+    # ``test_pyramid_check_passes``'s job, and it asserts it by name.
     assert report["checks"]["all_time"]["status"] == "pass", format_report(report)
-    assert report["passed"], format_report(report)
 
 
 #: Per-shard leaf ``count`` totals by year, from the fixture: each granule
