@@ -123,6 +123,17 @@ def test_an_occupied_prefix_is_refused_not_overwritten():
             emit_hierarchy(store, spec)
 
 
+def test_emit_shard_template_refuses_an_occupied_prefix_without_overwrite():
+    """``to_zarr`` accepted an identical template here; the one pass raises (issue #657)."""
+    grid, _spec = _leaf_spec()
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        grid.emit_shard_template(store)
+        with pytest.raises(ContainsGroupError):
+            grid.emit_shard_template(store)
+        grid.emit_shard_template(store, overwrite=True)
+
+
 def _companion_leaf(sharded: bool):
     """A K=16 leaf carrying every writer branch the handle map must cover.
 
