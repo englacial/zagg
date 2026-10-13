@@ -900,12 +900,9 @@ class RasterStrategy:
             "credentials": output_credentials,
             "endpoint_url": resolved_endpoint,
         }
-        # Temporal fan-out (issue #247): one work unit per (shard, window),
-        # membership decided at dispatch from the acquisitions' STAC
-        # datetimes. None (schedule none/absent) keeps the (shard, records)
-        # pairs — one bare leaf per shard carrying the full time axis (D13).
-        # Above the backend split, so the fan-out cannot drift between them;
-        # ``_expand_units`` is shared with the preview too (issue #648).
+        # Temporal fan-out (issue #247), per ``_expand_units``. Above the
+        # backend split, so the fan-out cannot drift between them; the helper
+        # is shared with the preview too (issue #648).
         cells = _expand_units(cells, config)
 
         if backend == "lambda":
