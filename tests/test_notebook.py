@@ -340,14 +340,14 @@ class TestMaxCostPreview:
         from zagg import hive, runner
         from zagg.processing import raster as raster_mod
 
-        class _Reached(Exception):
+        class _ExpansionReachedError(Exception):
             pass
 
         seen = []
 
         def _sentinel(cells, config):
             seen.append(list(cells))
-            raise _Reached
+            raise _ExpansionReachedError
 
         monkeypatch.setattr(runner, "_expand_units", _sentinel)
         _lambda_dispatch_env(monkeypatch)
@@ -370,7 +370,7 @@ class TestMaxCostPreview:
             ),
         }
         for name, drive in drives.items():
-            with pytest.raises(_Reached):
+            with pytest.raises(_ExpansionReachedError):
                 drive()
             assert len(seen) == 1, name
             assert len(seen.pop()) == 4, name  # the run's selected cells, unexpanded
