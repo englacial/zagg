@@ -220,6 +220,17 @@ examples:
         # The Event fan-out's ramp steps and any breaker trip (issue #652).
         for line in describe(results.get("ramp"), results.get("breaker")):
             print(line)
+        # The tail's verdict (issue #610): a run whose rollup sweep did not
+        # complete exits 0 by design — the rollups are regenerable caches (D9)
+        # — so the shortfall has to be on the operator's last screen, not in
+        # the log alone. The v3 California run printed nothing at all.
+        if short := results.get("tail_sweep_short"):
+            for reason in short:
+                print(f"  TAIL SHORT: {reason}")
+            print(
+                "  Regenerate with `python -m zagg.sweep <store>` and, for the ladder, "
+                "`python -m zagg.sweep <store> --stages --scope <subtree>`"
+            )
         print(f"Output: {results['store_path']}")
 
 

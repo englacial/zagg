@@ -700,16 +700,22 @@ windows serially.
 
 #### Which function the stage invokes go to
 
-The staged tail runs on its **own tier**: the 8,192 MB / 10 GB-`/tmp` variant
-of the run's function family (`process-shard-8192-disk` for the default
-stack), resolved by `runner._resolve_stage_function_name` — the run's
-function with its `-<memory>[-disk]` suffix replaced, or
-`ZAGG_LAMBDA_STAGE_FUNCTION_NAME` verbatim when set. It is the interim ruled
-on issue #586 (2026-09-26): the 0.55 fleet's order-6 stage died at the 4 GB
-cap on 64 unwindowed leaves. The fold is now streamed block by block
-(`zagg.sweep_fold` — a worker holds one block of inputs, not a level), and
-the tier stays until that has been measured on the fleet; stage nodes sit at
-order 6 and coarser, so the larger function is a small share of a run. The
+The staged tail runs on the **leaf tier**: the 4,096 MB / 10 GB-`/tmp`
+variant of the run's function family (`process-shard-4096-disk` for the
+default stack, `runner.STAGE_SWEEP_WORKER`), resolved by
+`runner._resolve_stage_function_name` — the run's function with its
+`-<memory>[-disk]` suffix replaced, or `ZAGG_LAMBDA_STAGE_FUNCTION_NAME`
+verbatim when set. From PR #587 to issue #659 it was the 8,192 MB variant:
+the stopgap ruled on issue #586 (2026-09-26) after the 0.55 fleet's order-6
+stage died at the 4 GB cap on 64 unwindowed leaves, when the fold densified
+a whole level of the node in memory. The fold is now streamed block by block
+(`zagg.sweep_fold` — a worker holds one block of inputs, not a level) and
+the schedule is sized (width 2, issue #639), and the measurement retired the
+stopgap: the 2,093 stage invokes of the 2026-10-12 v4 build peaked at 290 MB
+p99 / 2,926 MB max, none over 4 GB
+([issue #659](https://github.com/englacial/zagg/issues/659)). That build
+swept 798 of 2,726 shards, so the max (the order-0/1 close) grows with a
+full store; 4 GB leaves headroom over it. The
 dispatcher's role must be allowed to invoke that function. Both dispatchers
 resolve it the same way — `python -m zagg` (`runner._run_lambda`) and the
 `zagg.client` facade's tail — from the run's own resolved function name
@@ -818,7 +824,7 @@ from zagg.sweep_fleet import run_stage_sweep_fleet
 
 summary = run_stage_sweep_fleet(
     boto3.client("lambda"),
-    "process-shard-8192-disk",  # the STAGE tier of runner.DEFAULT_FUNCTION_NAME's family
+    "process-shard-4096-disk",  # the STAGE tier of runner.DEFAULT_FUNCTION_NAME's family
     "s3://bucket/prefix.zarr",
     leaves,                    # [(shard_key, window), ...]
     shard_order=6,
@@ -971,7 +977,8 @@ exists to avoid.
     that sees each tuple finish; its barrier waits are bounded by a total
     budget. Both legs are fail-open (D9) — a refused lease, a lost invoke or
     an expired barrier costs one later `python -m zagg.sweep` (or
-    `--stages`) pass, never a wrong answer. A dispatcher
+    `--stages`) pass, never a wrong answer — and each is REPORTED, so
+    "fail-open" never means "unsaid" (`tail_sweep_short`, below). A dispatcher
     killed mid-barrier leaves the run's lease held until its TTL expires into
     claimability, which is the lease's designed recovery.
 
@@ -1041,9 +1048,25 @@ the idempotent store-manifest backstop and the root `coverage.moc`), fires:
 | End-of-run step | What lands | If the launcher dies before it |
 |---|---|---|
 | 1. run record | `stats_<ts>_<run_id>.parquet` at the store root, then the marker `<store>.status/run-<run_id>/tail.json` | the leaves exist but no run record names them, and the hand sweeps below find their work in the run records |
-| 2. rollup sweep (only when the run walks **no** `/2` ladder — the `/1` retrofit regime; any other `/2` run's families ride step 3 and this step is not fired, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4) | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
-| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits — and, when the run walks the `/2` ladder (the tail then passes `families=zagg.sweep_families.CASCADE_FAMILIES`, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4), the rollup families riding the same walk, folded in each node's close and composed into the §10 root section by this run's own finisher, in place of step 2 (a windowed store always has the node close they ride — `pyramid.all_time` is required on a windowed config — and the dispatcher's `families_unswept` report is left for a store whose manifest withdrew the fold) — over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
+| 2. rollup sweep (only when the run walks **no** `/2` ladder — the `/1` retrofit regime; any other `/2` run's families ride step 3 and this step is not fired, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4) | the rollup families: `4^k` partition invokes sized from the run's leaf count, then the finisher — handed the partition records' names, it composes the root `coverage.moc`/`coverage.toc` from the accumulators they carry and reads no leaf for `stats`/`moc`/`submap` (the `/1` `overview` fold still opens its leaves); each lands its `sweep_stats_<ts>[_p<i>of<n>].json` record at the store root (what `python -m zagg.sweep` and this runbook read) and a copy as `families-p<i>of<n>.json` / `families-finisher.json` under `<store>.status/run-<run_id>/` — the dispatcher awaits those copies and reports `families_sweep: {partitions, fired, landed, finisher, accumulators, run_id, records_from, duration_s}` on the summary and the handle ([issue #610](https://github.com/englacial/zagg/issues/610)) — a pass that was fired and failed to dispatch reports `finisher: "dispatch_failed"` with `fired: 0`, never a bare `None`, which is reserved for the three ways a run needs no pass (no leaf, the families rode step 3, a flat store) | partitions already invoked finish; the finisher never fires and the root `coverage.moc`/`coverage.toc` stay as they were: `python -m zagg.sweep <store>` regenerates them |
+| 3. staged sweep (`output.sweep: "stages"` only) | the ladder and its Icechunk node commits — and, when the run walks the `/2` ladder (the tail then passes `families=zagg.sweep_families.CASCADE_FAMILIES`, [issue #610](https://github.com/englacial/zagg/issues/610) phase 4), the rollup families riding the same walk, folded in each node's close and composed into the §10 root section by this run's own finisher, in place of step 2 (a windowed store always has the node close they ride — `pyramid.all_time` is required on a windowed config — and the dispatcher's `families_unswept` report is left for a store whose manifest withdrew the fold) — over a schedule **sized to the per-invoke fold** so no dispatch node folds more than `STAGE_TARGET_NODES` nodes — one invoke's own fold is that times the dispatch nodes it is handed, which is 1 at the tail's default ([issue #610](https://github.com/englacial/zagg/issues/610)); any tuple short a unit record has its orders named to the finisher as `short_orders`, whose manifest actuals are then withheld rather than stamped; the dispatcher's whole summary rides the run summary and the handle as `stage_sweep` ([issue #610](https://github.com/englacial/zagg/issues/610)), so `barrier_timed_out` and `short_orders` outlive the dispatcher's log; last, the finisher releases the lease, then `sweep_stats_<ts>_stages.json` lands at the store root | nodes already invoked finish; later tuples and the finisher never fire, no record lands, and `sweep.lease.json` stays held until 900 s (its default TTL) past its last heartbeat |
 | 4. Icechunk finalize | the `finalize <run_id>` commit and the tag `run-<run_id>` | the run is untagged |
+
+!!! tip "What the run itself says about its tail"
+    Both sweep legs report, and neither is swallowed
+    ([issue #610](https://github.com/englacial/zagg/issues/610)). The run
+    summary and `client.RunHandle` carry `families_sweep` (step 2) and
+    `stage_sweep` (step 3) in full, plus one verdict over the two:
+
+    `tail_sweep_short` — a list with one reason per shortfall, `[]` when the
+    tail left nothing short. A families pass that did not dispatch or landed
+    no record, a staged sweep whose barrier expired or whose finisher never
+    landed, and orders whose manifest actuals were **withheld** each name
+    themselves there; the tail logs the same reasons as one warning, and
+    `python -m zagg` prints them as `TAIL SHORT:` lines with the
+    regeneration commands. A short tail still exits 0 — the rollups are
+    regenerable caches (D9) — so the verdict is the signal to re-run the
+    hand sweeps below, not the exit code.
 
 Shards the launcher had not dispatched yet never run. Work through the steps
 below from a host in the store's region: they read status objects and, for the

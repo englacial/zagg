@@ -230,6 +230,8 @@ class TestMaxCostPreview:
         )
         preview = notebook.max_cost_preview(cfg, SHARDMAP)
         assert preview["n_units"] == 4
+        # Flat raster tail: ping + raster setup + run stats.
+        assert preview["legs"]["tail"]["invokes"] == 3
 
     def test_windowed_raster_uses_raster_units(self, monkeypatch):
         # A windowed hive raster mirrors RasterStrategy.run: the (shard, window)
@@ -241,8 +243,14 @@ class TestMaxCostPreview:
         cfg.data_source["reader"] = "raster"
         cfg.output["store_layout"] = "hive"
         cfg.output["windowing"] = {"schedule": "monthly"}
+        # Shaped like the real (shard, records, window) units: the preview
+        # reads the families leg's leaf refs off them (issue #660).
         monkeypatch.setattr(
-            runner, "_raster_windowed_units", lambda cells, windowing: [object()] * 7
+            runner,
+            "_raster_windowed_units",
+            lambda cells, windowing: [
+                (cells[0][0], [], {"label": f"2020-{m:02d}"}) for m in range(1, 8)
+            ],
         )
         monkeypatch.setattr(
             runner,
@@ -251,6 +259,11 @@ class TestMaxCostPreview:
         )
         preview = notebook.max_cost_preview(cfg, SHARDMAP)
         assert preview["n_units"] == 7
+        # Hive raster tail: ping + setup + finalize + run stats + coverage.moc;
+        # no Icechunk and no staged sweep on the raster path.
+        assert preview["legs"]["tail"]["invokes"] == 5
+        cfg.output["coverage_moc"] = False
+        assert notebook.max_cost_preview(cfg, SHARDMAP)["legs"]["tail"]["invokes"] == 4
 
     def test_unvalidated_flat_windowed_raster_counts_selected_cells(self):
         # The raster arm's non-hive branch (issue #648 fold): windowing is
@@ -374,6 +387,204 @@ class TestMaxCostPreview:
                 drive()
             assert len(seen) == 1, name
             assert len(seen.pop()) == 4, name  # the run's selected cells, unexpanded
+
+
+def _synthetic_shardmap(tmp_path, decimals, years):
+    """A Phase-5 ShardMap of order-9 shards (D1 decimals) whose granules span ``years``."""
+    import json
+
+    from zagg.grids.morton import morton_word
+
+    granules = [
+        {
+            "id": f"ATL03_{year}0601000000_00000000_007_01.h5",
+            "s3": f"s3://bucket/{year}/g.h5",
+            "https": f"https://host/{year}/g.h5",
+            "time_start": f"{year}-06-01T00:00:00Z",
+            "time_end": f"{year}-06-01T01:00:00Z",
+        }
+        for year in years
+    ]
+    path = tmp_path / "sm.json"
+    path.write_text(
+        json.dumps(
+            {
+                "grid_signature": {
+                    "type": "healpix",
+                    "indexing_scheme": "nested",
+                    "parent_order": 9,
+                    "child_order": 19,
+                    "layout": "fullsphere",
+                },
+                "shard_keys": [morton_word(d) for d in decimals],
+                "granules": [list(granules) for _d in decimals],
+                "metadata": {},
+            }
+        )
+    )
+    return str(path)
+
+
+# Five order-9 shards: three under one order-8 parent, two under another, and
+# the two parents under different order-7 nodes (43314222, 43314224) -- so the
+# sized schedule (dispatch orders 7, 5, 3, 1, 0) has 2 dispatch nodes at order
+# 7 and 1 at each coarser order.
+_DECIMALS = ["4331422231", "4331422232", "4331422233", "4331422411", "4331422412"]
+
+
+def _expected_stage_invokes(decimals, per_node):
+    """Ancestor count at each sized tuple's dispatch order x ``per_node``, by hand."""
+    from zagg.sweep_partition import sized_stage_tuples
+
+    return sum(
+        len({d[: 1 + int(st["dispatch"])] for d in decimals}) * per_node
+        for st in sized_stage_tuples(9)
+    )
+
+
+class TestCostLegs:
+    """The per-leg preview (issue #660): stage invokes from the sized ladder, two columns."""
+
+    def test_windowed_stage_invokes_are_nodes_times_windows_plus_close(self, tmp_path):
+        cfg = default_config("atl03_tdigest_strata_healpix")  # yearly windows, sweep: stages
+        preview = notebook.max_cost_preview(
+            cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019, 2020, 2021))
+        )
+        stage = preview["legs"]["stage"]
+        # 3 windows + 1 close per dispatch node, over 2 + 1 + 1 + 1 + 1 nodes
+        # (dispatch orders 7, 5, 3, 1, 0) = 24.
+        assert stage["invokes"] == _expected_stage_invokes(_DECIMALS, 3 + 1) == 24
+        assert preview["n_units"] == preview["legs"]["leaves"]["invokes"] == 5
+        # The stage tier is the dispatcher's (issue #659: the leaf tier).
+        from zagg import runner
+
+        assert stage["memory_gb"] == runner.STAGE_SWEEP_WORKER["memory"] / 1024.0 == 4.0
+        # The rollup families ride the node closes, so no separate pass.
+        assert preview["legs"]["families"]["invokes"] == 0
+        # ping + setup + finalize backstop + run stats + coverage.moc (on by
+        # default for hive) + icechunk init/finalize + stage finisher.
+        assert preview["legs"]["tail"]["invokes"] == 8
+
+    def test_unwindowed_stage_invokes_are_one_per_node(self, tmp_path):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        del cfg.output["windowing"]
+        preview = notebook.max_cost_preview(cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019,)))
+        assert preview["legs"]["stage"]["invokes"] == _expected_stage_invokes(_DECIMALS, 1) == 6
+
+    def test_stage_count_matches_the_dispatcher_enumeration(self, tmp_path):
+        # The same parts the fleet dispatcher walks, spelled independently:
+        # sized tuples -> dispatch nodes -> stage units, one invoke each.
+        from zagg.grids.morton import morton_word
+        from zagg.sweep_fleet import dispatch_nodes
+        from zagg.sweep_partition import sized_stage_tuples
+        from zagg.sweep_units import stage_units
+
+        by_shard = {d: {"2019", "2020"} for d in _DECIMALS}
+        expected = 0
+        for st in sized_stage_tuples(9):
+            nodes = dispatch_nodes(by_shard, st["dispatch"])
+            for unit in stage_units(
+                by_shard, st["dispatch"], windowed=True, all_time=True, candidates=nodes
+            ):
+                expected += len(unit["windows"]) + int(unit["close"])
+        leaves = [(morton_word(d), w) for d in _DECIMALS for w in ("2019", "2020")]
+        assert notebook.stage_invokes(leaves, 9, windowed=True, all_time=True) == expected == 18
+
+    def test_top_level_keys_are_unchanged_and_leaf_scoped(self):
+        cfg = default_config("atl06")
+        preview = notebook.max_cost_preview(cfg, SHARDMAP)
+        assert set(_preview_stub()) <= set(preview)
+        assert {"legs", "typical_s", "ceiling_usd", "expected_usd"} <= set(preview)
+        assert set(preview["legs"]) == {"leaves", "stage", "families", "tail"}
+        assert preview["max_cost_usd"] == preview["legs"]["leaves"]["ceiling_usd"]
+        for leg in preview["legs"].values():
+            assert set(leg) == {"invokes", "memory_gb", "ceiling_usd", "expected_usd"}
+
+    def test_expected_never_exceeds_ceiling_and_totals_are_sums(self, tmp_path):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        preview = notebook.max_cost_preview(
+            cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019, 2020)), typical_s={"tail": 1e9}
+        )
+        legs = preview["legs"].values()
+        for leg in legs:
+            assert leg["expected_usd"] <= leg["ceiling_usd"]
+        assert preview["ceiling_usd"] == pytest.approx(sum(leg["ceiling_usd"] for leg in legs))
+        assert preview["expected_usd"] == pytest.approx(sum(leg["expected_usd"] for leg in legs))
+        # A typical past the wall is clamped to it: the tail's expected IS its ceiling.
+        tail = preview["legs"]["tail"]
+        assert tail["expected_usd"] == pytest.approx(tail["ceiling_usd"])
+
+    def test_typical_override_moves_only_expected(self, tmp_path):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        path = _synthetic_shardmap(tmp_path, _DECIMALS, (2019, 2020))
+        base = notebook.max_cost_preview(cfg, path)
+        faster = notebook.max_cost_preview(cfg, path, typical_s={"stage": 15.0})
+        assert faster["legs"]["stage"]["ceiling_usd"] == base["legs"]["stage"]["ceiling_usd"]
+        assert faster["legs"]["stage"]["expected_usd"] == pytest.approx(
+            base["legs"]["stage"]["expected_usd"] / 2
+        )
+        assert faster["typical_s"]["stage"] == 15.0 and faster["typical_s"]["leaves"] == 700.0
+
+    def test_flat_store_prices_leaves_and_tail_only(self):
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "flat"
+        preview = notebook.max_cost_preview(cfg, SHARDMAP)
+        assert preview["legs"]["stage"]["invokes"] == 0
+        assert preview["legs"]["families"]["invokes"] == 0
+        # No ping on flat: sync setup + run stats; finalize only to consolidate.
+        assert preview["legs"]["tail"]["invokes"] == 2
+        cfg.output["consolidate_metadata"] = True
+        assert notebook.max_cost_preview(cfg, SHARDMAP)["legs"]["tail"]["invokes"] == 3
+
+    def test_families_mode_fires_the_separate_pass(self, tmp_path):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        cfg.output["sweep"] = "families"
+        preview = notebook.max_cost_preview(cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019,)))
+        assert preview["legs"]["stage"]["invokes"] == 0
+        # One partition for a work set under FAMILIES_TARGET_LEAVES: that pass IS the finisher.
+        assert preview["legs"]["families"]["invokes"] == 1
+
+    def test_families_split_fires_non_empty_buckets_plus_finisher(self, tmp_path):
+        from zagg.sweep_partition import FAMILIES_TARGET_LEAVES
+
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        cfg.output["sweep"] = "families"
+        years = range(1990, 2020)  # 5 shards x 30 yearly windows = 150 leaves
+        assert len(_DECIMALS) * len(years) > FAMILIES_TARGET_LEAVES
+        preview = notebook.max_cost_preview(cfg, _synthetic_shardmap(tmp_path, _DECIMALS, years))
+        # The split refines to order 7 (4**7 partitions), where only the two
+        # order-7 ancestors' buckets are non-empty (90 and 60 leaves): 2 + finisher.
+        assert preview["legs"]["families"]["invokes"] == 2 + 1
+
+    def test_table_prints_both_columns_per_leg_and_total(self, tmp_path):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        preview = notebook.max_cost_preview(
+            cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019, 2020))
+        )
+        text = notebook.format_cost_legs(preview)
+        lines = text.splitlines()
+        assert "ceiling" in lines[1] and "expected" in lines[1]
+        stage_line = next(line for line in lines if line.strip().startswith("staged sweep"))
+        assert f"${preview['legs']['stage']['ceiling_usd']:.2f}" in stage_line
+        assert f"${preview['legs']['stage']['expected_usd']:.2f}" in stage_line
+        assert "30s" in stage_line
+        total_line = next(line for line in lines if line.strip().startswith("total"))
+        assert f"${preview['ceiling_usd']:.2f}" in total_line
+        assert lines[-1].startswith(f"Max cost ceiling: ~${preview['ceiling_usd']:.2f}")
+        # A pre-#660 preview (no legs) still prints the one-liner.
+        assert notebook.format_cost_legs(_preview_stub()) == notebook.format_max_cost(
+            _preview_stub()
+        )
+
+    def test_gate_prints_the_table_and_blocks_on_the_ceiling_total(self, tmp_path, capsys):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        preview = notebook.max_cost_preview(
+            cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019, 2020))
+        )
+        assert notebook.confirm_max_cost(preview, prompt=lambda q: "") is False
+        out = capsys.readouterr().out
+        assert "staged sweep" in out and "expected" in out
+        assert f"Max cost ceiling: ~${preview['ceiling_usd']:.2f}" in out
 
 
 class TestProgressFactory:
