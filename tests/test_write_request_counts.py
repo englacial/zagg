@@ -215,6 +215,7 @@ def _manifest(root: Path, prefixes) -> dict[str, str]:
     out = {}
     for leaf, column in prefixes.values():
         runs = [d for d in os.listdir(leaf) if d.startswith("run-")]
+        assert len(runs) == 1, (leaf, runs)  # a second run would collide on <version>
         for prefix in (leaf, column):
             for dirpath, _dirs, files in os.walk(prefix):
                 for name in files:
