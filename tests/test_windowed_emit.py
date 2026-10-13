@@ -774,13 +774,14 @@ class TestBulkEndToEnd:
         fakes = {**_fakes(), "s3://bucket/granuleA.h5": _h5([400.0, 401.0, 402.0])}
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"), fakes=fakes)
         assert [m["error"] for m in meta["windows"]] == ["No data after filtering", None, None]
-        assert meta["error"] is None and meta["total_obs"] == 11
+        assert [m.get("error_class") for m in meta["windows"]] == ["benign", None, None]
+        assert meta["error"] is None and "error_class" not in meta and meta["total_obs"] == 11
         # Every written window benign: the bare string, so the shard is no_data.
         far = {u: _h5([400.0]) for u in _fakes()}
         for h in far.values():
             h._arrays["/lat"] = np.full(1, 10.0)
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "far"), fakes=far)
-        assert meta["error"] in BENIGN_ERRORS
+        assert meta["error"] in BENIGN_ERRORS and meta["error_class"] == "benign"
 
     def test_one_window_failing_keeps_the_landed_windows(self, monkeypatch, tmp_path):
         # Review finding (4): a raise in one window's finish is that window's
@@ -800,11 +801,64 @@ class TestBulkEndToEnd:
         meta = _run_bulk(monkeypatch, _cfg(), root)
         assert [m["error"] for m in meta["windows"]] == [None, "RuntimeError: PUT failed", None]
         assert meta["error"] == "window 2019: RuntimeError: PUT failed"
+        # An error the classifier cannot name stays transient: isolated, and
+        # the shard goes on (issue #651 keeps this contract).
+        assert [m.get("error_class") for m in meta["windows"]] == [None, "transient", None]
+        assert meta["error_class"] == "transient" and "windows_unattempted" not in meta
         assert meta["total_obs"] == 7  # 2018 + 2020; the failed window counts nothing
         grid = _grid(_cfg())
         assert [_leaf_obs(root, _shard_word(), w, grid) for w in ("2018", "2020")] == [1, 6]
         rec = build_record(shard_key=_shard_word(), metadata=meta["windows"][1], window="2019")
         assert rec["success"] is False and rec["unit_windows"] == 3
+
+    def test_a_store_fatal_window_ends_the_shard(self, monkeypatch, tmp_path):
+        # Issue #651: a refusal the store would repeat for every window ends
+        # the invoke at the window that hit it -- recorded like any window
+        # failure, then raised through the loop, so the windows after it are
+        # never aggregated (no leaf, no column, no refs) and the windows
+        # before it keep their stamps.
+        from obstore.exceptions import GenericError
+
+        finish, seen = hive._LeafUnit.finish, []
+
+        def _refused(self, metadata):
+            seen.append(self.label)
+            if self.label == "2019":
+                raise GenericError("Generic S3 error: Got invalid DeleteObjects response: EOF")
+            return finish(self, metadata)
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _refused)
+        root = str(tmp_path / "bulk")
+        meta = _run_bulk(monkeypatch, _cfg(), root)
+        assert seen == ["2018", "2019"]
+        assert [m["window"] for m in meta["windows"]] == ["2018", "2019"]
+        assert meta["windows_unattempted"] == ["2020"]
+        assert meta["error"].startswith("window 2019: GenericError: Generic S3 error: Got invalid")
+        assert meta["error_class"] == meta["windows"][1]["error_class"] == "store-fatal"
+        assert meta["total_obs"] == 1  # 2018 alone landed
+        shard = _shard_word()
+        assert _leaf_obs(root, shard, "2018", _grid(_cfg())) == 1
+        assert not Path(hive.shard_leaf_path(root, shard, window="2020")).exists()
+
+    def test_a_store_fatal_column_report_ends_the_shard_too(self, monkeypatch, tmp_path):
+        # The column fold REPORTS its failure instead of raising (the leaf is
+        # committed by then); the class rides the report, and a fatal one
+        # ends the shard the same way, with the 2019 leaf itself stamped.
+        from obstore.exceptions import PermissionDeniedError
+
+        def _denied(*args, **kwargs):
+            if kwargs.get("window") == "2019":
+                raise PermissionDeniedError("AccessDenied on the column prefix")
+            return None
+
+        monkeypatch.setattr("zagg.column.write_leaf_column", _denied)
+        root = str(tmp_path / "bulk")
+        meta = _run_bulk(monkeypatch, _cfg(), root)
+        assert [m["window"] for m in meta["windows"]] == ["2018", "2019"]
+        assert meta["windows"][1]["error"].startswith("leaf column: ")
+        assert meta["error_class"] == "store-fatal" and meta["windows_unattempted"] == ["2020"]
+        grid = _grid(_cfg())
+        assert [_leaf_obs(root, _shard_word(), w, grid) for w in ("2018", "2019")] == [1, 5]
 
     def test_window_and_windows_are_exclusive(self, monkeypatch, tmp_path):
         with pytest.raises(ValueError, match="not both"):
@@ -1218,6 +1272,7 @@ class TestHandler:
         event = _handler_event(_cfg(), tmp_path)
         body = json.loads(_handle(handler_mod, event)["body"])
         assert body["error"] == "window 2019: RuntimeError: PUT failed"
+        assert body["error_class"] == "transient"
         assert [(r["window"], r["success"]) for r in body["stats"]] == [
             ("2018", True),
             ("2019", False),
@@ -1227,3 +1282,41 @@ class TestHandler:
         assert read_sidecar(hive.shard_leaf_path(store, shard, window="2018"))["n_obs"] == 1
         assert read_sidecar(hive.shard_leaf_path(store, shard, window="2020"))["n_obs"] == 6
         assert read_sidecar(hive.shard_leaf_path(store, shard, window="2019")) is None
+
+    def test_a_store_fatal_window_ends_the_invoke_with_its_class(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        # Issue #651 on the Lambda path: the invoke returns ONE result naming
+        # the error and its class, the records stop at the failed window, and
+        # ``build_shard_status`` carries the class into the status object off
+        # the body -- no handler change.
+        from obstore.exceptions import GenericError
+
+        from zagg.client_transport import build_shard_status
+        from zagg.telemetry import read_sidecar
+
+        finish = hive._LeafUnit.finish
+
+        def _refused(self, metadata):
+            if self.label == "2019":
+                raise GenericError("Generic S3 error: Got invalid DeleteObjects response: EOF")
+            return finish(self, metadata)
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _refused)
+        _patch(monkeypatch)
+        event = _handler_event(_cfg(), tmp_path)
+        response = _handle(handler_mod, event)
+        body = json.loads(response["body"])
+        assert response["statusCode"] == 500
+        assert body["error_class"] == "store-fatal" and body["windows_unattempted"] == ["2020"]
+        assert [(r["window"], r["success"]) for r in body["stats"]] == [
+            ("2018", True),
+            ("2019", False),
+        ]
+        store, shard = event["store_path"], event["shard_key"]
+        assert read_sidecar(hive.shard_leaf_path(store, shard, window="2018"))["n_obs"] == 1
+        assert read_sidecar(hive.shard_leaf_path(store, shard, window="2020")) is None
+        _key, status = build_shard_status(event, response)
+        assert status["status"] == "failed"
+        assert status["body"]["error_class"] == "store-fatal"
+        assert status["error"].startswith("window 2019: GenericError")
