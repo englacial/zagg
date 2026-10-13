@@ -23,8 +23,6 @@ import logging
 from zagg.config import (
     PipelineConfig,
     get_pipeline_type,
-    get_store_layout,
-    get_windowing,
     validate_config,
 )
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
@@ -47,16 +45,13 @@ def max_cost_preview(
     """Resolve the pre-invoke cost ceiling from shardmap + config alone.
 
     Mirrors the dispatching path's unit accounting -- cell selection
-    (``max_cells``/``morton_cell``) and the windowed-unit expansion -- so the
-    previewed ceiling equals the one the run logs before fan-out. The unit
-    accounting branches on pipeline kind exactly as :func:`~zagg.runner.agg`:
-    the spatial path expands with :func:`~zagg.runner._windowed_units` (issue
-    #246); the ``reader: raster`` re-route mirrors ``RasterStrategy.run``, whose
-    windowed fan-out (:func:`~zagg.runner._raster_windowed_units`, issue #247)
-    fires only on the hive layout and groups by acquisition, so its unit count
-    differs from the spatial expansion for a windowed-raster config. A temporal
-    run has no shardmap ceiling -- its fan-out unit is the ``events=`` item
-    resolved at call time, not a catalog shard -- so this raises ``ValueError``.
+    (``max_cells``/``morton_cell``) and the unit expansion -- so the previewed
+    ceiling equals the one the run logs before fan-out. The expansion is not
+    mirrored but SHARED: :func:`~zagg.runner._expand_units` is the one the
+    dispatch paths call, which is what keeps that equality true (issue #648).
+    A temporal run has no shardmap ceiling -- its fan-out unit is the
+    ``events=`` item resolved at call time, not a catalog shard -- so this
+    raises ``ValueError``.
     Returns ``{n_units, memory_gb, arch, timeout_s, max_cost_usd}``. No AWS
     access and no grid-signature check: this is display math, not dispatch.
     The ceiling prices one full timeout per unit and is NOT scaled by the
@@ -67,28 +62,21 @@ def max_cost_preview(
     """
     from zagg import runner
 
-    kind = get_pipeline_type(config)
-    if kind == "temporal":
+    if get_pipeline_type(config) == "temporal":
         raise ValueError(
             "temporal runs take events=; no shardmap ceiling (the fan-out unit "
             "is the event, resolved at call time, not a catalog shard)"
         )
-    if kind == "spatial" and (config.data_source or {}).get("reader") == "raster":
-        kind = "raster"
-
     catalog_path = catalog or config.catalog
     if not catalog_path:
         raise ValueError("No catalog specified (pass catalog= or set catalog: in config)")
     catalog_data = runner._load_catalog(catalog_path)
     cells = runner._select_cells(catalog_data, morton_cell=morton_cell, max_cells=max_cells)
-    windowing = get_windowing(config)
-    if kind == "raster":
-        # Mirror RasterStrategy.run: windowed fan-out only on the hive layout;
-        # otherwise one unit per selected cell (cells == _select_cells).
-        if get_store_layout(config) == "hive" and windowing is not None:
-            cells = runner._raster_windowed_units(cells, windowing)
-    elif windowing is not None:
-        cells = runner._windowed_units(cells, windowing, (config.bounds or {}).get("temporal"))
+    # The dispatch paths' own expansion, not a copy of it (issue #648): this
+    # branched per-window unconditionally, so a ``windowing.unit: shard`` run
+    # previewed its window count as invokes while the dispatch logged the
+    # true one (~9x on the yearly templates, $1,170 vs $131 at build scale).
+    cells = runner._expand_units(cells, config)
     memory_gb = runner._worker_memory_gb(config)
     timeout_s = runner._DEFAULT_FUNCTION_TIMEOUT_S
     return {
@@ -306,6 +294,11 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
     validate_config(config)
 
     total = None
+    # Honest default for the path that resolves no unit at all (no events=, no
+    # catalog): the bar is sized 0 and the generic noun matches the ``unit=
+    # "unit"`` the tqdm bar is built with -- "shards" would assert a unit this
+    # path never resolved (issue #648 fold).
+    desc = "units"
     if kwargs.get("events") is not None:
         # Materialize once and rebind: a one-shot iterable (generator) would be
         # exhausted by the count, then forwarded empty to agg -- TemporalStrategy's
@@ -314,6 +307,7 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
         events = list(kwargs["events"])
         kwargs["events"] = events
         total = len(events)
+        desc = "events"
     elif kwargs.get("catalog") or config.catalog:
         preview = max_cost_preview(
             config,
@@ -322,10 +316,16 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
             morton_cell=kwargs.get("morton_cell"),
         )
         total = preview["n_units"]
+        # The bar's unit IS the dispatch unit: ``_with_progress`` ticks once
+        # per dispatched unit and ``total`` is the same count the preview
+        # priced, so a bulk ``unit: shard`` run reads 0/N..N/N over its N
+        # invokes. The label has to follow the unit too (issue #648) — a bar
+        # saying "shards" must not tick once per (shard, window).
+        desc = runner._unit_noun(config)
         if kwargs.get("backend") == "lambda":
             print(format_max_cost(preview))
 
-    progress = _make_progress(total if total is not None else 0)
+    progress = _make_progress(total if total is not None else 0, desc)
     try:
         summary = runner.agg(config, on_progress=progress.update, **kwargs)
     finally:

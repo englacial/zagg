@@ -5,8 +5,9 @@ from either — the local backend over ATL03-shaped fake granules, only the
 h5coro transport stubbed — must come out with one leaf per (shard, year), the
 ``all`` row allocated beside them, the declared ladder folded by the staged
 sweep the template chains by default (issue #620), an Icechunk repo at the
-root with one row per window plus ``all`` (issue #604), and a clean
-``pyramid_check`` report. Nothing but the template's own ``data_source``
+root with one row per window plus ``all`` (issue #604), and a ``pyramid_check``
+report clean but for the one leg issue #649 is open on (the leaf tier's
+all-time member, xfailed below). Nothing but the template's own ``data_source``
 paths is spelled here: a template that stopped validating, lost its
 ``delta_time`` column or its windowing block, or declared a ladder the leaf
 worker cannot write would fail this file by name.
@@ -35,6 +36,7 @@ from zarr.storage import LocalStore, WrapperStore
 
 from zagg import hive, runner
 from zagg.config import default_config, get_windowing
+from zagg.grids.morton import morton_decimal
 from zagg.hive import MANIFEST_NAME
 from zagg.pyramid_check import format_report, validate_pyramid
 
@@ -262,17 +264,56 @@ def test_the_icechunk_repo_holds_one_row_per_window_plus_all(built):
     assert block["rows_per_manifest"] == 1
 
 
-def test_pyramid_check_passes(built):
+@pytest.fixture(scope="module")
+def report(built):
+    """One full-mode ``validate_pyramid`` per template, for the two tests that
+    read it: the walk is the slowest thing in this file and both want the same
+    store in the same state. Read-only -- neither test mutates the report -- so
+    sharing it couples nothing and can hide no failure.
+    """
+    return validate_pyramid(str(built.root), full=True)
+
+
+def test_pyramid_check_passes(built, report):
     name, cfg, root, shards = built[:4]
-    report = validate_pyramid(str(root), full=True)
-    assert report["passed"], format_report(report)
     # ``passed`` tolerates a skip; the value legs must actually run.
-    for check in ("materialization", "columns", "readback", "counts", "digests", "all_time"):
+    for check in ("materialization", "columns", "readback", "counts", "digests"):
         assert report["checks"][check]["status"] == "pass", format_report(report)
+    # Exactly one leg is red -- the issue #650 all-time one that
+    # ``test_the_all_time_leg_fails_until_649`` owns. This is the verdict for
+    # every OTHER leg too: a strict xfail fires only on a pass, so it cannot
+    # carry them, and without this line declaration, coordinates, records,
+    # composition and idempotency would be asserted by nothing in this file.
+    failed = sorted(n for n, c in report["checks"].items() if c["status"] == "fail")
+    assert failed == ["all_time"], format_report(report)
     assert report["windows"] == list(WINDOWS)
     assert report["roster"]["leaves"] == len(shards) * len(WINDOWS)
     assert report["all_time_nodes"]["missing"] == []
     assert report["columns"]["missing"] == [] and report["columns"]["partial"] == []
+    # The all-time fold is there above the shard and missing AT it: the leaf
+    # tier's ``all.pyramid.zarr`` is what issue #649 has yet to write, so the
+    # declared leaf levels have no all-time member and the store's default
+    # view is short its finest four. ``test_the_all_time_leg_fails_until_649``
+    # owns that verdict; everything else above is green already.
+    assert report["all_time_columns"] == {
+        "declared": len(shards),
+        "materialized": 0,
+        "missing": sorted(morton_decimal(k) for k in shards),
+    }
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="issue #649: a windowed run writes no all.pyramid.zarr, so the declared leaf-column "
+    "levels have no all-time member and the issue #650 all_time leg fails by leaf. Flips to "
+    "PASS when the shard-level close of #649 lands — delete the marker then.",
+)
+def test_the_all_time_leg_fails_until_649(report):
+    # Only the leg the reason names. ``passed`` would widen the flip
+    # condition: if #649 landed while some other leg was red this would stay
+    # xfailed and the marker undeleted. "No other leg is red" is
+    # ``test_pyramid_check_passes``'s job, and it asserts it by name.
+    assert report["checks"]["all_time"]["status"] == "pass", format_report(report)
 
 
 #: Per-shard leaf ``count`` totals by year, from the fixture: each granule

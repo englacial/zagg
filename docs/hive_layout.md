@@ -549,10 +549,15 @@ follow for an operator:
   manifest is the store's truth.** The older templates built `pyramid: false`
   stores, and the v3 ATL03 store declares `{overviews: 13}`. `pyramid.spec`
   is written once, at init; an append from the new template never rewrites
-  it, and the staged sweep refuses a `/1` manifest per invoke (see the
-  *Migration* notes on PR #622). **`sweep: true` is not the opt-out.** It
-  stops the staged fan-out, but the leaf side follows the *config's* ladder
-  and not the manifest. The leaf worker writes `[16..9]` columns
+  it, and the staged sweep refuses a `/1` manifest (see the *Migration* notes
+  on PR #622). Since [issue
+  #635](https://github.com/englacial/zagg/issues/635) that refusal costs
+  **nothing**: the fleet dispatcher reads the store's declaration once before
+  it fans out, so the run no-ops with one warning naming `--declare-pyramid`
+  instead of billing one dying invoke per dispatch node. **`sweep: true` is
+  still not the opt-out**, and the reason is now only the leaf side: the stage
+  fan-out already stops itself, but the leaf side follows the *config's*
+  ladder and not the manifest. The leaf worker writes `[16..9]` columns
   (`leaf_column_plan`) that the store declares nowhere. The Icechunk leaf seam
   stages refs for the config's leaf levels (`leaf_level_cells`) into a repo
   whose groups were built from the manifest. The `16` group does not exist
@@ -809,7 +814,13 @@ rides the handle as `handle.stage_sweep`). That chaining is **the default**
 for a hive store that declares a ladder since [issue
 #620](https://github.com/englacial/zagg/issues/620) — the sweep belongs to
 the append, not to an operator call; `sweep: true` (or `"families"`) keeps
-the families pass alone and `false` (or `"none"`) keeps neither. Work is discovered from
+the families pass alone and `false` (or `"none"`) keeps neither. That default
+reads the **config**, so the fleet dispatcher checks the **store** before it
+fans out: one manifest GET, and a store that declares no `/2` ladder fires
+nothing at all ([issue
+#635](https://github.com/englacial/zagg/issues/635) — the dispatcher's only
+read, with D8 amended for it; the gate is the workers' own `ladder_entries`,
+so a `/2` store's run is unchanged). Work is discovered from
 the **run records** (listing-based; the root `coverage.moc` is an
 accelerator for sibling candidates, never the source of truth — a fleet
 append with no subsequent sweep leaves it stale, and discovery still finds
@@ -864,7 +875,9 @@ D8), so the fold is the **dense bound** `(4^width − 1) / 3` — 21 at width 3,
 5 at width 2 — which never under-estimates; a caller that *does* hand a
 coverage MOC in gets the fold measured over the set the worker folds (the
 run's leaves ∪ that coverage), and may keep the full width where the store is
-genuinely sparse. Nothing is read from the store either way. A dense o9
+genuinely sparse. The **sizing** reads nothing from the store either way; the
+dispatcher's one read is the ladder gate's single manifest GET
+([issue #635](https://github.com/englacial/zagg/issues/635), below). A dense o9
 ladder's three width-3 tuples folding 21 nodes an invoke become **five tuples
 of uniform width 2** — `7:[8,7] 5:[6,5] 3:[4,3] 1:[2,1]`, then the one-order
 remainder `0:[0]` — folding 5. Alignment matters more than width: on the

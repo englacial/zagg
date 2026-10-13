@@ -900,13 +900,10 @@ class RasterStrategy:
             "credentials": output_credentials,
             "endpoint_url": resolved_endpoint,
         }
-        # Temporal fan-out (issue #247): one work unit per (shard, window),
-        # membership decided at dispatch from the acquisitions' STAC
-        # datetimes. None (schedule none/absent) keeps the (shard, records)
-        # pairs — one bare leaf per shard carrying the full time axis (D13).
-        # Shared by both backends, so the fan-out cannot drift between them.
-        if store_layout == "hive" and windowing is not None:
-            cells = _raster_windowed_units(cells, windowing)
+        # Temporal fan-out (issue #247), per ``_expand_units``. Above the
+        # backend split, so the fan-out cannot drift between them; the helper
+        # is shared with the preview too (issue #648).
+        cells = _expand_units(cells, config)
 
         if backend == "lambda":
             # No orchestrator-side store write on the lambda path (issue
@@ -2499,6 +2496,84 @@ def _raster_windowed_units(cells: list[tuple], windowing: dict) -> list:
     return units
 
 
+def _unit_kind(config: PipelineConfig) -> str:
+    """Which unit expansion this config DISPATCHES under (issue #648).
+
+    ``"cell"`` -- no windowing, so the ``(shard, records)`` pairs ride through
+    untouched. ``"shard"`` -- ``output.windowing.unit: shard``, the default
+    since issue #586: one unit per shard, emitting every window its granules
+    span. ``"shard-window"`` -- ``unit: window``, one unit per (shard,
+    window). ``"raster-window"`` -- the raster hive fan-out (issue #247), one
+    unit per (shard, window) whose MEMBERSHIP is decided per acquisition
+    (earliest STAC datetime per group, explicit schedules drop groups), a
+    different rule from the spatial expansion's.
+
+    Read apart from :func:`~zagg.config.get_windowing_unit` because that knob
+    reads ``"window"`` for every raster config, and a windowed raster config
+    must route to :func:`_raster_windowed_units` rather than to the spatial
+    :func:`_windowed_units` -- same word, different membership.
+    """
+    windowing = get_windowing(config)
+    if windowing is None:
+        return "cell"
+    if (config.data_source or {}).get("reader") == "raster":
+        # Mirror RasterStrategy.run: no windowed fan-out off the hive layout.
+        # Defense for an UNVALIDATED config, not a dispatch case: windowing
+        # requires hive for every active schedule (``_validate_windowing``),
+        # but ``zagg.notebook.max_cost_preview`` validates nothing and the CLI
+        # prices through it BEFORE ``agg`` validates (``zagg.__main__``), so a
+        # flat windowed raster config reaching here must count cells -- what
+        # the pre-#648 preview did -- not fan out on a layout that will refuse.
+        return "raster-window" if get_store_layout(config) == "hive" else "cell"
+    return "shard-window" if get_windowing_unit(config) == "window" else "shard"
+
+
+#: Display noun for one dispatch unit, by :func:`_unit_kind` (issue #648): a
+#: bar labelled ``shards`` must not tick once per (shard, window).
+_UNIT_NOUN = {
+    "cell": "shards",
+    "shard": "shards",
+    "shard-window": "shard-windows",
+    "raster-window": "shard-windows",
+}
+
+
+def _unit_noun(config: PipelineConfig) -> str:
+    """The progress bar's label for this config's dispatch unit (issue #648).
+
+    Falls back to ``"units"`` for an unlisted kind: the caller
+    (:func:`zagg.notebook.run`) labels the bar OUTSIDE ``_with_progress``'s
+    deliberate swallow, so a missing noun would abort a paid fan-out over a
+    cosmetic string.
+    """
+    return _UNIT_NOUN.get(_unit_kind(config), "units")
+
+
+def _expand_units(cells: list[tuple], config: PipelineConfig) -> list:
+    """Expand selected cells into the run's DISPATCH units (issue #648).
+
+    The one place the expansion is chosen, so the previewed ceiling and the
+    dispatched fan-out cannot drift: both spatial backends fan out through
+    here, ``RasterStrategy.run`` routes its own kind through here, and
+    :func:`zagg.notebook.max_cost_preview` prices and pre-sizes its bar from
+    here. Before this helper the preview always took the per-window
+    expansion, so a ``unit: shard`` run previewed its window count as invokes
+    (~9x on the yearly templates) while the dispatch logged the true one.
+
+    Returns ``cells`` unchanged under :func:`_unit_kind` ``"cell"``.
+    """
+    kind = _unit_kind(config)
+    if kind == "cell":
+        return cells
+    windowing = get_windowing(config)
+    if kind == "raster-window":
+        return _raster_windowed_units(cells, windowing)
+    bounds_temporal = (config.bounds or {}).get("temporal")
+    if kind == "shard-window":
+        return _windowed_units(cells, windowing, bounds_temporal)
+    return _shard_window_units(cells, windowing, bounds_temporal)
+
+
 def _resolve_invoked_by(session, region) -> dict | None:
     """Caller identity for the run's stats records (issue #297), or ``None``.
 
@@ -3282,16 +3357,10 @@ def _run_local(
         # chains the staged sweep here AND a ``/2`` ladder with composable
         # fields is declared (``icechunk_refs.ladder_walks``) — else to the
         # per-leaf commit. Explicit settings are honored.
-        # Temporal fan-out (issue #246 phase 5): one work unit per shard
-        # emitting every window its granules span (issue #586, the default),
-        # or per (shard, window) under ``windowing.unit: window``. None
-        # (schedule none/absent) keeps the (shard, records) pairs — dispatch
-        # byte-identical to pre-windowing runs. It runs BEFORE the init
-        # because the init allocates the run's rows from the units' window
-        # labels (issue #584 §11.2).
-        if windowing is not None:
-            fan = _windowed_units if get_windowing_unit(config) == "window" else _shard_window_units
-            cells = fan(cells, windowing, (config.bounds or {}).get("temporal"))
+        # Temporal fan-out (issue #246 phase 5), per ``_expand_units``. It
+        # runs BEFORE the init because the init allocates the run's rows from
+        # the units' window labels (issue #584 §11.2).
+        cells = _expand_units(cells, config)
         icechunk_init = _init_icechunk_local(
             config, grid, store_path, run_id, store_kwargs, cells=cells
         )
@@ -3824,15 +3893,9 @@ def _run_lambda(
         # ceiling; this path stays a pure shard/granule preview until then.
         return _dry_run_summary(cells, store_path)
 
-    # Temporal fan-out (issue #246 phase 5): one work unit per shard emitting
-    # every window its granules span (issue #586, the default), or per
-    # (shard, window) under ``windowing.unit: window``; the biggest-first
-    # bucket order above survives (shard-major expansion). None keeps the
-    # pairs — dispatch byte-identical.
-    windowing = get_windowing(config)
-    if windowing is not None:
-        fan = _windowed_units if get_windowing_unit(config) == "window" else _shard_window_units
-        cells = fan(cells, windowing, (config.bounds or {}).get("temporal"))
+    # Temporal fan-out (issue #246 phase 5), per ``_expand_units``: the
+    # biggest-first bucket order above survives it (shard-major expansion).
+    cells = _expand_units(cells, config)
 
     # Pre-invoke cost ceiling (issue #298): every unit is one invoke billed at
     # the worker's memory for at most the function timeout, so the bill is
@@ -4638,6 +4701,18 @@ def _run_lambda(
                     _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # The staged leg's dispatcher summary rides the RETURNED summary, like
+        # the families leg's above (review finding). A DECLINED fan-out (issue
+        # #635) fires nothing, so `_staged_sweep_incomplete` returns None and
+        # `icechunk_finalize` below records a tag where it used to record
+        # `{"skipped": "staged sweep barrier timed out"}` -- which leaves this
+        # dict's `skipped` reason and `families_unswept` as the run record's
+        # only durable trace that the declared ladder went unswept, and a
+        # WARNING does not outlive this process (issue #610). Set once HERE,
+        # outside the chaining gate, so the key is present on every path --
+        # no hive sweep, or a dispatch that failed open -- exactly as
+        # `families_sweep` is.
+        summary["stage_sweep"] = staged
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
         # worker invoke AFTER the staged sweep returned (its finisher is the
         # last ladder commit) — the dispatcher never writes (D8). Fail-open.
@@ -6522,6 +6597,20 @@ def _invoke_lambda_stage_sweep(
     one of them stays worker-side. Fail-open (D9): a refused lease, a lost
     invoke or a timed-out barrier costs one later
     ``python -m zagg.sweep --stages`` pass, never a wrong answer.
+
+    **The tail does not have to know the store declares a ladder.** The
+    chaining gate is the CONFIG's (:func:`zagg.config.chains_stages`) and a
+    manifest's ``pyramid`` block may lag it, so the dispatcher reads the
+    store's own declaration once before it fans out
+    (:func:`zagg.sweep_fleet.no_ladder_reason`, issue #635): a store carrying
+    no ``zagg-pyramid/2`` ladder costs this tail one manifest GET and zero
+    invokes, reported as ``skipped`` on the summary this returns, where it used
+    to bill one no-op invoke per dispatch node. That summary is what the run
+    summary and the client handle carry as ``stage_sweep`` (the families leg's
+    posture, :func:`_invoke_lambda_families_sweep`), so the decline's reason is
+    durable on the run record and not only in a log line (review finding).
+    Such a run rode no node close, so the summary's ``families_unswept`` sends
+    the rollups to :func:`_warn_families_unswept`'s backstop.
 
     **How long the tail can block.** One barrier per tuple plus the finisher's,
     each bounded by ``barrier_timeout_s``
