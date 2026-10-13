@@ -14,8 +14,9 @@ unwindowed counterpart, and the harness holds it to what spec §4.2–§4.6 stat
   overview built from another window's leaves therefore fails by value, on
   the node and the window that hold it; one carrying another window's name
   in its attrs fails read-back on every node, sampled or not.
-- **the all-time fold** — ``all.zarr`` at every ladder node, present exactly
-  where the manifest declares ``pyramid.overview.all_time`` (§4.5). Its
+- **the all-time fold** — ``all.zarr`` at every ladder node and, beside each
+  leaf's window columns, ``all.pyramid.zarr`` (§4.6, issue #650), present
+  exactly where the manifest declares ``pyramid.overview.all_time`` (§4.5). Its
   source is the node's OWN per-window overviews (§4.4 "The all-time fold of a
   windowed store"), so per sampled node the harness lists the windows the
   node has, and requires: every cell to equal the k-way fold across them
@@ -42,8 +43,9 @@ attrs, and from the geometry.
 — and its cross-check (:func:`_roster_gaps`: one LIST of the root, one per
 order-0 node, and under the run records one GET of ``coverage.moc``);
 one ``zarr.json`` GET per declared ``(node, window)`` overview, per ``(leaf,
-window)`` column and per ladder node's ``all.zarr``, declared or not (the
-same per-artifact bound as the unwindowed arm, times the window count);
+window)`` column, per leaf's ``all.pyramid.zarr`` and per ladder node's
+``all.zarr``, declared or not (the same per-artifact bound as the unwindowed
+arm, times the window count);
 then array reads for ``sample_windows`` windows × ``sample_nodes`` nodes
 per order × ``sample_cells`` cells, and for ``sample_nodes`` all-time nodes
 per order one delimiter LIST of the node's prefix plus the same cells of
@@ -427,7 +429,16 @@ def validate_windowed(
             "--roster list to tell a broken sweep from a stale record"
         )
     _all_time_check(
-        harness, ladder, declared, probes, groups, checks, report, all_time=all_time, full=full
+        harness,
+        ladder,
+        declared,
+        probes,
+        refs,
+        groups,
+        checks,
+        report,
+        all_time=all_time,
+        full=full,
     )
     if harness.warnings:
         report["warnings"] = list(dict.fromkeys([*report.get("warnings", []), *harness.warnings]))
@@ -799,28 +810,31 @@ def _node_window_labels(store, node: str) -> set:
 
 
 def _all_time_check(
-    harness, ladder, declared, probes, groups, checks, report, *, all_time, full
+    harness, ladder, declared, probes, refs, groups, checks, report, *, all_time, full
 ) -> None:
-    """Settle ``all_time``: the all-time fold at every ladder node (§4.4).
+    """Settle ``all_time``: the all-time member at every declared level (§4.4).
 
     Declared, every ladder node that has a leaf beneath it in any window must
     carry a committed ``all.zarr`` (one GET each); ``sample_nodes`` of them
     per order (all in full mode) are then held to the fold's contract — see
-    :func:`_all_time_node`. Undeclared, there is nothing to hold: reported
-    *not applicable*, after the same probe, naming any committed fold found.
+    :func:`_all_time_node`. The declared LEAF-column levels (§4.6) have an
+    all-time member too — ``all.pyramid.zarr`` — which the ladder cannot see
+    (:func:`zagg.pyramid_check._ladder` drops the leaf entry, whose node IS
+    the shard order), so it is probed here per roster leaf (issue #650).
+    Undeclared, there is nothing to hold: reported *not applicable*, after the
+    node probe, naming any committed fold found.
     """
+    from zagg.column import COLUMN_ROLE
     from zagg.store import open_object_store
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import OVERVIEW_SPEC_V2
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     orders = {k: sorted({n for w in declared for n in declared[w][k]}) for k, _ in ladder}
-    probed, errored = _probe_nodes(
-        harness.store_root,
-        [n for k in orders for n in orders[k]],
-        harness.store_kwargs,
-        workers=harness.workers,
+    probe = partial(
+        _probe_nodes, harness.store_root, store_kwargs=harness.store_kwargs, workers=harness.workers
     )
+    probed, errored = probe([n for k in orders for n in orders[k]])
     if errored:
         checks["all_time"] = _entry(
             "fail",
@@ -853,11 +867,36 @@ def _all_time_check(
         "materialized": len(committed),
         "missing": missing[:50],
     }
+    # Existence + role + commit stamp only: the ``merges_from_raw`` law of
+    # :func:`zagg.pyramid_check_v2._column_attrs_errors` is per-window.
+    leaves = sorted({dec for dec, _w in refs})
+    col_probed, col_errored = probe(leaves, rel=_column_object_rel)
+    if col_errored:
+        checks["all_time"] = _entry(
+            "fail",
+            f"{len(col_errored)} all.pyramid.zarr probe error(s) — the all-time state of the "
+            f"leaf-column tier is UNKNOWN, not a verdict: "
+            f"{[f'{n}: {e}' for n, e in sorted(col_errored.items())][:3]}",
+        )
+        return
+    levels, base = report.get("leaf_levels") or [], harness.cell_order
+    col_missing = [n for n in leaves if not _committed(col_probed.get(n), COLUMN_ROLE)]
+    report["all_time_columns"] = {
+        "declared": len(leaves),
+        "materialized": len(leaves) - len(col_missing),
+        "missing": col_missing[:50],
+    }
+    column_finding = col_missing and (
+        f"{len(col_missing)}/{len(leaves)} leaf/leaves carry no committed all.pyramid.zarr: "
+        f"{col_missing[:8]} — the declared leaf-column levels {list(levels)} have NO all-time "
+        f"member, so the store's default view is missing them (§4.6; the base, cells {base}, "
+        f"is exempt — an all-time leaf IS the unwindowed store)"
+    )
     if not committed:
         checks["all_time"] = _entry(
             "fail",
             f"declared but no committed all-time fold: 0/{len(probed)} nodes — the node close "
-            f"has not run",
+            f"has not run" + (f"; {column_finding}" if column_finding else ""),
         )
         return
     sources = _WindowSources(
@@ -902,6 +941,8 @@ def _all_time_check(
         found.insert(
             0, f"{len(missing)} declared node(s) carry no committed all.zarr: {missing[:8]}"
         )
+    if column_finding:
+        found.insert(0, column_finding)
     if found:
         checks["all_time"] = _entry(
             "fail", f"{len(found)} mismatch(es); first: {found[0]}", mismatches=found[:20]
@@ -919,7 +960,8 @@ def _all_time_check(
         f"against the k-way fold of their own per-window overviews — {counted['counts']} "
         f"count, {counted['digests']} digest, {counted['composition']} composition "
         f"comparison(s) — with the §4.4 provenance (regime, merges_from_raw, source_windows, "
-        f"source_children, generation)",
+        f"source_children, generation); {len(leaves)} leaf/leaves carry the all-time member at "
+        f"the declared leaf-column levels {list(levels)} (the base, cells {base}, is exempt)",
     )
 
 

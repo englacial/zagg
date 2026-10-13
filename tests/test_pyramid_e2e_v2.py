@@ -156,6 +156,10 @@ class TestV2FixtureE2E:
         assert report["passed"] is True
         assert report["pyramid_spec"] == "zagg-pyramid/2"
         assert report["leaf_levels"] == [5]
+        # The all-time legs are the windowed arm's alone (issue #650): an
+        # unwindowed store's single fold IS all-time (§4.2), so the leg is not
+        # on this checklist and the leaf tier's member is the ``columns`` leg's.
+        assert "all_time" not in report["checks"] and "all_time_columns" not in report
         # Declaration ↔ materialized: the fixed ladder is fully populated ...
         assert report["nodes"] == {
             "2": {"declared": 4, "materialized": 4},
