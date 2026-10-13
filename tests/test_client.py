@@ -1634,6 +1634,28 @@ class TestStagedSweepTail:
         assert handle.stage_sweep is staged
         assert handle.icechunk_finalize == {"skipped": reason}
 
+    def test_the_handle_carries_the_tails_verdict(self, catalog, monkeypatch):
+        # The facade's half of issue #610's "not swallowed": the same reasons
+        # ``runner._run_lambda`` reports as ``tail_sweep_short``, through the
+        # shared helper, so the two tails cannot drift on the verdict.
+        staged = {
+            "barrier_timed_out": True,
+            "short_orders": [2, 1, 0],
+            "finisher": {"fired": True, "landed": True},
+        }
+        _run_, handle, _stub, _seen = self._drive(catalog, monkeypatch, staged=staged)
+        assert len(handle.tail_sweep_short) == 2
+        assert "barrier timed out" in handle.tail_sweep_short[0]
+        assert "[2, 1, 0]" in handle.tail_sweep_short[1]
+
+    def test_a_whole_tail_leaves_the_verdict_empty(self, catalog, monkeypatch):
+        _run_, handle, _stub, _seen = self._drive(
+            catalog, monkeypatch, staged=self._COMPLETE, ladder=False
+        )
+        # The families pass landed (conftest's stub) and the ladder completed.
+        assert handle.families_sweep["finisher"] == "ok"
+        assert handle.tail_sweep_short == []
+
     def test_a_stage_sweep_that_fired_nothing_still_tags(self, catalog, monkeypatch):
         staged = {
             "skipped": "no dispatch nodes",
@@ -1678,6 +1700,11 @@ class TestStagedSweepTail:
         assert seen["order"] == [] and "icechunk_finalize" not in stub.modes()
         assert handle.stage_sweep is None
         assert handle.icechunk_finalize == {"skipped": "staged sweep dispatch failed"}
+        # The raise leads the verdict here too (issue #610): nothing was swept.
+        assert (
+            "sweep block raised (ValueError: malformed stats record)"
+            in (handle.tail_sweep_short[0])
+        )
 
     def test_a_leaf_pinned_run_still_chains_and_gates(self, catalog, monkeypatch):
         # No ``/2`` ladder declared, so the dispatch pins ``commit: "leaf"``,

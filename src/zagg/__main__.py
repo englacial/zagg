@@ -216,6 +216,17 @@ examples:
                 f"{phase} {secs:.0f}s" for phase, secs in results["worker_phase_max"].items()
             )
             print(f"Worker phases (max across cells): {breakdown}")
+        # The tail's verdict (issue #610): a run whose rollup sweep did not
+        # complete exits 0 by design — the rollups are regenerable caches (D9)
+        # — so the shortfall has to be on the operator's last screen, not in
+        # the log alone. The v3 California run printed nothing at all.
+        if short := results.get("tail_sweep_short"):
+            for reason in short:
+                print(f"  TAIL SHORT: {reason}")
+            print(
+                "  Regenerate with `python -m zagg.sweep <store>` and, for the ladder, "
+                "`python -m zagg.sweep <store> --stages --scope <subtree>`"
+            )
         print(f"Output: {results['store_path']}")
 
 
