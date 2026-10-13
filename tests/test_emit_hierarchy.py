@@ -111,16 +111,6 @@ def test_every_node_comes_back_as_a_handle():
     assert zarr.open_array(store, path=f"{grid.group_path}/count", mode="r")[:4].tolist() == [7] * 4
 
 
-def test_a_nested_root_path_keys_the_handles_from_the_store_root():
-    grid, spec = _leaf_spec()
-    store = MemoryStore()
-    with vlen_dtype_warning_suppressed():
-        nodes = emit_hierarchy(store, spec, path="a/b")
-    assert "a/b" in nodes and f"a/b/{grid.group_path}/count" in nodes
-    # Implicit parents get explicit group documents (issue #189's note).
-    assert "a" in nodes and "" in nodes
-
-
 def test_an_occupied_prefix_is_refused_not_overwritten():
     """The writers clear the prefix themselves; the pass never ``delete_dir``s per node."""
     _grid, spec = _leaf_spec()

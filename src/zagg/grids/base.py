@@ -253,8 +253,8 @@ def vlen_dtype_warning_suppressed():
         yield
 
 
-def emit_hierarchy(store: Store, spec, *, path: str = "") -> dict[str, Any]:
-    """Create ``spec``'s whole hierarchy under ``path`` in ONE pass; return its node handles.
+def emit_hierarchy(store: Store, spec) -> dict[str, Any]:
+    """Create ``spec``'s whole hierarchy at the store root in ONE pass; return its node handles.
 
     pydantic-zarr's ``GroupSpec.to_zarr`` walks the tree one node at a time —
     each member is its own probe of the node and its ancestors plus its own
@@ -267,10 +267,10 @@ def emit_hierarchy(store: Store, spec, *, path: str = "") -> dict[str, Any]:
     PUT pass. The root group is explicit in the set, so its document is
     written as before.
 
-    Returns ``{path: handle}`` keyed by each node's path relative to the
-    store root (``""`` is the root group): the array handles the writer then
-    writes through, instead of re-opening each array (``open_array`` is
-    another ancestor-probing GET per array).
+    Returns ``{path: handle}`` keyed by each node's path (``""`` is the root
+    group): the array handles the writer then writes through, instead of
+    re-opening each array (``open_array`` is another ancestor-probing GET per
+    array).
 
     A caller that means to overwrite clears the prefix first; the pass runs
     with ``overwrite=False`` and raises zarr's ``ContainsGroupError`` /
@@ -283,7 +283,7 @@ def emit_hierarchy(store: Store, spec, *, path: str = "") -> dict[str, Any]:
     from zarr.core.metadata.v3 import ArrayV3Metadata
 
     nodes = {}
-    for key, node in spec.to_flat(root_path=path).items():
+    for key, node in spec.to_flat().items():
         dump = node.model_dump()
         if isinstance(node, ArraySpec):
             nodes[key.lstrip("/")] = ArrayV3Metadata.from_dict(dump)
