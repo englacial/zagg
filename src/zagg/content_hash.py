@@ -108,7 +108,12 @@ def hash_array(values: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -> dict[str, str]:
+def hash_arrays(
+    group: Any,
+    *,
+    staged: Mapping[str, np.ndarray] | None = None,
+    nodes: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
     """O11 per-array hashes of every named zarr array beneath ``group``.
 
     ``group`` is an open zarr v3 group at the leaf ROOT; the scope is
@@ -131,12 +136,24 @@ def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -
     (that array was read back) but the staged seam is broken — silent
     key-composition drift between writer and enumeration would otherwise turn
     every hash into a read-back with no observable symptom.
+
+    ``nodes`` (issue #657) is the writer's own ``{path: handle}`` map from its
+    template pass (:func:`zagg.grids.base.emit_hierarchy`); given, the array
+    set is taken from it and ``group`` is not consulted — the discovery walk
+    is one listing per group plus one GET per member document, the third
+    read of every ``zarr.json`` the leaf path used to issue. The two scopes
+    coincide by construction for the writers that pass it: each cleared its
+    prefix before templating and is the artifact's only writer, so the store
+    holds exactly the nodes it created (pinned by the write-read parity tests
+    and the byte-identical stamps in ``tests/test_write_request_counts.py``).
+    Readers and verifiers keep the discovery scope.
     """
     import zarr
 
     staged = staged or {}
     hashes: dict[str, str] = {}
-    for key, node in group.members(max_depth=None):
+    members = nodes.items() if nodes is not None else group.members(max_depth=None)
+    for key, node in members:
         if not isinstance(node, zarr.Array):
             continue
         values = staged[key] if key in staged else node[...]
@@ -296,7 +313,13 @@ def content_hashes_record(hashes: Mapping[str, str]) -> dict:
     return {"arrays": dict(sorted(hashes.items())), "combined": combined_hash(hashes)}
 
 
-def staged_record(store: Any, staged: Mapping[str, np.ndarray], what: str) -> dict | None:
+def staged_record(
+    store: Any,
+    staged: Mapping[str, np.ndarray],
+    what: str,
+    *,
+    nodes: Mapping[str, Any] | None = None,
+) -> dict | None:
     """The §5.3 record over ``staged`` (read-back for the rest), or ``None``.
 
     The one entry point for every stamp writer that already holds its slabs
@@ -307,13 +330,17 @@ def staged_record(store: Any, staged: Mapping[str, np.ndarray], what: str) -> di
     unverifiable, never tampered.
 
     ``what`` is a log label only (the failing artifact, in whatever grammar
-    the call site names it); nothing parses it.
+    the call site names it); nothing parses it. ``nodes`` is the writer's
+    template-pass handle map (see :func:`hash_arrays`): with it the root is
+    not re-opened and no array document is read back.
     """
     try:
         import zarr
 
-        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
-        return content_hashes_record(hash_arrays(group, staged=staged))
+        group = None
+        if nodes is None:
+            group = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        return content_hashes_record(hash_arrays(group, staged=staged, nodes=nodes))
     except Exception as e:
         logger.warning(f"{what}: O11 content hashing failed (fail-open, issue #342): {e}")
         return None

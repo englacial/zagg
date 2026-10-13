@@ -2132,7 +2132,9 @@ class _LeafUnit:
             _t0 = time.time()
             from zagg.content_hash import staged_record
 
-            record = staged_record(box["store"], staged, f"leaf {self.leaf_path}")
+            record = staged_record(
+                box["store"], staged, f"leaf {self.leaf_path}", nodes=box.get("arrays")
+            )
             if record is not None:
                 metadata["content_hashes"] = record
                 # Same "populated phase_timings" gate as the write stamp
