@@ -62,6 +62,7 @@ from zagg.dispatch import (
     BENIGN_ERRORS,
     STORE_BENIGN,
     STORE_FATAL,
+    STORE_TRANSIENT,
     StoreFatalError,
     classify_store_error,
 )
@@ -2616,6 +2617,10 @@ def _process_windows(
             # body the client could not parse, a schema refusal): recorded
             # the same way, then raised through the worker's loop so the
             # remaining windows are never aggregated into the 900 s wall.
+            # Store-fatal comes only from an exception in hand (here, or the
+            # column report ``finish`` classifies): a RETURNED error is the
+            # worker's no-data channel, whose text can carry a source read's
+            # 403 exemplar, so it is benign or transient, never fatal.
             unit = units[w["label"]]
             try:
                 meta = unit.finish(aggregate(**unit.sinks()))
@@ -2631,7 +2636,8 @@ def _process_windows(
                     "error_class": classify_store_error(e),
                 }
             if meta.get("error") and not meta.get("error_class"):
-                meta["error_class"] = classify_store_error(meta["error"])
+                benign = meta["error"] in BENIGN_ERRORS
+                meta["error_class"] = STORE_BENIGN if benign else STORE_TRANSIENT
             metas[w["label"]] = meta
             if meta.get("error_class") == STORE_FATAL:
                 raise StoreFatalError(f"window {w['label']}: {meta['error']}")
@@ -2705,7 +2711,7 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
         first = failed[0]
         more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
-        meta["error_class"] = first.get("error_class") or classify_store_error(first["error"])
+        meta["error_class"] = first.get("error_class") or STORE_TRANSIENT
     elif written and all(m.get("error") for m in written):
         meta["error"] = written[0]["error"]
         meta["error_class"] = STORE_BENIGN
