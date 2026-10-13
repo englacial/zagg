@@ -24,6 +24,7 @@ show the same pattern; they are a follow-on and are reported, not pinned.
 from __future__ import annotations
 
 import collections
+import contextvars
 import hashlib
 import json
 import os
@@ -45,6 +46,10 @@ ZAGG_SRC = os.path.dirname(zagg.__file__) + "/"
 TEMPLATE = windowed.TEMPLATES[0]
 MANIFEST = Path(__file__).parent / "data" / "write_manifest" / f"{TEMPLATE}.json"
 FROZEN_NOW = "2026-01-01T00:00:00+00:00"
+#: The attribution rides the coroutine's own context, not a shared slot: zarr's
+#: dispatch threads cross ``sync`` concurrently, and tasks gathered inside a
+#: coroutine inherit its context, so every store op reads its own caller.
+CALLER = contextvars.ContextVar("caller", default="-")
 
 #: Store coroutines counted (``get_partial_values`` is counted once per key).
 METHODS = ("get", "exists", "set", "set_if_not_exists", "delete", "delete_dir")
@@ -96,17 +101,16 @@ class Counter:
 
     def __init__(self):
         self.ops: list[tuple[str, str, str, str]] = []
-        self.caller = "-"
 
     def install(self, monkeypatch) -> None:
         original_sync = zsync.sync
 
+        async def tagged(coro, label):
+            CALLER.set(label)
+            return await coro
+
         def counted_sync(coro, *args, **kwargs):
-            self.caller = _attribute()
-            try:
-                return original_sync(coro, *args, **kwargs)
-            finally:
-                self.caller = "-"  # an op outside any sync reads as unattributed
+            return original_sync(tagged(coro, _attribute()), *args, **kwargs)
 
         # The attribution is taken where the sync boundary is crossed, so the
         # async store methods below see the zagg frame that scheduled them.
@@ -124,7 +128,7 @@ class Counter:
         counter = self
 
         async def counted(self, key, *args, **kwargs):
-            counter.ops.append((str(self.root), str(key), method, counter.caller))
+            counter.ops.append((str(self.root), str(key), method, CALLER.get()))
             return await original(self, key, *args, **kwargs)
 
         return counted
@@ -135,7 +139,7 @@ class Counter:
 
         async def counted(self, *args, **kwargs):
             prefix = args[0] if args else kwargs.get("prefix", "")
-            counter.ops.append((str(self.root), str(prefix), method, counter.caller))
+            counter.ops.append((str(self.root), str(prefix), method, CALLER.get()))
             async for item in original(self, *args, **kwargs):
                 yield item
 
@@ -148,7 +152,7 @@ class Counter:
         async def counted(self, prototype, key_ranges):
             key_ranges = list(key_ranges)
             for key, _byte_range in key_ranges:
-                counter.ops.append((str(self.root), str(key), "get", counter.caller))
+                counter.ops.append((str(self.root), str(key), "get", CALLER.get()))
             return await original(self, prototype, key_ranges)
 
         return counted
