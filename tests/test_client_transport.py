@@ -1636,11 +1636,74 @@ class TestDispatchGuardSeam:
             )
 
     def test_a_fixed_window_records_nothing(self):
-        # No guard: the pre-#652 pacing, byte-identical (max_in_flight / None).
-        poller = ct.StatusPoller(lambda: MemoryStore(), drop_timeout_s=1050.0, max_in_flight=3)
-        assert isinstance(poller._guard, ct.FixedWindow)
-        assert poller._guard.room(10, 1) == 2 and poller._guard.tripped is None
-        assert poller._guard.ramp == [] and poller._guard.breaker is None
+        # No guard: the pre-#652 pacing (max_in_flight), never ramping or tripping.
+        store = MemoryStore()
+        fired: list[int] = []
+        poller = ct.StatusPoller(lambda: store, drop_timeout_s=1050.0, max_in_flight=1)
+        self._register(poller, (1, 2), fired)
+        poller._tick()
+        assert fired == [1]
+        _put_status(store, 1, body=_ok_body())
+        poller._tick()  # the freed slot refills in the same tick
+        assert fired == [1, 2] and isinstance(poller._guard, ct.FixedWindow)
+        assert poller._guard.tripped is None and poller._guard.breaker is None
+        assert poller._guard.ramp == []
+
+    @staticmethod
+    def _tripping_poller(now, **kwargs):
+        # One-result window: the first drop trips timeout-ratio.
+        guard = _guard(ramp={"start": 4, "cap": 4, "window": 1}, breaker={"timeout_ratio": 0.5})
+        store = kwargs.pop("store", None) or MemoryStore()
+        poller = ct.StatusPoller(
+            lambda: store,
+            guard=guard,
+            max_retries=3,
+            clock=lambda: now["t"],
+            **kwargs,
+        )
+        return poller, guard
+
+    def test_an_invoke_fault_in_its_backoff_is_refused_after_a_trip(self):
+        now = {"t": 1000.0}
+        poller, guard = self._tripping_poller(now, drop_timeout_s=1.0)
+        fired: list[int] = []
+
+        def faulty():
+            raise RuntimeError("TooManyRequestsException")
+
+        poller.register(1, "1", dispatch=lambda: fired.append(1))
+        faulted = poller.register(2, "2", dispatch=faulty)
+        poller._tick()  # 1 fires; 2's invoke raises: class (c), backoff to t=1002
+        now["t"] = 1001.5  # 1 drops (trip) while 2 is still inside its backoff
+        poller._tick()
+        assert guard.tripped["rule"] == "timeout-ratio" and not faulted.done()
+        now["t"] = 1003.0
+        poller._tick()  # past the backoff: refused, not re-invoked
+        result = faulted.result()
+        assert (result["outcome"], result["retries"]) == ("not-dispatched", 0)
+        assert "circuit breaker tripped" in result["error"]
+        assert "Event invoke failed" not in result["error"]
+
+    def test_observe_only_entries_are_never_refused_after_a_trip(self):
+        store = MemoryStore()
+        now = {"t": 1000.0}
+        poller, guard = self._tripping_poller(now, drop_timeout_s=100.0, store=store)
+        fired: list[int] = []
+        poller.register(1, "1", dispatch=lambda: fired.append(1))
+        landed = poller.register(2, "2", dispatched_at=1100.0)  # attach-shaped
+        lost = poller.register(3, "3", dispatched_at=1100.0)
+        poller._tick()  # observe-only entries hold slots too, but are never fired
+        assert fired == [1]
+        now["t"] = 1150.0  # 1 drops: the trip
+        poller._tick()
+        assert guard.tripped is not None and not landed.done() and not lost.done()
+        _put_status(store, 2, body=_ok_body())
+        poller._tick()
+        assert landed.result()["status_code"] == 200  # from its status object
+        assert not lost.done()
+        now["t"] = 1250.0
+        poller._tick()
+        assert lost.result()["outcome"] == "failed-unknown"  # at its drop deadline
 
 
 # -- Future plumbing -------------------------------------------------------------
