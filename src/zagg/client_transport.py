@@ -106,13 +106,13 @@ def drop_timeout_s(function_timeout_s: float) -> float:
     return float(function_timeout_s) + MAX_EVENT_AGE_S + _DROP_MARGIN_S
 
 
-#: Version stamped into every status object; bump on any key change. Read back
-#: in :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump
-#: is loud rather than subtly wrong (review finding, PR #343). The manifest and
-#: tail marker carry it too, but the slim manifest (issue #588) did not bump it:
-#: the worker stamps it while the dispatcher picks slim-or-full, so only the
-#: ``shards: null`` + ``shards_omitted`` shape can say which; status objects
-#: are unchanged; the manifest's keys are not normative in the spec.
+#: Version stamped into every status object; bump on a key removal, rename, or
+#: meaning change. Additive keys ride without a bump (the slim manifest of issue
+#: #588 and the status ``error_class`` key of issue #651 both did). Read back in
+#: :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump is
+#: loud rather than subtly wrong (review finding, PR #343). The manifest and tail
+#: marker carry it too; only the slim manifest's ``shards: null`` + ``shards_omitted``
+#: shape says slim-or-full, and the manifest's keys are not normative in the spec.
 STATUS_SCHEMA_VERSION = 1
 
 #: Dispatch-manifest object name under the run prefix (issue #327 phase 2).
