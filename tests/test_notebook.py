@@ -46,6 +46,75 @@ def _windowed_cfg(unit=None):
     return cfg
 
 
+#: s3 store for the lambda-backend drives below (the backend refuses a local path).
+_STORE = "s3://out/x.zarr"
+
+
+def _lambda_dispatch_env(monkeypatch, cells=4):
+    """Stub the AWS seams of the lambda fan-out, leaving the real dispatch.
+
+    Mirrors the ``lambda_env`` fixture of ``tests/test_runner_concurrency.py``
+    (the harness behind its ``test_on_progress_fires_per_completed_shard``)
+    plus the hive lifecycle's invokes, so ``notebook.run`` drives the real
+    :func:`~zagg.runner._run_lambda` -- its own expansion, its own
+    ``n = len(cells)``, its own per-completion ticks -- with nothing but the
+    invokes mocked.
+    """
+    from unittest.mock import MagicMock
+
+    import boto3
+
+    import zagg.grids as grids_mod
+    from zagg import hive, runner
+    from zagg.concurrency import ConcurrencyReport
+
+    grid = MagicMock()
+    grid.signature.return_value = {}
+    grid.spatial_signature.return_value = {}
+    grid.block_index.side_effect = lambda k: (k,)
+    monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: grid)
+    monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        runner,
+        "get_nsidc_s3_credentials",
+        lambda: {"accessKeyId": "AKIA", "secretAccessKey": "s", "sessionToken": "t"},
+    )
+    monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 900)
+    monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_invoke_lambda_setup_async", lambda *a, **k: "full")
+    monkeypatch.setattr(runner, "_invoke_lambda_icechunk_init", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_invoke_lambda_finalize", lambda *a, **k: None)
+    # The hive manifest checker (issue #274) polls the output store; keep the
+    # run read-free rather than reaching for a bucket that is not there
+    # (``tests/test_client.py`` does the same for its parity drives).
+    monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: None)
+    monkeypatch.setattr(
+        runner,
+        "compute_available_workers",
+        lambda requested, *a, **k: (
+            cells,
+            ConcurrencyReport(
+                account_limit=1000,
+                current_concurrent=0,
+                padding=100,
+                available=900,
+                function_reserved=None,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_invoke_lambda_cell",
+        lambda *a, **k: {
+            "status_code": 200,
+            "body": {"total_obs": 5},
+            "error": None,
+            "lambda_duration": 1.0,
+            "shard_key": 0,
+        },
+    )
+
+
 def _preview_stub():
     return {
         "n_units": 4,
@@ -411,6 +480,10 @@ class TestRunWrapper:
         # bulk windowed run of ONE invoke pre-sized to 0/9 and jumped when it
         # returned. Total is now the invoke count, and the label follows the
         # unit -- a bar saying "shards" must not tick per (shard, window).
+        # Driven through the REAL ``_run_lambda`` with only the invokes stubbed
+        # (issue #648 fold): the ticks come from the dispatch, and the expected
+        # counts are hand-written (4 shards, x8 yearly windows on this
+        # fixture), so neither side is re-derived from ``_expand_units``.
         sized = []
         ticks = []
 
@@ -425,20 +498,9 @@ class TestRunWrapper:
             sized.append((total, desc))
             return _Recorder()
 
-        def fake_agg(config, *, on_progress=None, **kwargs):
-            # Stand in for the dispatch: _with_progress ticks once per
-            # dispatched unit, so walk the real expansion's length.
-            from zagg import runner
-
-            cells = runner._select_cells(runner._load_catalog(SHARDMAP))
-            n = len(runner._expand_units(cells, config))
-            for i in range(1, n + 1):
-                on_progress(i, n, None)
-            return {"backend": "lambda"}
-
-        monkeypatch.setattr("zagg.runner.agg", fake_agg)
+        _lambda_dispatch_env(monkeypatch)
         monkeypatch.setattr(notebook, "_make_progress", _factory)
-        notebook.run(cfg_fn(), catalog=SHARDMAP, backend="lambda")
+        notebook.run(cfg_fn(), catalog=SHARDMAP, store=_STORE, backend="lambda")
         assert sized == [(units, noun)]
         # Ends exactly at its pre-sized total: no stall short, no overshoot.
         assert ticks[-1] == (units, units)
