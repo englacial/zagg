@@ -705,7 +705,7 @@ variant of the run's function family (`process-shard-4096-disk` for the
 default stack, `runner.STAGE_SWEEP_WORKER`), resolved by
 `runner._resolve_stage_function_name` — the run's function with its
 `-<memory>[-disk]` suffix replaced, or `ZAGG_LAMBDA_STAGE_FUNCTION_NAME`
-verbatim when set. From issue #587 to issue #659 it was the 8,192 MB variant:
+verbatim when set. From PR #587 to issue #659 it was the 8,192 MB variant:
 the stopgap ruled on issue #586 (2026-09-26) after the 0.55 fleet's order-6
 stage died at the 4 GB cap on 64 unwindowed leaves, when the fold densified
 a whole level of the node in memory. The fold is now streamed block by block
