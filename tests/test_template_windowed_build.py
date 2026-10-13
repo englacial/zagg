@@ -168,6 +168,13 @@ def test_pyramid_check_passes(built):
     # ``passed`` tolerates a skip; the value legs must actually run.
     for check in ("materialization", "columns", "readback", "counts", "digests"):
         assert report["checks"][check]["status"] == "pass", format_report(report)
+    # Exactly one leg is red -- the issue #650 all-time one that
+    # ``test_the_all_time_leg_fails_until_649`` owns. This is the verdict for
+    # every OTHER leg too: a strict xfail fires only on a pass, so it cannot
+    # carry them, and without this line declaration, coordinates, records,
+    # composition and idempotency would be asserted by nothing in this file.
+    failed = sorted(n for n, c in report["checks"].items() if c["status"] == "fail")
+    assert failed == ["all_time"], format_report(report)
     assert report["windows"] == list(WINDOWS)
     assert report["roster"]["leaves"] == len(shards) * len(WINDOWS)
     assert report["all_time_nodes"]["missing"] == []
