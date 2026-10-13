@@ -1775,6 +1775,9 @@ class _LeafUnit:
         self.identity = None
         self.box: dict = {}
         self.write_elapsed = 0.0
+        # This window's column fold, kept resident for the shard's all-time
+        # column (issue #649): filled by ``write_leaf_column`` in :meth:`finish`.
+        self.column_fold: dict = {}
         # A windowed leaf stores no per-cell ``morton`` array (issue #586
         # phase 3, spec §1.5 "The cell coordinate"): the word is derived from
         # the leaf id and the rank, so the template omits the member and the
@@ -2250,6 +2253,7 @@ class _LeafUnit:
                     time_range=time_range,
                     granule_count=metadata.get("granule_count", 0),
                     store_kwargs=store_kwargs,
+                    folded_out=self.column_fold,
                 )
             except Exception as e:
                 # Reported, not raised: the leaf is already COMMITTED here, so
@@ -2633,8 +2637,70 @@ def _process_windows(
             else None,
             **shard_kwargs,
         )
+        _close_windows(
+            shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs
+        )
     base["duration_s"] = time.time() - t0
     return _shard_meta(base, [metas[w["label"]] for w in windows])
+
+
+def _close_windows(shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs):
+    """The shard's all-time column from its RESIDENT window folds (issue #649).
+
+    After the bulk unit's windows land, their column folds (each
+    ``_LeafUnit.column_fold``) are folded once more, cell for cell across the
+    windows in ascending label order, into ``all.pyramid.zarr`` beside them
+    (:func:`zagg.column_alltime.close_shard` — the sweep's close law, one
+    tier down). The resident path requires every window of the shard to be
+    in memory: one the gate skipped as current, one that failed, or one that
+    was refused has no fold here, and the member is left for the stored-column
+    path to write (the issue's phase 2) rather than folded short under a name
+    that claims the whole record. A window whose sink kept nothing (the
+    benign no-data error) has no leaf and no column, and is simply not a
+    source. A failure is the SHARD's error — the windows' leaves and columns
+    are committed and keep their metadata and records; the invoke fails so
+    the dispatcher retries the shard — reported through the same channel a
+    failed column uses, never raised past the telemetry envelope.
+    """
+    from zagg.column import column_name
+    from zagg.column_alltime import _ResidentColumn, close_shard
+    from zagg.dispatch import BENIGN_ERRORS
+
+    row = []
+    for w in windows:
+        m = metas[w["label"]]
+        if m.get("current") or m.get("refused"):
+            return  # not resident: the stored-column path's case
+        if m.get("error"):
+            if m["error"] in BENIGN_ERRORS:
+                continue  # no leaf, no column: not a source
+            return  # a failed window: the retry rewrites it and the member
+        if not m.get("leaf_column"):
+            continue  # no column declared: nothing to fold (the close then clears)
+        row.append(
+            _ResidentColumn(
+                column_name(w["label"]),
+                units[w["label"]].column_fold,
+                node_order=grid.parent_order,
+                cell_order=grid.child_order,
+                granule_count=m.get("granule_count", 0),
+                time_range=m.get("time_range"),
+            )
+        )
+    _t0 = time.time()
+    try:
+        column = close_shard(
+            store_root, shard_key, grid, config, row, store_kwargs=unit_kwargs["store_kwargs"]
+        )
+    except Exception as e:
+        logger.error(f"all-time column write failed for shard {shard_key}: {e}")
+        base["error"] = f"all-time column: {e}"
+        base["all_time_column_error"] = str(e)
+        return
+    if column is not None:
+        base["all_time_column"] = column
+        if "phase_timings" in base:
+            base["phase_timings"]["all_time_column"] = time.time() - _t0
 
 
 def _shard_meta(base: dict, window_metas: list) -> dict:

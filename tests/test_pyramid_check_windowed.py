@@ -188,6 +188,13 @@ def _write_all_time_columns(root: Path) -> None:
     window token and the declared leaf-column groups, which a copy of one
     window's column carries). It is not a fold and does not model one. Delete
     this and call the real fold once #649 ships one.
+
+    Phase 1 of #649 writes the real member on the bulk path, but only when
+    every window of the shard is resident in the invoke: the append run here
+    gate-skips the windows the first run left current, so it leaves the first
+    run's member standing — folded over the windows of THAT run, stale. The
+    stand-in replaces it until the stored-column path (phase 2) folds the
+    skipped windows back in.
     """
     from zagg.column import COLUMN_ATTR
     from zagg.windows import SCHEDULE_NONE_TOKEN
@@ -197,6 +204,7 @@ def _write_all_time_columns(root: Path) -> None:
         windows = sorted(p for p in node.glob("*.pyramid.zarr") if p.name != "all.pyramid.zarr")
         assert windows, node
         member = node / "all.pyramid.zarr"
+        shutil.rmtree(member, ignore_errors=True)
         shutil.copytree(windows[-1], member)
         _set_attrs(member, lambda a: a[COLUMN_ATTR].update(window=SCHEDULE_NONE_TOKEN))
 

@@ -557,6 +557,8 @@ def write_column(
     time_range=None,
     granule_count: int = 0,
     store_kwargs: dict | None = None,
+    groups: dict | None = None,
+    provenance: dict | None = None,
 ) -> str:
     """Write one leaf's column artifact under its node prefix; returns its basename.
 
@@ -605,6 +607,17 @@ def write_column(
 
     Single-writer law (#381 point (2)): the column lives only under its
     leaf's node prefix and has exactly one writer, ever — no locking.
+
+    The windowed leaf's ALL-TIME column (issue #649, :mod:`zagg.column_alltime`)
+    is written through this same body under ``window ==``
+    :data:`~zagg.windows.SCHEDULE_NONE_TOKEN` — the token names the
+    artifact (``all.pyramid.zarr``) while the leaf path it sits beside is the
+    node's, and the stamp carries the token plus the folded windows' time
+    range, as the sweep's ``all.zarr`` stamp does. ``groups`` overrides or
+    extends a resolution's ``groups`` provenance slots (that member's
+    ``merges_from_raw`` is one deeper than the window members') and
+    ``provenance`` adds artifact-level ``zagg_column`` keys (its
+    ``source_windows``); a window column passes neither.
     """
     import zarr
     from mortie import generate_morton_children
@@ -633,7 +646,9 @@ def write_column(
             f"ever rewrites a leaf; got resolutions {resolutions}"
         )
     boundary = raw_fold_boundary(node_order, cell_order, resolutions)
-    leaf_path = shard_leaf_path(store_root, shard_key, window=window)
+    leaf_path = shard_leaf_path(
+        store_root, shard_key, window=None if window == SCHEDULE_NONE_TOKEN else window
+    )
     node_prefix = leaf_path.rstrip("/").rsplit("/", 1)[0]
     basename = column_name(window)
     path = f"{node_prefix}/{basename}"
@@ -676,9 +691,11 @@ def write_column(
                         "regime": LEAF_REGIME,
                         "merges_from_raw": member_merges_from_raw(res, boundary),
                         "n_cells": 4 ** (res - node_order),
+                        **((groups or {}).get(res) or {}),
                     }
                     for res in resolutions
                 },
+                **(provenance or {}),
                 "cells_with_data_order": resolutions[0],
                 "generated_at": _utcnow(),
             },
@@ -899,6 +916,7 @@ def write_leaf_column(
     time_range=None,
     granule_count: int = 0,
     store_kwargs: dict | None = None,
+    folded_out: dict | None = None,
 ) -> str | None:
     """Fold and write one leaf's column from its resident staged slabs.
 
@@ -932,6 +950,13 @@ def write_leaf_column(
     rides ON TOP of whatever the worker holds at this hook (``staged``
     itself, at least): on Lambda that releases only once the handler
     returns from ``process_and_write_hive``.
+
+    ``folded_out`` (issue #649), when given, receives the fold that was
+    written — ``{resolution: {field: slab}}`` — so the bulk multi-window unit
+    can keep each window's column RESIDENT and fold the shard's all-time
+    column from the exact values it wrote (:mod:`zagg.column_alltime`), with
+    no read-back. δ-bounded digests at the column resolutions: a few MB per
+    window, against the shard's own slabs.
     """
     store_kwargs = dict(store_kwargs or {})
     # The gate re-validates a declaration the templating path already
@@ -954,6 +979,8 @@ def write_leaf_column(
         resolutions=resolutions,
         node_order=grid.parent_order,
     )
+    if folded_out is not None:
+        folded_out.update(folded)
     return write_column(
         store_root,
         shard_key,

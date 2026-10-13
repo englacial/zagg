@@ -5,9 +5,9 @@ from either — the local backend over ATL03-shaped fake granules, only the
 h5coro transport stubbed — must come out with one leaf per (shard, year), the
 ``all`` row allocated beside them, the declared ladder folded by the staged
 sweep the template chains by default (issue #620), an Icechunk repo at the
-root with one row per window plus ``all`` (issue #604), and a ``pyramid_check``
-report clean but for the one leg issue #649 is open on (the leaf tier's
-all-time member, xfailed below). Nothing but the template's own ``data_source``
+root with one row per window plus ``all`` (issue #604), the leaf tier's
+all-time member folded beside each shard's window columns (issue #649), and a
+clean ``pyramid_check`` report. Nothing but the template's own ``data_source``
 paths is spelled here: a template that stopped validating, lost its
 ``delta_time`` column or its windowing block, or declared a ladder the leaf
 worker cannot write would fail this file by name.
@@ -23,7 +23,6 @@ import test_windowed_emit as emit
 
 from zagg import hive, runner
 from zagg.config import default_config, get_windowing
-from zagg.grids.morton import morton_decimal
 from zagg.hive import MANIFEST_NAME
 from zagg.pyramid_check import format_report, validate_pyramid
 
@@ -177,41 +176,93 @@ def test_pyramid_check_passes(built, report):
     # ``passed`` tolerates a skip; the value legs must actually run.
     for check in ("materialization", "columns", "readback", "counts", "digests"):
         assert report["checks"][check]["status"] == "pass", format_report(report)
-    # Exactly one leg is red -- the issue #650 all-time one that
-    # ``test_the_all_time_leg_fails_until_649`` owns. This is the verdict for
-    # every OTHER leg too: a strict xfail fires only on a pass, so it cannot
-    # carry them, and without this line declaration, coordinates, records,
-    # composition and idempotency would be asserted by nothing in this file.
+    # No leg is red; the all-time leg in particular, which until issue #649's
+    # close was the one failing leg of this store. A strict xfail cannot carry
+    # the other legs, so they are asserted by name here too.
     failed = sorted(n for n, c in report["checks"].items() if c["status"] == "fail")
-    assert failed == ["all_time"], format_report(report)
+    assert failed == [], format_report(report)
+    assert report["checks"]["all_time"]["status"] == "pass", format_report(report)
     assert report["windows"] == list(WINDOWS)
     assert report["roster"]["leaves"] == len(shards) * len(WINDOWS)
     assert report["all_time_nodes"]["missing"] == []
     assert report["columns"]["missing"] == [] and report["columns"]["partial"] == []
-    # The all-time fold is there above the shard and missing AT it: the leaf
-    # tier's ``all.pyramid.zarr`` is what issue #649 has yet to write, so the
-    # declared leaf levels have no all-time member and the store's default
-    # view is short its finest four. ``test_the_all_time_leg_fails_until_649``
-    # owns that verdict; everything else above is green already.
+    # The all-time fold is there above the shard AND at it: every leaf carries
+    # ``all.pyramid.zarr`` beside its window columns (issue #649), so the
+    # declared leaf levels have their all-time member and the store's default
+    # view reaches its finest four.
     assert report["all_time_columns"] == {
         "declared": len(shards),
-        "materialized": 0,
-        "missing": sorted(morton_decimal(k) for k in shards),
+        "materialized": len(shards),
+        "missing": [],
     }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="issue #649: a windowed run writes no all.pyramid.zarr, so the declared leaf-column "
-    "levels have no all-time member and the issue #650 all_time leg fails by leaf. Flips to "
-    "PASS when the shard-level close of #649 lands — delete the marker then.",
-)
-def test_the_all_time_leg_fails_until_649(report):
-    # Only the leg the reason names. ``passed`` would widen the flip
-    # condition: if #649 landed while some other leg was red this would stay
-    # xfailed and the marker undeleted. "No other leg is red" is
-    # ``test_pyramid_check_passes``'s job, and it asserts it by name.
-    assert report["checks"]["all_time"]["status"] == "pass", format_report(report)
+def test_the_all_time_column_is_the_kway_fold_of_the_window_columns(built):
+    """Issue #649's resident path on the v4 shape: at every declared leaf-column
+    level the ``all`` member's exact fields are the window members' sum, its
+    digests their k-way fold and its composition word the §3.4 merge of their
+    ``(word, n)`` pairs, in ascending window order — the close law, per
+    field class off the member's own recorded ``fields``."""
+    import zarr
+
+    from zagg.column import COLUMN_ATTR
+    from zagg.stats.composition import merge_composition_kway
+    from zagg.store import open_store
+    from zagg.sweep_overview import decode_digest, fold_digests, payload_weight
+    from zagg.windows import SCHEDULE_NONE_TOKEN
+
+    name, cfg, root, shards = built
+    for shard in shards:
+        node = hive.shard_leaf_path(str(root), shard).rsplit("/", 1)[0]
+        columns = {
+            w: zarr.open_group(open_store(f"{node}/{w}.pyramid.zarr"), mode="r", zarr_format=3)
+            for w in (*WINDOWS, SCHEDULE_NONE_TOKEN)
+        }
+        block = dict(columns[SCHEDULE_NONE_TOKEN].attrs)[COLUMN_ATTR]
+        assert block["window"] == SCHEDULE_NONE_TOKEN
+        assert block["source_windows"] == {"folded": 3, "missing": 0, "unreadable": 0}
+        windows = [dict(columns[w].attrs)[COLUMN_ATTR] for w in WINDOWS]
+        fields = block["fields"]
+        assert {m["class"] for m in fields.values()} >= {"exact", "approximate"}
+        for res in map(str, (16, 15, 14, 13, 12, 11, 10, 9)):
+            assert block["groups"][res]["merges_from_raw"] == 1 + max(
+                w["groups"][res]["merges_from_raw"] for w in windows
+            )
+            all_time = columns[SCHEDULE_NONE_TOKEN][res]
+            members = [columns[w][res] for w in WINDOWS]
+            populated = np.flatnonzero(np.asarray(all_time["count"][:]))
+            assert len(populated)
+            for field, meta in fields.items():
+                if meta["class"] == "exact":
+                    assert meta["method"] == "sum"
+                    np.testing.assert_array_equal(
+                        all_time[field][:], sum(np.asarray(m[field][:]) for m in members)
+                    )
+                    continue
+                if meta["class"] == "approximate":
+                    stored = [np.asarray(m[field][:]) for m in members]
+                    folded = np.asarray(all_time[field][:])
+                    for j in populated:
+                        cell = [decode_digest(d[j], meta["dtype"]) for d in stored if len(d[j])]
+                        expected = (
+                            fold_digests(cell, delta=meta["overview_delta"], dtype=meta["dtype"])
+                            if cell
+                            else b""
+                        )
+                        assert bytes(folded[j]) == expected, (shard, res, field, j)
+                    continue
+                of, of_dtype = meta["of"], fields[meta["of"]]["dtype"]
+                words = [np.asarray(m[field][:]) for m in members]
+                weights = [np.asarray(m[of][:]) for m in members]
+                folded = np.asarray(all_time[field][:])
+                for j in populated:
+                    parts = [
+                        (int(w[j]), n)
+                        for w, d in zip(words, weights)
+                        if (n := payload_weight(d[j], of_dtype)) > 0
+                    ]
+                    expected = merge_composition_kway(parts) if parts else 0
+                    assert int(folded[j]) == expected, (shard, res, field, j)
 
 
 #: Per-shard leaf ``count`` totals by year, from the fixture: each granule
