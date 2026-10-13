@@ -2679,9 +2679,10 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     invoke's, so a per-leaf record's fleet-safety columns describe the invoke
     that produced it), and every written one with ``unit_windows``; the shard meta carries the
     window-independent fields once, the sums, the time-range union, the
-    first failed window's error with its ``error_class`` (issue #651; a
-    benign no-data window is not a failure), and ``current`` / ``refused``
-    only when every window skipped that way.
+    failed window's error with its ``error_class`` (issue #651; the
+    store-fatal window that ended the invoke when there is one, else the
+    first failed; a benign no-data window is not a failure), and
+    ``current`` / ``refused`` only when every window skipped that way.
     """
     from zagg.windows import union_time_range
 
@@ -2708,7 +2709,7 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     # benign string, so the whole-shard case still classifies as no data.
     failed = [m for m in written if m.get("error") and m["error"] not in BENIGN_ERRORS]
     if failed:
-        first = failed[0]
+        first = next((m for m in failed if m.get("error_class") == STORE_FATAL), failed[0])
         more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
         meta["error_class"] = first.get("error_class") or STORE_TRANSIENT

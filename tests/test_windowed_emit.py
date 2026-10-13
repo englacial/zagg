@@ -840,6 +840,26 @@ class TestBulkEndToEnd:
         assert _leaf_obs(root, shard, "2018", _grid(_cfg())) == 1
         assert not Path(hive.shard_leaf_path(root, shard, window="2020")).exists()
 
+    def test_the_shard_names_its_fatal_window(self, monkeypatch, tmp_path):
+        # Review finding (2): a transient 2018 before a fatal 2019 reports
+        # the window that ended the invoke, not the first failed one.
+        from obstore.exceptions import GenericError
+
+        finish = hive._LeafUnit.finish
+
+        def _failing(self, metadata):
+            if self.label == "2018":
+                raise RuntimeError("PUT failed")
+            if self.label == "2019":
+                raise GenericError("Generic S3 error: Got invalid DeleteObjects response: EOF")
+            return finish(self, metadata)
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _failing)
+        meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"))
+        assert [m["error_class"] for m in meta["windows"]] == ["transient", "store-fatal"]
+        assert meta["error"].startswith("window 2019: GenericError")
+        assert meta["error_class"] == "store-fatal" and meta["windows_unattempted"] == ["2020"]
+
     def test_a_returned_source_denial_never_ends_the_shard(self, monkeypatch, tmp_path):
         # Review finding (1): a RETURNED error is the no-data channel, whose
         # text can carry a source read's 403 exemplar -- not a store refusal.
