@@ -15,7 +15,7 @@ unwindowed counterpart, and the harness holds it to what spec §4.2–§4.6 stat
   the node and the window that hold it; one carrying another window's name
   in its attrs fails read-back on every node, sampled or not.
 - **the all-time fold** — ``all.zarr`` at every ladder node and, beside each
-  leaf's window columns, ``all.pyramid.zarr`` (§4.6, issue #650), present
+  leaf's window columns, ``all.pyramid.zarr`` (issues #650/#649), present
   exactly where the manifest declares ``pyramid.overview.all_time`` (§4.5). Its
   source is the node's OWN per-window overviews (§4.4 "The all-time fold of a
   windowed store"), so per sampled node the harness lists the windows the
@@ -817,7 +817,7 @@ def _all_time_check(
     Declared, every ladder node that has a leaf beneath it in any window must
     carry a committed ``all.zarr`` (one GET each); ``sample_nodes`` of them
     per order (all in full mode) are then held to the fold's contract — see
-    :func:`_all_time_node`. The declared LEAF-column levels (§4.6) have an
+    :func:`_all_time_node`. The declared LEAF-column levels have an
     all-time member too — ``all.pyramid.zarr`` — which the ladder cannot see
     (:func:`zagg.pyramid_check._ladder` drops the leaf entry, whose node IS
     the shard order), so it is probed here per roster leaf (issue #650).
@@ -889,8 +889,8 @@ def _all_time_check(
     column_finding = col_missing and (
         f"{len(col_missing)}/{len(leaves)} leaf/leaves carry no committed all.pyramid.zarr: "
         f"{col_missing[:8]} — the declared leaf-column levels {levels} have NO all-time "
-        f"member, so the store's default view is missing them (§4.6; the base, cells {base}, "
-        f"is exempt — an all-time leaf IS the unwindowed store)"
+        f"member, so the store's default view is missing them (issue #650; the base, cells "
+        f"{base}, is exempt — an all-time leaf IS the unwindowed store)"
     )
     if not committed:
         checks["all_time"] = _entry(
