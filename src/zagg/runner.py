@@ -2541,7 +2541,7 @@ _UNIT_NOUN = {
 }
 
 
-def unit_noun(config: PipelineConfig) -> str:
+def _unit_noun(config: PipelineConfig) -> str:
     """The progress bar's label for this config's dispatch unit (issue #648).
 
     Falls back to ``"units"`` for an unlisted kind: the caller
