@@ -110,6 +110,20 @@ class TestRamp:
         g.record(_ok())
         assert g.width == 1000
 
+    def test_results_fired_at_the_old_width_do_not_advance_the_step(self):
+        # Stamped results gate on the width they were dispatched at: the
+        # 250-wide wave's stragglers completing after the widen are not
+        # evidence for 500 -> 1000.
+        g = _guard(ramp={"start": 250})
+        _feed(g, [{**_ok(), "dispatch_width": 250} for _ in range(50)])
+        assert g.width == 500
+        _feed(g, [{**_ok(), "dispatch_width": 250} for _ in range(100)])
+        assert g.width == 500
+        _feed(g, [{**_ok(), "dispatch_width": 500} for _ in range(49)])
+        assert g.width == 500
+        g.record({**_ok(), "dispatch_width": 500})
+        assert g.width == 1000 and g.ramp[-1]["at_result"] == 200
+
     def test_results_without_timings_never_widen(self):
         results = [_ok() for _ in range(80)]
         for r in results:

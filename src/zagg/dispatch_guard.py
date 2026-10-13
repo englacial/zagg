@@ -9,8 +9,9 @@ the one seam that decides what fires next
 
 - **Ramp** -- the in-flight width starts at ``start`` and multiplies by
   ``factor`` up to ``cap`` (never above the run's ``workers``) once the last
-  ``window`` results completed at the current width have a median write
-  phase (status ``timings``: ``write + column + icechunk``) within
+  ``window`` results dispatched at the current width (a result's
+  ``dispatch_width`` stamp; unstamped, those completed since the width took
+  effect) have a median write phase (status ``timings``: ``write + column + icechunk``) within
   ``tolerance`` x the baseline, the median of the run's first ``window``
   write phases. The first wave IS the canary: it is just the ramp's first
   step. With the ruled defaults (500 -> 1,000, one step) the first step's
@@ -171,6 +172,7 @@ class ResultRecord:
     write_s: float | None
     timeout: bool
     store_fatal: bool
+    dispatch_width: int | None = None
 
 
 def _median(values: list) -> float | None:
@@ -208,6 +210,7 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
         write_s=sum(parts) if parts else None,
         timeout=timeout,
         store_fatal=failed and error_class == STORE_FATAL,
+        dispatch_width=result.get("dispatch_width"),
     )
 
 
@@ -286,7 +289,11 @@ class DispatchGuard:
         samples = [r.write_s for r in self._records if r.write_s is not None]
         if self._baseline is None and len(samples) >= cfg.window:
             self._baseline = _median(samples[: cfg.window])
-        at_width = [r.write_s for r in self._records[self._widened_at :] if r.write_s is not None]
+        at_width = [
+            r.write_s
+            for r in self._records[self._widened_at :]
+            if r.write_s is not None and r.dispatch_width in (None, self.width)
+        ]
         baseline, current = self._baseline, _median(at_width[-cfg.window :])
         if baseline is None or current is None or len(at_width) < cfg.window:
             return
