@@ -116,9 +116,9 @@ def hash_arrays(
 ) -> dict[str, str]:
     """O11 per-array hashes of every named zarr array beneath ``group``.
 
-    ``group`` is an open zarr v3 group at the leaf ROOT; the scope is
-    discovery-based (§5.1): ``members(max_depth=None)``, so the key set is
-    whatever named arrays exist beneath the root — data fields, ragged vlen
+    ``group`` is an open zarr v3 group at the leaf ROOT; absent ``nodes`` the
+    scope is discovery-based (§5.1): ``members(max_depth=None)``, so the key
+    set is whatever named arrays exist beneath the root — data fields, ragged vlen
     payloads and their locations siblings, ``morton``, every coordinate —
     keyed by the array's path relative to the leaf root (e.g. ``"8/morton"``).
 
@@ -142,11 +142,16 @@ def hash_arrays(
     set is taken from it and ``group`` is not consulted — the discovery walk
     is one listing per group plus one GET per member document, the third
     read of every ``zarr.json`` the leaf path used to issue. The two scopes
-    coincide by construction for the writers that pass it: each cleared its
-    prefix before templating and is the artifact's only writer, so the store
-    holds exactly the nodes it created (pinned by the write-read parity tests
-    and the byte-identical stamps in ``tests/test_write_request_counts.py``).
-    Readers and verifiers keep the discovery scope.
+    coincide for the writers that pass it: each cleared its prefix before
+    templating, and a concurrent duplicate writer (an Event retry, see
+    ``hive._LeafUnit._leaf``) emits the same template from the same config
+    over the same cleared prefix, so the store holds exactly the node set
+    each writer created. The equivalence is pinned by the write-read parity
+    tests (``TestWorkerWiring::test_write_read_parity``,
+    ``TestCoverageCompleteness``, ``TestWriterNodeSet`` in
+    ``tests/test_content_hash.py``) and the byte-identical stamps in
+    ``tests/test_write_request_counts.py``. Readers and verifiers keep the
+    discovery scope.
     """
     import zarr
 
