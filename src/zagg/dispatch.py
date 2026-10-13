@@ -369,7 +369,10 @@ _STORE_RETRYABLE_STATUSES = frozenset({408, 429})
 #: Refusal text with no status to key on: object_store's malformed-body parse
 #: failures (``Got invalid DeleteObjects response``), S3 error codes that
 #: arrive without their status, and the write path's own contract refusals
-#: (``hive`` / ``column`` raise ``ValueError`` naming the spec section).
+#: (``hive`` / ``column`` raise ``ValueError`` naming the spec section, or
+#: saying ``refusing to`` / ``gate refused``). Each token names a refusal, never
+#: a bare word: ``Connection refused`` and a ``KeyError``'s ``not found`` are
+#: not store refusals and stay transient.
 _STORE_FATAL_TOKENS = (
     "got invalid",
     "malformed",
@@ -380,11 +383,12 @@ _STORE_FATAL_TOKENS = (
     "invalid argument",
     "nosuchbucket",
     "no such bucket",
-    "not found",
+    "nosuchkey",
     "permission denied",
     "unauthenticated",
     "forbidden",
-    "refus",
+    "refusing to",
+    "gate refused",
     "spec §",
 )
 
