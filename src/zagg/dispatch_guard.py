@@ -201,7 +201,9 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
         wall = float(function_timeout_s)
     timings = body.get("phase_timings") or {}
     parts = [timings[k] for k in WRITE_PHASES if isinstance(timings.get(k), (int, float))]
-    failed = bool(error) and error not in BENIGN_ERRORS and not timeout
+    # The no-data channel's text starts with its benign entry and may carry a
+    # source read's 403/404 exemplar after it: benign, never store-fatal.
+    failed = bool(error) and not str(error).startswith(BENIGN_ERRORS) and not timeout
     error_class = result.get("error_class") or body.get("error_class")
     if error_class is None and failed:
         error_class = classify_store_error(error)

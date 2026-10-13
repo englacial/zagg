@@ -290,6 +290,20 @@ class TestClassifyResult:
         rec = classify_result(result, function_timeout_s=TIMEOUT_S)
         assert not rec.timeout and not rec.store_fatal
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "No data after filtering (e.g. HTTP status client error (404 Not Found))",
+            "No data after filtering (3 reads raised; e.g. HTTP status client error "
+            "(403 Forbidden))",
+        ],
+    )
+    def test_a_benign_prefixed_error_is_not_store_fatal(self, error):
+        result = {"status_code": 500, "body": {}, "error": error, "lambda_duration": 5}
+        assert not classify_result(result, function_timeout_s=TIMEOUT_S).store_fatal
+        g = _feed(_guard(), [dict(result) for _ in range(5)])
+        assert g.tripped is None
+
 
 class TestGuardConfig:
     def test_defaults_match_the_ruling(self):
