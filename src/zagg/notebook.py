@@ -162,8 +162,10 @@ def max_cost_preview(
     - ``families`` -- the separate families pass, when the tail fires one
       (a hive store with the sweep on whose rollups do NOT ride the staged
       sweep's node closes, :func:`zagg.runner._cascade_families`): one
-      invoke per :func:`zagg.sweep_partition.families_partitions` plus the
-      finisher.
+      invoke when :func:`zagg.sweep_partition.families_partitions` is 1 (that
+      pass is the finisher), else one per NON-EMPTY bucket of
+      :func:`zagg.sweep_partition.partition_leaves` plus the finisher -- what
+      :func:`zagg.sweep_fleet.run_families_sweep_fleet` fires.
     - ``tail`` -- the fixed invokes: ping, setup, finalize backstop and the
       run-stats record, the Icechunk init and finalize when the companion
       repo is on, and the stage finisher when the sweep is staged. An upper
@@ -181,7 +183,7 @@ def max_cost_preview(
     """
     from zagg import runner
     from zagg.grids import from_config
-    from zagg.sweep_partition import families_partitions
+    from zagg.sweep_partition import families_partitions, partition_leaves
 
     if get_pipeline_type(config) == "temporal":
         raise ValueError(
@@ -219,7 +221,10 @@ def max_cost_preview(
         else 0
     )
     rides = bool(runner._cascade_families(config, grid)) if staged else False
-    n_families = families_partitions(leaves) + 1 if sweeps and leaves and not rides else 0
+    n_families = 0
+    if sweeps and leaves and not rides:
+        n = families_partitions(leaves)
+        n_families = 1 if n == 1 else len(partition_leaves(leaves, n)) + 1
     n_tail = 4 + (2 if get_icechunk(config) else 0) + (1 if n_stage else 0)
     legs = {
         "leaves": _leg(len(cells), memory_gb, timeout_s, typical["leaves"]),
