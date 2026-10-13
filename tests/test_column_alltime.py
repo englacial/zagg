@@ -318,10 +318,59 @@ class TestBulkUnit:
         )
         assert [m["window"] for m in meta["windows"]] == ["2020"]
         assert meta["error"] is None and "all_time_column" not in meta
-        assert {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k} == before
-        assert json.loads((member / "zarr.json").read_text())["attributes"][COLUMN_ATTR][
-            "source_windows"
-        ] == {"folded": 3, "missing": 0, "unreadable": 0}
+        # Nor is the three-window member left standing: it folds the 2020
+        # column this run rewrote, and absent beats stale (finding (2)).
+        assert before and not member.exists()
+        assert not (_node(root) / "all.pyramid.stats.json").exists()
+        assert (_node(root) / "2018.pyramid.zarr").exists()
+
+    def test_a_partly_current_rerun_clears_the_member_it_would_leave_stale(
+        self, monkeypatch, tmp_path
+    ):
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert (_node(root) / "all.pyramid.zarr").exists()
+        gate = hive._LeafUnit.gate
+
+        def _current(self, *, allow_contraction):
+            if self.label == "2018":
+                return {"shard_key": int(self.shard_key), "window": "2018", "current": True}
+            return gate(self, allow_contraction=allow_contraction)
+
+        monkeypatch.setattr(hive._LeafUnit, "gate", _current)
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert meta["error"] is None and "all_time_column" not in meta
+        assert not (_node(root) / "all.pyramid.zarr").exists()
+
+    def test_an_all_current_rerun_leaves_the_member_standing(self, monkeypatch, tmp_path):
+        # Nothing changed, so the member is still correct: no clear.
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        before = emit._tree(root)
+
+        def _current(self, *, allow_contraction):
+            return {"shard_key": int(self.shard_key), "window": self.label, "current": True}
+
+        monkeypatch.setattr(hive._LeafUnit, "gate", _current)
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert meta["current"] is True and emit._tree(root) == before
+
+    def test_a_fanout_window_unit_clears_the_member(self, monkeypatch, tmp_path):
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        out = emit._run_fanout(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), records=[emit._records()[1]]
+        )
+        assert list(out) == ["2020"] and out["2020"]["error"] is None
+        assert not (_node(root) / "all.pyramid.zarr").exists()
+        assert (_node(root) / "2020.pyramid.zarr").exists()
 
     def test_the_stored_labels_are_the_window_columns_beside_the_shard(self, monkeypatch, tmp_path):
         from zagg.column_alltime import stored_window_labels

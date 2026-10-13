@@ -2530,7 +2530,21 @@ def process_and_write_hive(
         **unit.sinks(),
         temporal_out=unit.temporal_acc,
     )
-    return unit.finish(metadata)
+    meta = unit.finish(metadata)
+    if window is not None and not meta.get("error"):
+        # A fan-out window unit rewrote one window column the shard's all-time
+        # member folds (issue #649): the member is stale, and absent beats
+        # stale until the stored-column path (phase 2) rewrites it here. A
+        # failed clear is the unit's error, as a failed column is.
+        from zagg.column import _clear_column
+
+        try:
+            _clear_column(store_root, shard_key, None, store_kwargs)
+        except Exception as e:
+            logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
+            meta["error"] = f"all-time column: {e}"
+            meta["all_time_column_error"] = str(e)
+    return meta
 
 
 def _process_windows(
@@ -2658,26 +2672,33 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
     sends only the windows they touch — one LIST of the node,
     :func:`zagg.column_alltime.stored_window_labels`); the member is then left
     for the stored-column path to write (the issue's phase 2) rather than
-    folded short under a name that claims the whole record. A window whose
-    sink kept nothing (the benign no-data error) has no leaf and no column,
-    and is simply not a source. A failure is the SHARD's error — the windows' leaves and columns
-    are committed and keep their metadata and records; the invoke fails so
+    folded short under a name that claims the whole record. A deferred
+    close whose invoke WROTE a window CLEARS the standing member: it folds
+    that window's previous column, and absent beats stale (the
+    :func:`zagg.column._clear_column` rule); an invoke that changed nothing
+    leaves it. A window whose sink kept nothing (the benign no-data error)
+    has no leaf and no column, and is simply not a source. A failure is the
+    SHARD's error — the windows' leaves and columns are committed and keep their metadata and records; the invoke fails so
     the dispatcher retries the shard — reported through the same channel a
     failed column uses, never raised past the telemetry envelope.
     """
-    from zagg.column import column_name
+    from zagg.column import _clear_column, column_name
     from zagg.column_alltime import _ResidentColumn, close_shard, stored_window_labels
     from zagg.dispatch import BENIGN_ERRORS
 
-    row, resident = [], set()
+    row, resident, deferred, wrote = [], set(), False, False
     for w in windows:
         m = metas[w["label"]]
         if m.get("current") or m.get("refused"):
-            return  # not resident: the stored-column path's case
+            deferred = True  # not resident: the stored-column path's case
+            continue
+        # Landed, or committed its leaf before its column failed.
+        wrote |= not m.get("error") or bool(m.get("column_error"))
         if m.get("error"):
-            if m["error"] in BENIGN_ERRORS:
-                continue  # no leaf, no column: not a source
-            return  # a failed window: the retry rewrites it and the member
+            # Benign: no leaf, no column, not a source. Otherwise a failed
+            # window: the retry rewrites it and the member.
+            deferred |= m["error"] not in BENIGN_ERRORS
+            continue
         if not m.get("leaf_column"):
             continue  # no column declared: nothing to fold (the close then clears)
         resident.add(w["label"])
@@ -2694,8 +2715,12 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
     _t0 = time.time()
     store_kwargs = unit_kwargs["store_kwargs"]
     try:
-        if not stored_window_labels(store_root, shard_key, store_kwargs) <= resident:
-            return  # a stored window this invoke does not hold: the stored-column path's case
+        if not deferred:  # a stored window this invoke does not hold defers too
+            deferred = not stored_window_labels(store_root, shard_key, store_kwargs) <= resident
+        if deferred:
+            if wrote:
+                _clear_column(store_root, shard_key, None, store_kwargs)
+            return
         column = close_shard(store_root, shard_key, grid, config, row, store_kwargs=store_kwargs)
     except Exception as e:
         logger.error(f"all-time column write failed for shard {shard_key}: {e}")

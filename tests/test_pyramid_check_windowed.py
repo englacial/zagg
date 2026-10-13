@@ -136,6 +136,9 @@ def built(tmp_path_factory):
         # as current to the staged sweep. No fleet rewrites a leaf that fast.
         time.sleep(1.1)
         _run(monkeypatch, tmp_path, root, first_run=False)
+    # The append cleared the member the first run wrote (issue #649 review
+    # finding (2)); the copy still holds it.
+    assert list(early.rglob("all.pyramid.zarr")) and not list(root.rglob("all.pyramid.zarr"))
     for store in (root, early):
         _write_all_time_columns(store)
     return root, early
@@ -190,11 +193,13 @@ def _write_all_time_columns(root: Path) -> None:
     this and call the real fold once #649 ships one.
 
     Phase 1 of #649 writes the real member on the bulk path, but only when
-    every window of the shard is resident in the invoke: the append run here
-    gate-skips the windows the first run left current, so it leaves the first
-    run's member standing — folded over the windows of THAT run, stale. The
-    stand-in replaces it until the stored-column path (phase 2) folds the
-    skipped windows back in.
+    every window the shard holds is resident in the invoke: the append run
+    here gate-skips the windows the first run left current, so it CLEARS the
+    first run's member (it folds a window the append rewrote, and absent
+    beats stale) and writes none. The first-run copy keeps that run's real
+    member, which the ``rmtree`` drops so both stores carry the same
+    stand-in. Both go once the stored-column path (phase 2) folds the skipped
+    windows back in.
     """
     from zagg.column import COLUMN_ATTR
     from zagg.windows import SCHEDULE_NONE_TOKEN
