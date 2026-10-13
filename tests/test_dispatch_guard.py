@@ -100,6 +100,12 @@ class TestRamp:
         assert g.width == 1000
         assert [s["width"] for s in g.ramp] == [250, 500, 1000]
 
+    def test_a_window_at_exactly_the_tolerance_widens(self):
+        g = _guard(ramp={"start": 250})
+        _feed(g, [_ok(write=100.0)] * 50)
+        _feed(g, [_ok(write=120.0)] * 50)  # exactly 1.2x the baseline
+        assert g.width == 1000
+
     def test_the_window_at_the_new_width_starts_fresh(self):
         # After widening, the results completed at the OLD width are not the
         # evidence for the next step: 50 new ones have to land first.
@@ -257,11 +263,18 @@ class TestBreaker:
         _feed(g, [_ok()] * 100)
         assert g.tripped == verdict and g.width == 500 and len(g.ramp) == 1
 
-    def test_the_first_trip_wins(self):
-        # Three store-fatal AND a timeout storm in the first 20: store-fatal
-        # is evaluated first and the verdict names it.
-        g = _feed(_guard(), [_failed(error_class="store-fatal")] * 3 + [_timeout()] * 47)
-        assert g.tripped["rule"] == RULE_STORE_FATAL
+    def test_store_fatal_wins_when_both_rules_fire_on_one_record(self):
+        # At result 10 store-fatal reaches 3 AND the timeout ratio (7/10) is
+        # first evaluable: store-fatal is checked first and the verdict names it.
+        fatal = _failed(error_class="store-fatal")
+        g = _feed(_guard(ramp={"window": 10}), [fatal] * 2 + [_timeout()] * 7)
+        assert g.tripped is None
+        g.record(fatal)
+        assert g.tripped["rule"] == RULE_STORE_FATAL and g.tripped["at_result"] == 10
+
+    def test_wall_at_exactly_the_margin_does_not_hold(self):
+        g = _feed(_guard(), [_ok(wall=765.0)] * 50)  # 0.85 * 900, not over it
+        assert g.breaker is None and g.width == 1000
 
 
 class TestRoomAndRefusal:
