@@ -32,8 +32,10 @@ the deepest window member folded** at that group (2 at or above the raw-fold
 boundary, 3 below it — the rule the stage close applies to its sources,
 :func:`zagg.sweep_fold._gather_depth` + 1), and the artifact carries
 ``source_windows`` — ``{folded, missing, unreadable}`` over the window
-columns — exactly as the sweep's ``all.zarr`` does. The commit stamp carries
-the token and the folded windows' time-range union, as the sweep's does.
+columns — as the sweep's ``all.zarr`` does, a window refused at any group
+counting ``unreadable`` (:func:`write_all_time_column`). The commit stamp
+carries the token and the folded windows' time-range union, as the sweep's
+does.
 """
 
 from __future__ import annotations
@@ -93,8 +95,9 @@ class _ResidentColumn(_ColumnReader):
 def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> tuple:
     """``(folded, depth, broken, demotions)`` over ``row``.
 
-    ``folded`` is ``{res: {field: slab}}``, ``depth`` ``{res: merges_from_raw}``,
-    ``broken`` the windows the kernel refused, and ``demotions`` ``{res:
+    ``folded`` is ``{res: {field: slab}}``, ``depth`` ``{res: merges_from_raw}``
+    over the windows folded AT that group, ``broken`` ``{res: windows}`` the
+    kernel refused there (review finding (8)), and ``demotions`` ``{res:
     records}`` — the packed rail's :func:`zagg.sweep_overview.demotion_records`
     at each group where it fired, and only there (review finding (7)).
 
@@ -106,9 +109,8 @@ def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> t
     1`` with the shard as the one child: output cell ``j`` is the k-way fold
     of the windows' cell ``j`` at that resolution, the sweep's close law. A
     window carrying one half of a companion pair at some group is refused
-    there and returned in ``broken`` (the kernel's posture — never folded
-    payload-only); it counts ``unreadable`` in the artifact's
-    ``source_windows``. A window whose column lacks a group (a declaration
+    THERE alone and returned in ``broken[res]`` (the kernel's posture — never
+    folded payload-only); its other groups still fold it. A window whose column lacks a group (a declaration
     deepened since it was written) contributes fill there, the kernel's
     schema-evolution rule; a window carrying a packed field's divisor digest
     without its word (a column written before the field was declared)
@@ -117,7 +119,7 @@ def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> t
     """
     folded: dict = {}
     depth: dict = {}
-    broken: set = set()
+    broken: dict = {}
     demoted: dict = {}
     for res in sorted((int(r) for r in resolutions), reverse=True):
         n_out = 4 ** (res - int(node_order))
@@ -125,8 +127,9 @@ def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> t
             [row], fields, res_src=res, src_per_child=n_out, factor=1, n_out=n_out
         )
         folded[res] = slabs
-        depth[res] = _gather_depth([row], res) + 1
-        broken |= {w for _child, w in bad}
+        broken[res] = {w for _child, w in bad}
+        kept = [None if w in broken[res] else entry for w, entry in enumerate(row)]
+        depth[res] = _gather_depth([kept], res) + 1
         if demotions:
             demoted[res] = demotions
         for record in demotions:
@@ -153,12 +156,16 @@ def write_all_time_column(
     A thin caller of :func:`zagg.column.write_column` under the reserved
     window token: the fold's groups, ``merges_from_raw`` one deeper than the
     window members' (and the packed rail's ``demotions`` where it fired), the
-    ``source_windows`` counters, a stamp carrying the
-    folded windows' granule counts summed and their time ranges unioned (the
-    stage close's own derivation, :func:`zagg.sweep_stage._fold_result`).
-    ``None``, and nothing written, when no window source is a committed
-    column — there is nothing to fold, and an all-time member folded from
-    nothing would claim a record it does not hold.
+    ``source_windows`` counters, and a stamp. One stated derivation (review
+    finding (8)): a window counts ``folded`` in ``source_windows`` only when
+    no group refused it — one refused at ANY group counts ``unreadable``, as
+    an unopenable one does, since the member under-covers it there — while
+    the stamp sums the granule counts and unions the time ranges of every
+    window folded at ANY group, the record whose content the bytes carry.
+    (:func:`zagg.sweep_units.close_node` refuses per window over the stage's
+    one group; a multi-group column needs the split.) ``None``, and nothing
+    written, when no window is folded at any group — an all-time member
+    folded from nothing would claim a record it does not hold.
     """
     from zagg.column import write_column
     from zagg.windows import SCHEDULE_NONE_TOKEN, union_time_range
@@ -168,10 +175,12 @@ def write_all_time_column(
     folded, depth, broken, demoted = fold_all_time(
         row, fields, node_order=node_order, resolutions=resolutions
     )
-    used = [entry for w, entry in enumerate(row) if _is_reader(entry) and w not in broken]
+    readers = [w for w, entry in enumerate(row) if _is_reader(entry)]
+    used = [row[w] for w in readers if any(w not in bad for bad in broken.values())]
     if not used:
         logger.warning(f"shard {shard_key}: no window column could be folded; no all-time column")
         return None
+    whole = sum(1 for w in readers if not any(w in bad for bad in broken.values()))
     missing = sum(1 for entry in row if entry is None)
     ranges = [s.stamp["time_range"] for s in used if s.stamp.get("time_range") is not None]
     return write_column(
@@ -193,9 +202,9 @@ def write_all_time_column(
         },
         provenance={
             "source_windows": {
-                "folded": len(used),
+                "folded": whole,
                 "missing": missing,
-                "unreadable": len(row) - len(used) - missing,
+                "unreadable": len(row) - whole - missing,
             }
         },
     )

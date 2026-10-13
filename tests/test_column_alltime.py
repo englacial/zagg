@@ -85,7 +85,8 @@ class TestFoldAllTime:
         folded, depth, broken, demotions = fold_all_time(
             _resident(folds), tc.FIELDS, node_order=tc.SHARD_ORDER, resolutions=resolutions
         )
-        assert broken == set() and demotions == {} and sorted(folded) == sorted(resolutions)
+        assert broken == {r: set() for r in resolutions} and demotions == {}
+        assert sorted(folded) == sorted(resolutions)
         for res in resolutions:
             expected = _oracle(folds, res)
             assert set(folded[res]) == set(expected)
@@ -134,7 +135,7 @@ class TestFoldAllTime:
         )
         two = _oracle({k: v for k, v in folds.items() if k != "2019"}, tc.CELL_ORDER)
         np.testing.assert_array_equal(folded[tc.CELL_ORDER]["count"], two["count"])
-        assert broken == set()
+        assert broken == {tc.CELL_ORDER: set()}
         basename = write_all_time_column(
             str(tmp_path),
             tc.morton_word("-311"),
@@ -187,6 +188,55 @@ class TestFoldAllTime:
         )
         groups = _attrs(tmp_path / "clean", basename)[COLUMN_ATTR]["groups"]
         assert not any("demotions" in g for g in groups.values())
+
+    def test_a_refusal_is_per_group_and_the_counters_say_so(self, tmp_path):
+        # Review finding (8): 2019 carries its digest's location sibling at
+        # every group but the coarsest, so the kernel refuses it THERE alone.
+        from zagg.sweep_fold import _gather_depth
+
+        n = 4 ** (tc.CELL_ORDER - tc.SHARD_ORDER)
+        resolutions = [tc.CELL_ORDER, tc.CELL_ORDER - 1, tc.SHARD_ORDER]
+        folds = {}
+        for k, label in enumerate(("2018", "2019")):
+            slabs, _truth = tc._located_cell_slabs(
+                {0: np.arange(5.0) + k, 1: np.arange(3.0)}, tc.LOCATED_FIELDS, n
+            )
+            folds[label] = fold_column(
+                slabs,
+                tc.LOCATED_FIELDS,
+                cell_order=tc.CELL_ORDER,
+                resolutions=resolutions,
+                node_order=tc.SHARD_ORDER,
+            )
+        del folds["2019"][tc.SHARD_ORDER]["h_tdigest_locations"]
+        row = _resident(folds)
+        # A refused window's depth must not reach the group that refused it.
+        groups = row[1].attrs[COLUMN_ATTR]["groups"]
+        for res in resolutions:
+            groups[str(res)]["merges_from_raw"] = 5
+        folded, depth, broken, _demotions = fold_all_time(
+            row, tc.LOCATED_FIELDS, node_order=tc.SHARD_ORDER, resolutions=resolutions
+        )
+        assert broken == {tc.CELL_ORDER: set(), tc.CELL_ORDER - 1: set(), tc.SHARD_ORDER: {1}}
+        assert depth[tc.SHARD_ORDER] == _gather_depth([row[:1]], tc.SHARD_ORDER) + 1 == 2
+        assert depth[tc.CELL_ORDER] == depth[tc.CELL_ORDER - 1] == 6
+        # 2019's digest still folds at the groups that did not refuse it.
+        finest = decode_digest(folded[tc.CELL_ORDER]["h_tdigest"][0], "float32")
+        assert finest[:, 1].sum() == 10
+        basename = write_all_time_column(
+            str(tmp_path),
+            tc.morton_word("-311"),
+            row,
+            tc.LOCATED_FIELDS,
+            node_order=tc.SHARD_ORDER,
+            cell_order=tc.CELL_ORDER,
+            resolutions=resolutions,
+        )
+        attrs = _attrs(tmp_path, basename)
+        assert attrs[COLUMN_ATTR]["source_windows"] == {"folded": 1, "missing": 0, "unreadable": 1}
+        # The stamp covers every window folded at some group: both.
+        assert attrs[COMMIT_ATTR]["granule_count"] == 2
+        assert attrs[COMMIT_ATTR]["time_range"][1].startswith("2019-12-31")
 
     def test_nothing_to_fold_writes_nothing(self, tmp_path):
         assert (
