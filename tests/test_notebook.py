@@ -425,9 +425,10 @@ def _synthetic_shardmap(tmp_path, decimals, years):
     return str(path)
 
 
-# Five order-9 shards: three under one order-8 parent, two under another, all
-# under one order-7 ancestor -- so the dispatch node count is 2 at order 8 and
-# 1 at every coarser order (sized schedule: dispatch orders 7, 5, 3, 1, 0).
+# Five order-9 shards: three under one order-8 parent, two under another, and
+# the two parents under different order-7 nodes (43314222, 43314224) -- so the
+# sized schedule (dispatch orders 7, 5, 3, 1, 0) has 2 dispatch nodes at order
+# 7 and 1 at each coarser order.
 _DECIMALS = ["4331422231", "4331422232", "4331422233", "4331422411", "4331422412"]
 
 
@@ -450,7 +451,8 @@ class TestCostLegs:
             cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019, 2020, 2021))
         )
         stage = preview["legs"]["stage"]
-        # 3 windows + 1 close per dispatch node, over 2 + 1 + 1 + 1 + 1 nodes = 24.
+        # 3 windows + 1 close per dispatch node, over 2 + 1 + 1 + 1 + 1 nodes
+        # (dispatch orders 7, 5, 3, 1, 0) = 24.
         assert stage["invokes"] == _expected_stage_invokes(_DECIMALS, 3 + 1) == 24
         assert preview["n_units"] == preview["legs"]["leaves"]["invokes"] == 5
         # The stage tier is the dispatcher's (issue #659: the leaf tier).
