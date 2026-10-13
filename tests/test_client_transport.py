@@ -1446,6 +1446,182 @@ class TestKeys:
         assert ct.drop_timeout_s(900) == 900 + 60 + 90
 
 
+# -- dispatch ramp + circuit breaker through the poller (issue #652) -----------------
+
+
+def _guard(**knobs):
+    from zagg.dispatch_guard import DispatchGuard, GuardConfig
+
+    return DispatchGuard(GuardConfig.from_dict(knobs), function_timeout_s=900.0)
+
+
+def _ok_body(write=10.0):
+    return {
+        "total_obs": 7,
+        "duration_total_s": 600.0,
+        "phase_timings": {"read": 50.0, "write": write, "column": write},
+    }
+
+
+class TestDispatchGuardSeam:
+    """``StatusPoller`` paces by its ``guard`` (issue #652): the ramp widens the
+    window as flat-timed results land, a trip refuses every queued shard
+    (``not-dispatched``, through the caller's failure policy) and re-fires
+    nothing, and in-flight invokes still resolve from their status objects.
+    Tick-driven with a fake clock, no threads."""
+
+    @staticmethod
+    def _register(poller, keys, fired):
+        return {k: poller.register(k, str(k), dispatch=lambda k=k: fired.append(k)) for k in keys}
+
+    def test_the_ramp_widens_the_window_as_flat_results_land(self):
+        store = MemoryStore()
+        guard = _guard(ramp={"start": 1, "cap": 4, "window": 2})
+        fired: list[int] = []
+        poller = ct.StatusPoller(lambda: store, guard=guard, drop_timeout_s=1050.0)
+        self._register(poller, range(1, 11), fired)
+        poller._tick()
+        assert fired == [1]  # the canary: the ramp's first wave
+        _put_status(store, 1, body=_ok_body())
+        poller._tick()  # one result is short of the window; the freed slot refills
+        assert fired == [1, 2] and guard.width == 1
+        _put_status(store, 2, body=_ok_body())
+        poller._tick()  # two flat results: 1 -> 2, and the wider window fires 3, 4
+        assert fired == [1, 2, 3, 4] and guard.width == 2
+        for k in (3, 4):
+            _put_status(store, k, body=_ok_body())
+        poller._tick()  # two results AT width 2: 2 -> 4
+        assert fired == list(range(1, 9)) and guard.width == 4
+        assert guard.ramp == [
+            {"width": 1, "at_result": 0},
+            {"width": 2, "at_result": 2},
+            {"width": 4, "at_result": 4},
+        ]
+        # Every attempt is stamped with the width it fired at.
+        widths = {e.shard_key: e.dispatch_width for e in poller._entries.values()}
+        assert widths == {1: 1, 2: 1, 3: 2, 4: 2, 5: 4, 6: 4, 7: 4, 8: 4, 9: None, 10: None}
+
+    def test_results_fired_at_the_old_width_do_not_advance_the_step(self):
+        store = MemoryStore()
+        guard = _guard(ramp={"start": 2, "cap": 8, "window": 2})
+        fired: list[int] = []
+        poller = ct.StatusPoller(lambda: store, guard=guard, drop_timeout_s=1050.0)
+        self._register(poller, range(1, 11), fired)
+        poller._tick()
+        _put_status(store, 1, body=_ok_body())
+        poller._tick()  # shard 3 fires at width 2
+        _put_status(store, 2, body=_ok_body())
+        poller._tick()  # the window is flat: 2 -> 4; 4, 5, 6 fire at width 4
+        assert fired == [1, 2, 3, 4, 5, 6] and guard.width == 4
+        _put_status(store, 3, body=_ok_body())
+        poller._tick()  # a width-2 result: no evidence for the next step
+        assert guard.width == 4
+        for k in (4, 5):
+            _put_status(store, k, body=_ok_body())
+        poller._tick()  # two width-4 results: 4 -> 8
+        assert guard.width == 8
+
+    def test_a_timeout_storm_trips_the_breaker_and_refuses_the_queue(self):
+        store = MemoryStore()
+        guard = _guard(ramp={"start": 2, "cap": 2, "window": 2}, breaker={"timeout_ratio": 0.5})
+        now = {"t": 1000.0}
+        fired: list[int] = []
+        failed: list[tuple] = []
+
+        def on_failed(entry, result):
+            failed.append((entry.shard_key, result))
+            entry.future.set_result(result)
+
+        poller = ct.StatusPoller(
+            lambda: store,
+            guard=guard,
+            drop_timeout_s=100.0,
+            max_retries=3,
+            clock=lambda: now["t"],
+            on_failed=on_failed,
+        )
+        futures = self._register(poller, range(1, 6), fired)
+        poller._tick()
+        assert fired == [1, 2]
+        now["t"] = 1200.0  # both past the drop deadline: 2 of the last 2 timed out
+        poller._tick()
+        assert guard.tripped["rule"] == "timeout-ratio"
+        # Nothing else is invoked: shard 1 dropped BEFORE the trip and was
+        # re-queued (class (b)), so its re-fire is refused; shard 2's drop IS
+        # the trip, so it resolves failed-unknown with no re-fire; the queue is
+        # refused. All through the caller's failure policy.
+        assert fired == [1, 2]
+        assert all(f.done() for f in futures.values())
+        outcomes = {k: (f.result()["outcome"], f.result()["retries"]) for k, f in futures.items()}
+        assert outcomes == {
+            1: ("not-dispatched", 0),  # one attempt made, the re-fire refused
+            2: ("failed-unknown", 0),
+            3: ("not-dispatched", -1),  # never attempted, as after a shutdown
+            4: ("not-dispatched", -1),
+            5: ("not-dispatched", -1),
+        }
+        assert sorted(k for k, _ in failed) == [1, 2, 3, 4, 5]
+        refusal = futures[3].result()
+        assert "timeout-ratio" in refusal["error"] and refusal["status_code"] is None
+
+    def test_in_flight_invokes_finish_after_a_trip(self):
+        store = MemoryStore()
+        guard = _guard(ramp={"start": 2, "cap": 2, "window": 2}, breaker={"timeout_ratio": 0.4})
+        now = {"t": 1000.0}
+        fired: list[int] = []
+        poller = ct.StatusPoller(
+            lambda: store, guard=guard, drop_timeout_s=95.0, clock=lambda: now["t"]
+        )
+        futures = self._register(poller, range(1, 6), fired)
+        poller._tick()  # 1, 2 fire at t=1000
+        _put_status(store, 1, body=_ok_body())
+        now["t"] = 1010.0
+        poller._tick()  # 1 lands; 3 fires at t=1010
+        assert fired == [1, 2, 3]
+        now["t"] = 1100.0  # 2's deadline (1095) passed, 3's (1105) has not
+        poller._tick()
+        assert guard.tripped["rule"] == "timeout-ratio"  # 1 of the last 2
+        assert fired == [1, 2, 3]
+        assert futures[2].result()["outcome"] == "failed-unknown"
+        assert futures[4].result()["outcome"] == futures[5].result()["outcome"] == "not-dispatched"
+        assert not futures[3].done()  # in flight: it cannot be recalled
+        _put_status(store, 3, body=_ok_body())
+        poller._tick()
+        assert futures[3].result()["status_code"] == 200  # ... and its result still lands
+
+    def test_store_fatal_statuses_trip_and_a_late_registration_is_refused(self):
+        store = MemoryStore()
+        guard = _guard(breaker={"store_fatal": 2, "store_fatal_first": 5})
+        fired: list[int] = []
+        poller = ct.StatusPoller(lambda: store, guard=guard, drop_timeout_s=1050.0)
+        futures = self._register(poller, range(1, 5), fired)
+        poller._tick()
+        assert fired == [1, 2, 3, 4]  # all inside the 500-wide first wave
+        for k in (1, 2):
+            _put_status(
+                store,
+                k,
+                status="failed",
+                status_code=500,
+                error="window 2018 failed: HTTP status client error (403 Forbidden)",
+                body={"error": "window 2018 failed: HTTP status client error (403 Forbidden)"},
+            )
+        poller._tick()
+        assert guard.tripped["rule"] == "store-fatal" and guard.tripped["at_result"] == 2
+        assert futures[1].result()["status_code"] == 500  # the failed status is terminal, as before
+        late = poller.register(9, "9", dispatch=lambda: fired.append(9))
+        poller._tick()
+        assert late.result()["outcome"] == "not-dispatched" and 9 not in fired
+        assert not futures[3].done() and not futures[4].done()  # left to finish
+
+    def test_a_fixed_window_records_nothing(self):
+        # No guard: the pre-#652 pacing, byte-identical (max_in_flight / None).
+        poller = ct.StatusPoller(lambda: MemoryStore(), drop_timeout_s=1050.0, max_in_flight=3)
+        assert isinstance(poller._guard, ct.FixedWindow)
+        assert poller._guard.room(10, 1) == 2 and poller._guard.tripped is None
+        assert poller._guard.ramp == [] and poller._guard.breaker is None
+
+
 # -- Future plumbing -------------------------------------------------------------
 
 

@@ -259,6 +259,7 @@ class FixedWindow:
 
     def __init__(self, max_in_flight: int | None):
         self._max = max_in_flight
+        self.width = max_in_flight  # what the poller stamps on each result
 
     def record(self, result: dict) -> None:
         pass

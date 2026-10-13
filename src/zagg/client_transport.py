@@ -56,6 +56,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from zagg.dispatch import BENIGN_ERRORS
+from zagg.dispatch_guard import FixedWindow
 from zagg.telemetry import billed_seconds
 
 logger = logging.getLogger(__name__)
@@ -705,6 +706,7 @@ class _ShardEntry:
     drop_refires: int = 0  # class-(b) re-fires spent (see StatusPoller)
     retry_not_before: float = 0.0  # class-(c) backoff: don't re-fire before this
     dispatched_at: float | None = None  # this attempt's dispatch clock
+    dispatch_width: int | None = None  # the guard's width when this attempt fired (#652)
     first_dispatched_at: float | None = None
     consumed: set = field(default_factory=set)  # attempt_ids already acted on
 
@@ -736,10 +738,10 @@ class StatusPoller:
     mystery.
 
     The poller also owns Event dispatch: shards register with a zero-arg
-    ``dispatch`` closure and at most ``max_in_flight`` are
-    dispatched-unresolved at once (the concurrency preflight's clamp —
-    load-bearing under the fleet's 60 s ``MaximumEventAgeInSeconds``, which
-    silently drops an Event that cannot start in time).
+    ``dispatch`` closure and ``guard`` paces them — a fixed ``max_in_flight``
+    window (the preflight clamp, load-bearing under the fleet's 60 s
+    ``MaximumEventAgeInSeconds``) or the issue #652 ramp + breaker, which also
+    refuses every queued shard once it trips (:mod:`zagg.dispatch_guard`).
 
     **Retry policy — three fault classes** (issue #327 amendment (b) as folded
     from the PR #343 review; espg's to veto). Function errors never return to
@@ -797,6 +799,7 @@ class StatusPoller:
         drop_timeout_s: float,
         max_retries: int = 3,
         max_in_flight: int | None = None,
+        guard=None,
         on_failed: Callable[[_ShardEntry, dict], None] | None = None,
         initial_interval_s: float | None = None,
         max_interval_s: float | None = None,
@@ -806,7 +809,7 @@ class StatusPoller:
         self._store: Any = None
         self._drop_timeout_s = drop_timeout_s
         self._max_retries = max(1, int(max_retries))
-        self._max_in_flight = max_in_flight
+        self._guard: Any = guard if guard is not None else FixedWindow(max_in_flight)
         self._on_failed = on_failed
         # None -> the module constants, read at construction so tests can
         # scale the cadence for every internally-built poller.
@@ -937,10 +940,6 @@ class StatusPoller:
             ]
         return min(stamps) - self._clock() if stamps else None
 
-    def _pending(self) -> list[_ShardEntry]:
-        with self._lock:
-            return [e for e in self._entries.values() if not e.future.done()]
-
     def _tick(self) -> bool:
         # Resolve BEFORE dispatching so a slot freed by a resolution refills in
         # the SAME tick (review finding, PR #343: dispatching first left the
@@ -952,7 +951,8 @@ class StatusPoller:
 
     def _resolve_landed(self) -> bool:
         """Consume newly-landed status objects; classify past-deadline shards."""
-        pending = [e for e in self._pending() if not e.queued]
+        with self._lock:
+            pending = [e for e in self._entries.values() if not e.queued and not e.future.done()]
         if not pending:
             return False
         progressed = False
@@ -972,12 +972,10 @@ class StatusPoller:
         return progressed
 
     def _dispatch_up_to_window(self) -> bool:
-        """Fire queued shards while the in-flight window has room (pacing).
+        """Fire queued shards while the guard's window has room (issue #652 pacing).
 
-        A queued entry still inside its class-(c) backoff is skipped (not
-        counted against the window either — a parked shard holds no slot), so
-        the loop terminates on a faulting dispatch instead of spinning the whole
-        retry budget in one pass.
+        A queued entry inside its class-(c) backoff is skipped (and holds no
+        slot), so a faulting dispatch cannot spin the retry budget in one pass.
         """
         dispatched = False
         while True:
@@ -991,10 +989,7 @@ class StatusPoller:
                 in_flight = sum(
                     1 for e in self._entries.values() if not e.queued and not e.future.done()
                 )
-                room = (
-                    len(queued) if self._max_in_flight is None else self._max_in_flight - in_flight
-                )
-                batch = queued[: max(room, 0)]
+                batch = queued[: self._guard.room(len(queued), in_flight)]
                 for entry in batch:
                     entry.queued = False
             if not batch:
@@ -1007,7 +1002,11 @@ class StatusPoller:
         dispatch = entry.dispatch
         if dispatch is None:  # observe-only entries are never queued (attach)
             return
+        if self._guard.tripped is not None:  # the breaker: refuse, never invoke (issue #652)
+            self._resolve_failure(entry, self._result(entry, **self._guard.refusal()))
+            return
         entry.attempts += 1
+        entry.dispatch_width = self._guard.width
         entry.retry_not_before = 0.0  # this attempt cleared any armed backoff
         entry.dispatched_at = self._clock()
         if entry.first_dispatched_at is None:
@@ -1086,6 +1085,7 @@ class StatusPoller:
             body=obj.get("body") or {},
             error=obj.get("error"),
         )
+        self._guard.record({**result, "dispatch_width": entry.dispatch_width})
         if obj.get("status") in ("ok", "no_data"):
             entry.future.set_result(result)
         else:
@@ -1106,9 +1106,7 @@ class StatusPoller:
             "timeout": False,
             "granule_count": entry.granule_count,
         }
-        if outcome is not None:
-            result["outcome"] = outcome
-        return result
+        return {**result, "outcome": outcome} if outcome is not None else result
 
     # -- the three retry classes (see the class docstring) --------------------
 
@@ -1133,6 +1131,7 @@ class StatusPoller:
         """
         if (
             entry.dispatch is not None
+            and self._guard.tripped is None  # a tripped breaker re-fires nothing (#652)
             and entry.drop_refires < _MAX_DROP_REFIRES
             and entry.attempts < self._max_retries
         ):
@@ -1196,4 +1195,5 @@ class StatusPoller:
             ),
             outcome="failed-unknown",
         )
+        self._guard.record({**result, "dispatch_width": entry.dispatch_width})
         self._drop_failed(entry, result)
