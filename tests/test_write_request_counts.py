@@ -63,11 +63,15 @@ ZARR_ENTRY = (
 
 #: Per-(shard, window) ceilings over the leaf + column prefixes. Issue #657
 #: phase 1 pins today's writer; later phases lower them (acceptance: metadata
-#: GETs < 10, metadata PUTs one per ``zarr.json``, total <= 250).
+#: GETs < 10, metadata PUTs one per ``zarr.json``, total <= 250). A kind with
+#: no entry (data GET, HEAD, ``list``, ``list_prefix``) is pinned at zero.
 CEILINGS = {
     "metadata GET": 285,
     "metadata PUT": 100,
     "data PUT": 82,
+    "data DELETE": 28,
+    "delete_dir": 14,
+    "list_dir": 12,
     "total": 490,
 }
 
@@ -261,8 +265,8 @@ def test_requests_per_shard_window_stay_under_the_ceilings(counted_build):
     print("\n" + report)
     for unit, counter in buckets.items():
         totals = _totals(counter)
-        for kind, ceiling in CEILINGS.items():
-            assert totals.get(kind, 0) <= ceiling, (unit, kind, totals, report)
+        for kind, count in totals.items():
+            assert count <= CEILINGS.get(kind, 0), (unit, kind, totals, report)
 
 
 def test_every_unit_lands_its_objects(counted_build):
