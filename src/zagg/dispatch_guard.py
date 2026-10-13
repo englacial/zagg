@@ -141,10 +141,13 @@ class GuardConfig:
     @classmethod
     def from_dict(cls, block: dict | None) -> GuardConfig:
         """Validate a ``dispatch`` block; ``None`` / ``{}`` is the defaults."""
+        if block is not None and not isinstance(block, dict):
+            raise ValueError(f"dispatch must be a mapping (got {block!r})")
         block = dict(block or {})
         values: dict = {}
         for group, names in (("ramp", cls._RAMP), ("breaker", cls._BREAKER)):
-            sub = block.pop(group, None) or {}
+            sub = block.pop(group, None)
+            sub = {} if sub is None else sub
             if not isinstance(sub, dict):
                 raise ValueError(f"dispatch.{group} must be a mapping (got {sub!r})")
             unknown = set(sub) - set(names)
@@ -165,11 +168,16 @@ class GuardConfig:
             raise ValueError(f"dispatch: ramp.cap {cfg.cap} is below ramp.start {cfg.start}")
         if cfg.tolerance < 1.0:
             raise ValueError(f"dispatch: ramp.tolerance must be >= 1.0 (got {cfg.tolerance!r})")
-        for name in ("timeout_ratio", "wall_fraction"):
-            if getattr(cfg, name) > 1.0:
+        for name in ("timeout_ratio", "wall_fraction"):  # at 1.0 the rule can never fire
+            if getattr(cfg, name) >= 1.0:
                 raise ValueError(
-                    f"dispatch: breaker.{name} must be <= 1.0 (got {getattr(cfg, name)!r})"
+                    f"dispatch: breaker.{name} must be < 1.0 (got {getattr(cfg, name)!r})"
                 )
+        if cfg.store_fatal > cfg.store_fatal_first:
+            raise ValueError(
+                f"dispatch: breaker.store_fatal {cfg.store_fatal} exceeds "
+                f"breaker.store_fatal_first {cfg.store_fatal_first}, so it can never trip"
+            )
         return cfg
 
     def as_dict(self) -> dict:
