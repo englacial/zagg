@@ -219,7 +219,8 @@ class _Built(NamedTuple):
     #: the deletes it allowed (prefix clears, sidecars)
     deletes: list
     #: the same build with the guard off through a permissive store (zarr's
-    #: own delete-on-all-fill, as before #653), for the key-set match
+    #: own delete-on-all-fill, as before #653), for the key-set match; None
+    #: for the single-digest template, which has no all-fill slab to compare
     permissive: object
 
 
@@ -230,13 +231,15 @@ def built(request, tmp_path_factory):
     with pytest.MonkeyPatch.context() as monkeypatch:
         cfg, root, shards = _build(monkeypatch, tmp_path, request.param, refuse_chunk_deletes=True)
     attempted, deletes = _NoChunkDeletes.attempted, _NoChunkDeletes.deletes
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        _, permissive, _ = _build(
-            monkeypatch,
-            tmp_path_factory.mktemp("permissive-store"),
-            request.param,
-            refuse_chunk_deletes=False,
-        )
+    permissive = None
+    if request.param == TEMPLATES[0]:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            _, permissive, _ = _build(
+                monkeypatch,
+                tmp_path_factory.mktemp("permissive-store"),
+                request.param,
+                refuse_chunk_deletes=False,
+            )
     return _Built(request.param, cfg, root, shards, attempted, deletes, permissive)
 
 
@@ -384,25 +387,34 @@ def _objects(root):
 _RUN_DIR = re.compile(r"^run-[0-9a-f]{32}-[0-9a-f]{8}$")
 
 
+_NO_FILL_SLAB = "the single-digest template has no all-fill slab: the refusal alone is its check"
+
+
 def test_the_build_never_asks_the_store_to_delete_a_chunk(built):
     """Issue #653: an all-fill slab is skipped, not written-as-delete.
 
     The build finishing proves nothing — a refused write is caught and logged
     per window/column and ``runner.agg`` still returns — so the proof is
     ``attempted`` staying empty (with ``test_pyramid_check_passes`` and
-    ``test_each_photon_lands_in_its_own_year`` showing every leaf landed). Only the strata template has a slab the stub
-    window leaves all fill (its signal stratum and ``composition``), so only
-    there is the skipped object's absence visible — the single-digest template
-    writes every window's one digest and is the control: nothing populated is
-    ever skipped (``test_skipped_blocks_leave_no_object_either_way``).
+    ``test_each_photon_lands_in_its_own_year`` showing every leaf landed).
+    Both templates run it: for the strata one the stub window's signal
+    stratum and ``composition`` are all fill, so this is the #653 regression
+    guard; the single-digest one writes its one digest in every window, so
+    for it this only checks that the refusal stays scoped.
     """
     name, cfg, root, shards = built[:4]
     assert built.attempted == []
     # The refusal is scoped: the per-leaf template clear (``delete_dir("")``,
     # D4) and the sidecar deletes went through, at least one per leaf.
     assert len(built.deletes) >= len(shards) * len(WINDOWS)
+
+
+def test_the_stub_windows_fill_slab_has_no_object(built):
+    """The skipped object's absence, where there is one to skip: the strata
+    template's signal stratum, populated in 2020 and all fill in 2021."""
+    name, cfg, root, shards = built[:4]
     if name != TEMPLATES[0]:
-        return
+        pytest.skip(_NO_FILL_SLAB)
     base = str(cfg.output["grid"]["child_order"])
     for shard in shards:
         leaf = {
@@ -428,5 +440,9 @@ def test_skipped_blocks_leave_no_object_either_way(built):
     The twin runs with ``all_fill`` patched to ``False``, so it is zarr's own
     pre-#653 behaviour (delete-on-all-fill); key-set equality therefore means
     the guard skipped exactly the blocks zarr would have deleted, no more.
+    Strata template only: the single-digest one has nothing to skip, so its
+    twin would match by construction and is not built.
     """
+    if built.permissive is None:
+        pytest.skip(_NO_FILL_SLAB)
     assert _objects(built.root) == _objects(built.permissive)
