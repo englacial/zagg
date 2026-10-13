@@ -2727,10 +2727,17 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
         base["error"] = f"all-time column: {e}"
         base["all_time_column_error"] = str(e)
         return
+    finally:
+        # The close's cost reaches the run records (review finding (4)): they
+        # are built per WINDOW meta, so it rides every written window's
+        # phases as the invoke's ``read`` does, and ``telemetry.merge``
+        # counts it once per invoke (``INVOKE_PHASES``).
+        elapsed = time.time() - _t0
+        for m in (base, *(m for m in metas.values() if not (m.get("current") or m.get("refused")))):
+            if "phase_timings" in m:
+                m["phase_timings"]["all_time_column"] = elapsed
     if column is not None:
         base["all_time_column"] = column
-        if "phase_timings" in base:
-            base["phase_timings"]["all_time_column"] = time.time() - _t0
 
 
 def _shard_meta(base: dict, window_metas: list) -> dict:

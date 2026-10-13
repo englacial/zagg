@@ -253,6 +253,24 @@ class TestBulkUnit:
             m["granule_count"] for m in meta["windows"]
         )
 
+    def test_the_close_cost_reaches_every_window_record_once_per_invoke(
+        self, monkeypatch, tmp_path
+    ):
+        # Review finding (4): records are built per window meta (runner and
+        # the Lambda handler alike), so the shard meta's phase is invisible.
+        from zagg.telemetry import build_record, merge
+
+        meta = emit._run_bulk(
+            monkeypatch, emit._digest_cfg(), str(tmp_path / "bulk"), fakes=emit._dense_fakes()
+        )
+        close = meta["phase_timings"]["all_time_column"]
+        records = [
+            build_record(shard_key=meta["shard_key"], metadata=m, run_id="r", window=m["window"])
+            for m in meta["windows"]
+        ]
+        assert [r["phase_timings"]["all_time_column"] for r in records] == [close] * 3
+        assert merge(records)["phase_timings"]["all_time_column"] == pytest.approx(close)
+
     def test_a_rerun_writes_the_same_bytes(self, monkeypatch, tmp_path):
         cfg = emit._digest_cfg()
         root = str(tmp_path / "bulk")
