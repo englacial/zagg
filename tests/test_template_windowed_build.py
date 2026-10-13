@@ -16,9 +16,14 @@ The build runs through a store that REFUSES to delete a chunk key the way
 the source.coop bucket did on 2026-10-12 (issue #653): one window holds
 noise only, so its leaf, column and sweep slabs for the signal stratum are
 all fill, and zarr's answer to an all-fill slab is a ``delete`` of a key that
-does not exist. The writers skip those slabs instead, and the proof is the
-build itself — plus a key-for-key match against a permissive build, since a
-skipped block and a deleted one both leave no object.
+does not exist. The writers skip those slabs instead. Finishing the build
+proves nothing: a refused write is caught and logged per window (``hive``'s
+``_emit``) or per column (the leaf-column ``except Exception``), and
+``runner.agg`` returns normally. The proof is the refuser recording no
+chunk-key delete (``attempted`` empty), ``pyramid_check`` and the per-year
+counts showing every leaf landed, and a key-for-key match against a
+guard-off permissive build, since a skipped block and a deleted one both
+leave no object.
 """
 
 from __future__ import annotations
@@ -382,8 +387,10 @@ _RUN_DIR = re.compile(r"^run-[0-9a-f]{32}-[0-9a-f]{8}$")
 def test_the_build_never_asks_the_store_to_delete_a_chunk(built):
     """Issue #653: an all-fill slab is skipped, not written-as-delete.
 
-    The build already proved it by finishing against the refusing store; the
-    assertions name the evidence. Only the strata template has a slab the stub
+    The build finishing proves nothing — a refused write is caught and logged
+    per window/column and ``runner.agg`` still returns — so the proof is
+    ``attempted`` staying empty (with ``test_pyramid_check_passes`` and
+    ``test_each_photon_lands_in_its_own_year`` showing every leaf landed). Only the strata template has a slab the stub
     window leaves all fill (its signal stratum and ``composition``), so only
     there is the skipped object's absence visible — the single-digest template
     writes every window's one digest and is the control: nothing populated is
