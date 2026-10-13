@@ -5,10 +5,10 @@ from either — the local backend over ATL03-shaped fake granules, only the
 h5coro transport stubbed — must come out with one leaf per (shard, year), the
 ``all`` row allocated beside them, the declared ladder folded by the staged
 sweep the template chains by default (issue #620), an Icechunk repo at the
-root with one row per window plus ``all`` (issue #604), and a
-``pyramid_check`` report clean but for the one leg issue #649 is open on
-(the leaf tier's all-time member, xfailed below). Nothing but the
-template's own ``data_source`` paths is spelled here: a template that stopped validating, lost its
+root with one row per window plus ``all`` (issue #604), and a ``pyramid_check``
+report clean but for the one leg issue #649 is open on (the leaf tier's
+all-time member, xfailed below). Nothing but the template's own ``data_source``
+paths is spelled here: a template that stopped validating, lost its
 ``delta_time`` column or its windowing block, or declared a ladder the leaf
 worker cannot write would fail this file by name.
 """
