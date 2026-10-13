@@ -1824,8 +1824,8 @@ class TestRaggedWriteGuards:
 class _DeleteRecordingStore(MemoryStore):
     """A ``MemoryStore`` that records every chunk-key ``delete`` zarr issues."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)  # kwargs: zarr's read-only clone (``with_read_only``)
         self.deleted: list = []
 
     async def delete(self, key):
@@ -1871,6 +1871,53 @@ class TestSkipFillWrites:
         _set_ragged_block(store, grid, "h_raw", (3,), block, skip_fill=True)
         assert self._keys(store, grid, "h_raw") == []
         assert store.deleted == []
+
+    @staticmethod
+    def _companion_case():
+        """A dense ``count`` plus a ``resolution: chunk`` companion ``anchor_h``,
+        and a carrier factory filling both with one value per column."""
+        from mortie import geo2mort
+
+        cfg = TestChunkResolutionCompanion._chunk_cfg("atl06")
+        grid = HealpixGrid(2, 4, layout="fullsphere", config=cfg)
+        store = _DeleteRecordingStore()
+        grid.emit_template(store)
+        parent = int(geo2mort(-78.5, -132.0, order=2)[0])
+        n = len(grid.children(parent))
+        fill = open_group(store=store, mode="r", path=grid.group_path)["count"].metadata.fill_value
+
+        def carrier(count, anchor):
+            stats = {
+                "count": np.full(n, count, dtype="float32"),
+                "anchor_h": np.full(n, anchor, dtype="float32"),
+            }
+            return _build_output(
+                stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
+            )
+
+        return grid, store, grid.block_index(parent), fill, carrier
+
+    def test_leaf_dense_and_companion_skip_all_fill(self):
+        grid, store, chunk_idx, fill, carrier = self._companion_case()
+        all_fill_carrier = carrier(fill, np.nan)
+        write_dataframe_to_zarr(
+            all_fill_carrier, store, grid=grid, chunk_idx=chunk_idx, skip_fill=True
+        )
+        assert self._keys(store, grid, "count") == []
+        assert self._keys(store, grid, "anchor_h") == []
+        assert store.deleted == []
+
+    def test_flat_dense_and_companion_delete_a_stale_key(self):
+        grid, store, chunk_idx, fill, carrier = self._companion_case()
+        write_dataframe_to_zarr(carrier(3, 42.5), store, grid=grid, chunk_idx=chunk_idx)
+        assert len(self._keys(store, grid, "count")) == 1
+        assert len(self._keys(store, grid, "anchor_h")) == 1
+        write_dataframe_to_zarr(carrier(fill, np.nan), store, grid=grid, chunk_idx=chunk_idx)
+        assert self._keys(store, grid, "count") == []
+        assert self._keys(store, grid, "anchor_h") == []
+        assert sorted(store.deleted) == sorted(
+            f"{grid.group_path}/{f}/c/{chunk_idx[0]}" for f in ("anchor_h", "count")
+        )
 
 
 class TestTemporalCompanionSeams:

@@ -164,6 +164,7 @@ def write_dataframe_to_zarr(
     chunk_idx: tuple,
     staged_out: dict | None = None,
     omit: tuple = (),
+    skip_fill: bool = False,
 ) -> Store:
     """Write a per-shard output carrier to an existing Zarr template.
 
@@ -199,6 +200,10 @@ def write_dataframe_to_zarr(
         them. A windowed hive leaf passes ``("morton",)`` (issue #586 phase
         3): its template carries no per-cell coordinate, the word being
         derived (:func:`zagg.grids.morton.cell_words`).
+    skip_fill : bool, optional
+        Skip an all-fill block instead of letting zarr DELETE its key
+        (:func:`all_fill`, issue #653). Only the hive leaf passes it — its
+        prefix was just cleared; the flat path keeps zarr's delete.
 
     Returns
     -------
@@ -244,7 +249,8 @@ def write_dataframe_to_zarr(
                     zarr_format=3,
                     consolidated=False,
                 )
-                array.set_block_selection(block_idx, block)
+                if not (skip_fill and all_fill(array, block)):
+                    array.set_block_selection(block_idx, block)
             continue
 
         # Scalar columns reshape to the grid's chunk_shape; a vector column keeps
@@ -276,7 +282,8 @@ def write_dataframe_to_zarr(
                         f"{target_trailing_chunks} must equal trailing shape "
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
-            array.set_block_selection(block_idx, values)
+            if not (skip_fill and all_fill(array, values)):
+                array.set_block_selection(block_idx, values)
             if staged_out is not None:
                 # Stage the leaf-wide slab (issue #342): allocate at fill on
                 # first sight of the array — mirroring write_leaf_to_zarr's
@@ -422,13 +429,15 @@ def write_shard_to_zarr(
     return store
 
 
-def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields):
+def _write_companion_columns(
+    carrier, store, grid, block_index, chunk_res_fields, *, skip_fill: bool = False
+):
     """Write a chunk's ``resolution: chunk`` companion columns (unsharded path).
 
     A ``resolution: chunk`` companion array is shaped at the coarse chunk grid
     (one block per chunk), never sharded, so it keeps the per-chunk write even on
     the sharded path. Reuses the same chunk-uniform collapse + block placement as
-    :func:`write_dataframe_to_zarr`'s companion branch.
+    :func:`write_dataframe_to_zarr`'s companion branch, ``skip_fill`` included.
     """
     block_idx = tuple(int(i) for i in block_index)
     for name, values in _iter_carrier_columns(carrier):
@@ -445,7 +454,8 @@ def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields
                 zarr_format=3,
                 consolidated=False,
             )
-            array.set_block_selection(target, block)
+            if not (skip_fill and all_fill(array, block)):
+                array.set_block_selection(target, block)
 
 
 def write_ragged_to_zarr(
@@ -620,7 +630,7 @@ def write_leaf_to_zarr(
         # extent — the ``hive.leaf_block_index`` derivation).
         if chunk_res_fields:
             local = tuple(int(s.start) // c for s, c in zip(region, inner_shape))
-            _write_companion_columns(carrier, store, grid, local, chunk_res_fields)
+            _write_companion_columns(carrier, store, grid, local, chunk_res_fields, skip_fill=True)
             _write_ragged_companions(ragged, store, grid, local, chunk_res_fields, skip_fill=True)
         if _carrier_empty(carrier) and not ragged:
             continue

@@ -2010,6 +2010,7 @@ class _LeafUnit:
             chunk_idx=local,
             staged_out=self.staged,
             omit=self.omit,
+            skip_fill=True,
         )
         if ragged:
             self.ragged_chunks.append((local, ragged))
