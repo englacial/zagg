@@ -109,6 +109,21 @@ class TestClassifyStoreError:
         except RuntimeError as wrapped:
             assert classify_store_error(wrapped) == "store-fatal"
 
+    def test_a_fault_raised_while_handling_a_refusal_keeps_its_class(self):
+        # zarr's ``ObjectStore.get`` falls back from a suffix range inside
+        # ``except NotSupportedError:``; a 503 there carries the refusal only
+        # as ``__context__``, which is not a cause.
+        from obstore.exceptions import GenericError, NotSupportedError
+
+        try:
+            try:
+                raise NotSupportedError("suffix range not supported")
+            except NotSupportedError:
+                raise GenericError("non-2xx status code: 503 Service Unavailable")
+        except GenericError as fallback:
+            assert isinstance(fallback.__context__, NotSupportedError)
+            assert classify_store_error(fallback) == "transient"
+
     def test_what_the_client_retried_stays_transient(self):
         from obstore.exceptions import GenericError
 
