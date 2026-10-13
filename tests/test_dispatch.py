@@ -147,6 +147,20 @@ class TestClassifyStoreError:
             == "transient"
         )
 
+    def test_a_retried_s3_code_outranks_its_400(self):
+        # A stalled upload body is S3's ``400 RequestTimeout``, which botocore
+        # retries; the bare 400 is still a refusal.
+        assert (
+            classify_store_error(
+                "Client error with status 400 Bad Request: <Code>RequestTimeout</Code>"
+            )
+            == "transient"
+        )
+        assert classify_store_error("<Code>SlowDown</Code>: Please reduce your request rate") == (
+            "transient"
+        )
+        assert classify_store_error("Client error with status 400 Bad Request") == "store-fatal"
+
     def test_bare_words_are_not_refusals(self):
         # ``Connection refused`` is a connection fault, and a ``KeyError``'s
         # ``not found`` is not the store's: the tokens name the refusal.

@@ -366,6 +366,18 @@ _STORE_STATUS_RE = re.compile(r"(?:status(?: code)?|http|error)\W{0,3}([45]\d\d)
 #: 4xx statuses that are throttling or a request timeout, not a refusal.
 _STORE_RETRYABLE_STATUSES = frozenset({408, 429})
 
+#: S3 error codes the client retries whatever status carries them: a stalled
+#: upload body is ``400 RequestTimeout``, and throttling / server faults can
+#: arrive as their code alone. Checked before the status, so the 400 stays
+#: transient while a bare ``400 Bad Request`` is still a refusal.
+_STORE_TRANSIENT_TOKENS = (
+    "requesttimeout",
+    "slowdown",
+    "internalerror",
+    "serviceunavailable",
+    "too many requests",
+)
+
 #: Refusal text with no status to key on: object_store's malformed-body parse
 #: failures (``Got invalid DeleteObjects response``), S3 error codes that
 #: arrive without their status, and the write path's own contract refusals
@@ -434,8 +446,9 @@ def classify_store_error(error: BaseException | str | None) -> str:
     (``leaf column: ...``, the unit-failure channel ``_LeafUnit.finish``
     reports through). The order is
     benign string, fatal type anywhere in the ``from`` chain, credentials
-    (:func:`zagg.processing.worker.is_auth_failure`), HTTP status (4xx fatal
-    but throttling / request timeout, 5xx transient), fatal token, and
+    (:func:`zagg.processing.worker.is_auth_failure`), retried S3 code
+    (``RequestTimeout``, ``SlowDown``, ...), HTTP status (4xx fatal but
+    throttling / request timeout, 5xx transient), fatal token, and
     transient for whatever is left -- see :data:`STORE_FATAL`.
     """
     text = str(error) if error is not None else ""
@@ -454,12 +467,14 @@ def classify_store_error(error: BaseException | str | None) -> str:
 
     if is_auth_failure(error if isinstance(error, BaseException) else Exception(text)):
         return STORE_FATAL
+    low = text.lower()
+    if any(token in low for token in _STORE_TRANSIENT_TOKENS):
+        return STORE_TRANSIENT
     match = _STORE_STATUS_RE.search(text)
     if match:
         code = int(match.group(1))
         transient = code in _STORE_RETRYABLE_STATUSES or code >= 500
         return STORE_TRANSIENT if transient else STORE_FATAL
-    low = text.lower()
     if any(token in low for token in _STORE_FATAL_TOKENS):
         return STORE_FATAL
     return STORE_TRANSIENT
