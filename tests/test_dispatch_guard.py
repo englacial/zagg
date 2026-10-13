@@ -295,7 +295,7 @@ class TestRoomAndRefusal:
     def test_fixed_window_paces_without_recording(self):
         w = FixedWindow(3)
         w.record(_timeout())
-        assert w.tripped is None
+        assert w.tripped is None and w.breaker is None and w.ramp == []
         assert w.room(queued=10, in_flight=1) == 2
         assert w.room(queued=10, in_flight=5) == 0
         assert FixedWindow(None).room(queued=10, in_flight=5) == 10

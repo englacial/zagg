@@ -244,11 +244,18 @@ class FixedWindow:
     """A fixed pacing window: what the poller paces by without a ramp.
 
     ``max_in_flight`` shards dispatched-unresolved at once, or unbounded on
-    ``None`` (``Run.attach`` registers observe-only entries). Same surface as
-    :class:`DispatchGuard`, never records, never trips.
+    ``None`` (``Run.attach`` registers observe-only entries). Mirrors the
+    :class:`DispatchGuard` reads the poller and the summaries make --
+    ``record``, ``room``, ``tripped``, ``breaker``, ``ramp`` -- and never
+    records or trips, so ``breaker`` is ``None`` and ``ramp`` is ``[]``.
     """
 
     tripped: dict | None = None
+    breaker: dict | None = None
+
+    @property
+    def ramp(self) -> list[dict]:
+        return []  # a fresh list: no shared mutable class state
 
     def __init__(self, max_in_flight: int | None):
         self._max = max_in_flight
