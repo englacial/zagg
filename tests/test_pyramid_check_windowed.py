@@ -595,8 +595,12 @@ class TestDamage:
     @pytest.mark.parametrize("damage", ["gone", "torn"])
     def test_a_leaf_without_the_all_time_column_member_fails_by_leaf(self, store, damage):
         # Issue #650: a store whose default view has lost its finest declared
-        # levels cannot be a PASS. The gate is the writers' own — role AND the
-        # D4 stamp — so a member whose stamp never landed reads as absent.
+        # levels cannot be a PASS. The ABSENCE gate is the writers' own — role
+        # AND the D4 stamp — so a member whose stamp never landed reads as
+        # absent. The sentence this asserts also claims the declared LEVELS
+        # have no member, which is now checked rather than taken on trust:
+        # ``test_a_member_that_is_not_the_fold_fails_on_identity`` covers the
+        # present-but-wrong half the gate alone used to let through.
         from zagg.hive import COMMIT_ATTR
 
         leaf = SHARDS[0]
