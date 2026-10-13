@@ -12,11 +12,38 @@ from pathlib import Path
 import pytest
 
 from zagg import notebook
-from zagg.config import default_config
+from zagg.config import default_config, validate_config
 from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC_BY_ARCH
 
 # 4-shard ATL03 shardmap checked into the tree (benchmark fixture).
 SHARDMAP = str(Path(__file__).parent / "data" / "benchmark" / "shardmaps" / "sm_healpix_o9.json")
+
+
+def _windowed_cfg(unit=None):
+    """A hive config windowed yearly over SHARDMAP (4 shards, 8 windows each).
+
+    ``unit=None`` leaves ``output.windowing.unit`` unset, so it resolves to
+    the ``"shard"`` default of issue #586 — the shape issue #648 mispriced.
+    """
+    cfg = default_config("atl06")
+    cfg.data_source = {
+        "reader": "h5coro",
+        "driver": "s3",
+        "groups": ["g1"],
+        "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+        "variables": {"h_li": "/h", "s_li": "/s", "delta_time": "/dt"},
+    }
+    cfg.output["store_layout"] = "hive"
+    cfg.output["windowing"] = {
+        "schedule": "yearly",
+        "time_field": "delta_time",
+        "epoch": "2018-01-01T00:00:00Z",
+        "scale": "gps",
+    }
+    if unit is not None:
+        cfg.output["windowing"]["unit"] = unit
+    validate_config(cfg)
+    return cfg
 
 
 def _preview_stub():
@@ -129,6 +156,55 @@ class TestMaxCostPreview:
         )
         preview = notebook.max_cost_preview(cfg, SHARDMAP)
         assert preview["n_units"] == 7
+
+    def test_windowed_shard_unit_prices_one_invoke_per_shard(self):
+        # issue #648: ``unit: shard`` (the #586 default) emits every window
+        # from ONE invoke, so the ceiling is per shard. The preview took the
+        # per-window expansion unconditionally and overcounted by the window
+        # count -- 8x on this fixture, ~9x on the 0.60.0 yearly templates.
+        preview = notebook.max_cost_preview(_windowed_cfg(), SHARDMAP)
+        assert preview["n_units"] == 4
+
+    def test_windowed_window_unit_prices_one_invoke_per_shard_window(self):
+        preview = notebook.max_cost_preview(_windowed_cfg(unit="window"), SHARDMAP)
+        assert preview["n_units"] == 32  # 4 shards x 8 yearly windows
+
+    def test_unwindowed_unchanged_by_the_unit_branch(self):
+        assert notebook.max_cost_preview(default_config("atl06"), SHARDMAP)["n_units"] == 4
+
+    @pytest.mark.parametrize(
+        "cfg_fn",
+        [
+            lambda: default_config("atl06"),
+            _windowed_cfg,
+            lambda: _windowed_cfg(unit="window"),
+        ],
+        ids=["unwindowed", "unit-shard", "unit-window"],
+    )
+    def test_preview_equals_the_dispatched_unit_count(self, cfg_fn):
+        # The docstring's promise, pinned (issue #648): the previewed ceiling
+        # equals the one the run logs before fan-out. It holds because both
+        # sides call ONE helper -- assert that identity rather than a second
+        # copy of the arithmetic, so the two cannot drift again.
+        from zagg import runner
+
+        cfg = cfg_fn()
+        cells = runner._select_cells(runner._load_catalog(SHARDMAP))
+        dispatched = len(runner._expand_units(cells, cfg))
+        assert notebook.max_cost_preview(cfg, SHARDMAP)["n_units"] == dispatched
+
+    def test_every_dispatch_path_expands_through_the_shared_helper(self):
+        # The identity above is only worth anything while the dispatch paths
+        # still route through _expand_units: a path that inlined its own fan
+        # would drift silently. Pin the call sites (issue #648).
+        import inspect
+
+        from zagg import runner
+
+        for fn in (runner._run_local, runner._run_lambda):
+            assert "_expand_units(cells, config)" in inspect.getsource(fn), fn.__name__
+        raster = inspect.getsource(runner.RasterStrategy.run)
+        assert "_expand_units(cells, config)" in raster
 
 
 class TestProgressFactory:
@@ -320,6 +396,72 @@ class TestRunWrapper:
             {"event_key": "b"},
             {"event_key": "c"},
         ]
+
+    @pytest.mark.parametrize(
+        ("cfg_fn", "units", "noun"),
+        [
+            (lambda: default_config("atl06"), 4, "shards"),
+            (_windowed_cfg, 4, "shards"),
+            (lambda: _windowed_cfg(unit="window"), 32, "shard-windows"),
+        ],
+        ids=["unwindowed", "unit-shard", "unit-window"],
+    )
+    def test_bar_is_sized_and_labelled_in_the_dispatch_unit(self, monkeypatch, cfg_fn, units, noun):
+        # issue #648: the bar total came from the per-window preview, so a
+        # bulk windowed run of ONE invoke pre-sized to 0/9 and jumped when it
+        # returned. Total is now the invoke count, and the label follows the
+        # unit -- a bar saying "shards" must not tick per (shard, window).
+        sized = []
+        ticks = []
+
+        class _Recorder:
+            def update(self, done, total, cost_usd):
+                ticks.append((done, total))
+
+            def close(self):
+                pass
+
+        def _factory(total, desc="shards"):
+            sized.append((total, desc))
+            return _Recorder()
+
+        def fake_agg(config, *, on_progress=None, **kwargs):
+            # Stand in for the dispatch: _with_progress ticks once per
+            # dispatched unit, so walk the real expansion's length.
+            from zagg import runner
+
+            cells = runner._select_cells(runner._load_catalog(SHARDMAP))
+            n = len(runner._expand_units(cells, config))
+            for i in range(1, n + 1):
+                on_progress(i, n, None)
+            return {"backend": "lambda"}
+
+        monkeypatch.setattr("zagg.runner.agg", fake_agg)
+        monkeypatch.setattr(notebook, "_make_progress", _factory)
+        notebook.run(cfg_fn(), catalog=SHARDMAP, backend="lambda")
+        assert sized == [(units, noun)]
+        # Ends exactly at its pre-sized total: no stall short, no overshoot.
+        assert ticks[-1] == (units, units)
+        assert len(ticks) == units
+
+    def test_events_bar_is_labelled_in_events(self, monkeypatch):
+        sized = []
+
+        class _Recorder:
+            def update(self, done, total, cost_usd):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("zagg.runner.agg", lambda config, **k: {"backend": "local"})
+        monkeypatch.setattr(
+            notebook,
+            "_make_progress",
+            lambda total, desc="shards": sized.append(desc) or _Recorder(),
+        )
+        notebook.run(default_config("atl06"), events=[{"event_key": "a"}])
+        assert sized == ["events"]
 
 
 class TestConfirmMaxCost:

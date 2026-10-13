@@ -904,9 +904,9 @@ class RasterStrategy:
         # membership decided at dispatch from the acquisitions' STAC
         # datetimes. None (schedule none/absent) keeps the (shard, records)
         # pairs — one bare leaf per shard carrying the full time axis (D13).
-        # Shared by both backends, so the fan-out cannot drift between them.
-        if store_layout == "hive" and windowing is not None:
-            cells = _raster_windowed_units(cells, windowing)
+        # Above the backend split, so the fan-out cannot drift between them;
+        # ``_expand_units`` is shared with the preview too (issue #648).
+        cells = _expand_units(cells, config)
 
         if backend == "lambda":
             # No orchestrator-side store write on the lambda path (issue
@@ -2499,6 +2499,69 @@ def _raster_windowed_units(cells: list[tuple], windowing: dict) -> list:
     return units
 
 
+def _unit_kind(config: PipelineConfig) -> str:
+    """Which unit expansion this config DISPATCHES under (issue #648).
+
+    ``"cell"`` -- no windowing, so the ``(shard, records)`` pairs ride through
+    untouched. ``"shard"`` -- ``output.windowing.unit: shard``, the default
+    since issue #586: one unit per shard, emitting every window its granules
+    span. ``"shard-window"`` -- ``unit: window``, one unit per (shard,
+    window). ``"acquisition"`` -- the raster hive fan-out (issue #247), whose
+    membership is decided per acquisition at dispatch.
+
+    Read apart from :func:`~zagg.config.get_windowing_unit` because that knob
+    is not the whole answer: it reads ``"window"`` for every raster config,
+    and the raster path fans out only on the hive layout.
+    """
+    windowing = get_windowing(config)
+    if windowing is None:
+        return "cell"
+    if (config.data_source or {}).get("reader") == "raster":
+        # Mirror RasterStrategy.run: no windowed fan-out off the hive layout.
+        return "acquisition" if get_store_layout(config) == "hive" else "cell"
+    return "shard-window" if get_windowing_unit(config) == "window" else "shard"
+
+
+#: Display noun for one dispatch unit, by :func:`_unit_kind` (issue #648): a
+#: bar labelled ``shards`` must not tick once per (shard, window).
+_UNIT_NOUN = {
+    "cell": "shards",
+    "shard": "shards",
+    "shard-window": "shard-windows",
+    "acquisition": "shard-windows",
+}
+
+
+def unit_noun(config: PipelineConfig) -> str:
+    """The progress bar's label for this config's dispatch unit (issue #648)."""
+    return _UNIT_NOUN[_unit_kind(config)]
+
+
+def _expand_units(cells: list[tuple], config: PipelineConfig) -> list:
+    """Expand selected cells into the run's DISPATCH units (issue #648).
+
+    The one place the expansion is chosen, so the previewed ceiling and the
+    dispatched fan-out cannot drift: both spatial backends fan out through
+    here, ``RasterStrategy.run`` routes its own kind through here, and
+    :func:`zagg.notebook.max_cost_preview` prices and pre-sizes its bar from
+    here. Before this helper the preview always took the per-window
+    expansion, so a ``unit: shard`` run previewed its window count as invokes
+    (~9x on the yearly templates) while the dispatch logged the true one.
+
+    Returns ``cells`` unchanged under :func:`_unit_kind` ``"cell"``.
+    """
+    kind = _unit_kind(config)
+    if kind == "cell":
+        return cells
+    windowing = get_windowing(config)
+    if kind == "acquisition":
+        return _raster_windowed_units(cells, windowing)
+    bounds_temporal = (config.bounds or {}).get("temporal")
+    if kind == "shard-window":
+        return _windowed_units(cells, windowing, bounds_temporal)
+    return _shard_window_units(cells, windowing, bounds_temporal)
+
+
 def _resolve_invoked_by(session, region) -> dict | None:
     """Caller identity for the run's stats records (issue #297), or ``None``.
 
@@ -3282,16 +3345,10 @@ def _run_local(
         # chains the staged sweep here AND a ``/2`` ladder with composable
         # fields is declared (``icechunk_refs.ladder_walks``) — else to the
         # per-leaf commit. Explicit settings are honored.
-        # Temporal fan-out (issue #246 phase 5): one work unit per shard
-        # emitting every window its granules span (issue #586, the default),
-        # or per (shard, window) under ``windowing.unit: window``. None
-        # (schedule none/absent) keeps the (shard, records) pairs — dispatch
-        # byte-identical to pre-windowing runs. It runs BEFORE the init
-        # because the init allocates the run's rows from the units' window
-        # labels (issue #584 §11.2).
-        if windowing is not None:
-            fan = _windowed_units if get_windowing_unit(config) == "window" else _shard_window_units
-            cells = fan(cells, windowing, (config.bounds or {}).get("temporal"))
+        # Temporal fan-out (issue #246 phase 5), per ``_expand_units``. It
+        # runs BEFORE the init because the init allocates the run's rows from
+        # the units' window labels (issue #584 §11.2).
+        cells = _expand_units(cells, config)
         icechunk_init = _init_icechunk_local(
             config, grid, store_path, run_id, store_kwargs, cells=cells
         )
@@ -3824,15 +3881,9 @@ def _run_lambda(
         # ceiling; this path stays a pure shard/granule preview until then.
         return _dry_run_summary(cells, store_path)
 
-    # Temporal fan-out (issue #246 phase 5): one work unit per shard emitting
-    # every window its granules span (issue #586, the default), or per
-    # (shard, window) under ``windowing.unit: window``; the biggest-first
-    # bucket order above survives (shard-major expansion). None keeps the
-    # pairs — dispatch byte-identical.
-    windowing = get_windowing(config)
-    if windowing is not None:
-        fan = _windowed_units if get_windowing_unit(config) == "window" else _shard_window_units
-        cells = fan(cells, windowing, (config.bounds or {}).get("temporal"))
+    # Temporal fan-out (issue #246 phase 5), per ``_expand_units``: the
+    # biggest-first bucket order above survives it (shard-major expansion).
+    cells = _expand_units(cells, config)
 
     # Pre-invoke cost ceiling (issue #298): every unit is one invoke billed at
     # the worker's memory for at most the function timeout, so the bill is
