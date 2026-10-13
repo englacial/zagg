@@ -1085,7 +1085,7 @@ class StatusPoller:
             body=obj.get("body") or {},
             error=obj.get("error"),
         )
-        self._guard.record({**result, "dispatch_width": entry.dispatch_width})
+        self._guard.record(dict(result, dispatch_width=entry.dispatch_width, unit=entry.key))
         if obj.get("status") in ("ok", "no_data"):
             entry.future.set_result(result)
         else:
@@ -1195,5 +1195,5 @@ class StatusPoller:
             ),
             outcome="failed-unknown",
         )
-        self._guard.record({**result, "dispatch_width": entry.dispatch_width})
+        self._guard.record(dict(result, dispatch_width=entry.dispatch_width, unit=entry.key))
         self._drop_failed(entry, result)

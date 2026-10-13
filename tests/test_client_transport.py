@@ -1589,6 +1589,21 @@ class TestDispatchGuardSeam:
         poller._tick()
         assert futures[3].result()["status_code"] == 200  # ... and its result still lands
 
+    def test_windows_of_one_shard_each_count_toward_the_timeout_ratio(self):
+        guard = _guard(ramp={"start": 4, "cap": 4, "window": 4}, breaker={"timeout_ratio": 0.5})
+        now = {"t": 1000.0}
+        fired: list[str] = []
+        poller = ct.StatusPoller(
+            lambda: MemoryStore(), guard=guard, drop_timeout_s=100.0, clock=lambda: now["t"]
+        )
+        for w in ("2018", "2019", "2020", "2021"):
+            poller.register(7, f"7/{w}", window=w, dispatch=lambda w=w: fired.append(w))
+        poller._tick()
+        assert len(fired) == 4
+        now["t"] = 1200.0  # all four windows of shard 7 drop: 4 of the last 4
+        poller._tick()
+        assert len(guard._records) == 4 and guard.tripped["rule"] == "timeout-ratio"
+
     def test_store_fatal_statuses_trip_and_a_late_registration_is_refused(self):
         store = MemoryStore()
         guard = _guard(breaker={"store_fatal": 2, "store_fatal_first": 5})

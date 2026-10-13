@@ -257,6 +257,15 @@ class TestBreaker:
         _feed(g, [{**_ok(), "shard_key": "k9"}] + [_ok()] * 9)
         assert g.width == 1000 and g.ramp[-1]["at_result"] == 60
 
+    def test_each_window_of_a_shard_counts_its_own_timeout(self):
+        # The poller's ``unit`` (one status key per (shard, window)) is the
+        # dedupe identity: an 11th timeout from another window of k9 trips.
+        drops = [{**_timeout(), "shard_key": f"k{i}", "unit": f"k{i}/2019"} for i in range(10)]
+        g = _feed(_guard(), [_ok()] * 39 + drops)
+        assert g.tripped is None
+        _feed(g, [{**_timeout(), "shard_key": "k9", "unit": "k9/2020"}])
+        assert g.tripped["rule"] == "timeout-ratio"
+
     def test_a_trip_is_sticky_and_records_keep_counting(self):
         g = _feed(_guard(), [_ok()] * 39 + [_timeout()] * 11)
         verdict = dict(g.tripped)
