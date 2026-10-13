@@ -1423,7 +1423,7 @@ class Run:
                     )
                     handle.stage_sweep = runner._invoke_lambda_stage_sweep(
                         client,
-                        # The staged tail runs on its own tier (issue #586).
+                        # The staged tail runs on the leaf tier, STAGE_SWEEP_WORKER (issue #659).
                         runner._resolve_stage_function_name(self.function_name),
                         self.store,
                         leaves,

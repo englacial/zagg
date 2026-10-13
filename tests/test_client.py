@@ -1527,9 +1527,9 @@ class TestStagedSweepTail:
         ((args, kwargs),) = seen["stage"]
         assert kwargs["families"] == CASCADE_FAMILIES
         assert handle.families_sweep is None  # nothing separate was fired
-        # The staged tail runs on the 8,192 MB tier of the run's own function
-        # family, as on ``_run_lambda`` (issue #586).
-        assert args[0] is stub and args[1:3] == ("process-shard-test-8192-disk", _STORE)
+        # The staged tail runs on the 4,096 MB leaf tier of the run's own
+        # function family, as on ``_run_lambda`` (issue #659).
+        assert args[0] is stub and args[1:3] == ("process-shard-test-4096-disk", _STORE)
         assert args[3] == [(w, None) for w in sorted(_WORDS)]  # every ok leaf
         assert kwargs["shard_order"] == 6 and kwargs["dirt_only"] == []
         # The stage records name the run this sweep completes (issue #593): it
