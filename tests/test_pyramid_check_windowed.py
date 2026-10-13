@@ -136,6 +136,8 @@ def built(tmp_path_factory):
         # as current to the staged sweep. No fleet rewrites a leaf that fast.
         time.sleep(1.1)
         _run(monkeypatch, tmp_path, root, first_run=False)
+    for store in (root, early):
+        _write_all_time_columns(store)
     return root, early
 
 
@@ -164,6 +166,33 @@ def _set_attrs(path: Path, edit) -> None:
 
 def _failed(report):
     return sorted(name for name, c in report["checks"].items() if c["status"] == "fail")
+
+
+def _write_all_time_columns(root: Path) -> None:
+    """Hand-write each leaf's ``all.pyramid.zarr`` — the §4.6 all-time member.
+
+    The ``all_time`` leg requires it at the declared leaf-column levels (issue
+    #650), and NO writer folds the window columns into one: ``zagg.column``
+    and ``zagg.column_backfill`` each fold exactly one ``(leaf, window)``, so
+    a windowed store comes off the real pipeline without it (issue #649, the
+    shard-level close). A correct store is therefore modelled here by copying
+    a leaf's newest window column to the all-time name and restamping its
+    recorded window to the reserved token. The leg checks existence, role and
+    the commit stamp only — which the copy carries honestly — never the
+    per-window ``merges_from_raw`` law of the ``columns`` leg, so the stand-in
+    is exactly as strong as the check it answers. Delete this and call the
+    real fold once #649 ships one.
+    """
+    from zagg.column import COLUMN_ATTR
+    from zagg.windows import SCHEDULE_NONE_TOKEN
+
+    for leaf in SHARDS:
+        node = root / _rel(leaf[:-1], leaf[-1])
+        windows = sorted(p for p in node.glob("*.pyramid.zarr") if p.name != "all.pyramid.zarr")
+        assert windows, node
+        member = node / "all.pyramid.zarr"
+        shutil.copytree(windows[-1], member)
+        _set_attrs(member, lambda a: a[COLUMN_ATTR].update(window=SCHEDULE_NONE_TOKEN))
 
 
 class TestACorrectStore:
@@ -199,6 +228,18 @@ class TestACorrectStore:
         assert "all-time fold declared" in checks["declaration"]["detail"]
         assert "k-way fold of their own per-window overviews" in checks["all_time"]["detail"]
         assert "no-op" in checks["idempotency"]["detail"]
+
+    def test_the_all_time_column_member_is_required_at_the_declared_levels(self, built):
+        # Issue #650: the §4.6 all-time member present at every declared
+        # leaf-column level, the leg passes and says so. The ladder cannot see
+        # that tier (``_ladder`` drops the leaf entry), so without this probe
+        # the leg reported 9/9 nodes and PASS with the levels empty.
+        report = validate_pyramid(str(built[0]), full=True)
+        assert report["checks"]["all_time"]["status"] == "pass", format_report(report)
+        assert report["all_time_columns"] == {"declared": 3, "materialized": 3, "missing": []}
+        detail = report["checks"]["all_time"]["detail"]
+        assert "3 leaf/leaves carry the all-time member at the declared leaf-column" in detail
+        assert "levels [7] (the base, cells 8, is exempt)" in detail
 
     def test_the_sampled_default_passes_and_says_what_it_sampled(self, built):
         report = validate_pyramid(str(built[0]), sample_windows=2, sample_nodes=1, sample_cells=2)
@@ -545,6 +586,29 @@ class TestDamage:
         assert _failed(report) == ["all_time"]
         assert "['-511']" in report["checks"]["all_time"]["mismatches"][0]
 
+    @pytest.mark.parametrize("damage", ["gone", "torn"])
+    def test_a_leaf_without_the_all_time_column_member_fails_by_leaf(self, store, damage):
+        # Issue #650: a store whose default view has lost its finest declared
+        # levels cannot be a PASS. The gate is the writers' own — role AND the
+        # D4 stamp — so a member whose stamp never landed reads as absent.
+        from zagg.hive import COMMIT_ATTR
+
+        leaf = SHARDS[0]
+        member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
+        if damage == "gone":
+            shutil.rmtree(member)
+        else:
+            _set_attrs(member, lambda a: a.pop(COMMIT_ATTR))
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        assert report["all_time_columns"] == {"declared": 3, "materialized": 2, "missing": [leaf]}
+        (finding,) = report["checks"]["all_time"]["mismatches"]
+        assert finding.startswith(
+            f"1/3 leaf/leaves carry no committed all.pyramid.zarr: ['{leaf}']"
+        )
+        assert "the declared leaf-column levels [7] have NO all-time member" in finding
+        assert "the base, cells 8, is exempt" in finding
+
 
 @pytest.fixture(scope="module")
 def composed(tmp_path_factory):
@@ -552,6 +616,7 @@ def composed(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("windowed-composition")
     with pytest.MonkeyPatch.context() as monkeypatch:
         _run(monkeypatch, tmp_path, tmp_path / "store", first_run=False, composition=True)
+    _write_all_time_columns(tmp_path / "store")
     return tmp_path / "store"
 
 
@@ -599,6 +664,7 @@ def clocked(tmp_path_factory):
     with pytest.MonkeyPatch.context() as monkeypatch:
         summary = _run(monkeypatch, tmp_path, root, first_run=False, temporal=True)
     assert summary["cells_error"] == 0
+    _write_all_time_columns(root)
     return root
 
 
