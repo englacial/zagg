@@ -1821,6 +1821,58 @@ class TestRaggedWriteGuards:
             write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(inner=2), chunk_idx=(0,))
 
 
+class _DeleteRecordingStore(MemoryStore):
+    """A ``MemoryStore`` that records every chunk-key ``delete`` zarr issues."""
+
+    def __init__(self):
+        super().__init__()
+        self.deleted: list = []
+
+    async def delete(self, key):
+        self.deleted.append(key)
+        await super().delete(key)
+
+
+class TestSkipFillWrites:
+    """Issue #653: an all-fill block on a just-cleared hive leaf prefix is not
+    written (zarr would DELETE its absent key, which a bulk-delete-refusing
+    bucket fails, issue #651), while the flat path — a rerun onto an existing
+    store — keeps zarr's delete so no stale object survives."""
+
+    @staticmethod
+    def _ragged_store():
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=TestRaggedVlenWrite._ragged_cfg())
+        store = _DeleteRecordingStore()
+        grid.emit_template(store)
+        return grid, store
+
+    @staticmethod
+    def _keys(store, grid, field):
+        prefix = f"{grid.group_path}/{field}/c/"
+        return [k for k in store._store_dict if k.startswith(prefix)]
+
+    def test_flat_ragged_block_deletes_a_stale_key(self):
+        from zagg.processing.write import _set_ragged_block
+
+        grid, store = self._ragged_store()
+        write_ragged_to_zarr(
+            {"h_raw": ([np.ones((2, 1), np.float32)], [0])}, store, grid=grid, chunk_idx=(3,)
+        )
+        assert self._keys(store, grid, "h_raw") == [f"{grid.group_path}/h_raw/c/3"]
+        _set_ragged_block(store, grid, "h_raw", (3,), np.full(grid.chunk_shape, b"", dtype=object))
+        assert self._keys(store, grid, "h_raw") == []
+        assert store.deleted == [f"{grid.group_path}/h_raw/c/3"]
+
+    def test_leaf_ragged_block_skips_all_fill(self):
+        from zagg.processing.write import _set_ragged_block
+
+        grid, store = self._ragged_store()
+        block = np.full(grid.chunk_shape, b"", dtype=object)
+        _set_ragged_block(store, grid, "h_raw", (3,), block, skip_fill=True)
+        assert self._keys(store, grid, "h_raw") == []
+        assert store.deleted == []
+
+
 class TestTemporalCompanionSeams:
     """Spec §8.2/§8.3/§9 declaration + write seams (issue #410).
 

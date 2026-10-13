@@ -139,7 +139,12 @@ def all_fill(array, values) -> bool:
     bucket answering the bulk ``DeleteObjects`` with an error document fails
     the write (issue #651). The writers test here and skip the write instead:
     absence is already the spec's encoding (§4, an inner chunk with no data
-    MUST be absent), so a skipped slab leaves the bytes a delete would have.
+    MUST be absent), so a skipped slab leaves the bytes a delete would have —
+    but only on a key known to be absent. Callers pass it only for a prefix
+    they have just cleared (the hive leaf, the columns, the stage/relay
+    overviews); the flat writers (:func:`write_shard_to_zarr`,
+    :func:`write_ragged_to_zarr`) keep zarr's delete, since a rerun onto an
+    existing flat store must not leave a stale object behind.
     The comparison is zarr's own (``NDBuffer.all_equal``: NaN equals the NaN
     fill, signed zeros stay distinct), so a slab skipped here is exactly one
     zarr would have deleted — never one it would have written.
@@ -405,8 +410,7 @@ def write_shard_to_zarr(
                         f"{target_trailing_chunks} must equal trailing shape "
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
-            if not all_fill(array, slab):  # an all-fill shard would be a DELETE (#653)
-                array.set_block_selection(block_idx, slab)
+            array.set_block_selection(block_idx, slab)
 
     # ONE object write per ragged field too (issue #209): the vlen-bytes
     # array shares the dense arrays' ShardingCodec geometry, so the whole
@@ -550,11 +554,11 @@ def write_ragged_leaf_to_zarr(
     slabs: dict = {}
     for block, ragged in ragged_chunks:
         block = tuple(int(b) for b in block)
-        _write_ragged_companions(ragged, store, grid, block, chunk_res_fields)
+        _write_ragged_companions(ragged, store, grid, block, chunk_res_fields, skip_fill=True)
         region = tuple(slice(b * c, (b + 1) * c) for b, c in zip(block, inner_shape))
         _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_fields)
     for name, slab in slabs.items():
-        _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab)
+        _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab, skip_fill=True)
     if staged_out is not None:
         staged_out.update({f"{grid.group_path}/{name}": slab for name, slab in slabs.items()})
     return store
@@ -617,7 +621,7 @@ def write_leaf_to_zarr(
         if chunk_res_fields:
             local = tuple(int(s.start) // c for s, c in zip(region, inner_shape))
             _write_companion_columns(carrier, store, grid, local, chunk_res_fields)
-            _write_ragged_companions(ragged, store, grid, local, chunk_res_fields)
+            _write_ragged_companions(ragged, store, grid, local, chunk_res_fields, skip_fill=True)
         if _carrier_empty(carrier) and not ragged:
             continue
         for name, values in _iter_carrier_columns(carrier):
@@ -662,7 +666,7 @@ def write_leaf_to_zarr(
             if not all_fill(array, slab):  # an all-fill shard would be a DELETE (#653)
                 array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
     for name, slab in ragged_slabs.items():
-        _set_ragged_block(store, grid, name, leaf_block, slab)
+        _set_ragged_block(store, grid, name, leaf_block, slab, skip_fill=True)
     if staged_out is not None:
         staged_out.update(
             {f"{grid.group_path}/{name}": slab for name, slab in {**slabs, **ragged_slabs}.items()}
@@ -804,7 +808,9 @@ def _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_
                 out[pos] = payload
 
 
-def _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields) -> None:
+def _write_ragged_companions(
+    ragged, store, grid, block_index, chunk_res_fields, *, skip_fill: bool = False
+) -> None:
     """Write a chunk's ``resolution: chunk`` RAGGED companions (issue #82/#209).
 
     The vlen analogue of :func:`_write_companion_columns`: the populated cells
@@ -813,7 +819,8 @@ def _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields)
     the chunk-grid vlen array. ``location`` + ``resolution: chunk`` is rejected
     at config validation, but a config built without ``validate_config`` could
     still deliver a located triple here — fail loudly rather than silently
-    dropping the location channel (issue #87).
+    dropping the location channel (issue #87). ``skip_fill`` is
+    :func:`_set_ragged_block`'s.
     """
     if not chunk_res_fields:
         return
@@ -835,15 +842,17 @@ def _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields)
         block[(0,) * len(block_idx)] = _ragged_payload_bytes(
             name, chunk_payload, _ragged_sig(name, grid)
         )
-        _set_ragged_block(store, grid, name, block_idx, block)
+        _set_ragged_block(store, grid, name, block_idx, block, skip_fill=skip_fill)
 
 
-def _set_ragged_block(store, grid, name, block_idx, block) -> None:
+def _set_ragged_block(store, grid, name, block_idx, block, *, skip_fill: bool = False) -> None:
     """One block-selection write into a ragged vlen array (issue #209).
 
-    A block whose every cell is the ``b""`` fill — a ``where``-predicated
-    stratum no photon of the window satisfied — is not written: zarr would
-    DELETE its key instead (:func:`all_fill`, issue #653).
+    With ``skip_fill`` (the hive leaf, onto its just-cleared prefix), a block
+    whose every cell is the ``b""`` fill — a ``where``-predicated stratum no
+    photon of the window satisfied — is not written: zarr would DELETE its key
+    instead (:func:`all_fill`, issue #653). Without it (the flat path) zarr's
+    delete stands, so a rerun clears a stale object.
     """
     with config.set({"async.concurrency": 128}):
         array = open_array(
@@ -852,7 +861,7 @@ def _set_ragged_block(store, grid, name, block_idx, block) -> None:
             zarr_format=3,
             consolidated=False,
         )
-        if not all_fill(array, block):
+        if not (skip_fill and all_fill(array, block)):
             array.set_block_selection(tuple(block_idx), block)
 
 
