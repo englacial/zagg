@@ -294,7 +294,11 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
     validate_config(config)
 
     total = None
-    desc = "shards"
+    # Honest default for the path that resolves no unit at all (no events=, no
+    # catalog): the bar is sized 0 and the generic noun matches the ``unit=
+    # "unit"`` the tqdm bar is built with -- "shards" would assert a unit this
+    # path never resolved (issue #648 fold).
+    desc = "units"
     if kwargs.get("events") is not None:
         # Materialize once and rebind: a one-shot iterable (generator) would be
         # exhausted by the count, then forwarded empty to agg -- TemporalStrategy's
