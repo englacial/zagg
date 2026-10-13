@@ -314,9 +314,12 @@ class TestMaxCostPreview:
     )
     def test_preview_equals_the_dispatched_unit_count(self, cfg_fn):
         # The docstring's promise, pinned (issue #648): the previewed ceiling
-        # equals the one the run logs before fan-out. It holds because both
-        # sides call ONE helper -- assert that identity rather than a second
-        # copy of the arithmetic, so the two cannot drift again.
+        # equals the one the run logs before fan-out. Scope, because both
+        # sides read the same helper (issue #648 fold): this pins only that
+        # the preview adds no step of its own on top of it -- a WRONG
+        # expansion moves both sides together and still passes. The
+        # arithmetic itself is guarded by the two counting tests above
+        # (4 vs 32) and by the packaged-template drive.
         from zagg import runner
 
         cfg = cfg_fn()
