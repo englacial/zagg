@@ -429,16 +429,7 @@ def validate_windowed(
             "--roster list to tell a broken sweep from a stale record"
         )
     _all_time_check(
-        harness,
-        ladder,
-        declared,
-        probes,
-        refs,
-        groups,
-        checks,
-        report,
-        all_time=all_time,
-        full=full,
+        harness, ladder, declared, probes, refs, groups, checks, report, all_time, full=full
     )
     if harness.warnings:
         report["warnings"] = list(dict.fromkeys([*report.get("warnings", []), *harness.warnings]))
@@ -810,31 +801,29 @@ def _node_window_labels(store, node: str) -> set:
 
 
 def _all_time_check(
-    harness, ladder, declared, probes, refs, groups, checks, report, *, all_time, full
+    harness, ladder, declared, probes, refs, groups, checks, report, all_time, *, full
 ) -> None:
     """Settle ``all_time``: the all-time member at every declared level (§4.4).
 
     Declared, every ladder node that has a leaf beneath it in any window must
     carry a committed ``all.zarr`` (one GET each); ``sample_nodes`` of them
     per order (all in full mode) are then held to the fold's contract — see
-    :func:`_all_time_node`. The declared LEAF-column levels have an
-    all-time member too — ``all.pyramid.zarr`` — which the ladder cannot see
-    (:func:`zagg.pyramid_check._ladder` drops the leaf entry, whose node IS
-    the shard order), so it is probed here per roster leaf (issue #650).
+    :func:`_all_time_node`. The declared LEAF-column levels have an all-time
+    member too — ``all.pyramid.zarr`` — which the ladder cannot see (``_ladder``
+    drops the leaf entry, whose node IS the shard order), so it is probed per
+    roster leaf and held to its recorded window and groups (issue #650).
     Undeclared, there is nothing to hold: reported *not applicable*, after the
     node probe, naming any committed fold found.
     """
-    from zagg.column import COLUMN_ROLE
+    from zagg.column import COLUMN_ATTR, COLUMN_ROLE
     from zagg.store import open_object_store
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import OVERVIEW_SPEC_V2
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     orders = {k: sorted({n for w in declared for n in declared[w][k]}) for k, _ in ladder}
-    probe = partial(
-        _probe_nodes, harness.store_root, store_kwargs=harness.store_kwargs, workers=harness.workers
-    )
-    probed, errored = probe([n for k in orders for n in orders[k]])
+    kw = {"store_kwargs": harness.store_kwargs, "workers": harness.workers}
+    probed, errored = _probe_nodes(harness.store_root, [n for k in orders for n in orders[k]], **kw)
     if errored:
         checks["all_time"] = _entry(
             "fail",
@@ -867,10 +856,10 @@ def _all_time_check(
         "materialized": len(committed),
         "missing": missing[:50],
     }
-    # Existence + role + commit stamp only: the ``merges_from_raw`` law of
-    # :func:`zagg.pyramid_check_v2._column_attrs_errors` is per-window.
+    # Existence, role, the stamp, and the window/groups identity the text
+    # below claims; never the per-window ``merges_from_raw`` law beside it.
     leaves = sorted({dec for dec, _w in refs})
-    col_probed, col_errored = probe(leaves, rel=_column_object_rel)
+    col_probed, col_errored = _probe_nodes(harness.store_root, leaves, rel=_column_object_rel, **kw)
     if col_errored:
         checks["all_time"] = _entry(
             "fail",
@@ -893,6 +882,16 @@ def _all_time_check(
         f"{base}, is exempt — an all-time leaf IS the unwindowed store)"
     )
     col_findings = [column_finding] if col_missing else []
+    for dec in (n for n in leaves if n not in col_missing):
+        block = col_probed[dec].get(COLUMN_ATTR)
+        block = block if isinstance(block, dict) else {}
+        raw = block.get("groups")
+        got = sorted((int(g) for g in raw), reverse=True) if isinstance(raw, dict) else []
+        if block.get("window") != SCHEDULE_NONE_TOKEN or not set(levels) <= set(got):
+            col_findings.append(
+                f"{dec}: all.pyramid.zarr window {block.get('window')!r} / groups {got} is not "
+                f"the all-time fold of the leaf columns ({SCHEDULE_NONE_TOKEN!r}, covering {levels})"
+            )
     if not committed:
         checks["all_time"] = _entry(
             "fail",

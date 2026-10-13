@@ -615,6 +615,31 @@ class TestDamage:
         assert "the declared leaf-column levels [7] have NO all-time member" in finding
         assert "the base, cells 8, is exempt" in finding
 
+    @pytest.mark.parametrize("damage", ["window", "groups"])
+    def test_a_member_that_is_not_the_fold_fails_on_identity(self, store, damage):
+        # Issue #650: a plain copy of one window's column under the all-time
+        # name, or one short of the declared levels, is NOT the all-time fold.
+        # The node arm one tier up rejects exactly that mislabel (``!=
+        # (OVERVIEW_SPEC_V2, SCHEDULE_NONE_TOKEN) — not the all-time fold``),
+        # and the leaf tier now agrees instead of passing it. Present and
+        # committed, so it counts as materialized; it fails on identity.
+        from zagg.column import COLUMN_ATTR
+
+        leaf = SHARDS[0]
+        member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
+        if damage == "window":
+            _set_attrs(member, lambda a: a[COLUMN_ATTR].update(window="2020"))
+        else:
+            _set_attrs(member, lambda a: a[COLUMN_ATTR]["groups"].clear())
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        assert report["all_time_columns"] == {"declared": 3, "materialized": 3, "missing": []}
+        (finding,) = report["checks"]["all_time"]["mismatches"]
+        assert finding.startswith(f"{leaf}: all.pyramid.zarr window ")
+        assert "is not the all-time fold of the leaf columns ('all', covering [7])" in finding
+        want = "window '2020' / groups [7, 6]" if damage == "window" else "window 'all' / groups []"
+        assert want in finding
+
 
 @pytest.fixture(scope="module")
 def composed(tmp_path_factory):
