@@ -2542,8 +2542,14 @@ _UNIT_NOUN = {
 
 
 def unit_noun(config: PipelineConfig) -> str:
-    """The progress bar's label for this config's dispatch unit (issue #648)."""
-    return _UNIT_NOUN[_unit_kind(config)]
+    """The progress bar's label for this config's dispatch unit (issue #648).
+
+    Falls back to ``"units"`` for an unlisted kind: the caller
+    (:func:`zagg.notebook.run`) labels the bar OUTSIDE ``_with_progress``'s
+    deliberate swallow, so a missing noun would abort a paid fan-out over a
+    cosmetic string.
+    """
+    return _UNIT_NOUN.get(_unit_kind(config), "units")
 
 
 def _expand_units(cells: list[tuple], config: PipelineConfig) -> list:
