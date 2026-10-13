@@ -879,7 +879,7 @@ def _all_time_check(
             f"{[f'{n}: {e}' for n, e in sorted(col_errored.items())][:3]}",
         )
         return
-    levels, base = report.get("leaf_levels") or [], harness.cell_order
+    levels, base = report["leaf_levels"], harness.cell_order
     col_missing = [n for n in leaves if not _committed(col_probed.get(n), COLUMN_ROLE)]
     report["all_time_columns"] = {
         "declared": len(leaves),
@@ -888,7 +888,7 @@ def _all_time_check(
     }
     column_finding = col_missing and (
         f"{len(col_missing)}/{len(leaves)} leaf/leaves carry no committed all.pyramid.zarr: "
-        f"{col_missing[:8]} — the declared leaf-column levels {list(levels)} have NO all-time "
+        f"{col_missing[:8]} — the declared leaf-column levels {levels} have NO all-time "
         f"member, so the store's default view is missing them (§4.6; the base, cells {base}, "
         f"is exempt — an all-time leaf IS the unwindowed store)"
     )
@@ -961,7 +961,7 @@ def _all_time_check(
         f"count, {counted['digests']} digest, {counted['composition']} composition "
         f"comparison(s) — with the §4.4 provenance (regime, merges_from_raw, source_windows, "
         f"source_children, generation); {len(leaves)} leaf/leaves carry the all-time member at "
-        f"the declared leaf-column levels {list(levels)} (the base, cells {base}, is exempt)",
+        f"the declared leaf-column levels {levels} (the base, cells {base}, is exempt)",
     )
 
 
