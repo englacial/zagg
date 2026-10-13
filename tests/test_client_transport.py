@@ -423,6 +423,8 @@ class TestEventDispatch:
         assert not any(m in modes for m in ("sweep", "stages", "icechunk_finalize"))
         assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
         assert handle.families_sweep is None and handle.stage_sweep is None
+        assert any("circuit breaker tripped (timeout-ratio)" in r for r in handle.tail_sweep_short)
+        assert handle.dispatch_pacing.startswith("guard: ramp + circuit breaker")
 
     def test_each_dispatch_tail_reads_its_own_guard(self, catalog, monkeypatch):
         # Two dispatches on one Run: A trips, B (clean) is dispatched before
@@ -459,6 +461,12 @@ class TestEventDispatch:
         )
         handle.results()
         assert handle.ramp == [{"width": 2, "at_result": 0}] and handle.breaker is None
+        assert handle.tail_sweep_short == []  # no trip: the verdict is the pre-#652 one
+        # The sync transport has no poller, so no guard: the handle says why.
+        sync = _run(catalog, client=__import__("test_client").StubLambdaClient()).dispatch()
+        sync.results()
+        assert (sync.ramp, sync.breaker) == ([], None)
+        assert "act only on transport='event'" in sync.dispatch_pacing
 
     def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):
         # An oversized row set on an EVENT run keeps its run record: the tail
@@ -1052,6 +1060,11 @@ class TestAggEventMode:
         assert summary["icechunk_finalize"] == {
             "skipped": "circuit breaker tripped (timeout-ratio)"
         }
+        # The run's tail verdict names the trip (issue #610's key, #652's reason).
+        assert any(
+            "circuit breaker tripped (timeout-ratio)" in r for r in summary["tail_sweep_short"]
+        )
+        assert summary["dispatch_pacing"].startswith("guard: ramp + circuit breaker")
         modes = [m for m in stub.modes() if m]
         assert "stats" in modes and "coverage" in modes
 

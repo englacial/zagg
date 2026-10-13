@@ -208,6 +208,18 @@ class TestBreaker:
         g = _feed(_guard(), [_failed(error_class="store-fatal", in_body=True)] * 3)
         assert g.tripped["rule"] == RULE_STORE_FATAL
 
+    def test_store_error_class_is_the_spelling_pr_658_stamps(self):
+        # PR #658 renames the leaf's class key; the old spelling stays a fallback
+        # for status objects written before it, and the new one wins when both
+        # are present.
+        fatal = {**_failed(), "store_error_class": "store-fatal"}
+        assert classify_result(fatal, function_timeout_s=TIMEOUT_S).store_fatal
+        in_body = _failed()
+        in_body["body"]["store_error_class"] = "store-fatal"
+        assert classify_result(in_body, function_timeout_s=TIMEOUT_S).store_fatal
+        both = {**_failed(error_class="store-fatal"), "store_error_class": "transient"}
+        assert not classify_result(both, function_timeout_s=TIMEOUT_S).store_fatal
+
     @pytest.mark.parametrize(
         "error",
         [
@@ -428,3 +440,54 @@ class TestDescribe:
         )
         assert line.startswith("Circuit breaker held widening: rule wall-margin")
         assert describe([], None) == [] and describe(None, None) == []
+
+
+class TestParseKnobs:
+    def test_dotted_pairs_build_the_nested_block(self):
+        from zagg.dispatch_guard import parse_knobs
+
+        block = parse_knobs(["ramp.start=250", "ramp.cap=800", "breaker.timeout_ratio=0.3"])
+        assert block == {"ramp": {"start": 250, "cap": 800}, "breaker": {"timeout_ratio": 0.3}}
+        assert isinstance(block["ramp"]["start"], int)  # ints stay ints for the validator
+        assert GuardConfig.from_dict(block).cap == 800
+
+    def test_nothing_means_no_knobs(self):
+        from zagg.dispatch_guard import parse_knobs
+
+        assert parse_knobs(None) is None and parse_knobs([]) is None
+
+    @pytest.mark.parametrize(
+        ("pair", "needle"),
+        [
+            ("ramp.start", "expects group.key=value"),
+            ("start=250", "expects group.key=value"),
+            ("ramp.=250", "expects group.key=value"),
+            ("ramp.start=fast", "not a number"),
+        ],
+    )
+    def test_bad_pairs_are_refused(self, pair, needle):
+        from zagg.dispatch_guard import parse_knobs
+
+        with pytest.raises(ValueError, match=needle):
+            parse_knobs([pair])
+
+    def test_unknown_keys_fall_to_the_validator(self):
+        from zagg.dispatch_guard import parse_knobs
+
+        with pytest.raises(ValueError, match="unknown key"):
+            GuardConfig.from_dict(parse_knobs(["canary.size=8"]))
+
+
+class TestPacing:
+    def test_describe_leads_with_the_pacing_line(self):
+        from zagg.dispatch_guard import PACING_GUARD, describe, pool_width_pacing
+
+        why = pool_width_pacing("invocation", "async")
+        assert why == (
+            "pool width (invocation='async'): the ramp and circuit breaker act only on "
+            "invocation='event' (issue #652)"
+        )
+        assert describe([], None, why) == [f"Dispatch pacing: {why}"]
+        lines = describe([{"width": 500, "at_result": 0}], None, PACING_GUARD)
+        assert lines[0] == f"Dispatch pacing: {PACING_GUARD}" and len(lines) == 2
+        assert describe([], None, None) == []

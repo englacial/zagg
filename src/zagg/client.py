@@ -86,7 +86,14 @@ from zagg.config import (
     validate_config,
 )
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, LAMBDA_PRICE_PER_GB_SEC, max_cost_usd
-from zagg.dispatch_guard import NOT_DISPATCHED, DispatchGuard, GuardConfig, describe
+from zagg.dispatch_guard import (
+    NOT_DISPATCHED,
+    PACING_GUARD,
+    DispatchGuard,
+    GuardConfig,
+    describe,
+    pool_width_pacing,
+)
 from zagg.grids import from_config as grid_from_config
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
@@ -249,6 +256,10 @@ class RunHandle:
         #: sync transport and on a reattached handle (neither has a guard).
         self.ramp: list[dict] = []
         self.breaker: dict | None = None
+        #: What paced this dispatch (issue #652): the guard on the event
+        #: transport, else the pool width with the knob to flip named;
+        #: ``None`` on a reattached handle (attach dispatches nothing).
+        self.dispatch_pacing: str | None = None
         # This dispatch's guard (issue #652), bound here rather than on the
         # ``Run`` so a later dispatch cannot swap it out from under this tail.
         self._guard: Any = None
@@ -1057,6 +1068,9 @@ class Run:
 
         handle = RunHandle(futures, store_path=self.store, memory_gb=memory_gb)
         handle.dispatch_manifest = manifest_sent
+        handle.dispatch_pacing = (
+            PACING_GUARD if transport == "event" else pool_width_pacing("transport", transport)
+        )
         handle._guard = guard
         finisher = threading.Thread(
             target=self._post_run,
@@ -1342,7 +1356,7 @@ class Run:
                 f"width {trip['width']}: {refused} units not dispatched, tail legs skipped "
                 f"(issue #652)"
             )
-        for line in describe(handle.ramp, handle.breaker):
+        for line in describe(handle.ramp, handle.breaker, handle.dispatch_pacing):
             logger.info(line)
         # ONE warn/retry/record implementation for every dispatch path (issue
         # #335 phase 1): agg's _run_lambda, the raster driver and this finisher
@@ -1529,6 +1543,7 @@ class Run:
             handle.stage_sweep,
             stage_chained=stage_chained,
             tail_error=families_error,
+            breaker=trip,
         )
         runner._warn_tail_sweep_short(handle.tail_sweep_short)
         skip = runner._staged_sweep_incomplete(handle.stage_sweep) if stage_chained else None

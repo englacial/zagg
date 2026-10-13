@@ -69,7 +69,14 @@ from zagg.dispatch import (
     estimate_cost_usd,
     max_cost_usd,
 )
-from zagg.dispatch_guard import NOT_DISPATCHED, DispatchGuard, GuardConfig, describe
+from zagg.dispatch_guard import (
+    NOT_DISPATCHED,
+    PACING_GUARD,
+    DispatchGuard,
+    GuardConfig,
+    describe,
+    pool_width_pacing,
+)
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
@@ -312,7 +319,9 @@ def agg(
         on every backend, honored by ``backend="lambda"`` with
         ``invocation="event"`` — the only path paced by the status poller.
         ``summary["ramp"]`` lists the width steps and ``summary["breaker"]``
-        the trip or hold (``None`` when neither fired). Travels through the
+        the trip or hold (``None`` when neither fired); ``summary[
+        "dispatch_pacing"]`` says what paced the fan-out — the guard, or the
+        pool width with the knob to flip named. Travels through the
         strategies as ``dispatch_knobs`` so it never shadows the generic
         :func:`zagg.dispatch.dispatch` loop; the temporal and raster
         strategies accept and ignore it (no status poller to pace).
@@ -4304,6 +4313,9 @@ def _run_lambda(
             max_retries=max_retries,
             guard=state["guard"],
         ).start()
+    # What paces this fan-out, said in the summary (issue #652 question 10):
+    # the async/sync channels have no status poller, so no ramp or breaker.
+    pacing = PACING_GUARD if invocation == "event" else pool_width_pacing("invocation", invocation)
 
     # Create template via Lambda (flat only). The template write happens
     # inside the function so the orchestrator only needs
@@ -4653,6 +4665,7 @@ def _run_lambda(
             # by the pool width and have no guard.
             "ramp": guard.ramp if guard is not None else [],
             "breaker": guard.breaker if guard is not None else None,
+            "dispatch_pacing": pacing,
             "store_path": store_path,
             "backend": "lambda",
             "function_name": function_name,
@@ -4821,6 +4834,7 @@ def _run_lambda(
             staged,
             stage_chained=stage_chained,
             tail_error=families_error,
+            breaker=trip,
         )
         _warn_tail_sweep_short(summary["tail_sweep_short"])
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
@@ -4869,7 +4883,7 @@ def _run_lambda(
                 f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items()
             )
             logger.info(f"Worker phases (max across cells): {breakdown}")
-        for line in describe(summary["ramp"], summary["breaker"]):
+        for line in describe(summary["ramp"], summary["breaker"], summary["dispatch_pacing"]):
             logger.info(line)
         _log_container_stats(container_stats)
     except Exception as tail_error:
@@ -6492,7 +6506,12 @@ def _families_sweep_reported(outcome: dict | None) -> dict:
 
 
 def _tail_sweep_short(
-    families_sweep, stage_sweep, *, stage_chained: bool, tail_error: str | None = None
+    families_sweep,
+    stage_sweep,
+    *,
+    stage_chained: bool,
+    tail_error: str | None = None,
+    breaker: dict | None = None,
 ) -> list:
     """Why this run's tail left the store short of its rollups; ``[]`` when it did not.
 
@@ -6530,7 +6549,9 @@ def _tail_sweep_short(
     ``tail_error`` is what the tail's own fail-open ``except`` swallowed, and
     it leads the list: a block that raised before either leg fired reports
     neither outcome, so without it the worst case — nothing swept at all —
-    would be the emptiest verdict (review finding).
+    would be the emptiest verdict (review finding). ``breaker`` is the
+    dispatch circuit breaker's trip (issue #652), which cancels both legs
+    before they fire: the same emptiest verdict, so it leads too.
 
     Fail-open itself, and deliberately: both call sites sit OUTSIDE their
     tail's fail-open arm, so a raise in here would take down a run whose
@@ -6542,7 +6563,11 @@ def _tail_sweep_short(
     """
     try:
         return _tail_sweep_reasons(
-            families_sweep, stage_sweep, stage_chained=stage_chained, tail_error=tail_error
+            families_sweep,
+            stage_sweep,
+            stage_chained=stage_chained,
+            tail_error=tail_error,
+            breaker=breaker,
         )
     except Exception as e:
         logger.warning(f"the tail's verdict could not be computed (fail-open, D9): {e}")
@@ -6553,10 +6578,21 @@ def _tail_sweep_short(
 
 
 def _tail_sweep_reasons(
-    families_sweep, stage_sweep, *, stage_chained: bool, tail_error: str | None = None
+    families_sweep,
+    stage_sweep,
+    *,
+    stage_chained: bool,
+    tail_error: str | None = None,
+    breaker: dict | None = None,
 ) -> list:
     """The reasons themselves; :func:`_tail_sweep_short` is the fail-open wrapper."""
     reasons = []
+    if breaker and breaker.get("tripped"):
+        reasons.append(
+            f"the dispatch circuit breaker tripped ({breaker.get('rule')}) at result "
+            f"{breaker.get('at_result')}, so the families pass and the staged sweep were not "
+            "fired and the undispatched units are not in the store (issue #652)"
+        )
     if tail_error:
         reasons.append(
             f"the tail's sweep block raised ({tail_error}), so what it had not yet fired is unswept"

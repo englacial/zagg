@@ -13,7 +13,7 @@ import logging
 import sys
 
 from zagg.config import get_pipeline_type, load_config
-from zagg.dispatch_guard import describe
+from zagg.dispatch_guard import GuardConfig, describe, parse_knobs
 from zagg.notebook import confirm_max_cost, max_cost_preview
 from zagg.runner import agg, normalize_output_credentials
 
@@ -93,6 +93,18 @@ examples:
         "so the config selection is not silently masked.",
     )
     parser.add_argument(
+        "--dispatch",
+        action="append",
+        default=None,
+        metavar="GROUP.KEY=VALUE",
+        help="Event fan-out ramp / circuit-breaker knob (issue #652), repeatable: "
+        "ramp.start ramp.factor ramp.cap ramp.window ramp.tolerance, "
+        "breaker.timeout_ratio breaker.wall_fraction breaker.store_fatal "
+        "breaker.store_fatal_first. Defaults: ramp 500 -> 1000 (x2, window 50, "
+        "tolerance 1.2); breaker 0.20 / 0.85 / 3 of the first 20. Honored by "
+        "--backend lambda on the event transport.",
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
@@ -104,6 +116,14 @@ examples:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     config = load_config(args.config)
+
+    # The ramp / breaker knobs (issue #652): shape and range are refused here,
+    # before the cost prompt and before any invoke.
+    try:
+        dispatch = parse_knobs(args.dispatch)
+        GuardConfig.from_dict(dispatch)
+    except ValueError as e:
+        parser.error(str(e))
 
     # Load output credentials from a JSON file (kept out of shell history).
     output_credentials = None
@@ -156,6 +176,7 @@ examples:
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url,
         profile=args.profile,
+        dispatch=dispatch,
     )
 
     if args.dry_run:
@@ -217,8 +238,11 @@ examples:
                 f"{phase} {secs:.0f}s" for phase, secs in results["worker_phase_max"].items()
             )
             print(f"Worker phases (max across cells): {breakdown}")
-        # The Event fan-out's ramp steps and any breaker trip (issue #652).
-        for line in describe(results.get("ramp"), results.get("breaker")):
+        # How the fan-out was paced, the ramp steps and any breaker trip
+        # (issue #652); the pacing line says WHY when no guard ran.
+        for line in describe(
+            results.get("ramp"), results.get("breaker"), results.get("dispatch_pacing")
+        ):
             print(line)
         # The tail's verdict (issue #610): a run whose rollup sweep did not
         # complete exits 0 by design — the rollups are regenerable caches (D9)

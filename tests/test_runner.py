@@ -1975,6 +1975,9 @@ class TestSummaryKeysByteIdentical:
         # pace by the pool width and carry no guard. LAMBDA-only.
         "ramp",
         "breaker",
+        # What paced the fan-out (issue #652): the guard, or the pool width with
+        # the knob to flip named, so [] / None above are never read as silence.
+        "dispatch_pacing",
     } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -2375,6 +2378,10 @@ class TestSummaryKeysByteIdentical:
         assert set(summary.keys()) == self._LAMBDA_KEYS
         assert summary["families_sweep"] is None  # flat: nothing was swept
         assert summary["ramp"] == [] and summary["breaker"] is None  # async: no guard
+        assert summary["dispatch_pacing"] == (
+            "pool width (invocation='async'): the ramp and circuit breaker act only on "
+            "invocation='event' (issue #652)"
+        )
         assert summary["backend"] == "lambda"
         assert summary["cells_with_data"] == 4
         assert summary["total_obs"] == 12
@@ -5980,3 +5987,24 @@ class TestCliContractionGuardSurface:
         }
         self._run(monkeypatch, [], summary)
         assert "FAILED" not in capsys.readouterr().out
+
+
+class TestTailShortBreaker:
+    def test_a_trip_leads_the_tail_verdict(self):
+        from zagg import runner
+
+        trip = {"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000}
+        (reason,) = runner._tail_sweep_short(None, None, stage_chained=False, breaker=trip)
+        assert reason.startswith(
+            "the dispatch circuit breaker tripped (timeout-ratio) at result 137"
+        )
+        assert "families pass and the staged sweep were not fired" in reason
+        # A hold is not a trip, and no guard at all is the pre-#652 verdict.
+        hold = dict(trip, tripped=False, rule="wall-margin")
+        assert runner._tail_sweep_short(None, None, stage_chained=False, breaker=hold) == []
+        assert runner._tail_sweep_short(None, None, stage_chained=False, breaker=None) == []
+        # It leads: ahead of the raised-block reason the verdict already carried.
+        reasons = runner._tail_sweep_short(
+            None, None, stage_chained=False, tail_error="boom", breaker=trip
+        )
+        assert [r.split(" ")[2] for r in reasons] == ["circuit", "sweep"]

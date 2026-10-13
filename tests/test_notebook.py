@@ -670,6 +670,10 @@ class TestRunView:
         )
         html_out = notebook.RunView(summary)._repr_html_()
         assert "Dispatch ramp (width@result): 500@0 -&gt; 1000@50" in html_out
+        unpaced = dict(_lambda_summary(), dispatch_pacing="pool width (invocation='async'): why")
+        assert "Dispatch pacing: pool width (invocation=&#x27;async&#x27;)" in (
+            notebook.RunView(unpaced)._repr_html_()
+        )
         assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio" in html_out
         # Neither key (a sync run, an older summary): nothing is rendered.
         assert "ramp" not in notebook.RunView(_lambda_summary())._repr_html_()
@@ -681,7 +685,89 @@ class TestRunView:
         assert "with_data=2" in repr(view)
 
 
+class TestCliDispatchFlag:
+    """``--dispatch group.key=value`` (issue #652) reaches ``agg(dispatch=...)``
+    as the nested block, and a bad knob is refused before the cost gate."""
+
+    def _drive(self, monkeypatch, argv, summary=None):
+        import zagg.__main__ as cli
+
+        seen: dict = {}
+
+        def _fake_agg(config, **kwargs):
+            seen.update(kwargs)
+            return summary if summary is not None else _lambda_summary()
+
+        cfg = default_config("atl06")
+        cfg.catalog = SHARDMAP
+        monkeypatch.setattr(cli, "agg", _fake_agg)
+        monkeypatch.setattr(cli, "load_config", lambda path: cfg)
+        monkeypatch.setattr("sys.argv", argv)
+        return cli, seen
+
+    def test_repeated_flags_build_the_block(self, monkeypatch, capsys):
+        cli, seen = self._drive(
+            monkeypatch,
+            [
+                "zagg",
+                "--config",
+                "c.yaml",
+                "--dispatch",
+                "ramp.start=250",
+                "--dispatch",
+                "breaker.timeout_ratio=0.3",
+            ],
+        )
+        cli.main()
+        assert seen["dispatch"] == {"ramp": {"start": 250}, "breaker": {"timeout_ratio": 0.3}}
+
+    def test_no_flag_passes_none(self, monkeypatch, capsys):
+        cli, seen = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"])
+        cli.main()
+        assert seen["dispatch"] is None
+
+    @pytest.mark.parametrize("flag", ["ramp.cap=1", "canary.size=8", "ramp.start"])
+    def test_a_bad_knob_is_refused_before_agg(self, monkeypatch, capsys, flag):
+        cli, seen = self._drive(monkeypatch, ["zagg", "--config", "c.yaml", "--dispatch", flag])
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+        assert exc_info.value.code == 2 and seen == {}  # argparse's usage error, no agg
+
+    def test_the_pacing_ramp_and_trip_lines_print(self, monkeypatch, capsys):
+        from zagg.dispatch_guard import PACING_GUARD, pool_width_pacing
+
+        summary = dict(
+            _lambda_summary(),
+            dispatch_pacing=PACING_GUARD,
+            ramp=[{"width": 500, "at_result": 0}, {"width": 1000, "at_result": 50}],
+            breaker={"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000},
+        )
+        cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=summary)
+        cli.main()
+        out = capsys.readouterr().out
+        assert f"Dispatch pacing: {PACING_GUARD}" in out
+        assert "Dispatch ramp (width@result): 500@0 -> 1000@50" in out
+        assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio at result 137" in out
+        # The default async channel says WHY nothing ramped (question 10).
+        unpaced = dict(_lambda_summary(), dispatch_pacing=pool_width_pacing("invocation", "async"))
+        cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=unpaced)
+        cli.main()
+        assert "act only on invocation='event'" in capsys.readouterr().out
+
+
 class TestRunWrapper:
+    def test_dispatch_knobs_reach_agg(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_agg(config, **kwargs):
+            seen.update(kwargs)
+            return _lambda_summary()
+
+        monkeypatch.setattr("zagg.runner.agg", fake_agg)
+        knobs = {"ramp": {"start": 250}}
+        notebook.run(default_config("atl06"), catalog=SHARDMAP, backend="local", dispatch=knobs)
+        assert seen["dispatch"] == knobs  # one mechanism: the facade forwards the block
+
     def test_drives_progress_from_agg_callback(self, monkeypatch):
         recorded = []
 

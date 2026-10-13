@@ -42,6 +42,7 @@ from __future__ import annotations
 import re
 import statistics
 from dataclasses import dataclass, fields
+from typing import Iterable
 
 from zagg import dispatch as _dispatch
 from zagg.dispatch import BENIGN_ERRORS
@@ -113,6 +114,26 @@ RULE_STORE_FATAL = "store-fatal"
 
 #: The ``outcome`` a shard the breaker refused to dispatch resolves with.
 NOT_DISPATCHED = "not-dispatched"
+
+#: ``summary["dispatch_pacing"]`` / ``handle.dispatch_pacing`` when the guard
+#: paces the fan-out: only the Event transport has the status poller the ramp
+#: and breaker live in.
+PACING_GUARD = "guard: ramp + circuit breaker on the Event transport (issue #652)"
+
+
+def pool_width_pacing(knob: str, value: str) -> str:
+    """The pacing line for a fan-out the guard does NOT pace, saying why.
+
+    ``agg``'s default ``invocation="async"`` (the #151 result-object channel)
+    and ``Run.dispatch``'s default ``transport="sync"`` have no status poller,
+    so they pace by the pool width alone and ``ramp`` / ``breaker`` read
+    ``[]`` / ``None``; this names the knob to flip rather than leaving that
+    silence to be read as "nothing happened" (issue #652 question 10).
+    """
+    return (
+        f"pool width ({knob}={value!r}): the ramp and circuit breaker act only on "
+        f"{knob}='event' (issue #652)"
+    )
 
 
 @dataclass(frozen=True)
@@ -188,6 +209,33 @@ class GuardConfig:
         }
 
 
+def parse_knobs(pairs: Iterable[str] | None) -> dict | None:
+    """``["ramp.start=250", "breaker.timeout_ratio=0.3"]`` -> the nested ``dispatch`` block.
+
+    The CLI's ``--dispatch group.key=value`` spelling (repeatable); values are
+    numbers (``int`` when they parse as one, else ``float``). Shape only --
+    :meth:`GuardConfig.from_dict` owns the key and range validation. ``None``
+    / empty means "no knobs".
+    """
+    if not pairs:
+        return None
+    block: dict = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        group, dot, name = key.partition(".")
+        if not (sep and dot and group and name):
+            raise ValueError(f"--dispatch expects group.key=value (got {pair!r})")
+        try:
+            value: int | float = int(raw)
+        except ValueError:
+            try:
+                value = float(raw)
+            except ValueError:
+                raise ValueError(f"--dispatch {key}: not a number (got {raw!r})") from None
+        block.setdefault(group, {})[name] = value
+    return block
+
+
 @dataclass(frozen=True)
 class ResultRecord:
     """One completed result, reduced to what the rules read."""
@@ -228,7 +276,18 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
     # The no-data channel's text starts with its benign entry and may carry a
     # source read's 403/404 exemplar after it: benign, never store-fatal.
     failed = bool(error) and not str(error).startswith(BENIGN_ERRORS) and not timeout
-    error_class = result.get("error_class") or body.get("error_class")
+    # PR #658 stamps the leaf's class as ``store_error_class`` (its own parquet
+    # column); ``error_class`` is the earlier spelling, kept for status objects
+    # written before the rename.
+    error_class = next(
+        (
+            source[key]
+            for key in ("store_error_class", "error_class")
+            for source in (result, body)
+            if source.get(key)
+        ),
+        None,
+    )
     if error_class is None and failed:
         error_class = classify_store_error(error)
     return ResultRecord(
@@ -381,13 +440,14 @@ class DispatchGuard:
         }
 
 
-def describe(ramp: list | None, breaker: dict | None) -> list[str]:
-    """Human lines for ``summary["ramp"]`` / ``summary["breaker"]`` (CLI, notebook, log).
+def describe(ramp: list | None, breaker: dict | None, pacing: str | None = None) -> list[str]:
+    """Human lines for ``summary["ramp"]`` / ``["breaker"]`` / ``["dispatch_pacing"]``.
 
-    Empty for a run that paced by a fixed window (no ramp steps, no verdict),
-    so the sync and async transports print nothing new.
+    Shared by the CLI, the notebook view and the run log. ``pacing`` leads
+    when given, so a fan-out the guard did not pace says why (see
+    :func:`pool_width_pacing`) instead of printing nothing.
     """
-    lines = []
+    lines = [f"Dispatch pacing: {pacing}"] if pacing else []
     if ramp:
         steps = " -> ".join(f"{s['width']}@{s['at_result']}" for s in ramp)
         lines.append(f"Dispatch ramp (width@result): {steps}")
