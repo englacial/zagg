@@ -258,13 +258,19 @@ def emit_hierarchy(store: Store, spec) -> dict[str, Any]:
 
     pydantic-zarr's ``GroupSpec.to_zarr`` walks the tree one node at a time —
     each member is its own probe of the node and its ancestors plus its own
-    PUT, so a leaf or column template costs ~2 metadata GETs per object
-    before a byte of data moves (issue #657; issue #189 is the upstream ask).
-    Here every node's metadata object is built exactly as ``to_zarr`` builds
-    it (``ArrayV3Metadata.from_dict`` / ``GroupMetadata.from_dict`` of the
-    spec's own dump — the same serialized bytes) and the whole set goes to
-    ``zarr.create_hierarchy`` once: one concurrent probe pass, one concurrent
-    PUT pass. The root group is explicit in the set, so its document is
+    PUT (measured ~1.1 metadata GETs per object), and the writers then
+    re-opened every array (``open_array``, another GET per array) before a
+    byte of data moved (issue #657; issue #189 is the upstream ask). Here
+    every node's metadata object is built exactly as ``to_zarr`` builds it
+    (``ArrayV3Metadata.from_dict`` / ``GroupMetadata.from_dict`` of the spec's
+    own dump — the same serialized bytes) and the whole set goes to
+    ``zarr.create_hierarchy`` once: one probe GET per node (the
+    ``overwrite=False`` existence check), then one PUT per node, in two
+    concurrent passes. The saving is the per-node ancestor walk and the
+    ``open_array`` re-reads, not the probe itself. Only the PUT pass is held
+    to ``async.concurrency``; the probe pass is an unbounded
+    ``asyncio.gather`` over every node (harmless at a template's tens of
+    nodes). The root group is explicit in the set, so its document is
     written as before.
 
     Returns ``{path: handle}`` keyed by each node's path (``""`` is the root
