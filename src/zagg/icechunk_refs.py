@@ -1162,44 +1162,88 @@ def open_vetted(store_root: str, *, store_kwargs: dict, want: dict | None = None
     return repo, block
 
 
-def _stage_units(session, units: Iterable[dict]) -> tuple[int, set]:
-    """Write ``units`` into ``session`` (nothing committed); ``(refs, levels)`` staged."""
+def _stage_units(
+    session, units: Iterable[dict], store_root: str, store_kwargs: dict
+) -> tuple[int, set, int]:
+    """Write ``units`` into ``session`` (nothing committed); ``(refs, levels, bytes)`` staged.
+
+    A unit lands as virtual refs, except on a level whose chunks are the
+    repo's own bytes (:func:`zagg.icechunk_native.native_level` — the §4
+    overview levels, which a later run rewrites in place), where the entry's
+    chunks are COPIED in and ``bytes`` counts them. The decision is the
+    repo's own ``levels`` block, never the unit's: a carrier written before
+    this writer carries exactly the same entries (§11.3, issue #584).
+
+    Two things a native level adds to the session. **IO**, which is the part
+    that scales: a GET of every overview object the unit names, and a
+    committing node's units are its children's columns recursively, so the
+    count is its whole SUBTREE's — at the global setting (``commit_order``
+    3, ``shard_order`` 9) of order 10⁴ objects inside one open session,
+    where the virtual arm did none. They are gathered
+    ``icechunk_native.READ_BATCH`` at a time, but they still lengthen the
+    window in which a sibling node's commit can force this one to rebase,
+    and the per-invoke wall time against the 900 s ceiling is **unmeasured**
+    (issue #584 review: a fleet run before the v4 build). **Memory**, which
+    is bounded: one read window's objects plus the slices taken from them,
+    each slice a copy of its bytes, so the §11.4 streaming peak is one
+    child's carriers plus about TWICE ``READ_BATCH`` overview objects. A
+    copy whose object moved since the
+    plan raises (:func:`zagg.icechunk_native.stage_unit`), which costs the
+    node its whole gather: the gather describes a state that no longer
+    exists, so the hook counts it failed (D9) and the next sweep re-gathers
+    it.
+    """
+    from zagg.icechunk_native import native_level, stage_unit
+    from zagg.store import open_object_store
+
     block = _session_block(session) or {}
     rows, levels = block.get("rows") or [], block.get("levels") or {}
-    refs = 0
+    prefix = container_prefix(store_root)
+    etags = prefix.startswith("s3://")
+    store = None
+    refs, native = 0, 0
     orders: set = set()
     for unit in units:
         order = int(unit["level"])
         row = row_index(rows, unit.get("row", ALL_ROW))
-        for entry in unit["entries"]:
-            if not entry["refs"]:
-                continue
-            array_path = f"{order}/{entry['path']}"
-            if entry["sharded"]:
-                rejected = session.store.set_virtual_refs_arr(
-                    array_path,
-                    (1, *entry["chunk_grid"]),
-                    list(entry["locations"]),
-                    np.asarray(entry["offsets"], dtype="<u8"),
-                    np.asarray(entry["lengths"], dtype="<u8"),
-                    arr_offset=(row, *entry["arr_offset"]),
-                    checksum=entry["checksum"],
-                )
-                if rejected:
-                    raise RuntimeError(f"{array_path}: {len(rejected)} virtual refs rejected")
-            else:
-                check_column_entry(levels.get(str(order)), entry, array_path)
-                for key, location, length, chunk_checksum in entry["chunks"]:
-                    session.store.set_virtual_ref(
-                        f"{order}/{row_key(key, row)}",
-                        location,
-                        offset=0,
-                        length=int(length),
-                        checksum=chunk_checksum,
+        entries = [entry for entry in unit["entries"] if entry["refs"]]
+        if not entries:
+            continue
+        # The decision is the LEVEL's, so it is the whole unit's: every entry
+        # of a unit lives at one cell order and a level is native or virtual.
+        # Hoisted so the native arm sees the unit and can batch its reads.
+        if native_level(levels.get(str(order))):
+            if store is None:
+                store = open_object_store(store_root, **store_kwargs)
+            native += stage_unit(session, order, row, entries, prefix, store, etags=etags)
+        else:
+            for entry in entries:
+                array_path = f"{order}/{entry['path']}"
+                if entry["sharded"]:
+                    rejected = session.store.set_virtual_refs_arr(
+                        array_path,
+                        (1, *entry["chunk_grid"]),
+                        list(entry["locations"]),
+                        np.asarray(entry["offsets"], dtype="<u8"),
+                        np.asarray(entry["lengths"], dtype="<u8"),
+                        arr_offset=(row, *entry["arr_offset"]),
+                        checksum=entry["checksum"],
                     )
-            refs += int(entry["refs"])
-            orders.add(order)
-    return refs, orders
+                    if rejected:
+                        raise RuntimeError(f"{array_path}: {len(rejected)} virtual refs rejected")
+                else:
+                    check_column_entry(levels.get(str(order)), entry, array_path)
+                    for key, location, length, chunk_checksum in entry["chunks"]:
+                        session.store.set_virtual_ref(
+                            f"{order}/{row_key(key, row)}",
+                            location,
+                            offset=0,
+                            length=int(length),
+                            checksum=chunk_checksum,
+                        )
+        refs += sum(int(entry["refs"]) for entry in entries)
+        orders.add(order)
+    return refs, orders, native
 
 
 def _row_growth_only(exc, repo, session, base: str) -> bool:
@@ -1252,9 +1296,11 @@ def commit_units(
     (§11.4) — and it hands the stream as a CALLABLE so a replay (below)
     streams the subtree again instead of holding it; a one-shot iterable is
     retained for the replay. Returns ``{"path", "snapshot", "refs", "levels",
-    "rebases", "replays", "commit_s"}`` (``snapshot`` ``None`` when nothing
-    was written). ``repo`` skips the open/vet when the caller already holds a
-    vetted handle.
+    "rebases", "replays", "commit_s", "native_bytes"}`` (``snapshot`` ``None``
+    when nothing was written; ``native_bytes`` the overview bytes copied into
+    the repo rather than referenced, §11.3 — every ATTEMPT's, as ``rebases``
+    and ``commit_s`` are, because a replay re-pays the whole copy). ``repo``
+    skips the open/vet when the caller already holds a vetted handle.
 
     **The row-growth replay (§11.4, issue #584 phase 3).** Another run's init
     landing while this session holds staged refs grows every level array by a
@@ -1266,10 +1312,27 @@ def commit_units(
     session based on the grown arrays and committed, each unit's label
     resolving to the same row index (the row law, §11.2: a row never moves),
     at most :data:`REPLAY_TRIES` times, then the failure propagates to the
-    fail-open caller. ``rebases`` and ``commit_s`` sum every session's,
-    the failed ones included. A growth with ANY commit since the session's base that
+    fail-open caller. ``rebases``, ``commit_s`` and ``native_bytes`` sum
+    every session's, the failed ones included. A growth with ANY commit since
+    the session's base that
     updated a staged chunk is refused, whichever landed first: the original
     ``RebaseFailedError`` propagates. The record's ``replays`` counts them.
+
+    **What a replay costs, and the residue it leaves (issue #584 review).** A
+    fresh session cannot adopt the abandoned one's staged chunks, so a replay
+    re-GETs and re-copies the units in full; ``native_bytes`` therefore
+    reports every attempt, which is what the repo paid. Icechunk writes a
+    native chunk's object **eagerly**, at ``store.set`` rather than at the
+    commit (verified against icechunk 2.2.2: one chunk object present before
+    the commit, still present after the session is dropped), so the
+    abandoned attempt's objects **stay in repo storage referenced by no
+    snapshot** — as do those of a copy that raised part-way through a node's
+    entries. Correctness is unaffected: the session is never committed, so no
+    half-copied level is visible to any read or tag. The residue is bytes,
+    and only ``garbage_collect`` can see them, which the default
+    ``retain_runs: 0`` never runs (§11.4). Preventing the orphan needs an
+    Icechunk-side deferred write or an explicit abort, so it is recorded
+    rather than fixed.
     """
     import icechunk
 
@@ -1277,11 +1340,17 @@ def commit_units(
         repo, _block = open_vetted(store_root, store_kwargs=store_kwargs)
     source = units if callable(units) else list(units)
     path = repo_path(store_root)
-    replays, rebases, commit_s = 0, 0, 0.0  # summed over the replays: the node's contention
+    # Summed over the replays: the node's contention, and the bytes it
+    # paid — a replay re-copies the whole unit (above), so the committed
+    # attempt alone under-reports exactly when the repo paid most.
+    replays, rebases, commit_s, copied = 0, 0, 0.0, 0
     while True:
         session = repo.writable_session(BRANCH)
         base = session.snapshot_id
-        refs, orders = _stage_units(session, source() if callable(source) else source)
+        refs, orders, native = _stage_units(
+            session, source() if callable(source) else source, store_root, store_kwargs
+        )
+        copied += native
         if not refs:
             return {
                 "path": path,
@@ -1291,6 +1360,7 @@ def commit_units(
                 "rebases": rebases,
                 "replays": replays,
                 "commit_s": commit_s,
+                "native_bytes": copied,
             }
         t0 = time.perf_counter()
         try:
@@ -1315,6 +1385,7 @@ def commit_units(
             "rebases": rebases + rounds,
             "replays": replays,
             "commit_s": commit_s + time.perf_counter() - t0,
+            "native_bytes": copied,
         }
 
 
@@ -1466,6 +1537,14 @@ def record_leaf(
         repo=repo,
     )
     arrays = sum(1 for unit in units for entry in unit["entries"] if entry["refs"])
+    # ``native_bytes`` belongs to the overview levels (§11.3) and a leaf's
+    # units name none of them, so it is 0 here and stays off the record §11.4
+    # documents; the ladder's stage row is where it is read. The property is
+    # not local: ``multiscales._mirror_block`` gives the shard-order entry
+    # the COLUMN artifact and every coarser entry the overview one, and
+    # ``pyramid.expand_overviews`` gives each entry its own cell orders, so
+    # no cell order a leaf's column unit names is an overview level.
+    outcome = {key: value for key, value in outcome.items() if key != "native_bytes"}
     return {**outcome, "arrays": arrays, "checksum": checksum}
 
 

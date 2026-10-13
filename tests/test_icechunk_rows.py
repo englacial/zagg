@@ -78,6 +78,23 @@ def _refs(session, array_path: str) -> dict:
     return asyncio.run(collect())
 
 
+def _fold_objects(root) -> dict:
+    """``{key: sha256}`` of every all-time overview chunk object under ``root``.
+
+    The bytes, not the mtime: what a virtual ref's checksum catches is a
+    rewrite of the object's CONTENT, and a rewrite inside one second is
+    exactly the case a timestamp proxy would miss (spec §11.3).
+    """
+    import hashlib
+    from pathlib import Path
+
+    return {
+        str(obj): hashlib.sha256(obj.read_bytes()).hexdigest()
+        for obj in sorted(Path(root).rglob("all.zarr/**/c/*"))
+        if obj.is_file()
+    }
+
+
 class TestRunRows:
     def test_an_unwindowed_run_writes_the_all_row(self):
         assert icechunk_rows.run_rows(None) == ["all"]
@@ -855,12 +872,14 @@ class TestTheLadderWalksAWindowedStore:
         assert group[level]["count"][fold, :].sum() > group[level]["count"][window, :].sum()
 
     def test_a_tag_cut_before_an_append_still_reads_every_level(self, monkeypatch, cfg, tmp_path):
-        # Plan phase 2 acceptance (3). A windowed store maintains the fold
-        # (PR #623), and ``all.zarr`` is the one overview object an append
-        # REWRITES, so a pre-append tag's virtual ref to the ``all`` row is
-        # stale until the fold is written natively (plan phase 3): the tag is
-        # read at its window row only. Every per-window row is immutable and
-        # reads.
+        # Plan phase 2 acceptance (3), and phase 3's: "two runs over one
+        # store; the first run's tag reads its own ``all`` overview after the
+        # second run rewrote ``all.zarr``." A windowed store maintains the
+        # fold (PR #623) and ``all.zarr`` is the one overview object an
+        # append REWRITES, which a virtual ref could not survive; the fold's
+        # row is the repo's own bytes (spec §11.3), so the tag reads the
+        # ``all`` row it was cut with and not the append's. Every per-window
+        # row is immutable and reads either way.
         from test_icechunk_refs import _ladder_run
 
         shards = _shards(_grid(cfg), 2)
@@ -877,14 +896,16 @@ class TestTheLadderWalksAWindowedStore:
         repo = icechunk_refs.open_repo(root, store_kwargs={})
         rows = icechunk_refs.read_block(root, store_kwargs={})["rows"]
         assert sorted(rows) == ["2019", "all"]  # the one window and the fold's row
-        window = rows.index("2019")
-        before = {
-            level: zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")[level]["count"][
-                window
-            ]
-            for level in icechunk_refs.read_block(root, store_kwargs={})["levels"]
-        }
-        assert before
+        window, fold = rows.index("2019"), rows.index("all")
+        tagged = zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")
+        levels = list(icechunk_refs.read_block(root, store_kwargs={})["levels"])
+        before = {level: tagged[level]["count"][window] for level in levels}
+        folded = {level: tagged[level]["count"][fold] for level in levels}
+        assert before and any(values.any() for values in folded.values()), (
+            "the first run wrote no all-time fold to read back"
+        )
+        objects = _fold_objects(root)
+        assert objects, "no all-time overview object was written"
         _grid_, _root, second = _ladder_run(
             monkeypatch,
             cfg,
@@ -895,17 +916,35 @@ class TestTheLadderWalksAWindowedStore:
         )
         assert second["cells_error"] == 0
         assert icechunk_refs.read_block(root, store_kwargs={})["rows"] == [*rows, "2020"]
-        # The tag reads what it was cut with: its window row, every level, the
-        # same values -- the append added a row and moved no window ref.
+        # The append rewrote the fold's objects under the tag's feet -- which
+        # is what makes the ``all`` row below a test of the copy and not of
+        # immutable bytes.
+        rewritten = _fold_objects(root)
+        assert [key for key in objects if rewritten.get(key) != objects[key]], (
+            "the append left every all-time overview object as it was"
+        )
+        # The tag reads what it was cut with: its window row AND its ``all``
+        # row, every level, the same values -- the append added a row, moved
+        # no window ref, and re-folded the fold without disturbing the rows
+        # already committed.
         repo = icechunk_refs.open_repo(root, store_kwargs={})
         tagged = zarr.open_group(repo.readonly_session(tag=tag).store, mode="r")
         for level, values in before.items():
             np.testing.assert_array_equal(tagged[level]["count"][window], values)
-        # And the branch tip carries the new row, the window row unchanged.
+        for level, values in folded.items():
+            np.testing.assert_array_equal(tagged[level]["count"][fold], values)
+        # And the branch tip carries the new row, the window row unchanged,
+        # and a fold that is now the two windows' -- so the tag is reading
+        # its own history, not the same bytes twice.
         tip, _repo = _open(root)
         for level, values in before.items():
             assert tip[level]["count"].shape[0] == 3
             np.testing.assert_array_equal(tip[level]["count"][window], values)
+        assert [
+            level
+            for level, values in folded.items()
+            if tip[level]["count"][fold].sum() > values.sum()
+        ], "the append did not grow the all-time fold"
 
 
 class TestRowGrowthUnderStagedRefs:

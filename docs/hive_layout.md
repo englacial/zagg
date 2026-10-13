@@ -2221,6 +2221,17 @@ object's `last_modified` ceiled to the next whole second on a local store —
 so a leaf replaced in place fails loudly instead of decoding stale offsets
 (locally, only a replacement landing inside the same second slips through).
 
+The **overview** levels are the exception: their chunks are the repo's own
+bytes, copied in by the commit that would otherwise have referenced them
+(spec §11.3). A leaf is write-once and a versioned leaf is never rewritten
+at all, but an overview object (`{window}.zarr`, `all.zarr`) is re-folded
+under its own key by every later run whose subtree gained a leaf — and on a
+windowed store `all.zarr` is rewritten by every append — so a reference into
+one goes stale and a run tag could not read the level it was cut with. The
+store's overview objects are untouched by this and stay authoritative for a
+path reader and for the sweep's own gather; what the repo stops doing is
+pointing at them.
+
 Four writes, all worker-side (the dispatcher never writes, D8), all
 **fail-open** — the repo is a regenerable index, never load-bearing:
 
@@ -2260,8 +2271,16 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   the [staged sweep](#the-staged-sweep-issue-384)): a stage node gathers its
   subtree's carriers — leaf sidecars at the finest tuple (one per
   `(leaf, window)` on a windowed store, each naming its own row), its children's
-  node ref columns above — adds the refs of the overview objects at its
-  tuple's orders, and either writes its own node column or **commits**. On a
+  node ref columns above — adds the overview objects at its
+  tuple's orders, whose chunks the committing session **copies in** rather
+  than referencing (spec §11.3), and either writes its own node column or
+  **commits**. A copy whose object moved since it was sized is refused, and
+  the node fails open (`icechunk_failed`) rather than committing a gather of
+  a state that no longer exists. That copy is the one cost that scales with
+  the node's **subtree** rather than its own tuple: a committing node GETs
+  every overview object below it, inside its open session, in gathered
+  windows (spec §11.3 sizes it; the per-invoke wall time is unmeasured and
+  wants a fleet run). On a
   windowed store the hook runs once per node, after that node's window units
   and its close, so each row's refs are gathered and committed together. The
   tuple whose order range contains `commit_order` commits everything
@@ -2276,7 +2295,11 @@ Four writes, all worker-side (the dispatcher never writes, D8), all
   Each stage row records `icechunk_commits`, `icechunk_rebases`,
   `icechunk_replays` (commits replayed in a fresh session because another
   run's init grew the row axis under the node's staged refs, spec §11.4),
-  `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
+  `icechunk_commit_s`, `icechunk_native_bytes` (the overview bytes copied
+  into the repo instead of referenced, spec §11.3 — every commit attempt's,
+  since a replay re-copies the whole unit and leaves the abandoned
+  attempt's chunk objects behind unreferenced), `icechunk_refs`,
+  `icechunk_missing`,
   `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
   `icechunk_regathered` (dirt-only nodes, re-gathered without a fold) and
   `icechunk_s` (the hook's own wall time, the gather included), plus an
@@ -2425,6 +2448,14 @@ expiry squashes every commit before that
 cutoff — the oldest retained run's own intermediate commits included — into
 its finalize snapshot; the newer runs keep theirs until a later cutoff
 passes them. Leaf objects are never touched by any of it.
+
+What K = 0 now means, with native overview levels (spec §11.3): the repo
+keeps **every** superseded overview chunk it ever copied in, so it grows each
+run by the touched rows' overview byte set rather than by manifest bytes, and
+the chunk objects a failed or replayed node commit orphaned are never
+reclaimed either — only `garbage_collect` can see those, and K = 0 never
+calls it. `icechunk_native_bytes`, summed over the run's stage rows, is the
+per-run figure.
 
 `output.icechunk: false` opts a hive run out (default on; excluded from the
 D19 semantic core like `sweep`). Windowed (`morton-hive/2`) leaves and raster

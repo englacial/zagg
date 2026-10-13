@@ -4272,9 +4272,9 @@ their bytes.
 "Backfill" is therefore not a category: an evolving fact is written to the
 repo in a commit, never by rewriting leaves — the §11.4 **operations**
 (`zagg.icechunk_ops`: `set-attrs`, `declare-pyramid`) are how an operator
-writes one. Stage 2's remaining items are tracked on issue #582: native
-overview chunks (issue #584 phase 3, on the `/2` array model), moczarr's
-reads through the repo (phase 6) and the browser (phase 7).
+writes one. Native overview chunks landed with the `/2` array model (issue
+#584 phase 3, §11.3); stage 2's remaining items are tracked on issue #582:
+moczarr's reads through the repo (phase 6) and the browser (phase 7).
 
 **Succession.** A change to the repo's ARRAY MODEL is a new revision,
 declared in the `zagg_icechunk.spec` token (§11.1), so a reader
@@ -4300,7 +4300,8 @@ A morton hive is many leaf zarrs. The companion presents every leaf of one
 order as **one zarr hierarchy** by recording each leaf's inner chunks as
 [Icechunk](https://icechunk.io) **virtual chunk references** —
 `(location, offset, length)` byte ranges into the leaf objects that already
-exist — so an Icechunk reader (icechunk-py, icechunk-js in a browser) opens
+exist (the §4 overview levels, whose objects a later run rewrites in place,
+are copied in as the repo's own chunks instead — §11.3) — so an Icechunk reader (icechunk-py, icechunk-js in a browser) opens
 the hive as a single array per field without moczarr's hand-built virtual
 store, and every hive commit maps onto an Icechunk snapshot.
 
@@ -4597,6 +4598,73 @@ Each **populated** inner chunk is recorded as one virtual reference:
   a single-chunk array), `offset` 0, `length` the object size (§11.4); a
   missing object gets no reference.
 
+**Native chunks: the overview levels (contract).** Every level's chunks are
+virtual references, **except** at an `artifact: "overview"` level (the
+block's `levels`, §11.1), whose chunks are the repository's **own bytes** —
+copied in by the commit that would otherwise have referenced them (issue
+[#584](https://github.com/englacial/zagg/issues/584) phase 3). The reason is
+mutability, not size. A leaf is write-once (§1.5) and a versioned leaf's
+objects are never rewritten at all, so a reference into one stays valid; a §4
+overview object (`{window}.zarr`, `all.zarr`) is **re-folded under its own
+key** by every later run whose subtree gained a leaf, which invalidates the
+reference's checksum — and on a windowed store `all.zarr` is rewritten by
+*every* append. A failed reference is the honest outcome on the branch tip
+(the next staged sweep re-plans it) and defeats a **run tag**, whose whole
+contract is to read the store as that run left it (§11.4). Copied in, an
+overview level reads from a tag exactly as it was committed, while the
+store's overview objects stay authoritative for a path reader and for the
+ladder's own gather (§4.5). A `leaf` level is referenced, unchanged — it is
+write-once, and versioned (§1.5) it is never rewritten at all. A `column`
+level is referenced too, and there the exposure stands: a leaf's §4.6 column
+object sits **beside** the leaf rather than under its version subgroup, so a
+re-run of that leaf rewrites it under the same keys and a tag's column refs
+are valid only while that leaf is not rewritten. Bringing the column under
+the leaf's version root, or copying it in as the overviews are, is open on
+issue [#584](https://github.com/englacial/zagg/issues/584).
+
+The copy is byte-for-byte — the object's inner chunk IS the repo array's
+`(1, C)` chunk (§11.2) — so nothing is re-encoded and the index law above is
+untouched: a native chunk lands at the same `(w, r·C + j)` a reference
+would have, in the same manifest (§11.5), and a reader sees one array
+whatever the mixture (Icechunk resolves both; a repo written before this rule
+keeps the references it holds, each row superseded when a later run
+re-commits it). A chunk small enough for Icechunk to **inline** carries its
+bytes in the manifest rather than a chunk object — Icechunk's own threshold,
+and nothing above depends on which it chose. The cost is the overview bytes a
+second time, in the repo, at the levels **above** the base — each coarser
+level holding a quarter of the cells of the one below it, and only the
+composable fields (§4.5).
+
+The commit also pays **one GET per overview object**, and the committing
+node pays it for its whole **subtree**, not for its own tuple: its units are
+its children's node columns recursively (§11.4), so every overview object
+under it at every finer overview order is read inside the open session.
+At the global setting (`commit_order` 3, `split_order`/`shard_order` 9) the
+overview nodes under one committing node number 4⁵+4⁴+4³+4²+4+1 = 1,365
+across the orders, times the composable arrays per node — of order 10⁴
+objects in one invoke, where the virtual arm did **no** IO at commit time.
+The reads are issued concurrently in fixed windows (`icechunk_native.READ_BATCH`),
+which takes the round trips off the wall clock and bounds the memory at
+roughly **twice** one window's object bytes (each chunk slice is a copy),
+but the per-invoke wall time against the Lambda ceiling
+is **unmeasured** — a fleet measurement is owed before a global-scale build.
+
+A native chunk carries **no** checksum, the bytes being the repository's
+own, so the copy vets the object it reads against the form the plan recorded
+and **refuses** it when they differ: another writer re-folded that overview
+between the plan and the copy, so the gather describes a state that no
+longer exists. On a sharded object the copy vets it **byte-exactly** as
+well, which a reference structurally cannot: the shard index is at the end
+of the object (§1.5), so it is inside the bytes the copy already holds, and
+the offsets, lengths and presence pattern it records are compared against
+the ones the plan read. A reference has only the checksum, and a checksum
+can agree across a rewrite — an `ETag` is whatever the container mints, and
+a `file://` `last_modified` is ceiled to the whole second — so a re-fold
+inside that window is invisible to it; the index is not, and a re-fold that
+**shrank** a chunk would otherwise be sliced short and committed, which on a
+tag is permanent. Either refusal drops the node's whole gather — fail-open (D9), counted
+`icechunk_failed` on its stage row — and the next staged sweep re-gathers it.
+
 Chunk keys are the array's own, under the `chunk_key_encoding` its
 `zarr.json` declares — zagg emits the `default` encoding with the `/`
 separator throughout — so the chunk at grid index `(i₀, i₁, …)` is
@@ -4732,9 +4800,26 @@ columns do:
    and the growth landed first; the rebase failure propagates. A replayed
    node's rebases and commit time sum every session's, the defeated one
    included, and a replay counts whether or not its re-read then staged
-   anything to commit. Each stage row
+   anything to commit.
+
+   A replay **re-pays the native copy in full** (§11.3): a fresh session
+   cannot adopt the abandoned one's staged chunks, so every overview object
+   the node reads is read and copied again, and `icechunk_native_bytes`
+   counts every attempt — what the repository actually paid, not the
+   committed attempt alone. Two consequences follow from Icechunk writing a
+   native chunk's object **eagerly**, at the staging write rather than at the
+   commit: the abandoned attempt's chunk objects **remain in repository
+   storage referenced by no snapshot**, as do those of a copy that raised
+   part-way through a node's entries, and only `garbage_collect` can ever see
+   them — which the default `retain_runs: 0` does not run (below). No
+   *correctness* consequence: the session is never committed, so no
+   half-copied level is visible to any read or tag, and the residue is bytes
+   rather than state. Each stage row
    records `icechunk_commits`, `icechunk_rebases`, `icechunk_replays`,
-   `icechunk_commit_s`, `icechunk_refs`, `icechunk_missing`,
+   `icechunk_commit_s`, `icechunk_native_bytes` (the overview bytes its
+   commit attempts copied into the repo rather than referenced, §11.3,
+   the replayed attempts included),
+   `icechunk_refs`, `icechunk_missing`,
    `icechunk_failed`, `icechunk_skipped_levels`, `icechunk_clean`,
    `icechunk_regathered` and `icechunk_s` — every one
    pre-seeded, so a row's key set does not depend on whether a node did work
@@ -4859,7 +4944,28 @@ tags it once the ladder is complete). One finalize, in order:
    therefore reads one snapshot per run only up to the oldest retained tag,
    and per commit after it. Neither step touches a virtual target: Icechunk
    manages none of the leaf objects (the virtual-target collector below is
-   the operator's tool for those). Retention is fail-open inside finalize: an error (two
+   the operator's tool for those). It does collect the **native** overview
+   chunks (§11.3) that no retained snapshot references — they are the
+   repository's own objects, so they go exactly in step with the snapshots
+   that could have read them, and the store's own overview objects are
+   untouched.
+
+   **Under the default `retain_runs: 0` there is no collection at all**, and
+   that is the configuration almost every store runs. Nothing above this
+   paragraph happens: no tag is deleted, no snapshot expires, and
+   `garbage_collect` is never called. Three things follow, and they are the
+   genuinely new operational property of native overview levels (§11.3):
+   every **superseded** native overview chunk is kept for ever; the
+   repository therefore grows each run by the **touched rows'** overview byte
+   set (`_overview_units` plans this run's rows, so an append is its new
+   window plus `all`), where before this rule it grew by manifest bytes
+   alone; and the chunk objects a failed or replayed copy orphaned (above)
+   are unreachable too, since only `garbage_collect` can see them. The
+   per-run figure an operator can read is `icechunk_native_bytes` summed over
+   the run's stage rows. Whether the default K should change with this is a
+   posture question, open on issue
+   [#584](https://github.com/englacial/zagg/issues/584); this page records
+   the behaviour, it does not change it. Retention is fail-open inside finalize: an error (two
    finalizes racing on one tag delete, a collection cut off by the invoke's
    ceiling) is recorded as `retention_error` and steps 2 and 3 still run;
 2. one content-free **`finalize {run_id}` commit** whose commit metadata
@@ -5062,6 +5168,14 @@ stage node) the writer issues:
 Plus, per stage node, one small `GET` per child carrier. Small beside the
 leaf write, but not nothing.
 
+Plus, at a **committing** node and **inside its open session**, one
+full-object `GET` of every overview object its units name — its whole
+subtree's, at every finer overview order — because an `artifact: "overview"`
+level's chunks are copied in rather than referenced (§11.3, which sizes it).
+This is the one request cost on this page that scales with the subtree
+rather than with the node's own tuple, and the only one paid between
+`writable_session` and `commit`.
+
 Writing refs is **fail-open** (D9) at every rung: a leaf's sidecar failure
 is logged and recorded in its D20 stats sidecar (`icechunk.error`) and never
 fails the leaf; a stage node's failure counts `icechunk_failed` and never
@@ -5239,7 +5353,10 @@ issue [#584](https://github.com/englacial/zagg/issues/584) (its phase 4);
 the finalize and tags of §11.4 apply to them unchanged once they have a
 repo. The sweep-built §4
 overviews are **in** scope since the ladder (§11.4): every declared overview
-level has its group in the store's one repo, and its refs. None of these change the leaf format, the
+level has its group in the store's one repo, and its chunks — **copied in**
+rather than referenced, since those objects are the ones a later run
+rewrites in place (§11.3), which is what lets a run tag read the `all` row
+it was cut with. None of these change the leaf format, the
 t-digest storage or the moczarr reader.
 
 **Scale (informative).** Snapshot size is proportional to the manifest

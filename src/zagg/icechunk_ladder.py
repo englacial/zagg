@@ -10,8 +10,12 @@ travel the way the digest columns do:
    leaf (:func:`write_leaf_refs`) and commits nothing;
 2. each stage node of the staged sweep gathers its subtree — the leaf
    sidecars at the finest tuple, its children's node **ref columns** above —
-   adds the refs of the overview objects it just wrote, and either writes
-   its own node column for the tuple above or **commits** (:func:`stage_node_refs`);
+   adds the plan of the overview objects it just wrote, and either writes
+   its own node column for the tuple above or **commits** (:func:`stage_node_refs`).
+   An overview level's plan is **copied in** rather than referenced at that
+   commit (:mod:`zagg.icechunk_native`, §11.3): those objects are rewritten in
+   place by the next run that re-folds them, so a tag holding virtual refs to
+   them could not read the level it was cut with;
 3. the tuple whose order range contains ``icechunk.commit_order`` commits
    everything gathered in ONE commit per node covering every order in its
    subtree (refs into ``/19/…``, ``/13/…``, ``/12/…``, … of the one repo —
@@ -69,13 +73,17 @@ GEOMETRY_KEYS = ("shard_order", "chunk_order", "cell_order")
 #: not any node did work, so the row's key set does not depend on the pass.
 #: ``icechunk_commit_s`` is the commit's own wall time, ``icechunk_s`` the
 #: hook's (the gather included); ``icechunk_replays`` counts the commits
-#: replayed in a fresh session over another run's row growth (§11.4).
+#: replayed in a fresh session over another run's row growth (§11.4);
+#: ``icechunk_native_bytes`` the overview bytes the commits COPIED into the
+#: repo rather than referenced (§11.3) — the price of a tag that reads its
+#: own fold, measured rather than asserted.
 STAGE_COUNTS = (
     "icechunk_refs",
     "icechunk_commits",
     "icechunk_rebases",
     "icechunk_replays",
     "icechunk_commit_s",
+    "icechunk_native_bytes",
     "icechunk_missing",
     "icechunk_failed",
     "icechunk_skipped_levels",
@@ -354,6 +362,12 @@ def _overview_units(
 ):
     """Ref entries of every overview object under ``node`` at the tuple's orders.
 
+    The entries are planned exactly as a leaf's are and the committing
+    session copies their bytes in instead of referencing them (an overview
+    level is native, :mod:`zagg.icechunk_native`); nothing about the plan or
+    the carrier differs, so a node column written by an earlier writer
+    travels and commits unchanged.
+
     One unit per (level, ROW): a windowed store's node carries one overview
     object per window (``{window}.zarr``, D23) plus ``all.zarr`` for the
     cross-window fold, and each lands at its own row (§11.2, issue #584
@@ -598,6 +612,7 @@ def stage_node_refs(
     counts["icechunk_rebases"] += outcome["rebases"]
     counts["icechunk_replays"] += outcome["replays"]
     counts["icechunk_commit_s"] += outcome["commit_s"]
+    counts["icechunk_native_bytes"] += outcome["native_bytes"]
     return record
 
 
@@ -672,6 +687,7 @@ def node_row(record: dict) -> dict:
         row["rebases"] = int(commit["rebases"])
         row["replays"] = int(commit.get("replays") or 0)
         row["commit_s"] = float(commit["commit_s"])
+        row["native_bytes"] = int(commit.get("native_bytes") or 0)
     return row
 
 
