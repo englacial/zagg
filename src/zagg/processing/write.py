@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
+from zarr.core.buffer import default_buffer_prototype
 
 from zagg.config import (
     PipelineConfig,
@@ -125,6 +126,29 @@ def _carrier_empty(carrier) -> bool:
     if isinstance(carrier, pd.DataFrame):
         return carrier.empty
     return carrier.num_rows == 0
+
+
+def all_fill(array, values) -> bool:
+    """Whether ``values`` is entirely ``array``'s fill value (issue #653).
+
+    Zarr never stores an all-fill chunk: with ``write_empty_chunks`` off (the
+    default) the codec pipeline turns one into a store ``delete`` of its key,
+    and the sharding codec does the same for a shard whose every inner chunk
+    is fill. A fresh leaf, column or overview writes onto a prefix it has just
+    cleared, so that key does not exist and the delete buys nothing — while a
+    bucket answering the bulk ``DeleteObjects`` with an error document fails
+    the write (issue #651). The writers test here and skip the write instead:
+    absence is already the spec's encoding (§4, an inner chunk with no data
+    MUST be absent), so a skipped slab leaves the bytes a delete would have.
+    The comparison is zarr's own (``NDBuffer.all_equal``: NaN equals the NaN
+    fill, signed zeros stay distinct), so a slab skipped here is exactly one
+    zarr would have deleted — never one it would have written.
+    """
+    fill = array.metadata.fill_value
+    if fill is None:
+        return False
+    values = default_buffer_prototype().nd_buffer.from_numpy_array(np.asarray(values))
+    return bool(values.all_equal(fill))
 
 
 def write_dataframe_to_zarr(
@@ -381,7 +405,8 @@ def write_shard_to_zarr(
                         f"{target_trailing_chunks} must equal trailing shape "
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
-            array.set_block_selection(block_idx, slab)
+            if not all_fill(array, slab):  # an all-fill shard would be a DELETE (#653)
+                array.set_block_selection(block_idx, slab)
 
     # ONE object write per ragged field too (issue #209): the vlen-bytes
     # array shares the dense arrays' ShardingCodec geometry, so the whole
@@ -634,7 +659,8 @@ def write_leaf_to_zarr(
                         f"{target_trailing_chunks} must equal trailing shape "
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
-            array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
+            if not all_fill(array, slab):  # an all-fill shard would be a DELETE (#653)
+                array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
     for name, slab in ragged_slabs.items():
         _set_ragged_block(store, grid, name, leaf_block, slab)
     if staged_out is not None:
@@ -813,7 +839,12 @@ def _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields)
 
 
 def _set_ragged_block(store, grid, name, block_idx, block) -> None:
-    """One block-selection write into a ragged vlen array (issue #209)."""
+    """One block-selection write into a ragged vlen array (issue #209).
+
+    A block whose every cell is the ``b""`` fill — a ``where``-predicated
+    stratum no photon of the window satisfied — is not written: zarr would
+    DELETE its key instead (:func:`all_fill`, issue #653).
+    """
     with config.set({"async.concurrency": 128}):
         array = open_array(
             store,
@@ -821,7 +852,8 @@ def _set_ragged_block(store, grid, name, block_idx, block) -> None:
             zarr_format=3,
             consolidated=False,
         )
-        array.set_block_selection(tuple(block_idx), block)
+        if not all_fill(array, block):
+            array.set_block_selection(tuple(block_idx), block)
 
 
 def _chunk_uniform_ragged(name: str, values_list: list):

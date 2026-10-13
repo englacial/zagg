@@ -618,6 +618,7 @@ def write_column(
     from zagg.grids.base import vlen_dtype_warning_suppressed
     from zagg.grids.morton import morton_decimal
     from zagg.hive import _utcnow, shard_leaf_path, stamp_commit
+    from zagg.processing.write import all_fill
     from zagg.store import open_store
     from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
     from zagg.windows import SCHEDULE_NONE_TOKEN
@@ -658,7 +659,8 @@ def write_column(
             staged[f"{res}/morton"] = words
             for name, slab in folded[res].items():
                 arr = open_array(store, path=f"{res}/{name}", zarr_format=3, consolidated=False)
-                arr[:] = slab
+                if not all_fill(arr, slab):  # an all-fill object would be a DELETE (#653)
+                    arr[:] = slab
                 staged[f"{res}/{name}"] = slab
     root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
     root.attrs.update(
