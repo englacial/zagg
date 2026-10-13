@@ -584,7 +584,11 @@ class HealpixGrid:
         template write alone only rewrites members the NEW schema declares —
         a schema-narrowed rerun would leave the retired members' objects
         behind (e.g. the post-#337 ``cell_ids`` chunk orphans), masquerading
-        as data.
+        as data. ``overwrite=False`` on an occupied prefix now RAISES
+        ``ContainsGroupError`` (issue #657): the one-pass
+        :func:`zagg.grids.base.emit_hierarchy` refuses existing nodes, where
+        pydantic-zarr's ``to_zarr`` accepted a structurally identical template.
+        Every leaf writer passes ``overwrite=True``.
 
         Scope of the justification (fold review — the evidence, not more): the
         observed ``No array found in store … at path 19/cell_ids`` signature is
