@@ -2687,7 +2687,10 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
     from zagg.dispatch import BENIGN_ERRORS
 
     row, resident, deferred, wrote = [], set(), False, False
-    for w in windows:
+    # Ascending label order, not the dispatcher's (an explicit schedule
+    # dispatches in DECLARED order): a float fold's rounding follows row order,
+    # and the sweep's close folds ``sorted`` labels (review finding (5)).
+    for w in sorted(windows, key=lambda w: w["label"]):
         m = metas[w["label"]]
         if m.get("current") or m.get("refused"):
             deferred = True  # not resident: the stored-column path's case

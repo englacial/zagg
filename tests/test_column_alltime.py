@@ -271,6 +271,30 @@ class TestBulkUnit:
         assert [r["phase_timings"]["all_time_column"] for r in records] == [close] * 3
         assert merge(records)["phase_timings"]["all_time_column"] == pytest.approx(close)
 
+    def test_the_row_folds_in_label_order_whatever_the_dispatch_order(self, monkeypatch, tmp_path):
+        import zagg.column_alltime as column_alltime
+
+        seen = []
+        close = column_alltime.close_shard
+
+        def _spy(store_root, shard_key, grid, config, row, **kw):
+            seen.append([r.path for r in row])
+            return close(store_root, shard_key, grid, config, row, **kw)
+
+        monkeypatch.setattr(column_alltime, "close_shard", _spy)
+        cfg = emit._digest_cfg()
+        emit._patch(monkeypatch, emit._dense_fakes())
+        shard, urls, windows = emit._bulk_unit(cfg)
+        trees = []
+        for order, name in ((windows, "sorted"), (windows[::-1], "reversed")):
+            root = str(tmp_path / name)
+            hive.process_and_write_hive(
+                shard, urls, emit._grid(cfg), {}, root, cfg, store_kwargs={}, windows=order
+            )
+            trees.append({k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k})
+        assert seen == [[f"{w}.pyramid.zarr" for w in WINDOWS]] * 2
+        assert trees[0] and trees[0] == trees[1]
+
     def test_a_rerun_writes_the_same_bytes(self, monkeypatch, tmp_path):
         cfg = emit._digest_cfg()
         root = str(tmp_path / "bulk")
