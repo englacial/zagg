@@ -713,7 +713,9 @@ a whole level of the node in memory. The fold is now streamed block by block
 the schedule is sized (width 2, issue #639), and the measurement retired the
 stopgap: the 2,093 stage invokes of the 2026-10-12 v4 build peaked at 290 MB
 p99 / 2,926 MB max, none over 4 GB
-([issue #659](https://github.com/englacial/zagg/issues/659)). The
+([issue #659](https://github.com/englacial/zagg/issues/659)). That build
+swept 798 of 2,726 shards, so the max (the order-0/1 close) grows with a
+full store; 4 GB leaves headroom over it. The
 dispatcher's role must be allowed to invoke that function. Both dispatchers
 resolve it the same way — `python -m zagg` (`runner._run_lambda`) and the
 `zagg.client` facade's tail — from the run's own resolved function name

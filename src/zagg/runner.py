@@ -121,7 +121,9 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
 #: width 2, top-aligned (issue #639) — and the measurement is in: the 2,093
 #: stage invokes of run ``stage-20261012T164317Z-5e45d0`` (2026-10-12, the v4
 #: California build) peaked at 261 MB p50 / 290 MB p99 / 2,926 MB max, zero
-#: over 4 GB, 26 s p50 duration. A dispatch default, not a deployment change:
+#: over 4 GB, 26 s p50 duration. That run swept 798 of 2,726 shards: the max
+#: is the order-0/1 close, which grows with a full store; 4 GB leaves headroom
+#: over it. A dispatch default, not a deployment change:
 #: the variant is one the stack already stamps (``deployment/aws/template.yaml``).
 STAGE_SWEEP_WORKER = {"memory": 4096, "extra_disk": True}
 

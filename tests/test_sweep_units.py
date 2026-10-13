@@ -1365,7 +1365,9 @@ class TestStageTier:
         from zagg.config import WORKER_MEMORIES
 
         # The leaf tier (issue #659): zero of the 2,093 measured stage invokes
-        # exceeded 4 GB (max 2,926 MB), so the 8 GB stopgap is retired.
+        # exceeded 4 GB (max 2,926 MB, the order-0/1 close on a run that swept
+        # 798 of 2,726 shards; it grows with a full store), so the 8 GB
+        # stopgap is retired.
         assert runner.STAGE_SWEEP_WORKER == {"memory": 4096, "extra_disk": True}
         assert runner.STAGE_SWEEP_WORKER["memory"] in WORKER_MEMORIES
 
