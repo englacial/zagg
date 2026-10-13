@@ -528,8 +528,20 @@ class TestCostLegs:
         cfg.output["sweep"] = "families"
         preview = notebook.max_cost_preview(cfg, _synthetic_shardmap(tmp_path, _DECIMALS, (2019,)))
         assert preview["legs"]["stage"]["invokes"] == 0
-        # One partition for a work set under FAMILIES_TARGET_LEAVES, plus the finisher.
-        assert preview["legs"]["families"]["invokes"] == 2
+        # One partition for a work set under FAMILIES_TARGET_LEAVES: that pass IS the finisher.
+        assert preview["legs"]["families"]["invokes"] == 1
+
+    def test_families_split_fires_non_empty_buckets_plus_finisher(self, tmp_path):
+        from zagg.sweep_partition import FAMILIES_TARGET_LEAVES
+
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        cfg.output["sweep"] = "families"
+        years = range(1990, 2020)  # 5 shards x 30 yearly windows = 150 leaves
+        assert len(_DECIMALS) * len(years) > FAMILIES_TARGET_LEAVES
+        preview = notebook.max_cost_preview(cfg, _synthetic_shardmap(tmp_path, _DECIMALS, years))
+        # The split refines to order 7 (4**7 partitions), where only the two
+        # order-7 ancestors' buckets are non-empty (90 and 60 leaves): 2 + finisher.
+        assert preview["legs"]["families"]["invokes"] == 2 + 1
 
     def test_table_prints_both_columns_per_leg_and_total(self, tmp_path):
         cfg = default_config("atl03_tdigest_strata_healpix")
