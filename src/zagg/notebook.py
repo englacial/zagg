@@ -317,7 +317,7 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
         # priced, so a bulk ``unit: shard`` run reads 0/N..N/N over its N
         # invokes. The label has to follow the unit too (issue #648) — a bar
         # saying "shards" must not tick once per (shard, window).
-        desc = runner.unit_noun(config)
+        desc = runner._unit_noun(config)
         if kwargs.get("backend") == "lambda":
             print(format_max_cost(preview))
 
