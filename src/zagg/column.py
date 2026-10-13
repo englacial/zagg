@@ -684,7 +684,7 @@ def write_column(
     populated = _populated_mask(folded[resolutions[0]], fields)
     # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
     # sidecar carries the same record.
-    hashes = staged_record(store, staged, f"leaf column {basename}")
+    hashes = staged_record(store, staged, f"leaf column {basename}", nodes=nodes)
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),

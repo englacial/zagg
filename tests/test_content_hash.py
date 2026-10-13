@@ -537,3 +537,67 @@ class TestDenseRecipe:
         hashes = {"a": "00", "b": "ff"}
         assert combined_hash(hashes) == combined_hash({"b": "00", "a": "ff"})
         assert combined_hash(hashes) != combined_hash({"a": "00", "b": "fe"})
+
+
+class TestWriterNodeSet:
+    """Issue #657: a writer hands ``hash_arrays`` its own node set — no store walk.
+
+    The template pass (``HealpixGrid.emit_shard_nodes``) returns every handle
+    the writer then writes through; the O11 record computed from that set
+    must equal the discovery-based record (§5.1) over the same store, and
+    must cost no metadata read.
+    """
+
+    @staticmethod
+    def _leaf():
+        import test_processing
+        from zarr.storage import MemoryStore
+
+        from zagg.processing import write_leaf_to_zarr
+
+        grid, shard_key, chunk_results, _payloads, _dense = (
+            test_processing.TestWriteLeafToZarr._setup()
+        )
+        store = MemoryStore()
+        nodes = grid.emit_shard_nodes(store, overwrite=True)
+        staged: dict = {}
+        write_leaf_to_zarr(
+            chunk_results, store, grid=grid, shard_key=shard_key, staged_out=staged, arrays=nodes
+        )
+        return store, nodes, staged
+
+    def test_the_node_set_record_equals_the_discovery_record(self):
+        from zagg.content_hash import staged_record
+
+        store, nodes, staged = self._leaf()
+        from_nodes = staged_record(store, staged, "leaf", nodes=nodes)
+        assert from_nodes is not None
+        assert from_nodes == staged_record(store, staged, "leaf")
+        group = zarr.open_group(store, mode="r", zarr_format=3)
+        assert from_nodes == content_hashes_record(hash_arrays(group))
+        assert set(from_nodes["arrays"]) == {
+            k for k, n in nodes.items() if isinstance(n, zarr.Array)
+        }
+
+    def test_the_node_set_record_reads_no_metadata(self, monkeypatch):
+        from zarr.storage import MemoryStore
+
+        from zagg.content_hash import staged_record
+
+        store, nodes, staged = self._leaf()
+        reads: list = []
+        original_get = MemoryStore.get
+
+        async def counted_get(self, key, *args, **kwargs):
+            reads.append(key)
+            return await original_get(self, key, *args, **kwargs)
+
+        async def no_listing(self, prefix):
+            raise AssertionError("the node-set record walked the store")
+            yield  # an async generator, like the method it replaces
+
+        monkeypatch.setattr(MemoryStore, "get", counted_get)
+        monkeypatch.setattr(MemoryStore, "list_dir", no_listing)
+        record = staged_record(store, staged, "leaf", nodes=nodes)
+        assert record is not None  # fail-open would hide a walk that raised
+        assert [k for k in reads if k.endswith("zarr.json")] == []
