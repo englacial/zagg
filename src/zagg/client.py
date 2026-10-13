@@ -86,7 +86,7 @@ from zagg.config import (
     validate_config,
 )
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, LAMBDA_PRICE_PER_GB_SEC, max_cost_usd
-from zagg.dispatch_guard import DispatchGuard, GuardConfig
+from zagg.dispatch_guard import NOT_DISPATCHED, DispatchGuard, GuardConfig, describe
 from zagg.grids import from_config as grid_from_config
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
@@ -1322,6 +1322,15 @@ class Run:
         trip = guard.tripped if guard is not None else None
         if guard is not None:
             handle.ramp, handle.breaker = guard.ramp, guard.breaker
+        if trip is not None:
+            refused = sum(r.get("outcome") == NOT_DISPATCHED for r in results)
+            logger.warning(
+                f"circuit breaker tripped ({trip['rule']}) at result {trip['at_result']}, "
+                f"width {trip['width']}: {refused} units not dispatched, tail legs skipped "
+                f"(issue #652)"
+            )
+        for line in describe(handle.ramp, handle.breaker):
+            logger.info(line)
         # ONE warn/retry/record implementation for every dispatch path (issue
         # #335 phase 1): agg's _run_lambda, the raster driver and this finisher
         # all route through runner._finalize_with_retry, so the message contract

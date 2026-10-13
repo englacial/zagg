@@ -391,13 +391,23 @@ class TestEventDispatch:
         assert "finalize" in modes and "coverage" in modes and "stats" in modes
         assert modes[-1] == "icechunk_finalize"  # the tail's last invoke (issue #582)
 
-    def test_a_tripped_breaker_skips_the_facade_tail(self, catalog, status_store, monkeypatch):
+    def test_a_tripped_breaker_skips_the_facade_tail(
+        self, catalog, status_store, monkeypatch, caplog
+    ):
         monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
         stub = DropNthStub(status_store, drop_nth=2, record=True)
-        handle = _run(catalog, client=stub, max_retries=1).dispatch(
-            transport="event", dispatch=_TRIP_KNOBS
-        )
-        handle.wait()
+        with caplog.at_level("INFO", logger="zagg.client"):
+            handle = _run(catalog, client=stub, max_retries=1).dispatch(
+                transport="event", dispatch=_TRIP_KNOBS
+            )
+            handle.wait()
+        # The trip is printed on the facade too, as on the CLI (review, PR #665).
+        assert (
+            "circuit breaker tripped (timeout-ratio) at result 2, width 1: "
+            "1 units not dispatched, tail legs skipped"
+        ) in caplog.text
+        assert "Dispatch ramp (width@result): 1@0" in caplog.text
+        assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio" in caplog.text
         assert handle.breaker["rule"] == "timeout-ratio" and handle.breaker["tripped"]
         assert handle.ramp == [{"width": 1, "at_result": 0}]
         assert handle.status() == {"pending": 0, "ok": 1, "failed": 2}
