@@ -158,7 +158,12 @@ class TestV2FixtureE2E:
         assert report["leaf_levels"] == [5]
         # The all-time legs are the windowed arm's alone (issue #650): an
         # unwindowed store's single fold IS all-time (§4.2), so the leg is not
-        # on this checklist and the leaf tier's member is the ``columns`` leg's.
+        # on this checklist at all. NOTE the two arms do not check the same
+        # artifact under a different leg: here ``all.pyramid.zarr`` IS the
+        # ``(leaf, schedule-none)`` column (``column_name(None)``), which the
+        # ``columns`` leg validates in full, while the windowed probe demands
+        # that same path for a different thing -- the fold of the window
+        # columns. That collision is issue #649's item (1) to rule on.
         assert "all_time" not in report["checks"] and "all_time_columns" not in report
         # Declaration ↔ materialized: the fixed ladder is fully populated ...
         assert report["nodes"] == {
