@@ -47,8 +47,13 @@ def _windowed_cfg(unit=None):
     return cfg
 
 
-def _raster_cfg(store):
-    """A windowed hive raster config -- the ``RasterStrategy.run`` call site."""
+def _raster_cfg(store, layout="hive"):
+    """A windowed raster config -- the ``RasterStrategy.run`` call site.
+
+    ``layout="flat"`` is the shape ``validate_config`` refuses (windowing is
+    hive-only) but ``max_cost_preview`` still prices, since it validates
+    nothing.
+    """
     from zagg.config import load_config_from_dict
 
     return load_config_from_dict(
@@ -60,7 +65,7 @@ def _raster_cfg(store):
             "output": {
                 "grid": {"type": "healpix", "parent_order": 9, "child_order": 19},
                 "store": store,
-                "store_layout": "hive",
+                "store_layout": layout,
                 "windowing": {"schedule": "monthly"},
             },
         }
@@ -246,6 +251,18 @@ class TestMaxCostPreview:
         )
         preview = notebook.max_cost_preview(cfg, SHARDMAP)
         assert preview["n_units"] == 7
+
+    def test_unvalidated_flat_windowed_raster_counts_selected_cells(self):
+        # The raster arm's non-hive branch (issue #648 fold): windowing is
+        # hive-only for any config that passed ``validate_config``, but this
+        # function validates nothing and the CLI gate prices through it before
+        # ``agg`` validates -- so the branch is live defense, and it counts
+        # cells exactly as the pre-#648 preview did rather than fanning out on
+        # a layout the run is about to refuse.
+        cfg = _raster_cfg("s3://out/r.zarr", layout="flat")
+        with pytest.raises(ValueError, match="store_layout: hive"):
+            validate_config(cfg)
+        assert notebook.max_cost_preview(cfg, SHARDMAP)["n_units"] == 4
 
     def test_windowed_shard_unit_prices_one_invoke_per_shard(self):
         # issue #648: ``unit: shard`` (the #586 default) emits every window
