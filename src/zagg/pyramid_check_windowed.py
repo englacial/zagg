@@ -886,17 +886,18 @@ def _all_time_check(
         "materialized": len(leaves) - len(col_missing),
         "missing": col_missing[:50],
     }
-    column_finding = col_missing and (
+    column_finding = (
         f"{len(col_missing)}/{len(leaves)} leaf/leaves carry no committed all.pyramid.zarr: "
         f"{col_missing[:8]} — the declared leaf-column levels {levels} have NO all-time "
         f"member, so the store's default view is missing them (issue #650; the base, cells "
         f"{base}, is exempt — an all-time leaf IS the unwindowed store)"
     )
+    col_findings = [column_finding] if col_missing else []
     if not committed:
         checks["all_time"] = _entry(
             "fail",
-            f"declared but no committed all-time fold: 0/{len(probed)} nodes — the node close "
-            f"has not run" + (f"; {column_finding}" if column_finding else ""),
+            f"0/{len(probed)} declared nodes carry the all-time fold — the node close has not run",
+            mismatches=col_findings,
         )
         return
     sources = _WindowSources(
@@ -941,8 +942,7 @@ def _all_time_check(
         found.insert(
             0, f"{len(missing)} declared node(s) carry no committed all.zarr: {missing[:8]}"
         )
-    if column_finding:
-        found.insert(0, column_finding)
+    found[:0] = col_findings
     if found:
         checks["all_time"] = _entry(
             "fail", f"{len(found)} mismatch(es); first: {found[0]}", mismatches=found[:20]
