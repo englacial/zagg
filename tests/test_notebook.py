@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from test_live_store_templates import WINDOWED_TEMPLATES
 
 from zagg import notebook
 from zagg.config import default_config, validate_config
@@ -260,6 +261,33 @@ class TestMaxCostPreview:
 
     def test_unwindowed_unchanged_by_the_unit_branch(self):
         assert notebook.max_cost_preview(default_config("atl06"), SHARDMAP)["n_units"] == 4
+
+    @pytest.mark.parametrize("name", WINDOWED_TEMPLATES)
+    def test_packaged_windowed_template_preview_equals_its_dispatch(self, monkeypatch, name):
+        # issue #648's third test bullet, on the templates the bug actually
+        # shipped on: issue #638 made these yearly-windowed from birth, and the
+        # reported probe was one of them. The hand-built ``_windowed_cfg``
+        # cannot catch a template whose windowing block resolves to something
+        # the classifier reads differently, so preview the PACKAGED config
+        # (the ``WINDOWED_TEMPLATES`` list of tests/test_live_store_templates.py)
+        # and compare it against the real lambda dispatch's ticks.
+        ticks = []
+
+        class _Recorder:
+            def update(self, done, total, cost_usd):
+                ticks.append((done, total))
+
+            def close(self):
+                pass
+
+        cfg = default_config(name)
+        preview = notebook.max_cost_preview(cfg, SHARDMAP)
+        assert preview["n_units"] == 4  # one invoke per shard, NOT per window
+        _lambda_dispatch_env(monkeypatch)
+        monkeypatch.setattr(notebook, "_make_progress", lambda total, desc="shards": _Recorder())
+        notebook.run(cfg, catalog=SHARDMAP, store=_STORE, backend="lambda")
+        assert len(ticks) == preview["n_units"]
+        assert ticks[-1] == (4, 4)
 
     @pytest.mark.parametrize(
         "cfg_fn",
