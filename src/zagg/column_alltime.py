@@ -91,7 +91,12 @@ class _ResidentColumn(_ColumnReader):
 
 
 def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> tuple:
-    """``({res: {field: slab}}, {res: merges_from_raw}, broken windows)`` over ``row``.
+    """``(folded, depth, broken, demotions)`` over ``row``.
+
+    ``folded`` is ``{res: {field: slab}}``, ``depth`` ``{res: merges_from_raw}``,
+    ``broken`` the windows the kernel refused, and ``demotions`` ``{res:
+    records}`` — the packed rail's :func:`zagg.sweep_overview.demotion_records`
+    at each group where it fired, and only there (review finding (7)).
 
     ``row`` is the shard's window sources in ascending window order — a
     :class:`_ResidentColumn` or a committed :class:`zagg.sweep_fold._ColumnReader`
@@ -105,11 +110,15 @@ def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> t
     payload-only); it counts ``unreadable`` in the artifact's
     ``source_windows``. A window whose column lacks a group (a declaration
     deepened since it was written) contributes fill there, the kernel's
-    schema-evolution rule.
+    schema-evolution rule; a window carrying a packed field's divisor digest
+    without its word (a column written before the field was declared)
+    demotes the field at that group — the cells it shares keep the fill
+    word — and the record says so.
     """
     folded: dict = {}
     depth: dict = {}
     broken: set = set()
+    demoted: dict = {}
     for res in sorted((int(r) for r in resolutions), reverse=True):
         n_out = 4 ** (res - int(node_order))
         slabs, bad, demotions = merge_level(
@@ -118,12 +127,14 @@ def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> t
         folded[res] = slabs
         depth[res] = _gather_depth([row], res) + 1
         broken |= {w for _child, w in bad}
+        if demotions:
+            demoted[res] = demotions
         for record in demotions:
             logger.warning(
                 f"all-time column at resolution {res}: packed rail fired ({record}); "
                 f"the affected cells keep the fill word (spec §3.3)"
             )
-    return folded, depth, broken
+    return folded, depth, broken, demoted
 
 
 def write_all_time_column(
@@ -141,7 +152,8 @@ def write_all_time_column(
 
     A thin caller of :func:`zagg.column.write_column` under the reserved
     window token: the fold's groups, ``merges_from_raw`` one deeper than the
-    window members', the ``source_windows`` counters, a stamp carrying the
+    window members' (and the packed rail's ``demotions`` where it fired), the
+    ``source_windows`` counters, a stamp carrying the
     folded windows' granule counts summed and their time ranges unioned (the
     stage close's own derivation, :func:`zagg.sweep_stage._fold_result`).
     ``None``, and nothing written, when no window source is a committed
@@ -153,7 +165,7 @@ def write_all_time_column(
 
     if not any(_is_reader(entry) for entry in row):
         return None
-    folded, depth, broken = fold_all_time(
+    folded, depth, broken, demoted = fold_all_time(
         row, fields, node_order=node_order, resolutions=resolutions
     )
     used = [entry for w, entry in enumerate(row) if _is_reader(entry) and w not in broken]
@@ -173,7 +185,12 @@ def write_all_time_column(
         time_range=union_time_range(*ranges) if ranges else None,
         granule_count=sum(int(s.stamp.get("granule_count") or 0) for s in used),
         store_kwargs=store_kwargs,
-        groups={res: {"merges_from_raw": d} for res, d in depth.items()},
+        # The rail's record sits in the group it fired at (spec §4.3),
+        # keyed only there, so a clean fold's attrs are unchanged.
+        groups={
+            res: {"merges_from_raw": d, **({"demotions": demoted[res]} if res in demoted else {})}
+            for res, d in depth.items()
+        },
         provenance={
             "source_windows": {
                 "folded": len(used),

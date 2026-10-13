@@ -82,10 +82,10 @@ class TestFoldAllTime:
     def test_every_member_is_the_kway_fold_of_the_window_members(self):
         folds = _window_folds()
         resolutions = [tc.CELL_ORDER, tc.CELL_ORDER - 1, tc.SHARD_ORDER]
-        folded, depth, broken = fold_all_time(
+        folded, depth, broken, demotions = fold_all_time(
             _resident(folds), tc.FIELDS, node_order=tc.SHARD_ORDER, resolutions=resolutions
         )
-        assert broken == set() and sorted(folded) == sorted(resolutions)
+        assert broken == set() and demotions == {} and sorted(folded) == sorted(resolutions)
         for res in resolutions:
             expected = _oracle(folds, res)
             assert set(folded[res]) == set(expected)
@@ -102,7 +102,7 @@ class TestFoldAllTime:
 
     def test_a_lone_window_folds_to_itself(self):
         folds = _window_folds(("2019",))
-        folded, depth, _broken = fold_all_time(
+        folded, depth, _broken, _demotions = fold_all_time(
             _resident(folds), tc.FIELDS, node_order=tc.SHARD_ORDER, resolutions=[tc.CELL_ORDER]
         )
         member = folds["2019"][tc.CELL_ORDER]
@@ -117,7 +117,7 @@ class TestFoldAllTime:
         # record 1 at {6, 5, 4} and 2 at {3, 2}; the all-time member one more.
         folds = _window_folds(shard_order=2, cell_order=6)
         resolutions = [6, 5, 4, 3, 2]
-        _folded, depth, _broken = fold_all_time(
+        _folded, depth, _broken, _demotions = fold_all_time(
             _resident(folds, shard_order=2, cell_order=6),
             tc.FIELDS,
             node_order=2,
@@ -129,7 +129,7 @@ class TestFoldAllTime:
         folds = _window_folds()
         row = _resident(folds)
         row[1] = None  # 2019: no committed column
-        folded, _depth, broken = fold_all_time(
+        folded, _depth, broken, _demotions = fold_all_time(
             row, tc.FIELDS, node_order=tc.SHARD_ORDER, resolutions=[tc.CELL_ORDER]
         )
         two = _oracle({k: v for k, v in folds.items() if k != "2019"}, tc.CELL_ORDER)
@@ -146,6 +146,47 @@ class TestFoldAllTime:
         )
         attrs = _attrs(tmp_path, basename)
         assert attrs[COLUMN_ATTR]["source_windows"] == {"folded": 2, "missing": 1, "unreadable": 0}
+
+    def test_a_window_without_the_packed_word_lands_in_the_groups(self, tmp_path):
+        # Review finding (7): 2019's column carries the divisor digest but not
+        # the composition word (written before the field was declared), so
+        # the rail blanks the shared cells; the artifact must say so.
+        n = 4 ** (tc.CELL_ORDER - tc.SHARD_ORDER)
+        resolutions = [tc.CELL_ORDER, tc.CELL_ORDER - 1, tc.SHARD_ORDER]
+        folds = {}
+        for k, label in enumerate(("2018", "2019")):
+            slabs = tc._cell_slabs({0: np.arange(5.0) + k, 1: np.arange(3.0)}, n)
+            slabs["composition"] = np.zeros(n, np.uint64)
+            slabs["composition"][:2] = (0xFF000000FF0000FF, 0x00FF00FF00FF0000)
+            folds[label] = fold_column(
+                slabs,
+                tc.PACKED_FIELDS,
+                cell_order=tc.CELL_ORDER,
+                resolutions=resolutions,
+                node_order=tc.SHARD_ORDER,
+            )
+        for group in folds["2019"].values():
+            del group["composition"]
+        args = dict(node_order=tc.SHARD_ORDER, cell_order=tc.CELL_ORDER, resolutions=resolutions)
+        basename = write_all_time_column(
+            str(tmp_path), tc.morton_word("-311"), _resident(folds), tc.PACKED_FIELDS, **args
+        )
+        groups = _attrs(tmp_path, basename)[COLUMN_ATTR]["groups"]
+        for res in map(str, resolutions):
+            (record,) = groups[res]["demotions"]
+            assert record["field"] == "composition" and record["reason"] == "word-missing"
+            assert record["contributors"] == 1 and record["of"] == "h_tdigest"
+        # A clean fold of the same field keys no ``demotions`` anywhere.
+        clean = {label: folds["2018"] for label in ("2018", "2019")}
+        basename = write_all_time_column(
+            str(tmp_path / "clean"),
+            tc.morton_word("-311"),
+            _resident(clean),
+            tc.PACKED_FIELDS,
+            **args,
+        )
+        groups = _attrs(tmp_path / "clean", basename)[COLUMN_ATTR]["groups"]
+        assert not any("demotions" in g for g in groups.values())
 
     def test_nothing_to_fold_writes_nothing(self, tmp_path):
         assert (
