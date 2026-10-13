@@ -419,14 +419,16 @@ class TestEventDispatch:
         # for A's (review finding, PR #665). One fresh status store per run id.
         monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
         fresh = [MemoryStore(), MemoryStore()]
-        by_prefix: dict = {}
-        monkeypatch.setattr(
-            ct, "open_status_store", lambda p, kw: by_prefix.setdefault(p, fresh[len(by_prefix)])
-        )
+        stub_a = DropNthStub(fresh[0], drop_nth=2, record=True)
+
+        def _store(prefix, kwargs):  # A's run id rode its (synchronous) setup invoke
+            ids = {e["run_manifest"]["run_id"] for _, _, e in stub_a.events if "run_manifest" in e}
+            return fresh[0] if any(i in prefix for i in ids) else fresh[1]
+
+        monkeypatch.setattr(ct, "open_status_store", _store)
         gate = threading.Event()
         tail = Run._run_tail
         monkeypatch.setattr(Run, "_run_tail", lambda *a, **k: gate.wait(10) and tail(*a, **k))
-        stub_a = DropNthStub(fresh[0], drop_nth=2, record=True)
         run = _run(catalog, client=stub_a, max_retries=1)
         a = run.dispatch(transport="event", dispatch=_TRIP_KNOBS)
         run._lambda_client = stub_b = EventStubLambdaClient(fresh[1], record=True)
