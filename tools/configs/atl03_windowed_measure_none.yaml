@@ -30,9 +30,11 @@
 # The staged tail: on the windowed arms the ladder fans one stage invoke per
 # (node, window) plus one close per node (the all-time fold); the unwindowed arm
 # runs one stage unit per node and no close. Every arm's stage invokes go to the
-# 8,192 MB tier -- the run's function family with ``-8192-disk``
-# (``process-shard-8192-disk``; env ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME``
-# overrides). The leaf fan-out stays on ``worker:`` below.
+# leaf tier -- the run's function family with ``-4096-disk``
+# (``process-shard-4096-disk``, ``runner.STAGE_SWEEP_WORKER``; env
+# ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME`` overrides). Issue #659 retired the 8,192
+# MB stopgap the ladder column below was priced at, so that column now reads 2x
+# high. The leaf fan-out stays on ``worker:`` below.
 #
 # Cost estimate per arm (issue #602 phase 3), extrapolated from the 0.55.0 run
 # (issue #586 phase 1) at $0.0000133334 per GB-s (arm64). Inputs: baseline

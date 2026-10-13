@@ -112,15 +112,18 @@ def _resolve_function_name(config: PipelineConfig, function_name: str | None) ->
     return base + suffix
 
 
-#: The worker-size variant a staged sweep's invokes run on (issue #586): the
-#: 8,192 MB tier with the 10 GB ``/tmp``. The interim ruled on the issue's
-#: 2026-09-26 amendment — the 0.55 fleet's order-6 stage died at the 4 GB cap
-#: on 64 unwindowed leaves — and it stays until the chunk-streamed fold
-#: (:mod:`zagg.sweep_fold`) has been measured on the fleet. Stage nodes sit at
-#: order 6 and coarser, 1/64th of the shards and fewer, so the tier costs
-#: little. A dispatch default, not a deployment change: the variant is one
-#: the stack already stamps (``deployment/aws/template.yaml``).
-STAGE_SWEEP_WORKER = {"memory": 8192, "extra_disk": True}
+#: The worker-size variant a staged sweep's invokes run on: the leaf tier,
+#: 4,096 MB with the 10 GB ``/tmp`` (issue #659). The 8,192 MB routing that
+#: preceded it was the issue #586 stopgap (the 2026-09-26 amendment: the 0.55
+#: fleet's order-6 stage died at the 4 GB cap because the fold densified a
+#: whole level of the node in memory). Both premises are gone — the fold
+#: streams by output chunk (:mod:`zagg.sweep_fold`) and the sized schedule is
+#: width 2, top-aligned (issue #639) — and the measurement is in: the 2,093
+#: stage invokes of run ``stage-20261012T164317Z-5e45d0`` (2026-10-12, the v4
+#: California build) peaked at 261 MB p50 / 290 MB p99 / 2,926 MB max, zero
+#: over 4 GB, 26 s p50 duration. A dispatch default, not a deployment change:
+#: the variant is one the stack already stamps (``deployment/aws/template.yaml``).
+STAGE_SWEEP_WORKER = {"memory": 4096, "extra_disk": True}
 
 _WORKER_SUFFIX_RE = re.compile(r"-(?:2048|4096|8192)(?:-disk)?$")
 
@@ -133,9 +136,10 @@ def _resolve_stage_function_name(function_name: str) -> str:
     tier down again); otherwise the :data:`STAGE_SWEEP_WORKER` variant of the
     RUN's own function family — ``function_name`` (already resolved,
     :func:`_resolve_function_name`) with its ``-<memory>[-disk]`` suffix, if
-    any, replaced. So ``process-shard`` and ``process-shard-4096-disk`` both
-    stage on ``process-shard-8192-disk``, and a ``-test`` family on its own
-    twin. The leaf fan-out is unaffected; only the staged tail moves.
+    any, replaced. So ``process-shard`` and ``process-shard-8192`` both stage
+    on ``process-shard-4096-disk``, and a ``-test`` family on its own twin.
+    The leaf fan-out is unaffected by the resolution; only the staged tail
+    is routed through it.
     """
     override = os.environ.get("ZAGG_LAMBDA_STAGE_FUNCTION_NAME")
     if override:
@@ -6682,8 +6686,8 @@ def _invoke_lambda_stage_sweep(
     no run id (a standalone staged pass) records ``null``.
 
     ``function_name`` is the function the STAGE invokes go to — the caller
-    resolves it (:func:`_resolve_stage_function_name`: the 8,192 MB variant
-    of the run's family, the issue #586 interim).
+    resolves it (:func:`_resolve_stage_function_name`: the
+    :data:`STAGE_SWEEP_WORKER` variant of the run's family).
 
     ``families`` (issue #610 phase 4) is which rollup families ride this
     sweep's node closes — forwarded verbatim to the dispatcher, where ``()``

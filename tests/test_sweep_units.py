@@ -1329,7 +1329,8 @@ class TestPipelineRunId:
 
 
 # ---------------------------------------------------------------------------
-# The staged tail's tier (the issue #586 interim).
+# The staged tail's tier: the leaf tier (issue #659; the 8 GB routing was the
+# issue #586 stopgap).
 # ---------------------------------------------------------------------------
 
 
@@ -1337,15 +1338,15 @@ class TestStageTier:
     @pytest.mark.parametrize(
         "run_function,stage_function",
         (
-            ("process-shard", "process-shard-8192-disk"),
-            ("process-shard-4096-disk", "process-shard-8192-disk"),
-            ("process-shard-2048", "process-shard-8192-disk"),
-            ("process-shard-8192-disk", "process-shard-8192-disk"),
-            ("process-shard-test-4096-disk", "process-shard-test-8192-disk"),
-            ("zagg-dev", "zagg-dev-8192-disk"),
+            ("process-shard", "process-shard-4096-disk"),
+            ("process-shard-4096-disk", "process-shard-4096-disk"),
+            ("process-shard-2048", "process-shard-4096-disk"),
+            ("process-shard-8192-disk", "process-shard-4096-disk"),
+            ("process-shard-test-8192-disk", "process-shard-test-4096-disk"),
+            ("zagg-dev", "zagg-dev-4096-disk"),
         ),
     )
-    def test_stage_invokes_go_to_the_8192_variant_of_the_run_family(
+    def test_stage_invokes_go_to_the_leaf_tier_variant_of_the_run_family(
         self, monkeypatch, run_function, stage_function
     ):
         from zagg import runner
@@ -1363,7 +1364,9 @@ class TestStageTier:
         from zagg import runner
         from zagg.config import WORKER_MEMORIES
 
-        assert runner.STAGE_SWEEP_WORKER == {"memory": 8192, "extra_disk": True}
+        # The leaf tier (issue #659): zero of the 2,093 measured stage invokes
+        # exceeded 4 GB (max 2,926 MB), so the 8 GB stopgap is retired.
+        assert runner.STAGE_SWEEP_WORKER == {"memory": 4096, "extra_disk": True}
         assert runner.STAGE_SWEEP_WORKER["memory"] in WORKER_MEMORIES
 
     def test_the_tail_dispatches_the_staged_sweep_there(self, tmp_path, monkeypatch):
@@ -1386,7 +1389,7 @@ class TestStageTier:
         monkeypatch.setattr(zagg.sweep_fleet, "run_stage_sweep_fleet", fake)
         runner._invoke_lambda_stage_sweep(
             None,
-            "process-shard-8192-disk",
+            "process-shard-4096-disk",
             str(tmp_path),
             [],
             shard_order=3,
@@ -1394,6 +1397,6 @@ class TestStageTier:
             all_time=True,
             pipeline_run_id="pipeline-5",
         )
-        assert seen["function_name"] == "process-shard-8192-disk"
+        assert seen["function_name"] == "process-shard-4096-disk"
         assert (seen["windowed"], seen["all_time"]) == (True, True)
         assert seen["pipeline_run_id"] == "pipeline-5"
