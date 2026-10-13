@@ -13,6 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import pytest
 
 from zagg.dispatch import (
+    BENIGN_ERRORS,
     LAMBDA_ARCH,
     LAMBDA_MEMORY_GB,
     LAMBDA_PRICE_PER_GB_SEC,
@@ -25,6 +26,8 @@ from zagg.dispatch import (
     LocalExecutor,
     PreflightReport,
     RunReport,
+    StoreFatalError,
+    classify_store_error,
     dispatch,
     lambda_classify,
     max_cost_usd,
@@ -55,6 +58,85 @@ class TestRetryPolicy:
     def test_never_classify_retries_nothing(self):
         assert not never_classify(Exception("TooManyRequestsException"))
         assert not never_classify(RuntimeError("boom"))
+
+
+class TestClassifyStoreError:
+    """The leaf write seam's error classes (issue #651)."""
+
+    def test_benign_strings_are_benign(self):
+        assert [classify_store_error(e) for e in BENIGN_ERRORS] == ["benign", "benign"]
+
+    def test_a_malformed_response_is_fatal_by_text_or_exception(self):
+        # The post-mortem's class: object_store could not parse the body, so
+        # obstore raised ``GenericError`` with no status to key on.
+        from obstore.exceptions import GenericError
+
+        text = "Generic S3 error: Got invalid DeleteObjects response: Error parsing XML"
+        assert classify_store_error(GenericError(text)) == "store-fatal"
+        assert classify_store_error(f"leaf column: GenericError: {text}") == "store-fatal"
+
+    def test_refusals_are_fatal_by_type_status_or_credentials(self):
+        from obstore.exceptions import NotFoundError, PermissionDeniedError
+        from zarr.errors import ContainsGroupError
+
+        assert classify_store_error(PermissionDeniedError("denied")) == "store-fatal"
+        assert classify_store_error(NotFoundError("missing parent")) == "store-fatal"
+        assert classify_store_error(ContainsGroupError("group where an array goes")) == (
+            "store-fatal"
+        )
+        assert classify_store_error("HTTP status client error (403 Forbidden) for url") == (
+            "store-fatal"
+        )
+        assert classify_store_error("Client error with status 400 Bad Request: no body") == (
+            "store-fatal"
+        )
+        assert classify_store_error(RuntimeError("AccessDenied: no s3:PutObject")) == "store-fatal"
+        # The write path's own contract refusal names the spec section.
+        assert classify_store_error(ValueError("cannot replace it in place (spec §1.5)")) == (
+            "store-fatal"
+        )
+
+    def test_a_fatal_cause_classifies_the_wrapper(self):
+        # ``_LeafUnit.finish`` re-raises the temporal record's failure as a
+        # ``RuntimeError`` *from* the store error: the chain carries the class.
+        from obstore.exceptions import PermissionDeniedError
+
+        try:
+            try:
+                raise PermissionDeniedError("denied")
+            except PermissionDeniedError as e:
+                raise RuntimeError("leaf temporal record failed to write") from e
+        except RuntimeError as wrapped:
+            assert classify_store_error(wrapped) == "store-fatal"
+
+    def test_what_the_client_retried_stays_transient(self):
+        from obstore.exceptions import GenericError
+
+        retried = (
+            "Error after 12 retries in 180s, max_retries:12, retry_timeout:180s, "
+            "source:HTTP status server error (503 Service Unavailable) for url"
+        )
+        assert classify_store_error(GenericError(retried)) == "transient"
+        assert classify_store_error("non-2xx status code: 429 Too Many Requests") == "transient"
+        assert classify_store_error("error sending request: connection reset by peer") == (
+            "transient"
+        )
+        assert classify_store_error(TimeoutError("timed out")) == "transient"
+
+    def test_the_unnamed_failure_keeps_per_window_isolation(self):
+        # Not a store error at all (a window's own reduce): isolated, as
+        # issue #586 pinned -- fatal is opt-in by name, never the default.
+        assert classify_store_error(RuntimeError("PUT failed")) == "transient"
+        assert classify_store_error(MemoryError()) == "transient"
+        assert classify_store_error(None) == "transient"
+
+    def test_a_shard_key_never_reads_as_a_status(self):
+        # ``_STORE_STATUS_RE`` needs the status word: a decimal key with a
+        # 4xx-shaped run of digits inside it is not a refusal.
+        assert classify_store_error("shard 3906256950232350729: PUT failed") == "transient"
+
+    def test_store_fatal_error_is_a_runtime_error(self):
+        assert issubclass(StoreFatalError, RuntimeError)
 
 
 class TestProtocolConformance:
