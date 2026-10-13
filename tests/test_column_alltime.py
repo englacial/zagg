@@ -295,6 +295,26 @@ class TestBulkUnit:
         assert seen == [[f"{w}.pyramid.zarr" for w in WINDOWS]] * 2
         assert trees[0] and trees[0] == trees[1]
 
+    def test_only_the_bulk_unit_keeps_its_column_fold(self, monkeypatch, tmp_path):
+        # Review finding (6): the fan-out ``window=`` unit never closes from
+        # memory, so it must not retain the fold ``write_leaf_column`` built.
+        import zagg.column as column
+
+        kept = []
+        write = column.write_leaf_column
+
+        def _spy(*a, folded_out=None, **kw):
+            kept.append(folded_out)
+            return write(*a, folded_out=folded_out, **kw)
+
+        monkeypatch.setattr(column, "write_leaf_column", _spy)
+        cfg = emit._digest_cfg()
+        emit._run_fanout(monkeypatch, cfg, str(tmp_path / "fan"), fakes=emit._dense_fakes())
+        assert kept == [None] * 3
+        kept.clear()
+        emit._run_bulk(monkeypatch, cfg, str(tmp_path / "bulk"), fakes=emit._dense_fakes())
+        assert len(kept) == 3 and all(sorted(k) == [6, 7] for k in kept)
+
     def test_a_rerun_writes_the_same_bytes(self, monkeypatch, tmp_path):
         cfg = emit._digest_cfg()
         root = str(tmp_path / "bulk")

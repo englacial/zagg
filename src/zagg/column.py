@@ -955,8 +955,10 @@ def write_leaf_column(
     written — ``{resolution: {field: slab}}`` — so the bulk multi-window unit
     can keep each window's column RESIDENT and fold the shard's all-time
     column from the exact values it wrote (:mod:`zagg.column_alltime`), with
-    no read-back. δ-bounded digests at the column resolutions: a few MB per
-    window, against the shard's own slabs.
+    no read-back. The bulk unit holds every window's fold until its close, so
+    its peak grows with the window count; the size per window is UNMEASURED
+    at the v4 geometry (cells 16..9 at node 9), and only the bulk unit passes
+    it — every other unit keeps nothing past this call.
     """
     store_kwargs = dict(store_kwargs or {})
     # The gate re-validates a declaration the templating path already

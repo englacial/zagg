@@ -1751,6 +1751,7 @@ class _LeafUnit:
         run_id,
         sidecar_spec,
         semantic_hash,
+        keep_fold: bool = False,
     ):
         from zagg.config import get_leaf_versions
 
@@ -1776,8 +1777,10 @@ class _LeafUnit:
         self.box: dict = {}
         self.write_elapsed = 0.0
         # This window's column fold, kept resident for the shard's all-time
-        # column (issue #649): filled by ``write_leaf_column`` in :meth:`finish`.
-        self.column_fold: dict = {}
+        # column (issue #649): filled by ``write_leaf_column`` in :meth:`finish`
+        # on the bulk unit alone (``keep_fold``), the one path that closes from
+        # memory; every other unit drops it on return, as before.
+        self.column_fold: dict | None = {} if keep_fold else None
         # A windowed leaf stores no per-cell ``morton`` array (issue #586
         # phase 3, spec §1.5 "The cell coordinate"): the word is derived from
         # the leaf id and the rank, so the template omits the member and the
@@ -2588,7 +2591,15 @@ def _process_windows(
             else list(granule_urls)
         )
         unit = _LeafUnit(
-            shard_key, urls, grid, store_root, config, window=w, windowing=windowing, **unit_kwargs
+            shard_key,
+            urls,
+            grid,
+            store_root,
+            config,
+            window=w,
+            windowing=windowing,
+            keep_fold=True,
+            **unit_kwargs,
         )
         units[w["label"]] = unit
         skipped = unit.gate(allow_contraction=allow_contraction) if skip_if_current else None
