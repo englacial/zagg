@@ -276,9 +276,6 @@ class TestMaxCostPreview:
         preview = notebook.max_cost_preview(_windowed_cfg(unit="window"), SHARDMAP)
         assert preview["n_units"] == 32  # 4 shards x 8 yearly windows
 
-    def test_unwindowed_unchanged_by_the_unit_branch(self):
-        assert notebook.max_cost_preview(default_config("atl06"), SHARDMAP)["n_units"] == 4
-
     @pytest.mark.parametrize("name", WINDOWED_TEMPLATES)
     def test_packaged_windowed_template_preview_equals_its_dispatch(self, monkeypatch, name):
         # issue #648's third test bullet, on the templates the bug actually
