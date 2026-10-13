@@ -281,12 +281,12 @@ _RETRIED = (
 
 
 @pytest.mark.parametrize(
-    ("message", "error_class", "emitted"),
+    ("message", "store_error_class", "emitted"),
     [(_FATAL, "store-fatal", ["2018", "2019"]), (_RETRIED, "transient", list(WINDOWS))],
     ids=["store-fatal", "transient"],
 )
 def test_a_refused_leaf_write_ends_the_unit_at_that_window(
-    monkeypatch, tmp_path, message, error_class, emitted
+    monkeypatch, tmp_path, message, store_error_class, emitted
 ):
     """A fatal-shaped error on the first chunk PUT of the second window ends the
     unit there: no later window is aggregated or opened, the earlier window
@@ -331,13 +331,13 @@ def test_a_refused_leaf_write_ends_the_unit_at_that_window(
     meta, other = metas[shard0], metas[shards[1]]
     assert [m["window"] for m in meta["windows"]] == emitted
     assert [w for s, w in aggregated if s == shard0] == emitted
-    assert meta["error_class"] == meta["windows"][1]["error_class"] == error_class
+    assert meta["store_error_class"] == meta["windows"][1]["store_error_class"] == store_error_class
     assert message in meta["windows"][1]["error"]
     assert other["error"] is None and [m["window"] for m in other["windows"]] == list(WINDOWS)
     # The window before the failure keeps its stamp; the failed one is debris.
     assert hive.resolve_leaf(leaf["2018"])[1] is not None
     assert hive.resolve_leaf(leaf["2019"])[1] is None
-    if error_class == "store-fatal":
+    if store_error_class == "store-fatal":
         # The bound: the unit returned after the failing window -- the window
         # after it was never aggregated, never opened, never written.
         assert meta["windows_unattempted"] == ["2020"]

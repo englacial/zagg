@@ -474,7 +474,11 @@ class RunView:
                 # The store-error class (issue #651) rides the local meta and
                 # the poller's result dict; the v1 sync result carries it in
                 # ``body`` only.
-                cls = str(r.get("error_class") or (r.get("body") or {}).get("error_class") or "")
+                cls = str(
+                    r.get("store_error_class")
+                    or (r.get("body") or {}).get("store_error_class")
+                    or ""
+                )
                 out.append(
                     f"<tr><td>{esc(str(key))}</td><td>{esc(cls)}</td>"
                     f"<td>{esc(str(r.get('error')))}</td></tr>"

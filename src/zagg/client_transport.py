@@ -108,7 +108,7 @@ def drop_timeout_s(function_timeout_s: float) -> float:
 
 #: Version stamped into every status object; bump on a key removal, rename, or
 #: meaning change. Additive keys ride without a bump (the slim manifest of issue
-#: #588 and the status ``error_class`` key of issue #651 both did). Read back in
+#: #588 and the status ``store_error_class`` key of issue #651 both did). Read back in
 #: :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump is
 #: loud rather than subtly wrong (review finding, PR #343). The manifest and tail
 #: marker carry it too; only the slim manifest's ``shards: null`` + ``shards_omitted``
@@ -166,7 +166,7 @@ def build_shard_status(event: dict, response: dict) -> tuple[str, dict] | None:
     (stats record, counters, container telemetry). ``attempt_id`` is a fresh
     uuid per EXECUTION: a duplicate execution (or a client re-dispatch)
     overwrites the object with a new id, which is what keeps the client's
-    retry accounting straight. ``error_class`` is the body's store-error class
+    retry accounting straight. ``store_error_class`` is the body's store-error class
     (issue #651: ``store-fatal`` / ``transient`` / ``benign``), so the poller
     and the readouts tell a refusal from a fault without parsing ``error``.
     """
@@ -195,7 +195,7 @@ def build_shard_status(event: dict, response: dict) -> tuple[str, dict] | None:
         "window": window,
         "timings": body.get("phase_timings"),
         "error": str(error) if error else None,
-        "error_class": body.get("error_class"),
+        "store_error_class": body.get("store_error_class"),
         "status_code": code,
         "body": body,
     }
@@ -1101,7 +1101,7 @@ class StatusPoller:
             "wall_time": self._clock() - start,
             "lambda_duration": billed_seconds(body),
             "error": error,
-            "error_class": body.get("error_class"),
+            "store_error_class": body.get("store_error_class"),
             "retries": entry.attempts - 1,
             "timeout": False,
             "granule_count": entry.granule_count,

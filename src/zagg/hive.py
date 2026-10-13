@@ -2270,7 +2270,7 @@ class _LeafUnit:
                 # coherent metadata dict to build its failure record from.
                 logger.error(f"leaf column write failed for shard {shard_key}: {e}")
                 metadata["error"] = f"leaf column: {e}"
-                metadata["error_class"] = classify_store_error(e)
+                metadata["store_error_class"] = classify_store_error(e)
                 metadata["column_error"] = str(e)
             else:
                 if column is not None:
@@ -2633,13 +2633,13 @@ def _process_windows(
                     "total_obs": 0,
                     "granule_count": len(unit.granule_urls),
                     "error": f"{type(e).__name__}: {e}",
-                    "error_class": classify_store_error(e),
+                    "store_error_class": classify_store_error(e),
                 }
-            if meta.get("error") and not meta.get("error_class"):
+            if meta.get("error") and not meta.get("store_error_class"):
                 benign = meta["error"] in BENIGN_ERRORS
-                meta["error_class"] = STORE_BENIGN if benign else STORE_TRANSIENT
+                meta["store_error_class"] = STORE_BENIGN if benign else STORE_TRANSIENT
             metas[w["label"]] = meta
-            if meta.get("error_class") == STORE_FATAL:
+            if meta.get("store_error_class") == STORE_FATAL:
                 raise StoreFatalError(f"window {w['label']}: {meta['error']}")
 
         try:
@@ -2679,7 +2679,7 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     invoke's, so a per-leaf record's fleet-safety columns describe the invoke
     that produced it), and every written one with ``unit_windows``; the shard meta carries the
     window-independent fields once, the sums, the time-range union, the
-    failed window's error with its ``error_class`` (issue #651; the
+    failed window's error with its ``store_error_class`` (issue #651; the
     store-fatal window that ended the invoke when there is one, else the
     first failed; a benign no-data window is not a failure), and
     ``current`` / ``refused`` only when every window skipped that way.
@@ -2709,13 +2709,13 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     # benign string, so the whole-shard case still classifies as no data.
     failed = [m for m in written if m.get("error") and m["error"] not in BENIGN_ERRORS]
     if failed:
-        first = next((m for m in failed if m.get("error_class") == STORE_FATAL), failed[0])
+        first = next((m for m in failed if m.get("store_error_class") == STORE_FATAL), failed[0])
         more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
-        meta["error_class"] = first.get("error_class") or STORE_TRANSIENT
+        meta["store_error_class"] = first.get("store_error_class") or STORE_TRANSIENT
     elif written and all(m.get("error") for m in written):
         meta["error"] = written[0]["error"]
-        meta["error_class"] = STORE_BENIGN
+        meta["store_error_class"] = STORE_BENIGN
     # The union, like the sums, is of the windows that landed — and it is what
     # the dispatcher's root-coverage union reads per window (runner._landed_coverage).
     time_range = union_time_range(*(m.get("time_range") for m in written if not m.get("error")))
