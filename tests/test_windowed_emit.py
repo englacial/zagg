@@ -840,6 +840,26 @@ class TestBulkEndToEnd:
         assert _leaf_obs(root, shard, "2018", _grid(_cfg())) == 1
         assert not Path(hive.shard_leaf_path(root, shard, window="2020")).exists()
 
+    def test_a_returned_source_denial_never_ends_the_shard(self, monkeypatch, tmp_path):
+        # Review finding (1): a RETURNED error is the no-data channel, whose
+        # text can carry a source read's 403 exemplar -- not a store refusal.
+        # It classifies transient and the shard goes on to 2020.
+        finish = hive._LeafUnit.finish
+        denied = "No data after filtering (1 granule reads raised; e.g. "
+        denied += "HTTP status client error (403 Forbidden))"
+
+        def _returned(self, metadata):
+            meta = finish(self, metadata)
+            if self.label == "2019":
+                meta["error"] = denied
+            return meta
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _returned)
+        meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"))
+        assert [m["window"] for m in meta["windows"]] == ["2018", "2019", "2020"]
+        assert meta["windows"][1]["error_class"] == meta["error_class"] == "transient"
+        assert "windows_unattempted" not in meta
+
     def test_a_store_fatal_column_report_ends_the_shard_too(self, monkeypatch, tmp_path):
         # The column fold REPORTS its failure instead of raising (the leaf is
         # committed by then); the class rides the report, and a fatal one
