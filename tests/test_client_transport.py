@@ -200,6 +200,40 @@ class EventStubLambdaClient:
         return [e.get("mode") for _, _, e in self.events]
 
 
+class DropNthStub(EventStubLambdaClient):
+    """An Event stub that silently drops the Nth cell invoke, whatever its key.
+
+    The dispatch order is the runner's (biggest-first buckets over the #197
+    shuffle), so a breaker test that needs "one landed, then one timed out"
+    keys the drop on invoke ORDER, not on a shard key.
+    """
+
+    def __init__(self, status_store, *, drop_nth, **kwargs):
+        super().__init__(status_store, **kwargs)
+        self._drop_nth = drop_nth
+        self.cell_invokes = 0
+
+    def invoke(self, **kwargs):
+        event = json.loads(kwargs["Payload"])
+        if event.get("mode") is None:
+            with self._lock:
+                self.cell_invokes += 1
+                nth = self.cell_invokes
+            if nth == self._drop_nth:
+                self.events.append((kwargs["FunctionName"], kwargs["InvocationType"], event))
+                return {"StatusCode": 202}
+        return super().invoke(**kwargs)
+
+
+#: One serial canary, then a trip on the first timeout: ``window: 1`` makes the
+#: breaker judge each result alone, so "one landed, the next timed out" trips
+#: ``timeout-ratio`` with a leaf on the store — the tail-skip case.
+_TRIP_KNOBS = {
+    "ramp": {"start": 1, "cap": 1, "window": 1},
+    "breaker": {"timeout_ratio": 0.5},
+}
+
+
 def _run(catalog, *, client, config=None, **kwargs):
     return Run.from_config(
         config if config is not None else default_config("atl06"),
@@ -356,6 +390,35 @@ class TestEventDispatch:
         assert modes[:first_cell] == ["ping", "setup", "icechunk_init"]
         assert "finalize" in modes and "coverage" in modes and "stats" in modes
         assert modes[-1] == "icechunk_finalize"  # the tail's last invoke (issue #582)
+
+    def test_a_tripped_breaker_skips_the_facade_tail(self, catalog, status_store, monkeypatch):
+        monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
+        stub = DropNthStub(status_store, drop_nth=2, record=True)
+        handle = _run(catalog, client=stub, max_retries=1).dispatch(
+            transport="event", dispatch=_TRIP_KNOBS
+        )
+        handle.wait()
+        assert handle.breaker["rule"] == "timeout-ratio" and handle.breaker["tripped"]
+        assert handle.ramp == [{"width": 1, "at_result": 0}]
+        assert handle.status() == {"pending": 0, "ok": 1, "failed": 2}
+        results = handle.results(return_exceptions=True)
+        errors = sorted(
+            e.payload["outcome"] for e in results.values() if isinstance(e, _shard_error())
+        )
+        assert errors == ["failed-unknown", "not-dispatched"]
+        assert stub.cell_invokes == 2
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "coverage" in modes
+        assert not any(m in modes for m in ("sweep", "stages", "icechunk_finalize"))
+        assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
+        assert handle.families_sweep is None and handle.stage_sweep is None
+
+    def test_handle_carries_the_ramp_without_a_trip(self, catalog, status_store):
+        handle = _run(catalog, client=EventStubLambdaClient(status_store)).dispatch(
+            transport="event", max_workers=2
+        )
+        handle.results()
+        assert handle.ramp == [{"width": 2, "at_result": 0}] and handle.breaker is None
 
     def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):
         # An oversized row set on an EVENT run keeps its run record: the tail
@@ -867,6 +930,87 @@ class TestAggEventMode:
         assert summary["cells_error"] == 1
         (bad,) = [r for r in summary["results"] if r.get("error")]
         assert bad["outcome"] == "failed-unknown"
+
+    def test_agg_event_summary_carries_the_ramp_and_breaker(
+        self, catalog_file, monkeypatch, status_store
+    ):
+        # Defaults, three shards, a preflight clamp of 3 workers: the ramp's
+        # first step is clamped to the run's workers and nothing trips.
+        summary = self._agg(catalog_file, monkeypatch, EventStubLambdaClient(status_store), "event")
+        assert summary["ramp"] == [{"width": 3, "at_result": 0}]
+        assert summary["breaker"] is None
+        sync = self._agg(
+            catalog_file, monkeypatch, __import__("test_client").StubLambdaClient(), "sync"
+        )
+        assert sync["ramp"] == [] and sync["breaker"] is None  # no poller, no guard
+
+    def test_a_tripped_breaker_refuses_the_rest_and_skips_the_tail(
+        self, catalog_file, monkeypatch, status_store
+    ):
+        from zagg import runner
+
+        monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
+        tail_calls: list[str] = []
+        for name in ("_invoke_lambda_families_sweep", "_invoke_lambda_stage_sweep"):
+            monkeypatch.setattr(
+                runner, name, lambda *a, _n=name, **k: tail_calls.append(_n) or {"fired": 0}
+            )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_icechunk_finalize",
+            lambda *a, **k: tail_calls.append("_invoke_lambda_icechunk_finalize") or {"tag": "t"},
+        )
+        # Control: the same knobs, nothing dropped — the tail runs.
+        control = self._agg(
+            catalog_file,
+            monkeypatch,
+            EventStubLambdaClient(status_store, record=True),
+            "event",
+            max_retries=1,
+            dispatch=_TRIP_KNOBS,
+        )
+        assert control["breaker"] is None and control["cells_with_data"] == 3
+        assert "_invoke_lambda_icechunk_finalize" in tail_calls
+        assert any(c.endswith("_sweep") for c in tail_calls)
+        tail_calls.clear()
+
+        # The second cell invoke never writes a status: one leaf landed, the
+        # next unit timed out, the breaker trips and the third is refused. A
+        # fresh status store, so the control run's objects cannot stand in
+        # for the dropped unit's.
+        fresh = MemoryStore()
+        monkeypatch.setattr(ct, "open_status_store", lambda prefix, kwargs: fresh)
+        stub = DropNthStub(fresh, drop_nth=2, record=True)
+        summary = self._agg(
+            catalog_file, monkeypatch, stub, "event", max_retries=1, dispatch=_TRIP_KNOBS
+        )
+        assert summary["breaker"] == {
+            "tripped": True,
+            "rule": "timeout-ratio",
+            "at_result": 2,
+            "width": 1,
+        }
+        assert summary["ramp"] == [{"width": 1, "at_result": 0}]
+        assert summary["cells_with_data"] == 1 and summary["cells_error"] == 2
+        outcomes = sorted(r.get("outcome") for r in summary["results"] if r.get("error"))
+        assert outcomes == ["failed-unknown", "not-dispatched"]
+        assert stub.cell_invokes == 2  # the refused unit was never invoked
+        # The tail legs are cancelled; the run record and coverage still land.
+        assert tail_calls == []
+        assert summary["families_sweep"] is None and summary["stage_sweep"] is None
+        assert summary["icechunk_finalize"] == {
+            "skipped": "circuit breaker tripped (timeout-ratio)"
+        }
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and "coverage" in modes
+
+    def test_a_bad_dispatch_block_is_refused_before_any_invoke(
+        self, catalog_file, monkeypatch, status_store
+    ):
+        stub = EventStubLambdaClient(status_store)
+        with pytest.raises(ValueError, match="ramp.cap 1 is below ramp.start"):
+            self._agg(catalog_file, monkeypatch, stub, "event", dispatch={"ramp": {"cap": 1}})
+        assert stub.events == []
 
     def test_windowed_units_resolve_on_both_windows(self, catalog_file, monkeypatch, status_store):
         # The ONE seam where the channel's two halves derive the same object

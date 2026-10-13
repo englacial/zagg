@@ -69,6 +69,7 @@ from zagg.dispatch import (
     estimate_cost_usd,
     max_cost_usd,
 )
+from zagg.dispatch_guard import NOT_DISPATCHED, DispatchGuard, GuardConfig, describe
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
@@ -213,6 +214,7 @@ def agg(
     allow_contraction: bool = False,
     events=None,
     on_progress=None,
+    dispatch: dict | None = None,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -297,6 +299,17 @@ def agg(
         exception) are never retried regardless. Default ``3``. Ignored by the
         ``"local"`` backend. Set to ``1`` (e.g. the CI benchmark) to measure one
         clean invocation and record a failure as a failure.
+    dispatch : dict, optional
+        The Event fan-out's ramp + circuit breaker knobs (issue #652), a
+        ``{"ramp": {...}, "breaker": {...}}`` block over the ruled defaults
+        (:class:`zagg.dispatch_guard.GuardConfig`); validated at submission
+        on every backend, honored by ``backend="lambda"`` with
+        ``invocation="event"`` — the only path paced by the status poller.
+        ``summary["ramp"]`` lists the width steps and ``summary["breaker"]``
+        the trip or hold (``None`` when neither fired). Travels through the
+        strategies as ``dispatch_knobs`` so it never shadows the generic
+        :func:`zagg.dispatch.dispatch` loop; the temporal and raster
+        strategies accept and ignore it (no status poller to pace).
     invocation : str
         Lambda-only (issue #151). ``"async"`` (default) dispatches each cell
         with ``InvocationType="Event"`` and polls a per-shard result object the
@@ -434,6 +447,7 @@ def agg(
         allow_contraction=allow_contraction,
         events=events,
         on_progress=on_progress,
+        dispatch_knobs=dispatch,
     )
 
 
@@ -471,6 +485,7 @@ class SpatialStrategy:
         allow_contraction=False,
         events=None,
         on_progress=None,
+        dispatch_knobs=None,
     ):
         # Resolve catalog and store
         catalog_path = catalog or config.catalog
@@ -565,6 +580,7 @@ class SpatialStrategy:
                 force_cold=force_cold,
                 allow_contraction=allow_contraction,
                 on_progress=on_progress,
+                dispatch_knobs=dispatch_knobs,
             )
         else:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -613,6 +629,7 @@ class TemporalStrategy:
         allow_contraction=False,
         events=None,
         on_progress=None,
+        dispatch_knobs=None,
     ):
         from zagg.config import collection_options
         from zagg.temporal import prepare_collection, process_event, specs_from_config
@@ -3843,6 +3860,7 @@ def _run_lambda(
     force_cold=False,
     allow_contraction=False,
     on_progress=None,
+    dispatch_knobs=None,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -3866,6 +3884,9 @@ def _run_lambda(
     from botocore.config import Config
 
     all_shards = list(catalog_data["shard_keys"])
+    # The ramp + breaker knobs (issue #652): refused at submission, before any
+    # invoke; consumed by the Event transport's poller below.
+    guard_config = GuardConfig.from_dict(dispatch_knobs)
     # Strict-AOI per-shard mask payload (issue #101), keyed by shard for the
     # per-cell event. Empty dict when the manifest carries no ``aoi_mask`` (flag
     # off) — the per-cell invoke then omits the ``aoi_payload`` event key, so the
@@ -4250,10 +4271,19 @@ def _run_lambda(
         from zagg.client_transport import StatusPoller, drop_timeout_s, open_status_store
 
         _status_kwargs = _output_store_kwargs(output_creds_event, region)
+        # The ramp + circuit breaker (issue #652): the poller paces its Event
+        # dispatch by the guard's width, the guard reads every completed
+        # result, and a trip refuses the queue and cancels the tail below.
+        state["guard"] = DispatchGuard(
+            guard_config,
+            workers=state["workers"],
+            function_timeout_s=state["function_timeout_s"],
+        )
         state["event_poller"] = StatusPoller(
             lambda: open_status_store(status_prefix, _status_kwargs),
             drop_timeout_s=drop_timeout_s(state["function_timeout_s"]),
             max_retries=max_retries,
+            guard=state["guard"],
         ).start()
 
     # Create template via Lambda (flat only). The template write happens
@@ -4357,6 +4387,8 @@ def _run_lambda(
         elif result.get("status_code") == 200 and not error:
             report.total_obs += body.get("total_obs", 0)
             report.cells_with_data += 1
+        elif result.get("outcome") == NOT_DISPATCHED:
+            report.cells_error += 1  # refused by the tripped breaker: one line below, not N
         elif error not in BENIGN_ERRORS:
             report.cells_error += 1
             key = result.get("shard_key")
@@ -4395,6 +4427,19 @@ def _run_lambda(
             manifest_stop.set()
             manifest_thread.join(timeout=_MANIFEST_CHECK_JOIN_TIMEOUT_S)
     fanout_s = time.time() - start_time
+    # The breaker's verdict (issue #652): a trip means the units past
+    # ``at_result`` were refused (``not-dispatched``, counted as errors above)
+    # and the tail legs below — families pass, staged sweep, Icechunk
+    # finalize — are skipped. In-flight Event invokes were left to finish.
+    guard = state.get("guard")
+    trip = guard.tripped if guard is not None else None
+    if trip is not None:
+        refused = sum(r.get("outcome") == NOT_DISPATCHED for r in report.results)
+        logger.warning(
+            f"circuit breaker tripped ({trip['rule']}) at result {trip['at_result']}, "
+            f"width {trip['width']}: {refused} units not dispatched, tail legs skipped "
+            f"(issue #652)"
+        )
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access). Guarded (issue #335): a failed
@@ -4584,6 +4629,11 @@ def _run_lambda(
             # "dropped" (no manifest: no Run.attach, no operator finalize).
             # What was SENT; the write is the worker's, best-effort.
             "dispatch_manifest": manifest_sent,
+            # The Event fan-out's ramp steps and breaker verdict (issue #652):
+            # ``[]`` / ``None`` on the sync and async transports, which pace
+            # by the pool width and have no guard.
+            "ramp": guard.ramp if guard is not None else [],
+            "breaker": guard.breaker if guard is not None else None,
             "store_path": store_path,
             "backend": "lambda",
             "function_name": function_name,
@@ -4637,7 +4687,7 @@ def _run_lambda(
         # on every unit shape, so nothing that did not land gets in.
         stage_chained, staged = False, None
         summary["families_sweep"] = None
-        if get_store_layout(config) == "hive" and get_sweep(config):
+        if get_store_layout(config) == "hive" and get_sweep(config) and trip is None:
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
@@ -4719,6 +4769,8 @@ def _run_lambda(
         # The stage nodes are Event invokes, so a sweep that did not complete
         # may still have node commits in flight: no tag then (review finding).
         skip = _staged_sweep_incomplete(staged) if stage_chained else None
+        if trip is not None:
+            skip = f"circuit breaker tripped ({trip['rule']})"
         if icechunk_init is None:
             summary["icechunk_finalize"] = None
         elif skip is not None:
@@ -4757,6 +4809,8 @@ def _run_lambda(
                 f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items()
             )
             logger.info(f"Worker phases (max across cells): {breakdown}")
+        for line in describe(summary["ramp"], summary["breaker"]):
+            logger.info(line)
         _log_container_stats(container_stats)
     except Exception as tail_error:
         # D6 precedence (issue #335 fold), matching the PR #333 client facade:

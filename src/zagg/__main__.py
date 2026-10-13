@@ -13,6 +13,7 @@ import logging
 import sys
 
 from zagg.config import get_pipeline_type, load_config
+from zagg.dispatch_guard import describe
 from zagg.notebook import confirm_max_cost, max_cost_preview
 from zagg.runner import agg, normalize_output_credentials
 
@@ -216,6 +217,9 @@ examples:
                 f"{phase} {secs:.0f}s" for phase, secs in results["worker_phase_max"].items()
             )
             print(f"Worker phases (max across cells): {breakdown}")
+        # The Event fan-out's ramp steps and any breaker trip (issue #652).
+        for line in describe(results.get("ramp"), results.get("breaker")):
+            print(line)
         print(f"Output: {results['store_path']}")
 
 

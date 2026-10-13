@@ -379,3 +379,22 @@ class DispatchGuard:
             "at_result": len(self._records),
             "width": self.width,
         }
+
+
+def describe(ramp: list | None, breaker: dict | None) -> list[str]:
+    """Human lines for ``summary["ramp"]`` / ``summary["breaker"]`` (CLI, notebook, log).
+
+    Empty for a run that paced by a fixed window (no ramp steps, no verdict),
+    so the sync and async transports print nothing new.
+    """
+    lines = []
+    if ramp:
+        steps = " -> ".join(f"{s['width']}@{s['at_result']}" for s in ramp)
+        lines.append(f"Dispatch ramp (width@result): {steps}")
+    if breaker:
+        what = "TRIPPED, dispatch stopped" if breaker.get("tripped") else "held widening"
+        lines.append(
+            f"Circuit breaker {what}: rule {breaker.get('rule')} at result "
+            f"{breaker.get('at_result')}, width {breaker.get('width')} (issue #652)"
+        )
+    return lines

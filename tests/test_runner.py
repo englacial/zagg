@@ -1956,6 +1956,11 @@ class TestSummaryKeysByteIdentical:
         # no staged sweep was chained or its dispatch failed open. LAMBDA-only,
         # for the same reason.
         "stage_sweep",
+        # The Event fan-out's dispatch ramp steps and breaker verdict (issue
+        # #652); ``[]`` / ``None`` on the sync and async transports, which
+        # pace by the pool width and carry no guard. LAMBDA-only.
+        "ramp",
+        "breaker",
     } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -2355,6 +2360,7 @@ class TestSummaryKeysByteIdentical:
         )
         assert set(summary.keys()) == self._LAMBDA_KEYS
         assert summary["families_sweep"] is None  # flat: nothing was swept
+        assert summary["ramp"] == [] and summary["breaker"] is None  # async: no guard
         assert summary["backend"] == "lambda"
         assert summary["cells_with_data"] == 4
         assert summary["total_obs"] == 12

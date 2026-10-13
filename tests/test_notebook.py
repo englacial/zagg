@@ -451,6 +451,18 @@ class TestRunView:
         assert "no metered cost" in html_out
         assert "$" not in html_out
 
+    def test_repr_html_shows_the_ramp_and_a_breaker_trip(self):
+        summary = dict(
+            _lambda_summary(),
+            ramp=[{"width": 500, "at_result": 0}, {"width": 1000, "at_result": 50}],
+            breaker={"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000},
+        )
+        html_out = notebook.RunView(summary)._repr_html_()
+        assert "Dispatch ramp (width@result): 500@0 -&gt; 1000@50" in html_out
+        assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio" in html_out
+        # Neither key (a sync run, an older summary): nothing is rendered.
+        assert "ramp" not in notebook.RunView(_lambda_summary())._repr_html_()
+
     def test_dict_access_delegates(self):
         view = notebook.RunView(_lambda_summary())
         assert view["backend"] == "lambda"

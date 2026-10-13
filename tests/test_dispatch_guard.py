@@ -404,3 +404,27 @@ class TestGuardConfig:
     def test_rejects_bad_blocks(self, block, needle):
         with pytest.raises(ValueError, match=needle):
             GuardConfig.from_dict(block)
+
+
+class TestDescribe:
+    def test_ramp_steps_and_a_trip(self):
+        from zagg.dispatch_guard import describe
+
+        lines = describe(
+            [{"width": 500, "at_result": 0}, {"width": 1000, "at_result": 50}],
+            {"tripped": True, "rule": RULE_TIMEOUT_RATIO, "at_result": 137, "width": 1000},
+        )
+        assert lines == [
+            "Dispatch ramp (width@result): 500@0 -> 1000@50",
+            "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio at result 137, "
+            "width 1000 (issue #652)",
+        ]
+
+    def test_a_hold_and_nothing(self):
+        from zagg.dispatch_guard import describe
+
+        (line,) = describe(
+            [], {"tripped": False, "rule": RULE_WALL_MARGIN, "at_result": 50, "width": 500}
+        )
+        assert line.startswith("Circuit breaker held widening: rule wall-margin")
+        assert describe([], None) == [] and describe(None, None) == []

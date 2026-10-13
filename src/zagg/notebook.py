@@ -26,6 +26,7 @@ from zagg.config import (
     validate_config,
 )
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
+from zagg.dispatch_guard import describe
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +258,10 @@ class RunView:
             shown = f"{val:,.1f}" if isinstance(val, float) else f"{val:,}"
             out.append(f"<tr><td>{label}</td><td>{shown}</td></tr>")
         out.append("</table>")
+
+        # The Event fan-out's ramp steps and any breaker trip (issue #652).
+        for line in describe(s.get("ramp"), s.get("breaker")):
+            out.append(f"<p>{esc(line)}</p>")
 
         failures = self._failures()
         if failures:

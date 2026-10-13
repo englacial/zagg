@@ -86,6 +86,7 @@ from zagg.config import (
     validate_config,
 )
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, LAMBDA_PRICE_PER_GB_SEC, max_cost_usd
+from zagg.dispatch_guard import DispatchGuard, GuardConfig
 from zagg.grids import from_config as grid_from_config
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
@@ -229,6 +230,12 @@ class RunHandle:
         #: handle is a snapshot of the reported shards and ran no tail
         #: (past the drop deadline, for good: see :meth:`Run.attach`).
         self.unreported_shards: int = 0
+        #: The Event transport's dispatch ramp steps and circuit-breaker
+        #: verdict (issue #652), the same ``ramp`` / ``breaker`` the CLI
+        #: summary carries, set when the tail runs; ``[]`` / ``None`` on the
+        #: sync transport and on a reattached handle (neither has a guard).
+        self.ramp: list[dict] = []
+        self.breaker: dict | None = None
 
     def __len__(self) -> int:
         return len(self.futures)
@@ -475,6 +482,10 @@ class Run:
         #: A reattached run (``Run.attach``) never held the init record: its
         #: tail finalizes the repo off the config's knob instead (issue #582).
         self._attached = False
+        #: The Event transport's ramp + breaker (issue #652): built per
+        #: dispatch from the ``dispatch`` knobs, consulted by the tail.
+        self._guard: Any = None
+        self._guard_config = GuardConfig()
         runner._check_signature(self.grid, catalog_data)
 
     def __repr__(self) -> str:
@@ -774,6 +785,7 @@ class Run:
         shard_keys=None,
         max_workers: int | None = None,
         transport: str = "sync",
+        dispatch: dict | None = None,
     ) -> RunHandle:
         """Fan the shards out; return a :class:`RunHandle` of per-shard futures.
 
@@ -830,11 +842,21 @@ class Run:
             then resolves ``failed-unknown``. Requires a deployed worker that
             writes status objects (issue #327) and read access to the status
             prefix for the poll.
+        dispatch : dict, optional
+            The event transport's ramp + circuit breaker knobs (issue #652),
+            the ``{"ramp": {...}, "breaker": {...}}`` block ``agg`` takes;
+            refused here, before any invoke. The width ramps from
+            ``ramp.start`` toward ``min(ramp.cap, max_workers)``; a trip
+            refuses the undispatched shards (their futures raise
+            :class:`ShardError` with the ``not-dispatched`` outcome) and the
+            tail skips the families pass, the staged sweep and the Icechunk
+            finalize. ``handle.ramp`` / ``handle.breaker`` record both.
         """
         from zagg import concurrency, runner
 
         if transport not in ("sync", "event"):
             raise ValueError(f'transport must be "sync" or "event", got {transport!r}')
+        self._guard_config, self._guard = GuardConfig.from_dict(dispatch), None
         cells = self._select(shard_keys)
         if not cells:
             raise ValueError("no shards selected")
@@ -1027,6 +1049,13 @@ class Run:
         handle._finisher = finisher
         finisher.start()
         return handle
+
+    def _dispatch_guard(self, workers: int, function_timeout_s: float):
+        """The poller's guard for this dispatch (issue #652); kept for the tail."""
+        self._guard = DispatchGuard(
+            self._guard_config, workers=workers, function_timeout_s=function_timeout_s
+        )
+        return self._guard
 
     def _dispatch_event(
         self,
@@ -1280,6 +1309,12 @@ class Run:
                     }
                 )
         layout = get_store_layout(self.config)
+        # The breaker's verdict (issue #652), as on ``runner._run_lambda``: a
+        # trip skips the families pass, the staged sweep and the Icechunk
+        # finalize; the run record and the root coverage still land.
+        trip = self._guard.tripped if self._guard is not None else None
+        if self._guard is not None:
+            handle.ramp, handle.breaker = self._guard.ramp, self._guard.breaker
         # ONE warn/retry/record implementation for every dispatch path (issue
         # #335 phase 1): agg's _run_lambda, the raster driver and this finisher
         # all route through runner._finalize_with_retry, so the message contract
@@ -1376,7 +1411,7 @@ class Run:
         # ``handle.stage_sweep`` None, so the finalize records ``{skipped}``
         # rather than tagging a tip the staged sweep never reached. Cleared
         # only on the explicit no-work branch below.
-        sweeps = layout == "hive" and get_sweep(self.config)
+        sweeps = layout == "hive" and get_sweep(self.config) and trip is None
         stage_chained = sweeps and chains_stages(self.config, self.grid) and not self._attached
         if sweeps:
             try:
@@ -1447,14 +1482,10 @@ class Run:
                     runner._warn_families_unswept(riding, handle.stage_sweep)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
-        self._finalize_icechunk(
-            handle,
-            client,
-            config_dict,
-            output_creds_event,
-            run_id,
-            skip=runner._staged_sweep_incomplete(handle.stage_sweep) if stage_chained else None,
-        )
+        skip = runner._staged_sweep_incomplete(handle.stage_sweep) if stage_chained else None
+        if trip is not None:
+            skip = f"circuit breaker tripped ({trip['rule']})"
+        self._finalize_icechunk(handle, client, config_dict, output_creds_event, run_id, skip=skip)
 
     def _finalize_icechunk(
         self,

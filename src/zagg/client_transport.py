@@ -448,7 +448,7 @@ def dispatch_event_shards(
         lambda: open_status_store(prefix, store_kwargs),
         drop_timeout_s=drop_timeout_s(timeout_s),
         max_retries=run.max_retries,
-        max_in_flight=workers,
+        guard=run._dispatch_guard(workers, timeout_s),
         on_failed=on_failed,
     )
     skip_hash = runner._fleet_skip_hash(run.config, run.overwrite)
