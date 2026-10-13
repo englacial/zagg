@@ -175,13 +175,19 @@ def _write_all_time_columns(root: Path) -> None:
     #650), and NO writer folds the window columns into one: ``zagg.column``
     and ``zagg.column_backfill`` each fold exactly one ``(leaf, window)``, so
     a windowed store comes off the real pipeline without it (issue #649, the
-    shard-level close). A correct store is therefore modelled here by copying
-    a leaf's newest window column to the all-time name and restamping its
-    recorded window to the reserved token. The leg checks existence, role and
-    the commit stamp only — which the copy carries honestly — never the
-    per-window ``merges_from_raw`` law of the ``columns`` leg, so the stand-in
-    is exactly as strong as the check it answers. Delete this and call the
-    real fold once #649 ships one.
+    shard-level close).
+
+    What this writes is therefore a STAND-IN, and a narrow one: a
+    ``copytree`` of the leaf's newest window column with ``zagg_column.window``
+    restamped to the reserved token. It is byte-for-byte that window's values,
+    it records ``merges_from_raw: 1`` where a real k-way fold would record 2,
+    its provenance names one window, and its D4 commit stamp is the one minted
+    for ``{window}.pyramid.zarr`` — borrowed from the object it copies, not
+    attesting to this one. What the leg does check it satisfies honestly:
+    existence, role, the stamp's presence, and the §4.6 identity (the reserved
+    window token and the declared leaf-column groups, which a copy of one
+    window's column carries). It is not a fold and does not model one. Delete
+    this and call the real fold once #649 ships one.
     """
     from zagg.column import COLUMN_ATTR
     from zagg.windows import SCHEDULE_NONE_TOKEN
