@@ -345,7 +345,7 @@ LAMBDA_PRICE_PER_GB_SEC = LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[LAMBDA_ARCH]
 BENIGN_ERRORS = ("No granules found", "No data after filtering")
 
 #: The three classes a leaf unit's ``error`` resolves to (issue #651), carried
-#: as ``error_class`` beside it. ``store-fatal`` is a refusal the store will
+#: as ``store_error_class`` beside it. ``store-fatal`` is a refusal the store will
 #: repeat for every window of the invoke (a 4xx, a response the client could
 #: not parse, a schema/template refusal): the bulk seam ends the invoke on it
 #: instead of aggregating the remaining windows into the 900 s wall.

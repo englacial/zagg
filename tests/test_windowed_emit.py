@@ -774,14 +774,14 @@ class TestBulkEndToEnd:
         fakes = {**_fakes(), "s3://bucket/granuleA.h5": _h5([400.0, 401.0, 402.0])}
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"), fakes=fakes)
         assert [m["error"] for m in meta["windows"]] == ["No data after filtering", None, None]
-        assert [m.get("error_class") for m in meta["windows"]] == ["benign", None, None]
-        assert meta["error"] is None and "error_class" not in meta and meta["total_obs"] == 11
+        assert [m.get("store_error_class") for m in meta["windows"]] == ["benign", None, None]
+        assert meta["error"] is None and "store_error_class" not in meta and meta["total_obs"] == 11
         # Every written window benign: the bare string, so the shard is no_data.
         far = {u: _h5([400.0]) for u in _fakes()}
         for h in far.values():
             h._arrays["/lat"] = np.full(1, 10.0)
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "far"), fakes=far)
-        assert meta["error"] in BENIGN_ERRORS and meta["error_class"] == "benign"
+        assert meta["error"] in BENIGN_ERRORS and meta["store_error_class"] == "benign"
 
     def test_one_window_failing_keeps_the_landed_windows(self, monkeypatch, tmp_path):
         # Review finding (4): a raise in one window's finish is that window's
@@ -803,8 +803,8 @@ class TestBulkEndToEnd:
         assert meta["error"] == "window 2019: RuntimeError: PUT failed"
         # An error the classifier cannot name stays transient: isolated, and
         # the shard goes on (issue #651 keeps this contract).
-        assert [m.get("error_class") for m in meta["windows"]] == [None, "transient", None]
-        assert meta["error_class"] == "transient" and "windows_unattempted" not in meta
+        assert [m.get("store_error_class") for m in meta["windows"]] == [None, "transient", None]
+        assert meta["store_error_class"] == "transient" and "windows_unattempted" not in meta
         assert meta["total_obs"] == 7  # 2018 + 2020; the failed window counts nothing
         grid = _grid(_cfg())
         assert [_leaf_obs(root, _shard_word(), w, grid) for w in ("2018", "2020")] == [1, 6]
@@ -834,7 +834,7 @@ class TestBulkEndToEnd:
         assert [m["window"] for m in meta["windows"]] == ["2018", "2019"]
         assert meta["windows_unattempted"] == ["2020"]
         assert meta["error"].startswith("window 2019: GenericError: Generic S3 error: Got invalid")
-        assert meta["error_class"] == meta["windows"][1]["error_class"] == "store-fatal"
+        assert meta["store_error_class"] == meta["windows"][1]["store_error_class"] == "store-fatal"
         assert meta["total_obs"] == 1  # 2018 alone landed
         shard = _shard_word()
         assert _leaf_obs(root, shard, "2018", _grid(_cfg())) == 1
@@ -856,9 +856,11 @@ class TestBulkEndToEnd:
 
         monkeypatch.setattr(hive._LeafUnit, "finish", _failing)
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"))
-        assert [m["error_class"] for m in meta["windows"]] == ["transient", "store-fatal"]
+        assert [m["store_error_class"] for m in meta["windows"]] == ["transient", "store-fatal"]
         assert meta["error"].startswith("window 2019: GenericError")
-        assert meta["error_class"] == "store-fatal" and meta["windows_unattempted"] == ["2020"]
+        assert meta["store_error_class"] == "store-fatal" and meta["windows_unattempted"] == [
+            "2020"
+        ]
 
     def test_a_returned_source_denial_never_ends_the_shard(self, monkeypatch, tmp_path):
         # Review finding (1): a RETURNED error is the no-data channel, whose
@@ -877,7 +879,7 @@ class TestBulkEndToEnd:
         monkeypatch.setattr(hive._LeafUnit, "finish", _returned)
         meta = _run_bulk(monkeypatch, _cfg(), str(tmp_path / "bulk"))
         assert [m["window"] for m in meta["windows"]] == ["2018", "2019", "2020"]
-        assert meta["windows"][1]["error_class"] == meta["error_class"] == "transient"
+        assert meta["windows"][1]["store_error_class"] == meta["store_error_class"] == "transient"
         assert "windows_unattempted" not in meta
 
     def test_a_store_fatal_column_report_ends_the_shard_too(self, monkeypatch, tmp_path):
@@ -896,7 +898,9 @@ class TestBulkEndToEnd:
         meta = _run_bulk(monkeypatch, _cfg(), root)
         assert [m["window"] for m in meta["windows"]] == ["2018", "2019"]
         assert meta["windows"][1]["error"].startswith("leaf column: ")
-        assert meta["error_class"] == "store-fatal" and meta["windows_unattempted"] == ["2020"]
+        assert meta["store_error_class"] == "store-fatal" and meta["windows_unattempted"] == [
+            "2020"
+        ]
         grid = _grid(_cfg())
         assert [_leaf_obs(root, _shard_word(), w, grid) for w in ("2018", "2019")] == [1, 5]
 
@@ -1312,7 +1316,7 @@ class TestHandler:
         event = _handler_event(_cfg(), tmp_path)
         body = json.loads(_handle(handler_mod, event)["body"])
         assert body["error"] == "window 2019: RuntimeError: PUT failed"
-        assert body["error_class"] == "transient"
+        assert body["store_error_class"] == "transient"
         assert [(r["window"], r["success"]) for r in body["stats"]] == [
             ("2018", True),
             ("2019", False),
@@ -1348,15 +1352,19 @@ class TestHandler:
         response = _handle(handler_mod, event)
         body = json.loads(response["body"])
         assert response["statusCode"] == 500
-        assert body["error_class"] == "store-fatal" and body["windows_unattempted"] == ["2020"]
+        assert body["store_error_class"] == "store-fatal" and body["windows_unattempted"] == [
+            "2020"
+        ]
         assert [(r["window"], r["success"]) for r in body["stats"]] == [
             ("2018", True),
             ("2019", False),
         ]
+        # The class rides the leaf's own record into the run parquet (phase 5).
+        assert [r["store_error_class"] for r in body["stats"]] == [None, "store-fatal"]
         store, shard = event["store_path"], event["shard_key"]
         assert read_sidecar(hive.shard_leaf_path(store, shard, window="2018"))["n_obs"] == 1
         assert read_sidecar(hive.shard_leaf_path(store, shard, window="2020")) is None
         _key, status = build_shard_status(event, response)
         assert status["status"] == "failed"
-        assert status["body"]["error_class"] == "store-fatal"
+        assert status["body"]["store_error_class"] == "store-fatal"
         assert status["error"].startswith("window 2019: GenericError")

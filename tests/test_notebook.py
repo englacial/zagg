@@ -645,15 +645,19 @@ class TestRunView:
         # runner's error counting).
         assert "No granules found" not in html_out
 
-    def test_repr_html_failures_show_the_store_error_class(self):
+    def test_repr_html_failures_show_the_store_store_error_class(self):
         # Issue #651: the class column reads the local meta's key, or the v1
         # sync result's ``body``; a classless failure renders an empty cell.
         view = notebook.RunView(
             {
                 "backend": "local",
                 "results": [
-                    {"shard_key": 1, "error": "window 2019: refused", "error_class": "store-fatal"},
-                    {"shard_key": 2, "error": "boom", "body": {"error_class": "transient"}},
+                    {
+                        "shard_key": 1,
+                        "error": "window 2019: refused",
+                        "store_error_class": "store-fatal",
+                    },
+                    {"shard_key": 2, "error": "boom", "body": {"store_error_class": "transient"}},
                     {"shard_key": 3, "error": "boom"},
                 ],
             }
