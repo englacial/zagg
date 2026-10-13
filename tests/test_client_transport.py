@@ -17,8 +17,10 @@ import pytest
 from obstore.store import MemoryStore
 
 import zagg.client_transport as ct
+from zagg import hive
 from zagg.client import Run
 from zagg.config import default_config
+from zagg.pyramid import PYRAMID_SPEC_V2, expand_overviews
 
 
 def _shard_error():
@@ -45,6 +47,10 @@ _WORDS = [11828422946311897094, 11828141471335186438, 11827859996358475782]
 _LABELS = ["-4211324", "-4211323", "-4211322"]
 _CREDS = {"accessKeyId": "AK", "secretAccessKey": "SK", "sessionToken": "TK"}
 _STORE = "s3://test-bucket/out.zarr"
+#: The shard order the staged-sweep audit's store declares — the config's own
+#: ``parent_order`` above, because the fleet dispatcher's ladder gate (issue
+#: #635) declines a manifest that denies the order it was handed.
+_D8_SHARD_ORDER = _ATL06_SIG["parent_order"]
 
 
 def _rec(n):
@@ -1321,6 +1327,28 @@ class TestD8Audit:
         # The fleet's record LIST opens the sweep's own status prefix through
         # the store factory; route it at the in-memory status store.
         monkeypatch.setattr(store_mod, "open_object_store", lambda path, *a, **k: status_store)
+        # The dispatcher's ONE store read (issue #635): it declines a store
+        # whose manifest declares no `/2` ladder before firing anything, so
+        # the audited run needs a manifest to pass that gate — and the audit
+        # is about PUTs, which this one is not. `hive` binds the store factory
+        # at import, so route it THERE too, or `read_manifest` reaches for the
+        # real `s3://test-bucket` and the gate's verdict depends on what the
+        # network answers: a 404 on a CI runner declines the run, no network
+        # at all fails open. Written before the PUT counter is installed.
+        monkeypatch.setattr(hive, "open_object_store", lambda path, *a, **k: status_store)
+        obstore.put(
+            status_store,
+            hive.MANIFEST_NAME,
+            json.dumps(
+                {
+                    "shard_order": _D8_SHARD_ORDER,
+                    "pyramid": {
+                        "spec": PYRAMID_SPEC_V2,
+                        "overviews": expand_overviews([9], parent_order=_D8_SHARD_ORDER),
+                    },
+                }
+            ).encode(),
+        )
         puts: list[str] = []
         real_put = obstore.put
 

@@ -4674,11 +4674,22 @@ def _run_lambda(
                         # closes in place of their own fan-out (issue #610).
                         families=riding,
                     )
-                    summary["stage_sweep"] = staged
                     _warn_families_unswept(riding, staged)
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
                 families_error = f"{type(e).__name__}: {e}"
+        # The staged leg's dispatcher summary rides the RETURNED summary, like
+        # the families leg's above (review finding). A DECLINED fan-out (issue
+        # #635) fires nothing, so `_staged_sweep_incomplete` returns None and
+        # `icechunk_finalize` below records a tag where it used to record
+        # `{"skipped": "staged sweep barrier timed out"}` -- which leaves this
+        # dict's `skipped` reason and `families_unswept` as the run record's
+        # only durable trace that the declared ladder went unswept, and a
+        # WARNING does not outlive this process (issue #610). Set once HERE,
+        # outside the chaining gate, so the key is present on every path --
+        # no hive sweep, or a dispatch that failed open -- exactly as
+        # `families_sweep` is.
+        summary["stage_sweep"] = staged
         # The run's verdict on its own tail (issue #610): one reason per
         # shortfall, empty when the tail left nothing short. Both legs' full
         # outcomes are above; this is what a caller reads without knowing
@@ -6721,6 +6732,20 @@ def _invoke_lambda_stage_sweep(
     one of them stays worker-side. Fail-open (D9): a refused lease, a lost
     invoke or a timed-out barrier costs one later
     ``python -m zagg.sweep --stages`` pass, never a wrong answer.
+
+    **The tail does not have to know the store declares a ladder.** The
+    chaining gate is the CONFIG's (:func:`zagg.config.chains_stages`) and a
+    manifest's ``pyramid`` block may lag it, so the dispatcher reads the
+    store's own declaration once before it fans out
+    (:func:`zagg.sweep_fleet.no_ladder_reason`, issue #635): a store carrying
+    no ``zagg-pyramid/2`` ladder costs this tail one manifest GET and zero
+    invokes, reported as ``skipped`` on the summary this returns, where it used
+    to bill one no-op invoke per dispatch node. That summary is what the run
+    summary and the client handle carry as ``stage_sweep`` (the families leg's
+    posture, :func:`_invoke_lambda_families_sweep`), so the decline's reason is
+    durable on the run record and not only in a log line (review finding).
+    Such a run rode no node close, so the summary's ``families_unswept`` sends
+    the rollups to :func:`_warn_families_unswept`'s backstop.
 
     **How long the tail can block.** One barrier per tuple plus the finisher's,
     each bounded by ``barrier_timeout_s``

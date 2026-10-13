@@ -1952,7 +1952,7 @@ class TestSummaryKeysByteIdentical:
         # The tail's families-sweep outcome (issue #610); None when nothing
         # was swept. LAMBDA-only — the local backend sweeps in-process.
         "families_sweep",
-        # The tail's staged-sweep summary (issue #610); None when no staged
+        # The tail's staged-sweep summary (issues #610, #635); None when no staged
         # sweep was chained or its dispatch failed open. This is the SPATIAL /
         # temporal lambda summary's set: the raster lambda tail reports
         # ``families_sweep`` and chains no staged sweep at all, so it carries
@@ -4924,6 +4924,32 @@ class TestLambdaSkipAndDirtOnly:
         # emptiest report would be the most misleading one (review finding).
         ((reason,)) = summary["tail_sweep_short"]
         assert "sweep block raised (RuntimeError: no leaves for you)" in reason
+
+    def test_a_declined_staged_sweep_is_visible_on_the_returned_summary(
+        self, monkeypatch, atl06_config
+    ):
+        # A declined fan-out (issue #635) fires nothing and so TAGS the run --
+        # the test above -- which leaves the dispatcher's own ``skipped``
+        # reason as the run record's only durable trace that the declared
+        # ladder went unswept. So it has to ride the summary this function
+        # RETURNS, as the families leg's outcome already does; a WARNING does
+        # not outlive the dispatcher process (review finding).
+        from zagg.sweep_fleet import NO_LADDER_SKIP
+
+        staged = {
+            "skipped": f"{NO_LADDER_SKIP}: no morton_hive.json at the store root",
+            "families_unswept": True,
+            "barrier_timed_out": False,
+            "finisher": {"fired": False, "landed": False},
+        }
+        summary, _seen = self._drive(
+            monkeypatch, atl06_config, body=self._DIRTY, init={"snapshot": "s0"}, staged=staged
+        )
+        assert summary["stage_sweep"] is staged  # the dispatcher's dict, whole
+        assert summary["stage_sweep"]["skipped"].startswith(NO_LADDER_SKIP)
+        assert summary["stage_sweep"]["families_unswept"] is True
+        # The field that used to carry the signal records a tag now.
+        assert summary["icechunk_finalize"] == {"tag": "run-x"}
 
 
 class TestLambdaFamiliesRideTheCascade:

@@ -12,8 +12,15 @@ Two things this pins, both about a staged pass that has nothing to do:
 * **Who may ask for a whole-store pass.** The ladder is chained by the run
   tail, scoped to the run's footprint; the hand-driven forms are recovery and
   have to name their scope.
+* **Which stores the fan-out is for** (issue #635, the follow-on to question
+  (11) on PR #622). The default keys on the config, so the dispatcher reads
+  the STORE's ladder declaration once before it fans out: a store that
+  declares none fires nothing, where it used to bill one invoke per dispatch
+  node, each dying in ``ladder_entries``.
 """
 
+import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -26,6 +33,8 @@ from test_sweep_stage import (
 )
 from test_sweep_stage_fleet import _FakeLambda
 
+from zagg.pyramid import PYRAMID_SPEC_V2
+from zagg.sweep_fleet import NO_LADDER_SKIP
 from zagg.sweep_units import UNIT_CLOSE, UNIT_WINDOW
 
 WINDOWS = TestWindowedStageSweep.WINDOWS
@@ -438,3 +447,329 @@ class TestStagesCliScope:
         monkeypatch.setattr("zagg.sweep_stages.run_stage_sweep", driver)
         assert main([str(root), "--stages", "--scope", "all"]) == 0
         assert seen["scope"] is None
+
+
+class TestStoreLadderGate:
+    """The dispatcher keys the staged sweep on the STORE's ladder (issue #635).
+
+    The default is the CONFIG's (``zagg.config.get_sweep_mode``, issue #620)
+    and ``pyramid.spec`` is written once, at init — so a ``/1``-manifest hive
+    store appended to by a ladder-declaring config used to fan out one stage
+    invoke per dispatch node of the schedule (287 on the California o9
+    shardmap), every one of them dying in
+    ``zagg.sweep_stage.ladder_entries``: billed invokes, zero writes. One
+    manifest GET before the first invoke makes that a run that fires nothing.
+    """
+
+    def _redeclare(self, root, pyramid):
+        """The fixture store's manifest, with another ``pyramid`` block.
+
+        The store the hazard describes: its leaves and columns are the ``/2``
+        fixture's and only the declaration differs — which is exactly what an
+        append to a pre-#384 store looks like, since no append rewrites
+        ``pyramid``.
+        """
+        from zagg.hive import MANIFEST_NAME
+
+        path = Path(root) / MANIFEST_NAME
+        manifest = json.loads(path.read_text())
+        manifest["pyramid"] = pyramid
+        path.write_text(json.dumps(manifest))
+
+    #: Every declaration the workers refuse, and the clause that names it. A
+    #: ``/1`` schedule and a declared-off ``/1`` are the two shapes PR #622's
+    #: Migration note describes; the ``/2`` shapes are an empty and two
+    #: malformed ``overviews`` lists. A ladder that merely FILTERS to nothing
+    #: is not here — the workers accept it, so the dispatcher does too
+    #: (``test_a_leaf_only_ladder_still_fans_out``).
+    NO_LADDER = [
+        ({"spec": "zagg-pyramid/1", "overview": {"orders": [2, 1], "spacing": 1}}, "/1 stores"),
+        ({"spec": "zagg-pyramid/1", "overview": {"orders": []}}, "/1 stores"),
+        ({"spec": PYRAMID_SPEC_V2, "overviews": []}, "absent or empty"),
+        # ``ladder_entries`` normalizes each entry, so a malformed one raises
+        # KeyError/TypeError rather than the named ValueError — and a decline
+        # is owed for those too (review finding).
+        ({"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 2}]}, "KeyError"),
+        ({"spec": PYRAMID_SPEC_V2, "overviews": ["2"]}, "TypeError"),
+    ]
+
+    @pytest.mark.parametrize("pyramid, named", NO_LADDER)
+    def test_a_store_with_no_ladder_fires_nothing(self, tmp_path, caplog, pyramid, named):
+        root = tmp_path / "s"
+        _stage_store(root)
+        self._redeclare(root, pyramid)
+        client = _FakeLambda(None)
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            summary = _tail_fleet(root, client)
+        # ZERO invokes: not the finisher's either, and no barrier was waited.
+        assert client.events == [] and summary["invokes"] == 0
+        # The constant is the matchable prefix; the reason the gate saw rides
+        # behind it, so the run record is self-explaining.
+        assert summary["skipped"].startswith(f"{NO_LADDER_SKIP}: ")
+        assert named in summary["skipped"]
+        assert summary["stages"] == []
+        assert summary["finisher"] == {"landed": False, "fired": False}
+        # ONE warning, and it names the retrofit and what it saw.
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "--declare-pyramid" in warnings[0] and named in warnings[0]
+
+    def test_the_gate_filters_at_the_manifest_shard_order(self, tmp_path):
+        # The leaf exclusion is the workers' own, and every worker takes
+        # ``int(manifest["shard_order"])``. Pinned on the declaration where
+        # the filter decides the verdict: a malformed entry at order 2 is
+        # validated at the store's 3, where a filter at 2 would have excluded
+        # it unseen and passed a declaration every worker refuses.
+        from zagg.sweep_fleet import no_ladder_reason
+
+        root = tmp_path / "s"
+        _stage_store(root)  # shard_order 3, ladder at orders 2..0
+        self._redeclare(
+            root,
+            {
+                "spec": PYRAMID_SPEC_V2,
+                "overviews": [
+                    {"node": 2, "cells": [4, 5]},
+                    {"node": 1, "cells": [3]},
+                    {"node": 0, "cells": [2]},
+                ],
+            },
+        )
+        assert "carries 2 members" in (no_ladder_reason(str(root), 3, {}) or "")
+
+    @pytest.mark.parametrize("handed, named", [(5, "not the 5"), (2, "not the 2")])
+    def test_a_shard_order_the_manifest_denies_declines_by_name(self, tmp_path, handed, named):
+        # The gate is the one place holding both numbers, so it refuses the
+        # divergence rather than reconciling it (review finding). The two
+        # directions cost differently, which is why the reason claims neither
+        # outright: a span ABOVE the manifest's order is refused per invoke by
+        # name ("stage tuple [3, 5) is not a span of this ladder"), while one
+        # BELOW it is accepted by the workers and folds the wrong levels.
+        from zagg.sweep_fleet import no_ladder_reason
+
+        root = tmp_path / "s"
+        _stage_store(root)  # shard_order 3
+        reason = no_ladder_reason(str(root), handed, {}) or ""
+        assert "declares shard_order 3" in reason and named in reason
+
+    def test_a_manifest_with_no_shard_order_declines(self, tmp_path):
+        # Every worker takes ``manifest["shard_order"]`` unguarded, so such a
+        # store costs one invoke per dispatch node and a bare KeyError each.
+        from zagg.hive import MANIFEST_NAME
+        from zagg.sweep_fleet import no_ladder_reason
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        path = root / MANIFEST_NAME
+        manifest = json.loads(path.read_text())
+        del manifest["shard_order"]
+        path.write_text(json.dumps(manifest))
+        assert "declares no shard_order" in (no_ladder_reason(str(root), 3, {}) or "")
+
+    def test_a_leaf_only_ladder_still_fans_out(self, tmp_path):
+        # A /2 declaration whose only entry is the leaf one (the fleet's own
+        # column) filters to an EMPTY ladder, and every worker accepts it:
+        # the three worker gates call ``ladder_entries`` for its refusals and
+        # discard the list, so such a run folds no level but still does the
+        # finisher's store-root work — the root MOC, the manifest actuals,
+        # the run record. Declining it would move what a /2 store does
+        # (review finding), so the gate does not.
+        from zagg.sweep_fleet import dispatch_nodes
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        self._redeclare(root, {"spec": PYRAMID_SPEC_V2, "overviews": [{"node": 3, "cells": [4]}]})
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert summary["skipped"] is None
+        by_shard = {d: {None} for d in LEAVES}
+        assert _fired(client) == {d: dispatch_nodes(by_shard, d) for d in (2, 1, 0)}
+        assert summary["finisher"]["fired"] is True
+
+    @pytest.mark.parametrize("body", [["not", "a", "manifest"], 5, "hello"])
+    def test_a_manifest_that_is_not_an_object_fires_nothing(self, tmp_path, body):
+        # The corrupt-manifest arm of the same finding: ``read_manifest``
+        # parses whatever JSON is there, so a non-object manifest reaches the
+        # gate as an AttributeError on ``manifest.get`` rather than as a
+        # refusal — still a decline, never a traceback out of the dispatcher.
+        # The REASON is pinned too (review finding): this shape has no
+        # ``return`` of its own and so inherited the retrofit remedy, which
+        # ``declare_pyramid`` refuses on a malformed manifest — the wrong-
+        # remedy class the per-arm fold fixed for its three siblings.
+        from zagg.hive import MANIFEST_NAME
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        (root / MANIFEST_NAME).write_text(json.dumps(body))
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert client.events == [] and summary["invokes"] == 0
+        assert summary["skipped"].startswith(NO_LADDER_SKIP)
+        assert f"is not a JSON object (a {type(body).__name__})" in summary["skipped"]
+        assert "restore or rewrite the manifest" in summary["skipped"]
+        assert "(re-)declare it with" not in summary["skipped"]  # not the retrofit's
+
+    def test_a_manifest_that_does_not_parse_fires_nothing(self, tmp_path):
+        # A truncated manifest is the store's own content, not an access
+        # failure (review finding): ``hive._read_json`` guards only the
+        # not-found shapes, so this reaches the gate as a JSONDecodeError —
+        # and failing open would bill one invoke per dispatch node, each
+        # re-raising the same parse error worker-side.
+        from zagg.hive import MANIFEST_NAME
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        (root / MANIFEST_NAME).write_text('{"shard_order": 3, "pyr')
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert client.events == [] and summary["invokes"] == 0
+        assert "does not parse" in summary["skipped"]
+
+    def test_a_local_root_that_does_not_exist_declines_without_writing(self, tmp_path):
+        # The gate's ONE READ must not write, on either path form (review
+        # finding): ``open_object_store``'s local branch mkdirs the root it is
+        # handed, so reading through it on a path that does not exist used to
+        # materialize the tree the gate then declined — "not a hive store
+        # root" about a directory the dispatcher had just created. The D8
+        # audit counts ``obstore.put``, so it cannot see this.
+        root = tmp_path / "typo" / "store"
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert client.events == [] and summary["invokes"] == 0
+        assert summary["skipped"].startswith(NO_LADDER_SKIP)
+        assert "no morton_hive.json at the store root" in summary["skipped"]
+        assert not root.exists() and not root.parent.exists()  # nothing was created
+
+    def test_a_root_with_no_manifest_fires_nothing(self, tmp_path):
+        root = tmp_path / "empty"
+        root.mkdir()
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert client.events == [] and summary["skipped"].startswith(NO_LADDER_SKIP)
+
+    def test_a_two_store_is_untouched(self, tmp_path):
+        # Acceptance: no change to what a /2 store does. The same fan-out,
+        # tuple by tuple, as ``dispatch_nodes`` over the work set.
+        from zagg.sweep_fleet import dispatch_nodes
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client)
+        assert summary["skipped"] is None
+        by_shard = {d: {None} for d in LEAVES}
+        assert _fired(client) == {d: dispatch_nodes(by_shard, d) for d in (2, 1, 0)}
+
+    def test_the_gate_is_one_manifest_read(self, tmp_path, monkeypatch):
+        # D8 is amended for ONE read, so the count is pinned rather than
+        # described: the worker arm is not executed here
+        # (``_FakeLambda(None)``), so every call counted is the dispatcher's.
+        import zagg.hive as hive_mod
+
+        read = []
+        inner = hive_mod.read_manifest
+        monkeypatch.setattr(
+            hive_mod,
+            "read_manifest",
+            lambda root, **kw: (read.append(root), inner(root, **kw))[1],
+        )
+        root = tmp_path / "s"
+        _stage_store(root)
+        summary = _tail_fleet(root, _FakeLambda(None))
+        assert read == [str(root)] and summary["invokes"] > 0
+
+    def test_an_unreadable_manifest_fails_open(self, tmp_path, caplog, monkeypatch):
+        # A dispatcher role may hold nothing but ``lambda:InvokeFunction``
+        # against the store (the D8 posture ``shard_order`` is handed in for),
+        # so a denied GET keeps the fan-out it has today and names the grant
+        # that would close the hazard — it never takes the ladder away.
+        def denied(*_a, **_kw):
+            raise PermissionError("AccessDenied")
+
+        monkeypatch.setattr("zagg.hive.read_manifest", denied)
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        with caplog.at_level(logging.WARNING, logger="zagg.sweep_fleet"):
+            summary = _tail_fleet(root, client)
+        assert summary["skipped"] is None and summary["invokes"] > 0
+        assert any("could not be read" in r.getMessage() for r in caplog.records)
+
+    def test_the_families_of_a_ladderless_store_come_back_unswept(self, tmp_path, caplog):
+        # The families ride a node CLOSE (issue #610 phase 4), and a run that
+        # fires nothing closes nothing — so the tail's own backstop warning is
+        # owed, and it reads this flag.
+        from zagg.runner import _warn_families_unswept
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        self._redeclare(root, {"spec": "zagg-pyramid/1", "overview": {"orders": []}})
+        client = _FakeLambda(None)
+        summary = _tail_fleet(root, client, families=["stats"])
+        assert client.events == [] and summary["families_unswept"] is True
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            _warn_families_unswept(["stats"], summary)
+        assert any("rode no node close" in r.getMessage() for r in caplog.records)
+
+    def test_a_declined_run_leaves_the_icechunk_finalize_free_to_tag(self, tmp_path):
+        # The gate MOVES this verdict and it is deliberate (review finding).
+        # Before it, such a run fanned out, no stage record landed and the
+        # barriers expired — ``barrier_timed_out`` — so
+        # ``_staged_sweep_incomplete`` skipped the finalize and left the run
+        # untagged. A declined run fires nothing, so nothing is in flight:
+        # that function's own rule ("a sweep that fired nothing has nothing
+        # in flight") returns None and the run is tagged. The tag is honest —
+        # the leaves are complete and the store declares no ladder to sweep.
+        from zagg.runner import _staged_sweep_incomplete
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        self._redeclare(root, {"spec": "zagg-pyramid/1", "overview": {"orders": [2, 1]}})
+        summary = _tail_fleet(root, _FakeLambda(None))
+        assert summary["barrier_timed_out"] is False
+        assert _staged_sweep_incomplete(summary) is None
+
+    def test_the_other_no_op_return_reports_unswept_families_too(self, tmp_path):
+        # The dispatcher's two no-op returns are the same situation for the
+        # rollups: no node closed (review finding). This one is reached with
+        # a work set whose refs all drop out of ``_normalize_leaves``, so no
+        # tuple produces a dispatch node.
+        from zagg.sweep_fleet import run_stage_sweep_fleet
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        client = _FakeLambda(None)
+        summary = run_stage_sweep_fleet(
+            client,
+            "fn",
+            str(root),
+            [],
+            shard_order=3,
+            store_kwargs={},
+            families=["stats"],
+            barrier_timeout_s=0.01,
+        )
+        assert summary["skipped"] == "no dispatch nodes"
+        assert client.events == [] and summary["families_unswept"] is True
+
+    def test_the_run_tail_seam_shares_the_gate(self, tmp_path):
+        # The dispatcher's two callers are the runner's tail seam and the
+        # hand-called form above; the gate is in the dispatcher, so one gate
+        # serves both.
+        from zagg.grids.morton import morton_word
+        from zagg.runner import _invoke_lambda_stage_sweep
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        self._redeclare(root, {"spec": "zagg-pyramid/1", "overview": {"orders": [2, 1]}})
+        client = _FakeLambda(None)
+        summary = _invoke_lambda_stage_sweep(
+            client,
+            "fn",
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            shard_order=3,
+            store_kwargs={},
+            barrier_timeout_s=0.01,
+        )
+        assert client.events == [] and summary["skipped"].startswith(NO_LADDER_SKIP)
