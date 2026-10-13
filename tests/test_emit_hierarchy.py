@@ -17,9 +17,25 @@ from zarr.core.sync import sync
 from zarr.errors import ContainsGroupError
 from zarr.storage import MemoryStore
 
+from zagg.column_shards import column_grid
 from zagg.config import default_config
 from zagg.grids import HealpixGrid
 from zagg.grids.base import emit_hierarchy, vlen_dtype_warning_suppressed
+from zagg.sweep_overview import _overview_config
+
+#: A wide column group's fields (§4.6): a NaN-filled float beside the counts
+#: and a vector-celled digest, so the group is one ShardingCodec object per array.
+COLUMN_FIELDS = {
+    "count": {"class": "exact", "method": "sum", "dtype": "int64", "fill_value": 0},
+    "h_mean": {"class": "exact", "method": "mean", "dtype": "float32", "fill_value": "NaN"},
+    "h_tdigest": {
+        "class": "approximate",
+        "method": "tdigest_kway",
+        "dtype": "float32",
+        "inner_shape": [2],
+        "delta": 4096,
+    },
+}
 
 
 def _documents(store: MemoryStore) -> dict[str, bytes]:
@@ -40,10 +56,24 @@ def _leaf_spec(**kwargs) -> tuple[HealpixGrid, GroupSpec]:
     return grid, spec
 
 
-@pytest.mark.parametrize("sharded", [True, False])
-def test_one_pass_writes_the_same_bytes_as_to_zarr(sharded):
-    """Dense sharded, dense unsharded, vlen ragged + located/timed siblings, vector attrs."""
-    _grid, spec = _leaf_spec(sharded=sharded)
+def _column_spec() -> GroupSpec:
+    grid = column_grid(9, 15, _overview_config(COLUMN_FIELDS))
+    assert grid.sharded and grid.chunks_per_shard > 1
+    return GroupSpec(members={"15": grid.shard_spec()}, attributes={})
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda: _leaf_spec(chunk_inner=15, sharded=True)[1], id="leaf-sharded"),
+        pytest.param(lambda: _leaf_spec(chunk_inner=15, sharded=False)[1], id="leaf-unsharded"),
+        pytest.param(lambda: _leaf_spec()[1], id="leaf-one-chunk"),
+        pytest.param(_column_spec, id="column-wide"),
+    ],
+)
+def test_one_pass_writes_the_same_bytes_as_to_zarr(build):
+    """Dense sharded / unsharded, vlen ragged + located/timed siblings, a NaN-filled column."""
+    spec = build()
     via_to_zarr, via_one_pass = MemoryStore(), MemoryStore()
     with vlen_dtype_warning_suppressed():
         spec.to_zarr(via_to_zarr, "", overwrite=True)
@@ -51,6 +81,18 @@ def test_one_pass_writes_the_same_bytes_as_to_zarr(sharded):
     expected, got = _documents(via_to_zarr), _documents(via_one_pass)
     assert set(got) == set(expected)
     assert [k for k in expected if expected[k] != got[k]] == []
+
+
+def test_the_identity_cases_cover_sharding_and_a_nan_fill():
+    """The parametrize cannot collapse to one spec again (K == 1 turns sharding off)."""
+    docs = [
+        node.model_dump()
+        for build in (lambda: _leaf_spec(chunk_inner=15, sharded=True)[1], _column_spec)
+        for node in build().to_flat().values()
+    ]
+    arrays = [doc for doc in docs if doc.get("node_type") == "array"]
+    assert any(c["name"] == "sharding_indexed" for doc in arrays for c in doc["codecs"])
+    assert any(str(doc["fill_value"]) == "NaN" for doc in arrays)
 
 
 def test_every_node_comes_back_as_a_handle():
