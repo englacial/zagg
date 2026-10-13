@@ -207,12 +207,14 @@ def _manifest(root: Path, prefixes) -> dict[str, str]:
     """sha256 per object under every leaf and column prefix.
 
     The leaf's version segment (``run-<id>``) is normalized to ``<version>``
-    and the pointer stamp is hashed without its ``current`` field; everything
-    else is the raw bytes. Telemetry sidecars beside the prefixes (``*.stats
-    .json``, with wall-clock timestamps) are not the writers' store bytes.
+    and the pointer stamp's ``current`` value (which must name that run
+    directory) to ``<version>`` in its raw bytes; everything else is the raw
+    bytes. Telemetry sidecars beside the prefixes (``*.stats .json``, with
+    wall-clock timestamps) are not the writers' store bytes.
     """
     out = {}
     for leaf, column in prefixes.values():
+        runs = [d for d in os.listdir(leaf) if d.startswith("run-")]
         for prefix in (leaf, column):
             for dirpath, _dirs, files in os.walk(prefix):
                 for name in files:
@@ -224,9 +226,11 @@ def _manifest(root: Path, prefixes) -> dict[str, str]:
                     if version:
                         parts[version[0]] = "<version>"
                     elif str(path) == f"{leaf}/zarr.json":
-                        doc = json.loads(data)
-                        doc["attributes"][hive.COMMIT_ATTR].pop("current", None)
-                        data = json.dumps(doc, sort_keys=True).encode()
+                        current = json.loads(data)["attributes"][hive.COMMIT_ATTR]["current"]
+                        assert current in runs, (leaf, current, runs)
+                        field = f'"current": "{current}"'.encode()
+                        assert data.count(field) == 1, (leaf, current)
+                        data = data.replace(field, b'"current": "<version>"')
                     out["/".join(parts)] = hashlib.sha256(data).hexdigest()
     return out
 
