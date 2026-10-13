@@ -184,6 +184,40 @@ def write_all_time_column(
     )
 
 
+def stored_window_labels(store_root: str, shard_key, store_kwargs: dict | None = None) -> set:
+    """The window labels with a ``{label}.pyramid.zarr`` beside the shard: one delimiter LIST.
+
+    The all-time member covers EVERY window the shard HAS, not the ones an
+    invoke was dispatched — a run over new granules alone sends the windows
+    those granules touch — and the store is the only place that knows
+    (:func:`zagg.sweep_units.node_windows`' posture, one tier down: the column
+    objects at the leaf's node prefix, the reserved ``all`` member excluded).
+    Bounded and node-scoped, never a walk; a failed LIST raises, since folding
+    the windows one invoke happened to hold and calling it all-time would
+    publish a short fold under a name that claims the whole record.
+    """
+    import obstore
+
+    from zagg.column import COLUMN_SUFFIX
+    from zagg.hive import shard_leaf_path
+    from zagg.store import open_object_store
+    from zagg.windows import SCHEDULE_NONE_TOKEN, validate_label
+
+    node_prefix = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
+    store = open_object_store(node_prefix, **dict(store_kwargs or {}))
+    labels = set()
+    for prefix in obstore.list_with_delimiter(store)["common_prefixes"]:
+        name = str(prefix).rstrip("/").rsplit("/", 1)[-1]
+        label = name.removesuffix(COLUMN_SUFFIX)
+        if label == name or label == SCHEDULE_NONE_TOKEN:
+            continue
+        try:
+            labels.add(validate_label(label))
+        except ValueError:
+            continue  # not a window's column (foreign debris)
+    return labels
+
+
 def close_shard(store_root: str, shard_key, grid, config, row: list, *, store_kwargs) -> str | None:
     """The worker seam: gate on the declaration, fold ``row``, write; returns the basename.
 

@@ -304,6 +304,34 @@ class TestBulkUnit:
         assert not (_node(root) / "all.pyramid.zarr").exists()
         assert (_node(root) / "2019.pyramid.zarr").exists()
 
+    def test_a_narrower_dispatch_does_not_fold_the_member_short(self, monkeypatch, tmp_path):
+        # Review finding (1): a run over new 2020 granules alone dispatches
+        # ``windows=[2020]``; the store still holds 2018 and 2019, so the
+        # resident fold would be one window under a name claiming all three.
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        member = _node(root) / "all.pyramid.zarr"
+        before = {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), records=[emit._records()[1]]
+        )
+        assert [m["window"] for m in meta["windows"]] == ["2020"]
+        assert meta["error"] is None and "all_time_column" not in meta
+        assert {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k} == before
+        assert json.loads((member / "zarr.json").read_text())["attributes"][COLUMN_ATTR][
+            "source_windows"
+        ] == {"folded": 3, "missing": 0, "unreadable": 0}
+
+    def test_the_stored_labels_are_the_window_columns_beside_the_shard(self, monkeypatch, tmp_path):
+        from zagg.column_alltime import stored_window_labels
+
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, emit._digest_cfg(), root, fakes=emit._dense_fakes())
+        (_node(root) / "not_a.label.pyramid.zarr").mkdir()  # outside the label charset
+        assert (_node(root) / "all.pyramid.zarr").exists()
+        assert stored_window_labels(root, emit._shard_word(), {}) == set(WINDOWS)
+
     def test_a_failed_close_is_the_shards_error_and_the_windows_keep_theirs(
         self, monkeypatch, tmp_path
     ):

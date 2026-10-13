@@ -2653,20 +2653,23 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
     (:func:`zagg.column_alltime.close_shard` — the sweep's close law, one
     tier down). The resident path requires every window of the shard to be
     in memory: one the gate skipped as current, one that failed, or one that
-    was refused has no fold here, and the member is left for the stored-column
-    path to write (the issue's phase 2) rather than folded short under a name
-    that claims the whole record. A window whose sink kept nothing (the
-    benign no-data error) has no leaf and no column, and is simply not a
-    source. A failure is the SHARD's error — the windows' leaves and columns
+    was refused has no fold here, and neither has a window the store holds a
+    column for that this invoke was not dispatched (a run over new granules
+    sends only the windows they touch — one LIST of the node,
+    :func:`zagg.column_alltime.stored_window_labels`); the member is then left
+    for the stored-column path to write (the issue's phase 2) rather than
+    folded short under a name that claims the whole record. A window whose
+    sink kept nothing (the benign no-data error) has no leaf and no column,
+    and is simply not a source. A failure is the SHARD's error — the windows' leaves and columns
     are committed and keep their metadata and records; the invoke fails so
     the dispatcher retries the shard — reported through the same channel a
     failed column uses, never raised past the telemetry envelope.
     """
     from zagg.column import column_name
-    from zagg.column_alltime import _ResidentColumn, close_shard
+    from zagg.column_alltime import _ResidentColumn, close_shard, stored_window_labels
     from zagg.dispatch import BENIGN_ERRORS
 
-    row = []
+    row, resident = [], set()
     for w in windows:
         m = metas[w["label"]]
         if m.get("current") or m.get("refused"):
@@ -2677,6 +2680,7 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
             return  # a failed window: the retry rewrites it and the member
         if not m.get("leaf_column"):
             continue  # no column declared: nothing to fold (the close then clears)
+        resident.add(w["label"])
         row.append(
             _ResidentColumn(
                 column_name(w["label"]),
@@ -2688,10 +2692,11 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
             )
         )
     _t0 = time.time()
+    store_kwargs = unit_kwargs["store_kwargs"]
     try:
-        column = close_shard(
-            store_root, shard_key, grid, config, row, store_kwargs=unit_kwargs["store_kwargs"]
-        )
+        if not stored_window_labels(store_root, shard_key, store_kwargs) <= resident:
+            return  # a stored window this invoke does not hold: the stored-column path's case
+        column = close_shard(store_root, shard_key, grid, config, row, store_kwargs=store_kwargs)
     except Exception as e:
         logger.error(f"all-time column write failed for shard {shard_key}: {e}")
         base["error"] = f"all-time column: {e}"
