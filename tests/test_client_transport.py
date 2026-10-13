@@ -1629,6 +1629,12 @@ class TestDispatchGuardSeam:
         assert late.result()["outcome"] == "not-dispatched" and 9 not in fired
         assert not futures[3].done() and not futures[4].done()  # left to finish
 
+    def test_guard_and_max_in_flight_are_exclusive(self):
+        with pytest.raises(ValueError, match=r"DispatchGuard\(workers"):
+            ct.StatusPoller(
+                lambda: MemoryStore(), guard=_guard(), drop_timeout_s=1.0, max_in_flight=3
+            )
+
     def test_a_fixed_window_records_nothing(self):
         # No guard: the pre-#652 pacing, byte-identical (max_in_flight / None).
         poller = ct.StatusPoller(lambda: MemoryStore(), drop_timeout_s=1050.0, max_in_flight=3)

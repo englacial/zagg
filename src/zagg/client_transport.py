@@ -737,11 +737,10 @@ class StatusPoller:
     during which no LIST runs. Fine for 900 s shards; it is a real ramp, not a
     mystery.
 
-    The poller also owns Event dispatch: shards register with a zero-arg
-    ``dispatch`` closure and ``guard`` paces them — a fixed ``max_in_flight``
-    window (the preflight clamp, load-bearing under the fleet's 60 s
-    ``MaximumEventAgeInSeconds``) or the issue #652 ramp + breaker, which also
-    refuses every queued shard once it trips (:mod:`zagg.dispatch_guard`).
+    The poller also owns Event dispatch: shards register a zero-arg ``dispatch`` closure, paced
+    by a fixed ``max_in_flight`` window (the preflight clamp, load-bearing under the fleet's 60 s
+    ``MaximumEventAgeInSeconds``) or by ``guard``, the #652 ramp + breaker that refuses the queue
+    once tripped. ``guard`` REPLACES ``max_in_flight`` (both raises); its clamp is ``workers=``.
 
     **Retry policy — three fault classes** (issue #327 amendment (b) as folded
     from the PR #343 review; espg's to veto). Function errors never return to
@@ -809,10 +808,11 @@ class StatusPoller:
         self._store: Any = None
         self._drop_timeout_s = drop_timeout_s
         self._max_retries = max(1, int(max_retries))
+        if guard is not None and max_in_flight is not None:
+            raise ValueError("guard replaces max_in_flight: clamp via DispatchGuard(workers=...)")
         self._guard: Any = guard if guard is not None else FixedWindow(max_in_flight)
         self._on_failed = on_failed
-        # None -> the module constants, read at construction so tests can
-        # scale the cadence for every internally-built poller.
+        # None -> the module constants, read here so tests can scale every poller's cadence.
         self._initial_interval_s = (
             _POLL_INITIAL_INTERVAL_S if initial_interval_s is None else initial_interval_s
         )
