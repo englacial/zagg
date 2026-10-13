@@ -92,14 +92,17 @@ class Counter:
 
     def __init__(self):
         self.ops: list[tuple[str, str, str, str]] = []
-        self.caller = "?"
+        self.caller = "-"
 
     def install(self, monkeypatch) -> None:
         original_sync = zsync.sync
 
         def counted_sync(coro, *args, **kwargs):
             self.caller = _attribute()
-            return original_sync(coro, *args, **kwargs)
+            try:
+                return original_sync(coro, *args, **kwargs)
+            finally:
+                self.caller = "-"  # an op outside any sync reads as unattributed
 
         # The attribution is taken where the sync boundary is crossed, so the
         # async store methods below see the zagg frame that scheduled them.
