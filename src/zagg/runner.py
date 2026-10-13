@@ -413,6 +413,9 @@ def agg(
     # so the temporal and raster paths get their own (smaller) checks rather
     # than a false refusal.
     validate_config(config)
+    # The dispatch knobs (issue #652) are refused on every backend before the
+    # catalog is read; only the Event poller consumes them.
+    GuardConfig.from_dict(dispatch)
 
     # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
     # is dispatch-level: the spatial path is the existing code, moved verbatim

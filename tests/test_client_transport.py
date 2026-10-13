@@ -8,6 +8,7 @@ obstore functions the production path uses.
 """
 
 import json
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -481,6 +482,17 @@ class TestEventDispatch:
         run = _run(catalog, client=EventStubLambdaClient(status_store))
         with pytest.raises(ValueError, match="transport"):
             run.dispatch(transport="carrier-pigeon")
+
+    @pytest.mark.parametrize("transport", ["sync", "event"])
+    def test_a_bad_dispatch_block_is_refused_before_any_invoke(
+        self, catalog, status_store, transport
+    ):
+        # The Run.dispatch twin of the agg refusal (review finding, PR #665):
+        # before the ping, the setup or any cell invoke, on both transports.
+        stub = EventStubLambdaClient(status_store)
+        with pytest.raises(ValueError, match=re.escape("dispatch: unknown key(s) ['canary']")):
+            _run(catalog, client=stub).dispatch(transport=transport, dispatch={"canary": 8})
+        assert stub.events == []
 
 
 # -- StatusPoller unit behavior --------------------------------------------------

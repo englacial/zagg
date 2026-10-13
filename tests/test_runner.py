@@ -77,6 +77,15 @@ class TestRunValidation:
             agg(atl06_config, catalog=catalog_file, store="./local.zarr", backend="lambda")
 
 
+class TestDispatchKnob:
+    def test_a_bad_block_is_refused_on_local_before_the_catalog(self, atl06_config):
+        # Validated on every backend (issue #652, review finding PR #665): the
+        # dispatch error must win over the missing-catalog one.
+        atl06_config.catalog = None
+        with pytest.raises(ValueError, match=re.escape("dispatch.ramp: unknown key(s)")):
+            agg(atl06_config, backend="local", dispatch={"ramp": {"begin": 1}})
+
+
 class TestAggValidatesConfig:
     """``agg`` is the single ``validate_config`` choke point (issue #485).
 
