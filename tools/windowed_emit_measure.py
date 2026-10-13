@@ -76,8 +76,10 @@ _QUANTILES = (0.5, 0.9, 1.0)
 _TIMEOUT = r"timeout|timed out"
 #: The Lambda function ceiling the "fits one invoke per shard" verdict is read against.
 FUNCTION_TIMEOUT_S = 900.0
-#: The stage tier: ``runner._resolve_stage_function_name`` sends every stage
-#: invoke to the run family's ``-8192-disk`` variant (issue #586 interim).
+#: The stage tier the measurement arms' runs went to: the ``-8192-disk``
+#: variant, the issue #586 interim. Issue #659 moved the staged tail to the
+#: leaf tier (``runner.STAGE_SWEEP_WORKER``, 4 GB); stage records carry no
+#: memory figure, so a readout of a run dispatched after it should take 4.0.
 STAGE_TIER_GB = 8.0
 #: The issue's occupancy constants, used only when no leaf ``count/zarr.json``
 #: can be read: 4,096 ``int32`` cells per inner chunk, 256 chunks per shard.

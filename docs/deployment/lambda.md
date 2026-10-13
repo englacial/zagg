@@ -700,16 +700,20 @@ windows serially.
 
 #### Which function the stage invokes go to
 
-The staged tail runs on its **own tier**: the 8,192 MB / 10 GB-`/tmp` variant
-of the run's function family (`process-shard-8192-disk` for the default
-stack), resolved by `runner._resolve_stage_function_name` — the run's
-function with its `-<memory>[-disk]` suffix replaced, or
-`ZAGG_LAMBDA_STAGE_FUNCTION_NAME` verbatim when set. It is the interim ruled
-on issue #586 (2026-09-26): the 0.55 fleet's order-6 stage died at the 4 GB
-cap on 64 unwindowed leaves. The fold is now streamed block by block
-(`zagg.sweep_fold` — a worker holds one block of inputs, not a level), and
-the tier stays until that has been measured on the fleet; stage nodes sit at
-order 6 and coarser, so the larger function is a small share of a run. The
+The staged tail runs on the **leaf tier**: the 4,096 MB / 10 GB-`/tmp`
+variant of the run's function family (`process-shard-4096-disk` for the
+default stack, `runner.STAGE_SWEEP_WORKER`), resolved by
+`runner._resolve_stage_function_name` — the run's function with its
+`-<memory>[-disk]` suffix replaced, or `ZAGG_LAMBDA_STAGE_FUNCTION_NAME`
+verbatim when set. From issue #587 to issue #659 it was the 8,192 MB variant:
+the stopgap ruled on issue #586 (2026-09-26) after the 0.55 fleet's order-6
+stage died at the 4 GB cap on 64 unwindowed leaves, when the fold densified
+a whole level of the node in memory. The fold is now streamed block by block
+(`zagg.sweep_fold` — a worker holds one block of inputs, not a level) and
+the schedule is sized (width 2, issue #639), and the measurement retired the
+stopgap: the 2,093 stage invokes of the 2026-10-12 v4 build peaked at 290 MB
+p99 / 2,926 MB max, none over 4 GB
+([issue #659](https://github.com/englacial/zagg/issues/659)). The
 dispatcher's role must be allowed to invoke that function. Both dispatchers
 resolve it the same way — `python -m zagg` (`runner._run_lambda`) and the
 `zagg.client` facade's tail — from the run's own resolved function name
@@ -818,7 +822,7 @@ from zagg.sweep_fleet import run_stage_sweep_fleet
 
 summary = run_stage_sweep_fleet(
     boto3.client("lambda"),
-    "process-shard-8192-disk",  # the STAGE tier of runner.DEFAULT_FUNCTION_NAME's family
+    "process-shard-4096-disk",  # the STAGE tier of runner.DEFAULT_FUNCTION_NAME's family
     "s3://bucket/prefix.zarr",
     leaves,                    # [(shard_key, window), ...]
     shard_order=6,
