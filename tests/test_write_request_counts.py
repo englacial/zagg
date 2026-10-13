@@ -38,6 +38,7 @@ from zarr.storage import LocalStore
 import zagg
 from zagg import hive
 from zagg.column import column_name
+from zagg.store import open_store
 
 ZAGG_SRC = os.path.dirname(zagg.__file__) + "/"
 
@@ -45,8 +46,10 @@ TEMPLATE = windowed.TEMPLATES[0]
 MANIFEST = Path(__file__).parent / "data" / "write_manifest" / f"{TEMPLATE}.json"
 FROZEN_NOW = "2026-01-01T00:00:00+00:00"
 
-#: Store methods counted, and whether the key names a metadata document.
-METHODS = ("get", "set", "set_if_not_exists", "delete", "delete_dir", "list_dir", "list_prefix")
+#: Store coroutines counted (``get_partial_values`` is counted once per key).
+METHODS = ("get", "exists", "set", "set_if_not_exists", "delete", "delete_dir")
+#: Async-generator listings: wrapped as generators, or zarr's member listing breaks.
+LISTINGS = ("list", "list_dir", "list_prefix")
 #: zarr / pydantic-zarr entry points worth naming in the attribution.
 ZARR_ENTRY = (
     "open_array",
@@ -62,10 +65,10 @@ ZARR_ENTRY = (
 #: phase 1 pins today's writer; later phases lower them (acceptance: metadata
 #: GETs < 10, metadata PUTs one per ``zarr.json``, total <= 250).
 CEILINGS = {
-    "metadata GET": 200,
-    "metadata PUT": 110,
-    "data PUT": 90,
-    "total": 420,
+    "metadata GET": 285,
+    "metadata PUT": 100,
+    "data PUT": 82,
+    "total": 490,
 }
 
 
@@ -105,23 +108,56 @@ class Counter:
                 monkeypatch.setattr(module, "sync", counted_sync)
         for method in METHODS:
             monkeypatch.setattr(LocalStore, method, self._wrap(method))
+        for method in LISTINGS:
+            monkeypatch.setattr(LocalStore, method, self._wrap_listing(method))
+        monkeypatch.setattr(LocalStore, "get_partial_values", self._wrap_partial())
 
     def _wrap(self, method):
         original = getattr(LocalStore, method)
         counter = self
 
-        async def counted(self, key="", *args, **kwargs):
+        async def counted(self, key, *args, **kwargs):
             counter.ops.append((str(self.root), str(key), method, counter.caller))
             return await original(self, key, *args, **kwargs)
 
         return counted
 
+    def _wrap_listing(self, method):
+        original = getattr(LocalStore, method)
+        counter = self
+
+        async def counted(self, *args, **kwargs):
+            prefix = args[0] if args else kwargs.get("prefix", "")
+            counter.ops.append((str(self.root), str(prefix), method, counter.caller))
+            async for item in original(self, *args, **kwargs):
+                yield item
+
+        return counted
+
+    def _wrap_partial(self):
+        original = LocalStore.get_partial_values
+        counter = self
+
+        async def counted(self, prototype, key_ranges):
+            key_ranges = list(key_ranges)
+            for key, _byte_range in key_ranges:
+                counter.ops.append((str(self.root), str(key), "get", counter.caller))
+            return await original(self, prototype, key_ranges)
+
+        return counted
+
 
 def _kind(key: str, method: str) -> str:
-    if method in ("delete_dir", "list_dir", "list_prefix"):
+    if method in ("delete_dir", *LISTINGS):
         return method
     doc = "metadata" if key.endswith("zarr.json") else "data"
-    verb = {"get": "GET", "set": "PUT", "set_if_not_exists": "PUT", "delete": "DELETE"}[method]
+    verb = {
+        "get": "GET",
+        "exists": "HEAD",
+        "set": "PUT",
+        "set_if_not_exists": "PUT",
+        "delete": "DELETE",
+    }[method]
     return f"{doc} {verb}"
 
 
@@ -233,6 +269,28 @@ def test_every_unit_lands_its_objects(counted_build):
         assert os.path.isdir(leaf) and os.path.isdir(column), unit
         totals = _totals(buckets[unit])
         assert totals["metadata PUT"] > 0 and totals["data PUT"] > 0, (unit, totals)
+
+
+def test_counting_store_keeps_the_content_hashes(counted_build):
+    """The counting wrappers do not break the O11 hasher: every stamp carries its record."""
+    _root, prefixes, _buckets, _other = counted_build
+    for unit, (leaf, column) in prefixes.items():
+        data_path, _pointer = hive.resolve_leaf(leaf)
+        for path in (data_path, column):
+            stamp = hive.read_commit(open_store(path, read_only=True))
+            arrays = (stamp.get("content_hashes") or {}).get("arrays", {})
+            assert arrays and set(arrays) == _array_paths(path), (unit, path, sorted(arrays))
+
+
+def _array_paths(path: str) -> set[str]:
+    """Every array under a group root, as paths relative to it."""
+    out = set()
+    for dirpath, _dirs, files in os.walk(path):
+        if "zarr.json" in files:
+            doc = json.loads((Path(dirpath) / "zarr.json").read_text())
+            if doc.get("node_type") == "array":
+                out.add(os.path.relpath(dirpath, path))
+    return out
 
 
 def test_store_bytes_match_the_manifest(counted_build):
