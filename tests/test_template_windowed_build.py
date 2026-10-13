@@ -315,13 +315,22 @@ def test_a_refused_leaf_write_ends_the_unit_at_that_window(
         metas[int(shard_key)] = meta = real_seam(shard_key, *args, **kwargs)
         return meta
 
+    # ``sinks()`` is the argument to ``aggregate``: one call per aggregated window.
+    aggregated, real_sinks = [], hive._LeafUnit.sinks
+
+    def _sinks(self):
+        aggregated.append((int(self.shard_key), self.label))
+        return real_sinks(self)
+
     monkeypatch.setattr(store_mod, "open_store", _open)
     monkeypatch.setattr(hive, "process_and_write_hive", _seam)
+    monkeypatch.setattr(hive._LeafUnit, "sinks", _sinks)
     _cfg, built, shards = _build(monkeypatch, tmp_path, name)
     assert str(built) == root and shards[0] == shard0 and state["raised"]
 
     meta, other = metas[shard0], metas[shards[1]]
     assert [m["window"] for m in meta["windows"]] == emitted
+    assert [w for s, w in aggregated if s == shard0] == emitted
     assert meta["error_class"] == meta["windows"][1]["error_class"] == error_class
     assert message in meta["windows"][1]["error"]
     assert other["error"] is None and [m["window"] for m in other["windows"]] == list(WINDOWS)
