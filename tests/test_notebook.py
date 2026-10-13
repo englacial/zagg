@@ -230,6 +230,8 @@ class TestMaxCostPreview:
         )
         preview = notebook.max_cost_preview(cfg, SHARDMAP)
         assert preview["n_units"] == 4
+        # Flat raster tail: ping + raster setup + run stats.
+        assert preview["legs"]["tail"]["invokes"] == 3
 
     def test_windowed_raster_uses_raster_units(self, monkeypatch):
         # A windowed hive raster mirrors RasterStrategy.run: the (shard, window)
@@ -257,6 +259,11 @@ class TestMaxCostPreview:
         )
         preview = notebook.max_cost_preview(cfg, SHARDMAP)
         assert preview["n_units"] == 7
+        # Hive raster tail: ping + setup + finalize + run stats + coverage.moc;
+        # no Icechunk and no staged sweep on the raster path.
+        assert preview["legs"]["tail"]["invokes"] == 5
+        cfg.output["coverage_moc"] = False
+        assert notebook.max_cost_preview(cfg, SHARDMAP)["legs"]["tail"]["invokes"] == 4
 
     def test_unvalidated_flat_windowed_raster_counts_selected_cells(self):
         # The raster arm's non-hive branch (issue #648 fold): windowing is
@@ -452,8 +459,9 @@ class TestCostLegs:
         assert stage["memory_gb"] == runner.STAGE_SWEEP_WORKER["memory"] / 1024.0 == 4.0
         # The rollup families ride the node closes, so no separate pass.
         assert preview["legs"]["families"]["invokes"] == 0
-        # ping + setup + finalize + run stats + icechunk init/finalize + stage finisher.
-        assert preview["legs"]["tail"]["invokes"] == 7
+        # ping + setup + finalize backstop + run stats + coverage.moc (on by
+        # default for hive) + icechunk init/finalize + stage finisher.
+        assert preview["legs"]["tail"]["invokes"] == 8
 
     def test_unwindowed_stage_invokes_are_one_per_node(self, tmp_path):
         cfg = default_config("atl03_tdigest_strata_healpix")
@@ -521,7 +529,10 @@ class TestCostLegs:
         preview = notebook.max_cost_preview(cfg, SHARDMAP)
         assert preview["legs"]["stage"]["invokes"] == 0
         assert preview["legs"]["families"]["invokes"] == 0
-        assert preview["legs"]["tail"]["invokes"] == 4
+        # No ping on flat: sync setup + run stats; finalize only to consolidate.
+        assert preview["legs"]["tail"]["invokes"] == 2
+        cfg.output["consolidate_metadata"] = True
+        assert notebook.max_cost_preview(cfg, SHARDMAP)["legs"]["tail"]["invokes"] == 3
 
     def test_families_mode_fires_the_separate_pass(self, tmp_path):
         cfg = default_config("atl03_tdigest_strata_healpix")

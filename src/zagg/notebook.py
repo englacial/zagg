@@ -25,6 +25,8 @@ import logging
 from zagg.config import (
     PipelineConfig,
     chains_stages,
+    get_consolidate_metadata,
+    get_coverage_moc,
     get_icechunk,
     get_parent_order,
     get_pipeline_type,
@@ -166,11 +168,18 @@ def max_cost_preview(
       pass is the finisher), else one per NON-EMPTY bucket of
       :func:`zagg.sweep_partition.partition_leaves` plus the finisher -- what
       :func:`zagg.sweep_fleet.run_families_sweep_fleet` fires.
-    - ``tail`` -- the fixed invokes: ping, setup, finalize backstop and the
-      run-stats record, the Icechunk init and finalize when the companion
-      repo is on, and the stage finisher when the sweep is staged. An upper
-      count: the finalize backstop is skipped when the init-time manifest
-      write landed.
+    - ``tail`` -- the fixed invokes, per layout and path under the tails' own
+      gates. Hive aggregation (:func:`zagg.runner._run_lambda`): ping, async
+      setup, finalize backstop, run stats, the root ``coverage.moc`` write
+      (``get_coverage_moc``), the Icechunk init and finalize
+      (``get_icechunk``) and the stage finisher (staged sweep). Flat
+      aggregation: sync setup, run stats, and finalize only under
+      ``get_consolidate_metadata``. Hive raster (``RasterStrategy.run``):
+      ping, async setup, finalize, run stats and the coverage write. Flat
+      raster: ping, raster setup, run stats. An upper count, and on a run
+      whose leaves land the only counted invoke that may not fire is the
+      hive aggregation finalize backstop, skipped when the init-time
+      manifest write landed.
 
     ``ceiling_usd`` prices every invoke to the wall and ``expected_usd`` at
     its leg's typical duration (:data:`TYPICAL_S`, overridden per leg by
@@ -225,7 +234,12 @@ def max_cost_preview(
     if sweeps and leaves and not rides:
         n = families_partitions(leaves)
         n_families = 1 if n == 1 else len(partition_leaves(leaves, n)) + 1
-    n_tail = 4 + (2 if get_icechunk(config) else 0) + (1 if n_stage else 0)
+    if get_store_layout(config) != "hive":
+        n_tail = 3 if raster else 2 + int(get_consolidate_metadata(config))
+    else:
+        n_tail = 4 + int(get_coverage_moc(config))
+        if not raster:
+            n_tail += (2 if get_icechunk(config) else 0) + (1 if n_stage else 0)
     legs = {
         "leaves": _leg(len(cells), memory_gb, timeout_s, typical["leaves"]),
         "stage": _leg(
