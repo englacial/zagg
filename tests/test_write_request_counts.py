@@ -312,6 +312,7 @@ def test_store_bytes_match_the_manifest(counted_build):
     if os.environ.get("ZAGG_WRITE_MANIFEST_REGEN"):
         MANIFEST.parent.mkdir(parents=True, exist_ok=True)
         MANIFEST.write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
+        pytest.fail("manifest regenerated; re-run without ZAGG_WRITE_MANIFEST_REGEN")
     pinned = json.loads(MANIFEST.read_text())
     missing = sorted(set(pinned) - set(manifest))
     extra = sorted(set(manifest) - set(pinned))
