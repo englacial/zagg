@@ -413,6 +413,33 @@ class TestEventDispatch:
         assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
         assert handle.families_sweep is None and handle.stage_sweep is None
 
+    def test_each_dispatch_tail_reads_its_own_guard(self, catalog, monkeypatch):
+        # Two dispatches on one Run: A trips, B (clean) is dispatched before
+        # A's tail runs. The guard rides each handle, so B's cannot stand in
+        # for A's (review finding, PR #665). One fresh status store per run id.
+        monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
+        fresh = [MemoryStore(), MemoryStore()]
+        by_prefix: dict = {}
+        monkeypatch.setattr(
+            ct, "open_status_store", lambda p, kw: by_prefix.setdefault(p, fresh[len(by_prefix)])
+        )
+        gate = threading.Event()
+        tail = Run._run_tail
+        monkeypatch.setattr(Run, "_run_tail", lambda *a, **k: gate.wait(10) and tail(*a, **k))
+        stub_a = DropNthStub(fresh[0], drop_nth=2, record=True)
+        run = _run(catalog, client=stub_a, max_retries=1)
+        a = run.dispatch(transport="event", dispatch=_TRIP_KNOBS)
+        run._lambda_client = stub_b = EventStubLambdaClient(fresh[1], record=True)
+        b = run.dispatch(transport="event")
+        gate.set()
+        a.wait()
+        b.wait()
+        assert a.breaker["rule"] == "timeout-ratio" and a.breaker["tripped"]
+        assert a.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
+        assert b.breaker is None and b.status() == {"pending": 0, "ok": 3, "failed": 0}
+        assert "icechunk_finalize" not in stub_a.modes()
+        assert "icechunk_finalize" in stub_b.modes()
+
     def test_handle_carries_the_ramp_without_a_trip(self, catalog, status_store):
         handle = _run(catalog, client=EventStubLambdaClient(status_store)).dispatch(
             transport="event", max_workers=2

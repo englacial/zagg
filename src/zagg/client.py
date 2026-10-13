@@ -236,6 +236,9 @@ class RunHandle:
         #: sync transport and on a reattached handle (neither has a guard).
         self.ramp: list[dict] = []
         self.breaker: dict | None = None
+        # This dispatch's guard (issue #652), bound here rather than on the
+        # ``Run`` so a later dispatch cannot swap it out from under this tail.
+        self._guard: Any = None
 
     def __len__(self) -> int:
         return len(self.futures)
@@ -483,7 +486,8 @@ class Run:
         #: tail finalizes the repo off the config's knob instead (issue #582).
         self._attached = False
         #: The Event transport's ramp + breaker (issue #652): built per
-        #: dispatch from the ``dispatch`` knobs, consulted by the tail.
+        #: dispatch from the ``dispatch`` knobs; ``dispatch`` moves it onto
+        #: the handle, whose tail reads it (never this slot).
         self._guard: Any = None
         self._guard_config = GuardConfig()
         runner._check_signature(self.grid, catalog_data)
@@ -1000,7 +1004,7 @@ class Run:
             manifest_sent = "full"  # the synchronous setup has no size gate
 
         aoi_by_shard = runner._aoi_payload_map(self.catalog_data)
-        result_prefix = None
+        result_prefix = guard = None
         if transport == "event":
             from zagg.client_transport import run_status_prefix
 
@@ -1018,6 +1022,7 @@ class Run:
                 aoi_by_shard=aoi_by_shard,
                 invoked_by=invoked_by,
             )
+            guard = self._guard  # built synchronously by the poller hand-off above
         else:
             pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="zagg-client")
             futures = {}
@@ -1039,6 +1044,7 @@ class Run:
 
         handle = RunHandle(futures, store_path=self.store, memory_gb=memory_gb)
         handle.dispatch_manifest = manifest_sent
+        handle._guard = guard
         finisher = threading.Thread(
             target=self._post_run,
             args=(handle, client, closer, config_dict, dataset, output_creds_event, run_id),
@@ -1312,9 +1318,10 @@ class Run:
         # The breaker's verdict (issue #652), as on ``runner._run_lambda``: a
         # trip skips the families pass, the staged sweep and the Icechunk
         # finalize; the run record and the root coverage still land.
-        trip = self._guard.tripped if self._guard is not None else None
-        if self._guard is not None:
-            handle.ramp, handle.breaker = self._guard.ramp, self._guard.breaker
+        guard = handle._guard
+        trip = guard.tripped if guard is not None else None
+        if guard is not None:
+            handle.ramp, handle.breaker = guard.ramp, guard.breaker
         # ONE warn/retry/record implementation for every dispatch path (issue
         # #335 phase 1): agg's _run_lambda, the raster driver and this finisher
         # all route through runner._finalize_with_retry, so the message contract
