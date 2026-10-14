@@ -61,14 +61,21 @@ multiplied trips the per-shard assertion.
 (:func:`zagg.icechunk_refs.repo_path`, which :func:`zagg.config.get_icechunk`
 defaults ON for every NON-RASTER hive store since issue #580) holds a
 DERIVED index — ``repo``, ``refs/...``, ``snapshots/<id>``,
-``manifests/<id>``, ``transactions/<id>``, ``overwritten/...`` — whose object
-count scales with the number of COMMITS (the leaf refs plus one per ladder
-commit), never with the leaf write path this model predicts. Its keys ride the
-``objects_icechunk`` bucket on the same D9 posture as the rollup / overview /
-telemetry buckets: counted, reported, netted out. What stays asserted is the
-repo's PRESENCE (:func:`object_count_mismatch`), so an init that fails open —
-the issue #606 class, invisible on S3 until ``d23d7788`` — is still a finding
-rather than a silently empty bucket.
+``manifests/<id>``, ``transactions/<id>``, ``overwritten/...`` — written one
+commit per populated leaf under the default ``commit: "leaf"``, which is what
+every benchmark arm runs today: ``zagg.icechunk_refs.ladder_walks`` keys off
+an explicit ``output.sweep: "stages"`` that no config under
+``tests/data/benchmark/configs/`` sets, so ``resolve_options`` resolves
+``commit: "leaf"`` and not ``"ladder"``. The bucket is therefore
+SHARD-SCALED here, the same dimension the write path scales on — what keeps
+it out of a window is not an orthogonal cadence but the object count PER
+COMMIT (a snapshot, N manifests, a transaction log, plus whatever compaction
+does), which is Icechunk's business and not deterministically modelable. Its
+keys ride the ``objects_icechunk`` bucket on the same D9 posture as the
+rollup / overview / telemetry buckets: counted, reported, netted out. What
+stays asserted is the repo's PRESENCE (:func:`object_count_mismatch`), so an
+init that fails open — the issue #606 class, invisible on S3 until
+``d23d7788`` — is still a finding rather than a silently empty bucket.
 
 **The hive model assumes the UNWINDOWED leaf** (review finding), as the flat
 model assumes fullsphere HEALPix (:func:`_require_fullsphere`). One populated
@@ -770,8 +777,10 @@ def write_path_total(measured: dict) -> int:
     * per-run root telemetry (issue #362) — additionally unbounded, since its
       names are per-run unique, so a reused store accumulates it and no fixed
       expectation could ever hold;
-    * the §11 Icechunk companion repo (issue #668) — a derived index whose
-      count scales with the run's commits, not with the write path.
+    * the §11 Icechunk companion repo (issue #668) — a derived index written
+      one commit per populated leaf under the operative ``commit: "leaf"``
+      (so shard-scaled, as the write path is), whose PER-COMMIT object count
+      is Icechunk's own and not deterministically modelable.
 
     This is the number :func:`object_count_mismatch` audits and the one
     ``objects_expected`` is comparable to; ``objects_total`` stays gross
