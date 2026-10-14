@@ -382,6 +382,11 @@ def test_the_stage_tier_is_the_dispatchers_own(arms, monkeypatch):
     # derived, not a copy: the readout follows the library's routing
     monkeypatch.setitem(STAGE_SWEEP_WORKER, "memory", 2048)
     assert tool.stage_tier_gb() == 2.0
+    # and the PRICE follows, not just the helper: the tier is read at call
+    # time, never frozen at import (a module-level ``_TIER = stage_tier_gb()``
+    # would keep the assertion above green while going stale here)
+    again = tool.measure(win["store"], store_kwargs={}, accuracy=False)
+    assert again["stage_runs"]["latest"]["gb_seconds"] == 51.0 * 2.0
 
 
 def test_prints_one_column_per_arm(arms, capsys):
