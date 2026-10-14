@@ -21,9 +21,11 @@ proves nothing: a refused write is caught and logged per window (``hive``'s
 ``_emit``) or per column (the leaf-column ``except Exception``), and
 ``runner.agg`` returns normally. The proof is the refuser recording no
 chunk-key delete (``attempted`` empty), ``pyramid_check`` and the per-year
-counts showing every leaf landed, and a key-for-key match against a
-guard-off permissive build, since a skipped block and a deleted one both
-leave no object.
+counts showing every leaf landed. The key-for-key match against a guard-off
+build lives in ``test_template_windowed_twin`` and the refused-write cases
+(issue #651) in ``test_template_windowed_refused``: each module carries its
+own builds so ``pytest --dist loadfile`` runs them on separate workers
+(issue #669).
 """
 
 from __future__ import annotations
@@ -211,10 +213,6 @@ class _Built(NamedTuple):
     attempted: list
     #: the deletes it allowed (prefix clears, sidecars)
     deletes: list
-    #: the same build with the guard off through a permissive store (zarr's
-    #: own delete-on-all-fill, as before #653), for the key-set match; None
-    #: for the single-digest template, which has no all-fill slab to compare
-    permissive: object
 
 
 @pytest.fixture(scope="module", params=TEMPLATES)
@@ -224,19 +222,7 @@ def built(request, tmp_path_factory):
     with pytest.MonkeyPatch.context() as monkeypatch:
         cfg, root, shards = _build(monkeypatch, tmp_path, request.param, refuse_chunk_deletes=True)
     attempted, deletes = _NoChunkDeletes.attempted, _NoChunkDeletes.deletes
-    permissive = None
-    if request.param == TEMPLATES[0]:
-        with pytest.MonkeyPatch.context() as monkeypatch:
-            # The pre-#653 writers: the guard off, so every all-fill slab goes
-            # to zarr, which deletes its key. Every call site looks ``all_fill``
-            # up on this module at call time, so one patch reaches them all.
-            import zagg.processing.write
-
-            monkeypatch.setattr(zagg.processing.write, "all_fill", lambda array, values: False)
-            _, permissive, _ = _build(
-                monkeypatch, tmp_path_factory.mktemp("permissive-store"), request.param
-            )
-    return _Built(request.param, cfg, root, shards, attempted, deletes, permissive)
+    return _Built(request.param, cfg, root, shards, attempted, deletes)
 
 
 def test_every_window_has_its_leaf_and_the_all_row_is_allocated(built):
@@ -427,116 +413,3 @@ def test_the_stub_windows_fill_slab_has_no_object(built):
 
         arr = zarr.open_array(_store(leaf["2021"]), path=f"{base}/h_tdigest_signal", mode="r")
         assert all(v == b"" for v in np.asarray(arr[:]).flat)
-
-
-def test_skipped_blocks_leave_no_object_either_way(built):
-    """A skipped all-fill block and zarr's delete of it both leave no key — and
-    the guard never skipped a block zarr would have written.
-
-    The twin runs with ``all_fill`` patched to ``False``, so it is zarr's own
-    pre-#653 behaviour (delete-on-all-fill); key-set equality therefore means
-    the guard skipped exactly the blocks zarr would have deleted, no more.
-    Strata template only: the single-digest one has nothing to skip, so its
-    twin would match by construction and is not built.
-    """
-    if built.permissive is None:
-        pytest.skip(_NO_FILL_SLAB)
-    assert _objects(built.root) == _objects(built.permissive)
-
-
-# ── a leaf write the store refuses (issue #651) ──────────────────────────────
-
-
-class _RefusingStore(WrapperStore):
-    """The leaf store, raising ``error`` on its first chunk PUT."""
-
-    def __init__(self, store, error, state):
-        super().__init__(store)
-        self._error, self._state = error, state
-
-    async def set(self, key, value):
-        if "/c/" in key and not self._state.get("raised"):
-            self._state["raised"] = True
-            raise self._error
-        await super().set(key, value)
-
-
-#: The two shapes the classifier tells apart: object_store could not parse the
-#: body (the post-mortem's class; no status to key on), and a 5xx the client
-#: already retried for the full policy.
-_FATAL = "Generic S3 error: Got invalid DeleteObjects response: EOF while parsing"
-_RETRIED = (
-    "Error after 12 retries in 180s, max_retries:12, retry_timeout:180s, "
-    "source:HTTP status server error (503 Service Unavailable) for url"
-)
-
-
-@pytest.mark.parametrize(
-    ("message", "store_error_class", "emitted"),
-    [(_FATAL, "store-fatal", ["2018", "2019"]), (_RETRIED, "transient", list(WINDOWS))],
-    ids=["store-fatal", "transient"],
-)
-def test_a_refused_leaf_write_ends_the_unit_at_that_window(
-    monkeypatch, tmp_path, message, store_error_class, emitted
-):
-    """A fatal-shaped error on the first chunk PUT of the second window ends the
-    unit there: no later window is aggregated or opened, the earlier window
-    keeps its stamp, the failed one is unstamped debris, and the result names
-    the class. The retried shape keeps the per-window isolation (issue #586):
-    the window fails alone and the rest of the shard lands.
-    """
-    import zagg.store as store_mod
-
-    name = TEMPLATES[0]
-    shard0 = _shard(SITES[0], int(default_config(name).output["grid"]["parent_order"]))
-    root = str(tmp_path / name)
-    leaf = {w: hive.shard_leaf_path(root, shard0, window=w) for w in WINDOWS}
-    real_open, opens, state = store_mod.open_store, [], {}
-
-    def _open(path, *args, **kwargs):
-        opens.append(str(path))
-        store = real_open(path, *args, **kwargs)
-        if str(path).startswith(leaf["2019"]) and not kwargs.get("read_only"):
-            return _RefusingStore(store, GenericError(message), state)
-        return store
-
-    metas, real_seam = {}, hive.process_and_write_hive
-
-    def _seam(shard_key, *args, **kwargs):
-        metas[int(shard_key)] = meta = real_seam(shard_key, *args, **kwargs)
-        return meta
-
-    # ``sinks()`` is the argument to ``aggregate``: one call per aggregated window.
-    aggregated, real_sinks = [], hive._LeafUnit.sinks
-
-    def _sinks(self):
-        aggregated.append((int(self.shard_key), self.label))
-        return real_sinks(self)
-
-    monkeypatch.setattr(store_mod, "open_store", _open)
-    monkeypatch.setattr(hive, "process_and_write_hive", _seam)
-    monkeypatch.setattr(hive._LeafUnit, "sinks", _sinks)
-    _cfg, built, shards = _build(monkeypatch, tmp_path, name)
-    assert str(built) == root and shards[0] == shard0 and state["raised"]
-
-    meta, other = metas[shard0], metas[shards[1]]
-    assert [m["window"] for m in meta["windows"]] == emitted
-    assert [w for s, w in aggregated if s == shard0] == emitted
-    assert meta["store_error_class"] == meta["windows"][1]["store_error_class"] == store_error_class
-    assert message in meta["windows"][1]["error"]
-    assert other["error"] is None and [m["window"] for m in other["windows"]] == list(WINDOWS)
-    # The window before the failure keeps its stamp; the failed one is debris.
-    assert hive.resolve_leaf(leaf["2018"])[1] is not None
-    assert hive.resolve_leaf(leaf["2019"])[1] is None
-    later = [w for w in WINDOWS if w > "2019"]  # 2020 and the #653 stub window 2021
-    if store_error_class == "store-fatal":
-        # The bound: the unit returned after the failing window -- the windows
-        # after it were never aggregated, never opened, never written.
-        assert meta["windows_unattempted"] == later
-        for w in later:
-            assert not any(o.startswith(leaf[w]) for o in opens)
-            assert not Path(leaf[w]).exists()
-    else:
-        assert "windows_unattempted" not in meta
-        for w in later:
-            assert hive.resolve_leaf(leaf[w])[1] is not None
