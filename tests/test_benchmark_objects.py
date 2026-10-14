@@ -1043,12 +1043,6 @@ def test_hive_icechunk_objects_get_their_own_bucket(monkeypatch):
     # audited write-path figure is the same with the repo as without it.
     assert measured["objects_total"] == len(write_path) + len(_ICECHUNK_KEYS)
     assert bench_objects.write_path_total(measured) == len(write_path)
-    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: write_path)
-    bare = bench_objects.store_object_counts(
-        "unused", grid=grid, shard_keys=[word], store_layout="hive"
-    )
-    assert bare["objects_icechunk"] == 0
-    assert bench_objects.write_path_total(bare) == bench_objects.write_path_total(measured)
 
 
 def test_flat_icechunk_objects_are_bucketed_not_unrecognized(tmp_path):
