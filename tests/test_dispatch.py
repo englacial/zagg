@@ -387,3 +387,113 @@ class TestDispatchLoop:
         assert report.total_obs == 10
         assert report.cost == CellCost()
         ex.shutdown()
+
+
+class TestDispatchCircuitBreaker:
+    """``dispatch(guard=...)`` (issue #652 phase 6): the seam the async / sync
+    transports and the temporal fan-out share. Results are recorded on the
+    pool thread that ran the unit (``gate``), before it takes the next; a unit
+    whose pool slot opens after a trip is refused without running. Width-1
+    pools make the trip point deterministic."""
+
+    @staticmethod
+    def _accumulate(report, i, result):
+        report.results.append(result)
+
+    @staticmethod
+    def _guard(**knobs):
+        from zagg.dispatch_guard import DispatchGuard, GuardConfig
+
+        return DispatchGuard(GuardConfig.from_dict({"breaker": knobs} if knobs else None))
+
+    def _run(self, work, payloads, guard):
+        calls: list = []
+
+        def counted(p):
+            calls.append(p)
+            return work(p)
+
+        ex = LambdaExecutor(
+            counted,
+            preflight_fn=lambda n: PreflightReport(workers=1),
+            pool_factory=ThreadPoolExecutor,
+            finalize_fn=lambda: None,
+        )
+        ex.preflight(len(payloads))
+        refuse = None if guard is None else (lambda p: guard.refused(shard_key=p))
+        report = dispatch(
+            ex,
+            payloads,
+            retry=LAMBDA_RETRY,
+            accumulate=self._accumulate,
+            guard=guard,
+            refuse=refuse,
+        )
+        ex.shutdown()
+        return calls, report
+
+    def test_a_healthy_run_is_unchanged_by_the_guard(self):
+        def ok(p):
+            return {"shard_key": p, "status_code": 200, "error": None, "lambda_duration": 1.0}
+
+        bare_calls, bare = self._run(ok, [1, 2, 3, 4], None)
+        guard = self._guard()
+        calls, guarded = self._run(ok, [1, 2, 3, 4], guard)
+        assert calls == bare_calls == [1, 2, 3, 4]  # same invokes, same order
+        assert guarded.results == bare.results and guarded.cost == bare.cost
+        assert guard.tripped is None and len(guard._records) == 4
+
+    def test_early_timeouts_stop_invoking_the_rest(self):
+        def timed_out(p):
+            return {
+                "shard_key": p,
+                "status_code": None,
+                "error": "Lambda error: Task timed out after 900.00 seconds",
+                "timeout": True,
+                "lambda_duration": 900.0,
+            }
+
+        guard = self._guard(window=1, timeout_ratio=0.5)
+        calls, report = self._run(timed_out, [1, 2, 3, 4, 5], guard)
+        assert calls == [1]  # the rest were refused as their slot opened
+        assert guard.tripped["rule"] == "timeout-ratio" and guard.tripped["at_result"] == 1
+        outcomes = [r.get("outcome") for r in report.results]
+        assert outcomes == [
+            None,
+            "not-dispatched",
+            "not-dispatched",
+            "not-dispatched",
+            "not-dispatched",
+        ]
+        refused = report.results[1]
+        assert refused["shard_key"] == 2 and refused["retries"] == -1
+        assert refused["lambda_duration"] == 0 and refused["status_code"] is None
+
+    def test_an_async_deadline_miss_counts_as_a_timeout(self):
+        # The #151 result-object channel's miss carries no ``timeout`` flag:
+        # its error prefix is the async twin of the Event drop (issue #652).
+        from zagg.dispatch_guard import NO_RESULT_PREFIX
+
+        def missed(p):
+            return {"shard_key": p, "error": f"{NO_RESULT_PREFIX} 990s (worker timed out)"}
+
+        guard = self._guard(window=1, timeout_ratio=0.5)
+        calls, _ = self._run(missed, [1, 2, 3], guard)
+        assert calls == [1] and guard.tripped["rule"] == "timeout-ratio"
+
+    def test_early_store_fatal_results_stop_invoking_the_rest(self):
+        # The ruled default: 3 store-fatal among the first 20.
+        def refused_write(p):
+            return {
+                "shard_key": p,
+                "status_code": 500,
+                "body": {"store_error_class": "store-fatal"},
+                "error": "window 2018 failed: HTTP status client error (403 Forbidden)",
+                "lambda_duration": 5.0,
+            }
+
+        guard = self._guard()
+        calls, report = self._run(refused_write, list(range(1, 9)), guard)
+        assert calls == [1, 2, 3]
+        assert guard.tripped["rule"] == "store-fatal" and guard.tripped["at_result"] == 3
+        assert [r.get("outcome") for r in report.results].count("not-dispatched") == 5

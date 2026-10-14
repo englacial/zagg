@@ -37,6 +37,7 @@ from zagg.config import (
     validate_config,
 )
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
+from zagg.dispatch_guard import describe
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +466,11 @@ class RunView:
             out.append(f"<tr><td>{label}</td><td>{shown}</td></tr>")
         out.append("</table>")
 
+        # What watched the fan-out and any breaker trip (issue #652); the
+        # pacing line says why when no guard ran.
+        for line in describe(s.get("breaker"), s.get("dispatch_pacing")):
+            out.append(f"<p>{esc(line)}</p>")
+
         failures = self._failures()
         if failures:
             out.append(f"<h4>failures ({len(failures)})</h4>")
@@ -493,7 +499,9 @@ class RunView:
 def run(config: PipelineConfig, **kwargs) -> RunView:
     """Invoke :func:`zagg.runner.agg` with a progress bar; return a :class:`RunView`.
 
-    Accepts every ``agg`` keyword unchanged. On ``backend="lambda"`` the
+    Accepts every ``agg`` keyword unchanged -- ``dispatch=`` (the issue #652
+    breaker block) included; the returned view renders the pacing line and
+    any breaker trip. On ``backend="lambda"`` the
     pre-invoke cost ceiling is *displayed* first (informational only -- this
     path never prompts, per issue #298; the blocking gate is CLI-only). The
     bar total is the previewed unit count for catalog runs and ``len(events)``

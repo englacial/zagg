@@ -685,6 +685,20 @@ class TestRunView:
         assert "no metered cost" in html_out
         assert "$" not in html_out
 
+    def test_repr_html_shows_a_breaker_trip(self):
+        summary = dict(
+            _lambda_summary(),
+            breaker={"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000},
+        )
+        html_out = notebook.RunView(summary)._repr_html_()
+        unpaced = dict(_lambda_summary(), dispatch_pacing="pool width (invocation='async'): why")
+        assert "Dispatch pacing: pool width (invocation=&#x27;async&#x27;)" in (
+            notebook.RunView(unpaced)._repr_html_()
+        )
+        assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio" in html_out
+        # Neither key (an older summary): nothing is rendered.
+        assert "Circuit breaker" not in notebook.RunView(_lambda_summary())._repr_html_()
+
     def test_dict_access_delegates(self):
         view = notebook.RunView(_lambda_summary())
         assert view["backend"] == "lambda"
@@ -692,7 +706,102 @@ class TestRunView:
         assert "with_data=2" in repr(view)
 
 
+class TestCliDispatchFlag:
+    """``--dispatch group.key=value`` (issue #652) reaches ``agg(dispatch=...)``
+    as the nested block, and a bad knob is refused before the cost gate."""
+
+    def _drive(self, monkeypatch, argv, summary=None):
+        import zagg.__main__ as cli
+
+        seen: dict = {}
+
+        def _fake_agg(config, **kwargs):
+            seen.update(kwargs)
+            return summary if summary is not None else _lambda_summary()
+
+        cfg = default_config("atl06")
+        cfg.catalog = SHARDMAP
+        monkeypatch.setattr(cli, "agg", _fake_agg)
+        monkeypatch.setattr(cli, "load_config", lambda path: cfg)
+        monkeypatch.setattr("sys.argv", argv)
+        return cli, seen
+
+    def test_repeated_flags_build_the_block(self, monkeypatch, capsys):
+        cli, seen = self._drive(
+            monkeypatch,
+            [
+                "zagg",
+                "--config",
+                "c.yaml",
+                "--dispatch",
+                "breaker.window=20",
+                "--dispatch",
+                "breaker.timeout_ratio=0.3",
+            ],
+        )
+        cli.main()
+        assert seen["dispatch"] == {"breaker": {"window": 20, "timeout_ratio": 0.3}}
+
+    def test_no_flag_passes_none(self, monkeypatch, capsys):
+        cli, seen = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"])
+        cli.main()
+        assert seen["dispatch"] is None
+        assert seen["invocation"] == "async"  # the default is unchanged
+
+    def test_invocation_event_carries_the_knobs_to_the_poller_path(self, monkeypatch, capsys):
+        # The only path the breaker acts on (PR #665 review): the CLI can
+        # now select it, and both kwargs reach agg together.
+        argv = ["zagg", "--config", "c.yaml", "--invocation", "event", "--dispatch"]
+        cli, seen = self._drive(monkeypatch, [*argv, "breaker.window=20"])
+        cli.main()
+        assert seen["invocation"] == "event"
+        assert seen["dispatch"] == {"breaker": {"window": 20}}
+
+    @pytest.mark.parametrize(
+        "flag", ["ramp.start=250", "breaker.store_fatal=30", "canary.size=8", "breaker.window"]
+    )
+    def test_a_bad_knob_is_refused_before_agg(self, monkeypatch, capsys, flag):
+        cli, seen = self._drive(monkeypatch, ["zagg", "--config", "c.yaml", "--dispatch", flag])
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+        assert exc_info.value.code == 2 and seen == {}  # argparse's usage error, no agg
+
+    def test_the_pacing_and_trip_lines_print(self, monkeypatch, capsys):
+        from zagg.dispatch_guard import guard_pacing
+
+        pacing = guard_pacing("invocation='async'")
+        summary = dict(
+            _lambda_summary(),
+            dispatch_pacing=pacing,
+            breaker={"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000},
+        )
+        cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=summary)
+        cli.main()
+        out = capsys.readouterr().out
+        assert f"Dispatch pacing: {pacing}" in out
+        assert "Dispatch ramp" not in out
+        assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio at result 137" in out
+        # A clean run still names the seam that watched it.
+        clean = dict(_lambda_summary(), dispatch_pacing=pacing, breaker=None)
+        cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=clean)
+        cli.main()
+        out = capsys.readouterr().out
+        assert f"Dispatch pacing: {pacing}" in out and "Circuit breaker" not in out
+
+
 class TestRunWrapper:
+    def test_dispatch_knobs_reach_agg(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_agg(config, **kwargs):
+            seen.update(kwargs)
+            return _lambda_summary()
+
+        monkeypatch.setattr("zagg.runner.agg", fake_agg)
+        knobs = {"breaker": {"window": 20}}
+        notebook.run(default_config("atl06"), catalog=SHARDMAP, backend="local", dispatch=knobs)
+        assert seen["dispatch"] == knobs  # one mechanism: the facade forwards the block
+
     def test_drives_progress_from_agg_callback(self, monkeypatch):
         recorded = []
 

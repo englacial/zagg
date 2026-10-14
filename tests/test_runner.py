@@ -77,6 +77,48 @@ class TestRunValidation:
             agg(atl06_config, catalog=catalog_file, store="./local.zarr", backend="lambda")
 
 
+class TestDispatchKnob:
+    def test_a_bad_block_is_refused_on_local_before_the_catalog(self, atl06_config):
+        # Validated on every backend (issue #652, review finding PR #665): the
+        # dispatch error must win over the missing-catalog one.
+        atl06_config.catalog = None
+        with pytest.raises(ValueError, match=re.escape("dispatch.breaker: unknown key(s)")):
+            agg(atl06_config, backend="local", dispatch={"breaker": {"begin": 1}})
+
+    @pytest.mark.parametrize(
+        ("backend", "invocation", "warns"),
+        [("local", "async", True), ("lambda", "async", False), ("lambda", "event", False)],
+    )
+    def test_knobs_on_the_local_backend_warn_before_the_run(
+        self, monkeypatch, caplog, atl06_config, backend, invocation, warns
+    ):
+        # Every Lambda transport consumes the knobs (issue #652 phase 6); only a
+        # local run, which has no breaker, says it ignores them.
+        from zagg import runner
+
+        monkeypatch.setattr(runner.SpatialStrategy, "run", lambda self, config, **kw: {})
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            agg(atl06_config, backend=backend, invocation=invocation, dispatch={"breaker": {}})
+        hit = [r for r in caplog.records if "dispatch knobs ignored" in r.getMessage()]
+        assert bool(hit) is warns
+        if warns:
+            assert "Lambda fan-outs only" in hit[0].getMessage()
+
+    def test_a_bad_block_is_refused_for_a_temporal_config(self):
+        # Validated in agg before the strategy (issue #652): the temporal
+        # fan-out has no poller, but a bad block still fails at submission.
+        with pytest.raises(ValueError, match=re.escape("dispatch.breaker: unknown key(s)")):
+            agg(_temporal_config(), events=_synthetic_events(), dispatch={"breaker": {"x": 1}})
+
+    def test_no_knobs_no_warning(self, monkeypatch, caplog, atl06_config):
+        from zagg import runner
+
+        monkeypatch.setattr(runner.SpatialStrategy, "run", lambda self, config, **kw: {})
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            agg(atl06_config, backend="local")
+        assert "dispatch knobs ignored" not in caplog.text
+
+
 class TestAggValidatesConfig:
     """``agg`` is the single ``validate_config`` choke point (issue #485).
 
@@ -1961,6 +2003,13 @@ class TestSummaryKeysByteIdentical:
         # The tail's verdict over both legs (issue #610): one reason per
         # shortfall, [] when the tail left nothing short.
         "tail_sweep_short",
+        # The fan-out's circuit-breaker verdict (issue #652); ``None`` when no
+        # rule tripped. LAMBDA-only. (The dispatch ramp and its ``ramp`` key
+        # were removed by the 2026-10-14 ruling.)
+        "breaker",
+        # What watched the fan-out (issue #652): the guard, or the pool width
+        # with the knob to flip named, so ``None`` above is never read as silence.
+        "dispatch_pacing",
     } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
@@ -2360,6 +2409,11 @@ class TestSummaryKeysByteIdentical:
         )
         assert set(summary.keys()) == self._LAMBDA_KEYS
         assert summary["families_sweep"] is None  # flat: nothing was swept
+        # The breaker watches the default async transport too (issue #652 phase 6).
+        assert "ramp" not in summary and summary["breaker"] is None
+        assert summary["dispatch_pacing"] == (
+            "full worker width, circuit breaker on (invocation='async') (issue #652)"
+        )
         assert summary["backend"] == "lambda"
         assert summary["cells_with_data"] == 4
         assert summary["total_obs"] == 12
@@ -5806,6 +5860,35 @@ class TestCliTailShortSurface:
         self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": []})
         assert "TAIL SHORT" not in capsys.readouterr().out
 
+    def test_a_trip_alone_prints_its_own_remedy_not_the_sweep(self, monkeypatch, capsys):
+        # A sweep never writes the refused units (issue #652, PR #665 review):
+        # the trip's reason names the re-dispatch; the sweep hint rides only
+        # beside another shortfall.
+        from zagg import runner
+
+        trip = {"tripped": True, "rule": "timeout-ratio", "at_result": 137}
+        short = runner._tail_sweep_short(None, None, stage_chained=False, breaker=trip)
+        self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": short})
+        out = capsys.readouterr().out
+        assert "TAIL SHORT: the dispatch circuit breaker tripped (timeout-ratio)" in out
+        assert "re-dispatch" in out and "zagg.sweep" not in out
+        both = [*short, "the families sweep did not dispatch, so the rollups are unswept"]
+        self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": both})
+        assert "python -m zagg.sweep <store>" in capsys.readouterr().out
+
+    def test_the_warning_gates_the_sweep_hint_the_same_way(self, caplog):
+        from zagg import runner
+
+        trip = {"tripped": True, "rule": "store-fatal", "at_result": 3}
+        (reason,) = runner._tail_sweep_short(None, None, stage_chained=False, breaker=trip)
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            runner._warn_tail_sweep_short([reason])
+        assert "re-dispatch" in caplog.text and "zagg.sweep" not in caplog.text
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            runner._warn_tail_sweep_short([reason, "the families sweep did not dispatch"])
+        assert "python -m zagg.sweep <store>" in caplog.text
+
 
 class TestCliFunctionNameDefault:
     """Issue #235: ``--function-name`` must default to ``None`` (resolved in
@@ -5965,3 +6048,25 @@ class TestCliContractionGuardSurface:
         }
         self._run(monkeypatch, [], summary)
         assert "FAILED" not in capsys.readouterr().out
+
+
+class TestTailShortBreaker:
+    def test_a_trip_leads_the_tail_verdict(self):
+        from zagg import runner
+
+        trip = {"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000}
+        (reason,) = runner._tail_sweep_short(None, None, stage_chained=False, breaker=trip)
+        assert reason.startswith(
+            "the dispatch circuit breaker tripped (timeout-ratio) at result 137"
+        )
+        # Its remedy is a re-dispatch, not a sweep (PR #665 review).
+        assert "fix the cause and re-dispatch" in reason and "zagg.sweep" not in reason
+        # A hold is not a trip, and no guard at all is the pre-#652 verdict.
+        hold = dict(trip, tripped=False, rule="wall-margin")
+        assert runner._tail_sweep_short(None, None, stage_chained=False, breaker=hold) == []
+        assert runner._tail_sweep_short(None, None, stage_chained=False, breaker=None) == []
+        # It leads: ahead of the raised-block reason the verdict already carried.
+        reasons = runner._tail_sweep_short(
+            None, None, stage_chained=False, tail_error="boom", breaker=trip
+        )
+        assert [r.split(" ")[2] for r in reasons] == ["circuit", "sweep"]

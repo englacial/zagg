@@ -374,6 +374,20 @@ def _lifecycle(responder):
     return _respond
 
 
+def test_a_bad_dispatch_block_is_refused_for_a_raster_config(manifest):
+    # Validated in agg before the strategy (issue #652): a raster run accepts
+    # and ignores a good block, but a bad one is refused at submission.
+    cfg, sm_path, _shard, _data = manifest
+    with pytest.raises(ValueError, match="dispatch.breaker: unknown key"):
+        agg(
+            cfg,
+            catalog=sm_path,
+            store="s3://b/x.zarr",
+            backend="lambda",
+            dispatch={"breaker": {"x": 1}},
+        )
+
+
 class TestRasterLambdaBackend:
     # Issue #264: the lambda path never opens or writes the store from the
     # orchestrator (the template rides the sync setup invoke), so these tests
@@ -385,6 +399,60 @@ class TestRasterLambdaBackend:
     # byte-identical synchronous-transport regression suite (no result_url on
     # the shard event, RequestResponse invoke). The async default is covered by
     # TestRasterLambdaAsyncBackend / TestInvokeLambdaRaster.
+
+    def test_early_timeouts_trip_and_stop_invoking(self, manifest, monkeypatch, tmp_path, caplog):
+        # issue #652 phase 6: the raster pool is gated too. Three shards on a
+        # width-1 run: the first times out, the breaker trips, the other two
+        # are refused without an invoke; every shard then counts as failed.
+        # The all-failed error and the run log name the trip themselves, not
+        # through whichever result came last (PR #665 review).
+        import logging
+
+        import boto3
+
+        cfg, _sm_path, _shard, _data = manifest
+        shards = [_shard_for_raster_at(dx) for dx in (0.0, 20_000.0, 40_000.0)]
+        assert len(set(shards)) == 3
+        entries = [
+            _entry("g0", str(tmp_path / "t0.tif"), T0, "dt-1"),
+            _entry("g1", str(tmp_path / "t1.tif"), T1, "dt-2"),
+        ]
+        grid = from_config(cfg)
+        path = str(tmp_path / "three.json")
+        ShardMap(grid.spatial_signature(), shards, [entries] * 3, {"collection": "s2"}).to_json(
+            path
+        )
+        invoked: list[int] = []
+
+        def responder(event):
+            invoked.append(event["shard_key"])
+            # Lambda's real sync timeout: FunctionError + its errorMessage.
+            return {
+                "__function_error__": True,
+                "errorMessage": "Task timed out after 900.00 seconds",
+            }
+
+        monkeypatch.setattr(
+            boto3, "client", lambda *a, **k: _FakeLambdaClient(_lifecycle(responder))
+        )
+        caplog.set_level(logging.WARNING, logger="zagg.runner")
+        with pytest.raises(
+            RuntimeError,
+            match=r"all 3 raster shard.*; circuit breaker tripped \(timeout-ratio\) at result 1$",
+        ):
+            agg(
+                cfg,
+                catalog=path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                max_workers=1,
+                invocation="sync",
+                dispatch={"breaker": {"window": 1, "timeout_ratio": 0.5}},
+            )
+        assert len(invoked) == 1
+        assert "circuit breaker tripped (timeout-ratio) at result 1, width 1: 2 units" in (
+            caplog.text
+        )
 
     def test_events_and_summary(self, manifest, monkeypatch, tmp_path):
         import boto3
@@ -412,8 +480,15 @@ class TestRasterLambdaBackend:
             backend="lambda",
             max_workers=2,
             invocation="sync",
+            # A good dispatch block is accepted and ignored (issue #652).
+            dispatch={"breaker": {"window": 20}},
         )
         assert summary["backend"] == "lambda"
+        # The breaker watches the raster pool too (issue #652 phase 6).
+        assert "ramp" not in summary and summary["breaker"] is None
+        assert summary["dispatch_pacing"] == (
+            "full worker width, circuit breaker on (raster fan-out) (issue #652)"
+        )
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
         assert summary["cells_error"] == 0
         # The key is unconditional (issue #297) — None here because the fake

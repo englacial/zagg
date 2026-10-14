@@ -69,6 +69,16 @@ from zagg.dispatch import (
     estimate_cost_usd,
     max_cost_usd,
 )
+from zagg.dispatch_guard import (
+    BREAKER_SHORT_PREFIX,
+    NO_RESULT_PREFIX,
+    NOT_DISPATCHED,
+    DispatchGuard,
+    GuardConfig,
+    describe,
+    guard_pacing,
+    trip_warning,
+)
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
@@ -219,6 +229,7 @@ def agg(
     allow_contraction: bool = False,
     events=None,
     on_progress=None,
+    dispatch: dict | None = None,
 ) -> dict:
     """Run the aggregation pipeline.
 
@@ -303,6 +314,16 @@ def agg(
         exception) are never retried regardless. Default ``3``. Ignored by the
         ``"local"`` backend. Set to ``1`` (e.g. the CI benchmark) to measure one
         clean invocation and record a failure as a failure.
+    dispatch : dict, optional
+        The circuit breaker knobs (issue #652), a ``{"breaker": {...}}``
+        block over the ruled defaults (:class:`zagg.dispatch_guard.GuardConfig`);
+        validated at submission on every backend, honored by every
+        ``backend="lambda"`` fan-out — each ``invocation``, raster and
+        temporal included (the local backend warns and ignores it).
+        ``summary["breaker"]`` is the trip (``None`` when none fired);
+        ``summary["dispatch_pacing"]`` names the seam that watched the
+        fan-out. Travels through the strategies as ``dispatch_knobs`` so it
+        never shadows the generic :func:`zagg.dispatch.dispatch` loop.
     invocation : str
         Lambda-only (issue #151). ``"async"`` (default) dispatches each cell
         with ``InvocationType="Event"`` and polls a per-shard result object the
@@ -406,6 +427,15 @@ def agg(
     # so the temporal and raster paths get their own (smaller) checks rather
     # than a false refusal.
     validate_config(config)
+    # The dispatch knobs (issue #652) are refused on every backend before the
+    # catalog is read; every Lambda fan-out consumes them, so a local run says
+    # so before it starts.
+    GuardConfig.from_dict(dispatch)
+    if dispatch is not None and backend != "lambda":
+        logger.warning(
+            f"dispatch knobs ignored: the circuit breaker watches Lambda fan-outs only "
+            f"(this run: backend={backend!r}) (issue #652)"
+        )
 
     # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
     # is dispatch-level: the spatial path is the existing code, moved verbatim
@@ -440,6 +470,7 @@ def agg(
         allow_contraction=allow_contraction,
         events=events,
         on_progress=on_progress,
+        dispatch_knobs=dispatch,
     )
 
 
@@ -477,6 +508,7 @@ class SpatialStrategy:
         allow_contraction=False,
         events=None,
         on_progress=None,
+        dispatch_knobs=None,
     ):
         # Resolve catalog and store
         catalog_path = catalog or config.catalog
@@ -571,6 +603,7 @@ class SpatialStrategy:
                 force_cold=force_cold,
                 allow_contraction=allow_contraction,
                 on_progress=on_progress,
+                dispatch_knobs=dispatch_knobs,
             )
         else:
             raise ValueError(f"Unknown backend: {backend!r} (expected 'local' or 'lambda')")
@@ -619,6 +652,7 @@ class TemporalStrategy:
         allow_contraction=False,
         events=None,
         on_progress=None,
+        dispatch_knobs=None,
     ):
         from zagg.config import collection_options
         from zagg.temporal import prepare_collection, process_event, specs_from_config
@@ -666,6 +700,7 @@ class TemporalStrategy:
                 invocation=invocation,
                 force_cold=force_cold,
                 on_progress=on_progress,
+                dispatch_knobs=dispatch_knobs,
             )
 
         if max_workers is None:
@@ -943,6 +978,7 @@ class RasterStrategy:
                 invocation=invocation,
                 allow_contraction=allow_contraction,
                 on_progress=on_progress,
+                dispatch_knobs=_ignored.get("dispatch_knobs"),
             )
 
         # Local backend: template emission stays orchestrator-owned (the
@@ -1313,6 +1349,7 @@ class RasterStrategy:
         invocation="async",
         allow_contraction=False,
         on_progress=None,
+        dispatch_knobs=None,
     ):
         """Fan shards out, one ``mode="process_raster"`` invoke each.
 
@@ -1559,10 +1596,15 @@ class RasterStrategy:
         errors = 0
         timesteps_written = 0
         last_error = None
+        refused = 0  # units the tripped breaker refused (``not-dispatched``)
         ok_units: list = []  # (shard_key, body) — coverage needs keys, rollups bodies
         stats_failures: list = []  # (shard_key, error, body) — run-parquet rows (#297)
+        # The circuit breaker (issue #652): each shard is recorded on its pool
+        # thread and refused once tripped; a trip skips the families leg below.
+        guard = DispatchGuard(GuardConfig.from_dict(dispatch_knobs), workers=max_workers)
+        work = guard.gate(_one, lambda pair: guard.refused(shard_key=int(pair[0])))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_one, pair): pair[0] for pair in cells}
+            futures = {pool.submit(work, pair): pair[0] for pair in cells}
             for i, fut in enumerate(as_completed(futures), 1):
                 label = shard_label(grid, futures[fut])
                 result = fut.result()
@@ -1577,6 +1619,7 @@ class RasterStrategy:
                         logger.warning("on_progress hook raised; ignoring", exc_info=True)
                 if result["error"]:
                     errors += 1
+                    refused += result.get("outcome") == NOT_DISPATCHED
                     last_error = result["error"]
                     stats_failures.append((int(futures[fut]), result["error"], result["body"]))
                     logger.warning(f"raster shard {label} failed: {result['error']}")
@@ -1588,6 +1631,9 @@ class RasterStrategy:
                     timesteps_written += body["timesteps"]
 
         wall_time = time.time() - t0
+        # Logged here, ahead of the all-failed raise below (issue #652).
+        if guard.tripped is not None:
+            logger.warning(trip_warning(guard.tripped, refused))
         finalize_error = None
         if store_layout == "hive":
             # Finalize-backstop-before-all-failed-raise, mirroring the local
@@ -1685,7 +1731,7 @@ class RasterStrategy:
         # mirroring the aggregation lambda path — partitioned from the leaf
         # count and awaited (issue #610), fail-open (D9; the CLI backstops).
         families_sweep, families_error = None, None
-        if store_layout == "hive" and get_sweep(config):
+        if store_layout == "hive" and get_sweep(config) and guard.tripped is None:
             try:
                 from zagg.sweep import leaves_from_stats_records
 
@@ -1711,7 +1757,15 @@ class RasterStrategy:
         # already durable (the run-stats write above) and is what re-raises when
         # some shards did land.
         if cells and errors == len(cells):
-            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
+            trip = guard.tripped
+            verdict = (
+                ""
+                if trip is None
+                else f"; circuit breaker tripped ({trip['rule']}) at result {trip['at_result']}"
+            )
+            raise RuntimeError(
+                f"all {errors} raster shard(s) failed; last error: {last_error}{verdict}"
+            )
         # Worker telemetry rollup (issue #250): billed durations and peak RSS,
         # null-safe on bodies from a worker that predates either field.
         ok_bodies = [b for _k, b in ok_units]
@@ -1769,6 +1823,9 @@ class RasterStrategy:
             # is its finalize record (issue #582).
             "icechunk": None,
             "icechunk_finalize": None,
+            # The breaker's verdict and the seam that watched (issue #652).
+            "breaker": guard.breaker,
+            "dispatch_pacing": guard_pacing("raster fan-out"),
         }
         if profile:
             # Straggler-maxed stage seconds (+ the write bucket) and summed
@@ -1788,9 +1845,15 @@ class RasterStrategy:
         # one it fires — a raster run walks no /2 ladder, so it chains no
         # staged sweep and has no second leg to read.
         summary["tail_sweep_short"] = _tail_sweep_short(
-            families_sweep, None, stage_chained=False, tail_error=families_error
+            families_sweep,
+            None,
+            stage_chained=False,
+            tail_error=families_error,
+            breaker=guard.tripped,
         )
         _warn_tail_sweep_short(summary["tail_sweep_short"])
+        for line in describe(summary["breaker"], summary["dispatch_pacing"]):
+            logger.info(line)
         logger.info(
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
@@ -1838,6 +1901,7 @@ def _run_lambda_events(
     invocation="async",
     force_cold=False,
     on_progress=None,
+    dispatch_knobs=None,
 ):
     """Fan the temporal pipeline out one event per Lambda invoke (issue #12, Phase 8).
 
@@ -2053,6 +2117,8 @@ def _run_lambda_events(
             logger.info(f"  [{i:4d}/{n}] {rate:.1f} events/s")
 
     accumulate = _with_progress(_accumulate, on_progress, n, metered=True)
+    # The circuit breaker (issue #652), at the generic loop's seam.
+    guard = DispatchGuard(GuardConfig.from_dict(dispatch_knobs), workers=max_workers)
 
     try:
         report = dispatch(
@@ -2061,6 +2127,8 @@ def _run_lambda_events(
             retry=LAMBDA_RETRY,
             accumulate=accumulate,
             on_submit_error=lambda e: raise_for_fd_exhaustion(e, max_workers),
+            guard=guard,
+            refuse=lambda ev: guard.refused(event_key=ev.get("event_key")),
         )
     finally:
         executor.shutdown()
@@ -2127,6 +2195,10 @@ def _run_lambda_events(
         "backend": "lambda",
         "results": rows,
         "failures": failures,
+        # The breaker's verdict and the seam that watched (issue #652); the
+        # temporal path has no tail legs to cancel.
+        "breaker": guard.breaker,
+        "dispatch_pacing": guard_pacing("temporal fan-out"),
         **container_stats,
     }
     logger.info(
@@ -2134,6 +2206,8 @@ def _run_lambda_events(
         f"{report.cells_error} errors, {wall_time:.1f}s, "
         f"~${estimated_cost:.4f} ({gb_seconds:.1f} GB-s)"
     )
+    for line in describe(summary["breaker"], summary["dispatch_pacing"]):
+        logger.info(line)
     _log_container_stats(container_stats)
     return summary
 
@@ -3859,6 +3933,7 @@ def _run_lambda(
     force_cold=False,
     allow_contraction=False,
     on_progress=None,
+    dispatch_knobs=None,
 ):
     """Run processing via AWS Lambda invocation.
 
@@ -3882,6 +3957,9 @@ def _run_lambda(
     from botocore.config import Config
 
     all_shards = list(catalog_data["shard_keys"])
+    # The breaker knobs (issue #652): refused at submission, before any
+    # invoke; consumed by the Event transport's poller below.
+    guard_config = GuardConfig.from_dict(dispatch_knobs)
     # Strict-AOI per-shard mask payload (issue #101), keyed by shard for the
     # per-cell event. Empty dict when the manifest carries no ``aoi_mask`` (flag
     # off) — the per-cell invoke then omits the ``aoi_payload`` event key, so the
@@ -4256,6 +4334,10 @@ def _run_lambda(
     # preflight() runs the probe, builds the sized client, and sizes the pool.
     executor.preflight(len(cells))
     max_workers = state["workers"]
+    # The circuit breaker on every transport (issue #652): the Event poller
+    # records and refuses; async/sync ride dispatch()'s loop and pool gate. A
+    # trip refuses the rest and cancels the tail below.
+    state["guard"] = DispatchGuard(guard_config, workers=state["workers"])
 
     # v2 status poller (issue #327): one background thread resolving every
     # in-flight shard from one LIST of the run's status prefix per tick.
@@ -4270,7 +4352,9 @@ def _run_lambda(
             lambda: open_status_store(status_prefix, _status_kwargs),
             drop_timeout_s=drop_timeout_s(state["function_timeout_s"]),
             max_retries=max_retries,
+            guard=state["guard"],
         ).start()
+    pacing = guard_pacing(f"invocation={invocation!r}")
 
     # Create template via Lambda (flat only). The template write happens
     # inside the function so the orchestrator only needs
@@ -4373,6 +4457,8 @@ def _run_lambda(
         elif result.get("status_code") == 200 and not error:
             report.total_obs += body.get("total_obs", 0)
             report.cells_with_data += 1
+        elif result.get("outcome") == NOT_DISPATCHED:
+            report.cells_error += 1  # refused by the tripped breaker: one line below, not N
         elif error not in BENIGN_ERRORS:
             report.cells_error += 1
             key = result.get("shard_key")
@@ -4398,6 +4484,9 @@ def _run_lambda(
             # guidance; this is a backstop for exhaustion that surfaces outside
             # the cell body (e.g. at submit time). Other exceptions propagate.
             on_submit_error=lambda e: raise_for_fd_exhaustion(e, max_workers),
+            # Event: the poller records and refuses, so dispatch() must not too.
+            guard=None if invocation == "event" else state["guard"],
+            refuse=lambda unit: state["guard"].refused(shard_key=int(unit[0])),
         )
     finally:
         executor.shutdown()
@@ -4411,6 +4500,15 @@ def _run_lambda(
             manifest_stop.set()
             manifest_thread.join(timeout=_MANIFEST_CHECK_JOIN_TIMEOUT_S)
     fanout_s = time.time() - start_time
+    # The breaker's verdict (issue #652): a trip means the units past
+    # ``at_result`` were refused (``not-dispatched``, counted as errors above)
+    # and the tail legs below — families pass, staged sweep, Icechunk
+    # finalize — are skipped. In-flight Event invokes were left to finish.
+    guard = state["guard"]
+    trip = guard.tripped
+    if trip is not None:
+        refused = sum(r.get("outcome") == NOT_DISPATCHED for r in report.results)
+        logger.warning(trip_warning(trip, refused))
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access). Guarded (issue #335): a failed
@@ -4600,6 +4698,9 @@ def _run_lambda(
             # "dropped" (no manifest: no Run.attach, no operator finalize).
             # What was SENT; the write is the worker's, best-effort.
             "dispatch_manifest": manifest_sent,
+            # The breaker's verdict on every transport (issue #652).
+            "breaker": guard.breaker,
+            "dispatch_pacing": pacing,
             "store_path": store_path,
             "backend": "lambda",
             "function_name": function_name,
@@ -4677,7 +4778,7 @@ def _run_lambda(
         # handler binds that name to the exception OBJECT (review finding),
         # and the raster tail already calls this one ``families_error``.
         families_error = None
-        if get_store_layout(config) == "hive" and get_sweep(config):
+        if get_store_layout(config) == "hive" and get_sweep(config) and trip is None:
             try:
                 from zagg.sweep import dirt_only_leaves, leaves_from_stats_records
 
@@ -4768,6 +4869,7 @@ def _run_lambda(
             staged,
             stage_chained=stage_chained,
             tail_error=families_error,
+            breaker=trip,
         )
         _warn_tail_sweep_short(summary["tail_sweep_short"])
         # Icechunk run finalize (issue #582, spec §11.4): one synchronous
@@ -4776,6 +4878,8 @@ def _run_lambda(
         # The stage nodes are Event invokes, so a sweep that did not complete
         # may still have node commits in flight: no tag then (review finding).
         skip = _staged_sweep_incomplete(staged) if stage_chained else None
+        if trip is not None:
+            skip = f"circuit breaker tripped ({trip['rule']})"
         if icechunk_init is None:
             summary["icechunk_finalize"] = None
         elif skip is not None:
@@ -4814,6 +4918,8 @@ def _run_lambda(
                 f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items()
             )
             logger.info(f"Worker phases (max across cells): {breakdown}")
+        for line in describe(summary["breaker"], summary["dispatch_pacing"]):
+            logger.info(line)
         _log_container_stats(container_stats)
     except Exception as tail_error:
         # D6 precedence (issue #335 fold), matching the PR #333 client facade:
@@ -5288,7 +5394,7 @@ def _poll_lambda_result(
                 "body": {},
                 "wall_time": time.time() - wall_start,
                 "lambda_duration": 0,
-                "error": f"no worker result within {poll_timeout_s:.0f}s ({cause})",
+                "error": f"{NO_RESULT_PREFIX} {poll_timeout_s:.0f}s ({cause})",
                 "retries": retries,
                 "granule_count": granule_count,
             }
@@ -6435,7 +6541,12 @@ def _families_sweep_reported(outcome: dict | None) -> dict:
 
 
 def _tail_sweep_short(
-    families_sweep, stage_sweep, *, stage_chained: bool, tail_error: str | None = None
+    families_sweep,
+    stage_sweep,
+    *,
+    stage_chained: bool,
+    tail_error: str | None = None,
+    breaker: dict | None = None,
 ) -> list:
     """Why this run's tail left the store short of its rollups; ``[]`` when it did not.
 
@@ -6473,7 +6584,9 @@ def _tail_sweep_short(
     ``tail_error`` is what the tail's own fail-open ``except`` swallowed, and
     it leads the list: a block that raised before either leg fired reports
     neither outcome, so without it the worst case — nothing swept at all —
-    would be the emptiest verdict (review finding).
+    would be the emptiest verdict (review finding). ``breaker`` is the
+    dispatch circuit breaker's trip (issue #652), which cancels both legs
+    before they fire: the same emptiest verdict, so it leads too.
 
     Fail-open itself, and deliberately: both call sites sit OUTSIDE their
     tail's fail-open arm, so a raise in here would take down a run whose
@@ -6485,7 +6598,11 @@ def _tail_sweep_short(
     """
     try:
         return _tail_sweep_reasons(
-            families_sweep, stage_sweep, stage_chained=stage_chained, tail_error=tail_error
+            families_sweep,
+            stage_sweep,
+            stage_chained=stage_chained,
+            tail_error=tail_error,
+            breaker=breaker,
         )
     except Exception as e:
         logger.warning(f"the tail's verdict could not be computed (fail-open, D9): {e}")
@@ -6496,10 +6613,22 @@ def _tail_sweep_short(
 
 
 def _tail_sweep_reasons(
-    families_sweep, stage_sweep, *, stage_chained: bool, tail_error: str | None = None
+    families_sweep,
+    stage_sweep,
+    *,
+    stage_chained: bool,
+    tail_error: str | None = None,
+    breaker: dict | None = None,
 ) -> list:
     """The reasons themselves; :func:`_tail_sweep_short` is the fail-open wrapper."""
     reasons = []
+    if breaker and breaker.get("tripped"):
+        reasons.append(
+            f"{BREAKER_SHORT_PREFIX} ({breaker.get('rule')}) at result "
+            f"{breaker.get('at_result')}: the undispatched units are not in the store and no "
+            "rollup sweep ran — fix the cause and re-dispatch (skip-if-current re-fires only "
+            "the missing units) (issue #652)"
+        )
     if tail_error:
         reasons.append(
             f"the tail's sweep block raised ({tail_error}), so what it had not yet fired is unswept"
@@ -6551,15 +6680,22 @@ def _warn_tail_sweep_short(reasons) -> None:
     time; this one is the RUN's verdict, the only line that spans both legs
     and the only one carrying the remedy, and it is what the CLI prints and
     the summary's ``tail_sweep_short`` holds. Silent when the tail left
-    nothing short, so a whole run's console is unchanged.
+    nothing short, so a whole run's console is unchanged. A breaker trip
+    carries its own remedy (re-dispatch, issue #652): sweeping a tripped
+    store folds a partial leaf set, so the sweep hint rides only beside
+    another reason.
     """
     if not reasons:
         return
+    hint = (
+        " — regenerate with `python -m zagg.sweep <store>` (the rollup families) and "
+        "`python -m zagg.sweep <store> --stages --scope <subtree>` (the ladder)"
+    )
+    sweepable = any(not r.startswith(BREAKER_SHORT_PREFIX) for r in reasons)
     logger.warning(
         "the run tail left the store short of its rollups: "
         + "; ".join(reasons)
-        + " — regenerate with `python -m zagg.sweep <store>` (the rollup families) and "
-        "`python -m zagg.sweep <store> --stages --scope <subtree>` (the ladder)"
+        + (hint if sweepable else "")
     )
 
 
