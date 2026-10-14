@@ -125,7 +125,7 @@ examples:
 
     config = load_config(args.config)
 
-    # The ramp / breaker knobs (issue #652): shape and range are refused here,
+    # The circuit-breaker knobs (issue #652): shape and range are refused here,
     # before the cost prompt and before any invoke.
     try:
         dispatch = parse_knobs(args.dispatch)
