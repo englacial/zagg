@@ -73,9 +73,15 @@ COMMIT (a snapshot, N manifests, a transaction log, plus whatever compaction
 does), which is Icechunk's business and not deterministically modelable. Its
 keys ride the ``objects_icechunk`` bucket on the same D9 posture as the
 rollup / overview / telemetry buckets: counted, reported, netted out. What
-stays asserted is the repo's PRESENCE (:func:`object_count_mismatch`), so an
-init that fails open — the issue #606 class, invisible on S3 until
-``d23d7788`` — is still a finding rather than a silently empty bucket.
+stays asserted is the repo's PRESENCE (:func:`object_count_mismatch`), so a
+repo that NEVER STOOD UP AT ALL is a finding rather than a silently empty
+bucket. The floor reaches exactly that far and no further: ``icechunk_init``
+ITSELF commits, so a repo whose init landed and whose every per-leaf commit
+then failed open (``zagg.hive``'s per-shard handler is as fail-open as the
+init's) still holds its own init objects and clears the floor. The wider
+"init fails open" class — the issue #606 story, invisible on S3 until
+``d23d7788`` — is therefore only PARTLY covered; narrowing it further is a
+scope call standing for espg on PR #672.
 
 **The hive model assumes the UNWINDOWED leaf** (review finding), as the flat
 model assumes fullsphere HEALPix (:func:`_require_fullsphere`). One populated
@@ -824,9 +830,14 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     The §11 Icechunk companion repo is audited as a PRESENCE floor rather than
     a count (issue #668): its object count scales with the run's commits, so a
     declared repo must have landed at least its ``icechunk/repo``, and a store
-    whose config declares none must have landed nothing. That keeps a silently
-    failed init visible — the issue #606 class, which fail-open init hid on S3
-    until ``d23d7788`` — without putting a commit-scaled number in a window.
+    whose config declares none must have landed nothing. What the floor
+    catches is a repo THAT NEVER STOOD UP AT ALL, not the whole fail-open
+    class: ``icechunk_init`` itself commits, so a repo whose init succeeded
+    and whose every per-leaf commit then failed open still holds its init
+    objects and clears ``>= 1``. That much is had without putting a
+    commit-scaled number in a window; reaching the per-leaf half needs either
+    a per-family sub-floor or the run's own per-leaf record, both of which are
+    open questions for espg on PR #672 (review finding).
 
     The undeclared direction ASSUMES A STORE WHOSE DECLARATION NEVER CHANGED,
     as the model assumes the unwindowed leaf (module docstring) and the

@@ -1075,9 +1075,11 @@ def test_flat_icechunk_objects_are_bucketed_not_unrecognized(tmp_path):
 
 def test_icechunk_floor_fires_both_ways():
     # The one assertion kept on a commit-scaled bucket (issue #668 item (2)):
-    # a declared repo must have landed at least its ``icechunk/repo`` -- the
-    # issue #606 class, a silent fail-open init, was invisible for a week --
-    # and a store whose config declares none must have landed nothing.
+    # a declared repo must have landed at least its ``icechunk/repo``, and a
+    # store whose config declares none must have landed nothing. What that
+    # floor catches is a repo that never stood up AT ALL -- ``icechunk_init``
+    # itself commits, so a repo whose per-leaf commits all failed open still
+    # clears it (review finding, standing for espg on PR #672).
     clean = {
         "objects_total": 4,
         "objects_metadata": 1,
