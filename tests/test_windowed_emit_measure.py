@@ -608,6 +608,12 @@ def test_a_stage_invoke_without_a_tier_falls_back_without_error():
     assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": 0}, 4.0) == 0.0
     # an absent finisher is the empty dict the loader hands back: no wall, no cost
     assert tool._invoke_gb_seconds({}, 4.0) == 0.0
+    # a numeric string still prices from the record
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": "8192"}, 4.0) == 80.0
+    # and a junk cell degrades like the leaf path's ``to_numeric`` coerce rather
+    # than raising out of the whole readout: unknown tier, or a zero wall
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": "4 GB"}, 4.0) == 40.0
+    assert tool._invoke_gb_seconds({"duration_s": "nope", "lambda_memory_mb": 8192}, 4.0) == 0.0
 
 
 def test_a_null_tier_stage_record_adds_no_phantom_gb_seconds(tmp_path):

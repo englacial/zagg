@@ -109,6 +109,21 @@ def stage_tier_gb() -> float:
     return STAGE_SWEEP_WORKER["memory"] / 1024.0
 
 
+def _num(v, default: float | None = None) -> float | None:
+    """A record scalar as a float; ``default`` when it is ``None`` or junk.
+
+    The stage path's counterpart to the ``pd.to_numeric(..., errors="coerce")``
+    every column of :func:`_billed_gb_seconds` goes through, and for the same
+    reason: a record carrying a non-numeric cell is priced from what it DOES
+    carry rather than raising out of the whole readout. Kept local so the
+    stage path does not pull pandas in.
+    """
+    try:
+        return default if v is None else float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _invoke_gb_seconds(rec: dict, fallback_gb: float) -> float:
     """One stage invoke's billed GB-seconds, off its own record.
 
@@ -123,13 +138,19 @@ def _invoke_gb_seconds(rec: dict, fallback_gb: float) -> float:
     The key is **null** on an off-Lambda pass, which nothing billed, so it
     prices at zero rather than being billed at the dispatcher's tier. A JSON
     ``get`` cannot tell those two apart, hence the membership test.
+
+    Both scalars are read through :func:`_num`, so a junk cell in a
+    hand-edited record reads as an unknown tier (or a zero wall) instead of
+    raising out of every store's readout.
     """
     if "lambda_memory_mb" not in rec:
         tier = fallback_gb  # predates the field: the tier is unknown
+    elif rec["lambda_memory_mb"] is None:
+        tier = 0.0  # null: nothing billed it
     else:
-        mb = rec["lambda_memory_mb"]
-        tier = 0.0 if mb is None else float(mb) / 1024.0  # null: nothing billed it
-    return float(rec.get("duration_s") or 0.0) * tier
+        mb = _num(rec["lambda_memory_mb"])
+        tier = fallback_gb if mb is None else mb / 1024.0  # junk reads as unknown
+    return (_num(rec.get("duration_s"), 0.0) or 0.0) * tier
 
 
 def _store(store_root: str, store_kwargs: dict):
