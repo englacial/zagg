@@ -33,77 +33,31 @@ Pure: no I/O, no clock, no threads. The poller feeds completed result dicts
 (its own v1-shaped ``_result``) through :meth:`DispatchGuard.record` and asks
 :meth:`DispatchGuard.room` for the next batch; one thread owns an instance.
 The store-fatal rule reads ``store_error_class`` when a status carries it
-(issue #651, PR #658) and otherwise classifies the error string with the same
-classifier; ``error_class`` is never read -- in zagg it names telemetry's
-exception type, not a store class.
+(issue #651, PR #658) and otherwise classifies the error string with
+:func:`zagg.dispatch.classify_store_error`, the worker's own classifier.
+``error_class`` is read only as a fallback for status objects written before
+the #658 rename, and only when it holds one of the three store classes -- in
+zagg that name also carries telemetry's exception type (``"ValueError"``),
+which must not short-circuit the classifier.
 """
 
 from __future__ import annotations
 
 import math
-import re
 import statistics
 from dataclasses import dataclass, fields
 from typing import Iterable
 
-from zagg import dispatch as _dispatch
-from zagg.dispatch import BENIGN_ERRORS
-
-#: The worker's own store-error classifier and its fatal class (issue #651,
-#: PR #658) once they are on main; the fallback below until then.
-#: TODO(#658): drop ``_classify_fallback`` when ``zagg.dispatch`` carries
-#: ``classify_store_error`` -- it mirrors that classifier's string path
-#: (benign, credentials, S3 code, status, refusal tokens) verbatim, dropping
-#: only the exception-type / ``from``-chain checks a status string has no
-#: object for.
-STORE_FATAL: str = getattr(_dispatch, "STORE_FATAL", "store-fatal")
-_STATUS_RE = re.compile(r"(?:status(?: code)?|http|error)\W{0,3}([45]\d\d)\b", re.I)
-_TRANSIENT_TOKENS = (
-    "requesttimeout",
-    "slowdown",
-    "internalerror",
-    "serviceunavailable",
-    "too many requests",
-)
-_FATAL_TOKENS = (
-    "got invalid",
-    "malformed",
-    "error parsing",
-    "failed to parse",
-    "bad request",
-    "invalidargument",
-    "invalid argument",
-    "nosuchbucket",
-    "no such bucket",
-    "nosuchkey",
-    "permission denied",
-    "unauthenticated",
-    "forbidden",
-    "refusing to",
-    "gate refused",
-    "spec §",
+from zagg.dispatch import (
+    BENIGN_ERRORS,
+    STORE_BENIGN,
+    STORE_FATAL,
+    STORE_TRANSIENT,
+    classify_store_error,
 )
 
-
-def _classify_fallback(error) -> str:
-    text = str(error) if error is not None else ""
-    if text in BENIGN_ERRORS:
-        return "benign"
-    from zagg.processing.worker import is_auth_failure  # lazy: keep this module light
-
-    if is_auth_failure(Exception(text)):
-        return STORE_FATAL
-    low = text.lower()
-    if any(t in low for t in _TRANSIENT_TOKENS):
-        return "transient"
-    match = _STATUS_RE.search(text)
-    if match:
-        code = int(match.group(1))
-        return "transient" if code in (408, 429) or code >= 500 else STORE_FATAL
-    return STORE_FATAL if any(t in low for t in _FATAL_TOKENS) else "transient"
-
-
-classify_store_error = getattr(_dispatch, "classify_store_error", _classify_fallback)
+#: The values ``store_error_class`` (or a pre-#658 ``error_class``) may hold.
+_STORE_CLASSES = frozenset({STORE_FATAL, STORE_TRANSIENT, STORE_BENIGN})
 
 
 #: The write-phase keys summed per result (the worker's ``phase_timings``).
@@ -304,10 +258,13 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
     # The no-data channel's text starts with its benign entry and may carry a
     # source read's 403/404 exemplar after it: benign, never store-fatal.
     failed = bool(error) and not str(error).startswith(BENIGN_ERRORS) and not timeout
-    # PR #658 stamps the leaf's class as ``store_error_class``; that key only.
-    # ``error_class`` never shipped as a store class -- telemetry fills it with
-    # the exception type -- so reading it would skip the string classifier.
+    # PR #658 stamps the leaf's class as ``store_error_class`` (the ruled name).
+    # ``error_class`` is the pre-#658 spelling, honored only when it holds a
+    # store class: telemetry fills the same name with the exception type.
     store_class = result.get("store_error_class") or body.get("store_error_class")
+    if store_class is None:
+        legacy = result.get("error_class") or body.get("error_class")
+        store_class = legacy if legacy in _STORE_CLASSES else None
     if store_class is None and failed:
         store_class = classify_store_error(error)
     return ResultRecord(

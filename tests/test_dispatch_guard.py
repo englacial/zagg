@@ -16,7 +16,6 @@ from zagg.dispatch_guard import (
     DispatchGuard,
     FixedWindow,
     GuardConfig,
-    _classify_fallback,
     classify_result,
 )
 
@@ -218,10 +217,26 @@ class TestBreaker:
 
     def test_telemetry_error_class_never_shadows_the_classifier(self):
         # ``error_class`` is telemetry's exception type (PR #665 review): a body
-        # carrying it with a fatal error string still classifies store-fatal.
+        # carrying it with a fatal error string still classifies store-fatal,
+        # and a transient string stays transient — the value is not a class.
         fatal = _failed(error="NoSuchBucket: the bucket does not exist")
         fatal["body"]["error_class"] = "ValueError"
         assert classify_result(fatal, function_timeout_s=TIMEOUT_S).store_fatal
+        transient = _failed(error="SlowDown: please reduce your request rate")
+        transient["body"]["error_class"] = "ValueError"
+        assert not classify_result(transient, function_timeout_s=TIMEOUT_S).store_fatal
+
+    def test_a_pre_658_error_class_holding_a_store_class_is_honored(self):
+        # The pre-#658 spelling, kept as a fallback only when it holds one of
+        # the three store classes; ``store_error_class`` wins when both are set.
+        legacy = _failed(error="boom")
+        legacy["body"]["error_class"] = "store-fatal"
+        assert classify_result(legacy, function_timeout_s=TIMEOUT_S).store_fatal
+        both = {
+            **_failed(error="boom", store_error_class="transient"),
+            "error_class": "store-fatal",
+        }
+        assert not classify_result(both, function_timeout_s=TIMEOUT_S).store_fatal
 
     @pytest.mark.parametrize(
         "error",
@@ -243,10 +258,20 @@ class TestBreaker:
         g = _feed(_guard(), [_failed(error=error)] * 10)
         assert g.tripped is None
 
+    def test_the_classifier_is_the_workers_own(self):
+        # PR #658 merged: the guard classifies a status's error string with the
+        # same function the worker stamps ``store_error_class`` from, so the
+        # dispatcher-side verdict cannot drift from the leaf's.
+        import zagg.dispatch
+        import zagg.dispatch_guard as dg
+
+        assert dg.classify_store_error is zagg.dispatch.classify_store_error
+        assert dg.STORE_FATAL == zagg.dispatch.STORE_FATAL == "store-fatal"
+
     @pytest.mark.parametrize(
         ("error", "expected"),
         [
-            # PR #658's own string cases, so the fallback cannot drift from it.
+            # PR #658's own string cases, through the shared classifier.
             ("HTTP status client error (403 Forbidden) for url", "store-fatal"),
             ("Client error with status 400 Bad Request: no body", "store-fatal"),
             ("AccessDenied: no s3:PutObject", "store-fatal"),
@@ -258,8 +283,10 @@ class TestBreaker:
             ("No granules found", "benign"),
         ],
     )
-    def test_the_fallback_mirrors_the_658_string_path(self, error, expected):
-        assert _classify_fallback(error) == expected
+    def test_the_658_string_cases_classify_the_same_here(self, error, expected):
+        from zagg.dispatch_guard import classify_store_error
+
+        assert classify_store_error(error) == expected
 
     def test_a_shard_counts_one_timeout_across_its_refire(self):
         # 10 timeouts of 50 is at the threshold; the re-fired k9 dropping

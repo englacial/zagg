@@ -1189,10 +1189,9 @@ class StatusPoller:
             status_code=None,
             body={},
             error=(
-                f"failed-unknown: no status object within {self._drop_timeout_s:.0f}s "
-                f"(function timeout + 60s max event age + margin) — the Event invoke "
-                f"was dropped under backpressure, or the worker died before its "
-                f"status write (check CloudWatch)"
+                f"failed-unknown: no status object within {self._drop_timeout_s:.0f}s (function "
+                f"timeout + 60s max event age + margin) — the Event invoke was dropped under "
+                f"backpressure, or the worker died before its status write (check CloudWatch)"
             ),
             outcome="failed-unknown",
         )
