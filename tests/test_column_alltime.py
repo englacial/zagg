@@ -1412,6 +1412,60 @@ class TestIcechunkAllRow:
         assert outcome in meta["icechunk_all_time"]
         assert (_node(root) / "all.pyramid.zarr").exists() and not carrier.exists()
 
+    @pytest.mark.parametrize("commit", ["ladder", "leaf"])
+    def test_an_all_current_invoke_heals_a_lost_carrier(self, monkeypatch, tmp_path, commit):
+        # PR #666 review finding (4): the member stands and is current, its
+        # ladder carrier is gone (a failed PUT, Icechunk enabled later) — the
+        # next all-current invoke plans it again, and rewrites no member.
+        from zagg import icechunk_ladder
+
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": commit}
+        root = str(tmp_path / "bulk")
+        self._init(cfg, root)
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        carrier = _node(root) / "all.pyramid.icechunk_refs.json"
+        assert carrier.exists() == (commit == "ladder")
+        standing = carrier.read_bytes() if commit == "ladder" else None
+        carrier.unlink(missing_ok=True)
+        before = emit._tree(root)
+        TestBulkUnit()._current_for(monkeypatch, set(WINDOWS))
+
+        def rerun():
+            return emit._run_bulk(
+                monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+            )
+
+        meta = rerun()
+        assert meta["current"] is True and "all_time_column" not in meta
+        if commit == "leaf":  # no carrier to lose: the closing unit committed the refs
+            assert "icechunk_all_time" not in meta and emit._tree(root) == before
+            return
+        assert meta["icechunk_all_time"]["sidecar"] == carrier.name
+        assert carrier.read_bytes() == standing  # the same member, the same refs
+        after = emit._tree(root)
+        assert {k: v for k, v in after.items() if k != str(carrier.relative_to(root))} == before
+        # A standing carrier costs the one GET and is left alone.
+        reads: list = []
+        real = icechunk_ladder.write_member_refs
+        monkeypatch.setattr(
+            icechunk_ladder, "write_member_refs", lambda *a, **kw: reads.append(a) or real(*a, **kw)
+        )
+        meta = rerun()
+        assert "icechunk_all_time" not in meta and reads == [] and emit._tree(root) == after
+
+    def test_a_heal_writes_nothing_when_the_member_is_absent(self, monkeypatch, tmp_path):
+        from zagg.column_alltime import heal_member_refs
+
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": "ladder"}
+        root = str(tmp_path / "fanout")
+        self._init(cfg, root)
+        emit._run_fanout(monkeypatch, cfg, root, fakes=emit._dense_fakes())  # no member
+        grid = emit._grid(cfg)
+        assert heal_member_refs(root, grid, cfg, emit._shard_word(), store_kwargs={}) is None
+        assert not (_node(root) / "all.pyramid.icechunk_refs.json").exists()
+
     def test_a_clear_drops_the_carrier_before_the_member(self, monkeypatch, tmp_path):
         # A member delete that fails half way must not leave a carrier over
         # the wreck; a member without a carrier is merely unindexed.

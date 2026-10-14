@@ -398,8 +398,17 @@ def record_member_refs(store_root: str, grid, config, shard_key, *, store_kwargs
     (``"ladder"``, :func:`zagg.icechunk_ladder.write_member_refs`, which the
     node's commit gathers when it closes). Fail-open, never raises: the
     member is normative, the repo a regenerable index (D9); a failure logs
-    and returns ``{"error"}``. Called only after the member was WRITTEN this
-    invoke — a current member keeps the refs it already has. Whatever this
+    and returns ``{"error"}``. Called after the member was WRITTEN this
+    invoke; a current member keeps the refs it already has, with two
+    exceptions. A ladder carrier that is GONE while the member stands (its
+    PUT failed here, Icechunk was enabled after the build, the carrier alone
+    expired) is re-planned by the next all-current invoke
+    (:func:`heal_member_refs`). A member and carrier that EXPIRE together on
+    a lifecycle bucket are not kept fresh: no unit's lifecycle touch covers
+    them, because a touch re-mints the checksums the committed refs carry
+    (§11.3) and nothing guarantees the re-commit — the repo's ``all`` row
+    then names deleted objects until an invoke finds the member gone and
+    re-folds it (standing with PR #666 Questions (6)). Whatever this
     returns, no PREVIOUS member's carrier stands when it does: the rewrite
     dropped it first (:func:`close_shard`), so a failed or empty plan leaves
     the shard without a carrier, never with a stale one.
@@ -423,6 +432,34 @@ def record_member_refs(store_root: str, grid, config, shard_key, *, store_kwargs
     except Exception as e:
         logger.warning(f"all-time column refs failed for shard {shard_key} (fail-open): {e}")
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def heal_member_refs(store_root: str, grid, config, shard_key, *, store_kwargs) -> dict | None:
+    """Re-write a LOST ladder carrier from the standing member; ``None`` when none was owed.
+
+    The all-current invoke's half of :func:`record_member_refs` (PR #666
+    review finding (4), phase 4): the member was not rewritten, so nothing
+    else would ever index it. Under ``commit: "ladder"`` a carrier that is
+    absent (or unreadable) is planned again from the standing member — no
+    member write — and nothing is written when the member itself is absent
+    (the plan is empty). ``commit: "leaf"`` has no carrier to lose: its refs
+    were committed by the closing unit. Cost: one GET per all-current bulk
+    invoke with Icechunk on; the plan's HEADs only when the carrier is gone.
+    The healed carrier is committed by the next node that closes over the
+    shard, like any carrier (the dirty-set rule, §11.4). Fail-open.
+    """
+    try:
+        from zagg.icechunk_ladder import read_member_refs
+        from zagg.icechunk_refs import resolve_options
+
+        if resolve_options(config, grid.parent_order, grid=grid)["commit"] == "leaf":
+            return None
+        if read_member_refs(store_root, shard_key, store_kwargs=store_kwargs) is not None:
+            return None
+    except Exception as e:
+        logger.warning(f"all-time column refs carrier unreadable for shard {shard_key}: {e}")
+    record = record_member_refs(store_root, grid, config, shard_key, store_kwargs=store_kwargs)
+    return None if record.get("skipped") else record
 
 
 def close_shard(
@@ -559,17 +596,18 @@ def _close_all_time(
             store_kwargs=store_kwargs,
         )
         closed = time.time() - _t0
-        if column is not None:
-            # The repo's ``all`` row at the column levels (issue #649, spec
-            # §11.2): after the member is committed, so the refs point at
-            # objects its stamp certifies. Fail-open inside (D9).
-            from zagg.config import get_icechunk
+        # The repo's ``all`` row at the column levels (issue #649, spec
+        # §11.2): after the member is committed, so the refs point at objects
+        # its stamp certifies; an invoke that wrote nothing heals a carrier
+        # the standing member has lost. Fail-open inside (D9).
+        from zagg.config import get_icechunk
 
-            if get_icechunk(config):
-                sink["icechunk_all_time"] = record_member_refs(
-                    store_root, grid, config, shard_key, store_kwargs=store_kwargs
-                )
-                refs_s = time.time() - _t0 - closed
+        if (column is not None or not fresh) and get_icechunk(config):
+            refs = record_member_refs if column is not None else heal_member_refs
+            record = refs(store_root, grid, config, shard_key, store_kwargs=store_kwargs)
+            if record is not None:
+                sink["icechunk_all_time"] = record
+            refs_s = time.time() - _t0 - closed
     except Exception as e:
         logger.error(f"all-time column write failed for shard {shard_key}: {e}")
         sink["error"] = f"all-time column: {e}"
