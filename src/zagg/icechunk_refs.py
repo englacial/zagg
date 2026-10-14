@@ -1370,10 +1370,9 @@ def leaf_units(
 def column_units(grid, config, shard_key, store_root, column, row, *, store_kwargs) -> list[dict]:
     """One unit per column member that is a repo LEVEL, at ``row`` (§11.2).
 
-    The column half of :func:`leaf_units`, shared with the shard's all-time
-    column (:func:`member_units`): ``column`` is the artifact's basename
-    beside the shard's leaves, ``row`` the label its refs land in. Empty when
-    the declaration carries no column.
+    The column half of :func:`leaf_units`, shared with :func:`member_units`:
+    ``column`` is the artifact's basename beside the shard's leaves, ``row``
+    its refs' label. Empty when the declaration carries no column.
     """
     from zagg.column import leaf_column_plan, leaf_level_cells
     from zagg.hive import shard_leaf_path
@@ -1405,11 +1404,9 @@ def column_units(grid, config, shard_key, store_root, column, row, *, store_kwar
 def member_units(grid, config, shard_key, store_root, *, store_kwargs) -> list[dict]:
     """The shard's all-time column's units: its declared levels at the ``all`` row (§11.2).
 
-    The windowed store's ``all`` row at the column levels (issue #649): the
-    §4.6 all-time column ``all.pyramid.zarr`` beside the shard's window
-    columns, indexed exactly as a window column is at its window's row —
-    and nothing at the base, which has no all-time leaf. Empty when no
-    column is declared; the caller indexes only a member it just wrote.
+    ``all.pyramid.zarr`` (§4.6, issue #649), indexed as a window column is at
+    its window's row; nothing at the base, which has no all-time leaf. Units
+    without refs (or none) when the member or its declaration is absent.
     """
     from zagg.column import column_name
 
@@ -1512,6 +1509,7 @@ __all__ = [
     "REBASE_TRIES",
     "REPLAY_TRIES",
     "ZARR_CONVENTIONS_ATTR",
+    "column_units",
     "commit_units",
     "container_prefix",
     "finest_dispatch_order",
@@ -1520,6 +1518,7 @@ __all__ = [
     "leaf_units",
     "level_grids",
     "leaf_ref_plan",
+    "member_units",
     "level_group_spec",
     "multiscales_layout",
     "object_ref_plan",

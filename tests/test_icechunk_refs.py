@@ -1802,6 +1802,52 @@ class TestCarrier:
         units, _meta = unpack_units(json.dumps(raw).encode(), "file:///r/")
         assert units == [{"level": 6, "row": "all", "entries": []}]
 
+    def test_the_member_carrier_is_the_leaf_carrier_under_its_own_key(self, cfg, tmp_path):
+        # One packer behind both (PR #666 review finding (7)): the same bytes
+        # and the same record — ``levels`` finest first — under another key.
+        from pathlib import Path
+
+        from zagg import icechunk_ladder
+
+        grid, root = _grid(cfg), str(tmp_path / "store")
+        (shard,) = _shards(grid, 1)
+        units = [
+            {
+                "level": level,
+                "row": "all",
+                "entries": [
+                    {
+                        "path": f"{level}/x",
+                        "sharded": False,
+                        "chunks": [(f"{level}/x/c/0", f"file://{root}/x/c/0", 12, '"etag"')],
+                        "refs": 1,
+                    }
+                ],
+            }
+            for level in (5, 6)
+        ]
+        leaf = hive.shard_leaf_path(root, shard)
+        member = icechunk_ladder.write_member_refs(root, shard, grid, units, store_kwargs={})
+        as_leaf = icechunk_ladder.write_leaf_refs(
+            root, leaf, grid, units, spec="morton-hive/3", store_kwargs={}
+        )
+        assert member["sidecar"] == "all.pyramid.icechunk_refs.json" != as_leaf["sidecar"]
+        assert member["levels"] == as_leaf["levels"] == [6, 5]
+        assert {**member, "sidecar": None} == {**as_leaf, "sidecar": None}
+        node = Path(leaf).parent
+        assert (node / member["sidecar"]).read_bytes() == (node / as_leaf["sidecar"]).read_bytes()
+
+    def test_a_geometry_refusal_names_the_carrier_it_vetted(self):
+        from zagg.icechunk_ladder import GEOMETRY_KEYS, _vet_geometry
+
+        block = dict.fromkeys(GEOMETRY_KEYS, 1)
+        with pytest.raises(ValueError, match="leaf 111 refs carry no geometry"):
+            _vet_geometry("111", {}, block)
+        with pytest.raises(ValueError, match="all-time column 111 refs are for"):
+            _vet_geometry(
+                "111", {"geometry": dict.fromkeys(GEOMETRY_KEYS, 2)}, block, "all-time column"
+            )
+
 
 def _ladder_run(
     monkeypatch,
