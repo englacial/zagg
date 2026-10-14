@@ -145,6 +145,19 @@ def pool_width_pacing(knob: str, value: str) -> str:
     )
 
 
+def no_poller_pacing(kind: str) -> str:
+    """The pacing line for the raster / temporal Lambda fan-outs (issue #652).
+
+    Those strategies refuse ``invocation="event"``, so unlike
+    :func:`pool_width_pacing` there is no knob to flip: the line says the
+    guard cannot apply rather than naming a value that raises.
+    """
+    return (
+        f"pool width: the {kind} fan-out has no status poller, so the ramp and "
+        "circuit breaker do not apply (issue #652)"
+    )
+
+
 @dataclass(frozen=True)
 class GuardConfig:
     """The ramp + breaker knobs (issue #652 defaults; every one a knob).

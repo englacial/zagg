@@ -104,6 +104,12 @@ class TestDispatchKnob:
         if warns:
             assert "invocation='event'" in hit[0].getMessage()
 
+    def test_a_bad_block_is_refused_for_a_temporal_config(self):
+        # Validated in agg before the strategy (issue #652): the temporal
+        # fan-out has no poller, but a bad block still fails at submission.
+        with pytest.raises(ValueError, match=re.escape("dispatch.breaker: unknown key(s)")):
+            agg(_temporal_config(), events=_synthetic_events(), dispatch={"breaker": {"x": 1}})
+
     def test_no_knobs_no_warning(self, monkeypatch, caplog, atl06_config):
         from zagg import runner
 

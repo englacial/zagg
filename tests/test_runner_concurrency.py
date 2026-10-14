@@ -275,6 +275,15 @@ class TestCostBlockEvents:
         assert cost["actual_cost_usd"] == pytest.approx(3 * 1.0 * 4.0 * LAMBDA_PRICE_PER_GB_SEC)
         assert cost["actual_cost_usd"] == summary["estimated_cost_usd"]
 
+    def test_summary_names_its_pacing(self, lambda_env, monkeypatch):
+        # No status poller on the events path (issue #652, PR #665 review).
+        summary = self._run(monkeypatch, self._cfg())
+        assert summary["ramp"] == [] and summary["breaker"] is None
+        assert summary["dispatch_pacing"] == (
+            "pool width: the temporal fan-out has no status poller, so the ramp and "
+            "circuit breaker do not apply (issue #652)"
+        )
+
     def test_max_bounds_actual(self, lambda_env, monkeypatch):
         # Even at the worst billed duration (the 900 s timeout), the pre-invoke
         # ceiling bounds the rollup.

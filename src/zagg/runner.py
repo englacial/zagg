@@ -76,6 +76,7 @@ from zagg.dispatch_guard import (
     DispatchGuard,
     GuardConfig,
     describe,
+    no_poller_pacing,
     pool_width_pacing,
 )
 from zagg.grids.base import shard_label
@@ -325,7 +326,9 @@ def agg(
         pool width with the knob to flip named. Travels through the
         strategies as ``dispatch_knobs`` so it never shadows the generic
         :func:`zagg.dispatch.dispatch` loop; the temporal and raster
-        strategies accept and ignore it (no status poller to pace).
+        strategies accept and ignore it (no status poller to pace), and their
+        lambda summaries carry ``ramp: []`` / ``breaker: None`` with a
+        ``dispatch_pacing`` line saying so.
     invocation : str
         Lambda-only (issue #151). ``"async"`` (default) dispatches each cell
         with ``InvocationType="Event"`` and polls a per-shard result object the
@@ -1806,6 +1809,10 @@ class RasterStrategy:
             # is its finalize record (issue #582).
             "icechunk": None,
             "icechunk_finalize": None,
+            # No status poller here (issue #652): the guard never paces it.
+            "ramp": [],
+            "breaker": None,
+            "dispatch_pacing": no_poller_pacing("raster"),
         }
         if profile:
             # Straggler-maxed stage seconds (+ the write bucket) and summed
@@ -2164,6 +2171,10 @@ def _run_lambda_events(
         "backend": "lambda",
         "results": rows,
         "failures": failures,
+        # No status poller here (issue #652): the guard never paces it.
+        "ramp": [],
+        "breaker": None,
+        "dispatch_pacing": no_poller_pacing("temporal"),
         **container_stats,
     }
     logger.info(
