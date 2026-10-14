@@ -2690,8 +2690,10 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
     skipped as current, one the store holds a column for that this invoke
     was not dispatched (a run over new granules sends only the windows they
     touch) — read back from its stored column. A window whose sink kept
-    nothing (the benign no-data error) has no leaf and no column, and is
-    simply not a source. A window that FAILED (or committed its leaf and
+    nothing (the benign no-data error) writes no leaf and no column: on a
+    first build it is not a source, but a leaf and column an earlier run
+    left survive (no issue #341 clear reaches it) and are read back like any
+    stored window's. A window that FAILED (or committed its leaf and
     then failed its column) defers the close: the retry rewrites it and the
     member, and meanwhile the standing member — which folds that window's
     previous column — is cleared, since absent beats stale (the

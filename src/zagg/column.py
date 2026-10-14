@@ -956,9 +956,11 @@ def write_leaf_column(
     can keep each window's column RESIDENT and fold the shard's all-time
     column from the exact values it wrote (:mod:`zagg.column_alltime`), with
     no read-back. The bulk unit holds every window's fold until its close, so
-    its peak grows with the window count; the size per window is UNMEASURED
+    its peak — staged + every window's fold + the member's fold during the
+    close — grows with the window count; the size per window is UNMEASURED
     at the v4 geometry (cells 16..9 at node 9), and only the bulk unit passes
-    it — every other unit keeps nothing past this call.
+    it — every other unit keeps nothing past this call (the fan-out unit
+    clears the member rather than closing it, PR #666 review finding (1)).
     """
     store_kwargs = dict(store_kwargs or {})
     # The gate re-validates a declaration the templating path already
