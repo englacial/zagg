@@ -555,7 +555,8 @@ class TestStatusPoller:
         assert calls["n"] == 2
         _put_status(store, 1)
         poller._tick()
-        assert fut.result(timeout=1)["retries"] == 1
+        assert fut.done()  # the tick resolved it: no wall clock left to wait on
+        assert fut.result()["retries"] == 1
 
     def test_throttled_invoke_backs_off_instead_of_bursting(self):
         # The medium-high from the PR #343 review: re-queueing without a
@@ -589,7 +590,8 @@ class TestStatusPoller:
             assert len(fired) == expected, fired
             now["t"] = stamp
             poller._tick()
-        result = fut.result(timeout=1)  # attempt 4 == max_retries: terminal
+        assert fut.done()  # attempt 4 == max_retries: terminal on that tick
+        result = fut.result()
         assert "TooManyRequestsException" in result["error"]
         assert result["retries"] == 3
         assert fired == [1000.0, 1002.0, 1006.0, 1014.0]
