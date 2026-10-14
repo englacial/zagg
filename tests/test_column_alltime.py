@@ -844,8 +844,38 @@ class TestBulkUnit:
         root = str(tmp_path / "bulk")
         emit._run_bulk(monkeypatch, emit._digest_cfg(), root, fakes=emit._dense_fakes())
         (_node(root) / "not_a.label.pyramid.zarr").mkdir()  # outside the label charset
+        (_node(root) / "notes.txt").mkdir()  # neither a leaf nor a column
         assert (_node(root) / "all.pyramid.zarr").exists()
         assert stored_window_labels(root, emit._shard_word(), {}) == set(WINDOWS)
+
+    def test_a_leaf_without_its_column_counts_missing(self, monkeypatch, tmp_path):
+        # PR #666 review finding (7): the shard's windows are its LEAVES too.
+        # 2018's column is gone but its leaf stands, and the run dispatches
+        # 2020 alone (current): 2018 must count ``missing``, not vanish.
+        import shutil
+
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        shutil.rmtree(_node(root) / "2018.pyramid.zarr")
+        assert Path(hive.shard_leaf_path(root, emit._shard_word(), window="2018")).exists()
+        self._current_for(monkeypatch, {"2020"})
+        meta = emit._run_bulk(
+            monkeypatch,
+            cfg,
+            root,
+            fakes=emit._dense_fakes(),
+            records=[emit._records()[1]],
+            skip_if_current=True,
+        )
+        assert [m["window"] for m in meta["windows"]] == ["2020"]
+        assert meta["current"] is True and meta["all_time_column"] == "all.pyramid.zarr"
+        attrs = json.loads((_node(root) / "all.pyramid.zarr" / "zarr.json").read_text())
+        assert attrs["attributes"][COLUMN_ATTR]["source_windows"] == {
+            "folded": 2,
+            "missing": 1,
+            "unreadable": 0,
+        }
 
     def test_a_failed_close_is_the_shards_error_and_the_windows_keep_theirs(
         self, monkeypatch, tmp_path

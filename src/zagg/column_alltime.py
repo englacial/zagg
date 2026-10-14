@@ -311,36 +311,46 @@ def write_all_time_column(
 
 
 def stored_window_labels(store_root: str, shard_key, store_kwargs: dict | None = None) -> set:
-    """The window labels with a ``{label}.pyramid.zarr`` beside the shard: one delimiter LIST.
+    """The window labels the shard HAS — its window leaves and columns: one delimiter LIST.
 
     The all-time member covers EVERY window the shard HAS, not the ones an
     invoke was dispatched — a run over new granules alone sends the windows
     those granules touch — and the store is the only place that knows
-    (:func:`zagg.sweep_units.node_windows`' posture, one tier down: the column
-    objects at the leaf's node prefix, the reserved ``all`` member excluded).
-    Bounded and node-scoped, never a walk; a failed LIST raises, since folding
-    the windows one invoke happened to hold and calling it all-time would
-    publish a short fold under a name that claims the whole record.
+    (:func:`zagg.sweep_units.node_windows`' posture, one tier down). At the
+    shard tier the windows it has are its LEAVES (``{id}_{label}.zarr``,
+    :func:`zagg.windows.split_leaf_name`) as well as its columns
+    (``{label}.pyramid.zarr``, the reserved ``all`` member excluded): a
+    committed leaf whose column is absent then reads ``missing`` in
+    :func:`window_row` instead of vanishing from the record (PR #666 review
+    finding (7)). Bounded and node-scoped, never a walk; a failed LIST raises,
+    since folding the windows one invoke happened to hold and calling it
+    all-time would publish a short fold under a name that claims the whole
+    record.
     """
     import obstore
 
     from zagg.column import COLUMN_SUFFIX
     from zagg.hive import shard_leaf_path
     from zagg.store import open_object_store
-    from zagg.windows import SCHEDULE_NONE_TOKEN, validate_label
+    from zagg.windows import SCHEDULE_NONE_TOKEN, split_leaf_name, validate_label
 
-    node_prefix = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
+    node_prefix, _sep, bare = shard_leaf_path(store_root, shard_key).rstrip("/").rpartition("/")
+    own_id = bare.removesuffix(".zarr")
     store = open_object_store(node_prefix, **dict(store_kwargs or {}))
     labels = set()
     for prefix in obstore.list_with_delimiter(store)["common_prefixes"]:
         name = str(prefix).rstrip("/").rsplit("/", 1)[-1]
-        label = name.removesuffix(COLUMN_SUFFIX)
-        if label == name or label == SCHEDULE_NONE_TOKEN:
-            continue
         try:
-            labels.add(validate_label(label))
+            if name.endswith(COLUMN_SUFFIX):
+                label = validate_label(name.removesuffix(COLUMN_SUFFIX))
+            else:
+                full_id, label = split_leaf_name(name)
+                if full_id != own_id:
+                    continue
         except ValueError:
-            continue  # not a window's column (foreign debris)
+            continue  # neither a window's leaf nor its column (foreign debris)
+        if label is not None and label != SCHEDULE_NONE_TOKEN:
+            labels.add(label)
     return labels
 
 
@@ -362,7 +372,7 @@ def close_shard(
     deletes any a previous declaration left (:func:`zagg.column._clear_column`
     under the token), so the member never outlives the declaration that
     made it. The windows folded are every label the shard HAS — the stored
-    columns beside it (:func:`stored_window_labels`), the ``resident`` folds
+    leaves and columns beside it (:func:`stored_window_labels`), the ``resident`` folds
     this invoke wrote, and ``dispatched``: the labels this invoke was sent
     but did not write (the identity gate skipped them), so a skipped window
     whose column is gone counts ``missing`` rather than vanishing from the
