@@ -164,6 +164,45 @@ def test_the_icechunk_repo_holds_one_row_per_window_plus_all(built):
     assert block["rows_per_manifest"] == 1
 
 
+def test_the_icechunk_all_row_reaches_the_leaf_column_levels(built):
+    """Issue #649 phase 4: the repo's ``all`` row at the declared column levels
+    reads the shard's all-time column, not fill — what the probe measured as
+    zero at cells 13 and 16 on v4."""
+    import zarr
+
+    from zagg.icechunk_refs import open_repo, read_block
+    from zagg.icechunk_rows import ALL_ROW
+    from zagg.store import open_store
+
+    name, cfg, root, shards = built
+    rows = read_block(str(root), store_kwargs={})["rows"]
+    session = open_repo(str(root), store_kwargs={}).readonly_session("main")
+    group = zarr.open_group(session.store, mode="r")
+    from zagg.grids import HealpixGrid
+
+    grid = HealpixGrid(parent_order=9, child_order=19, config=cfg)
+    for shard in shards:
+        (rank,) = grid.block_index(shard)
+        node = hive.shard_leaf_path(str(root), shard).rsplit("/", 1)[0]
+        member = zarr.open_group(open_store(f"{node}/all.pyramid.zarr"), mode="r", zarr_format=3)
+        for level in (16, 15, 14, 13):
+            n = 4 ** (level - 9)
+            got = np.asarray(
+                group[str(level)]["count"][rows.index(ALL_ROW), rank * n : (rank + 1) * n]
+            )
+            want = np.asarray(member[str(level)]["count"][:])
+            assert want.any(), (shard, level)
+            np.testing.assert_array_equal(got, want)
+            for w in WINDOWS:
+                column = zarr.open_group(
+                    open_store(f"{node}/{w}.pyramid.zarr"), mode="r", zarr_format=3
+                )
+                np.testing.assert_array_equal(
+                    group[str(level)]["count"][rows.index(w), rank * n : (rank + 1) * n],
+                    column[str(level)]["count"][:],
+                )
+
+
 @pytest.fixture(scope="module")
 def report(built):
     """One full-mode ``validate_pyramid`` per template, for the two tests that

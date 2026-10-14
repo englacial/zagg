@@ -366,6 +366,57 @@ def stored_window_labels(store_root: str, shard_key, store_kwargs: dict | None =
     return labels
 
 
+def clear_member(store_root: str, shard_key, store_kwargs=None) -> None:
+    """Delete the shard's all-time column, its sidecar and its Icechunk refs carrier.
+
+    :func:`zagg.column._clear_column` under the token (the member and
+    ``all.pyramid.stats.json``), plus the carrier the bulk unit wrote for the
+    ladder's ``all`` row (:func:`zagg.icechunk_ladder.delete_member_refs`,
+    fail-open): refs to an object that is gone would be committed by the
+    next ladder run as dangling, so the carrier goes with the member.
+    """
+    from zagg.column import _clear_column
+    from zagg.icechunk_ladder import delete_member_refs
+
+    store_kwargs = dict(store_kwargs or {})
+    _clear_column(store_root, shard_key, None, store_kwargs)
+    delete_member_refs(store_root, shard_key, store_kwargs=store_kwargs)
+
+
+def record_member_refs(store_root: str, grid, config, shard_key, *, store_kwargs) -> dict:
+    """The member's Icechunk record (issue #649; spec §11.2's ``all`` row at the column levels).
+
+    :func:`zagg.hive._leaf_icechunk_refs`' posture for the member: plan its
+    units from fresh HEADs (:func:`zagg.icechunk_refs.member_units`) and,
+    per the resolved ``commit`` mode, commit them (``"leaf"``, after vetting
+    the repo) or write them as the ladder's carrier beside the shard
+    (``"ladder"``, :func:`zagg.icechunk_ladder.write_member_refs`, which the
+    node's commit gathers when it closes). Fail-open, never raises: the
+    member is normative, the repo a regenerable index (D9); a failure logs
+    and returns ``{"error"}``. Called only after the member was WRITTEN this
+    invoke — a current member keeps the refs it already has.
+    """
+    try:
+        from zagg.icechunk_ladder import write_member_refs
+        from zagg.icechunk_refs import member_units, record_leaf, resolve_options, vet_leaf_repo
+
+        commit_leaf = resolve_options(config, grid.parent_order, grid=grid)["commit"] == "leaf"
+        repo = vet_leaf_repo(store_root, grid, store_kwargs=store_kwargs) if commit_leaf else None
+        units = member_units(grid, config, shard_key, store_root, store_kwargs=store_kwargs)
+        if not any(e["refs"] for u in units for e in u["entries"]):
+            return {"skipped": "empty"}
+        if commit_leaf:
+            return record_leaf(
+                store_root, grid, shard_key, store_kwargs=store_kwargs, units=units, repo=repo
+            )
+        record = write_member_refs(store_root, shard_key, grid, units, store_kwargs=store_kwargs)
+        checksum = "etag" if store_root.startswith("s3://") else "last_modified"
+        return {**record, "checksum": checksum}
+    except Exception as e:
+        logger.warning(f"all-time column refs failed for shard {shard_key} (fail-open): {e}")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def close_shard(
     store_root: str,
     shard_key,
@@ -398,12 +449,12 @@ def close_shard(
     one store handle each), one for the member; a re-fold then reads every
     stored member array in fold blocks, re-validating the root around each.
     """
-    from zagg.column import _clear_column, leaf_column_plan
+    from zagg.column import leaf_column_plan
 
     store_kwargs = dict(store_kwargs or {})
     plan = leaf_column_plan(config, grid)
     if plan is None:
-        _clear_column(store_root, shard_key, None, store_kwargs)
+        clear_member(store_root, shard_key, store_kwargs)
         return None
     resolutions, fields = plan
     labels = stored_window_labels(store_root, shard_key, store_kwargs) | set(resident)
@@ -482,6 +533,16 @@ def _close_all_time(
             fresh=fresh,
             store_kwargs=store_kwargs,
         )
+        if column is not None:
+            # The repo's ``all`` row at the column levels (issue #649, spec
+            # §11.2): after the member is committed, so the refs point at
+            # objects its stamp certifies. Fail-open inside (D9).
+            from zagg.config import get_icechunk
+
+            if get_icechunk(config):
+                sink["icechunk_all_time"] = record_member_refs(
+                    store_root, grid, config, shard_key, store_kwargs=store_kwargs
+                )
     except Exception as e:
         logger.error(f"all-time column write failed for shard {shard_key}: {e}")
         sink["error"] = f"all-time column: {e}"

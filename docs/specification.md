@@ -4788,12 +4788,22 @@ columns do:
    and its column, the window's label for a windowed leaf — one leaf, and
    so one carrier, per window; a carrier written before `/2` names none and
    is read as `all`) — never a row index, which only the repo knows (§11.2), so a
-   carrier stays valid whatever rows other runs allocate. It is a
+   carrier stays valid whatever rows other runs allocate. The bulk unit
+   that closes a windowed shard (§4.6 "The all-time column", issue
+   [#649](https://github.com/englacial/zagg/issues/649)) writes one more
+   carrier beside the shard's leaves, `all.pyramid.icechunk_refs.json`
+   (the member's own `{stem}.{base}` sibling grammar), holding the
+   all-time column's declared-level units at row `all` — no base unit,
+   since there is no all-time leaf — and deletes it whenever it clears the
+   member, so a carrier never outlives the object it indexes. It is a
    **writer-internal carrier**, not part of the reader contract — the repo
    is. No Icechunk session is opened on the leaf path.
 2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
    `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
-   the finest tuple, one per `(leaf, window)` on a windowed store, its
+   the finest tuple, one per `(leaf, window)` on a windowed store plus,
+   when the node closes (§4.4), each shard's all-time column carrier for
+   the `all` row (a shard without one — a per-window build, a close that
+   has not run — contributes nothing there and is not counted missing), its
    children's **node ref columns** (the same carrier at
    `{node}/icechunk_refs.json`) above — and adds the refs of the overview
    objects at every order of its tuple beneath it (read the same way a

@@ -1109,6 +1109,164 @@ class TestBulkUnit:
         assert not list(node.glob("*.pyramid.*"))
 
 
+class TestIcechunkAllRow:
+    """Phase 4 (issue #649): the repo's ``all`` row at the column levels references the member."""
+
+    @pytest.fixture(autouse=True)
+    def _icechunk(self):
+        pytest.importorskip("icechunk")
+
+    def _init(self, cfg, root):
+        from zagg import icechunk_refs
+        from zagg.config import get_windowing
+
+        grid = emit._grid(cfg)
+        manifest = hive.build_manifest(grid, windowing=get_windowing(cfg))
+        hive.ensure_manifest(root, manifest)
+        icechunk_refs.init_repo(
+            root,
+            grid,
+            cfg,
+            run_id="r1",
+            store_kwargs={},
+            manifest=manifest,
+            rows=[*WINDOWS, SCHEDULE_NONE_TOKEN],
+        )
+        return grid
+
+    def _repo(self, root):
+        from zagg import icechunk_refs
+
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        rows = icechunk_refs.read_block(root, store_kwargs={})["rows"]
+        return zarr.open_group(repo.readonly_session("main").store, mode="r"), rows
+
+    def test_member_units_name_the_all_row_at_the_declared_column_levels(
+        self, monkeypatch, tmp_path
+    ):
+        from zagg.icechunk_refs import member_units
+
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        units = member_units(emit._grid(cfg), cfg, emit._shard_word(), root, store_kwargs={})
+        # The declared leaf level (7) at the reserved row; no base unit (there
+        # is no all-time leaf), none for the node-order partial (6).
+        assert [(u["level"], u["row"]) for u in units] == [(7, SCHEDULE_NONE_TOKEN)]
+        entries = {e["path"]: e for e in units[0]["entries"]}
+        assert set(entries) == {"morton", "count", "h_tdigest"}
+        locations = {
+            loc
+            for e in entries.values()
+            for loc in (e["locations"] if e["sharded"] else [c[1] for c in e["chunks"]])
+            if loc
+        }
+        assert locations and all("/all.pyramid.zarr/7/" in loc for loc in locations)
+
+    def test_the_leaf_commit_lands_the_member_at_the_all_row(self, monkeypatch, tmp_path):
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": "leaf"}
+        root = str(tmp_path / "bulk")
+        grid = self._init(cfg, root)
+        meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert meta["error"] is None and meta["all_time_column"] == "all.pyramid.zarr"
+        assert meta["icechunk_all_time"].get("error") is None, meta["icechunk_all_time"]
+        assert meta["icechunk_all_time"]["refs"] > 0
+        group, rows = self._repo(root)
+        (rank,) = grid.block_index(emit._shard_word())
+        span = slice(rank * 4, (rank + 1) * 4)
+        member = _column_groups(_node(root) / "all.pyramid.zarr")[7]
+        np.testing.assert_array_equal(
+            group["7"]["count"][rows.index(SCHEDULE_NONE_TOKEN), span], member["count"]
+        )
+        for w in WINDOWS:
+            column = _column_groups(_node(root) / f"{w}.pyramid.zarr")[7]
+            np.testing.assert_array_equal(group["7"]["count"][rows.index(w), span], column["count"])
+        # The base has no all-time leaf: its ``all`` row reads fill.
+        assert not np.asarray(group["8"]["count"][rows.index(SCHEDULE_NONE_TOKEN), :]).any()
+        # The member's refs point into the member, the windows' into theirs.
+        from test_icechunk_rows import _refs
+
+        from zagg import icechunk_refs
+
+        refs = _refs(
+            icechunk_refs.open_repo(root, store_kwargs={}).readonly_session("main"), "7/count"
+        )
+        by_row = {}
+        for (row, _cell), (_kind, location, _offset, _length) in refs.items():
+            by_row.setdefault(row, set()).add(location.rsplit("/7/", 1)[0].rsplit("/", 1)[-1])
+        assert by_row[rows.index(SCHEDULE_NONE_TOKEN)] == {"all.pyramid.zarr"}
+        assert by_row[rows.index("2019")] == {"2019.pyramid.zarr"}
+
+    def test_the_ladder_carrier_is_written_read_and_cleared_with_the_member(
+        self, monkeypatch, tmp_path
+    ):
+        from zagg import icechunk_ladder, icechunk_refs
+        from zagg.grids.morton import morton_decimal
+
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": "ladder"}
+        root = str(tmp_path / "bulk")
+        grid = self._init(cfg, root)
+        meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert meta["icechunk_all_time"]["sidecar"] == "all.pyramid.icechunk_refs.json"
+        assert (_node(root) / "all.pyramid.icechunk_refs.json").exists()
+        got = icechunk_ladder.read_member_refs(root, emit._shard_word(), store_kwargs={})
+        assert got is not None
+        units, carrier_meta = got
+        assert [(u["level"], u["row"]) for u in units] == [(7, SCHEDULE_NONE_TOKEN)]
+        assert carrier_meta["geometry"] == {
+            "shard_order": grid.parent_order,
+            "chunk_order": grid.chunk_order,
+            "cell_order": grid.child_order,
+        }
+        # The committing node gathers it with the leaves' carriers when it
+        # closes, and not otherwise.
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        dec = morton_decimal(emit._shard_word())
+        node = dec[:-1]
+        args = (root, node, 6, 6, [dec], block, "morton-hive/2", {}, list(WINDOWS))
+        rows_closed = [row for u, _m in icechunk_ladder._child_units(*args, True) for row in u]
+        rows_open = [row for u, _m in icechunk_ladder._child_units(*args, False) for row in u]
+        assert [(u["level"], u["row"]) for u in rows_closed if u["row"] == SCHEDULE_NONE_TOKEN] == [
+            (7, SCHEDULE_NONE_TOKEN)
+        ]
+        assert all(u["row"] != SCHEDULE_NONE_TOKEN for u in rows_open)
+        # Committed, the ``all`` row at level 7 reads the member's values.
+        icechunk_refs.commit_units(root, units, f"node {node}", store_kwargs={})
+        group, rows = self._repo(root)
+        (rank,) = grid.block_index(emit._shard_word())
+        member = _column_groups(_node(root) / "all.pyramid.zarr")[7]
+        np.testing.assert_array_equal(
+            group["7"]["count"][rows.index(SCHEDULE_NONE_TOKEN), rank * 4 : (rank + 1) * 4],
+            member["count"],
+        )
+        # A fan-out unit clears the member — and its carrier with it.
+        out = emit._run_fanout(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), records=[emit._records()[1]]
+        )
+        assert out["2020"]["error"] is None
+        assert not (_node(root) / "all.pyramid.zarr").exists()
+        assert not (_node(root) / "all.pyramid.icechunk_refs.json").exists()
+        assert icechunk_ladder.read_member_refs(root, emit._shard_word(), store_kwargs={}) is None
+
+    def test_a_shard_without_a_carrier_is_not_missing(self, monkeypatch, tmp_path):
+        from zagg import icechunk_ladder, icechunk_refs
+        from zagg.grids.morton import morton_decimal
+
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": "ladder"}
+        root = str(tmp_path / "bulk")
+        self._init(cfg, root)
+        emit._run_fanout(monkeypatch, cfg, root, fakes=emit._dense_fakes())  # no member
+        block = icechunk_refs.read_block(root, store_kwargs={})
+        dec = morton_decimal(emit._shard_word())
+        args = (root, dec[:-1], 6, 6, [dec], block, "morton-hive/2", {}, list(WINDOWS))
+        yielded = list(icechunk_ladder._child_units(*args, True))
+        assert sum(miss for _u, miss in yielded) == 0
+        assert all(u["row"] != SCHEDULE_NONE_TOKEN for units, _m in yielded for u in units)
+
+
 @pytest.mark.parametrize("label", ["2019", SCHEDULE_NONE_TOKEN])
 def test_the_token_names_the_column_beside_the_node_not_a_leaf(tmp_path, label):
     # ``write_column`` under the token derives the node prefix from the

@@ -2569,10 +2569,10 @@ def process_and_write_hive(
         # ``all_time`` leg fails it by leaf — until the maintainer rules how
         # it gets one (standing on PR #666). A failed clear is the unit's
         # error, as a failed column is.
-        from zagg.column import _clear_column
+        from zagg.column_alltime import clear_member
 
         try:
-            _clear_column(store_root, shard_key, None, store_kwargs)
+            clear_member(store_root, shard_key, store_kwargs)
         except Exception as e:
             logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
             meta["error"] = f"all-time column: {e}"
@@ -2729,10 +2729,10 @@ def _process_windows(
                 or not (m.get("error") or m.get("current") or m.get("refused"))
                 for m in metas.values()
             ):
-                from zagg.column import _clear_column
+                from zagg.column_alltime import clear_member
 
                 try:
-                    _clear_column(store_root, shard_key, None, unit_kwargs["store_kwargs"])
+                    clear_member(store_root, shard_key, unit_kwargs["store_kwargs"])
                 except Exception as exc:
                     logger.error(f"all-time column clear failed for shard {shard_key}: {exc}")
     if not fatal:
@@ -2770,8 +2770,7 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
     which is what heals a shard whose close once failed — on this unit only:
     a ``unit: window`` unit never closes (it clears, PR #666 review (1)).
     """
-    from zagg.column import _clear_column
-    from zagg.column_alltime import _close_all_time, _resident_sources
+    from zagg.column_alltime import _close_all_time, _resident_sources, clear_member
     from zagg.dispatch import BENIGN_ERRORS
 
     written: dict = {}
@@ -2790,7 +2789,7 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
         # member folds a superseded column, so it goes until the retry.
         if written or any(m.get("column_error") for m in metas.values()):
             try:
-                _clear_column(store_root, shard_key, None, unit_kwargs["store_kwargs"])
+                clear_member(store_root, shard_key, unit_kwargs["store_kwargs"])
             except Exception as e:
                 logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
                 base["error"] = f"all-time column: {e}"

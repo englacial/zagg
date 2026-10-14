@@ -205,6 +205,75 @@ def unpack_units(raw: bytes, prefix: str) -> tuple[list[dict], dict]:
     return units, meta
 
 
+def member_refs_key() -> str:
+    """The shard's all-time column's ref carrier: ``all.pyramid.icechunk_refs.json``.
+
+    The column sidecar's own ``{stem}.{base}`` grammar (``all.pyramid.stats.json``,
+    :func:`zagg.column._sidecar_name`): a fixed name beside the shard's
+    leaves, disjoint from every leaf carrier (``icechunk_refs_{window}.json``)
+    because no window label carries a ``.``.
+    """
+    from zagg.column import column_name
+
+    return f"{column_name(None).removesuffix('.zarr')}.{LEAF_REFS_NAME}"
+
+
+def write_member_refs(store_root: str, shard_key, grid, units: list, *, store_kwargs) -> dict:
+    """PUT the all-time column's units (:func:`zagg.icechunk_refs.member_units`) beside the shard.
+
+    :func:`write_leaf_refs`'s carrier under :func:`member_refs_key`, with the
+    same geometry block, so the committing node vets and reads it the way it
+    reads a leaf's (:func:`_child_units`). Written by the bulk unit after it
+    closed the shard (issue #649); the record rides the shard's metadata.
+    """
+    from zagg.hive import shard_leaf_path
+    from zagg.store import open_object_store, put_object
+
+    node_prefix = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
+    raw = pack_units(
+        units,
+        container_prefix(store_root),
+        geometry={
+            "shard_order": int(grid.parent_order),
+            "chunk_order": int(grid.chunk_order),
+            "cell_order": int(grid.child_order),
+        },
+    )
+    put_object(open_object_store(node_prefix, **store_kwargs), member_refs_key(), raw)
+    entries = [e for u in units for e in u["entries"]]
+    return {
+        "sidecar": member_refs_key(),
+        "bytes": len(raw),
+        "refs": int(sum(e["refs"] for e in entries)),
+        "arrays": int(sum(1 for e in entries if e["refs"])),
+        "levels": sorted({int(u["level"]) for u in units if any(e["refs"] for e in u["entries"])}),
+    }
+
+
+def read_member_refs(store_root: str, shard_key, *, store_kwargs) -> tuple[list, dict] | None:
+    """The all-time column's ``(units, meta)``, or ``None`` when the shard has no carrier."""
+    from zagg.hive import shard_leaf_path
+
+    node = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
+    rel = f"{node[len(store_root.rstrip('/')) + 1 :]}/{member_refs_key()}"
+    raw = _get(store_root, rel, store_kwargs)
+    return None if raw is None else unpack_units(raw, container_prefix(store_root))
+
+
+def delete_member_refs(store_root: str, shard_key, *, store_kwargs) -> None:
+    """Drop the member's carrier with the member it indexed (fail-open; absent beats stale)."""
+    import obstore
+
+    from zagg.hive import shard_leaf_path
+    from zagg.store import open_object_store
+
+    node_prefix = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
+    try:
+        obstore.delete(open_object_store(node_prefix, **store_kwargs), member_refs_key())
+    except Exception as e:
+        logger.debug(f"all-time column refs carrier clear skipped at {node_prefix}: {e}")
+
+
 def leaf_refs_key(leaf_name: str, spec: str | None = None) -> str:
     """The leaf's ref-sidecar object name — the stats sidecar's sibling grammar."""
     from zagg.telemetry import _sibling_key
@@ -392,7 +461,16 @@ def _overview_units(
 
 
 def _child_units(
-    store_root, node, child_order, shard_order, candidates, block, spec, store_kwargs, windows
+    store_root,
+    node,
+    child_order,
+    shard_order,
+    candidates,
+    block,
+    spec,
+    store_kwargs,
+    windows,
+    closes=False,
 ):
     """Yield ``(units, missing)`` per child, one child at a time.
 
@@ -408,13 +486,20 @@ def _child_units(
     (``[None]`` on an unwindowed store): one shard has one leaf, and so one
     carrier, per window (issue #584 phase 2), each naming its own row. A
     node column above the leaf tuple carries every row already, so
-    ``windows`` applies to the leaf read alone.
+    ``windows`` applies to the leaf read alone. ``closes`` (a windowed node
+    writing the ``all`` row this run, issue #649) adds each leaf child's
+    all-time column carrier (:func:`read_member_refs`) — the shard's ``all``
+    row at the column levels; a shard without one (a per-window build, a
+    close that did not run) contributes nothing there and is not
+    ``missing``: the member is a derived artifact no reader may require.
     """
     from zagg.grids.morton import morton_word
     from zagg.sweep_overview import _node_at
 
     children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
     pairs = [(c, w) for c in children for w in (windows if child_order == shard_order else [None])]
+    if closes and child_order == shard_order:
+        pairs += [(c, ALL_ROW) for c in children]
     for child, window in pairs:
         # Per-CHILD fail-open: a foreign spec token, a truncated carrier
         # (``JSONDecodeError`` is a ``ValueError``) or a geometry mismatch is
@@ -423,7 +508,14 @@ def _child_units(
         # production geometry — so it counts as ``missing`` like a carrier
         # that was never written (review finding).
         try:
-            if child_order == shard_order:
+            if child_order == shard_order and window == ALL_ROW:
+                got = read_member_refs(store_root, morton_word(child), store_kwargs=store_kwargs)
+                if got is None:
+                    yield [], 0
+                    continue
+                child_units, meta = got
+                _vet_geometry(child, meta, block)
+            elif child_order == shard_order:
                 got = read_leaf_refs(
                     store_root,
                     morton_word(child),
@@ -435,15 +527,7 @@ def _child_units(
                     yield [], 1
                     continue
                 child_units, meta = got
-                geometry = meta.get("geometry")
-                # Keyed off the FIXED tuple, not off the carrier's own dict: a
-                # carrier with no geometry block compared {} != {} and passed.
-                if not isinstance(geometry, dict) or any(k not in geometry for k in GEOMETRY_KEYS):
-                    raise ValueError(f"leaf {child} refs carry no geometry block")
-                want = {key: geometry[key] for key in GEOMETRY_KEYS}
-                have = {key: block.get(key) for key in GEOMETRY_KEYS}
-                if have != want:
-                    raise ValueError(f"leaf {child} refs are for {want}, the repo is {have}")
+                _vet_geometry(child, meta, block)
             else:
                 child_units = read_node_refs(store_root, child, store_kwargs=store_kwargs)
                 if child_units is None:
@@ -454,6 +538,21 @@ def _child_units(
             yield [], 1
             continue
         yield child_units, 0
+
+
+def _vet_geometry(child: str, meta: dict, block: dict) -> None:
+    """A leaf carrier's geometry against the repo's, keyed off the FIXED tuple.
+
+    A carrier with no geometry block would compare ``{} != {}`` and pass, so
+    every key is required (review finding, issue #580).
+    """
+    geometry = meta.get("geometry")
+    if not isinstance(geometry, dict) or any(k not in geometry for k in GEOMETRY_KEYS):
+        raise ValueError(f"leaf {child} refs carry no geometry block")
+    want = {key: geometry[key] for key in GEOMETRY_KEYS}
+    have = {key: block.get(key) for key in GEOMETRY_KEYS}
+    if have != want:
+        raise ValueError(f"leaf {child} refs are for {want}, the repo is {have}")
 
 
 def node_rows(block: dict, rows) -> list[str]:
@@ -551,6 +650,9 @@ def stage_node_refs(
         spec,
         store_kwargs,
         windows,
+        # The ``all`` row at the column levels (issue #649): a windowed node
+        # that closes this run gathers its leaves' all-time column carriers.
+        bool(windows) and ALL_ROW in rows,
     )
     if column_only:
         units, missing = [], 0
