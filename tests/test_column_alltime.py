@@ -777,6 +777,18 @@ class TestBulkUnit:
             "missing": 1,
             "unreadable": 0,
         }
+        # PR #666 review finding (6): the row can never be whole, and a
+        # re-fold would write the same counters — so the next all-current run
+        # leaves the member standing instead of rewriting it every time.
+        before = emit._tree(root)
+        stamped = attrs["attributes"][COMMIT_ATTR]
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert meta["current"] is True and "all_time_column" not in meta
+        assert emit._tree(root) == before
+        attrs = json.loads((_node(root) / "all.pyramid.zarr" / "zarr.json").read_text())
+        assert attrs["attributes"][COMMIT_ATTR] == stamped
 
     def test_a_fanout_window_unit_clears_the_member(self, monkeypatch, tmp_path):
         # PR #666 review finding (1), the interim: concurrent ``(shard,

@@ -157,15 +157,22 @@ def member_current(store_root: str, shard_key, row: list, *, store_kwargs=None) 
     """Whether the standing ``all.pyramid.zarr`` already folds exactly ``row``.
 
     The skip gate of an invoke that wrote nothing (every window the identity
-    gate found current): the member is current when it is committed, folded
-    every window of ``row`` and nothing else (``source_windows`` says
-    ``folded == len(row)`` with no ``missing`` or ``unreadable`` — a short
-    fold is re-folded so the next run heals it), and is stamped no earlier
-    than any column it folds. Stamps resolve to one second, so a column
-    rewritten in the member's own second by a writer that does not clear the
-    member reads as current (the issue #417 blind spot; every zagg writer of
-    a window column clears or rewrites the member in the same invoke).
-    Anything unreadable is not current.
+    gate found current): the member is current when it is committed, its
+    standing ``source_windows`` are the counters a re-fold of ``row`` would
+    write — ``folded`` its readers, ``missing`` its ``None`` entries,
+    ``unreadable`` its :data:`zagg.sweep_fold.UNREADABLE` ones — and it is
+    stamped no earlier than any column it folds. A short fold of a row that
+    has since grown is re-folded, so the next run heals it; a row that can
+    never be whole (a corrupt window root, a dispatched window whose column
+    is gone) is re-folded ONCE, not on every run, since a re-fold would
+    change nothing (PR #666 review finding (6)). A window some group refuses
+    counts ``unreadable`` in the member but as a reader here, so such a
+    member is re-folded each run — the kernel's refusal is rare, and only a
+    fold can see it. Stamps resolve to one second, so a column rewritten in
+    the member's own second by a writer that does not clear the member reads
+    as current (the issue #417 blind spot; every zagg writer of a window
+    column clears or rewrites the member in the same invoke). A standing
+    member that cannot be read is not current.
     """
     from zagg.column import COLUMN_ATTR, column_name
     from zagg.hive import shard_leaf_path
@@ -176,19 +183,21 @@ def member_current(store_root: str, shard_key, row: list, *, store_kwargs=None) 
     except Exception as e:
         logger.warning(f"all-time column: standing member unreadable ({e}); re-folding")
         return False
-    if not member.committed or not all(_is_reader(entry) for entry in row):
+    if not member.committed:
         return False
+    readers = [entry for entry in row if _is_reader(entry)]
+    missing = sum(1 for entry in row if entry is None)
     block = member.attrs.get(COLUMN_ATTR)
     counters = (block.get("source_windows") or {}) if isinstance(block, dict) else {}
     if (counters.get("folded"), counters.get("missing"), counters.get("unreadable")) != (
-        len(row),
-        0,
-        0,
+        len(readers),
+        missing,
+        len(row) - len(readers) - missing,
     ):
         return False
     stamped = str(member.stamp.get("written_at") or "")
     return bool(stamped) and all(
-        str(entry.stamp.get("written_at") or "") <= stamped for entry in row
+        str(entry.stamp.get("written_at") or "") <= stamped for entry in readers
     )
 
 
@@ -381,7 +390,10 @@ def close_shard(
     :func:`member_current` says the standing member is not this row's fold.
     Returns the basename when a member was written, ``None`` otherwise
     (nothing to fold, or current). Failures raise; the caller reports them
-    as the unit's error.
+    as the unit's error. Cost of the all-current check, per invoke: one
+    delimiter LIST of the node, one root GET per stored window column (and
+    one store handle each), one for the member; a re-fold then reads every
+    stored member array in fold blocks, re-validating the root around each.
     """
     from zagg.column import _clear_column, leaf_column_plan
 
