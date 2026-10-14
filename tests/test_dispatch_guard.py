@@ -48,11 +48,11 @@ def _timeout():
     }
 
 
-def _failed(error="boom", error_class=None, in_body=False):
+def _failed(error="boom", store_error_class=None, in_body=False):
     body = {"error": error}
     result = {"status_code": 500, "body": body, "error": error, "lambda_duration": 30.0}
-    if error_class is not None:
-        (body if in_body else result)["error_class"] = error_class
+    if store_error_class is not None:
+        (body if in_body else result)["store_error_class"] = store_error_class
     return result
 
 
@@ -187,7 +187,7 @@ class TestBreaker:
         assert g.breaker["rule"] == RULE_WALL_MARGIN  # the hold stays on record
 
     def test_store_fatal_among_the_first_twenty_stops_dispatching(self):
-        g = _feed(_guard(), [_ok()] * 10 + [_failed(error_class="store-fatal")] * 3)
+        g = _feed(_guard(), [_ok()] * 10 + [_failed(store_error_class="store-fatal")] * 3)
         assert g.tripped == {
             "tripped": True,
             "rule": RULE_STORE_FATAL,
@@ -196,29 +196,32 @@ class TestBreaker:
         }
 
     def test_store_fatal_after_the_first_twenty_does_not_trip(self):
-        fatal = _failed(error_class="store-fatal")
+        fatal = _failed(store_error_class="store-fatal")
         g = _feed(_guard(), [_ok()] * 18 + [fatal] * 2 + [_ok()] + [fatal] * 5)
         assert g.tripped is None
 
     def test_transient_failures_are_not_store_fatal(self):
-        g = _feed(_guard(), [_failed(error_class="transient")] * 10)
+        g = _feed(_guard(), [_failed(store_error_class="transient")] * 10)
         assert g.tripped is None
 
-    def test_error_class_is_read_off_the_body_too(self):
-        g = _feed(_guard(), [_failed(error_class="store-fatal", in_body=True)] * 3)
+    def test_store_error_class_is_read_off_the_body_too(self):
+        g = _feed(_guard(), [_failed(store_error_class="store-fatal", in_body=True)] * 3)
         assert g.tripped["rule"] == RULE_STORE_FATAL
 
     def test_store_error_class_is_the_spelling_pr_658_stamps(self):
-        # PR #658 renames the leaf's class key; the old spelling stays a fallback
-        # for status objects written before it, and the new one wins when both
-        # are present.
+        # The result's key, then the body's (PR #658's own readout order).
         fatal = {**_failed(), "store_error_class": "store-fatal"}
         assert classify_result(fatal, function_timeout_s=TIMEOUT_S).store_fatal
         in_body = _failed()
         in_body["body"]["store_error_class"] = "store-fatal"
         assert classify_result(in_body, function_timeout_s=TIMEOUT_S).store_fatal
-        both = {**_failed(error_class="store-fatal"), "store_error_class": "transient"}
-        assert not classify_result(both, function_timeout_s=TIMEOUT_S).store_fatal
+
+    def test_telemetry_error_class_never_shadows_the_classifier(self):
+        # ``error_class`` is telemetry's exception type (PR #665 review): a body
+        # carrying it with a fatal error string still classifies store-fatal.
+        fatal = _failed(error="NoSuchBucket: the bucket does not exist")
+        fatal["body"]["error_class"] = "ValueError"
+        assert classify_result(fatal, function_timeout_s=TIMEOUT_S).store_fatal
 
     @pytest.mark.parametrize(
         "error",
@@ -287,7 +290,7 @@ class TestBreaker:
     def test_store_fatal_wins_when_both_rules_fire_on_one_record(self):
         # At result 10 store-fatal reaches 3 AND the timeout ratio (7/10) is
         # first evaluable: store-fatal is checked first and the verdict names it.
-        fatal = _failed(error_class="store-fatal")
+        fatal = _failed(store_error_class="store-fatal")
         g = _feed(_guard(ramp={"window": 10}), [fatal] * 2 + [_timeout()] * 7)
         assert g.tripped is None
         g.record(fatal)

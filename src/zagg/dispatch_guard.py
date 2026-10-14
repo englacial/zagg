@@ -32,9 +32,10 @@ results still land.
 Pure: no I/O, no clock, no threads. The poller feeds completed result dicts
 (its own v1-shaped ``_result``) through :meth:`DispatchGuard.record` and asks
 :meth:`DispatchGuard.room` for the next batch; one thread owns an instance.
-The store-fatal rule reads ``error_class`` when a status carries it (issue
-#651, PR #658) and otherwise classifies the error string with the same
-classifier.
+The store-fatal rule reads ``store_error_class`` when a status carries it
+(issue #651, PR #658) and otherwise classifies the error string with the same
+classifier; ``error_class`` is never read -- in zagg it names telemetry's
+exception type, not a store class.
 """
 
 from __future__ import annotations
@@ -272,8 +273,8 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
     ``failed-unknown`` drop outcome (no status object by the deadline -- a
     worker killed at the wall writes none), or Lambda's own ``Task timed
     out`` text; its wall is the function timeout when the body carries no
-    billed duration. Store-fatal reads ``error_class`` off the result or its
-    body (PR #658) and falls back to classifying the error string.
+    billed duration. Store-fatal reads ``store_error_class`` off the result,
+    then its body (PR #658), and falls back to classifying the error string.
     """
     body = result.get("body") or {}
     error = result.get("error")
@@ -290,25 +291,17 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
     # The no-data channel's text starts with its benign entry and may carry a
     # source read's 403/404 exemplar after it: benign, never store-fatal.
     failed = bool(error) and not str(error).startswith(BENIGN_ERRORS) and not timeout
-    # PR #658 stamps the leaf's class as ``store_error_class`` (its own parquet
-    # column); ``error_class`` is the earlier spelling, kept for status objects
-    # written before the rename.
-    error_class = next(
-        (
-            source[key]
-            for key in ("store_error_class", "error_class")
-            for source in (result, body)
-            if source.get(key)
-        ),
-        None,
-    )
-    if error_class is None and failed:
-        error_class = classify_store_error(error)
+    # PR #658 stamps the leaf's class as ``store_error_class``; that key only.
+    # ``error_class`` never shipped as a store class -- telemetry fills it with
+    # the exception type -- so reading it would skip the string classifier.
+    store_class = result.get("store_error_class") or body.get("store_error_class")
+    if store_class is None and failed:
+        store_class = classify_store_error(error)
     return ResultRecord(
         wall_s=wall,
         write_s=sum(parts) if parts else None,
         timeout=timeout,
-        store_fatal=failed and error_class == STORE_FATAL,
+        store_fatal=failed and store_class == STORE_FATAL,
         dispatch_width=result.get("dispatch_width"),
     )
 
