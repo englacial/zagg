@@ -341,6 +341,37 @@ class TestStageWorkerArm:
         on_disk = json.loads((prefix / name).read_text())
         assert on_disk["spec"] == STAGE_RECORD_SPEC and on_disk["role"] == "stage"
         assert on_disk["level_actuals"] and record["record"].endswith(name)
+        # off-Lambda: null, not a tier guessed from the dispatcher's routing
+        assert on_disk["lambda_memory_mb"] is None
+
+    def test_the_record_carries_the_invokes_own_memory_tier(self, tmp_path, monkeypatch):
+        # Issue #667: a cost reader prices the staged leg per invoke, so the
+        # tier belongs in the record. Assuming the tier the dispatcher routes
+        # to now misprices every record written under the previous one
+        # (issue #659 moved the staged tail from 8 GB to the leaf tier).
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "4096")
+        root, prefix = tmp_path / "s", tmp_path / "status"
+        _stage_store(root)
+        run_stage_worker(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            run_started=RUN_STARTED,
+            dispatch=0,
+            nodes=["1"],
+            records_from=str(prefix),
+        )
+        on_disk = json.loads((prefix / stage_record_name(0, 0)).read_text())
+        assert on_disk["lambda_memory_mb"] == 4096
+        finisher = run_stage_finisher(
+            str(root),
+            [(morton_word(d), None) for d in LEAVES],
+            run_id="F",
+            records_from=str(prefix),
+        )
+        assert finisher["finisher_record"].endswith(FINISHER_RECORD_NAME)
+        # the finisher is an invoke too, and is priced like one
+        assert json.loads((prefix / FINISHER_RECORD_NAME).read_text())["lambda_memory_mb"] == 4096
 
     def test_a_worker_nobody_can_witness_refuses_by_name(self, tmp_path):
         # A stage invoke without a records prefix folds correctly and then

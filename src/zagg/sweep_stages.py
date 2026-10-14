@@ -866,6 +866,23 @@ STAGE_RECORD_SPEC = "zagg-sweep-stage-record/1"
 FINISHER_RECORD_NAME = "finisher.json"
 
 
+def _lambda_memory_mb() -> int | None:
+    """This invoke's own memory tier in MB; ``None`` off-Lambda (issue #667).
+
+    The same figure under the same key a leaf row carries
+    (:func:`zagg.telemetry.flatten_record`), off the same source
+    (:func:`zagg.telemetry.lambda_env`), so a reader prices a stage invoke
+    from its OWN record instead of assuming the tier the dispatcher currently
+    routes to (:data:`zagg.runner.STAGE_SWEEP_WORKER`, which issue #659 moved
+    — a record written under the previous tier is priced 2x wrong by that
+    assumption). ``None`` off-Lambda — a local call of this worker, which
+    nothing billed.
+    """
+    from zagg.telemetry import lambda_env
+
+    return (lambda_env() or {}).get("memory_mb")
+
+
 def stage_record_name(dispatch: int, batch: int) -> str:
     """One stage invoke's record basename: ``stage-<dispatch>-<batch>.json``.
 
@@ -1083,6 +1100,11 @@ def run_stage_worker(
     close: an unwindowed store's one unit per node, and what a dispatcher
     predating the units sends. ``pipeline_run_id`` (issue #593) is the
     pipeline run this sweep completes, recorded beside its own ``run_id``.
+
+    The record carries ``lambda_memory_mb`` (:func:`_lambda_memory_mb`, issue
+    #667): the tier THIS invoke ran on, so a cost readout prices the staged
+    leg off the record rather than off the tier the dispatcher happens to
+    route to now.
     """
     from zagg.hive import MANIFEST_NAME, _decimal_order, read_manifest
     from zagg.sweep import _normalize_leaves
@@ -1170,6 +1192,7 @@ def run_stage_worker(
         "batch": int(batch),
         "unit": unit,  # which of the nodes' units ran; null = the nodes whole
         "window": window,
+        "lambda_memory_mb": _lambda_memory_mb(),
         "closes": manifest_closes(manifest),  # what the store declares (the dispatcher reads it)
         "tuple_width": int(tuple_width),
         "n_nodes": len(nodes),
@@ -1230,6 +1253,9 @@ def run_stage_finisher(
     everything, as before. ``pipeline_run_id`` (issue #593) is the
     pipeline run this sweep completes, recorded in the run record and the
     finisher record under its own key (``null`` when the dispatcher named none).
+    The finisher record also carries its own ``lambda_memory_mb``
+    (:func:`_lambda_memory_mb`, issue #667) — the finisher is an invoke the
+    cost readout prices like any other.
 
     ``records_from`` is REQUIRED and the prefix must list at least one stage
     record; both refuse by name. A finisher only ever fires after a fan-out,
@@ -1374,7 +1400,15 @@ def run_stage_finisher(
     summary["finisher_record"] = _put_stage_record(
         records_from,
         FINISHER_RECORD_NAME,
-        {"spec": STAGE_RECORD_SPEC, "role": "finisher", **summary},
+        {
+            "spec": STAGE_RECORD_SPEC,
+            "role": "finisher",
+            **summary,
+            # after ``**summary`` so the stamp stays authoritative: the field
+            # says what THIS invoke ran on, so a future summary key of the
+            # same name must not quietly win over it
+            "lambda_memory_mb": _lambda_memory_mb(),
+        },
         store_kwargs,
     )
     return summary

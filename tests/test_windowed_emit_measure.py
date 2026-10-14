@@ -338,7 +338,7 @@ def test_ladder_and_stage_runs(arms):
     assert latest["invokes"] == 5 and latest["failed"] == 1
     assert latest["barrier_timed_out"] is True and latest["short_orders"] == [0]
     assert latest["worker_s"] == 49.0 and latest["finisher_s"] == 2.0
-    assert latest["gb_seconds"] == 51.0 * tool.STAGE_TIER_GB
+    assert latest["gb_seconds"] == 51.0 * tool.stage_tier_gb()
     o3, o0 = latest["per_order"]
     assert (o3["dispatch_order"], o3["invokes"], o3["window_invokes"], o3["close_invokes"]) == (
         3,
@@ -361,11 +361,32 @@ def test_cost_sums_leaf_and_stage_gb_seconds(arms):
 
     price = LAMBDA_PRICE_PER_GB_SEC
 
-    # both stage runs count (the older one's 99 s invoke included), each at the 8 GB tier
-    assert win["cost"]["stage_gb_seconds"] == (51.0 + 99.0) * tool.STAGE_TIER_GB
+    # both stage runs count (the older one's 99 s invoke included), each at the stage tier
+    tier = tool.stage_tier_gb()
+    assert win["cost"]["stage_gb_seconds"] == (51.0 + 99.0) * tier
     assert win["cost"]["leaf_gb_seconds"] == 336.0
-    assert win["cost"]["total_usd"] == pytest.approx((336.0 + 150.0 * 8) * price)
+    assert win["cost"]["total_usd"] == pytest.approx((336.0 + 150.0 * tier) * price)
     assert base["cost"]["leaf_usd"] == pytest.approx(320.0 * price)
+
+
+def test_the_stage_tier_is_the_dispatchers_own(arms, monkeypatch):
+    """The stage leg is priced at what ``runner`` routes the staged tail to
+    (issue #667), not at a tier pinned in the tool."""
+    from zagg.runner import STAGE_SWEEP_WORKER
+
+    tier = STAGE_SWEEP_WORKER["memory"] / 1024.0
+    assert tool.stage_tier_gb() == tier
+    _, win = arms
+    assert win["stage_runs"]["latest"]["gb_seconds"] == 51.0 * tier
+    assert win["cost"]["stage_gb_seconds"] == (51.0 + 99.0) * tier
+    # derived, not a copy: the readout follows the library's routing
+    monkeypatch.setitem(STAGE_SWEEP_WORKER, "memory", 2048)
+    assert tool.stage_tier_gb() == 2.0
+    # and the PRICE follows, not just the helper: the tier is read at call
+    # time, never frozen at import (a module-level ``_TIER = stage_tier_gb()``
+    # would keep the assertion above green while going stale here)
+    again = tool.measure(win["store"], store_kwargs={}, accuracy=False)
+    assert again["stage_runs"]["latest"]["gb_seconds"] == 51.0 * 2.0
 
 
 def test_prints_one_column_per_arm(arms, capsys):
@@ -479,6 +500,27 @@ def test_a_timed_out_invoke_is_billed_the_function_wall(tmp_path):
     )
 
 
+def test_each_stage_invoke_is_priced_from_its_own_record(tmp_path):
+    """Issue #667: an invoke whose record names its tier is priced from it,
+    and one whose record predates the field falls back to what the dispatcher
+    routes to — so a store holding runs from both tiers prices each at its own."""
+    root = _store(tmp_path, windows=None)
+    tier = tool.stage_tier_gb()
+    status = Path(root + ".status") / "run-stage-20260101T000100Z-abcdef"
+    for name in ("stage-03-0000.json", "stage-00-0000.json"):
+        rec = json.loads((status / name).read_text())
+        rec["lambda_memory_mb"] = 8192  # the issue #586 campaign's stopgap tier
+        (status / name).write_text(json.dumps(rec))
+    measured = tool.measure(root, store_kwargs={}, accuracy=False)
+    older, latest = measured["stage_runs"]["runs"]
+    # the two stamped invokes at 8 GB; the finisher's record names no tier
+    assert latest["gb_seconds"] == (30.0 + 40.0) * 8.0 + 2.0 * tier
+    assert latest["worker_s"] == 70.0 and latest["finisher_s"] == 2.0  # walls, untiered
+    # the older run is campaign-era throughout: every invoke falls back
+    assert older["gb_seconds"] == 99.0 * tier
+    assert measured["cost"]["stage_gb_seconds"] == latest["gb_seconds"] + 99.0 * tier
+
+
 def test_the_tree_is_leaf_driven_not_parquet_driven(tmp_path):
     # A failed shard writes no leaf and a stale-worker / inexact parquet key
     # names no node: neither changes what the LIST says.
@@ -559,3 +601,39 @@ def test_billed_gb_seconds_prefers_the_record_and_recomputes_the_rest():
     assert tool._billed_gb_seconds(invokes) == 1.0 + 40.0 + 200.0
     assert tool._billed_gb_seconds(invokes.iloc[:0]) is None
     assert tool._billed_gb_seconds(pd.DataFrame({"n_obs": [1]})) is None
+
+
+def test_a_stage_invoke_without_a_tier_falls_back_without_error():
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": 8192}, 4.0) == 80.0
+    # absent (a record predating issue #667) is an UNKNOWN tier: fall back
+    assert tool._invoke_gb_seconds({"duration_s": 10.0}, 4.0) == 40.0
+    # null is not unknown: off-Lambda, nothing billed it, so nothing is priced
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": None}, 4.0) == 0.0
+    # a present 0 is no longer read as "names no tier" either
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": 0}, 4.0) == 0.0
+    # an absent finisher is the empty dict the loader hands back: no wall, no cost
+    assert tool._invoke_gb_seconds({}, 4.0) == 0.0
+    # a numeric string still prices from the record
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": "8192"}, 4.0) == 80.0
+    # and a junk cell degrades like the leaf path's ``to_numeric`` coerce rather
+    # than raising out of the whole readout: unknown tier, or a zero wall
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": "4 GB"}, 4.0) == 40.0
+    assert tool._invoke_gb_seconds({"duration_s": "nope", "lambda_memory_mb": 8192}, 4.0) == 0.0
+
+
+def test_a_null_tier_stage_record_adds_no_phantom_gb_seconds(tmp_path):
+    """Issue #667: ``lambda_memory_mb: null`` says the worker did not run on
+    Lambda, so nothing billed it (``docs/specification.md`` section 4.7) — the
+    readout prices it at zero rather than at the dispatcher's tier."""
+    root = _store(tmp_path, windows=None)
+    tier = tool.stage_tier_gb()
+    path = Path(root + ".status") / "run-stage-20260101T000100Z-abcdef" / "stage-03-0000.json"
+    rec = json.loads(path.read_text())
+    rec["lambda_memory_mb"] = None  # a local call of the worker entry point
+    path.write_text(json.dumps(rec))
+    measured = tool.measure(root, store_kwargs={}, accuracy=False)
+    latest = measured["stage_runs"]["latest"]
+    # only the 40 s invoke and the 2 s finisher are priced; the 30 s one is not
+    assert latest["gb_seconds"] == (40.0 + 2.0) * tier
+    assert latest["worker_s"] == 70.0  # the wall is unchanged: it ran, free
+    assert measured["cost"]["stage_gb_seconds"] == (40.0 + 2.0 + 99.0) * tier
