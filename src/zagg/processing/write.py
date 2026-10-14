@@ -114,6 +114,28 @@ def _build_output(
     return Table.from_pydict(columns)
 
 
+def _leaf_array(store, grid, name, arrays):
+    """The handle for ``{group_path}/{name}``: the template's, else one ``open_array``.
+
+    ``arrays`` is the ``{path: handle}`` map the leaf template pass returned
+    (``HealpixGrid.emit_shard_nodes``, issue #657); a writer holding it never
+    re-opens an array (each ``open_array`` is an ancestor-probing GET), and a
+    path missing from it is a template/writer mismatch, raised as a
+    ``KeyError`` rather than hidden behind a re-open. Only a caller without
+    the map (``arrays=None``) — the flat path, a bare store in a test — opens
+    as before.
+    """
+    path = f"{grid.group_path}/{name}"
+    if arrays is not None:
+        if path not in arrays:
+            raise KeyError(
+                f"{path!r}: the leaf template did not declare this array (issue #657); "
+                f"it declares {sorted(k for k in arrays if k.startswith(grid.group_path))}"
+            )
+        return arrays[path]
+    return open_array(store, path=path, zarr_format=3, consolidated=False)
+
+
 def _carrier_empty(carrier) -> bool:
     """Whether a process_shard output carrier (DataFrame or Arrow table) is empty.
 
@@ -196,6 +218,7 @@ def write_dataframe_to_zarr(
     staged_out: dict | None = None,
     omit: tuple = (),
     skip_fill: bool = False,
+    arrays: dict | None = None,
 ) -> Store:
     """Write a per-shard output carrier to an existing Zarr template.
 
@@ -235,6 +258,9 @@ def write_dataframe_to_zarr(
         Skip an all-fill block instead of letting zarr DELETE its key
         (:func:`all_fill`, issue #653). Only the hive leaf passes it — its
         prefix was just cleared; the flat path keeps zarr's delete.
+    arrays : dict, optional
+        The leaf template's ``{path: handle}`` map (issue #657); arrays are
+        written through these handles instead of being re-opened.
 
     Returns
     -------
@@ -274,12 +300,7 @@ def write_dataframe_to_zarr(
             block = chunk_value.reshape((1,) * len(chunk_idx) + trailing)
             block_idx = chunk_idx + (0,) * len(trailing)
             with config.set({"async.concurrency": 128}):
-                array = open_array(
-                    store,
-                    path=f"{grid.group_path}/{name}",
-                    zarr_format=3,
-                    consolidated=False,
-                )
+                array = _leaf_array(store, grid, name, arrays)
                 if not (skip_fill and all_fill(array, block)):
                     array.set_block_selection(block_idx, block)
             continue
@@ -296,12 +317,7 @@ def write_dataframe_to_zarr(
         values = values.reshape((*grid.chunk_shape, *trailing))
         block_idx = chunk_idx + (0,) * len(trailing)
         with config.set({"async.concurrency": 128}):
-            array = open_array(
-                store,
-                path=f"{grid.group_path}/{name}",
-                zarr_format=3,
-                consolidated=False,
-            )
+            array = _leaf_array(store, grid, name, arrays)
             if trailing:
                 # Enforce the single-trailing-chunk invariant: the target array's
                 # trailing chunk must span the whole payload, or set_block_selection
@@ -461,7 +477,7 @@ def write_shard_to_zarr(
 
 
 def _write_companion_columns(
-    carrier, store, grid, block_index, chunk_res_fields, *, skip_fill: bool = False
+    carrier, store, grid, block_index, chunk_res_fields, arrays=None, *, skip_fill: bool = False
 ):
     """Write a chunk's ``resolution: chunk`` companion columns (unsharded path).
 
@@ -479,12 +495,7 @@ def _write_companion_columns(
         block = chunk_value.reshape((1,) * len(block_idx) + trailing)
         target = block_idx + (0,) * len(trailing)
         with config.set({"async.concurrency": 128}):
-            array = open_array(
-                store,
-                path=f"{grid.group_path}/{name}",
-                zarr_format=3,
-                consolidated=False,
-            )
+            array = _leaf_array(store, grid, name, arrays)
             if not (skip_fill and all_fill(array, block)):
                 array.set_block_selection(target, block)
 
@@ -561,7 +572,12 @@ def write_ragged_to_zarr(
 
 
 def write_ragged_leaf_to_zarr(
-    ragged_chunks: list, store: Store, *, grid, staged_out: dict | None = None
+    ragged_chunks: list,
+    store: Store,
+    *,
+    grid,
+    staged_out: dict | None = None,
+    arrays: dict | None = None,
 ) -> Store:
     """Write a hive leaf's ragged fields in ONE array write each (issue #209).
 
@@ -585,7 +601,8 @@ def write_ragged_leaf_to_zarr(
     ``staged_out`` (issue #342): when a dict is passed, the assembled slabs
     are recorded in it under their leaf-relative array paths — refs to the
     exact arrays written, so the caller's O11 content hashing runs over the
-    staged values with no read-back.
+    staged values with no read-back. ``arrays`` is the leaf template's
+    ``{path: handle}`` map (issue #657): every write goes through it.
     """
     if not any(ragged for _block, ragged in ragged_chunks):
         return store
@@ -595,11 +612,13 @@ def write_ragged_leaf_to_zarr(
     slabs: dict = {}
     for block, ragged in ragged_chunks:
         block = tuple(int(b) for b in block)
-        _write_ragged_companions(ragged, store, grid, block, chunk_res_fields, skip_fill=True)
+        _write_ragged_companions(
+            ragged, store, grid, block, chunk_res_fields, arrays, skip_fill=True
+        )
         region = tuple(slice(b * c, (b + 1) * c) for b, c in zip(block, inner_shape))
         _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_fields)
     for name, slab in slabs.items():
-        _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab, skip_fill=True)
+        _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab, arrays, skip_fill=True)
     if staged_out is not None:
         staged_out.update({f"{grid.group_path}/{name}": slab for name, slab in slabs.items()})
     return store
@@ -613,6 +632,7 @@ def write_leaf_to_zarr(
     shard_key: int,
     staged_out: dict | None = None,
     omit: tuple = (),
+    arrays: dict | None = None,
 ) -> Store:
     """Write a SHARDED hive leaf in ONE block selection per array (issue #236).
 
@@ -648,6 +668,10 @@ def write_leaf_to_zarr(
     windowed leaf's ``("morton",)`` (issue #586 phase 3; see
     :func:`write_dataframe_to_zarr`). An omitted column is neither written
     nor staged.
+
+    ``arrays`` is the leaf template's ``{path: handle}`` map (issue #657):
+    the fill values come from it and every write goes through it, so the
+    pass issues no ``open_array`` probe.
     """
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
     inner_shape = tuple(int(s) for s in grid.chunk_shape)
@@ -661,8 +685,12 @@ def write_leaf_to_zarr(
         # extent — the ``hive.leaf_block_index`` derivation).
         if chunk_res_fields:
             local = tuple(int(s.start) // c for s, c in zip(region, inner_shape))
-            _write_companion_columns(carrier, store, grid, local, chunk_res_fields, skip_fill=True)
-            _write_ragged_companions(ragged, store, grid, local, chunk_res_fields, skip_fill=True)
+            _write_companion_columns(
+                carrier, store, grid, local, chunk_res_fields, arrays, skip_fill=True
+            )
+            _write_ragged_companions(
+                ragged, store, grid, local, chunk_res_fields, arrays, skip_fill=True
+            )
         if _carrier_empty(carrier) and not ragged:
             continue
         for name, values in _iter_carrier_columns(carrier):
@@ -671,13 +699,7 @@ def write_leaf_to_zarr(
             values = np.asarray(values)
             trailing = values.shape[1:]
             if name not in slabs:
-                array = open_array(
-                    store,
-                    path=f"{grid.group_path}/{name}",
-                    zarr_format=3,
-                    consolidated=False,
-                )
-                fill = array.metadata.fill_value
+                fill = _leaf_array(store, grid, name, arrays).metadata.fill_value
                 slabs[name] = np.full((*slab_shape, *trailing), fill, dtype=values.dtype)
             slabs[name][region] = values.reshape((*inner_shape, *trailing))
         # Cell-resolution ragged fields ride the same slab pass (issue #209).
@@ -687,12 +709,7 @@ def write_leaf_to_zarr(
     for name, slab in slabs.items():
         trailing = slab.shape[len(slab_shape) :]
         with config.set({"async.concurrency": 128}):
-            array = open_array(
-                store,
-                path=f"{grid.group_path}/{name}",
-                zarr_format=3,
-                consolidated=False,
-            )
+            array = _leaf_array(store, grid, name, arrays)
             if trailing:
                 # Single-trailing-chunk invariant (issue #29): a vector field's
                 # trailing payload dim must be one whole chunk, or the write at
@@ -707,7 +724,7 @@ def write_leaf_to_zarr(
             if not all_fill(array, slab):  # an all-fill shard would be a DELETE (#653)
                 array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
     for name, slab in ragged_slabs.items():
-        _set_ragged_block(store, grid, name, leaf_block, slab, skip_fill=True)
+        _set_ragged_block(store, grid, name, leaf_block, slab, arrays, skip_fill=True)
     if staged_out is not None:
         staged_out.update(
             {f"{grid.group_path}/{name}": slab for name, slab in {**slabs, **ragged_slabs}.items()}
@@ -850,7 +867,7 @@ def _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_
 
 
 def _write_ragged_companions(
-    ragged, store, grid, block_index, chunk_res_fields, *, skip_fill: bool = False
+    ragged, store, grid, block_index, chunk_res_fields, arrays=None, *, skip_fill: bool = False
 ) -> None:
     """Write a chunk's ``resolution: chunk`` RAGGED companions (issue #82/#209).
 
@@ -883,25 +900,23 @@ def _write_ragged_companions(
         block[(0,) * len(block_idx)] = _ragged_payload_bytes(
             name, chunk_payload, _ragged_sig(name, grid)
         )
-        _set_ragged_block(store, grid, name, block_idx, block, skip_fill=skip_fill)
+        _set_ragged_block(store, grid, name, block_idx, block, arrays, skip_fill=skip_fill)
 
 
-def _set_ragged_block(store, grid, name, block_idx, block, *, skip_fill: bool = False) -> None:
+def _set_ragged_block(
+    store, grid, name, block_idx, block, arrays=None, *, skip_fill: bool = False
+) -> None:
     """One block-selection write into a ragged vlen array (issue #209).
 
     With ``skip_fill`` (the hive leaf, onto its just-cleared prefix), a block
     whose every cell is the ``b""`` fill — a ``where``-predicated stratum no
     photon of the window satisfied — is not written: zarr would DELETE its key
     instead (:func:`all_fill`, issue #653). Without it (the flat path) zarr's
-    delete stands, so a rerun clears a stale object.
+    delete stands, so a rerun clears a stale object. ``arrays`` is the leaf's
+    handle map (issue #657).
     """
     with config.set({"async.concurrency": 128}):
-        array = open_array(
-            store,
-            path=f"{grid.group_path}/{name}",
-            zarr_format=3,
-            consolidated=False,
-        )
+        array = _leaf_array(store, grid, name, arrays)
         if not (skip_fill and all_fill(array, block)):
             array.set_block_selection(tuple(block_idx), block)
 

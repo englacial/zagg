@@ -22,6 +22,7 @@ from zagg.grids.base import (
     InconsistentShardError,
     apply_field_attrs,
     chunk_array_spec,
+    emit_hierarchy,
     ragged_array_spec,
     ragged_locations_name,
     ragged_times_name,
@@ -583,7 +584,11 @@ class HealpixGrid:
         template write alone only rewrites members the NEW schema declares —
         a schema-narrowed rerun would leave the retired members' objects
         behind (e.g. the post-#337 ``cell_ids`` chunk orphans), masquerading
-        as data.
+        as data. ``overwrite=False`` on an occupied prefix now RAISES
+        ``ContainsGroupError`` (issue #657) off one emptiness probe of the
+        prefix (any object under it, root doc or not), where pydantic-zarr's
+        ``to_zarr`` accepted a structurally identical template.
+        Every leaf writer passes ``overwrite=True``.
 
         Scope of the justification (fold review — the evidence, not more): the
         observed ``No array found in store … at path 19/cell_ids`` signature is
@@ -615,6 +620,28 @@ class HealpixGrid:
         prefix_store``), which is what makes a name-prefix twin like
         ``<leaf>.status`` safe rather than merely unlikely.
         """
+        self.emit_shard_nodes(store, overwrite=overwrite, cell_coordinate=cell_coordinate)
+        return store
+
+    def emit_shard_nodes(
+        self, store: Store, *, overwrite: bool = False, cell_coordinate: bool = True
+    ) -> dict:
+        """:meth:`emit_shard_template`, returning the ``{path: handle}`` map it created.
+
+        The leaf template is ONE probe-free pass of metadata PUTs
+        (:func:`zagg.grids.base.emit_hierarchy`, issue #657) and the leaf
+        writers write through the handles it returns, so no array is
+        re-opened on the data path. ``overwrite`` clears the prefix first (the
+        issue #341 semantics documented on :meth:`emit_shard_template`);
+        without it ONE emptiness probe of the prefix (``is_empty("")`` — a
+        bounded LIST on S3, not a HEAD of the root doc, so a torn template
+        with chunks but no root doc still counts as occupied) stands in for
+        the per-node check the pass no longer makes, and an occupied prefix
+        raises.
+        """
+        from zarr.core.sync import sync
+        from zarr.errors import ContainsGroupError
+
         spec = GroupSpec(
             members={self.group_path: self.shard_spec(cell_coordinate=cell_coordinate)},
             attributes={},
@@ -623,11 +650,10 @@ class HealpixGrid:
         # (zarr-python#3517); message-scoped suppression, see grids.base.
         with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
             if overwrite:
-                from zarr.core.sync import sync
-
                 sync(store.delete_dir(""))
-            spec.to_zarr(store, "", overwrite=overwrite)
-        return store
+            elif not sync(store.is_empty("")):
+                raise ContainsGroupError(f"A group exists in store {store!r} at path ''.")
+            return emit_hierarchy(store, spec)
 
     def spec(self) -> GroupSpec:
         """Return the pydantic-zarr GroupSpec for this grid's template."""
