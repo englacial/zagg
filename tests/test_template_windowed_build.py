@@ -285,7 +285,7 @@ def test_the_icechunk_all_row_reaches_the_leaf_column_levels(built):
     from zagg.icechunk_rows import ALL_ROW
     from zagg.store import open_store
 
-    name, cfg, root, shards = built
+    name, cfg, root, shards = built[:4]
     rows = read_block(str(root), store_kwargs={})["rows"]
     session = open_repo(str(root), store_kwargs={}).readonly_session("main")
     group = zarr.open_group(session.store, mode="r")
@@ -377,7 +377,7 @@ def test_the_all_time_column_is_the_kway_fold_of_the_window_columns(built):
     from zagg.sweep_overview import decode_digest, fold_digests, payload_weight
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
-    name, cfg, root, shards = built
+    name, cfg, root, shards = built[:4]
     for shard in shards:
         node = hive.shard_leaf_path(str(root), shard).rsplit("/", 1)[0]
         columns = {
