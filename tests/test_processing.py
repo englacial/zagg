@@ -1883,6 +1883,28 @@ class TestSkipFillWrites:
         assert all_fill(arr, np.full(4, 1e-50))
         assert not all_fill(arr, np.full(4, 1e-3))
 
+    def test_populated_runs_cuts_at_chunks_and_merges_neighbors(self):
+        """The per-chunk face of ``all_fill`` for a multi-chunk row (issue #653
+        phase 4): fill chunks drop out, adjacent survivors merge, a ragged tail
+        chunk is honored, and a fully populated row stays one run."""
+        import zarr
+
+        from zagg.processing.write import populated_runs
+
+        arr = zarr.create_array(
+            MemoryStore(), shape=(1, 10), chunks=(1, 4), dtype="u2", fill_value=0
+        )
+        row = np.zeros(10, dtype="u2")
+        assert populated_runs(arr, row, 4) == []
+        row[5] = 1  # chunk [4, 8) only
+        assert populated_runs(arr, row, 4) == [(4, 8)]
+        row[9] = 1  # plus the 2-cell tail chunk [8, 10) — merged with its neighbor
+        assert populated_runs(arr, row, 4) == [(4, 10)]
+        row[0] = 1  # chunk [0, 4) joins on: a fully populated row is one run
+        assert populated_runs(arr, row, 4) == [(0, 10)]
+        row[4:8] = 0  # a fill chunk in the middle splits the row
+        assert populated_runs(arr, row, 4) == [(0, 4), (8, 10)]
+
     @staticmethod
     def _companion_case():
         """A dense ``count`` plus a ``resolution: chunk`` companion ``anchor_h``,

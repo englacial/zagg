@@ -1015,6 +1015,107 @@ class TestLeafTemplate:
         assert names == ["bytes", "zstd"]
 
 
+class _ChunkDeleteRefusingStore(MemoryStore):
+    """A ``MemoryStore`` that fails a chunk-key ``delete`` the way the bucket did
+    (issue #653): obstore's ``GenericError`` for S3's ``<Error>``-in-a-2xx answer to
+    the bulk ``DeleteObjects``. Every attempt is recorded first."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)  # kwargs: zarr's read-only clone (``with_read_only``)
+        self.attempted: list = []
+
+    async def delete(self, key):
+        if "/c/" in f"/{key}/":
+            from obstore.exceptions import GenericError
+
+            self.attempted.append(key)
+            raise GenericError(
+                "Generic S3 error: Error performing DeleteObjects request: Got invalid "
+                f"DeleteObjects response for {key!r} (issue #653)"
+            )
+        await super().delete(key)
+
+
+class TestSkipFillRows:
+    """Issue #653 phase 4: a raster row spans several chunks, and zarr deletes
+    every all-fill chunk's key one by one — on the just-cleared hive leaf those
+    keys are absent, so the leaf writer skips those chunks instead
+    (``populated_runs``); the flat writer keeps zarr's delete."""
+
+    CHUNK = 256  # chunk_inner=12 under order-16 cells: 16 chunks of 256 per row
+
+    @staticmethod
+    def _leaf(tmp_path, store):
+        from zagg.processing.raster import emit_raster_leaf_template
+
+        cfg, _grid, shard = _healpix_setup(tmp_path)
+        grid = HealpixGrid(10, 16, config=cfg, chunk_inner=12, sharded=False)
+        emit_raster_leaf_template(store, grid, cfg, shard, np.array([0, 1], dtype=np.int64))
+        return grid
+
+    def _rows(self, grid):
+        mixed = np.zeros(grid.cells_per_shard, dtype=np.uint16)
+        mixed[self.CHUNK * 3 : self.CHUNK * 5] = 7  # chunks 3-4 populated, 14 all fill
+        return mixed, np.zeros_like(mixed)
+
+    @staticmethod
+    def _red_chunks(store):
+        return {k: v for k, v in store._store_dict.items() if "/red/c/" in k}
+
+    def test_leaf_rows_skip_fill_chunks_and_never_delete(self, tmp_path):
+        from zagg.processing.raster import write_raster_leaf_slab
+
+        store = _ChunkDeleteRefusingStore()
+        grid = self._leaf(tmp_path, store)
+        mixed, empty = self._rows(grid)
+        # The refuser raises on the first chunk delete, so finishing IS the
+        # proof here; ``attempted`` names it anyway.
+        write_raster_leaf_slab(store, grid, 0, {"red": mixed}, skip_fill=True)
+        write_raster_leaf_slab(store, grid, 1, {"red": empty}, skip_fill=True)
+        assert store.attempted == []
+        assert sorted(self._red_chunks(store)) == ["16/red/c/0/3", "16/red/c/0/4"]
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        np.testing.assert_array_equal(red[0, :], mixed)  # absent chunks read as fill
+        np.testing.assert_array_equal(red[1, :], empty)
+
+    def test_populated_chunk_bytes_match_a_guard_off_twin(self, tmp_path):
+        from zagg.processing.raster import write_raster_leaf_slab
+
+        stores = {}
+        for skip_fill in (False, True):
+            store = stores[skip_fill] = MemoryStore()
+            grid = self._leaf(tmp_path, store)
+            mixed, empty = self._rows(grid)
+            write_raster_leaf_slab(store, grid, 0, {"red": mixed}, skip_fill=skip_fill)
+            write_raster_leaf_slab(store, grid, 1, {"red": empty}, skip_fill=skip_fill)
+        # Guard off = zarr's delete-on-all-fill: the same two keys survive,
+        # byte for byte, so the guard skipped exactly what zarr would have
+        # deleted and changed nothing it would have written.
+        off, on = self._red_chunks(stores[False]), self._red_chunks(stores[True])
+        assert sorted(on) == sorted(off) == ["16/red/c/0/3", "16/red/c/0/4"]
+        assert all(on[k].to_bytes() == off[k].to_bytes() for k in on)
+
+    def test_flat_rows_keep_zarr_delete_of_a_stale_key(self, tmp_path):
+        # The flat template is emitted overwrite=False, so a rerun may find a
+        # stale object under an all-fill chunk: without skip_fill zarr still
+        # deletes it, exactly as before this guard.
+        from zagg.processing.raster import _shard_cell_range
+
+        cfg, _grid, shard = _healpix_setup(tmp_path)
+        grid = HealpixGrid(10, 16, config=cfg, chunk_inner=12, sharded=False)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([0], dtype=np.int64))
+        start, _stop = _shard_cell_range(grid, shard)
+        stale = np.full(grid.cells_per_shard, 5, dtype=np.uint16)
+        write_raster_slab(store, grid, shard, 0, {"red": stale})
+        n_before = len(self._red_chunks(store))
+        assert n_before == grid.cells_per_shard // self.CHUNK
+        write_raster_slab(store, grid, shard, 0, {"red": np.zeros_like(stale)})
+        assert self._red_chunks(store) == {}
+        red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert (red[0, start : start + self.CHUNK] == 0).all()
+
+
 class TestRasterMortonCoordinate:
     """Issue #304 raster extension (espg-ruled): morton is the sole stored
     cell coordinate on the raster path too, with the same dggs attrs block

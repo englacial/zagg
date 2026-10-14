@@ -161,6 +161,32 @@ def all_fill(array, values) -> bool:
     return bool(values.all_equal(fill))
 
 
+def populated_runs(array, values, chunk: int) -> list[tuple[int, int]]:
+    """Contiguous ``[lo, hi)`` runs of ``values`` whose chunks are not all fill.
+
+    The per-chunk face of :func:`all_fill` (issue #653) for a row write that
+    spans several chunks of one axis — the raster writers' ``array[t, lo:hi]
+    = row``, where a populated row can still hold all-fill chunks that zarr
+    would DELETE one key at a time. ``values`` is cut at the array's chunk
+    boundaries (``chunk`` cells each, aligned to index 0 of ``values``, which
+    the raster writers place at a chunk boundary), every all-fill piece is
+    dropped and the survivors are merged back into contiguous runs, so a fully
+    populated row stays one write. Same precondition as :func:`all_fill`:
+    only for a prefix the caller has just cleared.
+    """
+    n = len(values)
+    runs: list[tuple[int, int]] = []
+    for lo in range(0, n, chunk):
+        hi = min(lo + chunk, n)
+        if all_fill(array, values[lo:hi]):
+            continue
+        if runs and runs[-1][1] == lo:
+            runs[-1] = (runs[-1][0], hi)
+        else:
+            runs.append((lo, hi))
+    return runs
+
+
 def write_dataframe_to_zarr(
     df_out,
     store: Store,
