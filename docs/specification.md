@@ -1931,12 +1931,14 @@ stated here:
   did not run on Lambda** (a local call of the worker entry point, which
   nothing billed; the in-process `python -m zagg.sweep --stages` driver writes
   no per-invoke record at all), and the key is **absent** on a record written
-  before the field existed. A cost
-  reader prices each invoke from its own record and may fall back to the tier
-  the dispatcher routes to (`zagg.runner.STAGE_SWEEP_WORKER`) only for those
-  older records: the routed tier has changed
+  before the field existed. A cost reader prices each invoke from its own
+  record and may fall back to the tier the dispatcher routes to
+  (`zagg.runner.STAGE_SWEEP_WORKER`) only for those older records: the routed
+  tier has changed
   ([issue #659](https://github.com/englacial/zagg/issues/659)), so assuming it
-  for a record that predates the change misprices that record.
+  for a record that predates the change misprices that record. A `null`
+  record is not one of those — nothing billed it, so it prices at zero, not
+  at the fallback tier.
 - A stage record's **`families`**
   ([issue #610](https://github.com/englacial/zagg/issues/610)) is present
   when the rollup families rode the same walk as the ladder (§4.7's first
