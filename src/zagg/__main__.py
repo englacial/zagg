@@ -13,7 +13,7 @@ import logging
 import sys
 
 from zagg.config import get_pipeline_type, load_config
-from zagg.dispatch_guard import GuardConfig, describe, parse_knobs
+from zagg.dispatch_guard import BREAKER_SHORT_PREFIX, GuardConfig, describe, parse_knobs
 from zagg.notebook import confirm_max_cost, max_cost_preview
 from zagg.runner import agg, normalize_output_credentials
 
@@ -261,10 +261,13 @@ examples:
         if short := results.get("tail_sweep_short"):
             for reason in short:
                 print(f"  TAIL SHORT: {reason}")
-            print(
-                "  Regenerate with `python -m zagg.sweep <store>` and, for the ladder, "
-                "`python -m zagg.sweep <store> --stages --scope <subtree>`"
-            )
+            # A trip's remedy is a re-dispatch, in its own text (issue #652):
+            # a sweep never writes the refused units.
+            if any(not r.startswith(BREAKER_SHORT_PREFIX) for r in short):
+                print(
+                    "  Regenerate with `python -m zagg.sweep <store>` and, for the ladder, "
+                    "`python -m zagg.sweep <store> --stages --scope <subtree>`"
+                )
         print(f"Output: {results['store_path']}")
 
 

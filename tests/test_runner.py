@@ -5855,6 +5855,35 @@ class TestCliTailShortSurface:
         self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": []})
         assert "TAIL SHORT" not in capsys.readouterr().out
 
+    def test_a_trip_alone_prints_its_own_remedy_not_the_sweep(self, monkeypatch, capsys):
+        # A sweep never writes the refused units (issue #652, PR #665 review):
+        # the trip's reason names the re-dispatch; the sweep hint rides only
+        # beside another shortfall.
+        from zagg import runner
+
+        trip = {"tripped": True, "rule": "timeout-ratio", "at_result": 137}
+        short = runner._tail_sweep_short(None, None, stage_chained=False, breaker=trip)
+        self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": short})
+        out = capsys.readouterr().out
+        assert "TAIL SHORT: the dispatch circuit breaker tripped (timeout-ratio)" in out
+        assert "re-dispatch" in out and "zagg.sweep" not in out
+        both = [*short, "the families sweep did not dispatch, so the rollups are unswept"]
+        self._run_cli(monkeypatch, {**self._RESULTS, "tail_sweep_short": both})
+        assert "python -m zagg.sweep <store>" in capsys.readouterr().out
+
+    def test_the_warning_gates_the_sweep_hint_the_same_way(self, caplog):
+        from zagg import runner
+
+        trip = {"tripped": True, "rule": "store-fatal", "at_result": 3}
+        (reason,) = runner._tail_sweep_short(None, None, stage_chained=False, breaker=trip)
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            runner._warn_tail_sweep_short([reason])
+        assert "re-dispatch" in caplog.text and "zagg.sweep" not in caplog.text
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            runner._warn_tail_sweep_short([reason, "the families sweep did not dispatch"])
+        assert "python -m zagg.sweep <store>" in caplog.text
+
 
 class TestCliFunctionNameDefault:
     """Issue #235: ``--function-name`` must default to ``None`` (resolved in
@@ -6025,7 +6054,8 @@ class TestTailShortBreaker:
         assert reason.startswith(
             "the dispatch circuit breaker tripped (timeout-ratio) at result 137"
         )
-        assert "families pass and the staged sweep were not fired" in reason
+        # Its remedy is a re-dispatch, not a sweep (PR #665 review).
+        assert "fix the cause and re-dispatch" in reason and "zagg.sweep" not in reason
         # A hold is not a trip, and no guard at all is the pre-#652 verdict.
         hold = dict(trip, tripped=False, rule="wall-margin")
         assert runner._tail_sweep_short(None, None, stage_chained=False, breaker=hold) == []

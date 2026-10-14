@@ -70,6 +70,7 @@ from zagg.dispatch import (
     max_cost_usd,
 )
 from zagg.dispatch_guard import (
+    BREAKER_SHORT_PREFIX,
     NOT_DISPATCHED,
     PACING_GUARD,
     DispatchGuard,
@@ -6596,9 +6597,10 @@ def _tail_sweep_reasons(
     reasons = []
     if breaker and breaker.get("tripped"):
         reasons.append(
-            f"the dispatch circuit breaker tripped ({breaker.get('rule')}) at result "
-            f"{breaker.get('at_result')}, so the families pass and the staged sweep were not "
-            "fired and the undispatched units are not in the store (issue #652)"
+            f"{BREAKER_SHORT_PREFIX} ({breaker.get('rule')}) at result "
+            f"{breaker.get('at_result')}: the undispatched units are not in the store and no "
+            "rollup sweep ran — fix the cause and re-dispatch (skip-if-current re-fires only "
+            "the missing units) (issue #652)"
         )
     if tail_error:
         reasons.append(
@@ -6651,15 +6653,22 @@ def _warn_tail_sweep_short(reasons) -> None:
     time; this one is the RUN's verdict, the only line that spans both legs
     and the only one carrying the remedy, and it is what the CLI prints and
     the summary's ``tail_sweep_short`` holds. Silent when the tail left
-    nothing short, so a whole run's console is unchanged.
+    nothing short, so a whole run's console is unchanged. A breaker trip
+    carries its own remedy (re-dispatch, issue #652): sweeping a tripped
+    store folds a partial leaf set, so the sweep hint rides only beside
+    another reason.
     """
     if not reasons:
         return
+    hint = (
+        " — regenerate with `python -m zagg.sweep <store>` (the rollup families) and "
+        "`python -m zagg.sweep <store> --stages --scope <subtree>` (the ladder)"
+    )
+    sweepable = any(not r.startswith(BREAKER_SHORT_PREFIX) for r in reasons)
     logger.warning(
         "the run tail left the store short of its rollups: "
         + "; ".join(reasons)
-        + " — regenerate with `python -m zagg.sweep <store>` (the rollup families) and "
-        "`python -m zagg.sweep <store> --stages --scope <subtree>` (the ladder)"
+        + (hint if sweepable else "")
     )
 
 

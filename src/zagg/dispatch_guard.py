@@ -121,6 +121,13 @@ NOT_DISPATCHED = "not-dispatched"
 PACING_GUARD = "guard: ramp + circuit breaker on the Event transport (issue #652)"
 
 
+#: How a trip's ``tail_sweep_short`` reason starts. A sweep folds leaves that
+#: exist and never writes the refused ones, so the "regenerate with
+#: ``python -m zagg.sweep``" hint is printed only beside a reason that does
+#: not start with this: a trip's remedy is a re-dispatch, carried in its text.
+BREAKER_SHORT_PREFIX = "the dispatch circuit breaker tripped"
+
+
 def pool_width_pacing(knob: str, value: str) -> str:
     """The pacing line for a fan-out the guard does NOT pace, saying why.
 
