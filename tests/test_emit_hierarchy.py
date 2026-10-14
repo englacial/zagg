@@ -1,4 +1,4 @@
-"""``grids.base.emit_hierarchy``: one ``create_hierarchy`` pass, the same bytes (issue #657).
+"""``grids.base.emit_hierarchy``: one probe-free ``create_nodes`` pass, same bytes (issue #657).
 
 The leaf and column writers template through this helper instead of
 pydantic-zarr's node-at-a-time ``to_zarr``. The contract it has to keep is

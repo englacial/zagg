@@ -11,7 +11,7 @@ to the (shard, window) whose leaf or column prefix it touched. Two pins:
    post-mortem storm (issue #651) fails here by name.
 2. **Byte identity** — a sha256 per object under every leaf and column
    prefix, against the committed manifest. The writers are being restructured
-   (one ``create_hierarchy`` pass, kept array handles, hashes from memory)
+   (one probe-free ``create_nodes`` pass, kept array handles, hashes from memory)
    under the contract that NOT ONE BYTE on the store changes: every
    ``zarr.json``, chunk/shard object, stamp and O11 record must match. Set
    ``ZAGG_WRITE_MANIFEST_REGEN=1`` to regenerate the manifest after a
@@ -60,6 +60,7 @@ ZARR_ENTRY = (
     "open_array",
     "to_zarr",
     "create_hierarchy",
+    "create_nodes",
     "create_array",
     "open_group",
     "open",
