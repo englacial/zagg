@@ -120,12 +120,19 @@ class GuardConfig:
         if block is not None and not isinstance(block, dict):
             raise ValueError(f"dispatch must be a mapping (got {block!r})")
         block = dict(block or {})
+        if "ramp" in block:
+            raise ValueError(
+                "dispatch.ramp was removed (issue #652, 2026-10-14 ruling): the guard paces "
+                "at the full worker width; the rolling window is breaker.window"
+            )
         sub = block.pop("breaker", None)
         sub = {} if sub is None else sub
         if not isinstance(sub, dict):
             raise ValueError(f"dispatch.breaker must be a mapping (got {sub!r})")
         if block:
             raise ValueError(f"dispatch: unknown key(s) {sorted(block)} (expected breaker)")
+        if "wall_fraction" in sub:
+            raise ValueError("breaker.wall_fraction was removed with the ramp (issue #652)")
         unknown = set(sub) - set(cls._BREAKER)
         if unknown:
             raise ValueError(f"dispatch.breaker: unknown key(s) {sorted(unknown)}")

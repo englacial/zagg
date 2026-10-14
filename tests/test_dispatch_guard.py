@@ -311,9 +311,17 @@ class TestGuardConfig:
     @pytest.mark.parametrize(
         ("block", "needle"),
         [
-            # The ramp is gone from this PR (issue #652, 2026-10-14 ruling).
-            ({"ramp": {"start": 500}}, r"unknown key\(s\) \['ramp'\] \(expected breaker\)"),
-            ({"breaker": {"wall_fraction": 0.85}}, "unknown key"),
+            # The ramp is gone from this PR (issue #652, 2026-10-14 ruling); the
+            # message names what replaced it.
+            (
+                {"ramp": {"start": 500}},
+                r"dispatch\.ramp was removed \(issue #652, 2026-10-14 ruling\): the guard paces "
+                r"at the full worker width; the rolling window is breaker\.window",
+            ),
+            (
+                {"breaker": {"wall_fraction": 0.85}},
+                r"breaker\.wall_fraction was removed with the ramp \(issue #652\)",
+            ),
             ({"breaker": {"begin": 1}}, "unknown key"),
             ({"canary": 8}, "unknown key"),
             ({"breaker": {"window": 0}}, "window must be an integer > 0"),
