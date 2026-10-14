@@ -232,6 +232,24 @@ class DropNthStub(EventStubLambdaClient):
 #: trips ``timeout-ratio`` with a leaf on the store — the tail-skip case.
 _TRIP_KNOBS = {"breaker": {"window": 1, "timeout_ratio": 0.5}}
 
+#: A trip on the first store-fatal result.
+_STORE_FATAL_KNOBS = {"breaker": {"store_fatal": 1, "store_fatal_first": 20}}
+
+
+def _store_fatal_stub():
+    """A sync stub whose every cell invoke answers PR #658's store-fatal 500 envelope."""
+    from test_client import StubLambdaClient, _envelope
+
+    class StoreFatalStub(StubLambdaClient):
+        def invoke(self, **kwargs):
+            answer = super().invoke(**kwargs)  # records the event
+            if json.loads(kwargs["Payload"]).get("mode") is not None:
+                return answer
+            error = "window 2018 failed: HTTP status client error (403 Forbidden)"
+            return _envelope({"error": error, "store_error_class": "store-fatal"}, status=500)
+
+    return StoreFatalStub()
+
 
 def _run(catalog, *, client, config=None, **kwargs):
     return Run.from_config(
@@ -478,6 +496,21 @@ class TestEventDispatch:
         assert "stats" in modes and not any(m in modes for m in ("sweep", "icechunk_finalize"))
         assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
         assert handle.dispatch_pacing == guard_pacing("transport='sync'")
+
+    def test_sync_pool_store_fatal_trips_through_the_raised_payload(self, catalog, status_store):
+        # The facade's sync work raises ShardError: the guard reads the 500
+        # envelope off its ``payload`` (``gate``'s except branch), end to end.
+        stub = _store_fatal_stub()
+        handle = _run(catalog, client=stub, max_retries=1).dispatch(
+            transport="sync", dispatch=_STORE_FATAL_KNOBS, max_workers=1
+        )
+        handle.wait()
+        assert len(stub.cell_events()) == 1
+        assert handle.breaker["rule"] == "store-fatal" and handle.breaker["at_result"] == 1
+        errors = handle.results(return_exceptions=True).values()
+        outcomes = sorted(str(e.payload.get("outcome")) for e in errors)
+        assert outcomes == ["None", "not-dispatched", "not-dispatched"]
+        assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (store-fatal)"}
 
     def test_handle_carries_no_verdict_without_a_trip(self, catalog, status_store):
         handle = _run(catalog, client=EventStubLambdaClient(status_store)).dispatch(
@@ -1240,6 +1273,39 @@ class TestAggEventMode:
         assert len(calls) == 1
         self._assert_tripped_without_a_tail(summary, tail, "store-fatal")
 
+    def test_sync_store_fatal_results_trip_and_stop_invoking(
+        self, catalog_file, monkeypatch, status_store
+    ):
+        # invocation="sync": PR #658's real 500 envelope, read off the response.
+        tail = self._tail_recorder(monkeypatch)
+        stub = _store_fatal_stub()
+        summary = self._agg(
+            catalog_file,
+            monkeypatch,
+            stub,
+            "sync",
+            dispatch=_STORE_FATAL_KNOBS,
+            clamp=1,
+            max_retries=1,
+        )
+        assert len(stub.cell_events()) == 1
+        self._assert_tripped_without_a_tail(summary, tail, "store-fatal")
+
+    def test_agg_event_records_each_result_once(self, catalog_file, monkeypatch, status_store):
+        # The ruling: the poller records Event results, so the pool gate must
+        # not record them again (two identities, ``unit`` vs ``shard_key``,
+        # would never dedupe). Capture the guard the runner builds.
+        from zagg import runner
+
+        guards: list = []
+        real = runner.DispatchGuard
+        monkeypatch.setattr(
+            runner, "DispatchGuard", lambda *a, **k: guards.append(real(*a, **k)) or guards[-1]
+        )
+        summary = self._agg(catalog_file, monkeypatch, EventStubLambdaClient(status_store), "event")
+        (guard,) = guards
+        assert len(summary["results"]) == 3 and len(guard._records) == 3
+
     def test_sync_timeouts_trip_and_stop_invoking(self, catalog_file, monkeypatch, status_store):
         # invocation="sync" (RequestResponse): Lambda's own "Task timed out".
         from test_client import StubLambdaClient
@@ -1288,15 +1354,20 @@ class TestAggEventMode:
         assert invoked_g == invoked_b and len(invoked_g) == 3
         assert guarded["breaker"] is None and bare["breaker"] is None
         assert tail_g == tail_b
-        for key in (
-            "total_cells",
-            "cells_with_data",
-            "cells_error",
-            "total_obs",
-            "icechunk_finalize",
-        ):
-            assert guarded[key] == bare[key], key
+        # The whole summary, bar what varies run to run: the clocks, the
+        # run-id-keyed record path, and the results' completion order and
+        # per-unit wall clocks (compared below with those set aside).
+        volatile = {"fanout_s", "finalize_s", "setup_s", "wall_time_s", "run_stats_path"}
+
+        def steady(summary):
+            return {k: v for k, v in summary.items() if k not in volatile | {"results"}}
+
+        def units(summary):
+            rows = [{k: v for k, v in r.items() if k != "wall_time"} for r in summary["results"]]
+            return sorted(rows, key=lambda r: r["shard_key"])
+
         assert set(guarded) == set(bare)
+        assert steady(guarded) == steady(bare) and units(guarded) == units(bare)
 
     def test_windowed_units_resolve_on_both_windows(self, catalog_file, monkeypatch, status_store):
         # The ONE seam where the channel's two halves derive the same object

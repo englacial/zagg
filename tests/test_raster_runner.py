@@ -426,9 +426,10 @@ class TestRasterLambdaBackend:
 
         def responder(event):
             invoked.append(event["shard_key"])
+            # Lambda's real sync timeout: FunctionError + its errorMessage.
             return {
-                "statusCode": 500,
-                "body": json.dumps({"error": "Task timed out after 900.00 seconds"}),
+                "__function_error__": True,
+                "errorMessage": "Task timed out after 900.00 seconds",
             }
 
         monkeypatch.setattr(

@@ -392,8 +392,9 @@ class TestDispatchLoop:
 class TestDispatchCircuitBreaker:
     """``dispatch(guard=...)`` (issue #652 phase 6): the seam the async / sync
     transports and the temporal fan-out share. Results are recorded on the
-    loop's thread; a unit whose pool slot opens after a trip is refused
-    without running. Width-1 pools make the trip point deterministic."""
+    pool thread that ran the unit (``gate``), before it takes the next; a unit
+    whose pool slot opens after a trip is refused without running. Width-1
+    pools make the trip point deterministic."""
 
     @staticmethod
     def _accumulate(report, i, result):
