@@ -760,6 +760,9 @@ def _column_attrs_errors(dec, s, attrs, resolutions, boundary, *, all_time=False
                     f"the boundary member {boundary} below it (§4.6)"
                 )
             )
+        expected_cells = 4 ** (int(res) - int(s))
+        if int(g.get("n_cells", -1)) != expected_cells:
+            errs.append(f"{dec}[{res}]: n_cells {g.get('n_cells')} != 4^({res}-{s})")
     if all_time:
         if block.get("window") != SCHEDULE_NONE_TOKEN:
             errs.append(
@@ -774,9 +777,6 @@ def _column_attrs_errors(dec, s, attrs, resolutions, boundary, *, all_time=False
                 f"{dec}: all.pyramid.zarr source_windows {sw!r} lacks the integer "
                 f"folded/missing/unreadable counters (§4.6)"
             )
-        expected_cells = 4 ** (int(res) - int(s))
-        if int(g.get("n_cells", -1)) != expected_cells:
-            errs.append(f"{dec}[{res}]: n_cells {g.get('n_cells')} != 4^({res}-{s})")
     if resolutions and int(block.get("cells_with_data_order", -1)) != int(resolutions[0]):
         errs.append(
             f"{dec}: cells_with_data_order {block.get('cells_with_data_order')} != finest "

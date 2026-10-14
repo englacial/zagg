@@ -602,7 +602,9 @@ class TestDamage:
         assert "the declared leaf-column levels [7] have NO all-time member" in finding
         assert "the base, cells 8, is exempt" in finding
 
-    @pytest.mark.parametrize("damage", ["window", "groups", "depth", "counters"])
+    @pytest.mark.parametrize(
+        "damage", ["window", "groups", "empty", "depth", "n_cells", "counters"]
+    )
     def test_a_member_whose_attrs_break_the_carve_out_fails_by_name(self, store, damage):
         # Issue #650/#649: a plain copy of one window's column under the
         # all-time name (its window, its per-window depth, no counters), or
@@ -616,7 +618,9 @@ class TestDamage:
         edits = {
             "window": lambda a: a[COLUMN_ATTR].update(window="2020"),
             "groups": lambda a: a[COLUMN_ATTR]["groups"].pop("6"),
+            "empty": lambda a: a[COLUMN_ATTR]["groups"].clear(),
             "depth": lambda a: a[COLUMN_ATTR]["groups"]["7"].update(merges_from_raw=1),
+            "n_cells": lambda a: a[COLUMN_ATTR]["groups"]["6"].update(n_cells=999),
             "counters": lambda a: a[COLUMN_ATTR].pop("source_windows"),
         }
         _set_attrs(member, edits[damage])
@@ -627,11 +631,25 @@ class TestDamage:
         want = {
             "window": f"{leaf}: all.pyramid.zarr records window '2020', not the reserved token",
             "groups": f"{leaf}: column groups [7] != declared resolutions [7, 6] (§4.6)",
+            "empty": f"{leaf}: column groups [] != declared resolutions [7, 6] (§4.6)",
+            "n_cells": f"{leaf}[6]: n_cells 999 != 4^(6-6)",
             "depth": f"{leaf}[7]: group provenance ('leaf-column', 1) != ('leaf-column', 2) — "
             "the all-time column folds the window members, one more merge from raw",
             "counters": f"{leaf}: all.pyramid.zarr source_windows None lacks the integer",
         }[damage]
         assert any(f.startswith(want) for f in findings), findings
+
+    def test_a_window_column_with_a_wrong_grid_size_fails_by_name(self, store):
+        # Every column group's n_cells is 4^(r - order), window members too.
+        from zagg.column import COLUMN_ATTR
+
+        leaf = SHARDS[0]
+        column = store / _rel(leaf[:-1], f"{leaf[-1]}/2019.pyramid.zarr")
+        _set_attrs(column, lambda a: a[COLUMN_ATTR]["groups"]["7"].update(n_cells=999))
+        report = validate_pyramid(str(store), full=True)
+        assert not report["passed"]
+        found = [m for c in report["checks"].values() for m in c.get("mismatches", [])]
+        assert any(f"{leaf}[7]: n_cells 999 != 4^(7-6)" in m for m in found), found
 
     def test_the_member_is_compared_by_value_against_its_window_columns(self, built):
         # Issue #650's deferred leg: every committed member is held, cell for
