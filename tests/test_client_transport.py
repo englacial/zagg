@@ -519,11 +519,17 @@ class TestStatusPoller:
     def test_invoke_fault_burns_an_attempt_and_retries(self):
         # Driven tick by tick, no thread: the started-poller version raced its
         # own clock (issue #662). It advanced `now` as soon as the dispatch had
-        # incremented `calls`, but _invoke_faulted reads the clock a few
-        # instructions later, so a preempted poller thread stamped the re-fire
-        # at 1002.0 + 2 s = 1004.0 — a boundary the test never reaches, leaving
-        # `calls` at 1. The clock only moves here between ticks, so the
-        # stamp is read at 1000.0 by construction.
+        # incremented `calls`, but the clock read that stamps the backoff sits
+        # behind TWO logger.warning() calls — client_transport.py:1019 in
+        # _fire's except handler, and :1159 in _invoke_faulted immediately
+        # before the stamp — so the window is a logging round-trip through the
+        # root handlers (milliseconds under pytest's log capture), not a few
+        # instructions. A poller thread preempted there stamped the re-fire at
+        # 1002.0 + 2 s = 1004.0 — a boundary the test never reaches, leaving
+        # `calls` at 1. Replaying the old body reproduces it unaided at ~5%
+        # (2/40) on an idle box, and 0/40 with logging disabled. The clock only
+        # moves here between ticks, so the stamp is read at 1000.0 by
+        # construction.
         store = MemoryStore()
         now = {"t": 1000.0}
         calls = {"n": 0}
