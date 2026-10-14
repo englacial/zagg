@@ -113,18 +113,23 @@ def test_every_node_comes_back_as_a_handle():
     assert zarr.open_array(store, path=f"{grid.group_path}/count", mode="r")[:4].tolist() == [7] * 4
 
 
-def test_an_occupied_prefix_is_refused_not_overwritten():
-    """The writers clear the prefix themselves; the pass never ``delete_dir``s per node."""
+def test_the_pass_issues_no_reads(monkeypatch):
+    """No probe: the caller cleared the prefix, so every existence GET would 404 (PR #661)."""
     _grid, spec = _leaf_spec()
     store = MemoryStore()
+
+    async def no_read(self, *args, **kwargs):
+        raise AssertionError("emit_hierarchy read from the store")
+
+    for method in ("get", "exists", "list", "list_dir", "list_prefix", "delete_dir"):
+        monkeypatch.setattr(MemoryStore, method, no_read)
     with vlen_dtype_warning_suppressed():
-        emit_hierarchy(store, spec)
-        with pytest.raises(ContainsGroupError):
-            emit_hierarchy(store, spec)
+        nodes = emit_hierarchy(store, spec)
+    assert set(nodes) == {k.lstrip("/") for k in spec.to_flat()}
 
 
 def test_emit_shard_template_refuses_an_occupied_prefix_without_overwrite():
-    """``to_zarr`` accepted an identical template here; the one pass raises (issue #657)."""
+    """``to_zarr`` accepted an identical template here; one root probe raises (issue #657)."""
     grid, _spec = _leaf_spec()
     store = MemoryStore()
     with vlen_dtype_warning_suppressed():

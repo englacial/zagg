@@ -68,18 +68,18 @@ ZARR_ENTRY = (
 
 #: Per-(shard, window) ceilings over the leaf + column prefixes, a few
 #: percent over the issue #657 writers' measured maxima (phase 1 pinned
-#: today's 278 GET / 479 total). What remains: one probe GET per node from
-#: ``create_hierarchy``'s pre-PUT pass (91), the stamp and pointer reads (4),
-#: one PUT per ``zarr.json`` plus the attrs/stamp/pointer PUTs, and the data
-#: writes. A kind with no entry (data GET, HEAD, every listing) is pinned at
-#: zero: the hasher no longer walks the store.
+#: today's 278 GET / 479 total). What remains: the stamp and pointer reads
+#: (4 GETs — the template pass probes nothing, PR #661 ruling), one PUT per
+#: ``zarr.json`` plus the attrs/stamp/pointer PUTs, and the data writes. A
+#: kind with no entry (data GET, HEAD, every listing) is pinned at zero: the
+#: hasher no longer walks the store.
 CEILINGS = {
-    "metadata GET": 97,
+    "metadata GET": 5,
     "metadata PUT": 99,
     "data PUT": 82,
     "data DELETE": 28,
     "delete_dir": 3,
-    "total": 280,
+    "total": 190,
 }
 
 
