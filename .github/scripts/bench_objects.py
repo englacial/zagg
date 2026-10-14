@@ -488,11 +488,12 @@ def store_object_counts(
     ``objects_overviews`` is the SECOND-PASS SWEEP bucket, of which overview
     zarrs are one family and ancestor-node stage columns (issue #418) another
     — the name predates the second family and is load-bearing for the record's
-    readers, so it is described here rather than renamed. ``objects_per_shard`` keys are the
-    dispatched shards' external labels (``grid.shard_label``); a data object
-    whose block resolves to an undispatched shard is keyed ``"block:<n>"`` so
-    a stray write is visible rather than silently pooled. ``other_keys`` is a
-    capped sample of unclassifiable keys.
+    readers, so it is described here rather than renamed.
+    ``objects_per_shard`` keys are the dispatched shards' external labels
+    (``grid.shard_label``); a data object whose block resolves to an
+    undispatched shard is keyed ``"block:<n>"`` so a stray write is visible
+    rather than silently pooled. ``other_keys`` is a capped sample of
+    unclassifiable keys.
     """
     keys = [k for k in list_store_keys(store_path, **store_kwargs) if not _is_status_object(k)]
     per_shard: dict[str, int] = {}
