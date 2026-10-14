@@ -400,10 +400,14 @@ class TestRasterLambdaBackend:
     # the shard event, RequestResponse invoke). The async default is covered by
     # TestRasterLambdaAsyncBackend / TestInvokeLambdaRaster.
 
-    def test_early_timeouts_trip_and_stop_invoking(self, manifest, monkeypatch, tmp_path):
+    def test_early_timeouts_trip_and_stop_invoking(self, manifest, monkeypatch, tmp_path, caplog):
         # issue #652 phase 6: the raster pool is gated too. Three shards on a
         # width-1 run: the first times out, the breaker trips, the other two
         # are refused without an invoke; every shard then counts as failed.
+        # The all-failed error and the run log name the trip themselves, not
+        # through whichever result came last (PR #665 review).
+        import logging
+
         import boto3
 
         cfg, _sm_path, _shard, _data = manifest
@@ -430,8 +434,10 @@ class TestRasterLambdaBackend:
         monkeypatch.setattr(
             boto3, "client", lambda *a, **k: _FakeLambdaClient(_lifecycle(responder))
         )
+        caplog.set_level(logging.WARNING, logger="zagg.runner")
         with pytest.raises(
-            RuntimeError, match="all 3 raster shard.*not dispatched: circuit breaker"
+            RuntimeError,
+            match=r"all 3 raster shard.*; circuit breaker tripped \(timeout-ratio\) at result 1$",
         ):
             agg(
                 cfg,
@@ -443,6 +449,9 @@ class TestRasterLambdaBackend:
                 dispatch={"breaker": {"window": 1, "timeout_ratio": 0.5}},
             )
         assert len(invoked) == 1
+        assert "circuit breaker tripped (timeout-ratio) at result 1, width 1: 2 units" in (
+            caplog.text
+        )
 
     def test_events_and_summary(self, manifest, monkeypatch, tmp_path):
         import boto3

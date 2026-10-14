@@ -77,6 +77,7 @@ from zagg.dispatch_guard import (
     GuardConfig,
     describe,
     guard_pacing,
+    trip_warning,
 )
 from zagg.grids.base import shard_label
 from zagg.grids.morton import morton_word
@@ -1595,6 +1596,7 @@ class RasterStrategy:
         errors = 0
         timesteps_written = 0
         last_error = None
+        refused = 0  # units the tripped breaker refused (``not-dispatched``)
         ok_units: list = []  # (shard_key, body) — coverage needs keys, rollups bodies
         stats_failures: list = []  # (shard_key, error, body) — run-parquet rows (#297)
         # The circuit breaker (issue #652): each shard is recorded on its pool
@@ -1617,6 +1619,7 @@ class RasterStrategy:
                         logger.warning("on_progress hook raised; ignoring", exc_info=True)
                 if result["error"]:
                     errors += 1
+                    refused += result.get("outcome") == NOT_DISPATCHED
                     last_error = result["error"]
                     stats_failures.append((int(futures[fut]), result["error"], result["body"]))
                     logger.warning(f"raster shard {label} failed: {result['error']}")
@@ -1628,6 +1631,9 @@ class RasterStrategy:
                     timesteps_written += body["timesteps"]
 
         wall_time = time.time() - t0
+        # Logged here, ahead of the all-failed raise below (issue #652).
+        if guard.tripped is not None:
+            logger.warning(trip_warning(guard.tripped, refused))
         finalize_error = None
         if store_layout == "hive":
             # Finalize-backstop-before-all-failed-raise, mirroring the local
@@ -1751,7 +1757,15 @@ class RasterStrategy:
         # already durable (the run-stats write above) and is what re-raises when
         # some shards did land.
         if cells and errors == len(cells):
-            raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
+            trip = guard.tripped
+            verdict = (
+                ""
+                if trip is None
+                else f"; circuit breaker tripped ({trip['rule']}) at result {trip['at_result']}"
+            )
+            raise RuntimeError(
+                f"all {errors} raster shard(s) failed; last error: {last_error}{verdict}"
+            )
         # Worker telemetry rollup (issue #250): billed durations and peak RSS,
         # null-safe on bodies from a worker that predates either field.
         ok_bodies = [b for _k, b in ok_units]
@@ -4494,11 +4508,7 @@ def _run_lambda(
     trip = guard.tripped
     if trip is not None:
         refused = sum(r.get("outcome") == NOT_DISPATCHED for r in report.results)
-        logger.warning(
-            f"circuit breaker tripped ({trip['rule']}) at result {trip['at_result']}, "
-            f"width {trip['width']}: {refused} units not dispatched, tail legs skipped "
-            f"(issue #652)"
-        )
+        logger.warning(trip_warning(trip, refused))
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
     # requiring orchestrator-side S3 access). Guarded (issue #335): a failed

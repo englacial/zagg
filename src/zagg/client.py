@@ -92,6 +92,7 @@ from zagg.dispatch_guard import (
     GuardConfig,
     describe,
     guard_pacing,
+    trip_warning,
 )
 from zagg.grids import from_config as grid_from_config
 from zagg.grids.morton import morton_word
@@ -1358,11 +1359,7 @@ class Run:
             handle.breaker = guard.breaker
         if trip is not None:
             refused = sum(r.get("outcome") == NOT_DISPATCHED for r in results)
-            logger.warning(
-                f"circuit breaker tripped ({trip['rule']}) at result {trip['at_result']}, "
-                f"width {trip['width']}: {refused} units not dispatched, tail legs skipped "
-                f"(issue #652)"
-            )
+            logger.warning(trip_warning(trip, refused))
         for line in describe(handle.breaker, handle.dispatch_pacing):
             logger.info(line)
         # ONE warn/retry/record implementation for every dispatch path (issue

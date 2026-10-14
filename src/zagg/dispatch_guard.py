@@ -365,3 +365,11 @@ def describe(breaker: dict | None, pacing: str | None = None) -> list[str]:
             f"{breaker.get('at_result')}, width {breaker.get('width')} (issue #652)"
         )
     return lines
+
+
+def trip_warning(trip: dict, refused: int) -> str:
+    """The run log's one-line trip warning, shared by every transport."""
+    return (
+        f"circuit breaker tripped ({trip['rule']}) at result {trip['at_result']}, "
+        f"width {trip['width']}: {refused} units not dispatched, tail legs skipped (issue #652)"
+    )
