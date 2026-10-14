@@ -716,20 +716,32 @@ def measure_objects(
     of the write path being audited. A hive store with no readable manifest
     raises here rather than quietly modelling the pre-#384 shape.
     """
+    from zagg.config import get_icechunk
+
     pyramid = None
     leaf_versions = False
-    icechunk_declared = False
+    # The run's §11 declaration (issue #668): ASKED of the run's own config on
+    # both layouts rather than hard-coded False off-hive, then gated on the
+    # layout actually under audit. Both halves are load-bearing. Asking is what
+    # makes the flat answer honest instead of resting on an invariant two
+    # modules away (a non-hive store resolves True only via an explicit
+    # ``output.icechunk: true``, which ``validate_config`` rejects — see
+    # ``zagg.config.get_icechunk``). Gating is what keeps a DIVERGENT pair
+    # right: ``store_layout`` is this call's own argument and need not agree
+    # with ``get_store_layout(grid.config)``, as it does not in
+    # ``test_measure_objects_end_to_end`` (a flat store measured through a
+    # hive-layout grid config), and the layout being audited is the authority
+    # on whether a repo could be there at all. Never read from the store being
+    # measured — that is what makes "declared but absent" a finding at all.
+    icechunk_declared = get_icechunk(grid.config) and store_layout == "hive"
     if store_layout == "hive":
-        from zagg.config import get_icechunk, get_leaf_versions
+        from zagg.config import get_leaf_versions
         from zagg.hive import read_manifest
 
         pyramid = (read_manifest(store_path, **store_kwargs) or {}).get("pyramid")
-        # The run's knobs (issues #582/#668): the harness runs the config it
-        # audits, so the repo's declaration comes from the same config the
-        # ``icechunk_init`` step read — never from the store being measured,
-        # which is what makes "declared but absent" a finding at all.
+        # The run's versioned-leaf knob (issue #582): same posture — the
+        # harness runs the config it audits.
         leaf_versions = get_leaf_versions(grid.config)
-        icechunk_declared = get_icechunk(grid.config)
     expected = expected_object_counts(
         grid,
         n_shards=n_shards,
