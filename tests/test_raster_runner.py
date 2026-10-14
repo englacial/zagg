@@ -1108,6 +1108,152 @@ class TestRasterHiveLocalBackend:
         assert cov["time_range"] == [T0, T1]
 
 
+class TestRasterWindowedAllTimeFold:
+    """The all-time fold default on a windowed RASTER store (issue #633).
+
+    PR #623 phase 4 made a windowed store declare the all-time fold:
+    ``zagg.config.get_pyramid`` resolves an ABSENT ``output.pyramid.all_time``
+    to true on any windowed config, and ``_validate_pyramid`` refuses an
+    explicit false there. espg's ruling on question (20) of that PR scopes the
+    default to EVERY windowed store, raster included. The ``/1`` point arm is
+    ``test_sweep_overview.py::TestOverviewWriter``'s
+    ``test_a_v1_windowed_config_omitting_all_time_folds_all_zarr``; this is its
+    raster twin, built through ``agg(backend="local")`` — the normal run path —
+    rather than from hand-written leaves.
+    """
+
+    def test_a_windowed_raster_config_omitting_all_time_declares_the_fold(self, manifest):
+        from zagg import hive
+        from zagg.config import get_pyramid
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        assert "pyramid" not in cfg.output  # the default path: no knob at all
+        assert get_pyramid(cfg) == {"all_time": True}
+        summary = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        # The run is the premise, so pin that it IS windowed: two (shard,
+        # window) units and a /2 store carrying the daily schedule. Without
+        # this the block below would read the same for an unwindowed run,
+        # since it is templated from the config either way.
+        assert summary["total_cells"] == 2 and summary["cells_with_data"] == 2
+        m = hive.read_manifest(cfg.output["store"])
+        assert m["spec"] == "morton-hive/2" and m["temporal"]["schedule"] == "daily"
+        block = m["pyramid"]
+        # Raster is exempt from the issue #384 ``/2`` default flip, so what the
+        # run templates is the ``/1`` schedule the point arm folds: every two
+        # orders below the shard order (10), with the resolved fold on it.
+        assert block["spec"] == "zagg-pyramid/1"
+        assert block["overview"]["orders"] == [8, 6, 4, 2, 0]
+        assert block["overview"]["all_time"] is True
+
+    def test_the_declared_fold_materializes_no_overview_at_any_order(self, manifest, caplog):
+        # The gap the resolved default leaves on the raster arm, pinned as
+        # TODAY's contract rather than as a law: the fold is declared at every
+        # scheduled order and materialized at none of them. Raster leaves are
+        # column-less by construction (spec §4.6; issue #399 owns their
+        # overview regime), so a raster config — ``data_source.bands``, no
+        # ``aggregation.variables`` — declares ``fields: {}`` and
+        # ``sweep_overviews`` returns at its "no composable fields" gate
+        # before any leaf read. Issue #399's reducer-keyed folds are what
+        # flips this arm; until then an ``all.zarr`` here would be debris.
+        # §4.5's ``all_time`` bullet still reads as a materialization promise
+        # and its column-less carve-out sits in §4.6, so an external reader
+        # decoding from the spec alone would look for objects this arm proves
+        # are absent; scoping that sentence is question (1) on the PR.
+        from pathlib import Path
+
+        from zagg import hive
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep import _node_rel, run_sweep
+        from zagg.sweep_overview import _node_at
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        store_path = cfg.output["store"]
+        decl = hive.read_manifest(store_path)["pyramid"]["overview"]
+        assert decl["all_time"] is True and decl["fields"] == {}
+        # Pinned here as well as in the arm above, deliberately: it is what
+        # keeps the per-order loop at the bottom from going vacuous.
+        assert decl["orders"] == [8, 6, 4, 2, 0]
+        refs = [(shard, "20260713"), (shard, "20260718")]
+        # The gate returns before the dirty set is read, so the sweep never
+        # touches a leaf and ``refs`` alone pins nothing. Read the two
+        # windowed leaves back, as ``test_windowed_daily_leaves`` does with
+        # these same fixtures, so "a sweep over that store" names a store.
+        for _shard_ref, label in refs:
+            assert hive.read_commit(hive.shard_leaf_path(store_path, shard, window=label))
+        with caplog.at_level(logging.INFO, logger="zagg.sweep_overview"):
+            result = run_sweep(store_path, refs, families=("overview",))
+        counts = result["families"]["overview"]
+        assert counts["declared"] is True and counts["sweepable"] is True
+        # The run tail swept once already, so ``current`` is the counter that
+        # would betray an overview this arm then failed to find on the store.
+        assert counts["written"] == 0 and counts["current"] == 0
+        assert counts["empty"] == 0 and counts["failed"] == 0
+        assert "no composable fields declared" in caplog.text
+        # Nothing at ANY declared order — neither the all-time fold nor the
+        # per-window overviews it would sit beside — and nothing anywhere.
+        root, decimal = Path(store_path), morton_decimal(shard)
+        for order in decl["orders"]:
+            node = root / _node_rel(_node_at(decimal, order))
+            # The node path is composed from private helpers, so prove the
+            # prefix exists before reading anything into what is not under it.
+            assert node.is_dir()
+            # ``*.zarr``, not just ``all.zarr``: a per-window overview is
+            # named ``{window}.zarr`` (``_overview_basename``), so globbing
+            # makes the method name true. Safe at these nodes because the
+            # leaves sit at full depth (``43314244114_20260713.zarr``), and
+            # no ancestor at a declared order holds a zarr of any name.
+            assert not list(node.glob("*.zarr"))
+            assert not (node / "overview.rollup.json").exists()
+        # Store-wide backstop, deliberately ``all.zarr`` and not ``*.zarr``:
+        # the latter would match the two windowed leaves.
+        assert not list(root.rglob("all.zarr"))
+
+    def test_an_unwindowed_raster_config_declares_no_fold(self, tmp_path):
+        # The load-bearing control for the arm above: the SAME raster config
+        # without ``output.windowing`` resolves no fold, so that arm's
+        # ``all_time is True`` reads the windowed default, not a constant.
+        from zagg.config import get_pyramid
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = _cfg(tmp_path)
+        cfg.output["store_layout"] = "hive"
+        shard_order = cfg.output["grid"]["parent_order"]
+        assert get_pyramid(cfg) == {}
+        assert build_pyramid_block(cfg, shard_order)["overview"]["all_time"] is False
+
+    @pytest.mark.parametrize(
+        "knob",
+        [{"all_time": False}, {"orders": [8, 6], "all_time": False}],
+        ids=["bare", "with-a-schedule"],
+    )
+    def test_all_time_false_is_refused_on_a_windowed_raster_config(self, tmp_path, knob):
+        # Refused BY NAME on both spellings of the knob — bare, and beside a
+        # schedule — so a raster store cannot be configured to withdraw the
+        # fold its windows require. Both are the ``/1`` shape: the ``/2``
+        # grammar spells the schedule ``overviews:`` (``overview_block_v2``)
+        # and is not exercised here.
+        from zagg.config import get_pyramid
+
+        cfg = _cfg(tmp_path)
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "daily"}
+        cfg.output["pyramid"] = knob
+        with pytest.raises(ValueError, match="output.pyramid.all_time: false is refused"):
+            validate_config(cfg)
+        # The refusal is the WINDOWING's: the same raster config without
+        # ``output.windowing`` validates clean, and the knob reads back
+        # verbatim — ``get_pyramid`` defaults ``all_time`` only under a
+        # windowed config, so nothing rewrites what the caller spelled.
+        cfg.output.pop("windowing")
+        validate_config(cfg)
+        assert get_pyramid(cfg) == knob
+
+
 class TestRasterHiveLambdaBackend:
     """Lambda raster hive dispatch (issue #247 phase 4): lifecycle + events.
 
