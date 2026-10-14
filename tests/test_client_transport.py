@@ -384,6 +384,29 @@ class TestEventDispatch:
 # -- StatusPoller unit behavior --------------------------------------------------
 
 
+class _RecordingStop:
+    """Stands in for the poller's stop Event, so _run needs no wall clock.
+
+    Records the interval ``_run`` would have slept and ends the loop after
+    ``n_ticks`` iterations, which makes ``_run`` a pure function of an injected
+    clock: the backoff clamp's observable is the value it passes to
+    ``self._stop.wait(...)``.
+    """
+
+    def __init__(self, n_ticks):
+        self.waits: list[float] = []
+        self._n = n_ticks
+
+    def is_set(self):
+        return len(self.waits) >= self._n
+
+    def set(self):
+        self._n = 0
+
+    def wait(self, interval):
+        self.waits.append(interval)
+
+
 class TestStatusPoller:
     @staticmethod
     def _poller(store, **kwargs):
@@ -517,6 +540,19 @@ class TestStatusPoller:
         poller.shutdown(wait=True)
 
     def test_invoke_fault_burns_an_attempt_and_retries(self):
+        # Driven tick by tick, no thread: the started-poller version raced its
+        # own clock (issue #662). It advanced `now` as soon as the dispatch had
+        # incremented `calls`, but the clock read that stamps the backoff sits
+        # behind TWO logger.warning() calls — client_transport.py:1019 in
+        # _fire's except handler, and :1159 in _invoke_faulted immediately
+        # before the stamp — so the window is a logging round-trip through the
+        # root handlers (milliseconds under pytest's log capture), not a few
+        # instructions. A poller thread preempted there stamped the re-fire at
+        # 1002.0 + 2 s = 1004.0 — a boundary the test never reaches, leaving
+        # `calls` at 1. Replaying the old body reproduces it unaided at ~5%
+        # (2/40) on an idle box, and 0/40 with logging disabled. The clock only
+        # moves here between ticks, so the stamp is read at 1000.0 by
+        # construction.
         store = MemoryStore()
         now = {"t": 1000.0}
         calls = {"n": 0}
@@ -530,25 +566,73 @@ class TestStatusPoller:
             lambda: store, drop_timeout_s=1e6, max_retries=3, clock=lambda: now["t"]
         )
         fut = poller.register(1, "1", dispatch=flaky)
-        poller.start()
-        deadline = time.time() + 5
-        while calls["n"] < 1 and time.time() < deadline:
-            time.sleep(0.005)
+        entry = poller._entries[ct.shard_status_key(1)]
+        poller._tick()  # attempt 1 faults: the attempt is burned, 2 s armed
+        assert calls["n"] == 1
+        assert entry.attempts == 1 and entry.queued
+        assert entry.retry_not_before == 1002.0
+        # _run shortens its own interval to the armed stamp, so the re-fire is
+        # not overslept by up to _POLL_MAX_INTERVAL_S (the guard in _run that
+        # driving _tick directly no longer exercises).
+        assert poller._next_retry_wait() == 2.0
+        now["t"] = entry.retry_not_before - 0.001  # still INSIDE the backoff
+        poller._tick()
+        assert calls["n"] == 1
         now["t"] = 1002.0  # the 2 s class-(c) backoff expires
-        deadline = time.time() + 5
-        while calls["n"] < 2 and time.time() < deadline:
-            time.sleep(0.005)
+        assert poller._next_retry_wait() == 0.0
+        poller._tick()
         assert calls["n"] == 2
+        assert entry.retry_not_before == 0.0  # the re-fire consumed the backoff
         _put_status(store, 1)
-        assert fut.result(timeout=5)["retries"] == 1
-        poller.shutdown(wait=True)
+        poller._tick()
+        assert fut.done()  # the tick resolved it: no wall clock left to wait on
+        assert fut.result()["retries"] == 1
+
+    def test_run_never_oversleeps_an_armed_backoff(self):
+        # The clamp in _run (client_transport.py:924-926): `interval` is cut to
+        # an armed class-(c) stamp, so the idle-tick doubling cannot add up to
+        # _POLL_MAX_INTERVAL_S to every re-fire. _next_retry_wait() returning
+        # 2.0 is asserted above; that `interval` is actually clamped to it is
+        # asserted only here. Substituting the stop Event makes _run a pure
+        # function of the fake clock — no thread, no sleeping, no elapsed-time
+        # assertion, and no production change. Tick 1 faults and arms 2 s; the
+        # clock never advances, so the later ticks all sit inside that backoff,
+        # where the doubling would otherwise climb 2 -> 4 -> 8 toward the 15 s
+        # cap. The cadence is passed rather than taken from the module, because
+        # the autouse _fast_poll fixture pins it below the backoff, where the
+        # clamp has nothing to cut; these are the production constants.
+        store = MemoryStore()
+        now = {"t": 1000.0}
+
+        def flaky():
+            raise RuntimeError("TooManyRequestsException")
+
+        poller = ct.StatusPoller(
+            lambda: store,
+            drop_timeout_s=1e6,
+            max_retries=3,
+            initial_interval_s=2.0,
+            max_interval_s=15.0,
+            clock=lambda: now["t"],
+        )
+        poller.register(1, "1", dispatch=flaky)
+        poller._stop = _RecordingStop(3)
+        poller._run()
+        assert poller._stop.waits == [2.0, 2.0, 2.0]
 
     def test_throttled_invoke_backs_off_instead_of_bursting(self):
         # The medium-high from the PR #343 review: re-queueing without a
         # not-before stamp spent the WHOLE retry budget in ~0.3 ms, because
         # _dispatch_up_to_window's `while True` re-reads `queued` in the same
         # pass. Each re-fire now waits 2**attempts seconds — enforced by the
-        # clock, not by sleeping on the poller thread.
+        # clock, driven tick by tick rather than by a started poller racing the
+        # test for that clock (the same mechanism as issue #662: this one
+        # survived only because a 50 ms cushion made the window ~20x less
+        # likely to be hit, which hid it rather than closing it). That cushion
+        # was doing a second, real job as well: the autouse _fast_poll fixture
+        # pins the interval at 0.01 s, so 50 ms of sleep drove several ticks
+        # past the parked entry. The explicit inner loop below keeps that,
+        # deterministically.
         store = MemoryStore()
         now = {"t": 1000.0}
         fired: list[float] = []
@@ -561,20 +645,29 @@ class TestStatusPoller:
             lambda: store, drop_timeout_s=1e6, max_retries=4, clock=lambda: now["t"]
         )
         fut = poller.register(1, "1", dispatch=always_throttled)
-        poller.start()
-        # 2 s, then 4 s, then 8 s: no re-fire until the clock passes the stamp.
-        for expected, t in ((1, 1002.0), (2, 1006.0), (3, 1014.0)):
-            deadline = time.time() + 5
-            while len(fired) < expected and time.time() < deadline:
-                time.sleep(0.005)
-            time.sleep(0.05)  # several ticks INSIDE the backoff
+        entry = poller._entries[ct.shard_status_key(1)]
+        poller._tick()  # attempt 1
+        # 2 s, then 4 s, then 8 s: no re-fire until the clock reaches the stamp.
+        for expected, stamp in ((1, 1002.0), (2, 1006.0), (3, 1014.0)):
             assert len(fired) == expected, fired
-            now["t"] = t
-        result = fut.result(timeout=5)  # attempt 4 == max_retries: terminal
+            assert entry.retry_not_before == stamp
+            # One tick below the stamp is sufficient — _dispatch_up_to_window's
+            # parked-entry filter (`e.retry_not_before <= now`) is a stateless
+            # predicate re-evaluated per pass — but repeating it is free and
+            # keeps the parity with the real ticks the old cushion drove. This
+            # is also the first time either test pins the boundary from BELOW:
+            # the old body advanced straight from stamp - 2 to stamp.
+            now["t"] = stamp - 0.001  # ticks INSIDE the backoff change nothing
+            for _ in range(3):
+                poller._tick()
+            assert len(fired) == expected, fired
+            now["t"] = stamp
+            poller._tick()
+        assert fut.done()  # attempt 4 == max_retries: terminal on that tick
+        result = fut.result()
         assert "TooManyRequestsException" in result["error"]
         assert result["retries"] == 3
         assert fired == [1000.0, 1002.0, 1006.0, 1014.0]
-        poller.shutdown(wait=True)
 
     def test_a_store_fatal_status_is_terminal_and_names_its_class(self):
         # Issue #651: the worker ended its invoke on a refusal the store would
