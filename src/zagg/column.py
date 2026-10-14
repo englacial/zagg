@@ -585,7 +585,7 @@ def write_column(
     the 19/13/9 reference geometry with 2 composable fields — groups
     {13, 12, 11, 10, 9} — that is ``5*(1 + 3*2) + 3 + 1 = 39`` objects per
     ``(leaf, window)``, against the leaf's own ~10. Request cost (issue
-    #657): the template is ONE ``create_hierarchy`` pass
+    #657): the template is ONE probe-free ``create_nodes`` pass
     (:func:`zagg.grids.base.emit_hierarchy`) and every slab is written
     through the handle that pass returned — no ``open_array`` round-trip per
     array — inside the same ``async.concurrency: 128`` context as the
