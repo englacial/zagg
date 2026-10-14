@@ -2485,6 +2485,7 @@ def _write_overview(
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
+    from zagg.processing.write import all_fill
     from zagg.store import open_store
 
     target_order = cell_order - (shard_order - k)
@@ -2498,7 +2499,8 @@ def _write_overview(
     arr[:] = words
     for name, slab in fold["slabs"].items():
         arr = open_array(store, path=f"{target_order}/{name}", zarr_format=3, consolidated=False)
-        arr[:] = slab
+        if not all_fill(arr, slab):  # an all-fill object would be a DELETE (#653)
+            arr[:] = slab
     populated = _populated_mask(fold["slabs"], fields)
     root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
     root.attrs.update(

@@ -11,18 +11,33 @@ clean ``pyramid_check`` report. Nothing but the template's own ``data_source``
 paths is spelled here: a template that stopped validating, lost its
 ``delta_time`` column or its windowing block, or declared a ladder the leaf
 worker cannot write would fail this file by name.
+
+The build runs through a store that REFUSES to delete a chunk key the way
+the source.coop bucket did on 2026-10-12 (issue #653): one window holds
+noise only, so its leaf, column and sweep slabs for the signal stratum are
+all fill, and zarr's answer to an all-fill slab is a ``delete`` of a key that
+does not exist. The writers skip those slabs instead. Finishing the build
+proves nothing: a refused write is caught and logged per window (``hive``'s
+``_emit``) or per column (the leaf-column ``except Exception``), and
+``runner.agg`` returns normally. The proof is the refuser recording no
+chunk-key delete (``attempted`` empty), ``pyramid_check`` and the per-year
+counts showing every leaf landed, and a key-for-key match against a
+guard-off permissive build, since a skipped block and a deleted one both
+leave no object.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pytest
 import test_windowed_emit as emit
 from obstore.exceptions import GenericError
-from zarr.storage import WrapperStore
+from zarr.storage import LocalStore, WrapperStore
 
 from zagg import hive, runner
 from zagg.config import default_config, get_windowing
@@ -30,7 +45,11 @@ from zagg.hive import MANIFEST_NAME
 from zagg.pyramid_check import format_report, validate_pyramid
 
 TEMPLATES = ["atl03_tdigest_strata_healpix", "atl03_tdigest_healpix_hive"]
-WINDOWS = ("2018", "2019", "2020")
+#: 2021 is the stub window (issue #653): photons, but no signal photon, so
+#: every ``where``-predicated signal slab is all fill. A window with NO
+#: photons gets no leaf at all (``hive`` gates the leaf write on
+#: ``chunk_results``), which is why the stub is noise-only, not empty.
+WINDOWS = ("2018", "2019", "2020", "2021")
 #: Two order-9 shards under one order-8 parent (Sierra Nevada; the issue
 #: #602 measurement cell is nearby), so the ladder has a shared node.
 SITES = ((37.80, -119.50), (37.81, -119.48))
@@ -44,7 +63,7 @@ def _shard(site, order):
     return int(geo2mort(np.array([site[0]]), np.array([site[1]]), order=order)[0])
 
 
-def _granule(site, days, seed, groups):
+def _granule(site, days, seed, groups, *, noise_only=False):
     """An ATL03-shaped fake: six beam groups, photons linked from segments.
 
     Every group carries the same photons — ``len(days) * 20`` of them at the
@@ -52,6 +71,8 @@ def _granule(site, days, seed, groups):
     read plan (``spatial_index: segments``, ``pad: 1``), the segment link
     (``ph_index_beg`` origin 1), the 2-D ``signal_conf_ph`` column selector
     and the TEP filter all run against the paths the template declares.
+    ``noise_only`` zeroes every confidence (no TEP photon either): the stub
+    window's shape, in which no photon satisfies the signal predicate.
     """
     rng = np.random.default_rng(seed)
     per_day = 20
@@ -59,7 +80,10 @@ def _granule(site, days, seed, groups):
     lat = np.full(n, site[0]) + rng.normal(0, 1e-4, n)
     lon = np.full(n, site[1]) + rng.normal(0, 1e-4, n)
     conf = rng.integers(0, 5, (n, SURFACES)).astype("i1")
-    conf[: n // 4, 0] = -2  # TEP photons, dropped by the template's filter
+    if noise_only:
+        conf[:] = 0
+    else:
+        conf[: n // 4, 0] = -2  # TEP photons, dropped by the template's filter
     seg = n // 3
     arrays = {}
     for g in groups:
@@ -79,7 +103,60 @@ def _granule(site, days, seed, groups):
     return emit._FakeH5(arrays)
 
 
-def _build(monkeypatch, tmp_path, name):
+def _is_chunk(key):
+    """Whether a store key (or ``delete_dir`` prefix) addresses chunk data."""
+    return "/c/" in f"/{key}/"
+
+
+class _NoChunkDeletes(WrapperStore):
+    """A store that fails a chunk-key delete the way the bucket did (issue #653).
+
+    The leaf/column clears (``delete_dir("")`` on a prefix) and sidecar deletes
+    are still allowed — they remove keys that exist — and counted in
+    ``deletes``; a delete aimed at chunk data is recorded in ``attempted`` and
+    raised as the obstore error S3's ``<Error>``-in-a-2xx answer produces.
+    """
+
+    attempted: list = []
+    deletes: list = []
+
+    def _refuse(self, key):
+        self.attempted.append(key)
+        raise GenericError(
+            "Generic S3 error: Error performing DeleteObjects request: Got invalid "
+            f"DeleteObjects response for {key!r} (issue #653)"
+        )
+
+    async def delete(self, key):
+        if _is_chunk(key):
+            self._refuse(key)
+        self.deletes.append(key)
+        await self._store.delete(key)
+
+    async def delete_dir(self, prefix):
+        if _is_chunk(prefix):
+            self._refuse(prefix)
+        self.deletes.append(prefix)
+        await self._store.delete_dir(prefix)
+
+
+def _refuse_chunk_deletes(monkeypatch):
+    """Route every writable local store the build opens through the refuser."""
+    import zagg.store
+
+    real = zagg.store.open_store
+
+    def wrapped(path, *args, **kwargs):
+        store = real(path, *args, **kwargs)
+        if isinstance(store, LocalStore) and not store.read_only:
+            return _NoChunkDeletes(store)
+        return store
+
+    monkeypatch.setattr(zagg.store, "open_store", wrapped)
+    monkeypatch.setattr(runner, "open_store", wrapped)
+
+
+def _build(monkeypatch, tmp_path, name, *, refuse_chunk_deletes=False):
     """Run the template over the fakes on the local backend; return the root."""
     cfg = default_config(name)
     groups = list(cfg.data_source["groups"])
@@ -92,10 +169,13 @@ def _build(monkeypatch, tmp_path, name):
                 ("A", [300.0, 400.0], "2018-10-28T00:00:00Z", "2019-02-07T00:00:00Z"),
                 ("B", [800.0, 801.0], "2020-03-10T00:00:00Z", "2020-03-13T00:00:00Z"),
                 ("C", [729.5, 730.25], "2019-12-31T12:00:00Z", "2020-01-01T12:00:00Z"),
+                ("D", [1200.0], "2021-04-15T00:00:00Z", "2021-04-16T00:00:00Z"),
             )
         ):
             rec = emit._timed_rec(f"{tag}{i}", start, end)
-            fakes[rec["s3"]] = _granule(site, days, seed=10 * i + j, groups=groups)
+            fakes[rec["s3"]] = _granule(
+                site, days, seed=10 * i + j, groups=groups, noise_only=tag == "D"
+            )
             recs.append(rec)
         records.append(recs)
     catalog = {
@@ -114,21 +194,52 @@ def _build(monkeypatch, tmp_path, name):
     path.write_text(json.dumps(catalog))
     monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
     emit._patch(monkeypatch, fakes)
+    if refuse_chunk_deletes:
+        _refuse_chunk_deletes(monkeypatch)
     root = tmp_path / name
     runner.agg(cfg, catalog=str(path), store=str(root), backend="local")
     return cfg, root, catalog["shard_keys"]
 
 
+class _Built(NamedTuple):
+    name: str
+    cfg: object
+    root: object
+    shards: list
+    #: chunk-key deletes the refusing store was asked for (must stay empty)
+    attempted: list
+    #: the deletes it allowed (prefix clears, sidecars)
+    deletes: list
+    #: the same build with the guard off through a permissive store (zarr's
+    #: own delete-on-all-fill, as before #653), for the key-set match; None
+    #: for the single-digest template, which has no all-fill slab to compare
+    permissive: object
+
+
 @pytest.fixture(scope="module", params=TEMPLATES)
 def built(request, tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("template-store")
+    _NoChunkDeletes.attempted, _NoChunkDeletes.deletes = [], []
     with pytest.MonkeyPatch.context() as monkeypatch:
-        cfg, root, shards = _build(monkeypatch, tmp_path, request.param)
-    return request.param, cfg, root, shards
+        cfg, root, shards = _build(monkeypatch, tmp_path, request.param, refuse_chunk_deletes=True)
+    attempted, deletes = _NoChunkDeletes.attempted, _NoChunkDeletes.deletes
+    permissive = None
+    if request.param == TEMPLATES[0]:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            # The pre-#653 writers: the guard off, so every all-fill slab goes
+            # to zarr, which deletes its key. Every call site looks ``all_fill``
+            # up on this module at call time, so one patch reaches them all.
+            import zagg.processing.write
+
+            monkeypatch.setattr(zagg.processing.write, "all_fill", lambda array, values: False)
+            _, permissive, _ = _build(
+                monkeypatch, tmp_path_factory.mktemp("permissive-store"), request.param
+            )
+    return _Built(request.param, cfg, root, shards, attempted, deletes, permissive)
 
 
 def test_every_window_has_its_leaf_and_the_all_row_is_allocated(built):
-    name, cfg, root, shards = built
+    name, cfg, root, shards = built[:4]
     assert get_windowing(cfg)["schedule"] == "yearly"
     for shard in shards:
         for label in WINDOWS:
@@ -151,7 +262,7 @@ def test_the_icechunk_repo_holds_one_row_per_window_plus_all(built):
     from zagg.icechunk_refs import read_block, repo_path
     from zagg.icechunk_rows import ALL_ROW
 
-    name, cfg, root, shards = built
+    name, cfg, root, shards = built[:4]
     assert os.path.isdir(repo_path(str(root)))
     block = read_block(str(root), store_kwargs={})
     assert block is not None
@@ -221,11 +332,11 @@ def report(built):
     store in the same state. Read-only -- neither test mutates the report -- so
     sharing it couples nothing and can hide no failure.
     """
-    return validate_pyramid(str(built[2]), full=True)
+    return validate_pyramid(str(built.root), full=True)
 
 
 def test_pyramid_check_passes(built, report):
-    name, cfg, root, shards = built
+    name, cfg, root, shards = built[:4]
     # ``passed`` tolerates a skip; the value legs must actually run.
     for check in ("materialization", "columns", "readback", "counts", "digests"):
         assert report["checks"][check]["status"] == "pass", format_report(report)
@@ -324,8 +435,9 @@ def test_the_all_time_column_is_the_kway_fold_of_the_window_columns(built):
 #: puts 20 photons per day in every group, the TEP filter drops the first
 #: quarter (10, all from its first day), times 6 groups. A: day 300 (2018,
 #: 10 kept) and day 400 (2019, 20). B: days 800/801 (2020, 30). C: day
-#: 729.5 (2019-12-31T12:00, 10) and day 730.25 (2020-01-01T06:00, 20).
-WINDOW_COUNTS = {"2018": 10 * 6, "2019": (20 + 10) * 6, "2020": (30 + 20) * 6}
+#: 729.5 (2019-12-31T12:00, 10) and day 730.25 (2020-01-01T06:00, 20). D:
+#: day 1200 (2021, 20 noise photons, none TEP).
+WINDOW_COUNTS = {"2018": 10 * 6, "2019": (20 + 10) * 6, "2020": (30 + 20) * 6, "2021": 20 * 6}
 
 
 def test_each_photon_lands_in_its_own_year(built):
@@ -336,7 +448,7 @@ def test_each_photon_lands_in_its_own_year(built):
 
     from zagg.store import open_store
 
-    name, cfg, root, shards = built
+    name, cfg, root, shards = built[:4]
     for shard in shards:
         for label, expected in WINDOW_COUNTS.items():
             # A versioned leaf's arrays live under its stamp's ``current``.
@@ -354,6 +466,85 @@ def _store(leaf):
     from zagg.store import open_store
 
     return open_store(str(leaf))
+
+
+def _objects(root):
+    """Every object key under the store's ``*.zarr`` prefixes, root-relative.
+
+    Only the Zarr objects: the Icechunk repo beside them names its snapshots
+    and manifests by random id, and the run-stats sidecars carry run ids. A
+    versioned leaf's version directory (``run-<run_id>-<hash>``, spec §1.5)
+    is run-specific too, so it is normalized.
+    """
+    return {
+        "/".join(_RUN_DIR.sub("run-*", part) for part in p.relative_to(root).parts)
+        for p in root.rglob("*")
+        if p.is_file() and any(part.endswith(".zarr") for part in p.relative_to(root).parts)
+    }
+
+
+_RUN_DIR = re.compile(r"^run-[0-9a-f]{32}-[0-9a-f]{8}$")
+
+
+_NO_FILL_SLAB = "the single-digest template has no all-fill slab: the refusal alone is its check"
+
+
+def test_the_build_never_asks_the_store_to_delete_a_chunk(built):
+    """Issue #653: an all-fill slab is skipped, not written-as-delete.
+
+    The build finishing proves nothing — a refused write is caught and logged
+    per window/column and ``runner.agg`` still returns — so the proof is
+    ``attempted`` staying empty (with ``test_pyramid_check_passes`` and
+    ``test_each_photon_lands_in_its_own_year`` showing every leaf landed).
+    Both templates run it: for the strata one the stub window's signal
+    stratum and ``composition`` are all fill, so this is the #653 regression
+    guard; the single-digest one writes its one digest in every window, so
+    for it this only checks that the refusal stays scoped.
+    """
+    name, cfg, root, shards = built[:4]
+    assert built.attempted == []
+    # The refusal is scoped: the per-leaf template clear (``delete_dir("")``,
+    # D4) and the sidecar deletes went through, at least one per leaf.
+    assert len(built.deletes) >= len(shards) * len(WINDOWS)
+
+
+def test_the_stub_windows_fill_slab_has_no_object(built):
+    """The skipped object's absence, where there is one to skip: the strata
+    template's signal stratum, populated in 2020 and all fill in 2021."""
+    name, cfg, root, shards = built[:4]
+    if name != TEMPLATES[0]:
+        pytest.skip(_NO_FILL_SLAB)
+    base = str(cfg.output["grid"]["child_order"])
+    for shard in shards:
+        leaf = {
+            label: Path(hive.resolve_leaf(hive.shard_leaf_path(str(root), shard, window=label))[0])
+            for label in ("2020", "2021")
+        }
+        for label in leaf:
+            assert (leaf[label] / base / "count" / "c" / "0").exists(), label
+        # Populated in 2020, all fill in 2021 → one object vs none, and the
+        # 2021 array still reads as fill (absence is the encoding, spec §4).
+        assert (leaf["2020"] / base / "h_tdigest_signal" / "c" / "0").exists()
+        assert not (leaf["2021"] / base / "h_tdigest_signal").joinpath("c").exists()
+        import zarr
+
+        arr = zarr.open_array(_store(leaf["2021"]), path=f"{base}/h_tdigest_signal", mode="r")
+        assert all(v == b"" for v in np.asarray(arr[:]).flat)
+
+
+def test_skipped_blocks_leave_no_object_either_way(built):
+    """A skipped all-fill block and zarr's delete of it both leave no key — and
+    the guard never skipped a block zarr would have written.
+
+    The twin runs with ``all_fill`` patched to ``False``, so it is zarr's own
+    pre-#653 behaviour (delete-on-all-fill); key-set equality therefore means
+    the guard skipped exactly the blocks zarr would have deleted, no more.
+    Strata template only: the single-digest one has nothing to skip, so its
+    twin would match by construction and is not built.
+    """
+    if built.permissive is None:
+        pytest.skip(_NO_FILL_SLAB)
+    assert _objects(built.root) == _objects(built.permissive)
 
 
 # ── a leaf write the store refuses (issue #651) ──────────────────────────────
@@ -440,12 +631,15 @@ def test_a_refused_leaf_write_ends_the_unit_at_that_window(
     # The window before the failure keeps its stamp; the failed one is debris.
     assert hive.resolve_leaf(leaf["2018"])[1] is not None
     assert hive.resolve_leaf(leaf["2019"])[1] is None
+    later = [w for w in WINDOWS if w > "2019"]  # 2020 and the #653 stub window 2021
     if store_error_class == "store-fatal":
-        # The bound: the unit returned after the failing window -- the window
-        # after it was never aggregated, never opened, never written.
-        assert meta["windows_unattempted"] == ["2020"]
-        assert not any(o.startswith(leaf["2020"]) for o in opens)
-        assert not Path(leaf["2020"]).exists()
+        # The bound: the unit returned after the failing window -- the windows
+        # after it were never aggregated, never opened, never written.
+        assert meta["windows_unattempted"] == later
+        for w in later:
+            assert not any(o.startswith(leaf[w]) for o in opens)
+            assert not Path(leaf[w]).exists()
     else:
         assert "windows_unattempted" not in meta
-        assert hive.resolve_leaf(leaf["2020"])[1] is not None
+        for w in later:
+            assert hive.resolve_leaf(leaf[w])[1] is not None

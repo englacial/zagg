@@ -1104,7 +1104,9 @@ def emit_raster_leaf_template(
     return store
 
 
-def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict, *, streams: dict | None = None):
+def write_raster_leaf_slab(
+    store, grid, t_idx: int, slab: dict, *, streams: dict | None = None, skip_fill: bool = False
+):
     """Write one timestep's slab at LEAF-LOCAL indices: ``array[t, :] = values``.
 
     The leaf's arrays span exactly one shard, so the cell axis needs no
@@ -1118,6 +1120,13 @@ def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict, *, streams: dict
     hashed bytes are exactly the stored ones. The accumulators are
     thread-safe (this function runs on worker threads at ``write_buffer >
     1``) and tolerate the sink's completion-order arrival.
+
+    ``skip_fill`` (issue #653): write only the row's chunks that are not all
+    fill (:func:`~zagg.processing.write.populated_runs`) instead of letting
+    zarr DELETE each all-fill chunk's key. The hive leaf passes it — its
+    prefix was just cleared, so those keys are absent and the delete would
+    only cost (and on one bucket, fail) the write. The hash stream still sees
+    the whole cast row: an absent chunk reads back as fill.
     """
     from zarr import config as zarr_config
     from zarr import open_array
@@ -1128,7 +1137,8 @@ def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict, *, streams: dict
                 store, path=f"{grid.group_path}/{name}", zarr_format=3, consolidated=False
             )
             cast = np.asarray(values, dtype=arr.dtype)
-            arr[int(t_idx), :] = cast
+            for lo, hi in _row_runs(arr, cast, skip_fill):
+                arr[int(t_idx), lo:hi] = cast[lo:hi]
             if streams is not None:
                 stream = streams.get(f"{grid.group_path}/{name}")
                 if stream is not None:
@@ -1146,11 +1156,27 @@ def _shard_cell_range(grid, shard_key: int) -> tuple[int, int]:
     return start, start + grid.cells_per_shard
 
 
-def write_raster_slab(store, grid, shard_key: int, t_idx: int, slab: dict):
+def _row_runs(arr, cast, skip_fill: bool) -> list[tuple[int, int]]:
+    """The ``[lo, hi)`` pieces of a cast row to write: all of it, or with
+    ``skip_fill`` only its chunks that are not all fill (issue #653)."""
+    if not skip_fill:
+        return [(0, len(cast))]
+    from zagg.processing.write import populated_runs
+
+    return populated_runs(arr, cast, int(arr.chunks[1]))
+
+
+def write_raster_slab(
+    store, grid, shard_key: int, t_idx: int, slab: dict, *, skip_fill: bool = False
+):
     """Write one timestep x shard slab: ``array[t, start:stop] = values``.
 
     Chunk-aligned by construction (``start`` is a multiple of
-    ``cells_per_chunk``), so no read-modify-write.
+    ``cells_per_chunk``), so no read-modify-write. ``skip_fill`` is
+    :func:`write_raster_leaf_slab`'s; the flat runner leaves it off, since its
+    template is emitted ``overwrite=False`` and a rerun onto the same store
+    may find a stale key under an all-fill chunk — zarr's delete is what
+    clears it.
     """
     from zarr import config as zarr_config
     from zarr import open_array
@@ -1161,7 +1187,9 @@ def write_raster_slab(store, grid, shard_key: int, t_idx: int, slab: dict):
             arr = open_array(
                 store, path=f"{grid.group_path}/{name}", zarr_format=3, consolidated=False
             )
-            arr[int(t_idx), start:stop] = np.asarray(values, dtype=arr.dtype)
+            cast = np.asarray(values, dtype=arr.dtype)
+            for lo, hi in _row_runs(arr, cast, skip_fill):
+                arr[int(t_idx), start + lo : start + hi] = cast[lo:hi]
     return store
 
 
@@ -1449,7 +1477,10 @@ def process_and_write_raster_hive(
     def _write_slab(t_idx, slab):
         nonlocal write_s
         _t0 = time.time()
-        write_raster_leaf_slab(_leaf(), grid, t_idx, slab, streams=streams)
+        # skip_fill: the leaf prefix was just cleared (overwrite=True above),
+        # so an all-fill chunk's key is absent and zarr's delete of it would
+        # only cost — or fail — the write (issue #653).
+        write_raster_leaf_slab(_leaf(), grid, t_idx, slab, streams=streams, skip_fill=True)
         write_s += time.time() - _t0
 
     occupied: list = []
