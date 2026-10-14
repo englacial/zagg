@@ -4432,7 +4432,9 @@ and those are **deliberately not levels**: they overlap the overview levels
 for the same cells and are sweep inputs, not reader-facing artifacts. A
 level whose artifact a node never wrote (a column exists only under a `/2`
 declaration with composable fields; an overview only once swept) simply has
-no refs there and reads as fill. Every group is created by the once-per-run
+no refs there and reads as fill — an artifact never written, that is: a
+windowed store's `all` row at the column levels can instead hold refs to a
+member since cleared or rewritten, which fail on read (§11.2). Every group is created by the once-per-run
 init (§11.4) from the manifest's declaration, and the repo's **root attrs
 carry the manifest's `zagg-multiscales/1` block** as the root `multiscales`
 object — its keys verbatim, plus the zarr-conventions `layout` below — so a
@@ -4630,6 +4632,23 @@ its kind, fixed at birth with its schedule:
   (§11.6), and an init that names no label on a windowed store is refused
   rather than creating a repo with no rows.
 
+  **Contract — the `all` row at the column levels is virtual and may be
+  stale.** Its refs point into the shard's all-time column (§4.6), which a
+  writer rewrites in place on every append to the shard and deletes
+  whenever it clears the member (a `unit: window` unit, a failed window, a
+  store-fatal abort); a committed ref is never retracted. Between such a
+  clear or rewrite and the next bulk close that re-commits the row, the
+  branch tip's refs there name an object that is gone or replaced, and a
+  read of those chunks **fails** — the object is not found, or its §11.3
+  checksum does not match (that section's same-second caveat on a
+  `file://` container applies). It does not read as fill. A reader MUST
+  treat that failure, at row `all` of a column level, as "no all-time
+  member here now" — never as data, and not as a corrupt store; the window
+  rows of the same cells are unaffected and fold to the same member. A
+  tag is stale there by construction (issue
+  [#649](https://github.com/englacial/zagg/issues/649)'s ruling; a native
+  copy is PR [#646](https://github.com/englacial/zagg/pull/646)'s track).
+
 `all` therefore means one of two things — an unwindowed store's single
 row, or a windowed store's all-time fold — and since a store is one kind
 from birth the two meanings never meet in one store; the manifest's
@@ -4794,8 +4813,12 @@ columns do:
    carrier beside the shard's leaves, `all.pyramid.icechunk_refs.json`
    (the member's own `{stem}.{base}` sibling grammar), holding the
    all-time column's declared-level units at row `all` — no base unit,
-   since there is no all-time leaf — and deletes it whenever it clears the
-   member, so a carrier never outlives the object it indexes. It is a
+   since there is no all-time leaf. The writer deletes that carrier
+   (best-effort) before it rewrites the member and before it clears it, so
+   a carrier does not outlive the object it indexes; a member left
+   standing without one is given a new carrier by the next bulk unit that
+   finds the member current. That is a statement about the carrier alone:
+   refs already committed from it stay in the repo (§11.2). It is a
    **writer-internal carrier**, not part of the reader contract — the repo
    is. No Icechunk session is opened on the leaf path.
 2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
@@ -4868,6 +4891,15 @@ columns do:
    leaves, after a run whose commits were lost) is a **manual staged sweep
    over the whole store**, where every leaf is dirty by construction.
 
+   The all-time column's refs are the one artifact "committed by the run
+   that dirtied it" does not cover. A bulk unit that rebuilds the member
+   while writing no window (§4.6: every window current, the member absent,
+   short or older) rewrites the member and its carrier and dirties no
+   leaf, so no node gathers the new carrier: the branch tip keeps the
+   previous member's checksums — failing on read, as §11.2 states — until
+   a run next dirties a leaf under the shard's dispatch node, whose close
+   gathers it.
+
 `commit_order` defaults to the **finest dispatch node** of the staged sweep
 (`shard_order − tuple_width` when the shard order is a multiple of the width:
 6 at production), `split_order` to `commit_order`. Both ride the
@@ -4876,7 +4908,10 @@ columns do:
 **per-run** — the init writes this run's values so its stage nodes can read
 them, and they are never a compatibility key. `commit: "leaf"` keeps the per-leaf commit of the
 first revision — the leaf commits `leaf {decimal}` itself and the ladder
-commits overview refs only. An unset `commit` resolves to the ladder only
+commits overview refs only. The all-time column has **no carrier** in that
+mode: the bulk unit that closes the shard commits the member's units
+itself, at row `all`, under the same `leaf {decimal}` message as the
+shard's window leaves (the ancestry does not tell the two apart). An unset `commit` resolves to the ladder only
 when the run walks it — the dispatcher chains the staged sweep
 (`output.sweep: "stages"`) and a `/2` ladder with a composable field is
 declared — and to `"leaf"` otherwise, on every backend: a ladder-mode run
