@@ -639,6 +639,23 @@ class TestDamage:
         }[damage]
         assert any(f.startswith(want) for f in findings), findings
 
+    def test_the_members_are_checked_before_any_sweep_has_run(self, store):
+        # The leaf workers write all.pyramid.zarr; no node close is needed.
+        from zagg.column import COLUMN_ATTR
+
+        for node in list(store.rglob("all.zarr")):
+            shutil.rmtree(node)
+        leaf = SHARDS[0]
+        member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
+        _set_attrs(member, lambda a: a[COLUMN_ATTR].update(window="2020"))
+        report = validate_pyramid(str(store), full=True)
+        entry = report["checks"]["all_time"]
+        assert entry["status"] == "fail" and "the node close has not run" in entry["detail"]
+        assert report["all_time_columns"]["checked"] == 3
+        assert report["all_time_columns"]["stale"] == []
+        want = f"{leaf}: all.pyramid.zarr records window '2020', not the reserved token"
+        assert any(m.startswith(want) for m in entry["mismatches"]), entry["mismatches"]
+
     def test_a_member_group_laid_out_wrong_fails_by_name(self, store):
         # The §4.6 layout rule (issue #631) holds the all-time member as it
         # holds every window column: one whole unsharded chunk at this size.

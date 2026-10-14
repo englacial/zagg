@@ -828,16 +828,15 @@ def _all_time_check(
 ) -> None:
     """Settle ``all_time``: the all-time member at every declared level (§4.4, §4.6).
 
-    Declared, every ladder node that has a leaf beneath it in any window must
+    Declared, every ladder node with a leaf beneath it in any window must
     carry a committed ``all.zarr`` (one GET each); ``sample_nodes`` of them
-    per order (all in full mode) are then held to the fold's contract — see
-    :func:`_all_time_node`. The declared LEAF-column levels have an all-time
-    member too — ``all.pyramid.zarr`` beside the window columns (issues
-    #650/#649) — which the ladder cannot see (``_ladder`` drops the leaf
-    entry, whose node IS the shard order): :mod:`zagg.pyramid_check_alltime`
-    probes it per roster leaf and holds the committed ones to the §4.6
-    carve-out and the k-way fold of their window columns. Undeclared: *not
-    applicable*, after the node probe, naming any committed fold found.
+    per order (all in full mode) are held to the fold's contract (see
+    :func:`_all_time_node`). The LEAF-column levels have an all-time member
+    too, ``all.pyramid.zarr`` (issues #650/#649), which the ladder cannot see
+    (``_ladder`` drops the leaf entry): :mod:`zagg.pyramid_check_alltime`
+    holds it to §4.6 and the fold of its window columns, before the node
+    gate — the leaf workers write it whether or not a sweep ran. Undeclared:
+    *not applicable*, after the node probe, naming any committed fold found.
     """
     from zagg.store import open_object_store
     from zagg.sweep_overview import OVERVIEW_ATTR
@@ -888,11 +887,16 @@ def _all_time_check(
     if unknown:
         checks["all_time"] = _entry("fail", unknown)
         return
+    errors: dict = {name: [] for name in _VALUE_CHECKS}
+    counted = dict.fromkeys(_VALUE_CHECKS, 0)
+    col_findings += all_time_columns_check(
+        harness, leaves, members, col_probes, entries, groups, report, errors, counted, full=full
+    )
     if not committed:
         checks["all_time"] = _entry(
             "fail",
             f"0/{len(probed)} declared nodes carry the all-time fold — the node close has not run",
-            mismatches=col_findings,
+            mismatches=[*col_findings, *(e for name in _VALUE_CHECKS for e in errors[name])][:20],
         )
         return
     sources = _WindowSources(
@@ -905,8 +909,6 @@ def _all_time_check(
         workers=harness.workers,
     )
     store = open_object_store(harness.store_root, **harness.store_kwargs)
-    errors: dict = {name: [] for name in _VALUE_CHECKS}
-    counted = dict.fromkeys(_VALUE_CHECKS, 0)
     # The artifact's identity, on EVERY node (the attrs are in hand): an
     # all.zarr that records a window, or another spec, is not this fold.
     for node, attrs in sorted(committed.items()):
@@ -932,9 +934,6 @@ def _all_time_check(
             )
     for message in sources.warnings:
         harness.warn(message)
-    col_findings += all_time_columns_check(
-        harness, leaves, members, col_probes, entries, groups, report, errors, counted, full=full
-    )
     found = [e for name in _VALUE_CHECKS for e in errors[name]]
     if missing:
         found.insert(
