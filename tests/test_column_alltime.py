@@ -31,8 +31,15 @@ from zagg.windows import SCHEDULE_NONE_TOKEN
 WINDOWS = ("2018", "2019", "2020")
 
 
-def _window_folds(windows=WINDOWS, *, shard_order=tc.SHARD_ORDER, cell_order=tc.CELL_ORDER):
-    """``{label: fold_column output}`` over three windows of distinct resident cells."""
+def _window_folds(
+    windows=WINDOWS, *, shard_order=tc.SHARD_ORDER, cell_order=tc.CELL_ORDER, fields=tc.FIELDS
+):
+    """``{label: fold_column output}`` over three windows of distinct resident cells.
+
+    ``fields`` may locate the digest (its ``_locations`` sibling built in the
+    same call) or add a packed ``composition`` word ``of`` it, one distinct
+    lane word per window so the merge is a genuine blend.
+    """
     rng = np.random.default_rng(649)
     n_cells = 4 ** (cell_order - shard_order)
     out = {}
@@ -40,12 +47,24 @@ def _window_folds(windows=WINDOWS, *, shard_order=tc.SHARD_ORDER, cell_order=tc.
         # Every window populates a different subset, with cells 0 and 1 shared
         # by all so the cross-window merge has real work at the finest group.
         cells = {0: rng.normal(k, 1, 7), 1: rng.normal(10 + k, 1, 5), 2 + k: rng.normal(0, 1, 3)}
-        slabs = tc._cell_slabs(cells, n_cells)
+        if "location" in fields["h_tdigest"]:
+            slabs, _truth = tc._located_cell_slabs(cells, fields, n_cells)
+        else:
+            slabs = tc._cell_slabs(cells, n_cells)
+        if "composition" in fields:
+            slabs["composition"] = np.zeros(n_cells, np.uint64)
+            slabs["composition"][list(cells)] = (0xFF000000FF0000FF, 0x00FF00FF00FF0000)[k % 2]
         resolutions = list(range(cell_order, shard_order - 1, -1))
         out[label] = fold_column(
-            slabs, tc.FIELDS, cell_order=cell_order, resolutions=resolutions, node_order=shard_order
+            slabs, fields, cell_order=cell_order, resolutions=resolutions, node_order=shard_order
         )
     return out
+
+
+#: The three field classes the hybrid row must carry byte-for-byte (review
+#: finding (10) of PR #666): exact + approximate, a located digest (payload
+#: plus its ``_locations`` sibling), and a packed word with its ``of`` digest.
+CLASSES = {"plain": tc.FIELDS, "located": tc.LOCATED_FIELDS, "packed": tc.PACKED_FIELDS}
 
 
 def _resident(folds, *, shard_order=tc.SHARD_ORDER, cell_order=tc.CELL_ORDER):
@@ -257,7 +276,9 @@ class TestFoldAllTime:
         assert not list(tmp_path.rglob("all.pyramid.zarr"))
 
 
-def _stored_columns(root, folds, *, shard_order=tc.SHARD_ORDER, cell_order=tc.CELL_ORDER):
+def _stored_columns(
+    root, folds, *, shard_order=tc.SHARD_ORDER, cell_order=tc.CELL_ORDER, fields=tc.FIELDS
+):
     """Write ``folds`` as window columns beside the shard; returns their labels."""
     from zagg.column import write_column
 
@@ -266,7 +287,7 @@ def _stored_columns(root, folds, *, shard_order=tc.SHARD_ORDER, cell_order=tc.CE
             str(root),
             tc.morton_word("-311"),
             folded,
-            tc.FIELDS,
+            fields,
             node_order=shard_order,
             cell_order=cell_order,
             window=label,
@@ -288,11 +309,13 @@ class TestHybridRow:
             for res, group in folded.items()
         }
 
-    def test_resident_stored_and_mixed_rows_fold_to_the_same_bytes(self, tmp_path):
+    @pytest.mark.parametrize("kind", sorted(CLASSES))
+    def test_resident_stored_and_mixed_rows_fold_to_the_same_bytes(self, tmp_path, kind):
         from zagg.column_alltime import _StoredColumn, window_row
 
-        folds = _window_folds()
-        labels = _stored_columns(tmp_path, folds)
+        fields = CLASSES[kind]
+        folds = _window_folds(fields=fields)
+        labels = _stored_columns(tmp_path, folds, fields=fields)
         resident = {s.path.removesuffix(".pyramid.zarr"): s for s in _resident(folds)}
         rows = {
             "resident": window_row(str(tmp_path), tc.morton_word("-311"), labels, resident),
@@ -308,22 +331,26 @@ class TestHybridRow:
             "_StoredColumn",
         ]
         out = {}
-        for kind, row in rows.items():
+        for name, row in rows.items():
             folded, depth, broken, demoted = fold_all_time(
-                row, tc.FIELDS, node_order=tc.SHARD_ORDER, resolutions=[4, 3, 2]
+                row, fields, node_order=tc.SHARD_ORDER, resolutions=[4, 3, 2]
             )
-            out[kind] = (self._bytes(folded), depth, broken, demoted)
+            out[name] = (self._bytes(folded), depth, broken, demoted)
+            assert set(folded[4]) == set(folds["2019"][4])  # every array, siblings too
         assert out["resident"] == out["stored"] == out["mixed"]
         assert out["mixed"][1] == {4: 2, 3: 2, 2: 2}
+        assert out["mixed"][2] == {4: set(), 3: set(), 2: set()} and out["mixed"][3] == {}
 
-    def test_the_members_written_from_either_row_are_byte_identical(self, tmp_path):
+    @pytest.mark.parametrize("kind", sorted(CLASSES))
+    def test_the_members_written_from_either_row_are_byte_identical(self, tmp_path, kind):
         from zagg.column_alltime import window_row
 
-        folds = _window_folds()
+        fields = CLASSES[kind]
+        folds = _window_folds(fields=fields)
         trees = {}
-        for kind, held in (("resident", None), ("stored", {})):
-            root = tmp_path / kind
-            labels = _stored_columns(root, folds)
+        for source, held in (("resident", None), ("stored", {})):
+            root = tmp_path / source
+            labels = _stored_columns(root, folds, fields=fields)
             resident = (
                 {s.path.removesuffix(".pyramid.zarr"): s for s in _resident(folds)}
                 if held is None
@@ -335,14 +362,62 @@ class TestHybridRow:
                     str(root),
                     tc.morton_word("-311"),
                     row,
-                    tc.FIELDS,
+                    fields,
                     node_order=tc.SHARD_ORDER,
                     cell_order=tc.CELL_ORDER,
                     resolutions=[4, 3, 2],
                 )
                 == "all.pyramid.zarr"
             )
-            trees[kind] = {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
+            trees[source] = {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
+        assert trees["resident"] and trees["resident"] == trees["stored"]
+        extra = {"plain": None, "located": "h_tdigest_locations", "packed": "composition"}[kind]
+        assert extra is None or any(f"/{extra}/" in k for k in trees["stored"])
+
+    def test_a_window_refused_at_one_group_is_the_same_either_way(self, tmp_path):
+        # 2019's column lacks its digest's location sibling at the coarsest
+        # group alone, resident and stored alike: the kernel refuses it THERE
+        # in both rows, and the two members are byte-identical.
+        import shutil
+
+        from zagg.column_alltime import _StoredColumn, window_row
+
+        fields = tc.LOCATED_FIELDS
+        built = _window_folds(fields=fields)
+        trees, broken = {}, {}
+        for source in ("resident", "stored"):
+            folds = {w: {r: dict(g) for r, g in f.items()} for w, f in built.items()}
+            root = tmp_path / source
+            labels = _stored_columns(root, folds, fields=fields)
+            node = Path(hive.shard_leaf_path(str(root), tc.morton_word("-311"))).parent
+            shutil.rmtree(node / "2019.pyramid.zarr" / str(tc.SHARD_ORDER) / "h_tdigest_locations")
+            if source == "resident":
+                held = {s.path.removesuffix(".pyramid.zarr"): s for s in _resident(folds)}
+                del held["2019"]._folded[tc.SHARD_ORDER]["h_tdigest_locations"]
+            else:
+                held = {}
+            row = window_row(str(root), tc.morton_word("-311"), labels, held)
+            assert isinstance(row[1], _StoredColumn) is (source == "stored")
+            broken[source] = fold_all_time(
+                row, fields, node_order=tc.SHARD_ORDER, resolutions=[4, 3, 2]
+            )[2]
+            write_all_time_column(
+                str(root),
+                tc.morton_word("-311"),
+                row,
+                fields,
+                node_order=tc.SHARD_ORDER,
+                cell_order=tc.CELL_ORDER,
+                resolutions=[4, 3, 2],
+            )
+            trees[source] = {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
+            attrs = _attrs(root, "all.pyramid.zarr")
+            assert attrs[COLUMN_ATTR]["source_windows"] == {
+                "folded": 2,
+                "missing": 0,
+                "unreadable": 1,
+            }
+        assert broken["resident"] == broken["stored"] == {4: set(), 3: set(), 2: {1}}
         assert trees["resident"] and trees["resident"] == trees["stored"]
 
     def test_a_stored_row_names_missing_and_unreadable_windows(self, tmp_path):
@@ -789,6 +864,30 @@ class TestBulkUnit:
         assert emit._tree(root) == before
         attrs = json.loads((_node(root) / "all.pyramid.zarr" / "zarr.json").read_text())
         assert attrs["attributes"][COMMIT_ATTR] == stamped
+
+    def test_a_gate_refused_window_is_read_back(self, monkeypatch, tmp_path):
+        # PR #666 review finding (10): a window the gate REFUSES (a
+        # contraction without ``allow_contraction``) is a stored source of
+        # the close, as a current one is — not a deferral that clears.
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        fresh = self._member(root)
+        gate = hive._LeafUnit.gate
+
+        def _refuse(self, *, allow_contraction):
+            if self.label == "2018":
+                return {"shard_key": int(self.shard_key), "window": "2018", "refused": True}
+            return gate(self, allow_contraction=allow_contraction)
+
+        monkeypatch.setattr(hive._LeafUnit, "gate", _refuse)
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert [m.get("refused") for m in meta["windows"]] == [True, None, None]
+        assert meta["error"] is None and meta["all_time_column"] == "all.pyramid.zarr"
+        assert self._member(root) == fresh
+        _assert_member_folds_the_stored_columns(root, cfg)
 
     def test_a_fanout_window_unit_clears_the_member(self, monkeypatch, tmp_path):
         # PR #666 review finding (1), the interim: concurrent ``(shard,
