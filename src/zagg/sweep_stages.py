@@ -875,7 +875,8 @@ def _lambda_memory_mb() -> int | None:
     from its OWN record instead of assuming the tier the dispatcher currently
     routes to (:data:`zagg.runner.STAGE_SWEEP_WORKER`, which issue #659 moved
     — a record written under the previous tier is priced 2x wrong by that
-    assumption). ``None`` on an in-process pass: nothing billed it.
+    assumption). ``None`` off-Lambda — a local call of this worker, which
+    nothing billed.
     """
     from zagg.telemetry import lambda_env
 
