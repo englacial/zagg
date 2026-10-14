@@ -256,12 +256,12 @@ class DispatchGuard:
         self.tripped: dict | None = None
         self._lock = threading.Lock()  # serializes :meth:`gate` records (pool threads)
 
-    def record(self, result: dict) -> None:
+    def record(self, result: dict, *, dedupe: bool = True) -> None:
         """Fold one completed result in and re-evaluate both rules."""
         cfg = self.config
         rec = classify_result(result)
         key = result.get("unit", result.get("shard_key"))
-        if rec.timeout and key is not None:
+        if dedupe and rec.timeout and key is not None:
             # A dropped unit re-fires once: it counts one timeout, recorded at
             # its first drop; a later ok/failed completion still counts. The
             # identity is the poller's ``unit`` (its status key, one per
@@ -336,9 +336,11 @@ class DispatchGuard:
         return run
 
     def _record_locked(self, result) -> None:
+        # No dedupe: a pool unit never re-fires (the dedupe is the Event
+        # poller's), and the window units of one shard share its ``shard_key``.
         if isinstance(result, dict):
             with self._lock:
-                self.record(result)
+                self.record(result, dedupe=False)
 
     @property
     def breaker(self) -> dict | None:

@@ -263,6 +263,15 @@ class TestRoomAndRefusal:
             -1,
         )
 
+    def test_gate_counts_every_window_unit_of_one_shard(self):
+        # Pool window units share their shard's ``shard_key`` and never re-fire,
+        # so the poller's timeout dedupe must not collapse them (PR #665 review).
+        g = _guard(window=4, timeout_ratio=0.5)
+        run = g.gate(lambda w: {**_timeout(), "shard_key": 7}, lambda w: g.refused(shard_key=7))
+        outcomes = [run(w)["outcome"] for w in range(6)]
+        assert g.tripped["rule"] == RULE_TIMEOUT_RATIO and g.tripped["at_result"] == 4
+        assert outcomes == ["failed-unknown"] * 4 + [NOT_DISPATCHED] * 2
+
     def test_gate_records_a_raised_payload(self):
         # The facade's sync work raises ShardError carrying the result dict.
         class RaisedError(Exception):
