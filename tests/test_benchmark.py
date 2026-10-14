@@ -147,6 +147,7 @@ def test_build_record_cost_per_100km2():
     assert set(rec) == set(bench_metrics.RECORD_COLUMNS) | {
         "objects_per_shard",
         "objects_telemetry",
+        "objects_icechunk",
         "objects_mismatch",
     }
 

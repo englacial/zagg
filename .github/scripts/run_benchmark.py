@@ -561,7 +561,8 @@ def main(argv: list[str] | None = None) -> int:
             f"max_memory_mb={record['max_memory_mb']} "
             f"objects={record.get('objects_write_path')} write-path "
             f"(expected {record.get('objects_expected')}; "
-            f"{record.get('objects_total')} gross, telemetry {record.get('objects_telemetry')})"
+            f"{record.get('objects_total')} gross, telemetry {record.get('objects_telemetry')}, "
+            f"icechunk {record.get('objects_icechunk')})"
         )
 
     Path(args.out_json).write_text(json.dumps(records, indent=2))

@@ -83,6 +83,10 @@ FULL_AOI_COLUMNS = [
     # reindex), like the per-merge series.
     "objects_total",
     "objects_expected",
+    # The §11 Icechunk companion repo's bucket (issue #668), netted out of the
+    # audited write-path total: retained so a gross ``objects_total`` step on
+    # this record-only leg is reconcilable without re-LISTing the store.
+    "objects_icechunk",
     # Store-layout axis + flat<->hive parity verdict (issue #240 phase 4).
     # ``store_layout`` is "flat"|"hive" (null pre-hive rows read as flat; the
     # renderers key the 2x2 panels on flat rows only). ``parity_ok`` is the

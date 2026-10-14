@@ -103,7 +103,9 @@ def test_neon_catalog_builds_full_aoi_shardmap(tmp_path):
     # Dry-run writes no store -> object-count columns stay null (issue #240),
     # including the per-run root-telemetry tally (issue #362).
     assert run["objects_total"] is None and run["objects_mismatch"] is None
-    assert run["objects_telemetry"] is None
+    # ... and the §11 companion repo's bucket (issue #668), reported on this
+    # record-only leg because the audit on it is a presence floor, not a count.
+    assert run["objects_telemetry"] is None and run["objects_icechunk"] is None
 
 
 # --- pure helpers ----------------------------------------------------------
