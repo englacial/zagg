@@ -21,9 +21,13 @@ composition merge, all inside the one kernel.
 The inputs are hybrid, per window: the slabs this invoke has just folded
 (:class:`_ResidentColumn` — the bulk ``unit: shard`` build, where every
 window is resident and nothing is read), else the window's stored column read
-back (the non-resident path, phase 2 of the issue). One fold, one writer,
-the same bytes either way, because a resident slab IS the stored member's
-value.
+back (:class:`_StoredColumn` — a window the identity gate skipped as
+current, one an append did not touch, the other windows of a fan-out
+``unit: window`` invoke). :func:`window_row` builds the row from both kinds;
+one fold, one writer, the same bytes either way, because a resident slab IS
+the stored member's value. An invoke that wrote nothing (every window
+current) re-folds only when the member is absent, short, or older than a
+window column it folds (:func:`member_current`).
 
 Provenance (spec §4.6, the issue's carve-out): the member is a
 ``zagg-column/1`` artifact under the reserved ``all`` token, its groups keep
@@ -90,6 +94,98 @@ class _ResidentColumn(_ColumnReader):
     def _read(self, res: int, name: str, cells: slice):
         array = self._array(res, name)
         return None if array is None else array[cells]
+
+
+class _StoredColumn(_ColumnReader):
+    """A window column read back from the store for the all-time fold.
+
+    The sweep's stamp-validated reader over one ``{label}.pyramid.zarr`` —
+    one root GET for stamp and attrs, optimistic re-validation around every
+    member read — opened on its own path (the leaf worker holds no store
+    handle at the root). Without the foreign-sweep abort: the worker is not
+    a sweep, holds no lease and runs beside the fleet by design (§4.8), and
+    a fleet column's stamp carries no ``run_id`` for the guard to read; a
+    column rewritten under it mid-read still raises ``ColumnMovedError``
+    through the base class, which fails the close (the shard's error, and
+    the retry re-reads).
+    """
+
+    def __init__(self, path: str, *, store_kwargs: dict | None = None):
+        super().__init__(path, run_id=None, run_started="", store_kwargs=dict(store_kwargs or {}))
+
+    def _foreign_guard(self, stamp) -> None:
+        return None
+
+
+def window_row(store_root: str, shard_key, labels, resident: dict, *, store_kwargs=None) -> list:
+    """One source per window label, ascending: resident when held, else the stored column.
+
+    ``resident`` maps the labels this invoke wrote to their
+    :class:`_ResidentColumn`; every other label is read back as a
+    :class:`_StoredColumn` — a committed one is a source, an uncommitted or
+    absent one reads ``None`` (``missing``: the window is known to the shard
+    but its column is not there), one whose root cannot be read is
+    :data:`zagg.sweep_fold.UNREADABLE` (the sweep's ``_readers_for`` posture,
+    one tier down). Ascending label order is the close law's fold order.
+    """
+    from zagg.column import column_name
+    from zagg.hive import shard_leaf_path
+    from zagg.sweep_fold import UNREADABLE
+
+    node_prefix = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
+    row: list = []
+    for label in sorted(labels):
+        if label in resident:
+            row.append(resident[label])
+            continue
+        path = f"{node_prefix}/{column_name(label)}"
+        try:
+            reader = _StoredColumn(path, store_kwargs=store_kwargs)
+        except Exception as e:
+            logger.warning(f"all-time column: unreadable window column {path} ({e})")
+            row.append(UNREADABLE)
+            continue
+        row.append(reader if reader.committed else None)
+    return row
+
+
+def member_current(store_root: str, shard_key, row: list, *, store_kwargs=None) -> bool:
+    """Whether the standing ``all.pyramid.zarr`` already folds exactly ``row``.
+
+    The skip gate of an invoke that wrote nothing (every window the identity
+    gate found current): the member is current when it is committed, folded
+    every window of ``row`` and nothing else (``source_windows`` says
+    ``folded == len(row)`` with no ``missing`` or ``unreadable`` — a short
+    fold is re-folded so the next run heals it), and is stamped no earlier
+    than any column it folds. Stamps resolve to one second, so a column
+    rewritten in the member's own second by a writer that does not clear the
+    member reads as current (the issue #417 blind spot; every zagg writer of
+    a window column clears or rewrites the member in the same invoke).
+    Anything unreadable is not current.
+    """
+    from zagg.column import COLUMN_ATTR, column_name
+    from zagg.hive import shard_leaf_path
+
+    node_prefix = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
+    try:
+        member = _StoredColumn(f"{node_prefix}/{column_name(None)}", store_kwargs=store_kwargs)
+    except Exception as e:
+        logger.warning(f"all-time column: standing member unreadable ({e}); re-folding")
+        return False
+    if not member.committed or not all(_is_reader(entry) for entry in row):
+        return False
+    block = member.attrs.get(COLUMN_ATTR)
+    counters = (block.get("source_windows") or {}) if isinstance(block, dict) else {}
+    if (counters.get("folded"), counters.get("missing"), counters.get("unreadable")) != (
+        len(row),
+        0,
+        0,
+    ):
+        return False
+    stamped = str(member.stamp.get("written_at") or "")
+    return bool(stamped) and all(
+        str(entry.stamp.get("written_at") or "") <= stamped for entry in row
+    )
 
 
 def fold_all_time(row: list, fields: dict, *, node_order: int, resolutions) -> tuple:
@@ -244,14 +340,34 @@ def stored_window_labels(store_root: str, shard_key, store_kwargs: dict | None =
     return labels
 
 
-def close_shard(store_root: str, shard_key, grid, config, row: list, *, store_kwargs) -> str | None:
-    """The worker seam: gate on the declaration, fold ``row``, write; returns the basename.
+def close_shard(
+    store_root: str,
+    shard_key,
+    grid,
+    config,
+    resident: dict,
+    *,
+    dispatched=(),
+    fresh: bool = True,
+    store_kwargs,
+) -> str | None:
+    """The worker seam: gate on the declaration, build the row, fold, write; the basename.
 
     The same gate the window columns take (:func:`zagg.column.leaf_column_plan`):
     a declaration with no leaf-node levels writes no all-time column and
     deletes any a previous declaration left (:func:`zagg.column._clear_column`
     under the token), so the member never outlives the declaration that
-    made it. Failures raise; the caller reports them as the shard's error.
+    made it. The windows folded are every label the shard HAS — the stored
+    columns beside it (:func:`stored_window_labels`), the ``resident`` folds
+    this invoke wrote, and ``dispatched``: the labels this invoke was sent
+    but did not write (the identity gate skipped them), so a skipped window
+    whose column is gone counts ``missing`` rather than vanishing from the
+    record. ``fresh`` says the invoke wrote a window, so the member MUST be
+    rewritten; an invoke that wrote nothing rewrites only when
+    :func:`member_current` says the standing member is not this row's fold.
+    Returns the basename when a member was written, ``None`` otherwise
+    (nothing to fold, or current). Failures raise; the caller reports them
+    as the unit's error.
     """
     from zagg.column import _clear_column, leaf_column_plan
 
@@ -261,6 +377,13 @@ def close_shard(store_root: str, shard_key, grid, config, row: list, *, store_kw
         _clear_column(store_root, shard_key, None, store_kwargs)
         return None
     resolutions, fields = plan
+    labels = stored_window_labels(store_root, shard_key, store_kwargs) | set(resident)
+    labels |= set(dispatched)
+    if not labels:
+        return None
+    row = window_row(store_root, shard_key, labels, resident, store_kwargs=store_kwargs)
+    if not fresh and member_current(store_root, shard_key, row, store_kwargs=store_kwargs):
+        return None
     return write_all_time_column(
         store_root,
         shard_key,

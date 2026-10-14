@@ -1778,8 +1778,11 @@ class _LeafUnit:
         self.write_elapsed = 0.0
         # This window's column fold, kept resident for the shard's all-time
         # column (issue #649): filled by ``write_leaf_column`` in :meth:`finish`
-        # on the bulk unit alone (``keep_fold``), the one path that closes from
-        # memory; every other unit drops it on return, as before.
+        # on a WINDOWED unit (``keep_fold``) — the bulk unit closes from every
+        # window's fold, the fan-out unit from its own plus the stored
+        # siblings — never on an unwindowed leaf, which has no member to
+        # close. Its size is unmeasured at v4 geometry (δ-bounded digests
+        # over the column resolutions, 16,384 cells per field at cells 16).
         self.column_fold: dict | None = {} if keep_fold else None
         # A windowed leaf stores no per-cell ``morton`` array (issue #586
         # phase 3, spec §1.5 "The cell coordinate"): the word is derived from
@@ -2516,6 +2519,7 @@ def process_and_write_hive(
         config,
         window=window,
         windowing=windowing,
+        keep_fold=window is not None,
         **unit_kwargs,
     )
     # Leaf identity gate (issue #388): per (shard, window) unit, before any
@@ -2536,17 +2540,24 @@ def process_and_write_hive(
     meta = unit.finish(metadata)
     if window is not None and not meta.get("error"):
         # A fan-out window unit rewrote one window column the shard's all-time
-        # member folds (issue #649): the member is stale, and absent beats
-        # stale until the stored-column path (phase 2) rewrites it here. A
-        # failed clear is the unit's error, as a failed column is.
-        from zagg.column import _clear_column
-
-        try:
-            _clear_column(store_root, shard_key, None, store_kwargs)
-        except Exception as e:
-            logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
-            meta["error"] = f"all-time column: {e}"
-            meta["all_time_column_error"] = str(e)
+        # member folds (issue #649): the member is rewritten here from this
+        # window's resident fold plus the stored siblings — one writer per
+        # unit, so two concurrent units of one shard can each publish a
+        # member short of the other's window (last writer wins; a re-run
+        # heals it, and ``source_windows`` names the count). The bulk
+        # ``unit: shard`` default has one writer per shard and no race.
+        _close_all_time(
+            shard_key,
+            grid,
+            store_root,
+            config,
+            _resident_sources(grid, {unit.label: (unit, meta)}),
+            (),
+            fresh=True,
+            sink=meta,
+            timed=(meta,),
+            store_kwargs=store_kwargs,
+        )
     return meta
 
 
@@ -2662,96 +2673,137 @@ def _process_windows(
             else None,
             **shard_kwargs,
         )
-        _close_windows(
-            shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs
-        )
+    _close_windows(shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs)
     base["duration_s"] = time.time() - t0
     return _shard_meta(base, [metas[w["label"]] for w in windows])
 
 
-def _close_windows(shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs):
-    """The shard's all-time column from its RESIDENT window folds (issue #649).
+def _resident_sources(grid, written: dict) -> dict:
+    """``{label: _ResidentColumn}`` over the windows this invoke committed a column for.
 
-    After the bulk unit's windows land, their column folds (each
-    ``_LeafUnit.column_fold``) are folded once more, cell for cell across the
-    windows in ascending label order, into ``all.pyramid.zarr`` beside them
-    (:func:`zagg.column_alltime.close_shard` — the sweep's close law, one
-    tier down). The resident path requires every window of the shard to be
-    in memory: one the gate skipped as current, one that failed, or one that
-    was refused has no fold here, and neither has a window the store holds a
-    column for that this invoke was not dispatched (a run over new granules
-    sends only the windows they touch — one LIST of the node,
-    :func:`zagg.column_alltime.stored_window_labels`); the member is then left
-    for the stored-column path to write (the issue's phase 2) rather than
-    folded short under a name that claims the whole record. A deferred
-    close whose invoke WROTE a window CLEARS the standing member: it folds
-    that window's previous column, and absent beats stale (the
-    :func:`zagg.column._clear_column` rule); an invoke that changed nothing
-    leaves it. A window whose sink kept nothing (the benign no-data error)
-    has no leaf and no column, and is simply not a source. A failure is the
-    SHARD's error — the windows' leaves and columns are committed and keep their metadata and records; the invoke fails so
-    the dispatcher retries the shard — reported through the same channel a
-    failed column uses, never raised past the telemetry envelope.
+    ``written`` maps a label to its ``(_LeafUnit, metadata)``; a window with
+    no column (none declared, or a benign no-data window with no leaf) has
+    no source and is simply absent from the map.
     """
-    from zagg.column import _clear_column, column_name
-    from zagg.column_alltime import _ResidentColumn, close_shard, stored_window_labels
-    from zagg.dispatch import BENIGN_ERRORS
+    from zagg.column import column_name
+    from zagg.column_alltime import _ResidentColumn
 
-    row, resident, deferred, wrote = [], set(), False, False
-    # Ascending label order, not the dispatcher's (an explicit schedule
-    # dispatches in DECLARED order): a float fold's rounding follows row order,
-    # and the sweep's close folds ``sorted`` labels (review finding (5)).
-    for w in sorted(windows, key=lambda w: w["label"]):
-        m = metas[w["label"]]
-        if m.get("current") or m.get("refused"):
-            deferred = True  # not resident: the stored-column path's case
-            continue
-        # Landed, or committed its leaf before its column failed.
-        wrote |= not m.get("error") or bool(m.get("column_error"))
-        if m.get("error"):
-            # Benign: no leaf, no column, not a source. Otherwise a failed
-            # window: the retry rewrites it and the member.
-            deferred |= m["error"] not in BENIGN_ERRORS
-            continue
-        if not m.get("leaf_column"):
-            continue  # no column declared: nothing to fold (the close then clears)
-        resident.add(w["label"])
-        row.append(
-            _ResidentColumn(
-                column_name(w["label"]),
-                units[w["label"]].column_fold,
-                node_order=grid.parent_order,
-                cell_order=grid.child_order,
-                granule_count=m.get("granule_count", 0),
-                time_range=m.get("time_range"),
-            )
+    return {
+        label: _ResidentColumn(
+            column_name(label),
+            unit.column_fold,
+            node_order=grid.parent_order,
+            cell_order=grid.child_order,
+            granule_count=m.get("granule_count", 0),
+            time_range=m.get("time_range"),
         )
+        for label, (unit, m) in written.items()
+        if m.get("leaf_column")
+    }
+
+
+def _close_all_time(
+    shard_key, grid, store_root, config, resident, skipped, *, fresh, sink, timed, store_kwargs
+) -> None:
+    """Run the shard's all-time close; its failure is ``sink``'s error, its time rides ``timed``.
+
+    The one error channel both unit shapes use (issue #649): a failed close —
+    the LIST, a stored column read, the fold or the write — lands in
+    ``sink["error"]`` through the same channel a failed column uses, so the
+    invoke fails and the dispatcher retries the unit, while the leaves and
+    columns already committed keep their metadata and records; never raised
+    past the telemetry envelope. The elapsed time goes to every meta in
+    ``timed`` as ``phase_timings["all_time_column"]`` (review finding (4)):
+    the records are built per WINDOW meta, so it rides every written window's
+    phases as the invoke's ``read`` does, and ``telemetry.merge`` counts it
+    once per invoke (``INVOKE_PHASES``).
+    """
+    from zagg.column_alltime import close_shard
+
     _t0 = time.time()
-    store_kwargs = unit_kwargs["store_kwargs"]
+    column = None
     try:
-        if not deferred:  # a stored window this invoke does not hold defers too
-            deferred = not stored_window_labels(store_root, shard_key, store_kwargs) <= resident
-        if deferred:
-            if wrote:
-                _clear_column(store_root, shard_key, None, store_kwargs)
-            return
-        column = close_shard(store_root, shard_key, grid, config, row, store_kwargs=store_kwargs)
+        column = close_shard(
+            store_root,
+            shard_key,
+            grid,
+            config,
+            resident,
+            dispatched=skipped,
+            fresh=fresh,
+            store_kwargs=store_kwargs,
+        )
     except Exception as e:
         logger.error(f"all-time column write failed for shard {shard_key}: {e}")
-        base["error"] = f"all-time column: {e}"
-        base["all_time_column_error"] = str(e)
-        return
+        sink["error"] = f"all-time column: {e}"
+        sink["all_time_column_error"] = str(e)
     finally:
-        # The close's cost reaches the run records (review finding (4)): they
-        # are built per WINDOW meta, so it rides every written window's
-        # phases as the invoke's ``read`` does, and ``telemetry.merge``
-        # counts it once per invoke (``INVOKE_PHASES``).
         elapsed = time.time() - _t0
-        for m in (base, *(m for m in metas.values() if not (m.get("current") or m.get("refused")))):
+        for m in timed:
             if "phase_timings" in m:
                 m["phase_timings"]["all_time_column"] = elapsed
     if column is not None:
-        base["all_time_column"] = column
+        sink["all_time_column"] = column
+
+
+def _close_windows(shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs):
+    """The shard's all-time column after the bulk unit's windows land (issue #649).
+
+    Every window the shard has is folded, cell for cell in ascending label
+    order, into ``all.pyramid.zarr`` beside the window columns
+    (:func:`zagg.column_alltime.close_shard` — the sweep's close law, one
+    tier down): the windows this invoke wrote from their RESIDENT folds
+    (each ``_LeafUnit.column_fold``), every other — one the identity gate
+    skipped as current, one the store holds a column for that this invoke
+    was not dispatched (a run over new granules sends only the windows they
+    touch) — read back from its stored column. A window whose sink kept
+    nothing (the benign no-data error) has no leaf and no column, and is
+    simply not a source. A window that FAILED (or committed its leaf and
+    then failed its column) defers the close: the retry rewrites it and the
+    member, and meanwhile the standing member — which folds that window's
+    previous column — is cleared, since absent beats stale (the
+    :func:`zagg.column._clear_column` rule). An invoke that wrote nothing
+    (every window current) rewrites the member only when it is absent, short
+    or older than a column it folds (:func:`zagg.column_alltime.member_current`),
+    which is what heals a shard whose close once failed.
+    """
+    from zagg.column import _clear_column
+    from zagg.dispatch import BENIGN_ERRORS
+
+    written: dict = {}
+    skipped: list = []
+    failed = False
+    for w in windows:
+        m = metas[w["label"]]
+        if m.get("current") or m.get("refused"):
+            skipped.append(w["label"])
+        elif m.get("error") and m["error"] not in BENIGN_ERRORS:
+            failed = True
+        elif not m.get("error"):
+            written[w["label"]] = (units[w["label"]], m)
+    if failed:
+        # Landed windows, or a leaf committed before its column failed: the
+        # member folds a superseded column, so it goes until the retry.
+        if written or any(m.get("column_error") for m in metas.values()):
+            try:
+                _clear_column(store_root, shard_key, None, unit_kwargs["store_kwargs"])
+            except Exception as e:
+                logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
+                base["error"] = f"all-time column: {e}"
+                base["all_time_column_error"] = str(e)
+        return
+    _close_all_time(
+        shard_key,
+        grid,
+        store_root,
+        config,
+        _resident_sources(grid, written),
+        skipped,
+        fresh=bool(written),
+        sink=base,
+        timed=(base, *(m for _unit, m in written.values())),
+        store_kwargs=unit_kwargs["store_kwargs"],
+    )
 
 
 def _shard_meta(base: dict, window_metas: list) -> dict:

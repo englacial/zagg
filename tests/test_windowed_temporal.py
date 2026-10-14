@@ -101,11 +101,10 @@ class TestBulkAndFanOutAgree:
             assert record["source"] == "worker" and record["fields"] == ["h_tdigest"]
             word, counts = leaf_temporal.leaf_temporal_contribution(record)
             assert int(counts.obs.sum()) == N_OBS[label]
-        # ... and so is everything else under the shard node, but for the
-        # all-time column the bulk unit closes from its resident folds (issue
-        # #649 phase 1; the fan-out writes it from the stored columns in phase 2).
-        fan_tree, bulk_tree = _tree(fan_root), _tree(bulk_root)
-        assert fan_tree == {k: v for k, v in bulk_tree.items() if "/all.pyramid." not in k}
+        # ... and so is everything else under the shard node, the all-time
+        # column included (issue #649: resident folds on the bulk unit, the
+        # stored siblings on the fan-out, one law).
+        assert _tree(fan_root) == _tree(bulk_root)
 
     def test_a_window_record_covers_its_own_window_only(self, monkeypatch, tmp_path):
         # The windows' envelope words are disjoint and in window order: an

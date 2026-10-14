@@ -1,11 +1,13 @@
 """The windowed leaf's all-time column (issue #649).
 
-Phase 1, the resident path: the bulk ``unit: shard`` invoke folds the window
-columns it has just written into ``all.pyramid.zarr`` beside them, under the
-sweep's close law — every member the k-way fold of the window members, cell
-for cell, in ascending window order — and the member carries the §4.6
-carve-out's provenance (``merges_from_raw`` one deeper than the window
-members', ``source_windows``).
+The leaf worker folds a shard's window columns into ``all.pyramid.zarr``
+beside them under the sweep's close law — every member the k-way fold of the
+window members, cell for cell, in ascending window order — from a hybrid
+row: the folds this invoke holds resident (the bulk ``unit: shard`` build),
+the stored columns of the windows it did not write (a gate-skipped window,
+an append, the fan-out ``unit: window`` siblings). The member carries the
+§4.6 carve-out's provenance (``merges_from_raw`` one deeper than the window
+members', ``source_windows``), and the two input kinds give the same bytes.
 """
 
 import json
@@ -254,6 +256,188 @@ class TestFoldAllTime:
         assert not list(tmp_path.rglob("all.pyramid.zarr"))
 
 
+def _stored_columns(root, folds, *, shard_order=tc.SHARD_ORDER, cell_order=tc.CELL_ORDER):
+    """Write ``folds`` as window columns beside the shard; returns their labels."""
+    from zagg.column import write_column
+
+    for label, folded in folds.items():
+        write_column(
+            str(root),
+            tc.morton_word("-311"),
+            folded,
+            tc.FIELDS,
+            node_order=shard_order,
+            cell_order=cell_order,
+            window=label,
+            time_range=[f"{label}-01-01T00:00:00+00:00", f"{label}-12-31T00:00:00+00:00"],
+            granule_count=1,
+        )
+    return set(folds)
+
+
+class TestHybridRow:
+    """Resident and stored inputs are one fold: same bytes, same provenance."""
+
+    def _bytes(self, folded):
+        return {
+            res: {
+                name: [bytes(p) for p in slab] if slab.dtype == object else slab.tobytes()
+                for name, slab in group.items()
+            }
+            for res, group in folded.items()
+        }
+
+    def test_resident_stored_and_mixed_rows_fold_to_the_same_bytes(self, tmp_path):
+        from zagg.column_alltime import _StoredColumn, window_row
+
+        folds = _window_folds()
+        labels = _stored_columns(tmp_path, folds)
+        resident = {s.path.removesuffix(".pyramid.zarr"): s for s in _resident(folds)}
+        rows = {
+            "resident": window_row(str(tmp_path), tc.morton_word("-311"), labels, resident),
+            "stored": window_row(str(tmp_path), tc.morton_word("-311"), labels, {}),
+            "mixed": window_row(
+                str(tmp_path), tc.morton_word("-311"), labels, {"2019": resident["2019"]}
+            ),
+        }
+        assert all(isinstance(e, _StoredColumn) for e in rows["stored"])
+        assert [type(e).__name__ for e in rows["mixed"]] == [
+            "_StoredColumn",
+            "_ResidentColumn",
+            "_StoredColumn",
+        ]
+        out = {}
+        for kind, row in rows.items():
+            folded, depth, broken, demoted = fold_all_time(
+                row, tc.FIELDS, node_order=tc.SHARD_ORDER, resolutions=[4, 3, 2]
+            )
+            out[kind] = (self._bytes(folded), depth, broken, demoted)
+        assert out["resident"] == out["stored"] == out["mixed"]
+        assert out["mixed"][1] == {4: 2, 3: 2, 2: 2}
+
+    def test_the_members_written_from_either_row_are_byte_identical(self, tmp_path):
+        from zagg.column_alltime import window_row
+
+        folds = _window_folds()
+        trees = {}
+        for kind, held in (("resident", None), ("stored", {})):
+            root = tmp_path / kind
+            labels = _stored_columns(root, folds)
+            resident = (
+                {s.path.removesuffix(".pyramid.zarr"): s for s in _resident(folds)}
+                if held is None
+                else held
+            )
+            row = window_row(str(root), tc.morton_word("-311"), labels, resident)
+            assert (
+                write_all_time_column(
+                    str(root),
+                    tc.morton_word("-311"),
+                    row,
+                    tc.FIELDS,
+                    node_order=tc.SHARD_ORDER,
+                    cell_order=tc.CELL_ORDER,
+                    resolutions=[4, 3, 2],
+                )
+                == "all.pyramid.zarr"
+            )
+            trees[kind] = {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
+        assert trees["resident"] and trees["resident"] == trees["stored"]
+
+    def test_a_stored_row_names_missing_and_unreadable_windows(self, tmp_path):
+        from zagg.column_alltime import window_row
+        from zagg.sweep_fold import UNREADABLE
+
+        folds = _window_folds()
+        _stored_columns(tmp_path, {k: v for k, v in folds.items() if k != "2018"})
+        node = Path(hive.shard_leaf_path(str(tmp_path), tc.morton_word("-311"))).parent
+        (node / "2020.pyramid.zarr" / "zarr.json").write_text("{not json")
+        row = window_row(str(tmp_path), tc.morton_word("-311"), set(WINDOWS), {})
+        assert row[0] is None and row[2] is UNREADABLE and row[1].committed
+        basename = write_all_time_column(
+            str(tmp_path),
+            tc.morton_word("-311"),
+            row,
+            tc.FIELDS,
+            node_order=tc.SHARD_ORDER,
+            cell_order=tc.CELL_ORDER,
+            resolutions=[4, 3, 2],
+        )
+        attrs = _attrs(tmp_path, basename)
+        assert attrs[COLUMN_ATTR]["source_windows"] == {"folded": 1, "missing": 1, "unreadable": 1}
+
+    def test_a_stage_stamped_column_is_read_without_the_foreign_abort(self, tmp_path):
+        # The leaf worker is no sweep: a column stamped by some run is a
+        # source, never the two-live-sweeps abort the stage reader raises.
+        from zagg.column_alltime import _StoredColumn
+        from zagg.sweep_fold import _ColumnReader
+
+        _stored_columns(tmp_path, _window_folds(("2019",)))
+        node = Path(hive.shard_leaf_path(str(tmp_path), tc.morton_word("-311"))).parent
+        meta = json.loads((node / "2019.pyramid.zarr" / "zarr.json").read_text())
+        meta["attributes"][COMMIT_ATTR].update(run_id="sweep-x", written_at="2999-01-01T00:00:00")
+        (node / "2019.pyramid.zarr" / "zarr.json").write_text(json.dumps(meta))
+        path = str(node / "2019.pyramid.zarr")
+        with pytest.raises(Exception, match="foreign sweep"):
+            _ColumnReader(path, run_id="me", run_started="2000-01-01", store_kwargs={})
+        assert _StoredColumn(path).committed
+
+
+class TestMemberCurrent:
+    def _write(self, root, folds):
+        from zagg.column_alltime import window_row
+
+        labels = _stored_columns(root, folds)
+        row = window_row(str(root), tc.morton_word("-311"), labels, {})
+        write_all_time_column(
+            str(root),
+            tc.morton_word("-311"),
+            row,
+            tc.FIELDS,
+            node_order=tc.SHARD_ORDER,
+            cell_order=tc.CELL_ORDER,
+            resolutions=[4, 3, 2],
+        )
+        return row
+
+    def test_a_member_folding_exactly_the_row_is_current(self, tmp_path):
+        from zagg.column_alltime import member_current
+
+        row = self._write(tmp_path, _window_folds())
+        assert member_current(str(tmp_path), tc.morton_word("-311"), row)
+
+    def test_an_absent_short_or_older_member_is_not(self, tmp_path):
+        from zagg.column_alltime import member_current, window_row
+
+        folds = _window_folds()
+        self._write(tmp_path, folds)
+        shard = tc.morton_word("-311")
+        node = Path(hive.shard_leaf_path(str(tmp_path), shard)).parent
+        # A window the member did not fold (it landed since): short.
+        _stored_columns(tmp_path, _window_folds(("2021",)))
+        assert not member_current(
+            str(tmp_path), shard, window_row(str(tmp_path), shard, {*WINDOWS, "2021"}, {})
+        )
+        # A window column stamped after the member: the member is older.
+        meta = json.loads((node / "2019.pyramid.zarr" / "zarr.json").read_text())
+        meta["attributes"][COMMIT_ATTR]["written_at"] = "2999-01-01T00:00:00+00:00"
+        (node / "2019.pyramid.zarr" / "zarr.json").write_text(json.dumps(meta))
+        assert not member_current(
+            str(tmp_path), shard, window_row(str(tmp_path), shard, set(WINDOWS), {})
+        )
+        # A missing window in the row, and no member at all.
+        (node / "2019.pyramid.zarr" / "zarr.json").unlink()
+        assert not member_current(
+            str(tmp_path), shard, window_row(str(tmp_path), shard, set(WINDOWS), {})
+        )
+        import shutil
+
+        shutil.rmtree(node / "all.pyramid.zarr")
+        assert not member_current(
+            str(tmp_path), shard, window_row(str(tmp_path), shard, set(WINDOWS), {})
+        )
+
+
 def _attrs(root: Path, basename: str) -> dict:
     node = Path(hive.shard_leaf_path(str(root), tc.morton_word("-311"))).parent
     return json.loads((node / basename / "zarr.json").read_text())["attributes"]
@@ -308,8 +492,58 @@ def _column_groups(path: Path) -> dict:
     return groups
 
 
+def _assert_member_folds_the_stored_columns(root, cfg) -> None:
+    """The member at ``root``'s shard node is the close law over its stored window columns."""
+    node = _node(root)
+    labels = sorted(
+        p.name.removesuffix(".pyramid.zarr")
+        for p in node.glob("*.pyramid.zarr")
+        if p.name != "all.pyramid.zarr"
+    )
+    members = {w: _column_groups(node / f"{w}.pyramid.zarr") for w in labels}
+    all_time = _column_groups(node / "all.pyramid.zarr")
+    assert sorted(all_time) == sorted(members[labels[0]]) == [6, 7]
+    delta = overview_fold_delta(
+        {"delta": cfg.aggregation["variables"]["h_tdigest"]["params"]["delta"]}
+    )
+    for res, group in all_time.items():
+        np.testing.assert_array_equal(group["morton"], members[labels[0]][res]["morton"])
+        # Counts: the sum of the window members; digests: their k-way fold.
+        np.testing.assert_array_equal(group["count"], sum(members[w][res]["count"] for w in labels))
+        for j in range(len(group["count"])):
+            cell = [
+                decode_digest(members[w][res]["h_tdigest"][j], "float32")
+                for w in labels
+                if len(members[w][res]["h_tdigest"][j])
+            ]
+            expected = fold_digests(cell, delta=delta, dtype="float32") if cell else b""
+            assert bytes(group["h_tdigest"][j]) == bytes(expected), (res, j)
+    attrs = json.loads((node / "all.pyramid.zarr" / "zarr.json").read_text())["attributes"]
+    assert attrs[COLUMN_ATTR]["source_windows"] == {
+        "folded": len(labels),
+        "missing": 0,
+        "unreadable": 0,
+    }
+
+
 class TestBulkUnit:
-    """The resident path on the real bulk emit (``test_windowed_emit``'s harness)."""
+    """The hybrid row on the real emit (``test_windowed_emit``'s harness): the bulk
+    unit from its resident folds, the gate-skipped and appended windows from
+    their stored columns, the fan-out unit from its own fold plus the stored
+    siblings."""
+
+    def _member(self, root):
+        return {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
+
+    def _current_for(self, monkeypatch, labels):
+        gate = hive._LeafUnit.gate
+
+        def _current(self, *, allow_contraction):
+            if self.label in labels:
+                return {"shard_key": int(self.shard_key), "window": self.label, "current": True}
+            return gate(self, allow_contraction=allow_contraction)
+
+        monkeypatch.setattr(hive._LeafUnit, "gate", _current)
 
     def test_the_shard_closes_its_windows_into_the_all_time_column(self, monkeypatch, tmp_path):
         cfg = emit._digest_cfg()
@@ -318,27 +552,11 @@ class TestBulkUnit:
         assert meta["error"] is None and meta["all_time_column"] == "all.pyramid.zarr"
         assert meta["phase_timings"]["all_time_column"] >= 0
         node = _node(root)
-        members = {w: _column_groups(node / f"{w}.pyramid.zarr") for w in WINDOWS}
-        all_time = _column_groups(node / "all.pyramid.zarr")
-        assert sorted(all_time) == sorted(members["2019"]) == [6, 7]
-        meta_digest = cfg.aggregation["variables"]["h_tdigest"]
-        delta = overview_fold_delta({"delta": meta_digest["params"]["delta"]})
-        for res, group in all_time.items():
-            np.testing.assert_array_equal(group["morton"], members["2019"][res]["morton"])
-            # Counts: the sum of the window members; digests: their k-way fold.
-            np.testing.assert_array_equal(
-                group["count"], sum(members[w][res]["count"] for w in WINDOWS)
-            )
-            for j in range(len(group["count"])):
-                cell = [
-                    decode_digest(members[w][res]["h_tdigest"][j], "float32")
-                    for w in WINDOWS
-                    if len(members[w][res]["h_tdigest"][j])
-                ]
-                expected = fold_digests(cell, delta=delta, dtype="float32") if cell else b""
-                assert bytes(group["h_tdigest"][j]) == bytes(expected), (res, j)
+        assert sorted(p.name for p in node.glob("*.pyramid.zarr")) == [
+            f"{w}.pyramid.zarr" for w in (*WINDOWS, "all")
+        ]
+        _assert_member_folds_the_stored_columns(root, cfg)
         attrs = json.loads((node / "all.pyramid.zarr" / "zarr.json").read_text())["attributes"]
-        assert attrs[COLUMN_ATTR]["source_windows"] == {"folded": 3, "missing": 0, "unreadable": 0}
         assert attrs[COMMIT_ATTR]["time_range"] == meta["time_range"]
         assert attrs[COMMIT_ATTR]["granule_count"] == sum(
             m["granule_count"] for m in meta["windows"]
@@ -366,13 +584,14 @@ class TestBulkUnit:
         import zagg.column_alltime as column_alltime
 
         seen = []
-        close = column_alltime.close_shard
+        build = column_alltime.window_row
 
-        def _spy(store_root, shard_key, grid, config, row, **kw):
+        def _spy(*a, **kw):
+            row = build(*a, **kw)
             seen.append([r.path for r in row])
-            return close(store_root, shard_key, grid, config, row, **kw)
+            return row
 
-        monkeypatch.setattr(column_alltime, "close_shard", _spy)
+        monkeypatch.setattr(column_alltime, "window_row", _spy)
         cfg = emit._digest_cfg()
         emit._patch(monkeypatch, emit._dense_fakes())
         shard, urls, windows = emit._bulk_unit(cfg)
@@ -382,13 +601,16 @@ class TestBulkUnit:
             hive.process_and_write_hive(
                 shard, urls, emit._grid(cfg), {}, root, cfg, store_kwargs={}, windows=order
             )
-            trees.append({k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k})
+            trees.append(self._member(root))
         assert seen == [[f"{w}.pyramid.zarr" for w in WINDOWS]] * 2
         assert trees[0] and trees[0] == trees[1]
 
-    def test_only_the_bulk_unit_keeps_its_column_fold(self, monkeypatch, tmp_path):
-        # Review finding (6): the fan-out ``window=`` unit never closes from
-        # memory, so it must not retain the fold ``write_leaf_column`` built.
+    def test_windowed_units_keep_their_column_fold_and_unwindowed_ones_do_not(
+        self, monkeypatch, tmp_path
+    ):
+        # Review finding (6): the fold is retained only where a close consumes
+        # it — every windowed unit (bulk and fan-out both close), never an
+        # unwindowed leaf.
         import zagg.column as column
 
         kept = []
@@ -401,10 +623,18 @@ class TestBulkUnit:
         monkeypatch.setattr(column, "write_leaf_column", _spy)
         cfg = emit._digest_cfg()
         emit._run_fanout(monkeypatch, cfg, str(tmp_path / "fan"), fakes=emit._dense_fakes())
-        assert kept == [None] * 3
+        assert len(kept) == 3 and all(sorted(k) == [6, 7] for k in kept)
         kept.clear()
         emit._run_bulk(monkeypatch, cfg, str(tmp_path / "bulk"), fakes=emit._dense_fakes())
         assert len(kept) == 3 and all(sorted(k) == [6, 7] for k in kept)
+        kept.clear()
+        del cfg.output["windowing"]
+        shard, urls, _windows = emit._bulk_unit(emit._digest_cfg())
+        meta = hive.process_and_write_hive(
+            shard, urls, emit._grid(cfg), {}, str(tmp_path / "flat"), cfg, store_kwargs={}
+        )
+        assert meta["error"] is None and meta["leaf_column"] and kept == [None]
+        assert "all_time_column" not in meta
 
     def test_a_rerun_writes_the_same_bytes(self, monkeypatch, tmp_path):
         cfg = emit._digest_cfg()
@@ -435,95 +665,159 @@ class TestBulkUnit:
             "unreadable": 0,
         }
 
-    def test_a_gate_skipped_window_leaves_the_member_to_the_stored_path(
-        self, monkeypatch, tmp_path
-    ):
-        # Phase 1 folds from memory only: a window the identity gate skipped is
-        # not resident, so the member is not written short — the stored-column
-        # path (phase 2 of issue #649) owns that case.
-        gate = hive._LeafUnit.gate
-
-        def _current(self, *, allow_contraction):
-            if self.label == "2018":
-                return {"shard_key": int(self.shard_key), "window": "2018", "current": True}
-            return gate(self, allow_contraction=allow_contraction)
-
-        monkeypatch.setattr(hive._LeafUnit, "gate", _current)
-        root = str(tmp_path / "bulk")
-        meta = emit._run_bulk(
-            monkeypatch, emit._digest_cfg(), root, fakes=emit._dense_fakes(), skip_if_current=True
-        )
-        assert meta["error"] is None and "all_time_column" not in meta
-        assert not (_node(root) / "all.pyramid.zarr").exists()
-        assert (_node(root) / "2019.pyramid.zarr").exists()
-
-    def test_a_narrower_dispatch_does_not_fold_the_member_short(self, monkeypatch, tmp_path):
-        # Review finding (1): a run over new 2020 granules alone dispatches
-        # ``windows=[2020]``; the store still holds 2018 and 2019, so the
-        # resident fold would be one window under a name claiming all three.
+    def test_a_gate_skipped_window_is_read_back_not_re_aggregated(self, monkeypatch, tmp_path):
+        # 2018 is current: its stored column is a source of the member, while
+        # the shard reads and aggregates the two windows left to write only.
         cfg = emit._digest_cfg()
         root = str(tmp_path / "bulk")
         emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
-        member = _node(root) / "all.pyramid.zarr"
-        before = {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
+        fresh = self._member(root)
+        stamp_2018 = hive.read_commit(
+            open_store(hive.shard_leaf_path(root, emit._shard_word(), window="2018"))
+        )
+        self._current_for(monkeypatch, {"2018"})
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert meta["error"] is None and meta["all_time_column"] == "all.pyramid.zarr"
+        assert [m.get("current") for m in meta["windows"]] == [True, None, None]
+        assert [m.get("unit_windows") for m in meta["windows"]] == [None, 2, 2]
+        assert (
+            hive.read_commit(
+                open_store(hive.shard_leaf_path(root, emit._shard_word(), window="2018"))
+            )
+            == stamp_2018
+        )
+        assert self._member(root) == fresh
+        attrs = json.loads((_node(root) / "all.pyramid.zarr" / "zarr.json").read_text())
+        assert attrs["attributes"][COLUMN_ATTR]["source_windows"]["folded"] == 3
+
+    def test_an_append_leaves_the_member_a_fresh_full_build_writes(self, monkeypatch, tmp_path):
+        # Run 1 sees granule A alone (2018, 2019); the append sees A, B and C
+        # with 2018 current. Its member must equal a one-run build's.
+        cfg = emit._digest_cfg()
+        appended, fresh = str(tmp_path / "appended"), str(tmp_path / "fresh")
+        first = emit._run_bulk(
+            monkeypatch, cfg, appended, fakes=emit._dense_fakes(), records=[emit._records()[0]]
+        )
+        assert [m["window"] for m in first["windows"]] == ["2018", "2019"]
+        two = json.loads((_node(appended) / "all.pyramid.zarr" / "zarr.json").read_text())
+        assert two["attributes"][COLUMN_ATTR]["source_windows"]["folded"] == 2
+        self._current_for(monkeypatch, {"2018"})
+        meta = emit._run_bulk(
+            monkeypatch, cfg, appended, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert meta["error"] is None and meta["all_time_column"] == "all.pyramid.zarr"
+        monkeypatch.undo()
+        emit._run_bulk(monkeypatch, cfg, fresh, fakes=emit._dense_fakes())
+        assert self._member(appended) == self._member(fresh)
+
+    def test_a_narrower_dispatch_folds_the_stored_windows_in(self, monkeypatch, tmp_path):
+        # Review finding (1): a run over new 2020 granules alone dispatches
+        # ``windows=[2020]``; the store still holds 2018 and 2019, which the
+        # member folds from their stored columns — never one window under a
+        # name claiming all three.
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        before = self._member(root)
         meta = emit._run_bulk(
             monkeypatch, cfg, root, fakes=emit._dense_fakes(), records=[emit._records()[1]]
         )
         assert [m["window"] for m in meta["windows"]] == ["2020"]
-        assert meta["error"] is None and "all_time_column" not in meta
-        # Nor is the three-window member left standing: it folds the 2020
-        # column this run rewrote, and absent beats stale (finding (2)).
-        assert before and not member.exists()
-        assert not (_node(root) / "all.pyramid.stats.json").exists()
-        assert (_node(root) / "2018.pyramid.zarr").exists()
+        assert meta["error"] is None and meta["all_time_column"] == "all.pyramid.zarr"
+        # 2020's column changed (granule B alone, no C), so the member did too
+        # — and it is the fold of all three stored columns as they stand now.
+        assert before and self._member(root) != before
+        _assert_member_folds_the_stored_columns(root, cfg)
 
-    def test_a_partly_current_rerun_clears_the_member_it_would_leave_stale(
+    def test_an_all_current_rerun_leaves_a_current_member_and_rebuilds_a_missing_one(
+        self, monkeypatch, tmp_path
+    ):
+        import shutil
+
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        before = emit._tree(root)
+        member = _node(root) / "all.pyramid.zarr"
+        stamped = json.loads((member / "zarr.json").read_text())["attributes"][COMMIT_ATTR]
+        self._current_for(monkeypatch, set(WINDOWS))
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        # Nothing changed and the member folds exactly the shard's windows: no
+        # rewrite (the stamp is the very same object).
+        assert meta["current"] is True and "all_time_column" not in meta
+        assert emit._tree(root) == before
+        assert json.loads((member / "zarr.json").read_text())["attributes"][COMMIT_ATTR] == stamped
+        # The member gone (a close that once failed, review finding (3)): the
+        # all-current re-run rebuilds it from the stored columns, same bytes.
+        shutil.rmtree(member)
+        (_node(root) / "all.pyramid.stats.json").unlink()
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert meta["current"] is True and meta["all_time_column"] == "all.pyramid.zarr"
+        assert emit._tree(root) == before
+
+    def test_a_skipped_window_whose_column_is_gone_counts_missing(self, monkeypatch, tmp_path):
+        import shutil
+
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        shutil.rmtree(_node(root) / "2018.pyramid.zarr")
+        self._current_for(monkeypatch, set(WINDOWS))
+        meta = emit._run_bulk(
+            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+        )
+        assert meta["all_time_column"] == "all.pyramid.zarr"
+        attrs = json.loads((_node(root) / "all.pyramid.zarr" / "zarr.json").read_text())
+        assert attrs["attributes"][COLUMN_ATTR]["source_windows"] == {
+            "folded": 2,
+            "missing": 1,
+            "unreadable": 0,
+        }
+
+    def test_a_fanout_window_unit_rewrites_the_member_from_the_stored_siblings(
         self, monkeypatch, tmp_path
     ):
         cfg = emit._digest_cfg()
         root = str(tmp_path / "bulk")
         emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
-        assert (_node(root) / "all.pyramid.zarr").exists()
-        gate = hive._LeafUnit.gate
-
-        def _current(self, *, allow_contraction):
-            if self.label == "2018":
-                return {"shard_key": int(self.shard_key), "window": "2018", "current": True}
-            return gate(self, allow_contraction=allow_contraction)
-
-        monkeypatch.setattr(hive._LeafUnit, "gate", _current)
-        meta = emit._run_bulk(
-            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
-        )
-        assert meta["error"] is None and "all_time_column" not in meta
-        assert not (_node(root) / "all.pyramid.zarr").exists()
-
-    def test_an_all_current_rerun_leaves_the_member_standing(self, monkeypatch, tmp_path):
-        # Nothing changed, so the member is still correct: no clear.
-        cfg = emit._digest_cfg()
-        root = str(tmp_path / "bulk")
-        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
-        before = emit._tree(root)
-
-        def _current(self, *, allow_contraction):
-            return {"shard_key": int(self.shard_key), "window": self.label, "current": True}
-
-        monkeypatch.setattr(hive._LeafUnit, "gate", _current)
-        meta = emit._run_bulk(
-            monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
-        )
-        assert meta["current"] is True and emit._tree(root) == before
-
-    def test_a_fanout_window_unit_clears_the_member(self, monkeypatch, tmp_path):
-        cfg = emit._digest_cfg()
-        root = str(tmp_path / "bulk")
-        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        before = self._member(root)
         out = emit._run_fanout(
             monkeypatch, cfg, root, fakes=emit._dense_fakes(), records=[emit._records()[1]]
         )
         assert list(out) == ["2020"] and out["2020"]["error"] is None
+        assert out["2020"]["all_time_column"] == "all.pyramid.zarr"
+        assert out["2020"]["phase_timings"]["all_time_column"] >= 0
+        assert before and self._member(root) != before  # 2020 is now B alone
+        _assert_member_folds_the_stored_columns(root, cfg)
+
+    def test_a_failed_window_defers_the_close_and_clears_the_stale_member(
+        self, monkeypatch, tmp_path
+    ):
+        # Review finding (2): a window that failed leaves the member folding
+        # that window's previous column, so it goes until the retry.
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert (_node(root) / "all.pyramid.zarr").exists()
+        finish = hive._LeafUnit.finish
+
+        def _flaky(self, metadata):
+            if self.label == "2019":
+                raise RuntimeError("PUT failed")
+            return finish(self, metadata)
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _flaky)
+        meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert meta["error"] == "window 2019: RuntimeError: PUT failed"
+        assert "all_time_column" not in meta
         assert not (_node(root) / "all.pyramid.zarr").exists()
-        assert (_node(root) / "2020.pyramid.zarr").exists()
+        assert not (_node(root) / "all.pyramid.stats.json").exists()
 
     def test_the_stored_labels_are_the_window_columns_beside_the_shard(self, monkeypatch, tmp_path):
         from zagg.column_alltime import stored_window_labels
@@ -550,6 +844,15 @@ class TestBulkUnit:
         assert [m["error"] for m in meta["windows"]] == [None, None, None]
         assert all(m["leaf_column"] for m in meta["windows"])
         assert not (_node(root) / "all.pyramid.zarr").exists()
+        # The fan-out unit reports through the same channel.
+        out = emit._run_fanout(
+            monkeypatch,
+            emit._digest_cfg(),
+            root,
+            fakes=emit._dense_fakes(),
+            records=[emit._records()[1]],
+        )
+        assert out["2020"]["error"] == "all-time column: PUT failed"
 
     def test_no_column_declaration_means_no_member_and_clears_a_stale_one(
         self, monkeypatch, tmp_path
