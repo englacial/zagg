@@ -22,12 +22,15 @@ The inputs are hybrid, per window: the slabs this invoke has just folded
 (:class:`_ResidentColumn` — the bulk ``unit: shard`` build, where every
 window is resident and nothing is read), else the window's stored column read
 back (:class:`_StoredColumn` — a window the identity gate skipped as
-current, one an append did not touch, the other windows of a fan-out
-``unit: window`` invoke). :func:`window_row` builds the row from both kinds;
+current, one an append did not touch). :func:`window_row` builds the row from both kinds;
 one fold, one writer, the same bytes either way, because a resident slab IS
 the stored member's value. An invoke that wrote nothing (every window
 current) re-folds only when the member is absent, short, or older than a
-window column it folds (:func:`member_current`).
+window column it folds (:func:`member_current`). The fan-out ``unit: window``
+invoke does not close: its units of one shard run concurrently and would tear
+the member, so it clears it instead (PR #666 review finding (1)) — a
+``unit: window`` store carries no leaf all-time member until the maintainer
+rules how it gets one.
 
 Provenance (spec §4.6, the issue's carve-out): the member is a
 ``zagg-column/1`` artifact under the reserved ``all`` token, its groups keep

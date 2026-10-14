@@ -5,7 +5,8 @@ beside them under the sweep's close law — every member the k-way fold of the
 window members, cell for cell, in ascending window order — from a hybrid
 row: the folds this invoke holds resident (the bulk ``unit: shard`` build),
 the stored columns of the windows it did not write (a gate-skipped window,
-an append, the fan-out ``unit: window`` siblings). The member carries the
+an append). The fan-out ``unit: window`` invoke clears the member instead
+(its concurrent units would tear it; PR #666 review finding (1)). The member carries the
 §4.6 carve-out's provenance (``merges_from_raw`` one deeper than the window
 members', ``source_windows``), and the two input kinds give the same bytes.
 """
@@ -529,8 +530,7 @@ def _assert_member_folds_the_stored_columns(root, cfg) -> None:
 class TestBulkUnit:
     """The hybrid row on the real emit (``test_windowed_emit``'s harness): the bulk
     unit from its resident folds, the gate-skipped and appended windows from
-    their stored columns, the fan-out unit from its own fold plus the stored
-    siblings."""
+    their stored columns; the fan-out unit clears it."""
 
     def _member(self, root):
         return {k: v for k, v in emit._tree(root).items() if "/all.pyramid." in k}
@@ -605,12 +605,10 @@ class TestBulkUnit:
         assert seen == [[f"{w}.pyramid.zarr" for w in WINDOWS]] * 2
         assert trees[0] and trees[0] == trees[1]
 
-    def test_windowed_units_keep_their_column_fold_and_unwindowed_ones_do_not(
-        self, monkeypatch, tmp_path
-    ):
+    def test_only_the_bulk_unit_keeps_its_column_fold(self, monkeypatch, tmp_path):
         # Review finding (6): the fold is retained only where a close consumes
-        # it — every windowed unit (bulk and fan-out both close), never an
-        # unwindowed leaf.
+        # it — the bulk unit; the fan-out unit clears the member (PR #666
+        # review finding (1)) and an unwindowed leaf has no member at all.
         import zagg.column as column
 
         kept = []
@@ -623,7 +621,7 @@ class TestBulkUnit:
         monkeypatch.setattr(column, "write_leaf_column", _spy)
         cfg = emit._digest_cfg()
         emit._run_fanout(monkeypatch, cfg, str(tmp_path / "fan"), fakes=emit._dense_fakes())
-        assert len(kept) == 3 and all(sorted(k) == [6, 7] for k in kept)
+        assert kept == [None] * 3
         kept.clear()
         emit._run_bulk(monkeypatch, cfg, str(tmp_path / "bulk"), fakes=emit._dense_fakes())
         assert len(kept) == 3 and all(sorted(k) == [6, 7] for k in kept)
@@ -780,21 +778,23 @@ class TestBulkUnit:
             "unreadable": 0,
         }
 
-    def test_a_fanout_window_unit_rewrites_the_member_from_the_stored_siblings(
-        self, monkeypatch, tmp_path
-    ):
+    def test_a_fanout_window_unit_clears_the_member(self, monkeypatch, tmp_path):
+        # PR #666 review finding (1), the interim: concurrent ``(shard,
+        # window)`` units cannot share a writer for the member, so a clean
+        # fan-out unit clears it and a ``unit: window`` store carries none
+        # until the maintainer rules how it gets one.
         cfg = emit._digest_cfg()
         root = str(tmp_path / "bulk")
         emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
-        before = self._member(root)
+        assert (_node(root) / "all.pyramid.zarr").exists()
         out = emit._run_fanout(
             monkeypatch, cfg, root, fakes=emit._dense_fakes(), records=[emit._records()[1]]
         )
         assert list(out) == ["2020"] and out["2020"]["error"] is None
-        assert out["2020"]["all_time_column"] == "all.pyramid.zarr"
-        assert out["2020"]["phase_timings"]["all_time_column"] >= 0
-        assert before and self._member(root) != before  # 2020 is now B alone
-        _assert_member_folds_the_stored_columns(root, cfg)
+        assert "all_time_column" not in out["2020"]
+        assert not (_node(root) / "all.pyramid.zarr").exists()
+        assert not (_node(root) / "all.pyramid.stats.json").exists()
+        assert (_node(root) / "2020.pyramid.zarr").exists()
 
     def test_a_failed_window_defers_the_close_and_clears_the_stale_member(
         self, monkeypatch, tmp_path
@@ -844,15 +844,6 @@ class TestBulkUnit:
         assert [m["error"] for m in meta["windows"]] == [None, None, None]
         assert all(m["leaf_column"] for m in meta["windows"])
         assert not (_node(root) / "all.pyramid.zarr").exists()
-        # The fan-out unit reports through the same channel.
-        out = emit._run_fanout(
-            monkeypatch,
-            emit._digest_cfg(),
-            root,
-            fakes=emit._dense_fakes(),
-            records=[emit._records()[1]],
-        )
-        assert out["2020"]["error"] == "all-time column: PUT failed"
 
     def test_no_column_declaration_means_no_member_and_clears_a_stale_one(
         self, monkeypatch, tmp_path

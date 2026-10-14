@@ -1778,11 +1778,11 @@ class _LeafUnit:
         self.write_elapsed = 0.0
         # This window's column fold, kept resident for the shard's all-time
         # column (issue #649): filled by ``write_leaf_column`` in :meth:`finish`
-        # on a WINDOWED unit (``keep_fold``) — the bulk unit closes from every
-        # window's fold, the fan-out unit from its own plus the stored
-        # siblings — never on an unwindowed leaf, which has no member to
-        # close. Its size is unmeasured at v4 geometry (δ-bounded digests
-        # over the column resolutions, 16,384 cells per field at cells 16).
+        # on the bulk unit alone (``keep_fold``), the one path that closes —
+        # the fan-out unit clears the member instead (review finding (1)).
+        # The bulk peak is every window's fold at once, unmeasured at v4
+        # geometry (δ-bounded digests over the column resolutions, 16,384
+        # cells per field at cells 16).
         self.column_fold: dict | None = {} if keep_fold else None
         # A windowed leaf stores no per-cell ``morton`` array (issue #586
         # phase 3, spec §1.5 "The cell coordinate"): the word is derived from
@@ -2519,7 +2519,6 @@ def process_and_write_hive(
         config,
         window=window,
         windowing=windowing,
-        keep_fold=window is not None,
         **unit_kwargs,
     )
     # Leaf identity gate (issue #388): per (shard, window) unit, before any
@@ -2540,24 +2539,23 @@ def process_and_write_hive(
     meta = unit.finish(metadata)
     if window is not None and not meta.get("error"):
         # A fan-out window unit rewrote one window column the shard's all-time
-        # member folds (issue #649): the member is rewritten here from this
-        # window's resident fold plus the stored siblings — one writer per
-        # unit, so two concurrent units of one shard can each publish a
-        # member short of the other's window (last writer wins; a re-run
-        # heals it, and ``source_windows`` names the count). The bulk
-        # ``unit: shard`` default has one writer per shard and no race.
-        _close_all_time(
-            shard_key,
-            grid,
-            store_root,
-            config,
-            _resident_sources(grid, {unit.label: (unit, meta)}),
-            (),
-            fresh=True,
-            sink=meta,
-            timed=(meta,),
-            store_kwargs=store_kwargs,
-        )
+        # member folds (issue #649), and absent beats stale. It CLEARS the
+        # member rather than rewriting it: the ``(shard, window)`` units of one
+        # shard run concurrently, and ``write_column`` (delete, PUTs, stamp) is
+        # no atomic replace, so two writers would tear it under a valid stamp
+        # (review finding (1)); two deletes are benign. A ``unit: window``
+        # store therefore carries NO leaf all-time member — the checker's
+        # ``all_time`` leg fails it by leaf — until the maintainer rules how
+        # it gets one (standing on PR #666). A failed clear is the unit's
+        # error, as a failed column is.
+        from zagg.column import _clear_column
+
+        try:
+            _clear_column(store_root, shard_key, None, store_kwargs)
+        except Exception as e:
+            logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
+            meta["error"] = f"all-time column: {e}"
+            meta["all_time_column_error"] = str(e)
     return meta
 
 

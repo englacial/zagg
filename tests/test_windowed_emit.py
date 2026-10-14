@@ -643,11 +643,13 @@ class TestBulkEndToEnd:
         assert all(m.get("leaf_column") for m in bulk["windows"])
         fan_tree, bulk_tree = _tree(fan_root), _tree(bulk_root)
         assert any(".pyramid.zarr/" in k for k in bulk_tree)
-        # The all-time member too (issue #649): the bulk unit closes it from
-        # the folds it holds, the last fan-out unit from its own fold plus the
-        # stored siblings — the same bytes either way.
-        assert any("/all.pyramid.zarr/" in k for k in fan_tree)
-        assert fan_tree == bulk_tree
+        # The bulk unit closes its windows into ``all.pyramid.zarr`` (issue
+        # #649); the fan-out clears it, since its concurrent units would tear
+        # a shared member (PR #666 review finding (1), standing for the
+        # maintainer) — so a ``unit: window`` store carries none.
+        all_time = {k for k in bulk_tree if "/all.pyramid." in k}
+        assert all_time and not any("/all.pyramid." in k for k in fan_tree)
+        assert fan_tree == {k: v for k, v in bulk_tree.items() if k not in all_time}
 
     def test_versioned_leaves_match_the_fanout(self, monkeypatch, tmp_path):
         # Review finding (10): the #582 version subgroup + pointer per window,
