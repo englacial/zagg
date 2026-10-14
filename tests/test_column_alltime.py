@@ -1141,6 +1141,98 @@ class TestIcechunkAllRow:
         rows = icechunk_refs.read_block(root, store_kwargs={})["rows"]
         return zarr.open_group(repo.readonly_session("main").store, mode="r"), rows
 
+    def _ladder(self, monkeypatch, tmp_path, cfg, *, records=None, **block):
+        """A local run of the bulk unit with the staged sweep chained: ``(root, summary)``.
+
+        The real path end to end — the dispatcher's row allocation, the leaf
+        worker's close and carrier, the ladder's gather and commit. Shard
+        order 6 at width 3: tuples dispatch at 3 (child 6, the leaves) and 0.
+        """
+        from zagg import runner
+
+        cfg.output["sweep"] = "stages"
+        cfg.output["icechunk"] = {"commit": "ladder", **block}
+        catalog_path, _shard = emit._catalog(tmp_path)
+        if records is not None:
+            catalog = json.loads(Path(catalog_path).read_text())
+            catalog["granules"] = [records]
+            Path(catalog_path).write_text(json.dumps(catalog))
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        emit._patch(monkeypatch, emit._dense_fakes())
+        root = str(tmp_path / "out")
+        summary = runner.agg(cfg, catalog=catalog_path, store=root, backend="local")
+        assert summary["cells_error"] == 0
+        return root, summary
+
+    @staticmethod
+    def _spy_member_reads(monkeypatch):
+        from zagg import icechunk_ladder
+
+        reads: list = []
+        real = icechunk_ladder.read_member_refs
+        monkeypatch.setattr(
+            icechunk_ladder,
+            "read_member_refs",
+            lambda root, shard, **kw: reads.append(int(shard)) or real(root, shard, **kw),
+        )
+        return reads
+
+    def _all_row(self, root, cfg, level=7):
+        group, rows = self._repo(root)
+        (rank,) = emit._grid(cfg).block_index(emit._shard_word())
+        n = 4 ** (level - 6)
+        return group[str(level)], rows.index(SCHEDULE_NONE_TOKEN), slice(rank * n, (rank + 1) * n)
+
+    def test_a_closing_windowed_node_reads_each_leafs_member_carrier_once(
+        self, monkeypatch, tmp_path
+    ):
+        # PR #666 review findings (1)/(6): the predicate in the REAL
+        # ``stage_node_refs``, not a hand-passed flag to ``_child_units``.
+        cfg = emit._digest_cfg()
+        reads = self._spy_member_reads(monkeypatch)
+        root, _summary = self._ladder(monkeypatch, tmp_path, cfg)
+        assert reads == [emit._shard_word()]
+        level, row, span = self._all_row(root, cfg)
+        member = _column_groups(_node(root) / "all.pyramid.zarr")[7]
+        assert member["count"].any()
+        np.testing.assert_array_equal(level["count"][row, span], member["count"])
+
+    def test_a_node_closing_with_no_window_row_still_gathers_the_member(
+        self, monkeypatch, tmp_path
+    ):
+        # A windowed node whose run rows are ``[all]`` alone (nothing but the
+        # fold to write) has no window carrier to read, and still closes.
+        from zagg import icechunk_ladder
+        from zagg.grids.morton import morton_decimal
+        from zagg.sweep_stage import ladder_entries, stage_tuples
+
+        cfg = emit._digest_cfg()
+        root, _summary = self._ladder(monkeypatch, tmp_path, cfg)
+        manifest = hive.read_manifest(root)
+        dec = morton_decimal(emit._shard_word())
+        reads = self._spy_member_reads(monkeypatch)
+        leaf_reads: list = []
+        monkeypatch.setattr(
+            icechunk_ladder, "read_leaf_refs", lambda *a, **kw: leaf_reads.append(a) or None
+        )
+        counts = dict.fromkeys(icechunk_ladder.STAGE_COUNTS, 0)
+        record = icechunk_ladder.stage_node_refs(
+            root,
+            dec[: -(6 - 3)],
+            stage_tuples(6)[0],
+            shard_order=6,
+            levels=ladder_entries(manifest["pyramid"], 6),
+            fields=manifest["pyramid"]["overview"]["fields"],
+            candidates=[dec],
+            block=icechunk_ladder.ladder_context(root, manifest, store_kwargs={}),
+            spec=manifest["spec"],
+            store_kwargs={},
+            counts=counts,
+            rows=[SCHEDULE_NONE_TOKEN],
+        )
+        assert reads == [emit._shard_word()] and leaf_reads == []
+        assert record["missing"] == 0 and record["refs"] > 0
+
     def test_member_units_name_the_all_row_at_the_declared_column_levels(
         self, monkeypatch, tmp_path
     ):

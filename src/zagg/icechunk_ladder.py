@@ -630,9 +630,10 @@ def stage_node_refs(
     # The leaf tuple reads one carrier per (leaf, WINDOW); the ``all`` row
     # has no base leaf of its own (§11.2), so it names no leaf read. A
     # windowed node with nothing but the fold to write therefore reads no
-    # leaf at all, where an UNWINDOWED store's one ``all`` row IS its leaf
-    # (``{id}.zarr``) — the store is unwindowed exactly when its repo holds
-    # that row and no other (``icechunk_rows.store_rows``).
+    # LEAF carrier — only its leaves' all-time column carriers, below —
+    # where an UNWINDOWED store's one ``all`` row IS its leaf (``{id}.zarr``)
+    # — the store is unwindowed exactly when its repo holds that row and no
+    # other (``icechunk_rows.store_rows``).
     unwindowed = list(block.get("rows") or [ALL_ROW]) == [ALL_ROW]
     windows = [row for row in rows if row != ALL_ROW] or ([None] if unwindowed else [])
     # Which of the three roles this tuple plays (module docstring, §11.4).
@@ -650,9 +651,13 @@ def stage_node_refs(
         spec,
         store_kwargs,
         windows,
-        # The ``all`` row at the column levels (issue #649): a windowed node
-        # that closes this run gathers its leaves' all-time column carriers.
-        bool(windows) and ALL_ROW in rows,
+        # The ``all`` row at the column levels (issue #649): a WINDOWED node
+        # that closes this run gathers its leaves' all-time column carriers,
+        # whether or not it also has window rows to gather. Keyed off the
+        # store kind, never ``windows``: an unwindowed store's ``[None]`` is
+        # truthy and its ``all`` row is its leaf's own carrier — a member
+        # read there is one wasted GET per shard.
+        not unwindowed and ALL_ROW in rows,
     )
     if column_only:
         units, missing = [], 0

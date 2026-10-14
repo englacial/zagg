@@ -2090,6 +2090,29 @@ class TestLadder:
         rows = {r["dispatch_order"]: r for r in out["stages"]}
         assert rows[3]["icechunk_missing"] == 1 and rows[3]["icechunk_failed"] == 0
 
+    def test_an_unwindowed_gather_reads_no_member_carrier(self, monkeypatch, cfg, tmp_path):
+        # PR #666 review finding (1): an unwindowed store's ``all`` row is
+        # its leaf's own carrier, so the all-time column carrier (issue #649,
+        # a windowed store's artifact) is never looked for — one wasted GET
+        # per shard per gather otherwise.
+        from zagg import icechunk_ladder
+
+        reads: list = []
+        real = icechunk_ladder.read_member_refs
+        monkeypatch.setattr(
+            icechunk_ladder,
+            "read_member_refs",
+            lambda *a, **kw: reads.append(a) or real(*a, **kw),
+        )
+        for block in ({}, {"commit_order": 0}):  # the committing and the column-only gather
+            shards = _shards(_grid(cfg), 6)
+            _grid_, root, summary = _ladder_run(
+                monkeypatch, cfg, tmp_path / f"c{len(block)}", icechunk_block=block, shards=shards
+            )
+            assert summary["cells_error"] == 0
+            assert sum(r["icechunk_refs"] for r in _stage_rows(root)) > 0
+        assert reads == []
+
     def test_a_clean_subtree_is_skipped_whole(self, monkeypatch, cfg, tmp_path):
         # The gather is O(subtree); running it for every candidate node made
         # a one-leaf append cost O(store). A node with no dirty leaf beneath
