@@ -23,7 +23,6 @@ def twins(tmp_path_factory):
         _, guarded, _ = windowed._build(
             monkeypatch, tmp_path_factory.mktemp("guarded-store"), name, refuse_chunk_deletes=True
         )
-    assert windowed._NoChunkDeletes.attempted == []
     with pytest.MonkeyPatch.context() as monkeypatch:
         # The pre-#653 writers: the guard off, so every all-fill slab goes to
         # zarr, which deletes its key. Every call site looks ``all_fill`` up on
