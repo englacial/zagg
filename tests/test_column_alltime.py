@@ -941,3 +941,23 @@ def test_the_token_names_the_column_beside_the_node_not_a_leaf(tmp_path, label):
     assert basename == f"{label}.pyramid.zarr" and (node / basename).exists()
     assert _attrs(tmp_path, basename)[COLUMN_ATTR]["window"] == label
     assert [p.name for p in node.iterdir() if p.name.endswith(".zarr")] == [basename]
+
+
+def test_an_all_current_rebuild_is_reported_not_called_untouched(monkeypatch, tmp_path, caplog):
+    # PR #666 review finding (4): when every window skipped but the close
+    # rebuilt the member, the runner says so beside ``current``.
+    import logging
+    import shutil
+
+    import test_pyramid_check_windowed as pcw
+
+    root = tmp_path / "store"
+    pcw._run(monkeypatch, tmp_path, root, first_run=True)
+    for member in root.rglob("all.pyramid.zarr"):
+        shutil.rmtree(member)
+    with caplog.at_level(logging.INFO, logger="zagg.runner"):
+        pcw._run(monkeypatch, tmp_path, root, first_run=True)
+    lines = [r.message for r in caplog.records if "inputs unchanged" in r.message]
+    assert len(lines) == len(pcw.SHARDS)
+    assert all(line.endswith("leaf untouched; all-time member rewritten") for line in lines)
+    assert len(list(root.rglob("all.pyramid.zarr"))) == len(pcw.SHARDS)

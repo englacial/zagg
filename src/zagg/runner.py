@@ -3581,7 +3581,10 @@ def _run_local(
             # Skip-if-current (issue #388): counted apart in the summary
             # (_identity_counts), never as cells_with_data — this run wrote
             # nothing for the unit.
-            logger.info(f"  [{i}/{n}] {label}: current — inputs unchanged, leaf untouched")
+            # The bulk unit's all-time close may still rebuild a shard-level
+            # member no window owns (issue #649): said, never hidden.
+            rebuilt = "; all-time member rewritten" if meta.get("all_time_column") else ""
+            logger.info(f"  [{i}/{n}] {label}: current — inputs unchanged, leaf untouched{rebuilt}")
         elif meta.get("refused"):
             logger.warning(
                 f"  [{i}/{n}] {label}: REFUSED — planned inputs drop "

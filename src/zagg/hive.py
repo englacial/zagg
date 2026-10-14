@@ -1535,9 +1535,12 @@ def leaf_identity_gate(
 
     A skipped or refused unit writes NOTHING (no arrays, no stamp, no
     sidecar, no sub-map, no column): the caller returns ``meta`` untouched,
-    so zero sweep dirtiness by construction. The sidecar read is fail-open —
-    an unreadable, unparseable, or non-object sidecar degrades to today's
-    rewrite (the ``no-sidecar`` classification), never blocks the unit.
+    so zero sweep dirtiness by construction. (The shard's all-time member is
+    no unit's: the bulk close may rebuild it after every window skipped —
+    issue #649 — and the shard meta says so in ``all_time_column``.) The
+    sidecar read is fail-open — an unreadable, unparseable, or non-object
+    sidecar degrades to today's rewrite (the ``no-sidecar`` classification),
+    never blocks the unit.
 
     A matched identity is NOT sufficient to skip: the unit's ARTIFACTS must
     be current too, verified by reading them rather than the record.
@@ -2746,8 +2749,10 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     that produced it), and every written one with ``unit_windows``; the shard meta carries the
     window-independent fields once, the sums, the time-range union, the
     first failed window's error (a benign no-data window is not a failure),
-    and ``current`` / ``refused`` only when
-    every window skipped that way.
+    and ``current`` / ``refused`` only when every window skipped that way —
+    beside ``all_time_column`` when the close rewrote the member all the
+    same (issue #649: absent, short or older), so ``current`` never claims
+    the invoke wrote nothing.
     """
     from zagg.dispatch import BENIGN_ERRORS
     from zagg.windows import union_time_range
