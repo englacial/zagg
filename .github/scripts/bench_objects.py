@@ -805,6 +805,17 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     whose config declares none must have landed nothing. That keeps a silently
     failed init visible — the issue #606 class, which fail-open init hid on S3
     until ``d23d7788`` — without putting a commit-scaled number in a window.
+
+    The undeclared direction ASSUMES A STORE WHOSE DECLARATION NEVER CHANGED,
+    as the model assumes the unwindowed leaf (module docstring) and the
+    fullsphere flat grid (:func:`_require_fullsphere`). Unlike the per-run
+    telemetry names (issue #362), the repo sits at a FIXED ``icechunk/``
+    prefix and outlives the run that wrote it, so flipping a benchmark
+    target to ``output.icechunk: false`` over a store that already holds one
+    trips this arm on a stale artifact rather than on a regression. The fix
+    then is to empty the prefix or re-point the target at a fresh store — not
+    to widen the finding, which on a fresh store is what catches a writer
+    standing up a repo nobody declared.
     """
     problems = []
     total = write_path_total(measured)
