@@ -999,8 +999,9 @@ def test_is_icechunk_object_classification():
     # The prefix is the store-root child the writer reserves
     # (``hive.ICECHUNK_DIR_NAME`` / ``icechunk_refs.repo_path``), not a name
     # match: a bare object NAMED icechunk, a nested icechunk dir and the
-    # ladder's leaf ref SIDECAR (``icechunk_refs.json``, issue #582) are all
-    # outside it and must stay loud.
+    # ladder's leaf ref SIDECAR (``icechunk_refs.json``, issue #580 phase 6 --
+    # ``zagg.icechunk_ladder.LEAF_REFS_NAME``) are all outside it and must stay
+    # loud.
     from zagg.hive import ICECHUNK_DIR_NAME
 
     assert bench_objects._ICECHUNK_PREFIX == f"{ICECHUNK_DIR_NAME}/"
