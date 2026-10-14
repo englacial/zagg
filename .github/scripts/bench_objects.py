@@ -103,10 +103,6 @@ import bench_metrics
 from zagg.column import COLUMN_SUFFIX
 from zagg.hive import ICECHUNK_DIR_NAME
 
-#: The store-root prefix the §11 Icechunk companion repo occupies (issue #668),
-#: keyed off the writer's own reserved name rather than a second literal.
-_ICECHUNK_PREFIX = f"{ICECHUNK_DIR_NAME}/"
-
 # Per-shard attribution on the flat layout assumes the 1-D fullsphere HEALPix
 # layout the benchmark manifests use (block index arithmetic on the cells
 # axis); the hive layout attributes by leaf prefix and is layout-agnostic.
@@ -117,6 +113,10 @@ _ICECHUNK_PREFIX = f"{ICECHUNK_DIR_NAME}/"
 #: 0/5-9 digits or letters and ``all`` is the reserved token — which is what
 #: lets the hive walk tell an overview zarr from a stray source leaf.
 _MORTON_ID_RE = re.compile(r"-?[1-6][1-4]*")
+
+#: The store-root prefix the §11 Icechunk companion repo occupies (issue #668),
+#: keyed off the writer's own reserved name rather than a second literal.
+_ICECHUNK_PREFIX = f"{ICECHUNK_DIR_NAME}/"
 
 
 def _column_node(key: str) -> str | None:
