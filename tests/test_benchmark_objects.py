@@ -116,6 +116,9 @@ def test_expected_counts_live_matrix_config():
         "total_min": 8,
         "total_max": 8,
         "exact": True,
+        # The §11 repo is a hive-only companion and off by default on this
+        # flat arm (issue #668): the floor demands zero ``icechunk/`` objects.
+        "icechunk_declared": False,
     }
 
 
@@ -723,6 +726,9 @@ def test_measure_objects_end_to_end(tmp_path):
         "objects_expected": 8,  # exact: root telemetry is its own bucket (#362)
         "objects_per_shard": {_KEY_A: 3},
         "objects_telemetry": 0,
+        # A flat store never stands up the §11 companion repo (issue #668), so
+        # the bucket is reported empty and the undeclared floor stays silent.
+        "objects_icechunk": 0,
         "objects_mismatch": None,
     }
 

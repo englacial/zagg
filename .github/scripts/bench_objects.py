@@ -257,13 +257,14 @@ def expected_object_counts(
     store_layout: str = "flat",
     pyramid: dict | None = None,
     leaf_versions: bool = False,
+    icechunk_declared: bool = False,
 ) -> dict:
     """Expected store object counts for ``n_shards`` populated shards.
 
     Returns ``{"metadata", "per_shard_min", "per_shard_max", "total_min",
-    "total_max", "exact"}``. ``metadata`` is the fixed (shard-independent)
-    object count; ``exact`` is True when every per-shard count is
-    deterministic (the flat sharded live matrix), in which case
+    "total_max", "exact", "icechunk_declared"}``. ``metadata`` is the fixed
+    (shard-independent) object count; ``exact`` is True when every per-shard
+    count is deterministic (the flat sharded live matrix), in which case
     ``total_min == total_max`` is the asserted total.
 
     ``pyramid`` is the store manifest's ``pyramid`` block (hive only) — the
@@ -274,6 +275,12 @@ def expected_object_counts(
     spec §1.5): one more object per populated leaf, the pointer root's
     ``zarr.json``, since the version subgroup carries its own stamped root
     beside the group and array metadata the legacy leaf has.
+
+    ``icechunk_declared`` (:func:`zagg.config.get_icechunk`, threaded in by
+    :func:`measure_objects`) is NOT a count term — the §11 companion repo
+    scales with commits, not shards, so it is modeled as the PRESENCE floor
+    :func:`object_count_mismatch` asserts (issue #668) and carried through in
+    the returned dict so the two sides stay single-sourced.
     """
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -369,6 +376,8 @@ def expected_object_counts(
         "total_min": metadata_min + n_shards * lo,
         "total_max": metadata_max + n_shards * hi,
         "exact": lo == hi,
+        # Not a count: the §11 repo's PRESENCE floor (issue #668).
+        "icechunk_declared": icechunk_declared,
     }
 
 
@@ -688,6 +697,11 @@ def measure_objects(
     of shards expected to have written (the dispatch count for the per-merge
     harness, the completed-with-data count for the full-AOI fan-out).
 
+    The §11 Icechunk companion repo's objects are reported in their own
+    bucket (``objects_icechunk``, issue #668) and netted out of
+    ``objects_write_path``; the audit on them is the presence floor in
+    :func:`object_count_mismatch`, not a count.
+
     On hive the pyramid DECLARATION is read from the store's own manifest and
     threaded into the model (issue #418), so the column term needs no new
     argument at the harness call sites: the block is the run's declaration,
@@ -697,19 +711,25 @@ def measure_objects(
     """
     pyramid = None
     leaf_versions = False
+    icechunk_declared = False
     if store_layout == "hive":
-        from zagg.config import get_leaf_versions
+        from zagg.config import get_icechunk, get_leaf_versions
         from zagg.hive import read_manifest
 
         pyramid = (read_manifest(store_path, **store_kwargs) or {}).get("pyramid")
-        # The run's knob (issue #582): the harness runs the config it audits.
+        # The run's knobs (issues #582/#668): the harness runs the config it
+        # audits, so the repo's declaration comes from the same config the
+        # ``icechunk_init`` step read — never from the store being measured,
+        # which is what makes "declared but absent" a finding at all.
         leaf_versions = get_leaf_versions(grid.config)
+        icechunk_declared = get_icechunk(grid.config)
     expected = expected_object_counts(
         grid,
         n_shards=n_shards,
         store_layout=store_layout,
         pyramid=pyramid,
         leaf_versions=leaf_versions,
+        icechunk_declared=icechunk_declared,
     )
     measured = store_object_counts(
         store_path,
@@ -730,6 +750,10 @@ def measure_objects(
         # shared store is legible in metrics.json / the run log, never audited
         # (``object_count_mismatch`` nets it out of the total).
         "objects_telemetry": measured["objects_telemetry"],
+        # The §11 companion repo (issue #668): reported for the same reason —
+        # a commit-scaled bucket is worth seeing — and audited only for
+        # presence, never as a count.
+        "objects_icechunk": measured["objects_icechunk"],
         "objects_mismatch": object_count_mismatch(measured, expected),
     }
 
@@ -774,6 +798,13 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     optional, fail-open D9 root objects (``coverage.moc``, ``aggregation.yaml``
     — present or absent are both valid). Unclassifiable keys are always a
     finding: the model claims to know every object the run writes.
+
+    The §11 Icechunk companion repo is audited as a PRESENCE floor rather than
+    a count (issue #668): its object count scales with the run's commits, so a
+    declared repo must have landed at least its ``icechunk/repo``, and a store
+    whose config declares none must have landed nothing. That keeps a silently
+    failed init visible — the issue #606 class, which fail-open init hid on S3
+    until ``d23d7788`` — without putting a commit-scaled number in a window.
     """
     problems = []
     total = write_path_total(measured)
@@ -799,6 +830,14 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
         bad = {k: v for k, v in measured["objects_per_shard"].items() if v != per}
         if bad:
             problems.append(f"per-shard object counts != expected {per}: {bad}")
+    # The §11 companion repo: presence both ways (issue #668). ``.get`` for
+    # the same reason the netted buckets use it in :func:`write_path_total` —
+    # a hand-built ``measured``/``expected`` pair predates the bucket.
+    icechunk = measured.get("objects_icechunk", 0)
+    if expected.get("icechunk_declared") and not icechunk:
+        problems.append("no icechunk/ object in a store declaring the §11 repo (init failed open?)")
+    elif icechunk and not expected.get("icechunk_declared"):
+        problems.append(f"{icechunk} icechunk/ object(s) in a store declaring no §11 repo")
     if measured["objects_other"]:
         problems.append(
             f"{measured['objects_other']} unrecognized object key(s), "
