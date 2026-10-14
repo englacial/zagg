@@ -58,7 +58,8 @@ multiplied trips the per-shard assertion.
 
 **The §11 Icechunk companion repo is outside the audited total too** (issue
 #668). A hive store's reserved ``icechunk/`` root child
-(:func:`zagg.icechunk_refs.repo_path`, default ON since issue #580) holds a
+(:func:`zagg.icechunk_refs.repo_path`, which :func:`zagg.config.get_icechunk`
+defaults ON for every NON-RASTER hive store since issue #580) holds a
 DERIVED index — ``repo``, ``refs/...``, ``snapshots/<id>``,
 ``manifests/<id>``, ``transactions/<id>``, ``overwritten/...`` — whose object
 count scales with the number of COMMITS (the leaf refs plus one per ladder
