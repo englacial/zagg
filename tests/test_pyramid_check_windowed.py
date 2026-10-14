@@ -136,8 +136,11 @@ def built(tmp_path_factory):
         # as current to the staged sweep. No fleet rewrites a leaf that fast.
         time.sleep(1.1)
         _run(monkeypatch, tmp_path, root, first_run=False)
-    for store in (root, early):
-        _write_all_time_columns(store)
+    # Both stores carry the real all-time member (issue #649): the first run
+    # folded it from its resident window columns, the append from the window
+    # it rewrote plus the stored column of the one the gate skipped.
+    assert len(list(early.rglob("all.pyramid.zarr"))) == len(SHARDS)
+    assert len(list(root.rglob("all.pyramid.zarr"))) == len(SHARDS)
     return root, early
 
 
@@ -166,39 +169,6 @@ def _set_attrs(path: Path, edit) -> None:
 
 def _failed(report):
     return sorted(name for name, c in report["checks"].items() if c["status"] == "fail")
-
-
-def _write_all_time_columns(root: Path) -> None:
-    """Hand-write each leaf's ``all.pyramid.zarr`` — the §4.6 all-time member.
-
-    The ``all_time`` leg requires it at the declared leaf-column levels (issue
-    #650), and NO writer folds the window columns into one: ``zagg.column``
-    and ``zagg.column_backfill`` each fold exactly one ``(leaf, window)``, so
-    a windowed store comes off the real pipeline without it (issue #649, the
-    shard-level close).
-
-    What this writes is therefore a STAND-IN, and a narrow one: a
-    ``copytree`` of the leaf's newest window column with ``zagg_column.window``
-    restamped to the reserved token. It is byte-for-byte that window's values,
-    it records ``merges_from_raw: 1`` where a real k-way fold would record 2,
-    its provenance names one window, and its D4 commit stamp is the one minted
-    for ``{window}.pyramid.zarr`` — borrowed from the object it copies, not
-    attesting to this one. What the leg does check it satisfies honestly:
-    existence, role, the stamp's presence, and the §4.6 identity (the reserved
-    window token and the declared leaf-column groups, which a copy of one
-    window's column carries). It is not a fold and does not model one. Delete
-    this and call the real fold once #649 ships one.
-    """
-    from zagg.column import COLUMN_ATTR
-    from zagg.windows import SCHEDULE_NONE_TOKEN
-
-    for leaf in SHARDS:
-        node = root / _rel(leaf[:-1], leaf[-1])
-        windows = sorted(p for p in node.glob("*.pyramid.zarr") if p.name != "all.pyramid.zarr")
-        assert windows, node
-        member = node / "all.pyramid.zarr"
-        shutil.copytree(windows[-1], member)
-        _set_attrs(member, lambda a: a[COLUMN_ATTR].update(window=SCHEDULE_NONE_TOKEN))
 
 
 class TestACorrectStore:
@@ -242,10 +212,17 @@ class TestACorrectStore:
         # the leg reported 9/9 nodes and PASS with the levels empty.
         report = validate_pyramid(str(built[0]), full=True)
         assert report["checks"]["all_time"]["status"] == "pass", format_report(report)
-        assert report["all_time_columns"] == {"declared": 3, "materialized": 3, "missing": []}
+        assert report["all_time_columns"] == {
+            "declared": 3,
+            "materialized": 3,
+            "missing": [],
+            "checked": 3,
+            "stale": [],
+        }
         detail = report["checks"]["all_time"]["detail"]
         assert "3 leaf/leaves carry the all-time member at the declared leaf-column" in detail
-        assert "levels [7] (the base, cells 8, is exempt)" in detail
+        assert "levels [7], 3 checked against the k-way fold of their window columns" in detail
+        assert "(the base, cells 8, is exempt)" in detail
 
     def test_the_sampled_default_passes_and_says_what_it_sampled(self, built):
         report = validate_pyramid(str(built[0]), sample_windows=2, sample_nodes=1, sample_cells=2)
@@ -599,8 +576,8 @@ class TestDamage:
         # AND the D4 stamp — so a member whose stamp never landed reads as
         # absent. The sentence this asserts also claims the declared LEVELS
         # have no member, which is now checked rather than taken on trust:
-        # ``test_a_member_that_is_not_the_fold_fails_on_identity`` covers the
-        # present-but-wrong half the gate alone used to let through.
+        # ``test_a_member_whose_attrs_break_the_carve_out_fails_by_name`` and
+        # the value/staleness tests below cover the present-but-wrong half.
         from zagg.hive import COMMIT_ATTR
 
         leaf = SHARDS[0]
@@ -611,7 +588,13 @@ class TestDamage:
             _set_attrs(member, lambda a: a.pop(COMMIT_ATTR))
         report = validate_pyramid(str(store), full=True)
         assert _failed(report) == ["all_time"]
-        assert report["all_time_columns"] == {"declared": 3, "materialized": 2, "missing": [leaf]}
+        assert report["all_time_columns"] == {
+            "declared": 3,
+            "materialized": 2,
+            "missing": [leaf],
+            "checked": 2,
+            "stale": [],
+        }
         (finding,) = report["checks"]["all_time"]["mismatches"]
         assert finding.startswith(
             f"1/3 leaf/leaves carry no committed all.pyramid.zarr: ['{leaf}']"
@@ -619,30 +602,153 @@ class TestDamage:
         assert "the declared leaf-column levels [7] have NO all-time member" in finding
         assert "the base, cells 8, is exempt" in finding
 
-    @pytest.mark.parametrize("damage", ["window", "groups"])
-    def test_a_member_that_is_not_the_fold_fails_on_identity(self, store, damage):
-        # Issue #650: a plain copy of one window's column under the all-time
-        # name, or one short of the declared levels, is NOT the all-time fold.
-        # The node arm one tier up rejects exactly that mislabel (``!=
-        # (OVERVIEW_SPEC_V2, SCHEDULE_NONE_TOKEN) — not the all-time fold``),
-        # and the leaf tier now agrees instead of passing it. Present and
-        # committed, so it counts as materialized; it fails on identity.
+    @pytest.mark.parametrize(
+        "damage", ["window", "groups", "empty", "depth", "n_cells", "counters"]
+    )
+    def test_a_member_whose_attrs_break_the_carve_out_fails_by_name(self, store, damage):
+        # Issue #650/#649: a plain copy of one window's column under the
+        # all-time name (its window, its per-window depth, no counters), or
+        # one short of the column's groups, is NOT the all-time fold. Present
+        # and committed, so it counts as materialized; it fails on the §4.6
+        # carve-out's attrs (``_column_attrs_errors`` under ``all_time``).
         from zagg.column import COLUMN_ATTR
 
         leaf = SHARDS[0]
         member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
-        if damage == "window":
-            _set_attrs(member, lambda a: a[COLUMN_ATTR].update(window="2020"))
-        else:
-            _set_attrs(member, lambda a: a[COLUMN_ATTR]["groups"].clear())
+        edits = {
+            "window": lambda a: a[COLUMN_ATTR].update(window="2020"),
+            "groups": lambda a: a[COLUMN_ATTR]["groups"].pop("6"),
+            "empty": lambda a: a[COLUMN_ATTR]["groups"].clear(),
+            "depth": lambda a: a[COLUMN_ATTR]["groups"]["7"].update(merges_from_raw=1),
+            "n_cells": lambda a: a[COLUMN_ATTR]["groups"]["6"].update(n_cells=999),
+            "counters": lambda a: a[COLUMN_ATTR].pop("source_windows"),
+        }
+        _set_attrs(member, edits[damage])
         report = validate_pyramid(str(store), full=True)
         assert _failed(report) == ["all_time"]
-        assert report["all_time_columns"] == {"declared": 3, "materialized": 3, "missing": []}
-        (finding,) = report["checks"]["all_time"]["mismatches"]
-        assert finding.startswith(f"{leaf}: all.pyramid.zarr window ")
-        assert "is not the all-time fold of the leaf columns ('all', covering [7])" in finding
-        want = "window '2020' / groups [7, 6]" if damage == "window" else "window 'all' / groups []"
-        assert want in finding
+        assert report["all_time_columns"]["materialized"] == 3
+        findings = report["checks"]["all_time"]["mismatches"]
+        want = {
+            "window": f"{leaf}: all.pyramid.zarr records window '2020', not the reserved token",
+            "groups": f"{leaf}: column groups [7] != declared resolutions [7, 6] (§4.6)",
+            "empty": f"{leaf}: column groups [] != declared resolutions [7, 6] (§4.6)",
+            "n_cells": f"{leaf}[6]: n_cells 999 != 4^(6-6)",
+            "depth": f"{leaf}[7]: group provenance ('leaf-column', 1) != ('leaf-column', 2) — "
+            "the all-time column folds the window members, one more merge from raw",
+            "counters": f"{leaf}: all.pyramid.zarr source_windows None lacks the integer",
+        }[damage]
+        assert any(f.startswith(want) for f in findings), findings
+
+    def test_the_members_are_checked_before_any_sweep_has_run(self, store):
+        # The leaf workers write all.pyramid.zarr; no node close is needed.
+        from zagg.column import COLUMN_ATTR
+
+        for node in list(store.rglob("all.zarr")):
+            shutil.rmtree(node)
+        leaf = SHARDS[0]
+        member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
+        _set_attrs(member, lambda a: a[COLUMN_ATTR].update(window="2020"))
+        report = validate_pyramid(str(store), full=True)
+        entry = report["checks"]["all_time"]
+        assert entry["status"] == "fail" and "the node close has not run" in entry["detail"]
+        assert report["all_time_columns"]["checked"] == 3
+        assert report["all_time_columns"]["stale"] == []
+        want = f"{leaf}: all.pyramid.zarr records window '2020', not the reserved token"
+        assert any(m.startswith(want) for m in entry["mismatches"]), entry["mismatches"]
+
+    def test_a_member_group_laid_out_wrong_fails_by_name(self, store):
+        # The §4.6 layout rule (issue #631) holds the all-time member as it
+        # holds every window column: one whole unsharded chunk at this size.
+        import zarr
+
+        from zagg.store import open_store
+
+        leaf = SHARDS[0]
+        member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
+        group = zarr.open_group(open_store(str(member)), path="7")
+        old = group["count"]
+        data, attrs, dims = old[:], dict(old.attrs), old.metadata.dimension_names
+        group.create_array(
+            "count", data=data, chunks=(2,), attributes=attrs, dimension_names=dims, overwrite=True
+        )
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        found = report["checks"]["all_time"]["mismatches"]
+        want = f"{leaf}[7]/count: layout is unsharded, 2 cells per chunk; §4.6 requires"
+        assert any(m.startswith(want) for m in found), found
+
+    def test_a_window_column_with_a_wrong_grid_size_fails_by_name(self, store):
+        # Every column group's n_cells is 4^(r - order), window members too.
+        from zagg.column import COLUMN_ATTR
+
+        leaf = SHARDS[0]
+        column = store / _rel(leaf[:-1], f"{leaf[-1]}/2019.pyramid.zarr")
+        _set_attrs(column, lambda a: a[COLUMN_ATTR]["groups"]["7"].update(n_cells=999))
+        report = validate_pyramid(str(store), full=True)
+        assert not report["passed"]
+        found = [m for c in report["checks"].values() for m in c.get("mismatches", [])]
+        assert any(f"{leaf}[7]: n_cells 999 != 4^(7-6)" in m for m in found), found
+
+    def test_the_member_is_compared_by_value_against_its_window_columns(self, built):
+        # Issue #650's deferred leg: every committed member is held, cell for
+        # cell, to the k-way fold of the window columns beside it.
+        report = validate_pyramid(str(built[0]), full=True)
+        assert report["passed"], format_report(report)
+        assert report["all_time_columns"] == {
+            "declared": 3,
+            "materialized": 3,
+            "missing": [],
+            "checked": 3,
+            "stale": [],
+        }
+        assert (
+            "3 checked against the k-way fold of their window columns"
+            in (report["checks"]["all_time"]["detail"])
+        )
+
+    def test_a_member_cell_that_is_not_the_fold_fails_by_leaf_and_cell(self, store):
+        import zarr
+
+        from zagg.store import open_store
+
+        leaf = SHARDS[0]
+        member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
+        group = zarr.open_group(open_store(str(member)), path="7")
+        counts = group["count"][:]
+        cell = int(np.flatnonzero(counts)[0])
+        counts[cell] += 1
+        group["count"][:] = counts
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        found = [m for m in report["checks"]["all_time"]["mismatches"] if m.startswith(f"{leaf}[")]
+        assert found and found[0].startswith(f"{leaf}[{cell}]: stored {counts[cell]} != fold ")
+
+    @pytest.mark.parametrize("damage", ["short", "older"])
+    def test_a_stale_member_fails_by_name_and_is_not_compared(self, store, damage):
+        # A member that folded fewer windows than the shard holds, or that
+        # was stamped before one of its window columns, is stale: named, and
+        # its values are not compared (every cell would differ).
+        from zagg.column import COLUMN_ATTR
+        from zagg.hive import COMMIT_ATTR
+
+        leaf = SHARDS[0]
+        node = store / _rel(leaf[:-1], leaf[-1])
+        if damage == "short":
+            _set_attrs(
+                node / "all.pyramid.zarr",
+                lambda a: a[COLUMN_ATTR]["source_windows"].update(folded=2, missing=1),
+            )
+        else:
+            _set_attrs(
+                node / "2020.pyramid.zarr",
+                lambda a: a[COMMIT_ATTR].update(written_at="2999-01-01T00:00:00+00:00"),
+            )
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        assert report["all_time_columns"]["stale"] == [leaf]
+        findings = report["checks"]["all_time"]["mismatches"]
+        assert any(f.startswith(f"{leaf}: STALE all.pyramid.zarr") for f in findings), findings
+        assert not any(f.startswith(f"{leaf}[") for f in findings)
 
 
 @pytest.fixture(scope="module")
@@ -651,7 +757,6 @@ def composed(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("windowed-composition")
     with pytest.MonkeyPatch.context() as monkeypatch:
         _run(monkeypatch, tmp_path, tmp_path / "store", first_run=False, composition=True)
-    _write_all_time_columns(tmp_path / "store")
     return tmp_path / "store"
 
 
@@ -699,7 +804,6 @@ def clocked(tmp_path_factory):
     with pytest.MonkeyPatch.context() as monkeypatch:
         summary = _run(monkeypatch, tmp_path, root, first_run=False, temporal=True)
     assert summary["cells_error"] == 0
-    _write_all_time_columns(root)
     return root
 
 
@@ -810,6 +914,17 @@ class TestARosterThatUnderstatesTheStore:
             for m in report["checks"]["all_time"]["mismatches"]
         )
         assert validate_pyramid(str(store), full=True, roster="list")["passed"]
+
+    def test_a_window_column_the_run_records_lost_still_counts_toward_the_member(self, store):
+        # The writer folds every window the shard HAS (one LIST), so the
+        # member's coverage is judged against the store, not the roster: the
+        # lost 2020 record is the materialization finding, never a STALE member.
+        _drop_records(store, lambda row: row["window"] != "2020")
+        report = validate_pyramid(str(store), full=True)
+        assert report["all_time_columns"]["checked"] == 3
+        assert report["all_time_columns"]["stale"] == []
+        found = report["checks"]["all_time"]["mismatches"]
+        assert not any("all.pyramid.zarr" in m for m in found), found
 
     def test_a_shard_the_run_records_lost_fails_against_the_coverage_moc(self, store):
         key = _shard(SITES[2])

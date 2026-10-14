@@ -1340,17 +1340,10 @@ def leaf_units(
     node-order partial, which are sweep inputs that overlap the overview
     levels (:func:`level_grids`), laid out by :func:`zagg.column_shards.column_grid`.
     """
-    from zagg.column import leaf_column_plan, leaf_level_cells
-    from zagg.hive import shard_leaf_path
-    from zagg.sweep_overview import _overview_config
-
-    (rank,) = grid.block_index(int(shard_key))
     # The row IS the window: a windowed leaf is ``{id}_{row}.zarr`` and its
     # column artifact ``{column}`` already carries the window in its name
     # (the caller passes the windowed basename), issue #584 phase 2.
     window = None if row == ALL_ROW else str(row)
-    leaf_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key, window=window))
-    node_rel = leaf_rel.rsplit("/", 1)[0]
     units = [
         {
             "level": int(grid.child_order),
@@ -1365,11 +1358,34 @@ def leaf_units(
             ),
         }
     ]
-    plan = leaf_column_plan(config, grid) if column else None
+    if column:
+        units.extend(
+            column_units(
+                grid, config, shard_key, store_root, column, row, store_kwargs=store_kwargs
+            )
+        )
+    return units
+
+
+def column_units(grid, config, shard_key, store_root, column, row, *, store_kwargs) -> list[dict]:
+    """One unit per column member that is a repo LEVEL, at ``row`` (§11.2).
+
+    The column half of :func:`leaf_units`, shared with :func:`member_units`:
+    ``column`` is the artifact's basename beside the shard's leaves, ``row``
+    its refs' label. Empty when the declaration carries no column.
+    """
+    from zagg.column import leaf_column_plan, leaf_level_cells
+    from zagg.hive import shard_leaf_path
+    from zagg.sweep_overview import _overview_config
+
+    plan = leaf_column_plan(config, grid)
     if plan is None:
-        return units
+        return []
+    (rank,) = grid.block_index(int(shard_key))
+    node_rel = _leaf_rel(store_root, shard_leaf_path(store_root, shard_key)).rsplit("/", 1)[0]
     _resolutions, fields = plan
     cfg = _overview_config(fields)
+    units = []
     for res in leaf_level_cells(config, grid):
         if int(res) >= int(grid.child_order):
             continue  # a member at the store's own cell order duplicates the base (level_grids)
@@ -1383,6 +1399,20 @@ def leaf_units(
         if entries:
             units.append({"level": int(res), "row": row, "entries": entries})
     return units
+
+
+def member_units(grid, config, shard_key, store_root, *, store_kwargs) -> list[dict]:
+    """The shard's all-time column's units: its declared levels at the ``all`` row (§11.2).
+
+    ``all.pyramid.zarr`` (§4.6, issue #649), indexed as a window column is at
+    its window's row; nothing at the base, which has no all-time leaf. Units
+    without refs (or none) when the member or its declaration is absent.
+    """
+    from zagg.column import column_name
+
+    return column_units(
+        grid, config, shard_key, store_root, column_name(None), ALL_ROW, store_kwargs=store_kwargs
+    )
 
 
 def vet_leaf_repo(store_root: str, grid, *, store_kwargs: dict):
@@ -1479,6 +1509,7 @@ __all__ = [
     "REBASE_TRIES",
     "REPLAY_TRIES",
     "ZARR_CONVENTIONS_ATTR",
+    "column_units",
     "commit_units",
     "container_prefix",
     "finest_dispatch_order",
@@ -1487,6 +1518,7 @@ __all__ = [
     "leaf_units",
     "level_grids",
     "leaf_ref_plan",
+    "member_units",
     "level_group_spec",
     "multiscales_layout",
     "object_ref_plan",

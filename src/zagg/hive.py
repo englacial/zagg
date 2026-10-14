@@ -1543,9 +1543,12 @@ def leaf_identity_gate(
 
     A skipped or refused unit writes NOTHING (no arrays, no stamp, no
     sidecar, no sub-map, no column): the caller returns ``meta`` untouched,
-    so zero sweep dirtiness by construction. The sidecar read is fail-open —
-    an unreadable, unparseable, or non-object sidecar degrades to today's
-    rewrite (the ``no-sidecar`` classification), never blocks the unit.
+    so zero sweep dirtiness by construction. (The shard's all-time member is
+    no unit's: the bulk close may rebuild it after every window skipped —
+    issue #649 — and the shard meta says so in ``all_time_column``.) The
+    sidecar read is fail-open — an unreadable, unparseable, or non-object
+    sidecar degrades to today's rewrite (the ``no-sidecar`` classification),
+    never blocks the unit.
 
     A matched identity is NOT sufficient to skip: the unit's ARTIFACTS must
     be current too, verified by reading them rather than the record.
@@ -1759,6 +1762,7 @@ class _LeafUnit:
         run_id,
         sidecar_spec,
         semantic_hash,
+        keep_fold: bool = False,
     ):
         from zagg.config import get_leaf_versions
 
@@ -1783,6 +1787,14 @@ class _LeafUnit:
         self.identity = None
         self.box: dict = {}
         self.write_elapsed = 0.0
+        # This window's column fold, kept resident for the shard's all-time
+        # column (issue #649): filled by ``write_leaf_column`` in :meth:`finish`
+        # on the bulk unit alone (``keep_fold``), the one path that closes —
+        # the fan-out unit clears the member instead (review finding (1)).
+        # The bulk peak is every window's fold at once, unmeasured at v4
+        # geometry (δ-bounded digests over the column resolutions, 16,384
+        # cells per field at cells 16).
+        self.column_fold: dict | None = {} if keep_fold else None
         # A windowed leaf stores no per-cell ``morton`` array (issue #586
         # phase 3, spec §1.5 "The cell coordinate"): the word is derived from
         # the leaf id and the rank, so the template omits the member and the
@@ -2268,6 +2280,7 @@ class _LeafUnit:
                     time_range=time_range,
                     granule_count=metadata.get("granule_count", 0),
                     store_kwargs=store_kwargs,
+                    folded_out=self.column_fold,
                 )
             except Exception as e:
                 # Reported, not raised: the leaf is already COMMITTED here, so
@@ -2545,7 +2558,28 @@ def process_and_write_hive(
         **unit.sinks(),
         temporal_out=unit.temporal_acc,
     )
-    return unit.finish(metadata)
+    meta = unit.finish(metadata)
+    if window is not None and not meta.get("error"):
+        # A fan-out window unit rewrote one window column the shard's all-time
+        # member folds (issue #649), and absent beats stale. It CLEARS the
+        # member rather than rewriting it: the ``(shard, window)`` units of one
+        # shard run concurrently, and ``write_column`` (delete, PUTs, stamp) is
+        # no atomic replace, so two writers would tear it under a valid stamp
+        # (review finding (1)); two deletes are benign. A ``unit: window``
+        # store therefore carries NO leaf all-time member — the checker's
+        # ``all_time`` leg fails it by leaf — until the maintainer rules how
+        # it gets one (standing on PR #666). A failed clear is the unit's
+        # error, as a failed column is.
+        from zagg.column_alltime import clear_member
+
+        try:
+            clear_member(store_root, shard_key, store_kwargs)
+        except Exception as e:
+            logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
+            meta["error"] = f"all-time column: {e}"
+            meta["all_time_column_error"] = str(e)
+            meta["store_error_class"] = classify_store_error(e)
+    return meta
 
 
 def _process_windows(
@@ -2589,7 +2623,15 @@ def _process_windows(
             else list(granule_urls)
         )
         unit = _LeafUnit(
-            shard_key, urls, grid, store_root, config, window=w, windowing=windowing, **unit_kwargs
+            shard_key,
+            urls,
+            grid,
+            store_root,
+            config,
+            window=w,
+            windowing=windowing,
+            keep_fold=True,
+            **unit_kwargs,
         )
         units[w["label"]] = unit
         skipped = unit.gate(allow_contraction=allow_contraction) if skip_if_current else None
@@ -2605,6 +2647,7 @@ def _process_windows(
         "duration_s": 0.0,
         "error": None,
     }
+    fatal = False
     if todo:
         # Read only what the windows left to write need (review finding (2)):
         # the union of their granule subsets, in the unit's order, each
@@ -2678,8 +2721,93 @@ def _process_windows(
             left = [w["label"] for w in todo if w["label"] not in metas]
             logger.error(f"shard {shard_key}: {e}; {len(left)} windows not attempted")
             base["windows_unattempted"] = left
+            fatal = True
+            # Absent beats stale (§4.6): a window that landed first superseded
+            # a column the member folds. One delete, not a close — and the
+            # store may refuse it too, so a failure is logged, never the error.
+            if any(
+                m.get("column_error")
+                or not (m.get("error") or m.get("current") or m.get("refused"))
+                for m in metas.values()
+            ):
+                from zagg.column_alltime import clear_member
+
+                try:
+                    clear_member(store_root, shard_key, unit_kwargs["store_kwargs"])
+                except Exception as exc:
+                    logger.error(f"all-time column clear failed for shard {shard_key}: {exc}")
+    if not fatal:
+        # The shard's all-time column (issue #649) — never closed after a
+        # store-fatal abort: the windows not attempted have no column to
+        # fold, and the invoke is ending.
+        _close_windows(
+            shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs
+        )
     base["duration_s"] = time.time() - t0
     return _shard_meta(base, [metas[w["label"]] for w in windows if w["label"] in metas])
+
+
+def _close_windows(shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs):
+    """The shard's all-time column after the bulk unit's windows land (issue #649).
+
+    Every window the shard has is folded, cell for cell in ascending label
+    order, into ``all.pyramid.zarr`` beside the window columns
+    (:func:`zagg.column_alltime.close_shard` — the sweep's close law, one
+    tier down): the windows this invoke wrote from their RESIDENT folds
+    (each ``_LeafUnit.column_fold``), every other — one the identity gate
+    skipped as current, one the store holds a column for that this invoke
+    was not dispatched (a run over new granules sends only the windows they
+    touch) — read back from its stored column. A window whose sink kept
+    nothing (the benign no-data error) writes no leaf and no column: on a
+    first build it is not a source, but a leaf and column an earlier run
+    left survive (no issue #341 clear reaches it) and are read back like any
+    stored window's. A window that FAILED (or committed its leaf and
+    then failed its column) defers the close: the retry rewrites it and the
+    member, and meanwhile the standing member — which folds that window's
+    previous column — is cleared, since absent beats stale (the
+    :func:`zagg.column._clear_column` rule). An invoke that wrote nothing
+    (every window current) rewrites the member only when it is absent, short
+    or older than a column it folds (:func:`zagg.column_alltime.member_current`),
+    which is what heals a shard whose close once failed — on this unit only:
+    a ``unit: window`` unit never closes (it clears, PR #666 review (1)).
+    """
+    from zagg.column_alltime import _close_all_time, _resident_sources, clear_member
+    from zagg.dispatch import BENIGN_ERRORS
+
+    written: dict = {}
+    skipped: list = []
+    failed = False
+    for w in windows:
+        m = metas[w["label"]]
+        if m.get("current") or m.get("refused"):
+            skipped.append(w["label"])
+        elif m.get("error") and m["error"] not in BENIGN_ERRORS:
+            failed = True
+        elif not m.get("error"):
+            written[w["label"]] = (units[w["label"]], m)
+    if failed:
+        # Landed windows, or a leaf committed before its column failed: the
+        # member folds a superseded column, so it goes until the retry.
+        if written or any(m.get("column_error") for m in metas.values()):
+            try:
+                clear_member(store_root, shard_key, unit_kwargs["store_kwargs"])
+            except Exception as e:
+                logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
+                base["error"] = f"all-time column: {e}"
+                base["all_time_column_error"] = str(e)
+        return
+    _close_all_time(
+        shard_key,
+        grid,
+        store_root,
+        config,
+        _resident_sources(grid, written),
+        skipped,
+        fresh=bool(written),
+        sink=base,
+        timed=(base, *(m for _unit, m in written.values())),
+        store_kwargs=unit_kwargs["store_kwargs"],
+    )
 
 
 def _shard_meta(base: dict, window_metas: list) -> dict:
@@ -2692,7 +2820,10 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     failed window's error with its ``store_error_class`` (issue #651; the
     store-fatal window that ended the invoke when there is one, else the
     first failed; a benign no-data window is not a failure), and
-    ``current`` / ``refused`` only when every window skipped that way.
+    ``current`` / ``refused`` only when every window skipped that way —
+    beside ``all_time_column`` when the close rewrote the member all the
+    same (issue #649: absent, short or older), so ``current`` never claims
+    the invoke wrote nothing.
     """
     from zagg.windows import union_time_range
 
@@ -2723,7 +2854,8 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
         more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
         meta["store_error_class"] = first.get("store_error_class") or STORE_TRANSIENT
-    elif written and all(m.get("error") for m in written):
+    elif written and all(m.get("error") for m in written) and not base.get("error"):
+        # A failed close behind benign windows keeps its own error and class.
         meta["error"] = written[0]["error"]
         meta["store_error_class"] = STORE_BENIGN
     # The union, like the sums, is of the windows that landed — and it is what

@@ -1802,6 +1802,52 @@ class TestCarrier:
         units, _meta = unpack_units(json.dumps(raw).encode(), "file:///r/")
         assert units == [{"level": 6, "row": "all", "entries": []}]
 
+    def test_the_member_carrier_is_the_leaf_carrier_under_its_own_key(self, cfg, tmp_path):
+        # One packer behind both (PR #666 review finding (7)): the same bytes
+        # and the same record — ``levels`` finest first — under another key.
+        from pathlib import Path
+
+        from zagg import icechunk_ladder
+
+        grid, root = _grid(cfg), str(tmp_path / "store")
+        (shard,) = _shards(grid, 1)
+        units = [
+            {
+                "level": level,
+                "row": "all",
+                "entries": [
+                    {
+                        "path": f"{level}/x",
+                        "sharded": False,
+                        "chunks": [(f"{level}/x/c/0", f"file://{root}/x/c/0", 12, '"etag"')],
+                        "refs": 1,
+                    }
+                ],
+            }
+            for level in (5, 6)
+        ]
+        leaf = hive.shard_leaf_path(root, shard)
+        member = icechunk_ladder.write_member_refs(root, shard, grid, units, store_kwargs={})
+        as_leaf = icechunk_ladder.write_leaf_refs(
+            root, leaf, grid, units, spec="morton-hive/3", store_kwargs={}
+        )
+        assert member["sidecar"] == "all.pyramid.icechunk_refs.json" != as_leaf["sidecar"]
+        assert member["levels"] == as_leaf["levels"] == [6, 5]
+        assert {**member, "sidecar": None} == {**as_leaf, "sidecar": None}
+        node = Path(leaf).parent
+        assert (node / member["sidecar"]).read_bytes() == (node / as_leaf["sidecar"]).read_bytes()
+
+    def test_a_geometry_refusal_names_the_carrier_it_vetted(self):
+        from zagg.icechunk_ladder import GEOMETRY_KEYS, _vet_geometry
+
+        block = dict.fromkeys(GEOMETRY_KEYS, 1)
+        with pytest.raises(ValueError, match="leaf 111 refs carry no geometry"):
+            _vet_geometry("111", {}, block)
+        with pytest.raises(ValueError, match="all-time column 111 refs are for"):
+            _vet_geometry(
+                "111", {"geometry": dict.fromkeys(GEOMETRY_KEYS, 2)}, block, "all-time column"
+            )
+
 
 def _ladder_run(
     monkeypatch,
@@ -2089,6 +2135,29 @@ class TestLadder:
         out = run_stage_sweep(root, [(s, None) for s in shards], store_kwargs={})
         rows = {r["dispatch_order"]: r for r in out["stages"]}
         assert rows[3]["icechunk_missing"] == 1 and rows[3]["icechunk_failed"] == 0
+
+    def test_an_unwindowed_gather_reads_no_member_carrier(self, monkeypatch, cfg, tmp_path):
+        # PR #666 review finding (1): an unwindowed store's ``all`` row is
+        # its leaf's own carrier, so the all-time column carrier (issue #649,
+        # a windowed store's artifact) is never looked for — one wasted GET
+        # per shard per gather otherwise.
+        from zagg import icechunk_ladder
+
+        reads: list = []
+        real = icechunk_ladder.read_member_refs
+        monkeypatch.setattr(
+            icechunk_ladder,
+            "read_member_refs",
+            lambda *a, **kw: reads.append(a) or real(*a, **kw),
+        )
+        for block in ({}, {"commit_order": 0}):  # the committing and the column-only gather
+            shards = _shards(_grid(cfg), 6)
+            _grid_, root, summary = _ladder_run(
+                monkeypatch, cfg, tmp_path / f"c{len(block)}", icechunk_block=block, shards=shards
+            )
+            assert summary["cells_error"] == 0
+            assert sum(r["icechunk_refs"] for r in _stage_rows(root)) > 0
+        assert reads == []
 
     def test_a_clean_subtree_is_skipped_whole(self, monkeypatch, cfg, tmp_path):
         # The gather is O(subtree); running it for every candidate node made

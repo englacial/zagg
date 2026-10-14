@@ -3581,7 +3581,10 @@ def _run_local(
             # Skip-if-current (issue #388): counted apart in the summary
             # (_identity_counts), never as cells_with_data — this run wrote
             # nothing for the unit.
-            logger.info(f"  [{i}/{n}] {label}: current — inputs unchanged, leaf untouched")
+            # The bulk unit's all-time close may still rebuild a shard-level
+            # member no window owns (issue #649): said, never hidden.
+            rebuilt = "; all-time member rewritten" if meta.get("all_time_column") else ""
+            logger.info(f"  [{i}/{n}] {label}: current — inputs unchanged, leaf untouched{rebuilt}")
         elif meta.get("refused"):
             logger.warning(
                 f"  [{i}/{n}] {label}: REFUSED — planned inputs drop "
@@ -6221,8 +6224,8 @@ def _icechunk_rows(config, cells: list[tuple] | None = None) -> list:
     an unwindowed run writes the single ``all`` row; a windowed run the
     labels of its dispatch units (``cells``, already expanded), plus the
     reserved ``all`` row when the store maintains the cross-window fold
-    (``pyramid.overview.all_time``) — that row is populated at the overview
-    levels only, there being no all-time leaf at the base.
+    (``pyramid.overview.all_time``) — that row is populated above the base
+    only (overview and leaf-column levels), there being no all-time leaf.
 
     ``cells`` is REQUIRED for a windowed config and is the run's expanded
     units; a caller that has not fanned out is refused here rather than

@@ -719,8 +719,15 @@ def build(
     print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells")
 
 
-def _column_expected(column_dir: Path, basename: str) -> dict:
-    """The committed §4.6 column record: attrs, decoded groups, O11 hashes."""
+def _column_expected(column_dir: Path, basename: str, *, companions: bool = False) -> dict:
+    """The committed §4.6 column record: attrs, decoded groups, O11 hashes.
+
+    ``companions`` also decodes each approximate field's §9/§8.3 channels
+    (``{name}_locations``/``_times``, typed by their ``ragged`` element) into
+    the record, one list of decimal strings per cell, so the words are pinned
+    on decoded values and not only by hash (the ``windowed/`` fixture; the
+    older fixtures' records stay as published).
+    """
     import zarr
 
     store = zarr.storage.LocalStore(str(column_dir))
@@ -744,6 +751,14 @@ def _column_expected(column_dir: Path, basename: str) -> dict:
                 ]
             elif meta["class"] == "exact":
                 record[name] = [v.item() for v in group[name][:]]
+            for channel in (f"{name}_locations", f"{name}_times") if companions else ():
+                if meta["class"] != "approximate" or channel not in group:
+                    continue
+                element = np.dtype(group[channel].attrs["ragged"]["element"]["dtype"])
+                record[channel] = [
+                    [str(v) for v in np.frombuffer(bytes(p), element.newbyteorder("<"))]
+                    for p in group[channel][:]
+                ]
         groups[res] = record
     return {
         "object": basename,
@@ -2128,44 +2143,64 @@ def _fake_windowed_shard(grid, by_chunk, time_range):
 
     The carrier still holds the ``morton`` column the real worker builds —
     it is the WRITER that drops it for a windowed leaf, which is the path
-    this fixture pins.
+    this fixture pins. Driven through the BULK shape (``windows=`` +
+    ``emit_window``, issue #586 phase 2): the one window's sinks come from the
+    ``aggregate`` callback, exactly as the worker hands them over, so the
+    unit closes the shard into its all-time column (§4.6, issue #649) the
+    way a fleet invoke does.
     """
 
     def fake(g, shard_key, urls, **kwargs):
-        occupied = []
-        for ordinal, (block, children) in enumerate(grid.iter_chunks(int(shard_key))):
-            cells = by_chunk.get(ordinal, {})
-            if not cells:
-                kwargs["chunk_results"].append((block, pd.DataFrame(), {}))
-                continue
-            n = grid.cells_per_chunk
-            df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
-            df["count"] = np.array(
-                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64
-            )
-            ids = sorted(cells)
-            ragged = {
-                "h_tdigest": (
-                    [cells[i]["h_tdigest"][0] for i in ids],
-                    ids,
-                    [cells[i]["h_tdigest"][1] for i in ids],
-                )
-            }
-            kwargs["chunk_results"].append((block, df, ragged))
-            occupied.extend(int(children[i]) for i in sorted(cells))
-        kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
-        return pd.DataFrame(), {
-            "shard_key": int(shard_key),
-            "cells_with_data": len(occupied),
-            "total_obs": sum(c["count"] for cells in by_chunk.values() for c in cells.values()),
-            "granule_count": 1,
-            "files_processed": 1,
-            "duration_s": 0.0,
-            "time_range": time_range,
-            "error": None,
-        }
+        windows, emit_window = kwargs.get("windows"), kwargs.get("emit_window")
+        if windows is None:
+            return _fake_body(grid, by_chunk, time_range, shard_key, kwargs)
+        shard_meta = None
+        for w in windows:
+
+            def aggregate(_w=w, **sinks):
+                nonlocal shard_meta
+                _df, meta = _fake_body(grid, by_chunk, time_range, shard_key, sinks)
+                shard_meta = dict(meta)
+                return {**meta, "window": _w["label"], "unit_windows": len(windows)}
+
+            emit_window(w, aggregate)
+        return pd.DataFrame(), shard_meta
 
     return fake
+
+
+def _fake_body(grid, by_chunk, time_range, shard_key, kwargs):
+    """One window's aggregate into ``kwargs``' sinks; the ``process_shard`` return."""
+    occupied = []
+    for ordinal, (block, children) in enumerate(grid.iter_chunks(int(shard_key))):
+        cells = by_chunk.get(ordinal, {})
+        if not cells:
+            kwargs["chunk_results"].append((block, pd.DataFrame(), {}))
+            continue
+        n = grid.cells_per_chunk
+        df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
+        df["count"] = np.array([cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int64)
+        ids = sorted(cells)
+        ragged = {
+            "h_tdigest": (
+                [cells[i]["h_tdigest"][0] for i in ids],
+                ids,
+                [cells[i]["h_tdigest"][1] for i in ids],
+            )
+        }
+        kwargs["chunk_results"].append((block, df, ragged))
+        occupied.extend(int(children[i]) for i in sorted(cells))
+    kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
+    return pd.DataFrame(), {
+        "shard_key": int(shard_key),
+        "cells_with_data": len(occupied),
+        "total_obs": sum(c["count"] for cells in by_chunk.values() for c in cells.values()),
+        "granule_count": 1,
+        "files_processed": 1,
+        "duration_s": 0.0,
+        "time_range": time_range,
+        "error": None,
+    }
 
 
 def build_windowed(out: Path) -> None:
@@ -2256,6 +2291,9 @@ def build_windowed(out: Path) -> None:
     original = processing.process_shard
     processing.process_shard = _fake_windowed_shard(grid, by_chunk, time_range)
     try:
+        # The bulk ``unit: shard`` shape over the one window (issue #586 phase
+        # 2): the single writer of the shard's all-time column (§4.6, issue
+        # #649), which a per-window unit never writes.
         meta = hive.process_and_write_hive(
             shard,
             ["s3://fixture/a.h5"],
@@ -2264,15 +2302,33 @@ def build_windowed(out: Path) -> None:
             root,
             cfg,
             store_kwargs={},
-            window=window,
+            windows=[{**window, "granules": [0]}],
             sidecar_spec=hive.HIVE_SPEC_V2,
         )
     finally:
         processing.process_shard = original
     assert meta.get("error") is None, meta
+    assert meta.get("all_time_column") == "all.pyramid.zarr", meta
 
     leaf_rel = hive.shard_leaf_path("", shard, window=WINDOWED_LABEL).lstrip("/")
     assert not (out / leaf_rel / grid.group_path / "morton").exists()
+    node_dir = (out / leaf_rel).parent
+    window_column = _column_expected(
+        node_dir / "2019.pyramid.zarr", "2019.pyramid.zarr", companions=True
+    )
+    all_time = _column_expected(node_dir / "all.pyramid.zarr", "all.pyramid.zarr", companions=True)
+    # The §4.6 carve-out, asserted at build time: one more merge from raw
+    # than the window member at every group, the token, the counters, and a
+    # one-window fold that is the identity on the window's values.
+    groups = all_time["zagg_column"]["groups"]
+    assert {r: g["merges_from_raw"] for r, g in groups.items()} == {
+        r: g["merges_from_raw"] + 1 for r, g in window_column["zagg_column"]["groups"].items()
+    }
+    assert all_time["zagg_column"]["window"] == "all"
+    assert all_time["zagg_column"]["source_windows"] == {"folded": 1, "missing": 0, "unreadable": 0}
+    assert all_time["commit"]["window"] == "all"
+    assert all_time["commit"]["time_range"] == window_column["commit"]["time_range"]
+    assert all_time["groups"] == window_column["groups"]
 
     order19 = []
     for dec in WINDOWED_ORDER19_SHARDS:
@@ -2316,12 +2372,16 @@ def build_windowed(out: Path) -> None:
         },
         "cells": expected_cells,
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
+        # The window column and the shard's all-time column beside it (§4.6,
+        # issue #649), in the ``column/`` fixture's record shape.
+        "column": window_column,
+        "all_time_column": all_time,
     }
     assert f"{grid.group_path}/morton" not in expected["content_hashes"]["arrays"]
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     print(
         f"{out.name}: windowed leaf {leaf_rel}, {len(expected_cells)} populated cells, "
-        f"no stored morton"
+        f"no stored morton; all-time column {all_time['object']}"
     )
 
 

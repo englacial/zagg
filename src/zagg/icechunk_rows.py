@@ -188,7 +188,7 @@ def unit_row(window, *, windowed: bool) -> str:
     seam and the per-leaf commit cannot drift.
 
     On a WINDOWED store ``all`` is not a neutral default: §11.2 reserves it
-    for the cross-window fold maintained at the overview levels, so a unit
+    for the cross-window fold maintained above the base, so a unit
     that names no label is REFUSED rather than written over it. Nothing
     downstream would catch that — ``all`` IS an allocated row whenever
     ``pyramid.overview.all_time`` is on — and it would surface much later

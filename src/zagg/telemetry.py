@@ -109,6 +109,10 @@ _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
 #: shard_key)`` — :func:`merge` and every readout that totals rows. The
 #: ``read`` phase is the invoke's too (the shard is read once).
 INVOKE_LEVEL_KEYS = ("duration_s", "duration_total_s", "gb_seconds", "est_cost_usd", "n_obs_read")
+#: The invoke-level phases, repeated on each leaf record the same way: the
+#: shard's one ``read``, its one all-time column close (issue #649) and that
+#: member's Icechunk refs (the leaf's own ``icechunk`` phase is per leaf).
+INVOKE_PHASES = ("read", "all_time_column", "icechunk_all_time")
 _EQ_OR_NONE_KEYS = (
     "window",
     # Bulk multi-window unit width (issue #586): every leaf of one shard
@@ -501,7 +505,7 @@ def merge(records: Iterable[dict]) -> dict:
 
     The leaf records of one bulk multi-window invoke (issue #586:
     ``unit_windows`` set, one ``(run_id, shard_key)``) each repeat the
-    invoke's :data:`INVOKE_LEVEL_KEYS` and its ``read`` phase; the fold
+    invoke's :data:`INVOKE_LEVEL_KEYS` and its :data:`INVOKE_PHASES`; the fold
     counts those once per invoke, so a shard's rollup carries the billed
     wall and the cost of the one invoke that wrote its N leaves, not N
     times it. The rows of one invoke must meet in ONE call for that, which
@@ -554,7 +558,7 @@ def merge(records: Iterable[dict]) -> dict:
     phase_timings: dict[str, float] = {}
     for r in records:
         for name, secs in (r.get("phase_timings") or {}).items():
-            if name == "read" and id(r) in repeated:
+            if name in INVOKE_PHASES and id(r) in repeated:
                 continue
             phase_timings[name] = phase_timings.get(name, 0.0) + secs
     out["phase_timings"] = phase_timings

@@ -1180,7 +1180,11 @@ overviews** (`{window}.zarr`, every window the node has), cell for cell at
 the level's resolution — one k-way merge per cell across windows under the
 field's §4.5 law. It is written after the node's per-window artifacts and
 never from the leaf tier, so its cost follows the window count, not the
-subtree. Its `zagg-overview/2` attrs record:
+subtree. The shard order is a leaf of the staged walk, not a node of it, so
+the declared **leaf-column levels** take their all-time member from the leaf
+worker instead — the §4.6 **all-time column**, `all.pyramid.zarr` beside the
+shard's window columns, folded under this same law. Its `zagg-overview/2`
+attrs record:
 
 - `regime: "stage-merge"` at every level, a gather level included;
 - `merges_from_raw` **one more than its sources'**: `2` where the level's
@@ -1192,8 +1196,10 @@ subtree. Its `zagg-overview/2` attrs record:
   window overviews it consumed. `missing` counts a window known to have data
   beneath the node whose overview was not committed when the fold ran (its
   stage unit failed, or has not landed): the fold then under-covers that
-  window and the next sweep heals it. The key is present **exactly** on this
-  artifact; a reader MUST tolerate it and MUST NOT require it elsewhere;
+  window and the next sweep heals it. The key is present **exactly** on the
+  two all-time artifacts — this one and §4.6's leaf all-time column
+  (`all.pyramid.zarr`) — and never on a window artifact; a reader MUST
+  tolerate it and MUST NOT require it elsewhere;
 - `source_children` — the folded windows' own counters, **summed**: a window
   that under-covered its subtree makes the all-time fold short by the same
   children;
@@ -1637,7 +1643,14 @@ guessed at.
   unwindowed / `schedule: none` leaf takes the reserved token (§4.2), giving
   the §7 `column/` fixture's committed pair `11213.zarr` and
   `all.pyramid.zarr` side by side, and a `/1` windowed leaf
-  `11213_2019.zarr` is paired with `2019.pyramid.zarr`. The `.pyramid.zarr`
+  `11213_2019.zarr` is paired with `2019.pyramid.zarr`. On a **windowed**
+  store the same basename `all.pyramid.zarr` is the shard's **all-time
+  column** (below): the token keeps its §4.2 meaning — the whole record —
+  and a store is unwindowed or windowed from birth, so the two readings of
+  the name never meet in one store; which one a reader holds is the
+  manifest's `temporal` block, and the stamp says it too (`morton-hive/1`
+  with no `window` on the unwindowed leaf's column, `morton-hive/2` naming
+  `window: "all"` on the all-time one). The `.pyramid.zarr`
   suffix is the one name seam, and it is **normative** for name-grammar
   consumers (e.g. the root-MOC walker): a basename ending in `.pyramid.zarr`
   MUST NOT be read as a leaf or an overview. The seam is unambiguous because
@@ -1785,11 +1798,74 @@ guessed at.
   complete by construction), the `merges_from_raw` integer (1 at or above
   the raw-fold boundary, 2 below it — on the 19/13/9 reference geometry
   `{"13": 1, "12": 1, "11": 1, "10": 2, "9": 2}`; the example above is the
-  4/6 fixture geometry, whose boundary is the cell order), and `n_cells`
+  4/6 fixture geometry, whose boundary is the cell order; the windowed
+  store's all-time column records one more at every group — the carve-out
+  stated below), and `n_cells`
   — the group's **grid** size `4^(r - order)`, i.e. its arrays' length, not
   its populated-cell count (that is the stamp's `cells_with_data`, for the
   `cells_with_data_order` group only). `n_cells` is derivable and recorded
   as a convenience.
+- **The all-time column** (windowed stores; issue
+  [#649](https://github.com/englacial/zagg/issues/649)). Where the manifest
+  declares `pyramid.overview.all_time` (§4.5) on a windowed store, the leaf
+  worker that commits a shard's window columns also writes
+  `all.pyramid.zarr` beside them: the same artifact shape — one group per
+  column resolution, the full set the window columns carry, `morton` and
+  the composable fields with their channel siblings — every group the
+  **k-way fold across the shard's windows, cell for cell, in ascending
+  window-label order**, under §4.4's node-close law (exact classes by their
+  §4.5 merge law, approximate classes by the order-independent k-way digest
+  merge with their §9/§8.3 channels in the same call, packed words by
+  §3.4 from the windows' `(word, n)` pairs). Its sources are the window
+  columns' same-resolution groups — the worker's resident folds for the
+  windows it wrote, the stored columns read back for the rest (a window the
+  identity gate skipped, one an append did not touch) — and a resident
+  slab IS the stored member's value, so the bytes are the same either way:
+  the member equals what §4.4's close would have written had the shard been
+  a node. Its `zagg_column` attrs are a column's, with three differences
+  (the carve-out):
+  - `window` is the reserved token (`"all"`), and the stamp is
+    `morton-hive/2` naming `window: "all"`, `time_range` the union and
+    `granule_count` the sum over every window folded at **any** group —
+    including one that `source_windows` counts `unreadable` because some
+    group refused it, so the stamp is the record the bytes carry, not
+    `source_windows.folded`'s (the §4.4 close's own derivation);
+  - every group keeps `regime: "leaf-column"` and records `merges_from_raw`
+    **one more than the deepest window member folded at that group** — 2
+    at or above the raw-fold boundary, 3 below it (on the 19/13/9 reference
+    geometry `{"16": 2, "15": 2, "14": 2, "13": 2, "12": 2, "11": 2, "10": 3,
+    "9": 3}`; the §7 `windowed/` fixture's 4/6 geometry has no boundary, so
+    its member records 2 at both groups). The per-group law of the previous
+    bullet does not apply to this member, and a checker MUST derive its
+    expectation this way. A group additionally carries §4.3's `demotions`
+    list, present exactly when the packed rail fired at that group (a
+    window column holding the `of` digest but not the word);
+  - the artifact carries **`source_windows`** — `{"folded", "missing",
+    "unreadable"}` over the shard's windows, §4.4's grammar: `missing` is a
+    window the shard is known to have (a leaf or a column beside it) whose
+    column was not committed when the fold ran, `unreadable` one whose
+    column could not be read or that a group refused (a half companion
+    pair). The key is present exactly on the two all-time artifacts — this
+    one and §4.4's `all.zarr` — and a window column or an unwindowed
+    column MUST NOT carry it.
+
+  Write discipline and lifecycle: the member is rewritten wholesale (the
+  D4 order below) whenever the shard's bulk unit lands a window, from every
+  window the shard holds; an invoke that wrote no window rewrites it when
+  it is absent, when its standing `source_windows` counters differ from
+  the ones a re-fold of the shard's windows now would record, or when it
+  is stamped before a column it folds — and, since only a fold can see a
+  group's refusal, on every such invoke while a group refuses a window
+  (the re-fold counts that window `unreadable`, the gate a reader). A writer that cannot fold the whole record — a window
+  unit of a per-window (`unit: window`) dispatch, whose siblings run
+  concurrently and share no writer; a shard whose window failed — **clears**
+  the member rather than leaving one that folds a superseded column
+  (absent beats stale, the §4.6 column rule), so a store built per window
+  carries no leaf all-time member until a bulk unit closes it, and a reader
+  MUST NOT require the member (it is a derived artifact like every column).
+  A member whose `source_windows.missing` is non-zero under-covers and says
+  so. The **base** (`cells == cell_order`) has no all-time member: an
+  all-time leaf is the unwindowed store, not a column.
 - **Write discipline.** The leaf's own D4 order: template (wholesale — the
   column prefix, and any stale stats sidecar, are deleted first) → every
   group's arrays → `role`/`zagg_column` attrs → **one commit stamp last
@@ -1875,8 +1951,10 @@ reads such a group one chunk at a time (it never holds a level whole). The
 arrays, their values, the attrs and the §5 record are the same either way —
 the O11 hash is over decoded values. On a windowed store every window has
 its own stage column (`{window}.pyramid.zarr`), written by that window's own
-stage unit; there is no all-time stage column (a column relays gen-1
-content). Raster hive stores are column-less by construction: nothing
+stage unit; there is no all-time **stage** column (a stage column relays
+gen-1 content; the column tier's all-time member is the leaf's
+`all.pyramid.zarr` above, and the ladder's is §4.4's `all.zarr`). Raster
+hive stores are column-less by construction: nothing
 in this section applies to them (issue #399 owns their overview regime).
 
 ### 4.7 What §4 does not cover (informative)
@@ -2767,8 +2845,18 @@ the cell order to 10, the smallest leaf that can declare a §4.6 fine tier):
   derived word, and a neighbouring cell's word is not. The shipping readers
   are run over it too, and report the read-chunk ids a stored coordinate
   would give. Its §4.6 column (`2019.pyramid.zarr`) stores `morton` in every
-  group, the pin that the artifacts are unchanged. Every other fixture leaf
-  is unwindowed and keeps its stored array, byte for byte.
+  group, the pin that the artifacts are unchanged. Beside it sits the
+  windowed store's **all-time column** (`all.pyramid.zarr`, §4.6; issue
+  [#649](https://github.com/englacial/zagg/issues/649)) folded from that one
+  window: `windowed.expected.json` records it as `all_time_column` in the
+  `column/` fixture's record shape, pinning the carve-out on committed
+  bytes — `window: "all"`, `merges_from_raw` 2 at both groups (one more
+  than the window column's 1), `source_windows` `{1, 0, 0}`, a
+  `morton-hive/2` stamp naming `window: "all"` with the window's own
+  `time_range` and `granule_count`, and every group's values equal to the
+  window column's (a one-window fold is the identity: the same `count`, the
+  digest payload and location words re-encoded unchanged). Every other
+  fixture leaf is unwindowed and keeps its stored array, byte for byte.
 
 - **`demoted/`** — the §4.3 `demotions` surface
   ([#518](https://github.com/englacial/zagg/issues/518)): the
@@ -4332,7 +4420,7 @@ manifest's `zagg-multiscales/1` datasets (§4.9) plus the base:
 | level (group) | artifact per node | node order `n` | cells per object `4^(c−n)` | object arrays |
 |---|---|---|---|---|
 | `/19` | `{leaf}.zarr/19/…` | 9 (shard) | 4^10, as K = 256 inner chunks of 4^6 (§1.5, sharded) | the leaf template's |
-| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column) | 9 | 256, ONE unsharded chunk (a column member of `4^5` cells or more — `/14`–`/16` under `overviews: [16, 15, 14, 13]` — is one sharded object on the §4.6 inner chunk; its level is chunked at that inner chunk) | the column's declared member |
+| `/13` | `{node}/all.pyramid.zarr/13/…` (the leaf's sibling column; on a windowed store row `w` reads `{node}/{w}.pyramid.zarr/13/…` and the `all` row the §4.6 all-time column of the same name) | 9 | 256, ONE unsharded chunk (a column member of `4^5` cells or more — `/14`–`/16` under `overviews: [16, 15, 14, 13]` — is one sharded object on the §4.6 inner chunk; its level is chunked at that inner chunk) | the column's declared member |
 | `/12` … `/4` | `{node}/all.zarr/{c}/…` (the ancestor's overview) | 8 … 0 (= c − 4) | 256, ONE unsharded chunk | the overview's |
 
 (production geometry: shard 9 / chunk 13 / cell 19, declared leaf-node
@@ -4344,7 +4432,9 @@ and those are **deliberately not levels**: they overlap the overview levels
 for the same cells and are sweep inputs, not reader-facing artifacts. A
 level whose artifact a node never wrote (a column exists only under a `/2`
 declaration with composable fields; an overview only once swept) simply has
-no refs there and reads as fill. Every group is created by the once-per-run
+no refs there and reads as fill — an artifact never written, that is: a
+windowed store's `all` row at the column levels can instead hold refs to a
+member since cleared or rewritten, which fail on read (§11.2). Every group is created by the once-per-run
 init (§11.4) from the manifest's declaration, and the repo's **root attrs
 carry the manifest's `zagg-multiscales/1` block** as the root `multiscales`
 object — its keys verbatim, plus the zarr-conventions `layout` below — so a
@@ -4530,15 +4620,39 @@ its kind, fixed at birth with its schedule:
   only row at every level — it is the one-row case of the model, not a
   different one;
 - a **windowed** store has one row per label its runs have named: a row
-  per window written, and `all` for its all-time fold once a run names it
-  (populated at the overview levels only — there is no all-time leaf at
-  the base). Nothing is allocated that no run named: which labels a
+  per window written, and `all` for its all-time fold once a run names it.
+  The `all` row is populated at every level **above the base** — the
+  overview levels by the sweep's node close (§4.4's `all.zarr`), the
+  column levels by the leaf's all-time column (§4.6's `all.pyramid.zarr`,
+  once a bulk unit has closed the shard) — and **never at the base**: there
+  is no all-time leaf, so a reader of row `all` at the base finds fill
+  everywhere, by design. Nothing is allocated that no run named: which labels a
   windowed run names is the dispatcher's (the `all` fold follows
   `pyramid.overview.all_time`, §4.5) and lands with the windowed writer
   (§11.6), and an init that names no label on a windowed store is refused
   rather than creating a repo with no rows.
 
-The two meanings of `all` never meet in one store. **The row law:** a
+  **Contract — the `all` row at the column levels is virtual and may be
+  stale.** Its refs point into the shard's all-time column (§4.6), which a
+  writer rewrites in place on every append to the shard and deletes
+  whenever it clears the member (a `unit: window` unit, a failed window, a
+  store-fatal abort); a committed ref is never retracted. Between such a
+  clear or rewrite and the next bulk close that re-commits the row, the
+  branch tip's refs there name an object that is gone or replaced, and a
+  read of those chunks **fails** — the object is not found, or its §11.3
+  checksum does not match (that section's same-second caveat on a
+  `file://` container applies). It does not read as fill. A reader MUST
+  treat that failure, at row `all` of a column level, as "no all-time
+  member here now" — never as data, and not as a corrupt store; the window
+  rows of the same cells are unaffected and fold to the same member. A
+  tag is stale there by construction (issue
+  [#649](https://github.com/englacial/zagg/issues/649)'s ruling; a native
+  copy is PR [#646](https://github.com/englacial/zagg/pull/646)'s track).
+
+`all` therefore means one of two things — an unwindowed store's single
+row, or a windowed store's all-time fold — and since a store is one kind
+from birth the two meanings never meet in one store; the manifest's
+`temporal` block says which a reader holds. **The row law:** a
 label's row is allocated **once**, by label, in **order of first
 appearance**, and never moves — a window that sorts before an existing one
 is still appended after it (sorted rank would move every later reference).
@@ -4693,12 +4807,26 @@ columns do:
    and its column, the window's label for a windowed leaf — one leaf, and
    so one carrier, per window; a carrier written before `/2` names none and
    is read as `all`) — never a row index, which only the repo knows (§11.2), so a
-   carrier stays valid whatever rows other runs allocate. It is a
+   carrier stays valid whatever rows other runs allocate. The bulk unit
+   that closes a windowed shard (§4.6 "The all-time column", issue
+   [#649](https://github.com/englacial/zagg/issues/649)) writes one more
+   carrier beside the shard's leaves, `all.pyramid.icechunk_refs.json`
+   (the member's own `{stem}.{base}` sibling grammar), holding the
+   all-time column's declared-level units at row `all` — no base unit,
+   since there is no all-time leaf. The writer deletes that carrier
+   (best-effort) before it rewrites the member and before it clears it, so
+   a carrier does not outlive the object it indexes; a member left
+   standing without one is given a new carrier by the next bulk unit that
+   finds the member current. That is a statement about the carrier alone:
+   refs already committed from it stay in the repo (§11.2). It is a
    **writer-internal carrier**, not part of the reader contract — the repo
    is. No Icechunk session is opened on the leaf path.
 2. **Stage nodes gather.** Each dispatch node of the staged sweep (§4,
    `zagg.sweep_stages`) reads its subtree's carriers — the leaf sidecars at
-   the finest tuple, one per `(leaf, window)` on a windowed store, its
+   the finest tuple, one per `(leaf, window)` on a windowed store plus,
+   when the node closes (§4.4), each shard's all-time column carrier for
+   the `all` row (a shard without one — a per-window build, a close that
+   has not run — contributes nothing there and is not counted missing), its
    children's **node ref columns** (the same carrier at
    `{node}/icechunk_refs.json`) above — and adds the refs of the overview
    objects at every order of its tuple beneath it (read the same way a
@@ -4763,6 +4891,15 @@ columns do:
    leaves, after a run whose commits were lost) is a **manual staged sweep
    over the whole store**, where every leaf is dirty by construction.
 
+   The all-time column's refs are the one artifact "committed by the run
+   that dirtied it" does not cover. A bulk unit that rebuilds the member
+   while writing no window (§4.6: every window current, the member absent,
+   short or older) rewrites the member and its carrier and dirties no
+   leaf, so no node gathers the new carrier: the branch tip keeps the
+   previous member's checksums — failing on read, as §11.2 states — until
+   a run next dirties a leaf under the shard's dispatch node, whose close
+   gathers it.
+
 `commit_order` defaults to the **finest dispatch node** of the staged sweep
 (`shard_order − tuple_width` when the shard order is a multiple of the width:
 6 at production), `split_order` to `commit_order`. Both ride the
@@ -4771,7 +4908,10 @@ columns do:
 **per-run** — the init writes this run's values so its stage nodes can read
 them, and they are never a compatibility key. `commit: "leaf"` keeps the per-leaf commit of the
 first revision — the leaf commits `leaf {decimal}` itself and the ladder
-commits overview refs only. An unset `commit` resolves to the ladder only
+commits overview refs only. The all-time column has **no carrier** in that
+mode: the bulk unit that closes the shard commits the member's units
+itself, at row `all`, under the same `leaf {decimal}` message as the
+shard's window leaves (the ancestry does not tell the two apart). An unset `commit` resolves to the ladder only
 when the run walks it — the dispatcher chains the staged sweep
 (`output.sweep: "stages"`) and a `/2` ladder with a composable field is
 declared — and to `"leaf"` otherwise, on every backend: a ladder-mode run

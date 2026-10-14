@@ -705,7 +705,7 @@ def _column_layout_errors(harness, dec, s, q) -> list:
     return [f"{dec}[{q}]/{name}: {why}" for name, why in found.items()]
 
 
-def _column_attrs_errors(dec, s, attrs, resolutions, boundary) -> list:
+def _column_attrs_errors(dec, s, attrs, resolutions, boundary, *, all_time=False) -> list:
     """One leaf column's ``zagg_column`` attrs vs the §4.6 contract.
 
     Absent is :func:`_check_node`'s read-back leg (one line, not two);
@@ -713,9 +713,13 @@ def _column_attrs_errors(dec, s, attrs, resolutions, boundary) -> list:
     presence only and cannot see it (review finding). Each group's
     ``merges_from_raw`` is held to the DERIVED value — 1 at or finer than
     the raw-fold ``boundary``, 2 below it (issue #538) — never to a
-    constant.
+    constant. ``all_time`` is the windowed store's ``all.pyramid.zarr``
+    (issue #649, the §4.6 carve-out): every group one deeper than the window
+    members' derived depth, the reserved window token, and the
+    ``source_windows`` counters present — the one column that carries them.
     """
     from zagg.column import COLUMN_ATTR, COLUMN_SPEC, member_merges_from_raw
+    from zagg.windows import SCHEDULE_NONE_TOKEN
 
     block = attrs.get(COLUMN_ATTR)
     if block is None:
@@ -743,17 +747,36 @@ def _column_attrs_errors(dec, s, attrs, resolutions, boundary) -> list:
     for res, g in groups.items():
         if not isinstance(g, dict):
             continue
-        mfr = member_merges_from_raw(int(res), boundary)
+        mfr = member_merges_from_raw(int(res), boundary) + (1 if all_time else 0)
         if g.get("regime") != "leaf-column" or int(g.get("merges_from_raw", 0)) != mfr:
             errs.append(
                 f"{dec}[{res}]: group provenance ({g.get('regime')!r}, "
-                f"{g.get('merges_from_raw')}) != ('leaf-column', {mfr}) — a column group "
-                f"folds from the leaf's resident cells, or flat from the boundary member "
-                f"{boundary} below it (§4.6)"
+                f"{g.get('merges_from_raw')}) != ('leaf-column', {mfr}) — "
+                + (
+                    "the all-time column folds the window members, one more merge from raw "
+                    "than they record (§4.6, issue #649)"
+                    if all_time
+                    else f"a column group folds from the leaf's resident cells, or flat from "
+                    f"the boundary member {boundary} below it (§4.6)"
+                )
             )
         expected_cells = 4 ** (int(res) - int(s))
         if int(g.get("n_cells", -1)) != expected_cells:
             errs.append(f"{dec}[{res}]: n_cells {g.get('n_cells')} != 4^({res}-{s})")
+    if all_time:
+        if block.get("window") != SCHEDULE_NONE_TOKEN:
+            errs.append(
+                f"{dec}: all.pyramid.zarr records window {block.get('window')!r}, not the "
+                f"reserved token {SCHEDULE_NONE_TOKEN!r} — not the all-time column (§4.6)"
+            )
+        sw = block.get("source_windows")
+        if not isinstance(sw, dict) or any(
+            _as_int(sw.get(c)) is None for c in ("folded", "missing", "unreadable")
+        ):
+            errs.append(
+                f"{dec}: all.pyramid.zarr source_windows {sw!r} lacks the integer "
+                f"folded/missing/unreadable counters (§4.6)"
+            )
     if resolutions and int(block.get("cells_with_data_order", -1)) != int(resolutions[0]):
         errs.append(
             f"{dec}: cells_with_data_order {block.get('cells_with_data_order')} != finest "
