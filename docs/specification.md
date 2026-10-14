@@ -1825,9 +1825,11 @@ guessed at.
   a node. Its `zagg_column` attrs are a column's, with three differences
   (the carve-out):
   - `window` is the reserved token (`"all"`), and the stamp is
-    `morton-hive/2` naming `window: "all"`, `time_range` the folded
-    windows' union and `granule_count` their sum (the §4.4 close's own
-    derivation);
+    `morton-hive/2` naming `window: "all"`, `time_range` the union and
+    `granule_count` the sum over every window folded at **any** group —
+    including one that `source_windows` counts `unreadable` because some
+    group refused it, so the stamp is the record the bytes carry, not
+    `source_windows.folded`'s (the §4.4 close's own derivation);
   - every group keeps `regime: "leaf-column"` and records `merges_from_raw`
     **one more than the deepest window member folded at that group** — 2
     at or above the raw-fold boundary, 3 below it (on the 19/13/9 reference
@@ -1849,9 +1851,12 @@ guessed at.
 
   Write discipline and lifecycle: the member is rewritten wholesale (the
   D4 order below) whenever the shard's bulk unit lands a window, from every
-  window the shard holds; an invoke that wrote no window rewrites it only
-  when it is absent, folds a different window set, or is stamped before a
-  column it folds. A writer that cannot fold the whole record — a window
+  window the shard holds; an invoke that wrote no window rewrites it when
+  it is absent, when its standing `source_windows` counters differ from
+  the ones a re-fold of the shard's windows now would record, or when it
+  is stamped before a column it folds — and, since only a fold can see a
+  group's refusal, on every such invoke while a group refuses a window
+  (the re-fold counts that window `unreadable`, the gate a reader). A writer that cannot fold the whole record — a window
   unit of a per-window (`unit: window`) dispatch, whose siblings run
   concurrently and share no writer; a shard whose window failed — **clears**
   the member rather than leaving one that folds a superseded column
