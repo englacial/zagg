@@ -110,8 +110,9 @@ _MAX_OR_NONE_KEYS = ("max_memory_mb", "container_hwm_mb")
 #: ``read`` phase is the invoke's too (the shard is read once).
 INVOKE_LEVEL_KEYS = ("duration_s", "duration_total_s", "gb_seconds", "est_cost_usd", "n_obs_read")
 #: The invoke-level phases, repeated on each leaf record the same way: the
-#: shard's one ``read``, and its one all-time column close (issue #649).
-INVOKE_PHASES = ("read", "all_time_column")
+#: shard's one ``read``, its one all-time column close (issue #649) and that
+#: member's Icechunk refs (the leaf's own ``icechunk`` phase is per leaf).
+INVOKE_PHASES = ("read", "all_time_column", "icechunk_all_time")
 _EQ_OR_NONE_KEYS = (
     "window",
     # Bulk multi-window unit width (issue #586): every leaf of one shard

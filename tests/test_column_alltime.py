@@ -1342,6 +1342,48 @@ class TestIcechunkAllRow:
         assert not (_node(root) / "all.pyramid.icechunk_refs.json").exists()
         assert icechunk_ladder.read_member_refs(root, emit._shard_word(), store_kwargs={}) is None
 
+    def test_the_refs_are_timed_apart_from_the_close_once_per_invoke(self, monkeypatch, tmp_path):
+        # PR #666 review finding (3): ``all_time_column`` is the close alone;
+        # the member's refs are their own invoke-level phase on every record.
+        import zagg.column_alltime as column_alltime
+        from zagg.telemetry import INVOKE_PHASES, build_record, merge
+
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": "ladder"}
+        root = str(tmp_path / "bulk")
+        self._init(cfg, root)
+        real, real_time = column_alltime.record_member_refs, column_alltime.time.time
+        skew = [0.0]
+
+        def slow(*args, **kwargs):
+            skew[0] += 500.0  # the refs "take" 500 s on the module's clock
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(column_alltime, "record_member_refs", slow)
+        monkeypatch.setattr(column_alltime.time, "time", lambda: real_time() + skew[0])
+        meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        monkeypatch.undo()
+        assert meta["error"] is None and "sidecar" in meta["icechunk_all_time"]
+        phases = meta["phase_timings"]
+        assert 0 <= phases["all_time_column"] < 400 and phases["icechunk_all_time"] >= 500
+        assert "icechunk_all_time" in INVOKE_PHASES
+        records = [
+            build_record(shard_key=meta["shard_key"], metadata=m, run_id="r", window=m["window"])
+            for m in meta["windows"]
+        ]
+        refs_s = phases["icechunk_all_time"]
+        assert [r["phase_timings"]["icechunk_all_time"] for r in records] == [refs_s] * 3
+        assert merge(records)["phase_timings"]["icechunk_all_time"] == pytest.approx(refs_s)
+
+    def test_no_refs_phase_is_recorded_with_icechunk_off(self, monkeypatch, tmp_path):
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = False
+        meta = emit._run_bulk(monkeypatch, cfg, str(tmp_path / "bulk"), fakes=emit._dense_fakes())
+        assert meta["all_time_column"] == "all.pyramid.zarr" and "icechunk_all_time" not in meta
+        for m in (meta, *meta["windows"]):
+            assert "all_time_column" in m["phase_timings"]
+            assert "icechunk_all_time" not in m["phase_timings"]
+
     @pytest.mark.parametrize("outcome", ["error", "skipped"])
     def test_a_rewritten_member_never_keeps_the_previous_carrier(
         self, monkeypatch, tmp_path, outcome

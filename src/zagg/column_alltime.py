@@ -533,11 +533,20 @@ def _close_all_time(
     once per invoke (``INVOKE_PHASES``). The error carries its
     ``store_error_class`` (issue #651), so the dispatcher's fail-fast
     classification sees the close's failure as it sees a column's.
+
+    The member's Icechunk refs (:func:`record_member_refs`) are timed apart,
+    as ``phase_timings["icechunk_all_time"]`` on the same metas and under the
+    same once-per-invoke rule — the leaf's ``icechunk`` phase one tier up —
+    so ``all_time_column`` stays the close alone, the number the ruling on
+    issue #649 asked to have measured. Their OUTCOME is ``sink["icechunk_all_time"]``
+    on the shard meta and, on a failure, one WARNING: the run record is built
+    per window meta and has no key for it (a record-schema addition, not made
+    here), so a failed member-refs write is log-only by decision.
     """
     from zagg.dispatch import classify_store_error
 
     _t0 = time.time()
-    column = None
+    column = closed = refs_s = None
     try:
         column = close_shard(
             store_root,
@@ -549,6 +558,7 @@ def _close_all_time(
             fresh=fresh,
             store_kwargs=store_kwargs,
         )
+        closed = time.time() - _t0
         if column is not None:
             # The repo's ``all`` row at the column levels (issue #649, spec
             # §11.2): after the member is committed, so the refs point at
@@ -559,15 +569,18 @@ def _close_all_time(
                 sink["icechunk_all_time"] = record_member_refs(
                     store_root, grid, config, shard_key, store_kwargs=store_kwargs
                 )
+                refs_s = time.time() - _t0 - closed
     except Exception as e:
         logger.error(f"all-time column write failed for shard {shard_key}: {e}")
         sink["error"] = f"all-time column: {e}"
         sink["all_time_column_error"] = str(e)
         sink["store_error_class"] = classify_store_error(e)
     finally:
-        elapsed = time.time() - _t0
+        elapsed = time.time() - _t0 if closed is None else closed
         for m in timed:
             if "phase_timings" in m:
                 m["phase_timings"]["all_time_column"] = elapsed
+                if refs_s is not None:
+                    m["phase_timings"]["icechunk_all_time"] = refs_s
     if column is not None:
         sink["all_time_column"] = column
