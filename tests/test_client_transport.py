@@ -582,6 +582,7 @@ class TestStatusPoller:
         assert poller._next_retry_wait() == 0.0
         poller._tick()
         assert calls["n"] == 2
+        assert entry.retry_not_before == 0.0  # the re-fire consumed the backoff
         _put_status(store, 1)
         poller._tick()
         assert fut.done()  # the tick resolved it: no wall clock left to wait on
