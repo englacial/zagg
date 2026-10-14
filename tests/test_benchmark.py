@@ -2491,7 +2491,23 @@ def test_hive_config_expected_counts_root_moc_optional():
         "total_min": 13,
         "total_max": 15,
         "exact": True,
+        # The §11 companion repo is a PRESENCE floor, not a term (issue #668):
+        # this call models the repo-less shape, and the windows above are the
+        # same either way.
+        "icechunk_declared": False,
     }
+    # ... while the arm the Lambda Benchmark actually runs DECLARES the repo,
+    # which is what went red from 2026-10-07 once its init stopped failing
+    # open on S3 (issue #606 phase 1): ``measure_objects`` arms the floor off
+    # this same knob, and the repo's 16 objects ride ``objects_icechunk``
+    # instead of the ``other`` bucket that tripped the finding.
+    from zagg.config import get_icechunk
+
+    assert get_icechunk(cfg) is True
+    armed = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout="hive", icechunk_declared=get_icechunk(cfg)
+    )
+    assert armed == dict(exp, icechunk_declared=True)
 
 
 def test_matrix_mask_excludes_hive_rows():

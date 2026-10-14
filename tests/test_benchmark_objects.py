@@ -978,3 +978,196 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     assert write_path == expected["total_max"]
     assert measured["objects_other"] == 0
     assert bench_objects.object_count_mismatch(measured, expected) is None
+
+
+# --- the §11 Icechunk companion repo (issue #668) ----------------------------
+
+# One key per object family the repo lands (spec §11.1, and the sample the red
+# run printed): the repo doc, a branch ref, a snapshot, a manifest, a
+# transaction log and an overwritten-ref tombstone.
+_ICECHUNK_KEYS = [
+    "icechunk/repo",
+    "icechunk/refs/branch.main/ref.json",
+    "icechunk/snapshots/5VYJA6ZDZDYZEDK9VYQG",
+    "icechunk/manifests/9QX0P3JMB6ZVK2W7T1AC",
+    "icechunk/transactions/J4H8N2R5D9FQ7C3MB0YT",
+    "icechunk/overwritten/branch.main/ref.json",
+]
+
+
+def test_is_icechunk_object_classification():
+    # The prefix is the store-root child the writer reserves
+    # (``hive.ICECHUNK_DIR_NAME`` / ``icechunk_refs.repo_path``), not a name
+    # match: a bare object NAMED icechunk, a nested icechunk dir and the
+    # ladder's leaf ref SIDECAR (``icechunk_refs.json``, issue #582) are all
+    # outside it and must stay loud.
+    from zagg.hive import ICECHUNK_DIR_NAME
+
+    assert bench_objects._ICECHUNK_PREFIX == f"{ICECHUNK_DIR_NAME}/"
+    for key in _ICECHUNK_KEYS:
+        assert bench_objects._is_icechunk_object(key), key
+    assert not bench_objects._is_icechunk_object("icechunk")
+    assert not bench_objects._is_icechunk_object("0/012/icechunk/repo")
+    assert not bench_objects._is_icechunk_object("0/012/icechunk_refs.json")
+
+
+def test_hive_icechunk_objects_get_their_own_bucket(monkeypatch):
+    # The issue #668 defect: every ``icechunk/`` key fell through to ``other``
+    # and the hive arms went red with "16 unrecognized object key(s)". They
+    # must land in ``objects_icechunk`` and NOWHERE else -- not in ``other``
+    # (the finding that fired), not in the per-shard attribution (which would
+    # trip the exact issue #215 guard instead), and not in the rollup /
+    # overview / telemetry buckets they are netted out beside.
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    write_path = [hive.MANIFEST_NAME, f"{leaf}/count/c/0"]
+    monkeypatch.setattr(
+        bench_objects, "list_store_keys", lambda *a, **k: write_path + _ICECHUNK_KEYS
+    )
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_icechunk"] == len(_ICECHUNK_KEYS)
+    assert measured["objects_other"] == 0
+    assert measured["other_keys"] == []  # the sample list the red run printed
+    assert measured["objects_per_shard"] == {label: 1}
+    assert measured["objects_metadata"] == 1
+    assert measured["objects_rollups"] == 0
+    assert measured["objects_overviews"] == 0
+    assert measured["objects_telemetry"] == 0
+    # Gross total stays gross (storage questions want every object); the
+    # audited write-path figure is the same with the repo as without it.
+    assert measured["objects_total"] == len(write_path) + len(_ICECHUNK_KEYS)
+    assert bench_objects.write_path_total(measured) == len(write_path)
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: write_path)
+    bare = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert bare["objects_icechunk"] == 0
+    assert bench_objects.write_path_total(bare) == bench_objects.write_path_total(measured)
+
+
+def test_flat_icechunk_objects_are_bucketed_not_unrecognized(tmp_path):
+    # A flat store never stands a repo up, but the classifier runs on both
+    # layouts so a stray one is reported in its own bucket (and caught by the
+    # undeclared floor) instead of reading as an unmodeled write-path object.
+    grid = _grid(sharded=True)
+    root = str(tmp_path / "store")
+    store = open_store(root)
+    grid.emit_template(store)
+    word = morton_word(_KEY_A)
+    _write_flat_shard(grid, store, word, sharded=True)
+    (tmp_path / "store" / "icechunk").mkdir()
+    (tmp_path / "store" / "icechunk" / "repo").write_text("{}")
+
+    measured = bench_objects.store_object_counts(root, grid=grid, shard_keys=[word])
+    expected = bench_objects.expected_object_counts(grid, n_shards=1)
+    assert measured["objects_icechunk"] == 1
+    assert measured["objects_other"] == 0 and measured["other_keys"] == []
+    # Netted out, so the write-path total still matches the flat model exactly.
+    assert bench_objects.write_path_total(measured) == expected["total_max"]
+    # ... and the only finding is the undeclared repo itself.
+    assert expected["icechunk_declared"] is False
+    assert (
+        bench_objects.object_count_mismatch(measured, expected)
+        == "icechunk objects 1 != expected 0 (no repo declared)"
+    )
+
+
+def test_icechunk_floor_fires_both_ways():
+    # The one assertion kept on a commit-scaled bucket (issue #668 item (2)):
+    # a declared repo must have landed at least its ``icechunk/repo`` -- the
+    # issue #606 class, a silent fail-open init, was invisible for a week --
+    # and a store whose config declares none must have landed nothing.
+    clean = {
+        "objects_total": 4,
+        "objects_metadata": 1,
+        "objects_per_shard": {_KEY_A: 1},
+        "objects_icechunk": 2,
+        "objects_other": 0,
+        "other_keys": [],
+    }
+    declared = {
+        "metadata": 3,
+        "metadata_min": 1,
+        "per_shard_min": 1,
+        "per_shard_max": 1,
+        "total_min": 2,
+        "total_max": 4,
+        "exact": True,
+        "icechunk_declared": True,
+    }
+    assert bench_objects.object_count_mismatch(clean, declared) is None
+    missing = dict(clean, objects_total=2, objects_icechunk=0)
+    assert bench_objects.object_count_mismatch(missing, declared) == (
+        "icechunk objects 0 != expected >=1 (declared repo; init failed open?)"
+    )
+    undeclared = dict(declared, icechunk_declared=False)
+    assert bench_objects.object_count_mismatch(missing, undeclared) is None
+    assert bench_objects.object_count_mismatch(clean, undeclared) == (
+        "icechunk objects 2 != expected 0 (no repo declared)"
+    )
+    # A measured/expected pair from before the bucket existed is unaffected:
+    # both sides are read with ``.get``, as the netted buckets are.
+    legacy_measured = {k: v for k, v in clean.items() if k != "objects_icechunk"}
+    legacy_expected = {k: v for k, v in declared.items() if k != "icechunk_declared"}
+    assert bench_objects.object_count_mismatch(legacy_measured, legacy_expected) is None
+
+
+def test_icechunk_declaration_does_not_move_the_model_windows():
+    # Issue #668's third acceptance bullet: the repo is a floor, never a term.
+    # Declaring it must leave metadata/total/per-shard identical -- otherwise
+    # the #215/#240 tripwire's windows would drift with a knob.
+    cfg = _cfg()
+    cfg.output["store_layout"] = "hive"
+    grid = from_config(cfg)
+    off = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
+    on = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout="hive", icechunk_declared=True
+    )
+    assert on["icechunk_declared"] is True and off["icechunk_declared"] is False
+    assert {k: v for k, v in on.items() if k != "icechunk_declared"} == {
+        k: v for k, v in off.items() if k != "icechunk_declared"
+    }
+
+
+def test_measure_objects_arms_the_floor_from_the_run_config(monkeypatch):
+    # The harness entry point reads the declaration off the RUN'S CONFIG (the
+    # same one ``icechunk_init`` read), never off the store being measured --
+    # which is what makes "declared but absent" a finding instead of the two
+    # cases being indistinguishable.
+    from zagg import hive
+    from zagg.config import default_config, get_icechunk
+
+    cfg = default_config("atl06")
+    cfg.output["store_layout"] = "hive"
+    grid = from_config(cfg)
+    assert get_icechunk(cfg) is True  # the default under audit (spec §11.6)
+    word = int(morton_word(_KEY_A))
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    keys = [hive.MANIFEST_NAME, f"{leaf}/count/c/0"]
+    monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: {"pyramid": None})
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+
+    def payload():
+        return bench_objects.measure_objects(
+            "unused", grid=grid, shard_keys=[word], n_shards=1, store_layout="hive"
+        )
+
+    failed_init = payload()
+    assert failed_init["objects_icechunk"] == 0
+    assert "icechunk objects 0 != expected >=1" in failed_init["objects_mismatch"]
+    # With the repo on the bucket is reported and the floor is silent (the
+    # other findings this synthetic key list trips are not this test's
+    # business -- only the icechunk clause is).
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys + _ICECHUNK_KEYS)
+    landed = payload()
+    assert landed["objects_icechunk"] == len(_ICECHUNK_KEYS)
+    assert "icechunk objects" not in (landed["objects_mismatch"] or "")
+    # The repo is netted out of the reported write-path figure, so it reads the
+    # same as the run without one (issue #362's posture, now four buckets).
+    assert landed["objects_write_path"] == failed_init["objects_write_path"]
