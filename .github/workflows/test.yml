@@ -30,4 +30,10 @@ jobs:
       run: uv sync --extra test
 
     - name: Run tests with pytest
-      run: uv run pytest --cov=zagg --cov-report=xml --cov-report=term
+      # Whole test modules run in parallel, one module per worker at a time (issue #669):
+      # tests inside a module keep their order and module-scoped fixtures.
+      run: uv run pytest -n auto --dist loadfile --cov=zagg --cov-report=xml --cov-report=term
+      env:
+        # Coverage's sys.monitoring tracer (Python 3.12+, PEP 669): far less per-line overhead than
+        # the settrace tracer, which got slower in 3.12. zagg requires >=3.12, so every job can use it.
+        COVERAGE_CORE: sysmon
