@@ -447,7 +447,7 @@ def dispatch_event_shards(
         lambda: open_status_store(prefix, store_kwargs),
         drop_timeout_s=drop_timeout_s(timeout_s),
         max_retries=run.max_retries,
-        guard=run._dispatch_guard(workers, timeout_s),
+        guard=run._dispatch_guard(workers),
         on_failed=on_failed,
     )
     skip_hash = runner._fleet_skip_hash(run.config, run.overwrite)
@@ -705,7 +705,6 @@ class _ShardEntry:
     drop_refires: int = 0  # class-(b) re-fires spent (see StatusPoller)
     retry_not_before: float = 0.0  # class-(c) backoff: don't re-fire before this
     dispatched_at: float | None = None  # this attempt's dispatch clock
-    dispatch_width: int | None = None  # the guard's width when this attempt fired (#652)
     first_dispatched_at: float | None = None
     consumed: set = field(default_factory=set)  # attempt_ids already acted on
 
@@ -738,7 +737,7 @@ class StatusPoller:
 
     The poller also owns Event dispatch: shards register a zero-arg ``dispatch`` closure, paced
     by a fixed ``max_in_flight`` window (the preflight clamp, load-bearing under the fleet's 60 s
-    ``MaximumEventAgeInSeconds``) or by ``guard``, the #652 ramp + breaker that refuses the queue
+    ``MaximumEventAgeInSeconds``) or by ``guard``, the #652 circuit breaker that refuses the queue
     once tripped. ``guard`` REPLACES ``max_in_flight`` (both raises); its clamp is ``workers=``.
 
     **Retry policy — three fault classes** (issue #327 amendment (b) as folded
@@ -1005,7 +1004,6 @@ class StatusPoller:
             self._resolve_failure(entry, self._result(entry, **self._guard.refusal()))
             return
         entry.attempts += 1
-        entry.dispatch_width = self._guard.width
         entry.retry_not_before = 0.0  # this attempt cleared any armed backoff
         entry.dispatched_at = self._clock()
         if entry.first_dispatched_at is None:
@@ -1084,7 +1082,7 @@ class StatusPoller:
             body=obj.get("body") or {},
             error=obj.get("error"),
         )
-        self._guard.record(dict(result, dispatch_width=entry.dispatch_width, unit=entry.key))
+        self._guard.record(dict(result, unit=entry.key))
         if obj.get("status") in ("ok", "no_data"):
             entry.future.set_result(result)
         else:
@@ -1195,5 +1193,5 @@ class StatusPoller:
             ),
             outcome="failed-unknown",
         )
-        self._guard.record(dict(result, dispatch_width=entry.dispatch_width, unit=entry.key))
+        self._guard.record(dict(result, unit=entry.key))
         self._drop_failed(entry, result)

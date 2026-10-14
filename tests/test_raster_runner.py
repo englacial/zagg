@@ -378,13 +378,13 @@ def test_a_bad_dispatch_block_is_refused_for_a_raster_config(manifest):
     # Validated in agg before the strategy (issue #652): a raster run accepts
     # and ignores a good block, but a bad one is refused at submission.
     cfg, sm_path, _shard, _data = manifest
-    with pytest.raises(ValueError, match="dispatch.ramp: unknown key"):
+    with pytest.raises(ValueError, match="dispatch.breaker: unknown key"):
         agg(
             cfg,
             catalog=sm_path,
             store="s3://b/x.zarr",
             backend="lambda",
-            dispatch={"ramp": {"x": 1}},
+            dispatch={"breaker": {"x": 1}},
         )
 
 
@@ -427,14 +427,14 @@ class TestRasterLambdaBackend:
             max_workers=2,
             invocation="sync",
             # A good dispatch block is accepted and ignored (issue #652).
-            dispatch={"ramp": {"start": 250}},
+            dispatch={"breaker": {"window": 20}},
         )
         assert summary["backend"] == "lambda"
         # No status poller: the guard keys say so (issue #652, PR #665 review).
-        assert summary["ramp"] == [] and summary["breaker"] is None
+        assert "ramp" not in summary and summary["breaker"] is None
         assert summary["dispatch_pacing"] == (
-            "pool width: the raster fan-out has no status poller, so the ramp and "
-            "circuit breaker do not apply (issue #652)"
+            "pool width: the raster fan-out has no status poller, so the circuit "
+            "breaker does not apply (issue #652)"
         )
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
         assert summary["cells_error"] == 0

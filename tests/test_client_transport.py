@@ -226,13 +226,10 @@ class DropNthStub(EventStubLambdaClient):
         return super().invoke(**kwargs)
 
 
-#: One serial canary, then a trip on the first timeout: ``window: 1`` makes the
-#: breaker judge each result alone, so "one landed, the next timed out" trips
-#: ``timeout-ratio`` with a leaf on the store — the tail-skip case.
-_TRIP_KNOBS = {
-    "ramp": {"start": 1, "cap": 1, "window": 1},
-    "breaker": {"timeout_ratio": 0.5},
-}
+#: A trip on the first timeout: ``window: 1`` makes the breaker judge each
+#: result alone, so on a width-1 (serial) run "one landed, the next timed out"
+#: trips ``timeout-ratio`` with a leaf on the store — the tail-skip case.
+_TRIP_KNOBS = {"breaker": {"window": 1, "timeout_ratio": 0.5}}
 
 
 def _run(catalog, *, client, config=None, **kwargs):
@@ -399,7 +396,7 @@ class TestEventDispatch:
         stub = DropNthStub(status_store, drop_nth=2, record=True)
         with caplog.at_level("INFO", logger="zagg.client"):
             handle = _run(catalog, client=stub, max_retries=1).dispatch(
-                transport="event", dispatch=_TRIP_KNOBS
+                transport="event", dispatch=_TRIP_KNOBS, max_workers=1
             )
             handle.wait()
         # The trip is printed on the facade too, as on the CLI (review, PR #665).
@@ -407,10 +404,10 @@ class TestEventDispatch:
             "circuit breaker tripped (timeout-ratio) at result 2, width 1: "
             "1 units not dispatched, tail legs skipped"
         ) in caplog.text
-        assert "Dispatch ramp (width@result): 1@0" in caplog.text
+        assert "Dispatch ramp" not in caplog.text
         assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio" in caplog.text
         assert handle.breaker["rule"] == "timeout-ratio" and handle.breaker["tripped"]
-        assert handle.ramp == [{"width": 1, "at_result": 0}]
+        assert not hasattr(handle, "ramp")
         assert handle.status() == {"pending": 0, "ok": 1, "failed": 2}
         results = handle.results(return_exceptions=True)
         errors = sorted(
@@ -424,7 +421,7 @@ class TestEventDispatch:
         assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
         assert handle.families_sweep is None and handle.stage_sweep is None
         assert any("circuit breaker tripped (timeout-ratio)" in r for r in handle.tail_sweep_short)
-        assert handle.dispatch_pacing.startswith("guard: ramp + circuit breaker")
+        assert handle.dispatch_pacing.startswith("guard: circuit breaker")
 
     def test_each_dispatch_tail_reads_its_own_guard(self, catalog, monkeypatch):
         # Two dispatches on one Run: A trips, B (clean) is dispatched before
@@ -443,7 +440,7 @@ class TestEventDispatch:
         tail = Run._run_tail
         monkeypatch.setattr(Run, "_run_tail", lambda *a, **k: gate.wait(10) and tail(*a, **k))
         run = _run(catalog, client=stub_a, max_retries=1)
-        a = run.dispatch(transport="event", dispatch=_TRIP_KNOBS)
+        a = run.dispatch(transport="event", dispatch=_TRIP_KNOBS, max_workers=1)
         run._lambda_client = stub_b = EventStubLambdaClient(fresh[1], record=True)
         b = run.dispatch(transport="event")
         gate.set()
@@ -455,18 +452,18 @@ class TestEventDispatch:
         assert "icechunk_finalize" not in stub_a.modes()
         assert "icechunk_finalize" in stub_b.modes()
 
-    def test_handle_carries_the_ramp_without_a_trip(self, catalog, status_store):
+    def test_handle_carries_no_verdict_without_a_trip(self, catalog, status_store):
         handle = _run(catalog, client=EventStubLambdaClient(status_store)).dispatch(
             transport="event", max_workers=2
         )
         handle.results()
-        assert handle.ramp == [{"width": 2, "at_result": 0}] and handle.breaker is None
+        assert handle.breaker is None and handle._guard.width == 2  # the full width
         assert handle.tail_sweep_short == []  # no trip: the verdict is the pre-#652 one
         # The sync transport has no poller, so no guard: the handle says why.
         sync = _run(catalog, client=__import__("test_client").StubLambdaClient()).dispatch()
         sync.results()
-        assert (sync.ramp, sync.breaker) == ([], None)
-        assert "act only on transport='event'" in sync.dispatch_pacing
+        assert sync.breaker is None
+        assert "acts only on transport='event'" in sync.dispatch_pacing
 
     def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):
         # An oversized row set on an EVENT run keeps its run record: the tail
@@ -897,7 +894,7 @@ class TestAggEventMode:
     stay on sync — their metrics come from invoke responses."""
 
     @staticmethod
-    def _agg(catalog_file, monkeypatch, stub, invocation, config=None, **agg_kwargs):
+    def _agg(catalog_file, monkeypatch, stub, invocation, config=None, workers=3, **agg_kwargs):
         from unittest.mock import MagicMock
 
         import boto3
@@ -915,7 +912,7 @@ class TestAggEventMode:
             runner,
             "compute_available_workers",
             lambda requested, *a, **k: (
-                3,
+                workers,
                 ConcurrencyReport(
                     account_limit=1000,
                     current_concurrent=0,
@@ -934,7 +931,7 @@ class TestAggEventMode:
             backend="lambda",
             invocation=invocation,
             function_name="process-shard-test",
-            max_workers=3,
+            max_workers=workers,
             **agg_kwargs,
         )
 
@@ -1018,18 +1015,15 @@ class TestAggEventMode:
         (bad,) = [r for r in summary["results"] if r.get("error")]
         assert bad["outcome"] == "failed-unknown"
 
-    def test_agg_event_summary_carries_the_ramp_and_breaker(
-        self, catalog_file, monkeypatch, status_store
-    ):
-        # Defaults, three shards, a preflight clamp of 3 workers: the ramp's
-        # first step is clamped to the run's workers and nothing trips.
+    def test_agg_event_summary_carries_the_breaker(self, catalog_file, monkeypatch, status_store):
+        # Defaults, three shards, a preflight clamp of 3 workers: the guard
+        # paces at the full width and nothing trips; no ramp key (2026-10-14).
         summary = self._agg(catalog_file, monkeypatch, EventStubLambdaClient(status_store), "event")
-        assert summary["ramp"] == [{"width": 3, "at_result": 0}]
-        assert summary["breaker"] is None
+        assert summary["breaker"] is None and "ramp" not in summary
         sync = self._agg(
             catalog_file, monkeypatch, __import__("test_client").StubLambdaClient(), "sync"
         )
-        assert sync["ramp"] == [] and sync["breaker"] is None  # no poller, no guard
+        assert sync["breaker"] is None and "ramp" not in sync  # no poller, no guard
 
     def test_a_tripped_breaker_refuses_the_rest_and_skips_the_tail(
         self, catalog_file, monkeypatch, status_store
@@ -1055,6 +1049,7 @@ class TestAggEventMode:
             "event",
             max_retries=1,
             dispatch=_TRIP_KNOBS,
+            workers=1,
         )
         assert control["breaker"] is None and control["cells_with_data"] == 3
         assert "_invoke_lambda_icechunk_finalize" in tail_calls
@@ -1069,7 +1064,7 @@ class TestAggEventMode:
         monkeypatch.setattr(ct, "open_status_store", lambda prefix, kwargs: fresh)
         stub = DropNthStub(fresh, drop_nth=2, record=True)
         summary = self._agg(
-            catalog_file, monkeypatch, stub, "event", max_retries=1, dispatch=_TRIP_KNOBS
+            catalog_file, monkeypatch, stub, "event", max_retries=1, dispatch=_TRIP_KNOBS, workers=1
         )
         assert summary["breaker"] == {
             "tripped": True,
@@ -1077,7 +1072,6 @@ class TestAggEventMode:
             "at_result": 2,
             "width": 1,
         }
-        assert summary["ramp"] == [{"width": 1, "at_result": 0}]
         assert summary["cells_with_data"] == 1 and summary["cells_error"] == 2
         outcomes = sorted(r.get("outcome") for r in summary["results"] if r.get("error"))
         assert outcomes == ["failed-unknown", "not-dispatched"]
@@ -1092,7 +1086,7 @@ class TestAggEventMode:
         assert any(
             "circuit breaker tripped (timeout-ratio)" in r for r in summary["tail_sweep_short"]
         )
-        assert summary["dispatch_pacing"].startswith("guard: ramp + circuit breaker")
+        assert summary["dispatch_pacing"].startswith("guard: circuit breaker")
         modes = [m for m in stub.modes() if m]
         assert "stats" in modes and "coverage" in modes
 
@@ -1100,8 +1094,10 @@ class TestAggEventMode:
         self, catalog_file, monkeypatch, status_store
     ):
         stub = EventStubLambdaClient(status_store)
-        with pytest.raises(ValueError, match="ramp.cap 1 is below ramp.start"):
-            self._agg(catalog_file, monkeypatch, stub, "event", dispatch={"ramp": {"cap": 1}})
+        with pytest.raises(ValueError, match="can never trip"):
+            self._agg(
+                catalog_file, monkeypatch, stub, "event", dispatch={"breaker": {"store_fatal": 30}}
+            )
         assert stub.events == []
 
     def test_windowed_units_resolve_on_both_windows(self, catalog_file, monkeypatch, status_store):
@@ -1698,84 +1694,48 @@ class TestKeys:
         assert ct.drop_timeout_s(900) == 900 + 60 + 90
 
 
-# -- dispatch ramp + circuit breaker through the poller (issue #652) -----------------
+# -- circuit breaker through the poller (issue #652) -----------------------------------
 
 
-def _guard(**knobs):
+def _guard(workers=None, **knobs):
     from zagg.dispatch_guard import DispatchGuard, GuardConfig
 
-    return DispatchGuard(GuardConfig.from_dict(knobs), function_timeout_s=900.0)
+    cfg = GuardConfig.from_dict({"breaker": knobs}) if knobs else None
+    return DispatchGuard(cfg, workers=workers)
 
 
-def _ok_body(write=10.0):
-    return {
-        "total_obs": 7,
-        "duration_total_s": 600.0,
-        "phase_timings": {"read": 50.0, "write": write, "column": write},
-    }
+def _ok_body():
+    return {"total_obs": 7, "duration_total_s": 600.0}
 
 
 class TestDispatchGuardSeam:
-    """``StatusPoller`` paces by its ``guard`` (issue #652): the ramp widens the
-    window as flat-timed results land, a trip refuses every queued shard
-    (``not-dispatched``, through the caller's failure policy) and re-fires
-    nothing, and in-flight invokes still resolve from their status objects.
-    Tick-driven with a fake clock, no threads."""
+    """``StatusPoller`` paces by its ``guard`` (issue #652): the full worker
+    width, a trip refuses every queued shard (``not-dispatched``, through the
+    caller's failure policy) and re-fires nothing, and in-flight invokes still
+    resolve from their status objects. Tick-driven with a fake clock, no threads."""
 
     @staticmethod
     def _register(poller, keys, fired):
         return {k: poller.register(k, str(k), dispatch=lambda k=k: fired.append(k)) for k in keys}
 
-    def test_the_ramp_widens_the_window_as_flat_results_land(self):
+    def test_the_guard_paces_at_the_full_worker_width(self):
+        # No ramp (2026-10-14 ruling): the first wave is the run's whole width,
+        # and a freed slot refills in the same tick, never wider.
         store = MemoryStore()
-        guard = _guard(ramp={"start": 1, "cap": 4, "window": 2})
+        guard = _guard(workers=2)
         fired: list[int] = []
         poller = ct.StatusPoller(lambda: store, guard=guard, drop_timeout_s=1050.0)
-        self._register(poller, range(1, 11), fired)
+        self._register(poller, range(1, 6), fired)
         poller._tick()
-        assert fired == [1]  # the canary: the ramp's first wave
-        _put_status(store, 1, body=_ok_body())
-        poller._tick()  # one result is short of the window; the freed slot refills
-        assert fired == [1, 2] and guard.width == 1
-        _put_status(store, 2, body=_ok_body())
-        poller._tick()  # two flat results: 1 -> 2, and the wider window fires 3, 4
-        assert fired == [1, 2, 3, 4] and guard.width == 2
-        for k in (3, 4):
+        assert fired == [1, 2]
+        for k in (1, 2):
             _put_status(store, k, body=_ok_body())
-        poller._tick()  # two results AT width 2: 2 -> 4
-        assert fired == list(range(1, 9)) and guard.width == 4
-        assert guard.ramp == [
-            {"width": 1, "at_result": 0},
-            {"width": 2, "at_result": 2},
-            {"width": 4, "at_result": 4},
-        ]
-        # Every attempt is stamped with the width it fired at.
-        widths = {e.shard_key: e.dispatch_width for e in poller._entries.values()}
-        assert widths == {1: 1, 2: 1, 3: 2, 4: 2, 5: 4, 6: 4, 7: 4, 8: 4, 9: None, 10: None}
-
-    def test_results_fired_at_the_old_width_do_not_advance_the_step(self):
-        store = MemoryStore()
-        guard = _guard(ramp={"start": 2, "cap": 8, "window": 2})
-        fired: list[int] = []
-        poller = ct.StatusPoller(lambda: store, guard=guard, drop_timeout_s=1050.0)
-        self._register(poller, range(1, 11), fired)
         poller._tick()
-        _put_status(store, 1, body=_ok_body())
-        poller._tick()  # shard 3 fires at width 2
-        _put_status(store, 2, body=_ok_body())
-        poller._tick()  # the window is flat: 2 -> 4; 4, 5, 6 fire at width 4
-        assert fired == [1, 2, 3, 4, 5, 6] and guard.width == 4
-        _put_status(store, 3, body=_ok_body())
-        poller._tick()  # a width-2 result: no evidence for the next step
-        assert guard.width == 4
-        for k in (4, 5):
-            _put_status(store, k, body=_ok_body())
-        poller._tick()  # two width-4 results: 4 -> 8
-        assert guard.width == 8
+        assert fired == [1, 2, 3, 4] and guard.width == 2 and guard.tripped is None
 
     def test_a_timeout_storm_trips_the_breaker_and_refuses_the_queue(self):
         store = MemoryStore()
-        guard = _guard(ramp={"start": 2, "cap": 2, "window": 2}, breaker={"timeout_ratio": 0.5})
+        guard = _guard(workers=2, window=2, timeout_ratio=0.5)
         now = {"t": 1000.0}
         fired: list[int] = []
         failed: list[tuple] = []
@@ -1818,7 +1778,7 @@ class TestDispatchGuardSeam:
 
     def test_in_flight_invokes_finish_after_a_trip(self):
         store = MemoryStore()
-        guard = _guard(ramp={"start": 2, "cap": 2, "window": 2}, breaker={"timeout_ratio": 0.4})
+        guard = _guard(workers=2, window=2, timeout_ratio=0.4)
         now = {"t": 1000.0}
         fired: list[int] = []
         poller = ct.StatusPoller(
@@ -1842,7 +1802,7 @@ class TestDispatchGuardSeam:
         assert futures[3].result()["status_code"] == 200  # ... and its result still lands
 
     def test_windows_of_one_shard_each_count_toward_the_timeout_ratio(self):
-        guard = _guard(ramp={"start": 4, "cap": 4, "window": 4}, breaker={"timeout_ratio": 0.5})
+        guard = _guard(workers=4, window=4, timeout_ratio=0.5)
         now = {"t": 1000.0}
         fired: list[str] = []
         poller = ct.StatusPoller(
@@ -1858,12 +1818,12 @@ class TestDispatchGuardSeam:
 
     def test_store_fatal_statuses_trip_and_a_late_registration_is_refused(self):
         store = MemoryStore()
-        guard = _guard(breaker={"store_fatal": 2, "store_fatal_first": 5})
+        guard = _guard(store_fatal=2, store_fatal_first=5)
         fired: list[int] = []
         poller = ct.StatusPoller(lambda: store, guard=guard, drop_timeout_s=1050.0)
         futures = self._register(poller, range(1, 5), fired)
         poller._tick()
-        assert fired == [1, 2, 3, 4]  # all inside the 500-wide first wave
+        assert fired == [1, 2, 3, 4]  # all inside the unbounded first wave
         for k in (1, 2):
             _put_status(
                 store,
@@ -1888,7 +1848,7 @@ class TestDispatchGuardSeam:
             )
 
     def test_a_fixed_window_records_nothing(self):
-        # No guard: the pre-#652 pacing (max_in_flight), never ramping or tripping.
+        # No guard: the pre-#652 pacing (max_in_flight), never tripping.
         store = MemoryStore()
         fired: list[int] = []
         poller = ct.StatusPoller(lambda: store, drop_timeout_s=1050.0, max_in_flight=1)
@@ -1899,12 +1859,11 @@ class TestDispatchGuardSeam:
         poller._tick()  # the freed slot refills in the same tick
         assert fired == [1, 2] and isinstance(poller._guard, ct.FixedWindow)
         assert poller._guard.tripped is None and poller._guard.breaker is None
-        assert poller._guard.ramp == []
 
     @staticmethod
     def _tripping_poller(now, **kwargs):
         # One-result window: the first drop trips timeout-ratio.
-        guard = _guard(ramp={"start": 4, "cap": 4, "window": 1}, breaker={"timeout_ratio": 0.5})
+        guard = _guard(workers=4, window=1, timeout_ratio=0.5)
         store = kwargs.pop("store", None) or MemoryStore()
         poller = ct.StatusPoller(
             lambda: store,

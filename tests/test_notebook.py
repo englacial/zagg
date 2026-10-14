@@ -685,21 +685,19 @@ class TestRunView:
         assert "no metered cost" in html_out
         assert "$" not in html_out
 
-    def test_repr_html_shows_the_ramp_and_a_breaker_trip(self):
+    def test_repr_html_shows_a_breaker_trip(self):
         summary = dict(
             _lambda_summary(),
-            ramp=[{"width": 500, "at_result": 0}, {"width": 1000, "at_result": 50}],
             breaker={"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000},
         )
         html_out = notebook.RunView(summary)._repr_html_()
-        assert "Dispatch ramp (width@result): 500@0 -&gt; 1000@50" in html_out
         unpaced = dict(_lambda_summary(), dispatch_pacing="pool width (invocation='async'): why")
         assert "Dispatch pacing: pool width (invocation=&#x27;async&#x27;)" in (
             notebook.RunView(unpaced)._repr_html_()
         )
         assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio" in html_out
-        # Neither key (a sync run, an older summary): nothing is rendered.
-        assert "ramp" not in notebook.RunView(_lambda_summary())._repr_html_()
+        # Neither key (an older summary): nothing is rendered.
+        assert "Circuit breaker" not in notebook.RunView(_lambda_summary())._repr_html_()
 
     def test_dict_access_delegates(self):
         view = notebook.RunView(_lambda_summary())
@@ -736,13 +734,13 @@ class TestCliDispatchFlag:
                 "--config",
                 "c.yaml",
                 "--dispatch",
-                "ramp.start=250",
+                "breaker.window=20",
                 "--dispatch",
                 "breaker.timeout_ratio=0.3",
             ],
         )
         cli.main()
-        assert seen["dispatch"] == {"ramp": {"start": 250}, "breaker": {"timeout_ratio": 0.3}}
+        assert seen["dispatch"] == {"breaker": {"window": 20, "timeout_ratio": 0.3}}
 
     def test_no_flag_passes_none(self, monkeypatch, capsys):
         cli, seen = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"])
@@ -751,41 +749,42 @@ class TestCliDispatchFlag:
         assert seen["invocation"] == "async"  # the default is unchanged
 
     def test_invocation_event_carries_the_knobs_to_the_poller_path(self, monkeypatch, capsys):
-        # The only path the ramp/breaker act on (PR #665 review): the CLI can
+        # The only path the breaker acts on (PR #665 review): the CLI can
         # now select it, and both kwargs reach agg together.
         argv = ["zagg", "--config", "c.yaml", "--invocation", "event", "--dispatch"]
-        cli, seen = self._drive(monkeypatch, [*argv, "ramp.start=250"])
+        cli, seen = self._drive(monkeypatch, [*argv, "breaker.window=20"])
         cli.main()
         assert seen["invocation"] == "event"
-        assert seen["dispatch"] == {"ramp": {"start": 250}}
+        assert seen["dispatch"] == {"breaker": {"window": 20}}
 
-    @pytest.mark.parametrize("flag", ["ramp.cap=1", "canary.size=8", "ramp.start"])
+    @pytest.mark.parametrize(
+        "flag", ["ramp.start=250", "breaker.store_fatal=30", "canary.size=8", "breaker.window"]
+    )
     def test_a_bad_knob_is_refused_before_agg(self, monkeypatch, capsys, flag):
         cli, seen = self._drive(monkeypatch, ["zagg", "--config", "c.yaml", "--dispatch", flag])
         with pytest.raises(SystemExit) as exc_info:
             cli.main()
         assert exc_info.value.code == 2 and seen == {}  # argparse's usage error, no agg
 
-    def test_the_pacing_ramp_and_trip_lines_print(self, monkeypatch, capsys):
+    def test_the_pacing_and_trip_lines_print(self, monkeypatch, capsys):
         from zagg.dispatch_guard import PACING_GUARD, pool_width_pacing
 
         summary = dict(
             _lambda_summary(),
             dispatch_pacing=PACING_GUARD,
-            ramp=[{"width": 500, "at_result": 0}, {"width": 1000, "at_result": 50}],
             breaker={"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000},
         )
         cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=summary)
         cli.main()
         out = capsys.readouterr().out
         assert f"Dispatch pacing: {PACING_GUARD}" in out
-        assert "Dispatch ramp (width@result): 500@0 -> 1000@50" in out
+        assert "Dispatch ramp" not in out
         assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio at result 137" in out
-        # The default async channel says WHY nothing ramped (question 10).
+        # An unwatched channel says WHY no breaker reported (question 10).
         unpaced = dict(_lambda_summary(), dispatch_pacing=pool_width_pacing("invocation", "async"))
         cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=unpaced)
         cli.main()
-        assert "act only on invocation='event'" in capsys.readouterr().out
+        assert "acts only on invocation='event'" in capsys.readouterr().out
 
 
 class TestRunWrapper:
@@ -797,7 +796,7 @@ class TestRunWrapper:
             return _lambda_summary()
 
         monkeypatch.setattr("zagg.runner.agg", fake_agg)
-        knobs = {"ramp": {"start": 250}}
+        knobs = {"breaker": {"window": 20}}
         notebook.run(default_config("atl06"), catalog=SHARDMAP, backend="local", dispatch=knobs)
         assert seen["dispatch"] == knobs  # one mechanism: the facade forwards the block
 

@@ -97,13 +97,12 @@ examples:
         action="append",
         default=None,
         metavar="GROUP.KEY=VALUE",
-        help="Event fan-out ramp / circuit-breaker knob (issue #652), repeatable: "
-        "ramp.start ramp.factor ramp.cap ramp.window ramp.tolerance, "
-        "breaker.timeout_ratio breaker.wall_fraction breaker.store_fatal "
-        "breaker.store_fatal_first. Defaults: ramp 500 -> 1000 (x2, window 50, "
-        "tolerance 1.2); breaker 0.20 / 0.85 / 3 of the first 20; a repeated key "
-        "keeps the last value. Honored only by --backend lambda with "
-        "--invocation event; any other run warns and ignores it.",
+        help="Fan-out circuit-breaker knob (issue #652), repeatable: breaker.window "
+        "breaker.timeout_ratio breaker.store_fatal breaker.store_fatal_first. "
+        "Defaults: more than 0.20 of the last 50 timed out, or 3 store-fatal among "
+        "the first 20, stops dispatching; a repeated key keeps the last value. "
+        "Honored only by --backend lambda with --invocation event; any other run "
+        "warns and ignores it.",
     )
     parser.add_argument(
         "--invocation",
@@ -111,7 +110,7 @@ examples:
         default="async",
         help="Lambda transport (issues #151/#327): async (default, per-shard "
         "result objects), sync (RequestResponse), or event (the status-poller "
-        "fan-out). The --dispatch ramp and circuit breaker act on event only.",
+        "fan-out). The --dispatch circuit breaker acts on event only.",
     )
     parser.add_argument(
         "--yes",
@@ -248,11 +247,9 @@ examples:
                 f"{phase} {secs:.0f}s" for phase, secs in results["worker_phase_max"].items()
             )
             print(f"Worker phases (max across cells): {breakdown}")
-        # How the fan-out was paced, the ramp steps and any breaker trip
-        # (issue #652); the pacing line says WHY when no guard ran.
-        for line in describe(
-            results.get("ramp"), results.get("breaker"), results.get("dispatch_pacing")
-        ):
+        # What watched the fan-out and any breaker trip (issue #652); the
+        # pacing line says WHY when no guard ran.
+        for line in describe(results.get("breaker"), results.get("dispatch_pacing")):
             print(line)
         # The tail's verdict (issue #610): a run whose rollup sweep did not
         # complete exits 0 by design — the rollups are regenerable caches (D9)

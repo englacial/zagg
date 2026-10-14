@@ -250,11 +250,10 @@ class RunHandle:
         #: handle is a snapshot of the reported shards and ran no tail
         #: (past the drop deadline, for good: see :meth:`Run.attach`).
         self.unreported_shards: int = 0
-        #: The Event transport's dispatch ramp steps and circuit-breaker
-        #: verdict (issue #652), the same ``ramp`` / ``breaker`` the CLI
-        #: summary carries, set when the tail runs; ``[]`` / ``None`` on the
-        #: sync transport and on a reattached handle (neither has a guard).
-        self.ramp: list[dict] = []
+        #: The Event transport's circuit-breaker verdict (issue #652), the
+        #: same ``breaker`` the CLI summary carries, set when the tail runs;
+        #: ``None`` on the sync transport and on a reattached handle (neither
+        #: has a guard).
         self.breaker: dict | None = None
         #: What paced this dispatch (issue #652): the guard on the event
         #: transport, else the pool width with the knob to flip named;
@@ -509,7 +508,7 @@ class Run:
         #: A reattached run (``Run.attach``) never held the init record: its
         #: tail finalizes the repo off the config's knob instead (issue #582).
         self._attached = False
-        #: The Event transport's ramp + breaker (issue #652): built per
+        #: The Event transport's circuit breaker (issue #652): built per
         #: dispatch from the ``dispatch`` knobs; ``dispatch`` moves it onto
         #: the handle, whose tail reads it (never this slot).
         self._guard: Any = None
@@ -871,14 +870,13 @@ class Run:
             writes status objects (issue #327) and read access to the status
             prefix for the poll.
         dispatch : dict, optional
-            The event transport's ramp + circuit breaker knobs (issue #652),
-            the ``{"ramp": {...}, "breaker": {...}}`` block ``agg`` takes;
-            refused here, before any invoke. The width ramps from
-            ``ramp.start`` toward ``min(ramp.cap, max_workers)``; a trip
-            refuses the undispatched shards (their futures raise
+            The event transport's circuit breaker knobs (issue #652), the
+            ``{"breaker": {...}}`` block ``agg`` takes; refused here, before
+            any invoke. The fan-out runs at the full ``max_workers`` width; a
+            trip refuses the undispatched shards (their futures raise
             :class:`ShardError` with the ``not-dispatched`` outcome) and the
             tail skips the families pass, the staged sweep and the Icechunk
-            finalize. ``handle.ramp`` / ``handle.breaker`` record both.
+            finalize. ``handle.breaker`` records the trip.
         """
         from zagg import concurrency, runner
 
@@ -1083,11 +1081,9 @@ class Run:
         finisher.start()
         return handle
 
-    def _dispatch_guard(self, workers: int, function_timeout_s: float):
+    def _dispatch_guard(self, workers: int):
         """The poller's guard for this dispatch (issue #652); kept for the tail."""
-        self._guard = DispatchGuard(
-            self._guard_config, workers=workers, function_timeout_s=function_timeout_s
-        )
+        self._guard = DispatchGuard(self._guard_config, workers=workers)
         return self._guard
 
     def _dispatch_event(
@@ -1348,7 +1344,7 @@ class Run:
         guard = handle._guard
         trip = guard.tripped if guard is not None else None
         if guard is not None:
-            handle.ramp, handle.breaker = guard.ramp, guard.breaker
+            handle.breaker = guard.breaker
         if trip is not None:
             refused = sum(r.get("outcome") == NOT_DISPATCHED for r in results)
             logger.warning(
@@ -1356,7 +1352,7 @@ class Run:
                 f"width {trip['width']}: {refused} units not dispatched, tail legs skipped "
                 f"(issue #652)"
             )
-        for line in describe(handle.ramp, handle.breaker, handle.dispatch_pacing):
+        for line in describe(handle.breaker, handle.dispatch_pacing):
             logger.info(line)
         # ONE warn/retry/record implementation for every dispatch path (issue
         # #335 phase 1): agg's _run_lambda, the raster driver and this finisher

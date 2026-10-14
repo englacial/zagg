@@ -1,37 +1,28 @@
-"""Dispatch ramp + circuit breaker for the Event fan-out (issue #652).
+"""Dispatch circuit breaker for the Lambda fan-out (issue #652).
 
 The 2026-10-12 v4 build released 1,526 leaf invokes at once into a cold
 prefix; S3 write contention stretched every window's write phase until 1,522
 of them hit the 900 s wall, and the tail then swept a run that had mostly
-failed (post-mortem: issue #651). Two mechanisms, one object, consulted at
-the one seam that decides what fires next
-(:meth:`zagg.client_transport.StatusPoller._dispatch_up_to_window`):
+failed (post-mortem: issue #651). The breaker reads every completed result
+and STOPS DISPATCHING on either rule:
 
-- **Ramp** -- the in-flight width starts at ``start`` and multiplies by
-  ``factor`` up to ``cap`` (never above the run's ``workers``) once the last
-  ``window`` results dispatched at the current width (a result's
-  ``dispatch_width`` stamp; unstamped, those completed since the width took
-  effect) have a median write phase (status ``timings``: ``write + column + icechunk``) within
-  ``tolerance`` x the baseline, the median of the run's first ``window``
-  write phases. The first wave IS the canary: it is just the ramp's first
-  step. With the ruled defaults (500 -> 1,000, one step) the first step's
-  samples are the baseline, so that step is gated by the breaker alone.
-- **Breaker** -- over the same rolling window of completed results:
-  ``timeout-ratio`` (more than ``timeout_ratio`` of the last ``window``
-  timed out) and ``store-fatal`` (at least ``store_fatal`` store-fatal
-  results among the first ``store_fatal_first``) STOP DISPATCHING; a
-  ``wall-margin`` hold (median wall over ``wall_fraction`` x the function
-  timeout) stops widening while it lasts and keeps dispatching.
+- ``timeout-ratio`` -- more than ``timeout_ratio`` of the last ``window``
+  results timed out;
+- ``store-fatal`` -- at least ``store_fatal`` store-fatal results among the
+  run's first ``store_fatal_first``.
 
-A trip is sticky. Queued shards are then released for *refusal* -- the
-poller resolves them ``not-dispatched`` instead of invoking -- and the
-dispatchers skip the tail legs (staged sweep, families pass, Icechunk
-finalize). In-flight Event invokes cannot be recalled; they finish and their
-results still land.
+The guard paces at the run's full worker width (the concurrency preflight's
+clamp), as the fixed window did before it; a dispatch ramp was measured and
+set aside (issue #652, ruled 2026-10-14).
+
+A trip is sticky. Units not yet started are then *refused* -- they resolve
+``not-dispatched`` instead of invoking -- and the dispatchers skip the tail
+legs (staged sweep, families pass, Icechunk finalize). In-flight invokes
+cannot be recalled; they finish and their results still land.
 
 Pure: no I/O, no clock, no threads. The poller feeds completed result dicts
 (its own v1-shaped ``_result``) through :meth:`DispatchGuard.record` and asks
-:meth:`DispatchGuard.room` for the next batch; one thread owns an instance.
+:meth:`DispatchGuard.room` for the next batch; one thread records.
 The store-fatal rule reads ``store_error_class`` when a status carries it
 (issue #651, PR #658) and otherwise classifies the error string with
 :func:`zagg.dispatch.classify_store_error`, the worker's own classifier.
@@ -44,7 +35,6 @@ which must not short-circuit the classifier.
 from __future__ import annotations
 
 import math
-import statistics
 from dataclasses import dataclass, fields
 from typing import Iterable
 
@@ -59,22 +49,17 @@ from zagg.dispatch import (
 #: The values ``store_error_class`` (or a pre-#658 ``error_class``) may hold.
 _STORE_CLASSES = frozenset({STORE_FATAL, STORE_TRANSIENT, STORE_BENIGN})
 
-
-#: The write-phase keys summed per result (the worker's ``phase_timings``).
-WRITE_PHASES = ("write", "column", "icechunk")
-
 #: Breaker rule names, as they land in ``summary["breaker"]["rule"]``.
 RULE_TIMEOUT_RATIO = "timeout-ratio"
-RULE_WALL_MARGIN = "wall-margin"
 RULE_STORE_FATAL = "store-fatal"
 
 #: The ``outcome`` a shard the breaker refused to dispatch resolves with.
 NOT_DISPATCHED = "not-dispatched"
 
 #: ``summary["dispatch_pacing"]`` / ``handle.dispatch_pacing`` when the guard
-#: paces the fan-out: only the Event transport has the status poller the ramp
-#: and breaker live in.
-PACING_GUARD = "guard: ramp + circuit breaker on the Event transport (issue #652)"
+#: watches the fan-out: only the Event transport has the status poller the
+#: breaker lives in.
+PACING_GUARD = "guard: circuit breaker on the Event transport (issue #652)"
 
 
 #: How a trip's ``tail_sweep_short`` reason starts. A sweep folds leaves that
@@ -85,16 +70,16 @@ BREAKER_SHORT_PREFIX = "the dispatch circuit breaker tripped"
 
 
 def pool_width_pacing(knob: str, value: str) -> str:
-    """The pacing line for a fan-out the guard does NOT pace, saying why.
+    """The pacing line for a fan-out the guard does NOT watch, saying why.
 
     ``agg``'s default ``invocation="async"`` (the #151 result-object channel)
     and ``Run.dispatch``'s default ``transport="sync"`` have no status poller,
-    so they pace by the pool width alone and ``ramp`` / ``breaker`` read
-    ``[]`` / ``None``; this names the knob to flip rather than leaving that
-    silence to be read as "nothing happened" (issue #652 question 10).
+    so they pace by the pool width alone and ``breaker`` reads ``None``; this
+    names the knob to flip rather than leaving that silence to be read as
+    "nothing happened" (issue #652 question 10).
     """
     return (
-        f"pool width ({knob}={value!r}): the ramp and circuit breaker act only on "
+        f"pool width ({knob}={value!r}): the circuit breaker acts only on "
         f"{knob}='event' (issue #652)"
     )
 
@@ -107,33 +92,27 @@ def no_poller_pacing(kind: str) -> str:
     guard cannot apply rather than naming a value that raises.
     """
     return (
-        f"pool width: the {kind} fan-out has no status poller, so the ramp and "
-        "circuit breaker do not apply (issue #652)"
+        f"pool width: the {kind} fan-out has no status poller, so the circuit "
+        "breaker does not apply (issue #652)"
     )
 
 
 @dataclass(frozen=True)
 class GuardConfig:
-    """The ramp + breaker knobs (issue #652 defaults; every one a knob).
+    """The breaker knobs (issue #652 defaults; every one a knob).
 
-    Built from the ``dispatch`` block -- ``{"ramp": {...}, "breaker": {...}}``
-    with the field names below -- by :meth:`from_dict`, which rejects unknown
-    keys, wrong types and out-of-range values at submission.
+    Built from the ``dispatch`` block -- ``{"breaker": {...}}`` with the field
+    names below -- by :meth:`from_dict`, which rejects unknown keys, wrong
+    types and out-of-range values at submission.
     """
 
-    start: int = 500
-    factor: int = 2
-    cap: int = 1000
     window: int = 50
-    tolerance: float = 1.2
     timeout_ratio: float = 0.20
-    wall_fraction: float = 0.85
     store_fatal: int = 3
     store_fatal_first: int = 20
 
-    _RAMP = ("start", "factor", "cap", "window", "tolerance")
-    _BREAKER = ("timeout_ratio", "wall_fraction", "store_fatal", "store_fatal_first")
-    _INTS = frozenset({"start", "factor", "cap", "window", "store_fatal", "store_fatal_first"})
+    _BREAKER = ("window", "timeout_ratio", "store_fatal", "store_fatal_first")
+    _INTS = frozenset({"window", "store_fatal", "store_fatal_first"})
 
     @classmethod
     def from_dict(cls, block: dict | None) -> GuardConfig:
@@ -141,19 +120,16 @@ class GuardConfig:
         if block is not None and not isinstance(block, dict):
             raise ValueError(f"dispatch must be a mapping (got {block!r})")
         block = dict(block or {})
-        values: dict = {}
-        for group, names in (("ramp", cls._RAMP), ("breaker", cls._BREAKER)):
-            sub = block.pop(group, None)
-            sub = {} if sub is None else sub
-            if not isinstance(sub, dict):
-                raise ValueError(f"dispatch.{group} must be a mapping (got {sub!r})")
-            unknown = set(sub) - set(names)
-            if unknown:
-                raise ValueError(f"dispatch.{group}: unknown key(s) {sorted(unknown)}")
-            values.update({k: v for k, v in sub.items() if v is not None})
+        sub = block.pop("breaker", None)
+        sub = {} if sub is None else sub
+        if not isinstance(sub, dict):
+            raise ValueError(f"dispatch.breaker must be a mapping (got {sub!r})")
         if block:
-            raise ValueError(f"dispatch: unknown key(s) {sorted(block)} (expected ramp, breaker)")
-        cfg = cls(**values)
+            raise ValueError(f"dispatch: unknown key(s) {sorted(block)} (expected breaker)")
+        unknown = set(sub) - set(cls._BREAKER)
+        if unknown:
+            raise ValueError(f"dispatch.breaker: unknown key(s) {sorted(unknown)}")
+        cfg = cls(**{k: v for k, v in sub.items() if v is not None})
         for f in fields(cls):
             v = getattr(cfg, f.name)
             integer = f.name in cls._INTS
@@ -162,20 +138,10 @@ class GuardConfig:
             if isinstance(v, bool) or not isinstance(v, kinds) or not math.isfinite(v) or v <= 0:
                 kind = "an integer" if integer else "a number"
                 raise ValueError(f"dispatch: {f.name} must be {kind} > 0 (got {v!r})")
-        if cfg.factor < 2:
+        if cfg.timeout_ratio >= 1.0:  # at 1.0 the rule can never fire
             raise ValueError(
-                f"dispatch: ramp.factor must be >= 2 (got {cfg.factor!r}); "
-                "for a fixed width set ramp.start equal to ramp.cap"
+                f"dispatch: breaker.timeout_ratio must be < 1.0 (got {cfg.timeout_ratio!r})"
             )
-        if cfg.cap < cfg.start:
-            raise ValueError(f"dispatch: ramp.cap {cfg.cap} is below ramp.start {cfg.start}")
-        if cfg.tolerance < 1.0:
-            raise ValueError(f"dispatch: ramp.tolerance must be >= 1.0 (got {cfg.tolerance!r})")
-        for name in ("timeout_ratio", "wall_fraction"):  # at 1.0 the rule can never fire
-            if getattr(cfg, name) >= 1.0:
-                raise ValueError(
-                    f"dispatch: breaker.{name} must be < 1.0 (got {getattr(cfg, name)!r})"
-                )
         if cfg.store_fatal > cfg.store_fatal_first:
             raise ValueError(
                 f"dispatch: breaker.store_fatal {cfg.store_fatal} exceeds "
@@ -185,14 +151,11 @@ class GuardConfig:
 
     def as_dict(self) -> dict:
         """The nested ``dispatch`` block this config round-trips to."""
-        return {
-            "ramp": {k: getattr(self, k) for k in self._RAMP},
-            "breaker": {k: getattr(self, k) for k in self._BREAKER},
-        }
+        return {"breaker": {k: getattr(self, k) for k in self._BREAKER}}
 
 
 def parse_knobs(pairs: Iterable[str] | None) -> dict | None:
-    """``["ramp.start=250", "breaker.timeout_ratio=0.3"]`` -> the nested ``dispatch`` block.
+    """``["breaker.window=20", "breaker.timeout_ratio=0.3"]`` -> the nested ``dispatch`` block.
 
     The CLI's ``--dispatch group.key=value`` spelling (repeatable); values are
     numbers (``int`` when they parse as one, else ``float``). Shape only --
@@ -222,26 +185,19 @@ def parse_knobs(pairs: Iterable[str] | None) -> dict | None:
 class ResultRecord:
     """One completed result, reduced to what the rules read."""
 
-    wall_s: float | None
-    write_s: float | None
     timeout: bool
     store_fatal: bool
-    dispatch_width: int | None = None
 
 
-def _median(values: list) -> float | None:
-    return statistics.median(values) if values else None
-
-
-def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
-    """Reduce a poller result dict to a :class:`ResultRecord`.
+def classify_result(result: dict) -> ResultRecord:
+    """Reduce a completed result dict to a :class:`ResultRecord`.
 
     A timeout is the sync transport's ``timeout`` flag, the Event transport's
     ``failed-unknown`` drop outcome (no status object by the deadline -- a
     worker killed at the wall writes none), or Lambda's own ``Task timed
-    out`` text; its wall is the function timeout when the body carries no
-    billed duration. Store-fatal reads ``store_error_class`` off the result,
-    then its body (PR #658), and falls back to classifying the error string.
+    out`` text. Store-fatal reads ``store_error_class`` off the result, then
+    its body (PR #658), then a pre-#658 ``error_class`` holding a store class,
+    and falls back to classifying the error string.
     """
     body = result.get("body") or {}
     error = result.get("error")
@@ -250,11 +206,6 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
         or result.get("outcome") == "failed-unknown"
         or (error and "Task timed out" in str(error))
     )
-    wall = result.get("lambda_duration") or None
-    if wall is None and timeout:
-        wall = float(function_timeout_s)
-    timings = body.get("phase_timings") or {}
-    parts = [timings[k] for k in WRITE_PHASES if isinstance(timings.get(k), (int, float))]
     # The no-data channel's text starts with its benign entry and may carry a
     # source read's 403/404 exemplar after it: benign, never store-fatal.
     failed = bool(error) and not str(error).startswith(BENIGN_ERRORS) and not timeout
@@ -267,35 +218,23 @@ def classify_result(result: dict, *, function_timeout_s: float) -> ResultRecord:
         store_class = legacy if legacy in _STORE_CLASSES else None
     if store_class is None and failed:
         store_class = classify_store_error(error)
-    return ResultRecord(
-        wall_s=wall,
-        write_s=sum(parts) if parts else None,
-        timeout=timeout,
-        store_fatal=failed and store_class == STORE_FATAL,
-        dispatch_width=result.get("dispatch_width"),
-    )
+    return ResultRecord(timeout=timeout, store_fatal=failed and store_class == STORE_FATAL)
 
 
 class FixedWindow:
-    """A fixed pacing window: what the poller paces by without a ramp.
+    """A fixed pacing window with no breaker: the poller's default.
 
     ``max_in_flight`` shards dispatched-unresolved at once, or unbounded on
     ``None`` (``Run.attach`` registers observe-only entries). Mirrors the
     :class:`DispatchGuard` reads the poller and the summaries make --
-    ``record``, ``room``, ``tripped``, ``breaker``, ``ramp`` -- and never
-    records or trips, so ``breaker`` is ``None`` and ``ramp`` is ``[]``.
+    ``record``, ``room``, ``tripped``, ``breaker`` -- and never trips.
     """
 
     tripped: dict | None = None
     breaker: dict | None = None
 
-    @property
-    def ramp(self) -> list[dict]:
-        return []  # a fresh list: no shared mutable class state
-
     def __init__(self, max_in_flight: int | None):
         self._max = max_in_flight
-        self.width = max_in_flight  # what the poller stamps on each result
 
     def record(self, result: dict) -> None:
         pass
@@ -305,38 +244,23 @@ class FixedWindow:
 
 
 class DispatchGuard:
-    """The ramp + breaker over one run's completed results (see the module doc).
+    """The circuit breaker over one run's completed results (see the module doc).
 
     ``workers`` is the run's fan-out width (the concurrency preflight's
-    clamp): the ramp never exceeds it. ``function_timeout_s`` prices a
-    timeout's wall and anchors the ``wall-margin`` rule.
+    clamp), the in-flight window it paces by; ``None`` is unbounded.
     """
 
-    def __init__(
-        self,
-        config: GuardConfig | None = None,
-        *,
-        workers: int | None = None,
-        function_timeout_s: float,
-    ):
+    def __init__(self, config: GuardConfig | None = None, *, workers: int | None = None):
         self.config = config or GuardConfig()
-        self._timeout_s = float(function_timeout_s)
-        self._cap = self.config.cap if workers is None else min(self.config.cap, int(workers))
-        self.width = min(self.config.start, self._cap)
+        self.width = workers
         self._records: list[ResultRecord] = []
         self._timed_out: set = set()  # unit keys already recorded as a timeout
-        self._widened_at = 0  # result count when the current width took effect
-        self._baseline: float | None = None
-        self.ramp: list[dict] = [{"width": self.width, "at_result": 0}]
         self.tripped: dict | None = None
-        self._hold: dict | None = None
-
-    # -- the poller's two calls ----------------------------------------------
 
     def record(self, result: dict) -> None:
-        """Fold one completed result in; re-evaluate the breaker, then the ramp."""
+        """Fold one completed result in and re-evaluate both rules."""
         cfg = self.config
-        rec = classify_result(result, function_timeout_s=self._timeout_s)
+        rec = classify_result(result)
         key = result.get("unit", result.get("shard_key"))
         if rec.timeout and key is not None:
             # A dropped unit re-fires once: it counts one timeout, recorded at
@@ -352,43 +276,18 @@ class DispatchGuard:
             return
         if n <= cfg.store_fatal_first:
             if sum(r.store_fatal for r in self._records) >= cfg.store_fatal:
-                self.tripped = self._verdict(RULE_STORE_FATAL, True)
+                self.tripped = self._verdict(RULE_STORE_FATAL)
                 return
-        if n < cfg.window:
-            return
-        last = self._records[-cfg.window :]
-        if sum(r.timeout for r in last) / cfg.window > cfg.timeout_ratio:
-            self.tripped = self._verdict(RULE_TIMEOUT_RATIO, True)
-            return
-        wall = _median([r.wall_s for r in last if r.wall_s is not None])
-        holding = wall is not None and wall > cfg.wall_fraction * self._timeout_s
-        if holding and self._hold is None:
-            self._hold = self._verdict(RULE_WALL_MARGIN, False)
-        if holding or self.width >= self._cap:
-            return
-        samples = [r.write_s for r in self._records if r.write_s is not None]
-        if self._baseline is None and len(samples) >= cfg.window:
-            self._baseline = _median(samples[: cfg.window])
-        at_width = [
-            r.write_s
-            for r in self._records[self._widened_at :]
-            if r.write_s is not None and r.dispatch_width in (None, self.width)
-        ]
-        baseline, current = self._baseline, _median(at_width[-cfg.window :])
-        if baseline is None or current is None or len(at_width) < cfg.window:
-            return
-        if current <= cfg.tolerance * baseline:
-            self.width = min(self.width * cfg.factor, self._cap)
-            self._widened_at = n
-            self.ramp.append({"width": self.width, "at_result": n})
+        if n >= cfg.window:
+            last = self._records[-cfg.window :]
+            if sum(r.timeout for r in last) / cfg.window > cfg.timeout_ratio:
+                self.tripped = self._verdict(RULE_TIMEOUT_RATIO)
 
     def room(self, queued: int, in_flight: int) -> int:
         """Slots to fire now. Tripped: every queued shard, so the poller refuses them."""
-        if self.tripped is not None:
+        if self.tripped is not None or self.width is None:
             return queued
         return max(self.width - in_flight, 0)
-
-    # -- what the poller and the summaries read --------------------------------
 
     def refusal(self) -> dict:
         """``_result`` kwargs for a shard the tripped breaker refused to dispatch."""
@@ -405,33 +304,24 @@ class DispatchGuard:
 
     @property
     def breaker(self) -> dict | None:
-        """``summary["breaker"]``: the trip, else the first wall-margin hold, else ``None``."""
-        return self.tripped or self._hold
+        """``summary["breaker"]``: the trip, else ``None``."""
+        return self.tripped
 
-    def _verdict(self, rule: str, tripped: bool) -> dict:
-        return {
-            "tripped": tripped,
-            "rule": rule,
-            "at_result": len(self._records),
-            "width": self.width,
-        }
+    def _verdict(self, rule: str) -> dict:
+        return {"tripped": True, "rule": rule, "at_result": len(self._records), "width": self.width}
 
 
-def describe(ramp: list | None, breaker: dict | None, pacing: str | None = None) -> list[str]:
-    """Human lines for ``summary["ramp"]`` / ``["breaker"]`` / ``["dispatch_pacing"]``.
+def describe(breaker: dict | None, pacing: str | None = None) -> list[str]:
+    """Human lines for ``summary["breaker"]`` / ``["dispatch_pacing"]``.
 
     Shared by the CLI, the notebook view and the run log. ``pacing`` leads
-    when given, so a fan-out the guard did not pace says why (see
+    when given, so a fan-out the guard did not watch says why (see
     :func:`pool_width_pacing`) instead of printing nothing.
     """
     lines = [f"Dispatch pacing: {pacing}"] if pacing else []
-    if ramp:
-        steps = " -> ".join(f"{s['width']}@{s['at_result']}" for s in ramp)
-        lines.append(f"Dispatch ramp (width@result): {steps}")
     if breaker:
-        what = "TRIPPED, dispatch stopped" if breaker.get("tripped") else "held widening"
         lines.append(
-            f"Circuit breaker {what}: rule {breaker.get('rule')} at result "
+            f"Circuit breaker TRIPPED, dispatch stopped: rule {breaker.get('rule')} at result "
             f"{breaker.get('at_result')}, width {breaker.get('width')} (issue #652)"
         )
     return lines

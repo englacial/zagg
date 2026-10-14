@@ -82,8 +82,8 @@ class TestDispatchKnob:
         # Validated on every backend (issue #652, review finding PR #665): the
         # dispatch error must win over the missing-catalog one.
         atl06_config.catalog = None
-        with pytest.raises(ValueError, match=re.escape("dispatch.ramp: unknown key(s)")):
-            agg(atl06_config, backend="local", dispatch={"ramp": {"begin": 1}})
+        with pytest.raises(ValueError, match=re.escape("dispatch.breaker: unknown key(s)")):
+            agg(atl06_config, backend="local", dispatch={"breaker": {"begin": 1}})
 
     @pytest.mark.parametrize(
         ("backend", "invocation", "warns"),
@@ -98,7 +98,7 @@ class TestDispatchKnob:
 
         monkeypatch.setattr(runner.SpatialStrategy, "run", lambda self, config, **kw: {})
         with caplog.at_level("WARNING", logger="zagg.runner"):
-            agg(atl06_config, backend=backend, invocation=invocation, dispatch={"ramp": {}})
+            agg(atl06_config, backend=backend, invocation=invocation, dispatch={"breaker": {}})
         hit = [r for r in caplog.records if "dispatch knobs ignored" in r.getMessage()]
         assert bool(hit) is warns
         if warns:
@@ -2003,13 +2003,12 @@ class TestSummaryKeysByteIdentical:
         # The tail's verdict over both legs (issue #610): one reason per
         # shortfall, [] when the tail left nothing short.
         "tail_sweep_short",
-        # The Event fan-out's dispatch ramp steps and breaker verdict (issue
-        # #652); ``[]`` / ``None`` on the sync and async transports, which
-        # pace by the pool width and carry no guard. LAMBDA-only.
-        "ramp",
+        # The fan-out's circuit-breaker verdict (issue #652); ``None`` when no
+        # rule tripped. LAMBDA-only. (The dispatch ramp and its ``ramp`` key
+        # were removed by the 2026-10-14 ruling.)
         "breaker",
-        # What paced the fan-out (issue #652): the guard, or the pool width with
-        # the knob to flip named, so [] / None above are never read as silence.
+        # What watched the fan-out (issue #652): the guard, or the pool width
+        # with the knob to flip named, so ``None`` above is never read as silence.
         "dispatch_pacing",
     } | _IDENTITY_KEYS
 
@@ -2410,9 +2409,9 @@ class TestSummaryKeysByteIdentical:
         )
         assert set(summary.keys()) == self._LAMBDA_KEYS
         assert summary["families_sweep"] is None  # flat: nothing was swept
-        assert summary["ramp"] == [] and summary["breaker"] is None  # async: no guard
+        assert "ramp" not in summary and summary["breaker"] is None  # async: no guard
         assert summary["dispatch_pacing"] == (
-            "pool width (invocation='async'): the ramp and circuit breaker act only on "
+            "pool width (invocation='async'): the circuit breaker acts only on "
             "invocation='event' (issue #652)"
         )
         assert summary["backend"] == "lambda"

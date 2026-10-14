@@ -466,9 +466,9 @@ class RunView:
             out.append(f"<tr><td>{label}</td><td>{shown}</td></tr>")
         out.append("</table>")
 
-        # How the fan-out was paced, the ramp steps and any breaker trip
-        # (issue #652); the pacing line says why when no guard ran.
-        for line in describe(s.get("ramp"), s.get("breaker"), s.get("dispatch_pacing")):
+        # What watched the fan-out and any breaker trip (issue #652); the
+        # pacing line says why when no guard ran.
+        for line in describe(s.get("breaker"), s.get("dispatch_pacing")):
             out.append(f"<p>{esc(line)}</p>")
 
         failures = self._failures()
@@ -500,8 +500,8 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
     """Invoke :func:`zagg.runner.agg` with a progress bar; return a :class:`RunView`.
 
     Accepts every ``agg`` keyword unchanged -- ``dispatch=`` (the issue #652
-    ramp / breaker block) included; the returned view renders the pacing
-    line, the ramp steps and any breaker trip. On ``backend="lambda"`` the
+    breaker block) included; the returned view renders the pacing line and
+    any breaker trip. On ``backend="lambda"`` the
     pre-invoke cost ceiling is *displayed* first (informational only -- this
     path never prompts, per issue #298; the blocking gate is CLI-only). The
     bar total is the previewed unit count for catalog runs and ``len(events)``

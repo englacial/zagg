@@ -315,20 +315,19 @@ def agg(
         ``"local"`` backend. Set to ``1`` (e.g. the CI benchmark) to measure one
         clean invocation and record a failure as a failure.
     dispatch : dict, optional
-        The Event fan-out's ramp + circuit breaker knobs (issue #652), a
-        ``{"ramp": {...}, "breaker": {...}}`` block over the ruled defaults
+        The Event fan-out's circuit breaker knobs (issue #652), a
+        ``{"breaker": {...}}`` block over the ruled defaults
         (:class:`zagg.dispatch_guard.GuardConfig`); validated at submission
         on every backend, honored by ``backend="lambda"`` with
-        ``invocation="event"`` — the only path paced by the status poller.
-        ``summary["ramp"]`` lists the width steps and ``summary["breaker"]``
-        the trip or hold (``None`` when neither fired); ``summary[
-        "dispatch_pacing"]`` says what paced the fan-out — the guard, or the
-        pool width with the knob to flip named. Travels through the
-        strategies as ``dispatch_knobs`` so it never shadows the generic
+        ``invocation="event"`` — the only path the status poller watches.
+        ``summary["breaker"]`` is the trip (``None`` when none fired);
+        ``summary["dispatch_pacing"]`` says what watched the fan-out — the
+        guard, or the pool width with the knob to flip named. Travels through
+        the strategies as ``dispatch_knobs`` so it never shadows the generic
         :func:`zagg.dispatch.dispatch` loop; the temporal and raster
-        strategies accept and ignore it (no status poller to pace), and their
-        lambda summaries carry ``ramp: []`` / ``breaker: None`` with a
-        ``dispatch_pacing`` line saying so.
+        strategies accept and ignore it (no status poller), and their lambda
+        summaries carry ``breaker: None`` with a ``dispatch_pacing`` line
+        saying so.
     invocation : str
         Lambda-only (issue #151). ``"async"`` (default) dispatches each cell
         with ``InvocationType="Event"`` and polls a per-shard result object the
@@ -438,7 +437,7 @@ def agg(
     GuardConfig.from_dict(dispatch)
     if dispatch is not None and not (backend == "lambda" and invocation == "event"):
         logger.warning(
-            f"dispatch knobs ignored: the ramp and circuit breaker act only on "
+            f"dispatch knobs ignored: the circuit breaker acts only on "
             f"backend='lambda' with invocation='event' (this run: backend={backend!r}, "
             f"invocation={invocation!r}) (issue #652)"
         )
@@ -1809,8 +1808,7 @@ class RasterStrategy:
             # is its finalize record (issue #582).
             "icechunk": None,
             "icechunk_finalize": None,
-            # No status poller here (issue #652): the guard never paces it.
-            "ramp": [],
+            # No status poller here (issue #652): the guard never watches it.
             "breaker": None,
             "dispatch_pacing": no_poller_pacing("raster"),
         }
@@ -2171,8 +2169,7 @@ def _run_lambda_events(
         "backend": "lambda",
         "results": rows,
         "failures": failures,
-        # No status poller here (issue #652): the guard never paces it.
-        "ramp": [],
+        # No status poller here (issue #652): the guard never watches it.
         "breaker": None,
         "dispatch_pacing": no_poller_pacing("temporal"),
         **container_stats,
@@ -3931,7 +3928,7 @@ def _run_lambda(
     from botocore.config import Config
 
     all_shards = list(catalog_data["shard_keys"])
-    # The ramp + breaker knobs (issue #652): refused at submission, before any
+    # The breaker knobs (issue #652): refused at submission, before any
     # invoke; consumed by the Event transport's poller below.
     guard_config = GuardConfig.from_dict(dispatch_knobs)
     # Strict-AOI per-shard mask payload (issue #101), keyed by shard for the
@@ -4318,14 +4315,10 @@ def _run_lambda(
         from zagg.client_transport import StatusPoller, drop_timeout_s, open_status_store
 
         _status_kwargs = _output_store_kwargs(output_creds_event, region)
-        # The ramp + circuit breaker (issue #652): the poller paces its Event
-        # dispatch by the guard's width, the guard reads every completed
+        # The circuit breaker (issue #652): the poller paces its Event
+        # dispatch at the run's full width, the guard reads every completed
         # result, and a trip refuses the queue and cancels the tail below.
-        state["guard"] = DispatchGuard(
-            guard_config,
-            workers=state["workers"],
-            function_timeout_s=state["function_timeout_s"],
-        )
+        state["guard"] = DispatchGuard(guard_config, workers=state["workers"])
         state["event_poller"] = StatusPoller(
             lambda: open_status_store(status_prefix, _status_kwargs),
             drop_timeout_s=drop_timeout_s(state["function_timeout_s"]),
@@ -4333,7 +4326,7 @@ def _run_lambda(
             guard=state["guard"],
         ).start()
     # What paces this fan-out, said in the summary (issue #652 question 10):
-    # the async/sync channels have no status poller, so no ramp or breaker.
+    # the async/sync channels have no status poller, so no breaker.
     pacing = PACING_GUARD if invocation == "event" else pool_width_pacing("invocation", invocation)
 
     # Create template via Lambda (flat only). The template write happens
@@ -4679,10 +4672,8 @@ def _run_lambda(
             # "dropped" (no manifest: no Run.attach, no operator finalize).
             # What was SENT; the write is the worker's, best-effort.
             "dispatch_manifest": manifest_sent,
-            # The Event fan-out's ramp steps and breaker verdict (issue #652):
-            # ``[]`` / ``None`` on the sync and async transports, which pace
-            # by the pool width and have no guard.
-            "ramp": guard.ramp if guard is not None else [],
+            # The Event fan-out's breaker verdict (issue #652): ``None`` on
+            # the sync and async transports, which have no guard.
             "breaker": guard.breaker if guard is not None else None,
             "dispatch_pacing": pacing,
             "store_path": store_path,
@@ -4902,7 +4893,7 @@ def _run_lambda(
                 f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items()
             )
             logger.info(f"Worker phases (max across cells): {breakdown}")
-        for line in describe(summary["ramp"], summary["breaker"], summary["dispatch_pacing"]):
+        for line in describe(summary["breaker"], summary["dispatch_pacing"]):
             logger.info(line)
         _log_container_stats(container_stats)
     except Exception as tail_error:
