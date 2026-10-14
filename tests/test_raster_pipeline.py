@@ -1115,6 +1115,65 @@ class TestSkipFillRows:
         red = open_array(store, path=f"{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert (red[0, start : start + self.CHUNK] == 0).all()
 
+    def test_hive_worker_writes_no_chunk_delete(self, tmp_path, monkeypatch):
+        # The fleet path (issue #653 phase 4): ``process_and_write_raster_hive``
+        # must reach the row writer with skip_fill, so a store that refuses a
+        # chunk delete still commits the leaf. The guard-off twin (``all_fill``
+        # never true: zarr's delete of the absent keys, a no-op locally) reads
+        # back the same band, so nothing populated was skipped.
+        from zarr.storage import LocalStore, WrapperStore
+
+        import zagg.processing.write as write_mod
+        import zagg.store
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        attempted: list = []
+
+        class _Refuser(WrapperStore):
+            async def delete(self, key):
+                if "/c/" in f"/{key}/":
+                    attempted.append(key)
+                    raise RuntimeError(f"chunk delete of {key!r} (issue #653)")
+                await self._store.delete(key)
+
+        real = zagg.store.open_store
+
+        def refusing(path, *args, **kwargs):
+            store = real(path, *args, **kwargs)
+            if isinstance(store, LocalStore) and not store.read_only:
+                return _Refuser(store)
+            return store
+
+        cfg, _grid, shard = _healpix_setup(tmp_path)
+        grid = HealpixGrid(10, 16, config=cfg, chunk_inner=12, sharded=False)
+        _write_tiff(tmp_path / "h0.tif", np.full((96, 96), 555, dtype=np.uint16))
+        granules = [_entry("g0", {"red": str(tmp_path / "h0.tif")}, T0, time_key="dt-1")]
+        bands = {}
+        for guard in (True, False):
+            root = tmp_path / f"hive-{guard}"
+            with monkeypatch.context() as m:
+                if guard:
+                    m.setattr(zagg.store, "open_store", refusing)
+                else:
+                    m.setattr(write_mod, "all_fill", lambda a, v: False)
+                meta = process_and_write_raster_hive(
+                    shard, granules, grid, str(root), cfg, store_kwargs={}, window=None
+                )
+            assert "error" not in meta
+            leaf = hive.shard_leaf_path(str(root), shard)
+            assert hive.read_commit(leaf)["complete"]
+            red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+            bands[guard] = red[:]
+            if guard:
+                # The footprint covers part of the shard: the row holds
+                # all-fill chunks, so a delete of any would have hit the refuser.
+                n_keys = len([k for k in root.rglob("*") if k.is_file() and "/red/c/" in str(k)])
+                assert 0 < n_keys < grid.cells_per_shard // self.CHUNK
+        assert attempted == []
+        np.testing.assert_array_equal(bands[True], bands[False])
+        assert (bands[True] == 555).any()
+
 
 class TestRasterMortonCoordinate:
     """Issue #304 raster extension (espg-ruled): morton is the sole stored
