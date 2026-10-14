@@ -585,8 +585,7 @@ class HealpixGrid:
         a schema-narrowed rerun would leave the retired members' objects
         behind (e.g. the post-#337 ``cell_ids`` chunk orphans), masquerading
         as data. ``overwrite=False`` on an occupied prefix now RAISES
-        ``ContainsGroupError`` (issue #657): the one-pass
-        :func:`zagg.grids.base.emit_hierarchy` refuses existing nodes, where
+        ``ContainsGroupError`` (issue #657) off one root probe, where
         pydantic-zarr's ``to_zarr`` accepted a structurally identical template.
         Every leaf writer passes ``overwrite=True``.
 
@@ -628,13 +627,17 @@ class HealpixGrid:
     ) -> dict:
         """:meth:`emit_shard_template`, returning the ``{path: handle}`` map it created.
 
-        The leaf template is ONE ``create_hierarchy`` pass
+        The leaf template is ONE probe-free pass of metadata PUTs
         (:func:`zagg.grids.base.emit_hierarchy`, issue #657) and the leaf
         writers write through the handles it returns, so no array is
         re-opened on the data path. ``overwrite`` clears the prefix first (the
-        issue #341 semantics documented on :meth:`emit_shard_template`); an
-        occupied prefix without it raises.
+        issue #341 semantics documented on :meth:`emit_shard_template`);
+        without it ONE root probe stands in for the per-node check the pass
+        no longer makes, and an occupied prefix raises.
         """
+        from zarr.core.sync import sync
+        from zarr.errors import ContainsGroupError
+
         spec = GroupSpec(
             members={self.group_path: self.shard_spec(cell_coordinate=cell_coordinate)},
             attributes={},
@@ -643,9 +646,9 @@ class HealpixGrid:
         # (zarr-python#3517); message-scoped suppression, see grids.base.
         with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
             if overwrite:
-                from zarr.core.sync import sync
-
                 sync(store.delete_dir(""))
+            elif sync(store.exists("zarr.json")):
+                raise ContainsGroupError(store, "")
             return emit_hierarchy(store, spec)
 
     def spec(self) -> GroupSpec:
