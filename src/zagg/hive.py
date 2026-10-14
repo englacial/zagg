@@ -2015,7 +2015,9 @@ class _LeafUnit:
             # trade stops being acceptable; it is not taken here because D4 makes
             # "replaced wholesale" the contract and a stamp must never block a
             # retry.
-            self.grid.emit_shard_template(store, overwrite=True, cell_coordinate=not self.omit)
+            self.box["arrays"] = self.grid.emit_shard_nodes(
+                store, overwrite=True, cell_coordinate=not self.omit
+            )
             self.box["store"] = store
         return self.box["store"]
 
@@ -2030,6 +2032,7 @@ class _LeafUnit:
             chunk_idx=local,
             staged_out=self.staged,
             omit=self.omit,
+            arrays=self.box.get("arrays"),
         )
         if ragged:
             self.ragged_chunks.append((local, ragged))
@@ -2047,10 +2050,9 @@ class _LeafUnit:
         bracket) -> leaf pyramid column (issue #383) -> Icechunk refs commit
         (issue #580; last, after the one post-stamp phase that can still fail
         the unit) -> pointer swap (issue #582; versioned leaves only). The
-        hash pass precedes both sidecars, and the template's issue #341 clear
-        removed a prior attempt's copies (a versioned leaf's version prefix
-        is fresh per attempt), so its ``members()`` walk never meets
-        ``coverage.moc`` or ``temporal.toc``.
+        hash pass precedes both sidecars and hashes the template pass's own
+        node set (issue #657), never a store walk, so neither
+        ``coverage.moc`` nor ``temporal.toc`` can enter the record.
         """
         from zagg import leaf_temporal
         from zagg.processing import write_leaf_to_zarr, write_ragged_leaf_to_zarr
@@ -2096,6 +2098,7 @@ class _LeafUnit:
                 shard_key=int(shard_key),
                 staged_out=staged,
                 omit=self.omit,
+                arrays=box.get("arrays"),
             )
             self.write_elapsed += time.time() - _t0
         # Stamp ONLY a fully-written leaf: an errored shard (or one that
@@ -2110,7 +2113,11 @@ class _LeafUnit:
             _t0 = time.time()
             if not self.sharded:
                 write_ragged_leaf_to_zarr(
-                    self.ragged_chunks, box["store"], grid=grid, staged_out=staged
+                    self.ragged_chunks,
+                    box["store"],
+                    grid=grid,
+                    staged_out=staged,
+                    arrays=box.get("arrays"),
                 )
             self.write_elapsed += time.time() - _t0
             # O11 content hashes (issue #342, spec §5): computed in-worker at
@@ -2121,8 +2128,8 @@ class _LeafUnit:
             # streaming path (``sharded`` is forced off whenever a leaf holds
             # one inner chunk — the ``chunk_inner``-unset default).
             # ``resolution: chunk`` companions are the one read-back fallback
-            # inside ``hash_arrays``: they are written per chunk-block, never
-            # as a leaf slab. Computed BEFORE the stamp (issue #580) so the
+            # inside ``hash_arrays`` (through the template's own handle): they
+            # are written per chunk-block, never as a leaf slab. Computed BEFORE the stamp (issue #580) so the
             # record rides the stamp itself — the D4 seal then certifies the
             # digest of the bytes it seals — and the caller's D20 sidecar
             # (``telemetry.build_record``) carries the same record off
@@ -2136,7 +2143,9 @@ class _LeafUnit:
             _t0 = time.time()
             from zagg.content_hash import staged_record
 
-            record = staged_record(box["store"], staged, f"leaf {self.leaf_path}")
+            record = staged_record(
+                box["store"], staged, f"leaf {self.leaf_path}", nodes=box.get("arrays")
+            )
             if record is not None:
                 metadata["content_hashes"] = record
                 # Same "populated phase_timings" gate as the write stamp

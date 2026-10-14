@@ -253,6 +253,61 @@ def vlen_dtype_warning_suppressed():
         yield
 
 
+def emit_hierarchy(store: Store, spec) -> dict[str, Any]:
+    """Create ``spec``'s whole hierarchy at the store root in ONE pass; return its node handles.
+
+    pydantic-zarr's ``GroupSpec.to_zarr`` walks the tree one node at a time —
+    each member is its own probe of the node and its ancestors plus its own
+    PUT (measured ~1.1 metadata GETs per object), and the writers then
+    re-opened every array (``open_array``, another GET per array) before a
+    byte of data moved (issue #657; issue #189 is the upstream ask). Here
+    every node's metadata object is built exactly as ``to_zarr`` builds it
+    (``ArrayV3Metadata.from_dict`` / ``GroupMetadata.from_dict`` of the spec's
+    own dump — the same serialized bytes) and the whole set goes to zarr's
+    ``create_nodes`` once: one PUT per node in a single concurrent pass held
+    to ``async.concurrency``, and NO probe — ``zarr.create_hierarchy`` would
+    first GET every node's ``zarr.json`` to check for an occupant (its
+    ``overwrite=False`` pass), which here can only ever answer 404 (espg
+    ruling, PR #661). The root group is explicit in the set, so its document
+    is written as before.
+
+    Returns ``{path: handle}`` keyed by each node's path (``""`` is the root
+    group): the array handles the writer then writes through, instead of
+    re-opening each array (``open_array`` is another ancestor-probing GET per
+    array).
+
+    The contract this rests on: the caller guarantees an EMPTY prefix —
+    every writer ``delete_dir("")``s it immediately before this call (the
+    issue #341 wholesale-replace semantics). Nothing here checks for an
+    occupant; an occupied prefix would be overwritten node by node.
+    ``HealpixGrid.emit_shard_nodes`` keeps the ``overwrite=False`` refusal
+    with one root probe of its own.
+    """
+    from pydantic_zarr.experimental.v3 import ArraySpec
+    from zarr.core.group import GroupMetadata
+    from zarr.core.metadata.v3 import ArrayV3Metadata
+    from zarr.core.sync_group import create_nodes
+
+    nodes = {}
+    for key, node in spec.to_flat().items():
+        dump = node.model_dump()
+        if isinstance(node, ArraySpec):
+            nodes[key.lstrip("/")] = ArrayV3Metadata.from_dict(dump)
+        else:
+            nodes[key.lstrip("/")] = GroupMetadata.from_dict({**dump, "node_type": "group"})
+    # ``zarr.core.sync_group.create_nodes`` is the function ``create_hierarchy``
+    # hands its validated node set to — a ``zarr.core`` surface, not exported
+    # from ``zarr``; verified against zarr 3.2.1 (the fleet pin). It skips
+    # ``create_hierarchy``'s per-node existence probe because the caller has
+    # just cleared the prefix (``delete_dir("")``), so every probe could only
+    # answer 404. The set is complete by construction (``to_flat`` emits the
+    # root and every intermediate group), which is the validity
+    # ``create_hierarchy`` would otherwise have parsed in. Re-check on a zarr
+    # bump: the byte manifest in ``tests/test_write_request_counts.py`` and
+    # ``tests/test_emit_hierarchy.py``'s identity tests are the gate.
+    return dict(create_nodes(store=store, nodes=nodes))
+
+
 def ragged_array_spec(
     *,
     shape,
@@ -786,6 +841,7 @@ __all__ = [
     "ragged_times_name",
     "vector_array_spec",
     "vlen_dtype_warning_suppressed",
+    "emit_hierarchy",
     "chunk_array_spec",
     "sharded_array_spec",
 ]

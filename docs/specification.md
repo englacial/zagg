@@ -2305,10 +2305,19 @@ root** — data fields, the ragged vlen payload arrays and their
 leaf does not, §1.5), every coordinate — keyed by the
 array's **path relative to the leaf root** (e.g. `"8/morton"`).
 
-The scope is therefore **discovery-based**: both shipped implementations
-enumerate (`group.members(max_depth=None)`), so the key set is whatever named
-arrays exist under the leaf root, not what the template declared. That has
-one normative consequence a verifier MUST honour: **a key-set difference is a
+The scope is therefore **discovery-based** on the verifier side: a verifier
+(moczarr, zagg's parity checks) enumerates (`group.members(max_depth=None)`),
+so the key set it hashes is whatever named arrays exist under the leaf root,
+not what the template declared. The **leaf and leaf-column writers** hash
+the node set they have just created — the arrays of their own template pass,
+written under a prefix they cleared immediately before ([issue
+#657](https://github.com/englacial/zagg/issues/657); zero metadata reads) —
+and under that cleared prefix the created set *is* the enumerated set, so the
+key set and every per-array digest are the same either way. The overview and
+stage-sweep writers still enumerate (`group.members`) before hashing; moving
+them onto their own node set is a follow-on. Their stamps carry the same §5.3
+record either way. That has one
+normative consequence a verifier MUST honour: **a key-set difference is a
 distinct outcome from a digest mismatch.** Debris inside a leaf — a foreign
 array prefix, the [issue #341](https://github.com/englacial/zagg/issues/341)
 Bug A class, an
@@ -2317,10 +2326,12 @@ prefix — adds a key and so changes `combined`, which means a verifier
 comparing `combined` alone reports an intact leaf as tampered. A verifier MUST
 compare the per-array map first and report extra or missing keys as their own
 outcome ("extra array present" / "array missing"), reserving "mismatch" for a
-differing digest on a **shared** key. Hashing is the only path that
-enumerates: the read and fold paths open leaf arrays **by name** (no member
-enumeration, no LIST — [#344](https://github.com/englacial/zagg/pull/344)), so
-debris is inert everywhere else.
+differing digest on a **shared** key. Verification and the overview and
+stage-sweep writers are the only paths that enumerate: the leaf and
+leaf-column writers hash their own node set, and the read and fold paths
+open leaf arrays **by name** (no member enumeration, no LIST —
+[#344](https://github.com/englacial/zagg/pull/344)), so debris is inert
+everywhere else.
 
 ### 5.2 Per-array recipe
 

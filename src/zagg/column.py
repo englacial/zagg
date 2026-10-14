@@ -586,10 +586,12 @@ def write_column(
     three ``zarr.json`` PUTs (template, attrs, stamp) plus the sidecar. At
     the 19/13/9 reference geometry with 2 composable fields — groups
     {13, 12, 11, 10, 9} — that is ``5*(1 + 3*2) + 3 + 1 = 39`` objects per
-    ``(leaf, window)``, against the leaf's own ~10. The array writes run
-    inside the same ``async.concurrency: 128`` context as the template
-    (the leaf writers' posture, issue #209): serial open+PUT round-trips at
-    that count are a tail-latency term on every unit.
+    ``(leaf, window)``, against the leaf's own ~10. Request cost (issue
+    #657): the template is ONE probe-free ``create_nodes`` pass
+    (:func:`zagg.grids.base.emit_hierarchy`) and every slab is written
+    through the handle that pass returned — no ``open_array`` round-trip per
+    array — inside the same ``async.concurrency: 128`` context as the
+    template (the leaf writers' posture, issue #209).
 
     The commit stamp's ``cells_with_data`` counts the populated mask of the
     column's FINEST group — the one denominator a leaf or an overview has
@@ -619,16 +621,14 @@ def write_column(
     ``provenance`` adds artifact-level ``zagg_column`` keys (its
     ``source_windows``); a window column passes neither.
     """
-    import zarr
     from mortie import generate_morton_children
     from pydantic_zarr.experimental.v3 import GroupSpec
     from zarr import config as zarr_config
-    from zarr import open_array
     from zarr.core.sync import sync
 
     from zagg.column_shards import column_grid
     from zagg.content_hash import staged_record
-    from zagg.grids.base import vlen_dtype_warning_suppressed
+    from zagg.grids.base import emit_hierarchy, vlen_dtype_warning_suppressed
     from zagg.grids.morton import morton_decimal
     from zagg.hive import _utcnow, shard_leaf_path, stamp_commit
     from zagg.store import open_store
@@ -665,18 +665,15 @@ def write_column(
     with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
         sync(store.delete_dir(""))
         _delete_sidecar(node_prefix, _sidecar_name(basename), store_kwargs)
-        spec.to_zarr(store, "", overwrite=True)
+        nodes = emit_hierarchy(store, spec)
         for res in resolutions:
             words = np.asarray(generate_morton_children(int(shard_key), res), dtype=np.uint64)
-            arr = open_array(store, path=f"{res}/morton", zarr_format=3, consolidated=False)
-            arr[:] = words
+            nodes[f"{res}/morton"][:] = words
             staged[f"{res}/morton"] = words
             for name, slab in folded[res].items():
-                arr = open_array(store, path=f"{res}/{name}", zarr_format=3, consolidated=False)
-                arr[:] = slab
+                nodes[f"{res}/{name}"][:] = slab
                 staged[f"{res}/{name}"] = slab
-    root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
-    root.attrs.update(
+    nodes[""].update_attributes(
         {
             ROLE_ATTR: COLUMN_ROLE,
             COLUMN_ATTR: {
@@ -704,7 +701,7 @@ def write_column(
     populated = _populated_mask(folded[resolutions[0]], fields)
     # §5 O11 record BEFORE the stamp so it rides it (issue #580), then the
     # sidecar carries the same record.
-    hashes = staged_record(store, staged, f"leaf column {basename}")
+    hashes = staged_record(store, staged, f"leaf column {basename}", nodes=nodes)
     stamp_commit(
         store,
         cells_with_data=int(populated.sum()),
