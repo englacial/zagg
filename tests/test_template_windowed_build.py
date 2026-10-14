@@ -386,7 +386,7 @@ def test_the_all_time_column_is_the_kway_fold_of_the_window_columns(built):
         }
         block = dict(columns[SCHEDULE_NONE_TOKEN].attrs)[COLUMN_ATTR]
         assert block["window"] == SCHEDULE_NONE_TOKEN
-        assert block["source_windows"] == {"folded": 3, "missing": 0, "unreadable": 0}
+        assert block["source_windows"] == {"folded": len(WINDOWS), "missing": 0, "unreadable": 0}
         windows = [dict(columns[w].attrs)[COLUMN_ATTR] for w in WINDOWS]
         fields = block["fields"]
         assert {m["class"] for m in fields.values()} >= {"exact", "approximate"}
