@@ -857,7 +857,11 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     if expected.get("icechunk_declared") and not icechunk:
         problems.append("icechunk objects 0 != expected >=1 (declared repo; init failed open?)")
     elif icechunk and not expected.get("icechunk_declared"):
-        problems.append(f"icechunk objects {icechunk} != expected 0 (no repo declared)")
+        problems.append(
+            f"icechunk objects {icechunk} != expected 0 (no repo declared; "
+            f"a stale repo on a reused store reads the same — empty the "
+            f"icechunk/ prefix or re-point at a fresh store)"
+        )
     if measured["objects_other"]:
         problems.append(
             f"{measured['objects_other']} unrecognized object key(s), "

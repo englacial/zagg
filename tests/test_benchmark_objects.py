@@ -1066,9 +1066,10 @@ def test_flat_icechunk_objects_are_bucketed_not_unrecognized(tmp_path):
     assert bench_objects.write_path_total(measured) == expected["total_max"]
     # ... and the only finding is the undeclared repo itself.
     assert expected["icechunk_declared"] is False
-    assert (
-        bench_objects.object_count_mismatch(measured, expected)
-        == "icechunk objects 1 != expected 0 (no repo declared)"
+    assert bench_objects.object_count_mismatch(measured, expected) == (
+        "icechunk objects 1 != expected 0 (no repo declared; a stale repo on "
+        "a reused store reads the same — empty the icechunk/ prefix or "
+        "re-point at a fresh store)"
     )
 
 
@@ -1103,7 +1104,9 @@ def test_icechunk_floor_fires_both_ways():
     undeclared = dict(declared, icechunk_declared=False)
     assert bench_objects.object_count_mismatch(missing, undeclared) is None
     assert bench_objects.object_count_mismatch(clean, undeclared) == (
-        "icechunk objects 2 != expected 0 (no repo declared)"
+        "icechunk objects 2 != expected 0 (no repo declared; a stale repo on "
+        "a reused store reads the same — empty the icechunk/ prefix or "
+        "re-point at a fresh store)"
     )
     # A measured/expected pair from before the bucket existed is unaffected:
     # both sides are read with ``.get``, as the netted buckets are.
