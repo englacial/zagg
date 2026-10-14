@@ -338,7 +338,7 @@ def test_ladder_and_stage_runs(arms):
     assert latest["invokes"] == 5 and latest["failed"] == 1
     assert latest["barrier_timed_out"] is True and latest["short_orders"] == [0]
     assert latest["worker_s"] == 49.0 and latest["finisher_s"] == 2.0
-    assert latest["gb_seconds"] == 51.0 * tool.STAGE_TIER_GB
+    assert latest["gb_seconds"] == 51.0 * tool.stage_tier_gb()
     o3, o0 = latest["per_order"]
     assert (o3["dispatch_order"], o3["invokes"], o3["window_invokes"], o3["close_invokes"]) == (
         3,
@@ -361,11 +361,27 @@ def test_cost_sums_leaf_and_stage_gb_seconds(arms):
 
     price = LAMBDA_PRICE_PER_GB_SEC
 
-    # both stage runs count (the older one's 99 s invoke included), each at the 8 GB tier
-    assert win["cost"]["stage_gb_seconds"] == (51.0 + 99.0) * tool.STAGE_TIER_GB
+    # both stage runs count (the older one's 99 s invoke included), each at the stage tier
+    tier = tool.stage_tier_gb()
+    assert win["cost"]["stage_gb_seconds"] == (51.0 + 99.0) * tier
     assert win["cost"]["leaf_gb_seconds"] == 336.0
-    assert win["cost"]["total_usd"] == pytest.approx((336.0 + 150.0 * 8) * price)
+    assert win["cost"]["total_usd"] == pytest.approx((336.0 + 150.0 * tier) * price)
     assert base["cost"]["leaf_usd"] == pytest.approx(320.0 * price)
+
+
+def test_the_stage_tier_is_the_dispatchers_own(arms, monkeypatch):
+    """The stage leg is priced at what ``runner`` routes the staged tail to
+    (issue #667), not at a tier pinned in the tool."""
+    from zagg.runner import STAGE_SWEEP_WORKER
+
+    tier = STAGE_SWEEP_WORKER["memory"] / 1024.0
+    assert tool.stage_tier_gb() == tier
+    _, win = arms
+    assert win["stage_runs"]["latest"]["gb_seconds"] == 51.0 * tier
+    assert win["cost"]["stage_gb_seconds"] == (51.0 + 99.0) * tier
+    # derived, not a copy: the readout follows the library's routing
+    monkeypatch.setitem(STAGE_SWEEP_WORKER, "memory", 2048)
+    assert tool.stage_tier_gb() == 2.0
 
 
 def test_prints_one_column_per_arm(arms, capsys):

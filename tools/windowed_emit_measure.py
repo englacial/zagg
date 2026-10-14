@@ -30,9 +30,9 @@ Given one or more hive store roots — the arms of one order-6 cell built with
   included (``duration_total_s x`` the invoke's memory, falling back to the
   self-reported ``gb_seconds``; a timed-out invoke with no recorded wall at
   ``FUNCTION_TIMEOUT_S`` x its memory, as Lambda bills it), the
-  stage runs' (``duration_s x`` ``STAGE_TIER_GB``, the issue #586 campaign's
-  8 GB tier; a run dispatched after issue #659 staged at 4 GB and needs 4.0)
-  and the finisher's, priced at ``zagg.dispatch.LAMBDA_PRICE_PER_GB_SEC``.
+  stage runs' (``duration_s x`` the stage tier the dispatcher routes to,
+  :func:`stage_tier_gb`) and the finisher's, priced at
+  ``zagg.dispatch.LAMBDA_PRICE_PER_GB_SEC``.
 
 An arm that does not fit one invoke per shard is re-run with
 ``output.windowing.unit: window`` into its OWN store
@@ -77,14 +77,24 @@ _QUANTILES = (0.5, 0.9, 1.0)
 _TIMEOUT = r"timeout|timed out"
 #: The Lambda function ceiling the "fits one invoke per shard" verdict is read against.
 FUNCTION_TIMEOUT_S = 900.0
-#: The stage tier the measurement arms' runs went to: the ``-8192-disk``
-#: variant, the issue #586 interim. Issue #659 moved the staged tail to the
-#: leaf tier (``runner.STAGE_SWEEP_WORKER``, 4 GB); stage records carry no
-#: memory figure, so a readout of a run dispatched after it should take 4.0.
-STAGE_TIER_GB = 8.0
 #: The issue's occupancy constants, used only when no leaf ``count/zarr.json``
 #: can be read: 4,096 ``int32`` cells per inner chunk, 256 chunks per shard.
 FALLBACK_CHUNK = {"bytes_per_chunk": 16_384, "index_bytes": 4_100, "chunks": 256, "dtype": None}
+
+
+def stage_tier_gb() -> float:
+    """The memory tier a staged sweep's invokes are priced at, in GB.
+
+    Read off the library the dispatcher routes them with
+    (:data:`zagg.runner.STAGE_SWEEP_WORKER`, the leaf tier since issue #659),
+    so the readout prices what a run on this release goes to rather than a
+    tier pinned here (espg ruling, 2026-10-13, on PR #664 question (1)). The
+    accepted consequence: a readout of the issue #586 campaign's runs, which
+    did go to the 8 GB stopgap, under-prices their ladder.
+    """
+    from zagg.runner import STAGE_SWEEP_WORKER
+
+    return STAGE_SWEEP_WORKER["memory"] / 1024.0
 
 
 def _store(store_root: str, store_kwargs: dict):
@@ -644,7 +654,7 @@ def _stage_run(status, prefix: str, workers: int) -> dict:
         "short_orders": finisher.get("short_orders"),
         "worker_s": worker_s,
         "failed": sum(r["failed"] for r in per_order),
-        "gb_seconds": (worker_s + finisher_s) * STAGE_TIER_GB,
+        "gb_seconds": (worker_s + finisher_s) * stage_tier_gb(),
         "per_order": per_order,
     }
 
@@ -678,8 +688,8 @@ def stage_run_numbers(store_root: str, store_kwargs: dict, workers: int = 32) ->
 
 def cost_numbers(fleet: dict, stages: dict) -> dict:
     """GB-seconds and USD: the leaf fan-out (billed where recorded), every stage
-    run's invokes and finisher at ``STAGE_TIER_GB`` (the issue #586 campaign's
-    8 GB tier; a run dispatched after issue #659 needs 4.0), and the sum."""
+    run's invokes and finisher at the stage tier (:func:`stage_tier_gb`), and
+    the sum."""
     from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
 
     leaf = fleet.get("billed_gb_seconds")
