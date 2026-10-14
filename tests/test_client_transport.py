@@ -894,7 +894,18 @@ class TestAggEventMode:
     stay on sync — their metrics come from invoke responses."""
 
     @staticmethod
-    def _agg(catalog_file, monkeypatch, stub, invocation, config=None, workers=3, **agg_kwargs):
+    def _agg(
+        catalog_file,
+        monkeypatch,
+        stub,
+        invocation,
+        config=None,
+        workers=3,
+        clamp=None,
+        **agg_kwargs,
+    ):
+        # ``workers`` is the requested ``max_workers``; ``clamp`` the stubbed
+        # preflight (``compute_available_workers``) result, default ``workers``.
         from unittest.mock import MagicMock
 
         import boto3
@@ -912,7 +923,7 @@ class TestAggEventMode:
             runner,
             "compute_available_workers",
             lambda requested, *a, **k: (
-                workers,
+                workers if clamp is None else clamp,
                 ConcurrencyReport(
                     account_limit=1000,
                     current_concurrent=0,
@@ -1016,10 +1027,21 @@ class TestAggEventMode:
         assert bad["outcome"] == "failed-unknown"
 
     def test_agg_event_summary_carries_the_breaker(self, catalog_file, monkeypatch, status_store):
-        # Defaults, three shards, a preflight clamp of 3 workers: the guard
-        # paces at the full width and nothing trips; no ramp key (2026-10-14).
-        summary = self._agg(catalog_file, monkeypatch, EventStubLambdaClient(status_store), "event")
+        # Defaults, three shards, 3 requested workers clamped to 2 by the
+        # preflight: the guard paces at the clamp (not ``max_workers``) and
+        # nothing trips; no ramp key (2026-10-14).
+        from zagg import runner
+
+        widths: list[int] = []
+        real = runner.DispatchGuard
+        monkeypatch.setattr(
+            runner, "DispatchGuard", lambda *a, **k: widths.append(k["workers"]) or real(*a, **k)
+        )
+        summary = self._agg(
+            catalog_file, monkeypatch, EventStubLambdaClient(status_store), "event", clamp=2
+        )
         assert summary["breaker"] is None and "ramp" not in summary
+        assert widths == [2]
         sync = self._agg(
             catalog_file, monkeypatch, __import__("test_client").StubLambdaClient(), "sync"
         )
@@ -1049,7 +1071,7 @@ class TestAggEventMode:
             "event",
             max_retries=1,
             dispatch=_TRIP_KNOBS,
-            workers=1,
+            clamp=1,
         )
         assert control["breaker"] is None and control["cells_with_data"] == 3
         assert "_invoke_lambda_icechunk_finalize" in tail_calls
@@ -1062,9 +1084,11 @@ class TestAggEventMode:
         # for the dropped unit's.
         fresh = MemoryStore()
         monkeypatch.setattr(ct, "open_status_store", lambda prefix, kwargs: fresh)
+        # 3 requested workers, a preflight clamp of 1: the guard's width is the
+        # clamp, else all three shards fire before the trip and none is refused.
         stub = DropNthStub(fresh, drop_nth=2, record=True)
         summary = self._agg(
-            catalog_file, monkeypatch, stub, "event", max_retries=1, dispatch=_TRIP_KNOBS, workers=1
+            catalog_file, monkeypatch, stub, "event", max_retries=1, dispatch=_TRIP_KNOBS, clamp=1
         )
         assert summary["breaker"] == {
             "tripped": True,
