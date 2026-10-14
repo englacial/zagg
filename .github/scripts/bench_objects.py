@@ -835,9 +835,9 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     # a hand-built ``measured``/``expected`` pair predates the bucket.
     icechunk = measured.get("objects_icechunk", 0)
     if expected.get("icechunk_declared") and not icechunk:
-        problems.append("no icechunk/ object in a store declaring the §11 repo (init failed open?)")
+        problems.append("icechunk objects 0 != expected >=1 (declared repo; init failed open?)")
     elif icechunk and not expected.get("icechunk_declared"):
-        problems.append(f"{icechunk} icechunk/ object(s) in a store declaring no §11 repo")
+        problems.append(f"icechunk objects {icechunk} != expected 0 (no repo declared)")
     if measured["objects_other"]:
         problems.append(
             f"{measured['objects_other']} unrecognized object key(s), "
