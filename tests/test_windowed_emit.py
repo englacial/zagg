@@ -1336,6 +1336,7 @@ class TestHandler:
         # the body -- no handler change.
         from obstore.exceptions import GenericError
 
+        from zagg import runner
         from zagg.client_transport import build_shard_status
         from zagg.telemetry import read_sidecar
 
@@ -1361,6 +1362,23 @@ class TestHandler:
         ]
         # The class rides the leaf's own record into the run parquet (phase 5).
         assert [r["store_error_class"] for r in body["stats"]] == [None, "store-fatal"]
+        # ...and through the dispatcher's real row builder, the leaf row keeps
+        # the exception name in ``error_class`` beside its store class.
+        rows, _ = runner._lambda_result_rows(
+            [
+                {
+                    "shard_key": event["shard_key"],
+                    "status_code": response["statusCode"],
+                    "body": body,
+                    "error": body["error"],
+                    "retries": 0,
+                }
+            ]
+        )
+        assert [(r["error_class"], r["store_error_class"]) for r in rows] == [
+            (None, None),
+            ("GenericError", "store-fatal"),
+        ]
         store, shard = event["store_path"], event["shard_key"]
         assert read_sidecar(hive.shard_leaf_path(store, shard, window="2018"))["n_obs"] == 1
         assert read_sidecar(hive.shard_leaf_path(store, shard, window="2020")) is None

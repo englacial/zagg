@@ -964,11 +964,12 @@ class TestRunParquet:
     def test_store_error_class_is_its_own_column(self):
         # Issue #651: the leaf seam's three-valued class rides the record and
         # the parquet beside ``error_class``, which keeps its exception-name
-        # meaning (here the error string's leading token).
+        # meaning: a per-window error is ``f"{type(e).__name__}: {e}"``, so the
+        # real leaf row reads the exception name beside the store class.
         rec = build_record(
             shard_key=3,
             metadata={
-                "error": "window 2019: GenericError: Got invalid DeleteObjects response",
+                "error": "GenericError: Generic S3 error: Got invalid DeleteObjects response: EOF",
                 "store_error_class": "store-fatal",
                 "duration_s": 1.0,
             },
@@ -976,7 +977,7 @@ class TestRunParquet:
         row = flatten_record(rec, retries=0)
         assert rec["store_error_class"] == "store-fatal" and rec["success"] is False
         assert row["store_error_class"] == "store-fatal"
-        assert row["error_class"] == "window 2019"
+        assert row["error_class"] == "GenericError"
         assert merge([rec])["store_error_class"] == "store-fatal"
         assert merge([rec, _record(4)])["store_error_class"] is None  # per-leaf: collapses
         # A record whose metadata carries the SWEEP body's exception-name
