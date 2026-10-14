@@ -34,6 +34,7 @@ unwindowed store.
 from __future__ import annotations
 
 import logging
+from functools import partial
 
 from zagg.pyramid_check_core import _check_node, _column_object_rel, _committed, _rank
 from zagg.pyramid_check_windowed import _WindowSources
@@ -105,7 +106,9 @@ def all_time_columns_check(
     ``checked`` and ``stale``.
     """
     from zagg.column import COLUMN_ATTR, COLUMN_ROLE, column_resolutions, raw_fold_boundary
+    from zagg.pyramid_check_core import _probe_nodes
     from zagg.pyramid_check_v2 import _as_int, _column_attrs_errors
+    from zagg.store import open_object_store
 
     s = harness.shard_order
     resolutions = column_resolutions(entries, s)
@@ -120,6 +123,7 @@ def all_time_columns_check(
         sample_cells=harness.sample_cells,
         workers=harness.workers,
     )
+    store = open_object_store(harness.store_root, **harness.store_kwargs)
     picked = [dec for dec in leaves if dec in members]
     if not full and len(picked) > harness.sample_nodes:
         picks = harness.rng.choice(len(picked), harness.sample_nodes, replace=False)
@@ -129,10 +133,30 @@ def all_time_columns_check(
     for dec in picked:
         attrs = members[dec]
         findings.extend(_column_attrs_errors(dec, s, attrs, resolutions, boundary, all_time=True))
-        # The windows the shard is known to have: every window whose roster
-        # names this leaf; held = those with a committed column now.
-        known = sorted(w for w in col_probes if dec in col_probes[w])
-        held = {w: col_probes[w][dec] for w in known if _committed(col_probes[w][dec], COLUMN_ROLE)}
+        # The windows the shard HAS — the store's (one LIST, the writer's own
+        # set: a window whose run record never landed is still folded) and
+        # the roster's; held = those with a committed column now.
+        try:
+            listed = _node_column_labels(store, dec)
+        except Exception as exc:
+            findings.append(f"{dec}: cannot list the shard's windows ({exc}) — UNKNOWN")
+            continue
+        known = sorted(listed | {w for w in col_probes if dec in col_probes[w]})
+        held = {}
+        for w in known:
+            if dec in col_probes.get(w, {}):
+                probed = {dec: col_probes[w][dec]}
+            else:  # on disk, outside the roster: probed here
+                probed, errored = _probe_nodes(
+                    harness.store_root,
+                    [dec],
+                    harness.store_kwargs,
+                    rel=partial(_column_object_rel, window=w),
+                )
+                if errored:
+                    findings.append(f"{dec}[{w}]: window column probe failed ({errored[dec]})")
+            if _committed(probed.get(dec), COLUMN_ROLE):
+                held[w] = probed[dec]
         block = attrs.get(COLUMN_ATTR)
         counters = (block.get("source_windows") or {}) if isinstance(block, dict) else {}
         folded, missing, unreadable = (
@@ -203,6 +227,41 @@ def all_time_columns_check(
         harness.warn(message)
     report["all_time_columns"].update({"checked": len(picked), "stale": stale[:50]})
     return findings
+
+
+def _node_column_labels(store, decimal: str) -> set:
+    """The window labels the shard HAS: one delimiter LIST of the leaf's node.
+
+    Its window columns (``{label}.pyramid.zarr``, the reserved ``all`` member
+    excluded) and its own window leaves (``{id}_{label}.zarr``) — the set the
+    all-time member folds over (§4.6), which the roster may understate. The
+    sibling of :func:`zagg.pyramid_check_windowed._node_window_labels` one
+    tier down; a failed LIST raises.
+    """
+    import obstore
+
+    from zagg.column import COLUMN_SUFFIX
+    from zagg.grids.morton import morton_word
+    from zagg.hive import shard_leaf_path
+    from zagg.windows import SCHEDULE_NONE_TOKEN, split_leaf_name, validate_label
+
+    node, _sep, bare = shard_leaf_path("", morton_word(decimal)).strip("/").rpartition("/")
+    own_id = bare.removesuffix(".zarr")
+    labels = set()
+    for prefix in obstore.list_with_delimiter(store, node + "/")["common_prefixes"]:
+        name = str(prefix).rstrip("/").rsplit("/", 1)[-1]
+        try:
+            if name.endswith(COLUMN_SUFFIX):
+                label = validate_label(name.removesuffix(COLUMN_SUFFIX))
+            else:
+                full_id, label = split_leaf_name(name)
+                if full_id != own_id:
+                    continue
+        except ValueError:
+            continue  # a child digit, another leaf, or foreign debris
+        if label is not None and label != SCHEDULE_NONE_TOKEN:
+            labels.add(label)
+    return labels
 
 
 class _ColumnWindowSources(_WindowSources):

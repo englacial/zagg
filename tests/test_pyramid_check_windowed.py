@@ -877,6 +877,17 @@ class TestARosterThatUnderstatesTheStore:
         )
         assert validate_pyramid(str(store), full=True, roster="list")["passed"]
 
+    def test_a_window_column_the_run_records_lost_still_counts_toward_the_member(self, store):
+        # The writer folds every window the shard HAS (one LIST), so the
+        # member's coverage is judged against the store, not the roster: the
+        # lost 2020 record is the materialization finding, never a STALE member.
+        _drop_records(store, lambda row: row["window"] != "2020")
+        report = validate_pyramid(str(store), full=True)
+        assert report["all_time_columns"]["checked"] == 3
+        assert report["all_time_columns"]["stale"] == []
+        found = report["checks"]["all_time"]["mismatches"]
+        assert not any("all.pyramid.zarr" in m for m in found), found
+
     def test_a_shard_the_run_records_lost_fails_against_the_coverage_moc(self, store):
         key = _shard(SITES[2])
         _drop_records(store, lambda row: int(row["shard_key"]) != key)
