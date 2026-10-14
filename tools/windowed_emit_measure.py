@@ -87,15 +87,22 @@ def stage_tier_gb() -> float:
     """The memory tier a staged sweep's invokes are priced at when their own
     record names none, in GB.
 
-    Read off the library the dispatcher routes them with
+    Read off the library the dispatcher routes them with BY DEFAULT
     (:data:`zagg.runner.STAGE_SWEEP_WORKER`, the leaf tier since issue #659),
     so the readout prices what a run on this release goes to rather than a
     tier pinned here (espg ruling, 2026-10-13, on PR #664 question (1)). It is
     a FALLBACK: a record that names its own tier is priced from it
-    (:func:`_invoke_gb_seconds`). The accepted consequence of the ruling is
-    what is left over — a readout of the issue #586 campaign's runs, whose
-    records predate the field and which did go to the 8 GB stopgap,
-    under-prices their ladder.
+    (:func:`_invoke_gb_seconds`).
+
+    "By default" is the whole caveat: ``ZAGG_LAMBDA_STAGE_FUNCTION_NAME`` wins
+    verbatim over this constant
+    (:func:`zagg.runner._resolve_stage_function_name`), so a run an operator
+    pinned to another variant AND whose records predate ``lambda_memory_mb``
+    is priced at the default tier rather than its own. A record that names its
+    tier is immune — which is what the issue #667 field is for. The accepted
+    consequence of the ruling is what is left over: a readout of the issue
+    #586 campaign's runs, whose records predate the field and which did go to
+    the 8 GB stopgap, under-prices their ladder.
     """
     from zagg.runner import STAGE_SWEEP_WORKER
 
