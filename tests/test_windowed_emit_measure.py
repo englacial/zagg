@@ -495,6 +495,27 @@ def test_a_timed_out_invoke_is_billed_the_function_wall(tmp_path):
     )
 
 
+def test_each_stage_invoke_is_priced_from_its_own_record(tmp_path):
+    """Issue #667: an invoke whose record names its tier is priced from it,
+    and one whose record predates the field falls back to what the dispatcher
+    routes to — so a store holding runs from both tiers prices each at its own."""
+    root = _store(tmp_path, windows=None)
+    tier = tool.stage_tier_gb()
+    status = Path(root + ".status") / "run-stage-20260101T000100Z-abcdef"
+    for name in ("stage-03-0000.json", "stage-00-0000.json"):
+        rec = json.loads((status / name).read_text())
+        rec["lambda_memory_mb"] = 8192  # the issue #586 campaign's stopgap tier
+        (status / name).write_text(json.dumps(rec))
+    measured = tool.measure(root, store_kwargs={}, accuracy=False)
+    older, latest = measured["stage_runs"]["runs"]
+    # the two stamped invokes at 8 GB; the finisher's record names no tier
+    assert latest["gb_seconds"] == (30.0 + 40.0) * 8.0 + 2.0 * tier
+    assert latest["worker_s"] == 70.0 and latest["finisher_s"] == 2.0  # walls, untiered
+    # the older run is campaign-era throughout: every invoke falls back
+    assert older["gb_seconds"] == 99.0 * tier
+    assert measured["cost"]["stage_gb_seconds"] == latest["gb_seconds"] + 99.0 * tier
+
+
 def test_the_tree_is_leaf_driven_not_parquet_driven(tmp_path):
     # A failed shard writes no leaf and a stale-worker / inexact parquet key
     # names no node: neither changes what the LIST says.
@@ -575,3 +596,13 @@ def test_billed_gb_seconds_prefers_the_record_and_recomputes_the_rest():
     assert tool._billed_gb_seconds(invokes) == 1.0 + 40.0 + 200.0
     assert tool._billed_gb_seconds(invokes.iloc[:0]) is None
     assert tool._billed_gb_seconds(pd.DataFrame({"n_obs": [1]})) is None
+
+
+def test_a_stage_invoke_without_a_tier_falls_back_without_error():
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": 8192}, 4.0) == 80.0
+    # absent (a record predating issue #667) and null (off-Lambda, nothing
+    # billed it) both fall back rather than raise or price at zero
+    assert tool._invoke_gb_seconds({"duration_s": 10.0}, 4.0) == 40.0
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": None}, 4.0) == 40.0
+    # an absent finisher is the empty dict the loader hands back: no wall, no cost
+    assert tool._invoke_gb_seconds({}, 4.0) == 0.0

@@ -30,9 +30,10 @@ Given one or more hive store roots — the arms of one order-6 cell built with
   included (``duration_total_s x`` the invoke's memory, falling back to the
   self-reported ``gb_seconds``; a timed-out invoke with no recorded wall at
   ``FUNCTION_TIMEOUT_S`` x its memory, as Lambda bills it), the
-  stage runs' (``duration_s x`` the stage tier the dispatcher routes to,
-  :func:`stage_tier_gb`) and the finisher's, priced at
-  ``zagg.dispatch.LAMBDA_PRICE_PER_GB_SEC``.
+  stage runs' and the finisher's (each invoke's ``duration_s x`` the tier its
+  OWN record names, ``lambda_memory_mb``, falling back to the tier the
+  dispatcher routes to — :func:`stage_tier_gb` — for a record that predates
+  the field), priced at ``zagg.dispatch.LAMBDA_PRICE_PER_GB_SEC``.
 
 An arm that does not fit one invoke per shard is re-run with
 ``output.windowing.unit: window`` into its OWN store
@@ -83,18 +84,37 @@ FALLBACK_CHUNK = {"bytes_per_chunk": 16_384, "index_bytes": 4_100, "chunks": 256
 
 
 def stage_tier_gb() -> float:
-    """The memory tier a staged sweep's invokes are priced at, in GB.
+    """The memory tier a staged sweep's invokes are priced at when their own
+    record names none, in GB.
 
     Read off the library the dispatcher routes them with
     (:data:`zagg.runner.STAGE_SWEEP_WORKER`, the leaf tier since issue #659),
     so the readout prices what a run on this release goes to rather than a
-    tier pinned here (espg ruling, 2026-10-13, on PR #664 question (1)). The
-    accepted consequence: a readout of the issue #586 campaign's runs, which
-    did go to the 8 GB stopgap, under-prices their ladder.
+    tier pinned here (espg ruling, 2026-10-13, on PR #664 question (1)). It is
+    a FALLBACK: a record that names its own tier is priced from it
+    (:func:`_invoke_gb_seconds`). The accepted consequence of the ruling is
+    what is left over — a readout of the issue #586 campaign's runs, whose
+    records predate the field and which did go to the 8 GB stopgap,
+    under-prices their ladder.
     """
     from zagg.runner import STAGE_SWEEP_WORKER
 
     return STAGE_SWEEP_WORKER["memory"] / 1024.0
+
+
+def _invoke_gb_seconds(rec: dict, fallback_gb: float) -> float:
+    """One stage invoke's billed GB-seconds, off its own record.
+
+    ``duration_s`` times the tier the record names (``lambda_memory_mb``,
+    issue #667 — the stage record's half of this, beside the leaf row's), so a
+    run is priced at what it actually ran on and a store holding runs from two
+    tiers prices each at its own. ``fallback_gb`` prices a record that carries
+    no tier: the key is absent on a campaign-era record (it predates the
+    field) and ``null`` on an off-Lambda pass (which nothing billed).
+    """
+    mb = rec.get("lambda_memory_mb")
+    tier = float(mb) / 1024.0 if mb else fallback_gb
+    return float(rec.get("duration_s") or 0.0) * tier
 
 
 def _store(store_root: str, store_kwargs: dict):
@@ -581,7 +601,12 @@ def ladder_numbers(store) -> dict:
 
 
 def _stage_run(status, prefix: str, workers: int) -> dict:
-    """One fleet stage run's records under ``<store>.status/run-stage-*/``."""
+    """One fleet stage run's records under ``<store>.status/run-stage-*/``.
+
+    ``gb_seconds`` is the run's billed total, invoke by invoke off each
+    record's own tier (:func:`_invoke_gb_seconds`), the finisher included;
+    ``worker_s`` / ``finisher_s`` stay the plain wall sums beside it.
+    """
     import obstore
 
     names = sorted(
@@ -643,6 +668,8 @@ def _stage_run(status, prefix: str, workers: int) -> dict:
         per_order.append(row)
     worker_s = sum(float(r.get("duration_s") or 0.0) for r in records)
     finisher_s = float(finisher.get("duration_s") or 0.0)
+    tier = stage_tier_gb()
+    billed = sum(_invoke_gb_seconds(r, tier) for r in (*records, finisher))
     return {
         "run_id": prefix.rstrip("/").removeprefix("run-"),
         "pipeline_run_id": finisher.get("pipeline_run_id")
@@ -654,7 +681,7 @@ def _stage_run(status, prefix: str, workers: int) -> dict:
         "short_orders": finisher.get("short_orders"),
         "worker_s": worker_s,
         "failed": sum(r["failed"] for r in per_order),
-        "gb_seconds": (worker_s + finisher_s) * stage_tier_gb(),
+        "gb_seconds": billed,
         "per_order": per_order,
     }
 
@@ -688,8 +715,8 @@ def stage_run_numbers(store_root: str, store_kwargs: dict, workers: int = 32) ->
 
 def cost_numbers(fleet: dict, stages: dict) -> dict:
     """GB-seconds and USD: the leaf fan-out (billed where recorded), every stage
-    run's invokes and finisher at the stage tier (:func:`stage_tier_gb`), and
-    the sum."""
+    run's invokes and finisher at the tier each one's record names
+    (:func:`_invoke_gb_seconds`), and the sum."""
     from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
 
     leaf = fleet.get("billed_gb_seconds")
