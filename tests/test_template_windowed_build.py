@@ -25,11 +25,14 @@ counts showing every leaf landed, and a key-for-key match against a
 guard-off permissive build, since a skipped block and a deleted one both
 leave no object. That twin shares the guarded build below rather than
 building its own, because a second guarded strata build costs about 116 s of
-CPU on a 4-vCPU runner while this module's own wall stays far under the
-suite's parallel wall, so it is not the critical path (issue #669, measured
-in PR #670). The strata param therefore always builds its permissive twin,
-even when one test is selected. Only the refused-write cases (issue #651)
-need builds of their own, and they are in ``test_template_windowed_refused``.
+CPU on a 4-vCPU runner, and with every worker busy it is total CPU, not the
+duration of the slowest module, that the parallel wall is made of (issue
+#669, measured in PR #670). No claim is made here about when this module
+starts: xdist dispatches file scopes by descending item count, so a 16-item
+module lands late in the queue and can itself be on the critical path. The
+strata param therefore always builds its permissive twin, even when one test
+is selected. Only the refused-write cases (issue #651) need builds of their
+own, and they are in ``test_template_windowed_refused``.
 """
 
 from __future__ import annotations
