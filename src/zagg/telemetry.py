@@ -127,6 +127,9 @@ _EQ_OR_NONE_KEYS = (
     # existence must be discoverable without a tree listing. Named
     # ``leaf_column``, not ``column`` — see _ROW_SCALARS below.
     "leaf_column",
+    # Store-error class (issue #651): per-leaf, so a rollup across leaves
+    # collapses it; ``merge([r])`` stays ``r``.
+    "store_error_class",
     # Icechunk companion refs record (issue #580): per-leaf by definition —
     # one commit per leaf — so a rollup collapses it to None like the O11
     # record above.
@@ -478,6 +481,10 @@ def build_record(
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "success": not error,
         "error": str(error) if error else None,
+        # The leaf seam's three-valued class of ``error`` (issue #651): ridden
+        # off the window meta so the run parquet can tell a refusal from a
+        # fault; ``None`` for a clean unit and for every non-leaf record.
+        "store_error_class": metadata.get("store_error_class"),
         "invoked_by": dict(invoked_by) if invoked_by else None,
     }
 
@@ -651,6 +658,10 @@ _ROW_SCALARS = (
     "timestamp",
     "success",
     "error",
+    # The leaf write's store-error class (issue #651): ``store-fatal`` /
+    # ``transient`` / ``benign``, its own column — ``error_class`` below keeps
+    # the exception type name the dispatcher's failure rows carry.
+    "store_error_class",
 )
 
 
@@ -663,7 +674,9 @@ def flatten_record(record: dict, *, retries=None, error_class=None) -> dict:
     ``invoked_by`` (the ARN) + ``invoked_by_userid``. ``retries`` is the
     dispatcher's attempt count for the shard; ``error_class`` defaults to the
     error string's leading token (callers with the real exception type pass
-    it explicitly).
+    it explicitly). ``store_error_class`` (issue #651) is a separate column:
+    the leaf write's ``store-fatal`` / ``transient`` / ``benign`` class, copied
+    off the record like the other scalars.
     """
     row = {key: record.get(key) for key in _ROW_SCALARS}
     error = record.get("error")

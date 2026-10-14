@@ -58,6 +58,14 @@ import numpy as np
 import zarr
 from zarr.errors import GroupNotFoundError
 
+from zagg.dispatch import (
+    BENIGN_ERRORS,
+    STORE_BENIGN,
+    STORE_FATAL,
+    STORE_TRANSIENT,
+    StoreFatalError,
+    classify_store_error,
+)
 from zagg.store import open_object_store, put_object
 from zagg.windows import leaf_name, split_leaf_name, union_time_range
 
@@ -2271,6 +2279,7 @@ class _LeafUnit:
                 # coherent metadata dict to build its failure record from.
                 logger.error(f"leaf column write failed for shard {shard_key}: {e}")
                 metadata["error"] = f"leaf column: {e}"
+                metadata["store_error_class"] = classify_store_error(e)
                 metadata["column_error"] = str(e)
             else:
                 if column is not None:
@@ -2607,43 +2616,69 @@ def _process_windows(
             todo = [{**w, "granules": [at[i] for i in w["granules"]]} for w in todo]
 
         def _emit(w, aggregate):
-            # One window's failure (a write PUT, its own spill reduce, the
-            # legacy-over-versioned refusal) is that window's error, the way a
-            # failed fan-out unit costs only its leaf: the windows already
-            # landed keep their metadata (and so their records and sidecars),
-            # and the rest still run. A failure of the shared read raised
-            # before any window emits, and still fails the invoke.
+            # One window's failure (a write PUT, its own spill reduce) is that
+            # window's error, the way a failed fan-out unit costs only its
+            # leaf: the windows already landed keep their metadata (and so
+            # their records and sidecars), and the rest still run. A failure
+            # of the shared read raised before any window emits, and still
+            # fails the invoke. The exception is a STORE-FATAL error (issue
+            # #651: a refusal the store repeats for every window -- a 4xx, a
+            # body the client could not parse, a schema refusal): recorded
+            # the same way, then raised through the worker's loop so the
+            # remaining windows are never aggregated into the 900 s wall.
+            # Store-fatal comes only from an exception in hand (here, or the
+            # column report ``finish`` classifies): a RETURNED error is the
+            # worker's no-data channel, whose text can carry a source read's
+            # 403 exemplar, so it is benign or transient, never fatal.
             unit = units[w["label"]]
             try:
-                metas[w["label"]] = unit.finish(aggregate(**unit.sinks()))
+                meta = unit.finish(aggregate(**unit.sinks()))
             except Exception as e:
                 logger.exception(f"shard {shard_key} window {w['label']} failed: {e}")
-                metas[w["label"]] = {
+                meta = {
                     "shard_key": int(shard_key),
                     "window": w["label"],
                     "cells_with_data": 0,
                     "total_obs": 0,
                     "granule_count": len(unit.granule_urls),
                     "error": f"{type(e).__name__}: {e}",
+                    "store_error_class": classify_store_error(e),
                 }
+            if meta.get("error") and not meta.get("store_error_class"):
+                benign = meta["error"] in BENIGN_ERRORS
+                meta["store_error_class"] = STORE_BENIGN if benign else STORE_TRANSIENT
+            metas[w["label"]] = meta
+            if meta.get("store_error_class") == STORE_FATAL:
+                raise StoreFatalError(f"window {w['label']}: {meta['error']}")
 
-        _df_out, base = process_shard(
-            grid,
-            int(shard_key),
-            granule_urls,
-            time_range_of=windowing["time_field"],
-            windows=todo,
-            time_field=windowing["time_field"],
-            emit_window=_emit,
-            # One temporal record per window leaf (issue #575): each window's
-            # accumulator sees that window's binned observations alone.
-            temporal_out={w["label"]: units[w["label"]].temporal_acc for w in todo}
-            if leaf_temporal.armed(config)
-            else None,
-            **shard_kwargs,
-        )
+        try:
+            _df_out, base = process_shard(
+                grid,
+                int(shard_key),
+                granule_urls,
+                time_range_of=windowing["time_field"],
+                windows=todo,
+                time_field=windowing["time_field"],
+                emit_window=_emit,
+                # One temporal record per window leaf (issue #575): each
+                # window's accumulator sees that window's binned observations
+                # alone.
+                temporal_out={w["label"]: units[w["label"]].temporal_acc for w in todo}
+                if leaf_temporal.armed(config)
+                else None,
+                **shard_kwargs,
+            )
+        except StoreFatalError as e:
+            # The invoke ends here (issue #651): the windows not yet emitted
+            # are named, not aggregated -- no leaf, no column fold, no refs
+            # for them -- and the windows that landed keep their stamps. The
+            # read-phase metadata went with the raise; ``base`` is the
+            # skeleton, and the error rides the failed window's meta.
+            left = [w["label"] for w in todo if w["label"] not in metas]
+            logger.error(f"shard {shard_key}: {e}; {len(left)} windows not attempted")
+            base["windows_unattempted"] = left
     base["duration_s"] = time.time() - t0
-    return _shard_meta(base, [metas[w["label"]] for w in windows])
+    return _shard_meta(base, [metas[w["label"]] for w in windows if w["label"] in metas])
 
 
 def _shard_meta(base: dict, window_metas: list) -> dict:
@@ -2653,11 +2688,11 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     invoke's, so a per-leaf record's fleet-safety columns describe the invoke
     that produced it), and every written one with ``unit_windows``; the shard meta carries the
     window-independent fields once, the sums, the time-range union, the
-    first failed window's error (a benign no-data window is not a failure),
-    and ``current`` / ``refused`` only when
-    every window skipped that way.
+    failed window's error with its ``store_error_class`` (issue #651; the
+    store-fatal window that ended the invoke when there is one, else the
+    first failed; a benign no-data window is not a failure), and
+    ``current`` / ``refused`` only when every window skipped that way.
     """
-    from zagg.dispatch import BENIGN_ERRORS
     from zagg.windows import union_time_range
 
     n = len(window_metas)
@@ -2683,11 +2718,13 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
     # benign string, so the whole-shard case still classifies as no data.
     failed = [m for m in written if m.get("error") and m["error"] not in BENIGN_ERRORS]
     if failed:
-        first = failed[0]
+        first = next((m for m in failed if m.get("store_error_class") == STORE_FATAL), failed[0])
         more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
+        meta["store_error_class"] = first.get("store_error_class") or STORE_TRANSIENT
     elif written and all(m.get("error") for m in written):
         meta["error"] = written[0]["error"]
+        meta["store_error_class"] = STORE_BENIGN
     # The union, like the sums, is of the windows that landed — and it is what
     # the dispatcher's root-coverage union reads per window (runner._landed_coverage).
     time_range = union_time_range(*(m.get("time_range") for m in written if not m.get("error")))

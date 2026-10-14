@@ -576,6 +576,34 @@ class TestStatusPoller:
         assert fired == [1000.0, 1002.0, 1006.0, 1014.0]
         poller.shutdown(wait=True)
 
+    def test_a_store_fatal_status_is_terminal_and_names_its_class(self):
+        # Issue #651: the worker ended its invoke on a refusal the store would
+        # repeat; the status object is ``failed`` with the class explicit, the
+        # result dict carries it, and the shard is never re-dispatched
+        # (class (a) above, said by name for #652's breaker and the readouts).
+        store = MemoryStore()
+        fired: list[int] = []
+        poller = self._poller(store, max_retries=3)
+        fut = poller.register(7, "7", dispatch=lambda: fired.append(1))
+        error = "window 2019: GenericError: Generic S3 error: Got invalid DeleteObjects response"
+        _put_status(
+            store,
+            7,
+            status="failed",
+            error=error,
+            status_code=500,
+            body={
+                "error": error,
+                "store_error_class": "store-fatal",
+                "windows_unattempted": ["2020"],
+            },
+        )
+        poller.start()
+        result = fut.result(timeout=5)
+        poller.shutdown(wait=True)
+        assert result["error"] == error and result["store_error_class"] == "store-fatal"
+        assert result["retries"] == 0 and fired == [1]
+
     def test_default_failure_resolution_is_a_result_dict(self):
         # agg's mode: no on_failed -> the terminal failure resolves as the
         # v1-shaped result dict (the accumulator records it), never an exception.
@@ -1400,6 +1428,22 @@ class TestD8Audit:
         # tail marker, riding the stats invoke.
         assert "finalize" in [m for m in stub.modes() if m]
         assert puts == [ct.TAIL_NAME]
+
+
+def test_build_shard_status_carries_the_store_error_class_off_the_body():
+    # The worker half (issue #651): the class rides the body into the status
+    # object's own key -- a ``store-fatal`` unit is ``failed``, and a clean
+    # body carries ``None`` so the key is always present.
+    event = {"run_id": "r", "store_path": "s3://b/x.zarr", "shard_key": 5}
+    body = {"error": "window 2019: refused", "store_error_class": "store-fatal"}
+    _key, obj = ct.build_shard_status(event, _envelope(body, status=500))
+    assert (obj["status"], obj["store_error_class"], obj["body"]["store_error_class"]) == (
+        "failed",
+        "store-fatal",
+        "store-fatal",
+    )
+    _key, obj = ct.build_shard_status(event, _envelope({"total_obs": 1}))
+    assert (obj["status"], obj["store_error_class"]) == ("ok", None)
 
 
 def test_rows_from_status_reads_both_object_shapes(tmp_path):
