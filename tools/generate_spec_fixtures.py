@@ -719,8 +719,15 @@ def build(
     print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells")
 
 
-def _column_expected(column_dir: Path, basename: str) -> dict:
-    """The committed §4.6 column record: attrs, decoded groups, O11 hashes."""
+def _column_expected(column_dir: Path, basename: str, *, companions: bool = False) -> dict:
+    """The committed §4.6 column record: attrs, decoded groups, O11 hashes.
+
+    ``companions`` also decodes each approximate field's §9/§8.3 channels
+    (``{name}_locations``/``_times``, typed by their ``ragged`` element) into
+    the record, one list of decimal strings per cell, so the words are pinned
+    on decoded values and not only by hash (the ``windowed/`` fixture; the
+    older fixtures' records stay as published).
+    """
     import zarr
 
     store = zarr.storage.LocalStore(str(column_dir))
@@ -744,6 +751,14 @@ def _column_expected(column_dir: Path, basename: str) -> dict:
                 ]
             elif meta["class"] == "exact":
                 record[name] = [v.item() for v in group[name][:]]
+            for channel in (f"{name}_locations", f"{name}_times") if companions else ():
+                if meta["class"] != "approximate" or channel not in group:
+                    continue
+                element = np.dtype(group[channel].attrs["ragged"]["element"]["dtype"])
+                record[channel] = [
+                    [str(v) for v in np.frombuffer(bytes(p), element.newbyteorder("<"))]
+                    for p in group[channel][:]
+                ]
         groups[res] = record
     return {
         "object": basename,
@@ -2298,8 +2313,10 @@ def build_windowed(out: Path) -> None:
     leaf_rel = hive.shard_leaf_path("", shard, window=WINDOWED_LABEL).lstrip("/")
     assert not (out / leaf_rel / grid.group_path / "morton").exists()
     node_dir = (out / leaf_rel).parent
-    window_column = _column_expected(node_dir / "2019.pyramid.zarr", "2019.pyramid.zarr")
-    all_time = _column_expected(node_dir / "all.pyramid.zarr", "all.pyramid.zarr")
+    window_column = _column_expected(
+        node_dir / "2019.pyramid.zarr", "2019.pyramid.zarr", companions=True
+    )
+    all_time = _column_expected(node_dir / "all.pyramid.zarr", "all.pyramid.zarr", companions=True)
     # The §4.6 carve-out, asserted at build time: one more merge from raw
     # than the window member at every group, the token, the counters, and a
     # one-window fold that is the identity on the window's values.

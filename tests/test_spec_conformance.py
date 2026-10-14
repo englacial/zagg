@@ -2912,6 +2912,15 @@ class TestDerivedCellCoordinate:
             np.testing.assert_array_equal(member["count"][:], window["count"][:])
             for name in ("h_tdigest", "h_tdigest_locations"):
                 assert [bytes(p) for p in member[name][:]] == [bytes(p) for p in window[name][:]]
+            # The §9 location words, decoded from the member's bytes (uint64
+            # LE per the array's ``ragged`` element), are the record's.
+            assert member["h_tdigest_locations"].attrs["ragged"]["element"]["dtype"] == "uint64"
+            words = [
+                [str(w) for w in np.frombuffer(bytes(p), "<u8")]
+                for p in member["h_tdigest_locations"][:]
+            ]
+            assert words == want["h_tdigest_locations"]
+            assert any(words)
 
     def test_the_unwindowed_fixtures_still_store_theirs(self):
         # The other half of the rule: every unwindowed leaf keeps its array,
