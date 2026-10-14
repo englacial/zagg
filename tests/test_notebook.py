@@ -725,6 +725,16 @@ class TestCliDispatchFlag:
         cli, seen = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"])
         cli.main()
         assert seen["dispatch"] is None
+        assert seen["invocation"] == "async"  # the default is unchanged
+
+    def test_invocation_event_carries_the_knobs_to_the_poller_path(self, monkeypatch, capsys):
+        # The only path the ramp/breaker act on (PR #665 review): the CLI can
+        # now select it, and both kwargs reach agg together.
+        argv = ["zagg", "--config", "c.yaml", "--invocation", "event", "--dispatch"]
+        cli, seen = self._drive(monkeypatch, [*argv, "ramp.start=250"])
+        cli.main()
+        assert seen["invocation"] == "event"
+        assert seen["dispatch"] == {"ramp": {"start": 250}}
 
     @pytest.mark.parametrize("flag", ["ramp.cap=1", "canary.size=8", "ramp.start"])
     def test_a_bad_knob_is_refused_before_agg(self, monkeypatch, capsys, flag):

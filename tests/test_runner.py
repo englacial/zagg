@@ -85,6 +85,33 @@ class TestDispatchKnob:
         with pytest.raises(ValueError, match=re.escape("dispatch.ramp: unknown key(s)")):
             agg(atl06_config, backend="local", dispatch={"ramp": {"begin": 1}})
 
+    @pytest.mark.parametrize(
+        ("backend", "invocation", "warns"),
+        [("local", "async", True), ("lambda", "async", True), ("lambda", "event", False)],
+    )
+    def test_knobs_off_the_event_path_warn_before_the_run(
+        self, monkeypatch, caplog, atl06_config, backend, invocation, warns
+    ):
+        # Only the Event poller paces (issue #652, PR #665 review): any other
+        # run says so up front, naming the knob, instead of after the spend.
+        from zagg import runner
+
+        monkeypatch.setattr(runner.SpatialStrategy, "run", lambda self, config, **kw: {})
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            agg(atl06_config, backend=backend, invocation=invocation, dispatch={"ramp": {}})
+        hit = [r for r in caplog.records if "dispatch knobs ignored" in r.getMessage()]
+        assert bool(hit) is warns
+        if warns:
+            assert "invocation='event'" in hit[0].getMessage()
+
+    def test_no_knobs_no_warning(self, monkeypatch, caplog, atl06_config):
+        from zagg import runner
+
+        monkeypatch.setattr(runner.SpatialStrategy, "run", lambda self, config, **kw: {})
+        with caplog.at_level("WARNING", logger="zagg.runner"):
+            agg(atl06_config, backend="local")
+        assert "dispatch knobs ignored" not in caplog.text
+
 
 class TestAggValidatesConfig:
     """``agg`` is the single ``validate_config`` choke point (issue #485).

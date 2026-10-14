@@ -101,8 +101,17 @@ examples:
         "ramp.start ramp.factor ramp.cap ramp.window ramp.tolerance, "
         "breaker.timeout_ratio breaker.wall_fraction breaker.store_fatal "
         "breaker.store_fatal_first. Defaults: ramp 500 -> 1000 (x2, window 50, "
-        "tolerance 1.2); breaker 0.20 / 0.85 / 3 of the first 20. Honored by "
-        "--backend lambda on the event transport.",
+        "tolerance 1.2); breaker 0.20 / 0.85 / 3 of the first 20; a repeated key "
+        "keeps the last value. Honored only by --backend lambda with "
+        "--invocation event; any other run warns and ignores it.",
+    )
+    parser.add_argument(
+        "--invocation",
+        choices=["async", "sync", "event"],
+        default="async",
+        help="Lambda transport (issues #151/#327): async (default, per-shard "
+        "result objects), sync (RequestResponse), or event (the status-poller "
+        "fan-out). The --dispatch ramp and circuit breaker act on event only.",
     )
     parser.add_argument(
         "--yes",
@@ -176,6 +185,7 @@ examples:
         output_credentials=output_credentials,
         output_endpoint_url=output_endpoint_url,
         profile=args.profile,
+        invocation=args.invocation,
         dispatch=dispatch,
     )
 

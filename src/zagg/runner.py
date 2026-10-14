@@ -429,8 +429,15 @@ def agg(
     # than a false refusal.
     validate_config(config)
     # The dispatch knobs (issue #652) are refused on every backend before the
-    # catalog is read; only the Event poller consumes them.
+    # catalog is read; only the Event poller consumes them, so any other run
+    # says so before it spends (the knob to flip named).
     GuardConfig.from_dict(dispatch)
+    if dispatch is not None and not (backend == "lambda" and invocation == "event"):
+        logger.warning(
+            f"dispatch knobs ignored: the ramp and circuit breaker act only on "
+            f"backend='lambda' with invocation='event' (this run: backend={backend!r}, "
+            f"invocation={invocation!r}) (issue #652)"
+        )
 
     # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
     # is dispatch-level: the spatial path is the existing code, moved verbatim
