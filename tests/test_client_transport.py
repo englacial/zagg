@@ -384,6 +384,29 @@ class TestEventDispatch:
 # -- StatusPoller unit behavior --------------------------------------------------
 
 
+class _RecordingStop:
+    """Stands in for the poller's stop Event, so _run needs no wall clock.
+
+    Records the interval ``_run`` would have slept and ends the loop after
+    ``n_ticks`` iterations, which makes ``_run`` a pure function of an injected
+    clock: the backoff clamp's observable is the value it passes to
+    ``self._stop.wait(...)``.
+    """
+
+    def __init__(self, n_ticks):
+        self.waits: list[float] = []
+        self._n = n_ticks
+
+    def is_set(self):
+        return len(self.waits) >= self._n
+
+    def set(self):
+        self._n = 0
+
+    def wait(self, interval):
+        self.waits.append(interval)
+
+
 class TestStatusPoller:
     @staticmethod
     def _poller(store, **kwargs):
@@ -563,6 +586,38 @@ class TestStatusPoller:
         poller._tick()
         assert fut.done()  # the tick resolved it: no wall clock left to wait on
         assert fut.result()["retries"] == 1
+
+    def test_run_never_oversleeps_an_armed_backoff(self):
+        # The clamp in _run (client_transport.py:923-926): `interval` is cut to
+        # an armed class-(c) stamp, so the idle-tick doubling cannot add up to
+        # _POLL_MAX_INTERVAL_S to every re-fire. _next_retry_wait() returning
+        # 2.0 is asserted above; that `interval` is actually clamped to it is
+        # asserted only here. Substituting the stop Event makes _run a pure
+        # function of the fake clock — no thread, no sleeping, no elapsed-time
+        # assertion, and no production change. Tick 1 faults and arms 2 s; the
+        # clock never advances, so the later ticks all sit inside that backoff,
+        # where the doubling would otherwise climb 2 -> 4 -> 8 toward the 15 s
+        # cap. The cadence is passed rather than taken from the module, because
+        # the autouse _fast_poll fixture pins it below the backoff, where the
+        # clamp has nothing to cut; these are the production constants.
+        store = MemoryStore()
+        now = {"t": 1000.0}
+
+        def flaky():
+            raise RuntimeError("TooManyRequestsException")
+
+        poller = ct.StatusPoller(
+            lambda: store,
+            drop_timeout_s=1e6,
+            max_retries=3,
+            initial_interval_s=2.0,
+            max_interval_s=15.0,
+            clock=lambda: now["t"],
+        )
+        poller.register(1, "1", dispatch=flaky)
+        poller._stop = _RecordingStop(3)
+        poller._run()
+        assert poller._stop.waits == [2.0, 2.0, 2.0]
 
     def test_throttled_invoke_backs_off_instead_of_bursting(self):
         # The medium-high from the PR #343 review: re-queueing without a
