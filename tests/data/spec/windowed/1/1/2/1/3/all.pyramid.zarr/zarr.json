@@ -1,0 +1,75 @@
+{
+  "attributes": {
+    "role": "column",
+    "zagg_column": {
+      "spec": "zagg-column/1",
+      "node": "11213",
+      "order": 4,
+      "source_cell_order": 6,
+      "window": "all",
+      "fields": {
+        "count": {
+          "class": "exact",
+          "method": "sum",
+          "nan_policy": "skip"
+        },
+        "h_tdigest": {
+          "class": "approximate",
+          "method": "tdigest_kway",
+          "delta": 16,
+          "overview_delta": 16,
+          "dtype": "float32",
+          "inner_shape": [
+            2
+          ]
+        }
+      },
+      "groups": {
+        "5": {
+          "regime": "leaf-column",
+          "merges_from_raw": 2,
+          "n_cells": 4
+        },
+        "4": {
+          "regime": "leaf-column",
+          "merges_from_raw": 2,
+          "n_cells": 1
+        }
+      },
+      "source_windows": {
+        "folded": 1,
+        "missing": 0,
+        "unreadable": 0
+      },
+      "cells_with_data_order": 5,
+      "generated_at": "2026-10-14T00:57:46+00:00"
+    },
+    "morton_hive_commit": {
+      "spec": "morton-hive/2",
+      "complete": true,
+      "cells_with_data": 3,
+      "granule_count": 1,
+      "written_at": "2026-10-14T00:57:46+00:00",
+      "window": "all",
+      "time_range": [
+        "2019-03-01T00:00:00+00:00",
+        "2019-09-01T00:00:00+00:00"
+      ],
+      "content_hashes": {
+        "arrays": {
+          "4/count": "c7929c9c12d5874a9169e0676c1425a1f0feaa58f23d173c625d5d2791e03d11",
+          "4/h_tdigest": "c074d2090ede770ce7fd312a2d98abf2ffe1032866028866bd5024422d813484",
+          "4/h_tdigest_locations": "464700b72f5e0e618b26d0890a1dd2e8a1a7255091e4cbdb7e3417303ce7930c",
+          "4/morton": "92cedd52796c6c0844af1ce3e7e7636ed28804f6bf8f9d10ceab93edf1a29805",
+          "5/count": "c4654f97d4d1c0e0bb78fb05b14d189fe8b4d5ec7921ff4acc0860952b9b8769",
+          "5/h_tdigest": "61e2dde0a3b263a7b4daf463d32b3686b8be9759c652e1800b1e8e800196b733",
+          "5/h_tdigest_locations": "13c93fd6f975f697e38a37d6bc0d19770d238f1b869059828805b6ce51680d99",
+          "5/morton": "2d7a07b3e2db265b2050fedfd968fb6763f5b012c87033526852bffc90b059d2"
+        },
+        "combined": "0a276c990f582574554b12ef81453b2dfe60268236015d60f84a17893facc1d5"
+      }
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

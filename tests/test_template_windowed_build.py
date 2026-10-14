@@ -193,6 +193,8 @@ def test_pyramid_check_passes(built, report):
     assert report["all_time_columns"] == {
         "declared": len(shards),
         "materialized": len(shards),
+        "checked": len(shards),
+        "stale": [],
         "missing": [],
     }
 

@@ -429,7 +429,18 @@ def validate_windowed(
             "--roster list to tell a broken sweep from a stale record"
         )
     _all_time_check(
-        harness, ladder, declared, probes, refs, groups, checks, report, all_time, full=full
+        harness,
+        ladder,
+        declared,
+        probes,
+        refs,
+        groups,
+        checks,
+        report,
+        all_time,
+        col_probes=col_probes,
+        entries=entries,
+        full=full,
     )
     if harness.warnings:
         report["warnings"] = list(dict.fromkeys([*report.get("warnings", []), *harness.warnings]))
@@ -801,21 +812,33 @@ def _node_window_labels(store, node: str) -> set:
 
 
 def _all_time_check(
-    harness, ladder, declared, probes, refs, groups, checks, report, all_time, *, full
+    harness,
+    ladder,
+    declared,
+    probes,
+    refs,
+    groups,
+    checks,
+    report,
+    all_time,
+    *,
+    col_probes,
+    entries,
+    full,
 ) -> None:
-    """Settle ``all_time``: the all-time member at every declared level (§4.4).
+    """Settle ``all_time``: the all-time member at every declared level (§4.4, §4.6).
 
     Declared, every ladder node that has a leaf beneath it in any window must
     carry a committed ``all.zarr`` (one GET each); ``sample_nodes`` of them
     per order (all in full mode) are then held to the fold's contract — see
     :func:`_all_time_node`. The declared LEAF-column levels have an all-time
-    member too — ``all.pyramid.zarr`` — which the ladder cannot see (``_ladder``
-    drops the leaf entry, whose node IS the shard order), so it is probed per
-    roster leaf and held to its recorded window and groups (issue #650).
-    Undeclared, there is nothing to hold: reported *not applicable*, after the
-    node probe, naming any committed fold found.
+    member too — ``all.pyramid.zarr`` beside the window columns (issues
+    #650/#649) — which the ladder cannot see (``_ladder`` drops the leaf
+    entry, whose node IS the shard order): :mod:`zagg.pyramid_check_alltime`
+    probes it per roster leaf and holds the committed ones to the §4.6
+    carve-out and the k-way fold of their window columns. Undeclared: *not
+    applicable*, after the node probe, naming any committed fold found.
     """
-    from zagg.column import COLUMN_ATTR, COLUMN_ROLE
     from zagg.store import open_object_store
     from zagg.sweep_overview import OVERVIEW_ATTR
     from zagg.sweep_stage import OVERVIEW_SPEC_V2
@@ -856,42 +879,15 @@ def _all_time_check(
         "materialized": len(committed),
         "missing": missing[:50],
     }
-    # Existence, role, the stamp, and the window/groups identity the text
-    # below claims; never the per-window ``merges_from_raw`` law beside it.
+    # The leaf-column tier's member (issues #650/#649): probed per roster leaf
+    # and, below, held to the §4.6 carve-out and to the fold of its windows.
+    from zagg.pyramid_check_alltime import all_time_columns_check, probe_members
+
     leaves = sorted({dec for dec, _w in refs})
-    col_probed, col_errored = _probe_nodes(harness.store_root, leaves, rel=_column_object_rel, **kw)
-    if col_errored:
-        checks["all_time"] = _entry(
-            "fail",
-            f"{len(col_errored)} all.pyramid.zarr probe error(s) — the all-time state of the "
-            f"leaf-column tier is UNKNOWN, not a verdict: "
-            f"{[f'{n}: {e}' for n, e in sorted(col_errored.items())][:3]}",
-        )
+    members, col_findings, unknown = probe_members(harness, leaves, report)
+    if unknown:
+        checks["all_time"] = _entry("fail", unknown)
         return
-    levels, base = report["leaf_levels"], harness.cell_order
-    col_missing = [n for n in leaves if not _committed(col_probed.get(n), COLUMN_ROLE)]
-    report["all_time_columns"] = {
-        "declared": len(leaves),
-        "materialized": len(leaves) - len(col_missing),
-        "missing": col_missing[:50],
-    }
-    column_finding = (
-        f"{len(col_missing)}/{len(leaves)} leaf/leaves carry no committed all.pyramid.zarr: "
-        f"{col_missing[:8]} — the declared leaf-column levels {levels} have NO all-time "
-        f"member, so the store's default view is missing them (issue #650; the base, cells "
-        f"{base}, is exempt — an all-time leaf IS the unwindowed store)"
-    )
-    col_findings = [column_finding] if col_missing else []
-    for dec in (n for n in leaves if n not in col_missing):
-        block = col_probed[dec].get(COLUMN_ATTR)
-        block = block if isinstance(block, dict) else {}
-        raw = block.get("groups")
-        got = sorted((int(g) for g in raw), reverse=True) if isinstance(raw, dict) else []
-        if block.get("window") != SCHEDULE_NONE_TOKEN or not set(levels) <= set(got):
-            col_findings.append(
-                f"{dec}: all.pyramid.zarr window {block.get('window')!r} / groups {got} is not "
-                f"the all-time fold of the leaf columns ({SCHEDULE_NONE_TOKEN!r}, covering {levels})"
-            )
     if not committed:
         checks["all_time"] = _entry(
             "fail",
@@ -936,6 +932,9 @@ def _all_time_check(
             )
     for message in sources.warnings:
         harness.warn(message)
+    col_findings += all_time_columns_check(
+        harness, leaves, members, col_probes, entries, groups, report, errors, counted, full=full
+    )
     found = [e for name in _VALUE_CHECKS for e in errors[name]]
     if missing:
         found.insert(
@@ -960,7 +959,10 @@ def _all_time_check(
         f"count, {counted['digests']} digest, {counted['composition']} composition "
         f"comparison(s) — with the §4.4 provenance (regime, merges_from_raw, source_windows, "
         f"source_children, generation); {len(leaves)} leaf/leaves carry the all-time member at "
-        f"the declared leaf-column levels {levels} (the base, cells {base}, is exempt)",
+        f"the declared leaf-column levels {report['leaf_levels']}, "
+        f"{report['all_time_columns']['checked']} "
+        f"checked against the k-way fold of their window columns with the §4.6 carve-out "
+        f"(the base, cells {harness.cell_order}, is exempt)",
     )
 
 

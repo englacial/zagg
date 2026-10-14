@@ -2843,6 +2843,76 @@ class TestDerivedCellCoordinate:
         assert manifest["pyramid"]["overviews"]
         assert manifest["pyramid"]["overview"]["all_time"] is True
 
+    def test_the_all_time_column_sits_beside_the_window_column(self):
+        # §4.6 "The all-time column" (issue #649): the windowed store's
+        # ``all.pyramid.zarr``, folded from its one window, pinned on bytes.
+        exp = _expected(self.NAME)
+        node = _leaf_dir(self.NAME, exp).parent
+        assert sorted(p.name for p in node.iterdir() if p.name.endswith(".pyramid.zarr")) == [
+            "2019.pyramid.zarr",
+            "all.pyramid.zarr",
+        ]
+        member, window = exp["all_time_column"], exp["column"]
+        assert member["object"] == "all.pyramid.zarr" and window["object"] == "2019.pyramid.zarr"
+        attrs = json.loads((node / member["object"] / "zarr.json").read_text())["attributes"]
+        assert attrs["role"] == "column" and attrs["zagg_column"] == member["zagg_column"]
+        block = attrs["zagg_column"]
+        assert block["spec"] == "zagg-column/1" and block["window"] == "all"
+        assert window["zagg_column"]["window"] == exp["window"]
+
+    def test_the_all_time_column_records_the_carve_out(self):
+        exp = _expected(self.NAME)
+        member, window = exp["all_time_column"]["zagg_column"], exp["column"]["zagg_column"]
+        # One more merge from raw than the window member at EVERY group: the
+        # 4/6 geometry has no raw-fold boundary, so 1 -> 2 at both.
+        assert sorted(member["groups"], key=int, reverse=True) == ["5", "4"]
+        assert {r: g["merges_from_raw"] for r, g in member["groups"].items()} == {"5": 2, "4": 2}
+        assert {r: g["merges_from_raw"] for r, g in window["groups"].items()} == {"5": 1, "4": 1}
+        for r, g in member["groups"].items():
+            assert g["regime"] == "leaf-column" and g["n_cells"] == window["groups"][r]["n_cells"]
+            assert "demotions" not in g  # present exactly when the rail fired
+        # The counters ride this artifact alone.
+        assert member["source_windows"] == {"folded": 1, "missing": 0, "unreadable": 0}
+        assert "source_windows" not in window
+        assert member["fields"] == window["fields"]
+
+    def test_the_all_time_stamp_names_the_token_and_the_window_extent(self):
+        exp = _expected(self.NAME)
+        node = _leaf_dir(self.NAME, exp).parent
+        stamp = json.loads((node / "all.pyramid.zarr" / "zarr.json").read_text())["attributes"][
+            "morton_hive_commit"
+        ]
+        assert {k: v for k, v in stamp.items() if k != "written_at"} == exp["all_time_column"][
+            "commit"
+        ]
+        assert stamp["spec"] == "morton-hive/2" and stamp["window"] == "all"
+        window = exp["column"]["commit"]
+        assert stamp["time_range"] == window["time_range"]
+        assert stamp["granule_count"] == window["granule_count"]
+        assert stamp["content_hashes"]["arrays"].keys() == window["content_hashes"]["arrays"].keys()
+        # The §5 record over the member's own arrays, recomputed from bytes.
+        assert (
+            TestContentHashes._hash_leaf(node / "all.pyramid.zarr")
+            == (stamp["content_hashes"]["arrays"])
+        )
+
+    def test_a_one_window_fold_is_the_identity_on_the_window_column(self):
+        # The close law over one window: the same count, the same digest
+        # payload and location words re-encoded unchanged (the k-way merge's
+        # single-contributor arm), at every group.
+        exp = _expected(self.NAME)
+        node = _leaf_dir(self.NAME, exp).parent
+        assert exp["all_time_column"]["groups"] == exp["column"]["groups"]
+        for res, want in exp["all_time_column"]["groups"].items():
+            member = zarr.open_group(LocalStore(str(node / "all.pyramid.zarr")), path=res, mode="r")
+            window = zarr.open_group(
+                LocalStore(str(node / "2019.pyramid.zarr")), path=res, mode="r"
+            )
+            assert [str(w) for w in member["morton"][:]] == want["morton"]
+            np.testing.assert_array_equal(member["count"][:], window["count"][:])
+            for name in ("h_tdigest", "h_tdigest_locations"):
+                assert [bytes(p) for p in member[name][:]] == [bytes(p) for p in window[name][:]]
+
     def test_the_unwindowed_fixtures_still_store_theirs(self):
         # The other half of the rule: every unwindowed leaf keeps its array,
         # key and bytes — no committed fixture moved (the FROZEN literals
