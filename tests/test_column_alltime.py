@@ -1233,6 +1233,71 @@ class TestIcechunkAllRow:
         assert reads == [emit._shard_word()] and leaf_reads == []
         assert record["missing"] == 0 and record["refs"] > 0
 
+    def test_a_column_only_node_relays_the_member_to_the_commit_above(self, monkeypatch, tmp_path):
+        # PR #666 review finding (6): with ``commit_order`` coarser than the
+        # finest dispatch order — the fleet's path — the leaf tuple's node
+        # writes a ref COLUMN, and the member's row-``all`` units travel
+        # through it to the node that commits.
+        from zagg import icechunk_ladder, icechunk_refs
+        from zagg.grids.morton import morton_decimal
+
+        cfg = emit._digest_cfg()
+        root, _summary = self._ladder(monkeypatch, tmp_path, cfg, commit_order=0)
+        dec = morton_decimal(emit._shard_word())
+        relayed = icechunk_ladder.read_node_refs(root, dec[:-3], store_kwargs={})
+        assert relayed is not None, "the order-3 node wrote no ref column"
+        assert (7, SCHEDULE_NONE_TOKEN) in {(u["level"], u["row"]) for u in relayed}
+        (member_unit,) = [u for u in relayed if (u["level"], u["row"]) == (7, SCHEDULE_NONE_TOKEN)]
+        assert sum(e["refs"] for e in member_unit["entries"]) > 0
+        repo = icechunk_refs.open_repo(root, store_kwargs={})
+        nodes = [s.message for s in repo.ancestry(branch="main") if s.message.startswith("node ")]
+        assert nodes == [f"node {dec[:-6]}"]  # ONE commit, at the root tuple's node
+        level, row, span = self._all_row(root, cfg)
+        member = _column_groups(_node(root) / "all.pyramid.zarr")[7]
+        assert member["count"].any()
+        np.testing.assert_array_equal(level["count"][row, span], member["count"])
+        assert [bytes(a) for a in level["h_tdigest"][row, span]] == [
+            bytes(b) for b in member["h_tdigest"]
+        ]
+
+    def test_an_append_recommits_the_all_row_to_the_new_member(self, monkeypatch, tmp_path):
+        # The every-append case: a second bulk run lands a new window, the
+        # member is re-folded, its carrier rewritten, and the node that
+        # closes over the shard commits the ``all`` row again.
+        cfg = emit._digest_cfg()
+        first, later = emit._records()[:1], emit._records()[1:2]  # 2018-2019, then 2020
+        root, _summary = self._ladder(monkeypatch, tmp_path, cfg, records=first)
+        level, row, span = self._all_row(root, cfg)
+        before = np.asarray(level["count"][row, span])
+        np.testing.assert_array_equal(
+            before, _column_groups(_node(root) / "all.pyramid.zarr")[7]["count"]
+        )
+        again, _summary = self._ladder(monkeypatch, tmp_path, cfg, records=later)
+        assert again == root
+        member = _column_groups(_node(root) / "all.pyramid.zarr")[7]
+        assert member["count"].sum() > before.sum()  # the member grew by the window
+        level, row, span = self._all_row(root, cfg)
+        np.testing.assert_array_equal(level["count"][row, span], member["count"])
+        assert [bytes(a) for a in level["h_tdigest"][row, span]] == [
+            bytes(b) for b in member["h_tdigest"]
+        ]
+        group, rows = self._repo(root)
+        for w in WINDOWS:  # every window row still reads its own column
+            column = _column_groups(_node(root) / f"{w}.pyramid.zarr")[7]
+            np.testing.assert_array_equal(group["7"]["count"][rows.index(w), span], column["count"])
+
+    def test_the_dispatcher_allocates_the_rows_the_leaf_commit_test_names(self):
+        # ``_init`` passes the rows by hand; this ties them to the run's own
+        # allocation (``runner._icechunk_rows`` over the expanded bulk unit).
+        from zagg.config import get_windowing
+        from zagg.runner import _icechunk_rows, _shard_window_units
+
+        cfg = emit._digest_cfg()
+        units = _shard_window_units(
+            [(emit._shard_word(), emit._records())], get_windowing(cfg), None
+        )
+        assert _icechunk_rows(cfg, units) == [*WINDOWS, SCHEDULE_NONE_TOKEN]
+
     def test_member_units_name_the_all_row_at_the_declared_column_levels(
         self, monkeypatch, tmp_path
     ):

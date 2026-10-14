@@ -193,6 +193,17 @@ def test_the_icechunk_all_row_reaches_the_leaf_column_levels(built):
             want = np.asarray(member[str(level)]["count"][:])
             assert want.any(), (shard, level)
             np.testing.assert_array_equal(got, want)
+            # The digest payloads too (PR #666 review finding (6)): the vlen
+            # arrays of the sharded levels 14-16 are where a wrong inner-chunk
+            # offset or length would land, and ``count`` would not show it.
+            digests = [k for k, _a in member[str(level)].arrays() if k.startswith("h_tdigest")]
+            payloads = 0
+            for field in digests:
+                stored = [bytes(b) for b in member[str(level)][field][:]]
+                payloads += any(stored)
+                via_repo = group[str(level)][field][rows.index(ALL_ROW), rank * n : (rank + 1) * n]
+                assert [bytes(a) for a in via_repo] == stored, (shard, level, field)
+            assert payloads, (shard, level, digests)  # some digest field holds bytes here
             for w in WINDOWS:
                 column = zarr.open_group(
                     open_store(f"{node}/{w}.pyramid.zarr"), mode="r", zarr_format=3
