@@ -1342,6 +1342,80 @@ class TestIcechunkAllRow:
         assert not (_node(root) / "all.pyramid.icechunk_refs.json").exists()
         assert icechunk_ladder.read_member_refs(root, emit._shard_word(), store_kwargs={}) is None
 
+    @pytest.mark.parametrize("outcome", ["error", "skipped"])
+    def test_a_rewritten_member_never_keeps_the_previous_carrier(
+        self, monkeypatch, tmp_path, outcome
+    ):
+        # PR #666 review finding (2): the rewrite drops the old carrier
+        # before the member moves, so a refs write that fails (or plans
+        # nothing) leaves the shard unindexed, never indexed stale.
+        from zagg import icechunk_refs
+
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": "ladder"}
+        root = str(tmp_path / "bulk")
+        self._init(cfg, root)
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        carrier = _node(root) / "all.pyramid.icechunk_refs.json"
+        assert carrier.exists()
+
+        def plan(*args, **kwargs):
+            if outcome == "error":
+                raise OSError("throttled HEAD")
+            return []
+
+        monkeypatch.setattr(icechunk_refs, "member_units", plan)
+        meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert meta["error"] is None and meta["all_time_column"] == "all.pyramid.zarr"
+        assert outcome in meta["icechunk_all_time"]
+        assert (_node(root) / "all.pyramid.zarr").exists() and not carrier.exists()
+
+    def test_a_clear_drops_the_carrier_before_the_member(self, monkeypatch, tmp_path):
+        # A member delete that fails half way must not leave a carrier over
+        # the wreck; a member without a carrier is merely unindexed.
+        import zagg.column as column
+        from zagg.column_alltime import clear_member
+
+        cfg = emit._digest_cfg()
+        cfg.output["icechunk"] = {"commit": "ladder"}
+        root = str(tmp_path / "bulk")
+        self._init(cfg, root)
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        carrier = _node(root) / "all.pyramid.icechunk_refs.json"
+        assert carrier.exists()
+
+        def refuse(*args, **kwargs):
+            assert not carrier.exists(), "the member was cleared before its carrier"
+            raise PermissionError("AccessDenied")
+
+        monkeypatch.setattr(column, "_clear_column", refuse)
+        with pytest.raises(PermissionError):
+            clear_member(root, emit._shard_word(), {})
+        assert (_node(root) / "all.pyramid.zarr").exists() and not carrier.exists()
+
+    def test_a_carrier_delete_is_silent_when_absent_and_warns_otherwise(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        import logging
+
+        import obstore
+
+        from zagg import icechunk_ladder
+
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, emit._digest_cfg(), root, fakes=emit._dense_fakes())
+        caplog.set_level(logging.WARNING, logger="zagg.icechunk_ladder")
+        caplog.clear()
+        icechunk_ladder.delete_member_refs(root, emit._shard_word(), store_kwargs={})
+        assert not caplog.records  # nothing to delete: the normal case
+
+        def denied(*args, **kwargs):
+            raise PermissionError("AccessDenied")
+
+        monkeypatch.setattr(obstore, "delete", denied)
+        icechunk_ladder.delete_member_refs(root, emit._shard_word(), store_kwargs={})  # fail-open
+        assert ["AccessDenied" in r.getMessage() for r in caplog.records] == [True]
+
     def test_a_shard_without_a_carrier_is_not_missing(self, monkeypatch, tmp_path):
         from zagg import icechunk_ladder, icechunk_refs
         from zagg.grids.morton import morton_decimal

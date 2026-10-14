@@ -367,20 +367,25 @@ def stored_window_labels(store_root: str, shard_key, store_kwargs: dict | None =
 
 
 def clear_member(store_root: str, shard_key, store_kwargs=None) -> None:
-    """Delete the shard's all-time column, its sidecar and its Icechunk refs carrier.
+    """Delete the shard's Icechunk refs carrier, then its all-time column and sidecar.
 
-    :func:`zagg.column._clear_column` under the token (the member and
-    ``all.pyramid.stats.json``), plus the carrier the bulk unit wrote for the
-    ladder's ``all`` row (:func:`zagg.icechunk_ladder.delete_member_refs`,
-    fail-open): refs to an object that is gone would be committed by the
-    next ladder run as dangling, so the carrier goes with the member.
+    The carrier the bulk unit wrote for the ladder's ``all`` row goes FIRST
+    (:func:`zagg.icechunk_ladder.delete_member_refs`, fail-open): refs to an
+    object that is gone would be committed by the next ladder run as
+    dangling, and :func:`zagg.column._clear_column` under the token (the
+    member and ``all.pyramid.stats.json``) is fail-closed and can raise half
+    way — a member left without its carrier is merely unindexed, a carrier
+    left over a half-deleted member is not. Cost: one DELETE for the carrier
+    on every clear, whether or not Icechunk is on (a carrier written while it
+    was must not survive it being turned off), on top of ``_clear_column``'s
+    own — so one more request per ``(shard, window)`` unit of a fan-out build.
     """
     from zagg.column import _clear_column
     from zagg.icechunk_ladder import delete_member_refs
 
     store_kwargs = dict(store_kwargs or {})
-    _clear_column(store_root, shard_key, None, store_kwargs)
     delete_member_refs(store_root, shard_key, store_kwargs=store_kwargs)
+    _clear_column(store_root, shard_key, None, store_kwargs)
 
 
 def record_member_refs(store_root: str, grid, config, shard_key, *, store_kwargs) -> dict:
@@ -394,7 +399,10 @@ def record_member_refs(store_root: str, grid, config, shard_key, *, store_kwargs
     node's commit gathers when it closes). Fail-open, never raises: the
     member is normative, the repo a regenerable index (D9); a failure logs
     and returns ``{"error"}``. Called only after the member was WRITTEN this
-    invoke — a current member keeps the refs it already has.
+    invoke — a current member keeps the refs it already has. Whatever this
+    returns, no PREVIOUS member's carrier stands when it does: the rewrite
+    dropped it first (:func:`close_shard`), so a failed or empty plan leaves
+    the shard without a carrier, never with a stale one.
     """
     try:
         from zagg.icechunk_ladder import write_member_refs
@@ -448,8 +456,15 @@ def close_shard(
     delimiter LIST of the node, one root GET per stored window column (and
     one store handle each), one for the member; a re-fold then reads every
     stored member array in fold blocks, re-validating the root around each.
+    A rewrite first drops the previous member's Icechunk refs carrier (one
+    DELETE, fail-open, whether or not Icechunk is on): the carrier indexes
+    the objects about to be replaced, so it is absent from before the member
+    moves until :func:`record_member_refs` writes the new one — a refs write
+    that then fails, plans nothing or never runs leaves no stale carrier for
+    the ladder to commit (PR #666 review finding (2), phase 4).
     """
     from zagg.column import leaf_column_plan
+    from zagg.icechunk_ladder import delete_member_refs
 
     store_kwargs = dict(store_kwargs or {})
     plan = leaf_column_plan(config, grid)
@@ -464,6 +479,7 @@ def close_shard(
     row = window_row(store_root, shard_key, labels, resident, store_kwargs=store_kwargs)
     if not fresh and member_current(store_root, shard_key, row, store_kwargs=store_kwargs):
         return None
+    delete_member_refs(store_root, shard_key, store_kwargs=store_kwargs)
     return write_all_time_column(
         store_root,
         shard_key,

@@ -261,8 +261,15 @@ def read_member_refs(store_root: str, shard_key, *, store_kwargs) -> tuple[list,
 
 
 def delete_member_refs(store_root: str, shard_key, *, store_kwargs) -> None:
-    """Drop the member's carrier with the member it indexed (fail-open; absent beats stale)."""
+    """Drop the member's carrier with the member it indexed (fail-open; absent beats stale).
+
+    One DELETE. A carrier that is not there is the normal case and silent;
+    any other failure is logged at WARNING and swallowed — the carrier then
+    stands over a member that is gone or rewritten, and the next closing
+    node would commit its refs as stale ones (§11.3 fails them on read).
+    """
     import obstore
+    from obstore.exceptions import NotFoundError
 
     from zagg.hive import shard_leaf_path
     from zagg.store import open_object_store
@@ -270,8 +277,13 @@ def delete_member_refs(store_root: str, shard_key, *, store_kwargs) -> None:
     node_prefix = shard_leaf_path(store_root, shard_key).rstrip("/").rsplit("/", 1)[0]
     try:
         obstore.delete(open_object_store(node_prefix, **store_kwargs), member_refs_key())
+    except (FileNotFoundError, NotFoundError):
+        pass
     except Exception as e:
-        logger.debug(f"all-time column refs carrier clear skipped at {node_prefix}: {e}")
+        logger.warning(
+            f"all-time column refs carrier at {node_prefix} could not be deleted "
+            f"(fail-open; it may now be stale): {type(e).__name__}: {e}"
+        )
 
 
 def leaf_refs_key(leaf_name: str, spec: str | None = None) -> str:
