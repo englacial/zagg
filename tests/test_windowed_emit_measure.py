@@ -600,9 +600,29 @@ def test_billed_gb_seconds_prefers_the_record_and_recomputes_the_rest():
 
 def test_a_stage_invoke_without_a_tier_falls_back_without_error():
     assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": 8192}, 4.0) == 80.0
-    # absent (a record predating issue #667) and null (off-Lambda, nothing
-    # billed it) both fall back rather than raise or price at zero
+    # absent (a record predating issue #667) is an UNKNOWN tier: fall back
     assert tool._invoke_gb_seconds({"duration_s": 10.0}, 4.0) == 40.0
-    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": None}, 4.0) == 40.0
+    # null is not unknown: off-Lambda, nothing billed it, so nothing is priced
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": None}, 4.0) == 0.0
+    # a present 0 is no longer read as "names no tier" either
+    assert tool._invoke_gb_seconds({"duration_s": 10.0, "lambda_memory_mb": 0}, 4.0) == 0.0
     # an absent finisher is the empty dict the loader hands back: no wall, no cost
     assert tool._invoke_gb_seconds({}, 4.0) == 0.0
+
+
+def test_a_null_tier_stage_record_adds_no_phantom_gb_seconds(tmp_path):
+    """Issue #667: ``lambda_memory_mb: null`` says the worker did not run on
+    Lambda, so nothing billed it (``docs/specification.md`` section 4.7) — the
+    readout prices it at zero rather than at the dispatcher's tier."""
+    root = _store(tmp_path, windows=None)
+    tier = tool.stage_tier_gb()
+    path = Path(root + ".status") / "run-stage-20260101T000100Z-abcdef" / "stage-03-0000.json"
+    rec = json.loads(path.read_text())
+    rec["lambda_memory_mb"] = None  # a local call of the worker entry point
+    path.write_text(json.dumps(rec))
+    measured = tool.measure(root, store_kwargs={}, accuracy=False)
+    latest = measured["stage_runs"]["latest"]
+    # only the 40 s invoke and the 2 s finisher are priced; the 30 s one is not
+    assert latest["gb_seconds"] == (40.0 + 2.0) * tier
+    assert latest["worker_s"] == 70.0  # the wall is unchanged: it ran, free
+    assert measured["cost"]["stage_gb_seconds"] == (40.0 + 2.0 + 99.0) * tier

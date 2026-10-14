@@ -108,12 +108,20 @@ def _invoke_gb_seconds(rec: dict, fallback_gb: float) -> float:
     ``duration_s`` times the tier the record names (``lambda_memory_mb``,
     issue #667 — the stage record's half of this, beside the leaf row's), so a
     run is priced at what it actually ran on and a store holding runs from two
-    tiers prices each at its own. ``fallback_gb`` prices a record that carries
-    no tier: the key is absent on a campaign-era record (it predates the
-    field) and ``null`` on an off-Lambda pass (which nothing billed).
+    tiers prices each at its own.
+
+    The two ways a record names no tier are different facts and price
+    differently. The key is **absent** on a campaign-era record (it predates
+    the field), so the tier is unknown and ``fallback_gb`` stands in for it.
+    The key is **null** on an off-Lambda pass, which nothing billed, so it
+    prices at zero rather than being billed at the dispatcher's tier. A JSON
+    ``get`` cannot tell those two apart, hence the membership test.
     """
-    mb = rec.get("lambda_memory_mb")
-    tier = float(mb) / 1024.0 if mb else fallback_gb
+    if "lambda_memory_mb" not in rec:
+        tier = fallback_gb  # predates the field: the tier is unknown
+    else:
+        mb = rec["lambda_memory_mb"]
+        tier = 0.0 if mb is None else float(mb) / 1024.0  # null: nothing billed it
     return float(rec.get("duration_s") or 0.0) * tier
 
 
