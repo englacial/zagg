@@ -978,6 +978,24 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     assert write_path == expected["total_max"]
     assert measured["objects_other"] == 0
     assert bench_objects.object_count_mismatch(measured, expected) is None
+    # The §11 companion repo on a REAL hive store (issue #668): planted into
+    # the store the runner just wrote, so the LIST path -- not a synthetic key
+    # list -- proves the repo tree is bucketed, is not mis-attributed to the
+    # shard (which would trip the issue #215 guard), is netted out of the
+    # audited figure, and that a local ``icechunk/`` DIRECTORY is not itself
+    # listed as an object. This is the composition the red run hit: a real
+    # leaf and column beside a real repo.
+    refs = tmp_path / "out" / "icechunk" / "refs" / "branch.main"
+    refs.mkdir(parents=True)
+    (refs.parent.parent / "repo").write_text("{}")
+    (refs / "ref.json").write_text("{}")
+    again = bench_objects.store_object_counts(
+        root, grid=grid, shard_keys=[shard], store_layout="hive"
+    )
+    assert again["objects_icechunk"] == 2
+    assert again["objects_other"] == 0 and again["other_keys"] == []
+    assert again["objects_per_shard"] == measured["objects_per_shard"]
+    assert bench_objects.write_path_total(again) == expected["total_max"]
 
 
 # --- the §11 Icechunk companion repo (issue #668) ----------------------------
