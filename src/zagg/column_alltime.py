@@ -463,8 +463,12 @@ def _close_all_time(
     ``timed`` as ``phase_timings["all_time_column"]`` (review finding (4)):
     the records are built per WINDOW meta, so it rides every written window's
     phases as the invoke's ``read`` does, and ``telemetry.merge`` counts it
-    once per invoke (``INVOKE_PHASES``).
+    once per invoke (``INVOKE_PHASES``). The error carries its
+    ``store_error_class`` (issue #651), so the dispatcher's fail-fast
+    classification sees the close's failure as it sees a column's.
     """
+    from zagg.dispatch import classify_store_error
+
     _t0 = time.time()
     column = None
     try:
@@ -482,6 +486,7 @@ def _close_all_time(
         logger.error(f"all-time column write failed for shard {shard_key}: {e}")
         sink["error"] = f"all-time column: {e}"
         sink["all_time_column_error"] = str(e)
+        sink["store_error_class"] = classify_store_error(e)
     finally:
         elapsed = time.time() - _t0
         for m in timed:

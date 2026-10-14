@@ -949,6 +949,33 @@ class TestBulkUnit:
         assert not (_node(root) / "all.pyramid.zarr").exists()
         assert not (_node(root) / "all.pyramid.stats.json").exists()
 
+    def test_a_store_fatal_abort_ends_the_invoke_before_the_close(self, monkeypatch, tmp_path):
+        # Issue #651's fail-fast: a refusal the store would repeat ends the
+        # invoke at the window that hit it — the windows after it are never
+        # aggregated and NO close runs (nothing to fold them from, and the
+        # store is refusing writes). The standing member is left for the
+        # retry, which rewrites the windows and the member alike.
+        from obstore.exceptions import GenericError
+
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        before = self._member(root)
+        finish = hive._LeafUnit.finish
+
+        def _refused(self, metadata):
+            if self.label == "2019":
+                raise GenericError("Generic S3 error: Got invalid DeleteObjects response: EOF")
+            return finish(self, metadata)
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _refused)
+        meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert meta["store_error_class"] == "store-fatal"
+        assert meta["windows_unattempted"] == ["2020"]
+        assert "all_time_column" not in meta and "all_time_column_error" not in meta
+        assert all("all_time_column" not in m.get("phase_timings", {}) for m in meta["windows"])
+        assert before and self._member(root) == before
+
     def test_the_stored_labels_are_the_window_columns_beside_the_shard(self, monkeypatch, tmp_path):
         from zagg.column_alltime import stored_window_labels
 
@@ -1001,6 +1028,9 @@ class TestBulkUnit:
         meta = emit._run_bulk(monkeypatch, emit._digest_cfg(), root, fakes=emit._dense_fakes())
         assert meta["error"] == "all-time column: PUT failed"
         assert meta["all_time_column_error"] == "PUT failed"
+        assert (
+            meta["store_error_class"] == "transient"
+        )  # issue #651: the shard error carries its class
         assert [m["error"] for m in meta["windows"]] == [None, None, None]
         assert all(m["leaf_column"] for m in meta["windows"])
         assert not (_node(root) / "all.pyramid.zarr").exists()

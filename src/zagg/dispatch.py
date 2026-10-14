@@ -29,6 +29,7 @@ data. ``concurrency.py`` stays a helper module called from
 
 from __future__ import annotations
 
+import re
 import time
 from concurrent.futures import Future, as_completed
 from dataclasses import dataclass, field
@@ -342,6 +343,141 @@ LAMBDA_PRICE_PER_GB_SEC = LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[LAMBDA_ARCH]
 #: definition for all three -- it used to be duplicated in ``notebook`` and
 #: inlined in ``runner`` (review finding, PR #333).
 BENIGN_ERRORS = ("No granules found", "No data after filtering")
+
+#: The three classes a leaf unit's ``error`` resolves to (issue #651), carried
+#: as ``store_error_class`` beside it. ``store-fatal`` is a refusal the store will
+#: repeat for every window of the invoke (a 4xx, a response the client could
+#: not parse, a schema/template refusal): the bulk seam ends the invoke on it
+#: instead of aggregating the remaining windows into the 900 s wall.
+#: ``transient`` is what the store client already retried and still raised
+#: (5xx, throttling, timeouts, connection faults) -- and, deliberately, any
+#: failure this classifier cannot name: it keeps the per-window isolation of
+#: issue #586, so a mis-class costs one window, never the shard.
+STORE_FATAL = "store-fatal"
+STORE_TRANSIENT = "transient"
+STORE_BENIGN = "benign"
+
+#: An HTTP status the way object_store / reqwest / botocore print one
+#: (``HTTP status client error (403 Forbidden)``, ``Client error with status
+#: 400 Bad Request``, ``non-2xx status code: 503 ...``, ``HTTP 403``). The
+#: leading word keeps a decimal shard key from matching as a status.
+_STORE_STATUS_RE = re.compile(r"(?:status(?: code)?|http|error)\W{0,3}([45]\d\d)\b", re.I)
+
+#: 4xx statuses that are throttling or a request timeout, not a refusal.
+_STORE_RETRYABLE_STATUSES = frozenset({408, 429})
+
+#: S3 error codes the client retries whatever status carries them: a stalled
+#: upload body is ``400 RequestTimeout``, and throttling / server faults can
+#: arrive as their code alone. Checked before the status, so the 400 stays
+#: transient while a bare ``400 Bad Request`` is still a refusal.
+_STORE_TRANSIENT_TOKENS = (
+    "requesttimeout",
+    "slowdown",
+    "internalerror",
+    "serviceunavailable",
+    "too many requests",
+)
+
+#: Refusal text with no status to key on: object_store's malformed-body parse
+#: failures (``Got invalid DeleteObjects response``), S3 error codes that
+#: arrive without their status, and the write path's own contract refusals
+#: (``hive`` / ``column`` raise ``ValueError`` naming the spec section, or
+#: saying ``refusing to`` / ``gate refused``). Each token names a refusal, never
+#: a bare word: ``Connection refused`` and a ``KeyError``'s ``not found`` are
+#: not store refusals and stay transient.
+_STORE_FATAL_TOKENS = (
+    "got invalid",
+    "malformed",
+    "error parsing",
+    "failed to parse",
+    "bad request",
+    "invalidargument",
+    "invalid argument",
+    "nosuchbucket",
+    "no such bucket",
+    "nosuchkey",
+    "permission denied",
+    "unauthenticated",
+    "forbidden",
+    "refusing to",
+    "gate refused",
+    "spec §",
+)
+
+
+class StoreFatalError(RuntimeError):
+    """A window's store-fatal error, raised through the per-window loop (issue #651).
+
+    ``hive._process_windows``'s emit callback raises it after recording the
+    window's error, so the worker's loop stops aggregating; the seam catches
+    it and returns one result naming the error and its class.
+    """
+
+
+def _store_fatal_types() -> tuple:
+    """Exception types that are refusals by construction (lazy: optional deps)."""
+    from obstore import exceptions as obs
+    from zarr import errors as zerr
+
+    return (
+        obs.PermissionDeniedError,
+        obs.UnauthenticatedError,
+        obs.NotFoundError,
+        obs.InvalidPathError,
+        obs.NotSupportedError,
+        obs.UnknownConfigurationKeyError,
+        zerr.ContainsArrayError,
+        zerr.ContainsGroupError,
+        zerr.ContainsArrayAndGroupError,
+        zerr.MetadataValidationError,
+        zerr.NodeTypeValidationError,
+        zerr.UnknownCodecError,
+        zerr.NodeNotFoundError,
+    )
+
+
+def classify_store_error(error: BaseException | str | None) -> str:
+    """``error``'s class: :data:`STORE_BENIGN`, :data:`STORE_FATAL` or :data:`STORE_TRANSIENT`.
+
+    Takes the exception when the caller has it (its type and ``raise ...
+    from`` chain classify first; ``__context__`` is not followed, so a fault
+    raised inside an ``except NotSupportedError:`` fallback -- zarr's
+    suffix-range ``get`` -- keeps its own class) or the recorded error string
+    (``leaf column: ...``, the unit-failure channel ``_LeafUnit.finish``
+    reports through). The order is
+    benign string, fatal type anywhere in the ``from`` chain, credentials
+    (:func:`zagg.processing.worker.is_auth_failure`), retried S3 code
+    (``RequestTimeout``, ``SlowDown``, ...), HTTP status (4xx fatal but
+    throttling / request timeout, 5xx transient), fatal token, and
+    transient for whatever is left -- see :data:`STORE_FATAL`.
+    """
+    text = str(error) if error is not None else ""
+    if text in BENIGN_ERRORS:
+        return STORE_BENIGN
+    if isinstance(error, BaseException):
+        fatal = _store_fatal_types()
+        exc: BaseException | None = error
+        for _ in range(8):  # the ``from`` chain, bounded
+            if exc is None:
+                break
+            if isinstance(exc, fatal):
+                return STORE_FATAL
+            exc = exc.__cause__
+    from zagg.processing.worker import is_auth_failure
+
+    if is_auth_failure(error if isinstance(error, BaseException) else Exception(text)):
+        return STORE_FATAL
+    low = text.lower()
+    if any(token in low for token in _STORE_TRANSIENT_TOKENS):
+        return STORE_TRANSIENT
+    match = _STORE_STATUS_RE.search(text)
+    if match:
+        code = int(match.group(1))
+        transient = code in _STORE_RETRYABLE_STATUSES or code >= 500
+        return STORE_TRANSIENT if transient else STORE_FATAL
+    if any(token in low for token in _STORE_FATAL_TOKENS):
+        return STORE_FATAL
+    return STORE_TRANSIENT
 
 
 def max_cost_usd(
