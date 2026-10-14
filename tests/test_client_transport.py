@@ -589,7 +589,7 @@ class TestStatusPoller:
         assert fut.result()["retries"] == 1
 
     def test_run_never_oversleeps_an_armed_backoff(self):
-        # The clamp in _run (client_transport.py:923-926): `interval` is cut to
+        # The clamp in _run (client_transport.py:924-926): `interval` is cut to
         # an armed class-(c) stamp, so the idle-tick doubling cannot add up to
         # _POLL_MAX_INTERVAL_S to every re-fire. _next_retry_wait() returning
         # 2.0 is asserted above; that `interval` is actually clamped to it is
@@ -626,9 +626,13 @@ class TestStatusPoller:
         # _dispatch_up_to_window's `while True` re-reads `queued` in the same
         # pass. Each re-fire now waits 2**attempts seconds — enforced by the
         # clock, driven tick by tick rather than by a started poller racing the
-        # test for that clock (the same mechanism as issue #662: this one only
-        # survived on a 50 ms cushion that hid the window instead of closing
-        # it).
+        # test for that clock (the same mechanism as issue #662: this one
+        # survived only because a 50 ms cushion made the window ~20x less
+        # likely to be hit, which hid it rather than closing it). That cushion
+        # was doing a second, real job as well: the autouse _fast_poll fixture
+        # pins the interval at 0.01 s, so 50 ms of sleep drove several ticks
+        # past the parked entry. The explicit inner loop below keeps that,
+        # deterministically.
         store = MemoryStore()
         now = {"t": 1000.0}
         fired: list[float] = []
@@ -647,8 +651,15 @@ class TestStatusPoller:
         for expected, stamp in ((1, 1002.0), (2, 1006.0), (3, 1014.0)):
             assert len(fired) == expected, fired
             assert entry.retry_not_before == stamp
-            now["t"] = stamp - 0.001  # a tick INSIDE the backoff changes nothing
-            poller._tick()
+            # One tick below the stamp is sufficient — _dispatch_up_to_window's
+            # parked-entry filter (`e.retry_not_before <= now`) is a stateless
+            # predicate re-evaluated per pass — but repeating it is free and
+            # keeps the parity with the real ticks the old cushion drove. This
+            # is also the first time either test pins the boundary from BELOW:
+            # the old body advanced straight from stamp - 2 to stamp.
+            now["t"] = stamp - 0.001  # ticks INSIDE the backoff change nothing
+            for _ in range(3):
+                poller._tick()
             assert len(fired) == expected, fired
             now["t"] = stamp
             poller._tick()
