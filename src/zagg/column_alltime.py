@@ -48,6 +48,7 @@ does.
 from __future__ import annotations
 
 import logging
+import time
 
 from zagg.sweep_fold import _ColumnReader, _gather_depth, _is_reader, merge_level
 
@@ -397,3 +398,69 @@ def close_shard(
         resolutions=resolutions,
         store_kwargs=store_kwargs,
     )
+
+
+def _resident_sources(grid, written: dict) -> dict:
+    """``{label: _ResidentColumn}`` over the windows this invoke committed a column for.
+
+    ``written`` maps a label to its ``(_LeafUnit, metadata)``; a window with
+    no column (none declared, or a benign no-data window with no leaf) has
+    no source and is simply absent from the map.
+    """
+    from zagg.column import column_name
+
+    return {
+        label: _ResidentColumn(
+            column_name(label),
+            unit.column_fold,
+            node_order=grid.parent_order,
+            cell_order=grid.child_order,
+            granule_count=m.get("granule_count", 0),
+            time_range=m.get("time_range"),
+        )
+        for label, (unit, m) in written.items()
+        if m.get("leaf_column")
+    }
+
+
+def _close_all_time(
+    shard_key, grid, store_root, config, resident, skipped, *, fresh, sink, timed, store_kwargs
+) -> None:
+    """Run the shard's all-time close; its failure is ``sink``'s error, its time rides ``timed``.
+
+    The bulk unit's close, called from :func:`zagg.hive._close_windows` (the
+    fan-out unit clears the member instead): a failed close —
+    the LIST, a stored column read, the fold or the write — lands in
+    ``sink["error"]`` through the same channel a failed column uses, so the
+    invoke fails and the dispatcher retries the unit, while the leaves and
+    columns already committed keep their metadata and records; never raised
+    past the telemetry envelope. The elapsed time goes to every meta in
+    ``timed`` as ``phase_timings["all_time_column"]`` (review finding (4)):
+    the records are built per WINDOW meta, so it rides every written window's
+    phases as the invoke's ``read`` does, and ``telemetry.merge`` counts it
+    once per invoke (``INVOKE_PHASES``).
+    """
+    _t0 = time.time()
+    column = None
+    try:
+        column = close_shard(
+            store_root,
+            shard_key,
+            grid,
+            config,
+            resident,
+            dispatched=skipped,
+            fresh=fresh,
+            store_kwargs=store_kwargs,
+        )
+    except Exception as e:
+        logger.error(f"all-time column write failed for shard {shard_key}: {e}")
+        sink["error"] = f"all-time column: {e}"
+        sink["all_time_column_error"] = str(e)
+    finally:
+        elapsed = time.time() - _t0
+        for m in timed:
+            if "phase_timings" in m:
+                m["phase_timings"]["all_time_column"] = elapsed
+    if column is not None:
+        sink["all_time_column"] = column
