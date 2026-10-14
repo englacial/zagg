@@ -398,6 +398,12 @@ class TestGuardConfig:
             ({"ramp": {"start": 1.5}}, "start must be an integer > 0"),
             ({"ramp": {"window": True}}, "window must be an integer > 0"),
             ({"ramp": {"tolerance": 0.9}}, "tolerance must be >= 1.0"),
+            # nan / inf pass every range check and disable the rule (PR #665 review).
+            ({"breaker": {"timeout_ratio": float("nan")}}, "timeout_ratio must be a number > 0"),
+            ({"breaker": {"wall_fraction": float("nan")}}, "wall_fraction must be a number > 0"),
+            ({"ramp": {"tolerance": float("nan")}}, "tolerance must be a number > 0"),
+            ({"ramp": {"tolerance": float("inf")}}, "tolerance must be a number > 0"),
+            ({"ramp": {"factor": 1}}, "start equal to ramp.cap"),
             ({"ramp": {"start": 600, "cap": 500}}, "below ramp.start"),
             ({"breaker": {"timeout_ratio": 1.5}}, "timeout_ratio must be < 1.0"),
             ({"breaker": {"timeout_ratio": 1.0}}, "timeout_ratio must be < 1.0"),

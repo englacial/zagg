@@ -39,6 +39,7 @@ classifier.
 
 from __future__ import annotations
 
+import math
 import re
 import statistics
 from dataclasses import dataclass, fields
@@ -189,9 +190,15 @@ class GuardConfig:
             v = getattr(cfg, f.name)
             integer = f.name in cls._INTS
             kinds = int if integer else (int, float)
-            if isinstance(v, bool) or not isinstance(v, kinds) or v <= 0:
+            # nan / inf pass every comparison below and switch the rule off.
+            if isinstance(v, bool) or not isinstance(v, kinds) or not math.isfinite(v) or v <= 0:
                 kind = "an integer" if integer else "a number"
                 raise ValueError(f"dispatch: {f.name} must be {kind} > 0 (got {v!r})")
+        if cfg.factor < 2:
+            raise ValueError(
+                f"dispatch: ramp.factor must be >= 2 (got {cfg.factor!r}); "
+                "for a fixed width set ramp.start equal to ramp.cap"
+            )
         if cfg.cap < cfg.start:
             raise ValueError(f"dispatch: ramp.cap {cfg.cap} is below ramp.start {cfg.start}")
         if cfg.tolerance < 1.0:
