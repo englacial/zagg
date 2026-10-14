@@ -474,12 +474,23 @@ class RunView:
         failures = self._failures()
         if failures:
             out.append(f"<h4>failures ({len(failures)})</h4>")
-            out.append("<table><tr><th>unit</th><th>error</th></tr>")
+            out.append("<table><tr><th>unit</th><th>class</th><th>error</th></tr>")
             for r in failures[:_HTML_MAX_ROWS]:
                 key = r.get("shard_key", r.get("event_key"))
-                out.append(f"<tr><td>{esc(str(key))}</td><td>{esc(str(r.get('error')))}</td></tr>")
+                # The store-error class (issue #651) rides the local meta and
+                # the poller's result dict; the v1 sync result carries it in
+                # ``body`` only.
+                cls = str(
+                    r.get("store_error_class")
+                    or (r.get("body") or {}).get("store_error_class")
+                    or ""
+                )
+                out.append(
+                    f"<tr><td>{esc(str(key))}</td><td>{esc(cls)}</td>"
+                    f"<td>{esc(str(r.get('error')))}</td></tr>"
+                )
             if len(failures) > _HTML_MAX_ROWS:
-                out.append(f"<tr><td colspan=2>... {len(failures) - _HTML_MAX_ROWS} more</td></tr>")
+                out.append(f"<tr><td colspan=3>... {len(failures) - _HTML_MAX_ROWS} more</td></tr>")
             out.append("</table>")
         out.append("</div>")
         return "".join(out)

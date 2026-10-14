@@ -107,13 +107,13 @@ def drop_timeout_s(function_timeout_s: float) -> float:
     return float(function_timeout_s) + MAX_EVENT_AGE_S + _DROP_MARGIN_S
 
 
-#: Version stamped into every status object; bump on any key change. Read back
-#: in :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump
-#: is loud rather than subtly wrong (review finding, PR #343). The manifest and
-#: tail marker carry it too, but the slim manifest (issue #588) did not bump it:
-#: the worker stamps it while the dispatcher picks slim-or-full, so only the
-#: ``shards: null`` + ``shards_omitted`` shape can say which; status objects
-#: are unchanged; the manifest's keys are not normative in the spec.
+#: Version stamped into every status object; bump on a key removal, rename, or
+#: meaning change. Additive keys ride without a bump (the slim manifest of issue
+#: #588 and the status ``store_error_class`` key of issue #651 both did). Read back in
+#: :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump is
+#: loud rather than subtly wrong (review finding, PR #343). The manifest and tail
+#: marker carry it too; only the slim manifest's ``shards: null`` + ``shards_omitted``
+#: shape says slim-or-full, and the manifest's keys are not normative in the spec.
 STATUS_SCHEMA_VERSION = 1
 
 #: Dispatch-manifest object name under the run prefix (issue #327 phase 2).
@@ -167,7 +167,9 @@ def build_shard_status(event: dict, response: dict) -> tuple[str, dict] | None:
     (stats record, counters, container telemetry). ``attempt_id`` is a fresh
     uuid per EXECUTION: a duplicate execution (or a client re-dispatch)
     overwrites the object with a new id, which is what keeps the client's
-    retry accounting straight.
+    retry accounting straight. ``store_error_class`` is the body's store-error class
+    (issue #651: ``store-fatal`` / ``transient`` / ``benign``), so the poller
+    and the readouts tell a refusal from a fault without parsing ``error``.
     """
     run_id = event.get("run_id")
     store_path = event.get("store_path")
@@ -182,12 +184,8 @@ def build_shard_status(event: dict, response: dict) -> tuple[str, dict] | None:
         body = {}
     error = body.get("error")
     code = response.get("statusCode")
-    if error in BENIGN_ERRORS:
-        status = "no_data"
-    elif code == 200 and not error:
-        status = "ok"
-    else:
-        status = "failed"
+    benign, clean = error in BENIGN_ERRORS, code == 200 and not error
+    status = "no_data" if benign else "ok" if clean else "failed"
     window = (event.get("window") or {}).get("label")
     obj = {
         "schema_version": STATUS_SCHEMA_VERSION,
@@ -198,6 +196,7 @@ def build_shard_status(event: dict, response: dict) -> tuple[str, dict] | None:
         "window": window,
         "timings": body.get("phase_timings"),
         "error": str(error) if error else None,
+        "store_error_class": body.get("store_error_class"),
         "status_code": code,
         "body": body,
     }
@@ -1102,6 +1101,7 @@ class StatusPoller:
             "wall_time": self._clock() - start,
             "lambda_duration": billed_seconds(body),
             "error": error,
+            "store_error_class": body.get("store_error_class"),
             "retries": entry.attempts - 1,
             "timeout": False,
             "granule_count": entry.granule_count,
@@ -1116,7 +1116,8 @@ class StatusPoller:
         The object exists, so the worker ran to completion and reported its own
         error: deterministic for this shard, exactly the case issue #119
         excludes from retry on the sync transport. Re-firing it would bill a
-        second full execution for a guaranteed second failure.
+        second full execution for a guaranteed second failure -- a
+        ``store-fatal`` class (issue #651) says so by name.
         """
         self._resolve_failure(entry, result)
 

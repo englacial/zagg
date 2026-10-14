@@ -961,6 +961,35 @@ class TestRunParquet:
         assert row["error_class"] == "TimeoutError"  # explicit wins
         assert failure_record(shard_key=None, error="boom")["shard_key"] is None
 
+    def test_store_error_class_is_its_own_column(self):
+        # Issue #651: the leaf seam's three-valued class rides the record and
+        # the parquet beside ``error_class``, which keeps its exception-name
+        # meaning: a per-window error is ``f"{type(e).__name__}: {e}"``, so the
+        # real leaf row reads the exception name beside the store class.
+        rec = build_record(
+            shard_key=3,
+            metadata={
+                "error": "GenericError: Generic S3 error: Got invalid DeleteObjects response: EOF",
+                "store_error_class": "store-fatal",
+                "duration_s": 1.0,
+            },
+        )
+        row = flatten_record(rec, retries=0)
+        assert rec["store_error_class"] == "store-fatal" and rec["success"] is False
+        assert row["store_error_class"] == "store-fatal"
+        assert row["error_class"] == "GenericError"
+        assert merge([rec])["store_error_class"] == "store-fatal"
+        assert merge([rec, _record(4)])["store_error_class"] is None  # per-leaf: collapses
+        # A record whose metadata carries the SWEEP body's exception-name
+        # ``error_class`` (not a leaf class) gets no store class, and the
+        # dispatcher's explicit exception type still wins the old column.
+        sweep = build_record(
+            shard_key=5, metadata={"error": "boom", "error_class": "ValueError", "duration_s": 1}
+        )
+        assert sweep["store_error_class"] is None
+        assert flatten_record(sweep, error_class="ValueError")["store_error_class"] is None
+        assert flatten_record(_record(6))["store_error_class"] is None
+
     def test_run_parquet_key_shape(self):
         # Timestamp-first (D20) so a lexicographic listing is chronological.
         key = run_parquet_key("abc123", timestamp="20260718T010203Z")
