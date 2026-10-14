@@ -949,11 +949,16 @@ class TestBulkUnit:
         assert not (_node(root) / "all.pyramid.zarr").exists()
         assert not (_node(root) / "all.pyramid.stats.json").exists()
 
-    def test_a_store_fatal_abort_ends_the_invoke_before_the_close(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("fatal", ["2018", "2019"])
+    def test_a_store_fatal_abort_ends_the_invoke_before_the_close(
+        self, monkeypatch, tmp_path, fatal
+    ):
         # Issue #651's fail-fast: a refusal the store would repeat ends the
         # invoke at the window that hit it — the windows after it are never
         # aggregated and NO close runs (nothing to fold them from, and the
-        # store is refusing writes). The standing member is left for the
+        # store is refusing writes). A window that landed first superseded a
+        # column the member folds, so the member is cleared (absent beats
+        # stale, PR #666 review (9)); with none landed it is left for the
         # retry, which rewrites the windows and the member alike.
         from obstore.exceptions import GenericError
 
@@ -964,17 +969,18 @@ class TestBulkUnit:
         finish = hive._LeafUnit.finish
 
         def _refused(self, metadata):
-            if self.label == "2019":
+            if self.label == fatal:
                 raise GenericError("Generic S3 error: Got invalid DeleteObjects response: EOF")
             return finish(self, metadata)
 
         monkeypatch.setattr(hive._LeafUnit, "finish", _refused)
         meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
         assert meta["store_error_class"] == "store-fatal"
-        assert meta["windows_unattempted"] == ["2020"]
+        assert meta["windows_unattempted"] == [w for w in WINDOWS if w > fatal]
         assert "all_time_column" not in meta and "all_time_column_error" not in meta
         assert all("all_time_column" not in m.get("phase_timings", {}) for m in meta["windows"])
-        assert before and self._member(root) == before
+        assert before
+        assert self._member(root) == ({} if fatal == "2019" else before)
 
     def test_the_stored_labels_are_the_window_columns_beside_the_shard(self, monkeypatch, tmp_path):
         from zagg.column_alltime import stored_window_labels

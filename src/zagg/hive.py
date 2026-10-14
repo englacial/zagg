@@ -2711,10 +2711,24 @@ def _process_windows(
             logger.error(f"shard {shard_key}: {e}; {len(left)} windows not attempted")
             base["windows_unattempted"] = left
             fatal = True
+            # Absent beats stale (§4.6): a window that landed first superseded
+            # a column the member folds. One delete, not a close — and the
+            # store may refuse it too, so a failure is logged, never the error.
+            if any(
+                m.get("column_error")
+                or not (m.get("error") or m.get("current") or m.get("refused"))
+                for m in metas.values()
+            ):
+                from zagg.column import _clear_column
+
+                try:
+                    _clear_column(store_root, shard_key, None, unit_kwargs["store_kwargs"])
+                except Exception as exc:
+                    logger.error(f"all-time column clear failed for shard {shard_key}: {exc}")
     if not fatal:
-        # The shard's all-time column (issue #649) — never after a store-fatal
-        # abort: the windows not attempted have no column to fold, and the
-        # invoke is ending.
+        # The shard's all-time column (issue #649) — never closed after a
+        # store-fatal abort: the windows not attempted have no column to
+        # fold, and the invoke is ending.
         _close_windows(
             shard_key, grid, store_root, config, units, metas, windows, base, unit_kwargs
         )
