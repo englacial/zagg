@@ -1041,6 +1041,60 @@ class TestBulkUnit:
         assert all(m["leaf_column"] for m in meta["windows"])
         assert not (_node(root) / "all.pyramid.zarr").exists()
 
+    def test_a_failed_close_behind_benign_windows_keeps_its_error(self, monkeypatch, tmp_path):
+        # PR #666 review (10): every dispatched window found no data, but the
+        # store holds columns, so the close still runs; its failure is the
+        # shard's error, never masked as the benign no-data string.
+        import zagg.column_alltime as column_alltime
+
+        cfg = emit._digest_cfg()
+        root = str(tmp_path / "bulk")
+        emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+
+        def _empty(self, metadata):
+            return {
+                "shard_key": int(self.shard_key),
+                "window": self.label,
+                "cells_with_data": 0,
+                "total_obs": 0,
+                "error": "No data after filtering",
+            }
+
+        def _boom(*a, **k):
+            raise RuntimeError("LIST failed")
+
+        monkeypatch.setattr(hive._LeafUnit, "finish", _empty)
+        monkeypatch.setattr(column_alltime, "close_shard", _boom)
+        meta = emit._run_bulk(monkeypatch, cfg, root, fakes=emit._dense_fakes())
+        assert all(m["error"] == "No data after filtering" for m in meta["windows"])
+        assert meta["error"] == "all-time column: LIST failed"
+        assert meta["store_error_class"] == "transient"
+
+    def test_a_failed_fanout_clear_carries_its_store_error_class(self, monkeypatch, tmp_path):
+        # PR #666 review (10): the fan-out unit's member clear is a store
+        # write like any other; a refusal the store would repeat is fatal.
+        from obstore.exceptions import GenericError
+
+        import zagg.column as column
+
+        clear = column._clear_column
+
+        def _refused(store_root, shard_key, window, store_kwargs):
+            if window is None:
+                raise GenericError("Generic S3 error: Got invalid DeleteObjects response: EOF")
+            return clear(store_root, shard_key, window, store_kwargs)
+
+        monkeypatch.setattr(column, "_clear_column", _refused)
+        out = emit._run_fanout(
+            monkeypatch,
+            emit._digest_cfg(),
+            str(tmp_path / "fan"),
+            fakes=emit._dense_fakes(),
+            records=[emit._records()[1]],
+        )
+        assert out["2020"]["error"].startswith("all-time column: Generic S3 error")
+        assert out["2020"]["store_error_class"] == "store-fatal"
+
     def test_no_column_declaration_means_no_member_and_clears_a_stale_one(
         self, monkeypatch, tmp_path
     ):

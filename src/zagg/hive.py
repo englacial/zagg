@@ -2568,6 +2568,7 @@ def process_and_write_hive(
             logger.error(f"all-time column clear failed for shard {shard_key}: {e}")
             meta["error"] = f"all-time column: {e}"
             meta["all_time_column_error"] = str(e)
+            meta["store_error_class"] = classify_store_error(e)
     return meta
 
 
@@ -2844,7 +2845,8 @@ def _shard_meta(base: dict, window_metas: list) -> dict:
         more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
         meta["error"] = f"window {first.get('window')}: {first['error']}{more}"
         meta["store_error_class"] = first.get("store_error_class") or STORE_TRANSIENT
-    elif written and all(m.get("error") for m in written):
+    elif written and all(m.get("error") for m in written) and not base.get("error"):
+        # A failed close behind benign windows keeps its own error and class.
         meta["error"] = written[0]["error"]
         meta["store_error_class"] = STORE_BENIGN
     # The union, like the sums, is of the windows that landed — and it is what
