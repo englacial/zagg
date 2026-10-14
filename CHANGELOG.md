@@ -11,6 +11,18 @@ edit this file in a PR. Hand notes go under `[Unreleased]` via a `changelog`-lab
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-10-13
+
+### Merged pull requests
+
+- Stage dispatcher gates the staged sweep on the store's manifest ladder: one GET, no fan-out without a /2 declaration ([#645](https://github.com/englacial/zagg/pull/645)) by @espg
+- small fixes 2026-10-13: cost preview and bar count invokes, not windows; pyramid_check asks for the all-time column member ([#655](https://github.com/englacial/zagg/pull/655)) by @espg
+- The run tail reports a short sweep: the staged leg's summary and a named tail-short verdict on the run summary and the handle ([#644](https://github.com/englacial/zagg/pull/644)) by @espg
+- small fixes 2026-10-13 (b): staged sweep runs on the leaf tier; cost preview prices every leg from the template ([#664](https://github.com/englacial/zagg/pull/664)) by @espg
+- A store-fatal leaf write ends the invoke in seconds, not at the 900 s wall ([#658](https://github.com/englacial/zagg/pull/658)) by @espg
+- Leaf and column writers: one create_hierarchy pass, kept handles, hashes from memory (issue #657) ([#661](https://github.com/englacial/zagg/pull/661)) by @espg
+- skip all-fill slab writes so a fresh leaf never deletes a chunk (issue #653) ([#663](https://github.com/englacial/zagg/pull/663)) by @espg
+
 ## [0.60.0] - 2026-10-12
 
 ### Merged pull requests
