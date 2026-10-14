@@ -170,9 +170,12 @@ def member_current(store_root: str, shard_key, row: list, *, store_kwargs=None) 
     member is re-folded each run — the kernel's refusal is rare, and only a
     fold can see it. Stamps resolve to one second, so a column rewritten in
     the member's own second by a writer that does not clear the member reads
-    as current (the issue #417 blind spot; every zagg writer of a window
-    column clears or rewrites the member in the same invoke). A standing
-    member that cannot be read is not current.
+    as current (the issue #417 blind spot). The leaf workers clear or rewrite
+    the member in the same invoke; the operator-run ``column_backfill`` is
+    the exception — it rewrites window columns and leaves the member, which
+    only the stamp comparison then catches (spec §4.6 keeps the backfill off
+    a store an aggregation run may be writing). A standing member that
+    cannot be read is not current.
     """
     from zagg.column import COLUMN_ATTR, column_name
     from zagg.hive import shard_leaf_path
