@@ -101,7 +101,7 @@ examples:
         "breaker.timeout_ratio breaker.store_fatal breaker.store_fatal_first. "
         "Defaults: more than 0.20 of the last 50 timed out, or 3 store-fatal among "
         "the first 20, stops dispatching; a repeated key keeps the last value. "
-        "Honored only by --backend lambda with --invocation event; any other run "
+        "Honored by every --backend lambda run (each --invocation); a local run "
         "warns and ignores it.",
     )
     parser.add_argument(
@@ -110,7 +110,7 @@ examples:
         default="async",
         help="Lambda transport (issues #151/#327): async (default, per-shard "
         "result objects), sync (RequestResponse), or event (the status-poller "
-        "fan-out). The --dispatch circuit breaker acts on event only.",
+        "fan-out). The --dispatch circuit breaker watches all three.",
     )
     parser.add_argument(
         "--yes",

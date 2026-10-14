@@ -88,11 +88,10 @@ from zagg.config import (
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, LAMBDA_PRICE_PER_GB_SEC, max_cost_usd
 from zagg.dispatch_guard import (
     NOT_DISPATCHED,
-    PACING_GUARD,
     DispatchGuard,
     GuardConfig,
     describe,
-    pool_width_pacing,
+    guard_pacing,
 )
 from zagg.grids import from_config as grid_from_config
 from zagg.grids.morton import morton_word
@@ -250,14 +249,13 @@ class RunHandle:
         #: handle is a snapshot of the reported shards and ran no tail
         #: (past the drop deadline, for good: see :meth:`Run.attach`).
         self.unreported_shards: int = 0
-        #: The Event transport's circuit-breaker verdict (issue #652), the
-        #: same ``breaker`` the CLI summary carries, set when the tail runs;
-        #: ``None`` on the sync transport and on a reattached handle (neither
-        #: has a guard).
+        #: The circuit-breaker verdict (issue #652), the same ``breaker`` the
+        #: CLI summary carries, set when the tail runs on either transport;
+        #: ``None`` when nothing tripped and on a reattached handle (attach
+        #: dispatches nothing, so it has no guard).
         self.breaker: dict | None = None
-        #: What paced this dispatch (issue #652): the guard on the event
-        #: transport, else the pool width with the knob to flip named;
-        #: ``None`` on a reattached handle (attach dispatches nothing).
+        #: Which seam watched this dispatch (issue #652, ``guard_pacing``);
+        #: ``None`` on a reattached handle.
         self.dispatch_pacing: str | None = None
         # This dispatch's guard (issue #652), bound here rather than on the
         # ``Run`` so a later dispatch cannot swap it out from under this tail.
@@ -508,7 +506,7 @@ class Run:
         #: A reattached run (``Run.attach``) never held the init record: its
         #: tail finalizes the repo off the config's knob instead (issue #582).
         self._attached = False
-        #: The Event transport's circuit breaker (issue #652): built per
+        #: The circuit breaker (issue #652), on either transport: built per
         #: dispatch from the ``dispatch`` knobs; ``dispatch`` moves it onto
         #: the handle, whose tail reads it (never this slot).
         self._guard: Any = None
@@ -870,7 +868,7 @@ class Run:
             writes status objects (issue #327) and read access to the status
             prefix for the poll.
         dispatch : dict, optional
-            The event transport's circuit breaker knobs (issue #652), the
+            The circuit breaker knobs (issue #652), on either transport: the
             ``{"breaker": {...}}`` block ``agg`` takes; refused here, before
             any invoke. The fan-out runs at the full ``max_workers`` width; a
             trip refuses the undispatched shards (their futures raise
@@ -1046,11 +1044,16 @@ class Run:
             )
             guard = self._guard  # built synchronously by the poller hand-off above
         else:
+            # The circuit breaker on the sync pool (issue #652): each shard is
+            # recorded as it settles; a shard whose slot opens after a trip
+            # raises the not-dispatched ShardError instead of invoking.
+            guard = self._dispatch_guard(workers)
+            work = guard.gate(self._shard_work, lambda c, key, *a, **k: self._refused(guard, key))
             pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="zagg-client")
             futures = {}
             for key, records in cells:
                 futures[int(key)] = pool.submit(
-                    self._shard_work,
+                    work,
                     client,
                     int(key),
                     records,
@@ -1066,9 +1069,7 @@ class Run:
 
         handle = RunHandle(futures, store_path=self.store, memory_gb=memory_gb)
         handle.dispatch_manifest = manifest_sent
-        handle.dispatch_pacing = (
-            PACING_GUARD if transport == "event" else pool_width_pacing("transport", transport)
-        )
+        handle.dispatch_pacing = guard_pacing(f"transport={transport!r}")
         handle._guard = guard
         finisher = threading.Thread(
             target=self._post_run,
@@ -1082,9 +1083,19 @@ class Run:
         return handle
 
     def _dispatch_guard(self, workers: int):
-        """The poller's guard for this dispatch (issue #652); kept for the tail."""
+        """This dispatch's guard (issue #652): the poller's, or the sync pool's."""
         self._guard = DispatchGuard(self._guard_config, workers=workers)
         return self._guard
+
+    def _refused(self, guard: DispatchGuard, shard_key: int) -> dict:
+        """A sync-pool shard the tripped breaker refused: raise, as the event path does."""
+        from zagg import runner
+
+        label = runner._safe_label(self.grid, shard_key)
+        payload = guard.refused(shard_key=shard_key)
+        raise ShardError(
+            f"shard {label}: {payload['error']}", shard_key=shard_key, label=label, payload=payload
+        )
 
     def _dispatch_event(
         self,

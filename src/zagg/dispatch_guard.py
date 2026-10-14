@@ -20,9 +20,14 @@ A trip is sticky. Units not yet started are then *refused* -- they resolve
 legs (staged sweep, families pass, Icechunk finalize). In-flight invokes
 cannot be recalled; they finish and their results still land.
 
-Pure: no I/O, no clock, no threads. The poller feeds completed result dicts
-(its own v1-shaped ``_result``) through :meth:`DispatchGuard.record` and asks
-:meth:`DispatchGuard.room` for the next batch; one thread records.
+One guard watches every Lambda transport (issue #652 phase 6), fed at the
+seam each already has: the Event transport's status poller records each
+status and asks :meth:`DispatchGuard.room` for the next batch; every pool
+fan-out -- the async and sync transports and the temporal fan-out through
+:func:`zagg.dispatch.dispatch`, the raster fan-out and the facade's sync pool
+directly -- wraps its work in :meth:`DispatchGuard.gate`, which records each
+unit on its pool thread under the guard's lock and refuses the rest after a
+trip. No I/O, no clock.
 The store-fatal rule reads ``store_error_class`` when a status carries it
 (issue #651, PR #658) and otherwise classifies the error string with
 :func:`zagg.dispatch.classify_store_error`, the worker's own classifier.
@@ -35,8 +40,9 @@ which must not short-circuit the classifier.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, fields
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 from zagg.dispatch import (
     BENIGN_ERRORS,
@@ -56,10 +62,11 @@ RULE_STORE_FATAL = "store-fatal"
 #: The ``outcome`` a shard the breaker refused to dispatch resolves with.
 NOT_DISPATCHED = "not-dispatched"
 
-#: ``summary["dispatch_pacing"]`` / ``handle.dispatch_pacing`` when the guard
-#: watches the fan-out: only the Event transport has the status poller the
-#: breaker lives in.
-PACING_GUARD = "guard: circuit breaker on the Event transport (issue #652)"
+#: How the async / raster result channels (issue #151) report a unit whose
+#: result object never landed by the poll deadline: the worker timed out, was
+#: OOM-killed or crashed -- the async twin of the Event ``failed-unknown`` drop,
+#: so the ``timeout-ratio`` rule counts it. ``runner`` builds the message off it.
+NO_RESULT_PREFIX = "no worker result within"
 
 
 #: How a trip's ``tail_sweep_short`` reason starts. A sweep folds leaves that
@@ -69,32 +76,15 @@ PACING_GUARD = "guard: circuit breaker on the Event transport (issue #652)"
 BREAKER_SHORT_PREFIX = "the dispatch circuit breaker tripped"
 
 
-def pool_width_pacing(knob: str, value: str) -> str:
-    """The pacing line for a fan-out the guard does NOT watch, saying why.
+def guard_pacing(where: str) -> str:
+    """``summary["dispatch_pacing"]`` / ``handle.dispatch_pacing`` (issue #652).
 
-    ``agg``'s default ``invocation="async"`` (the #151 result-object channel)
-    and ``Run.dispatch``'s default ``transport="sync"`` have no status poller,
-    so they pace by the pool width alone and ``breaker`` reads ``None``; this
-    names the knob to flip rather than leaving that silence to be read as
-    "nothing happened" (issue #652 question 10).
+    Every Lambda fan-out -- each transport, raster and temporal included --
+    runs at its full worker width under the circuit breaker; ``where`` names
+    the path (``"invocation='async'"``, ``"raster fan-out"``, ...) so a
+    summary says which seam watched it.
     """
-    return (
-        f"pool width ({knob}={value!r}): the circuit breaker acts only on "
-        f"{knob}='event' (issue #652)"
-    )
-
-
-def no_poller_pacing(kind: str) -> str:
-    """The pacing line for the raster / temporal Lambda fan-outs (issue #652).
-
-    Those strategies refuse ``invocation="event"``, so unlike
-    :func:`pool_width_pacing` there is no knob to flip: the line says the
-    guard cannot apply rather than naming a value that raises.
-    """
-    return (
-        f"pool width: the {kind} fan-out has no status poller, so the circuit "
-        "breaker does not apply (issue #652)"
-    )
+    return f"full worker width, circuit breaker on ({where}) (issue #652)"
 
 
 @dataclass(frozen=True)
@@ -212,6 +202,7 @@ def classify_result(result: dict) -> ResultRecord:
         result.get("timeout")
         or result.get("outcome") == "failed-unknown"
         or (error and "Task timed out" in str(error))
+        or (error and str(error).startswith(NO_RESULT_PREFIX))
     )
     # The no-data channel's text starts with its benign entry and may carry a
     # source read's 403/404 exemplar after it: benign, never store-fatal.
@@ -263,6 +254,7 @@ class DispatchGuard:
         self._records: list[ResultRecord] = []
         self._timed_out: set = set()  # unit keys already recorded as a timeout
         self.tripped: dict | None = None
+        self._lock = threading.Lock()  # serializes :meth:`gate` records (pool threads)
 
     def record(self, result: dict) -> None:
         """Fold one completed result in and re-evaluate both rules."""
@@ -309,6 +301,45 @@ class DispatchGuard:
             "outcome": NOT_DISPATCHED,
         }
 
+    def refused(self, **ident) -> dict:
+        """A refused unit's full result dict (``ident``: its ``shard_key`` / ``event_key``).
+
+        The shape a pool fan-out's accumulator and run record read: no billed
+        duration, never attempted (``retries: -1``, as on the Event poller).
+        """
+        return {**ident, **self.refusal(), "lambda_duration": 0, "retries": -1, "timeout": False}
+
+    def gate(self, work: Callable[..., Any], refuse: Callable[..., Any]) -> Callable[..., Any]:
+        """``work`` wrapped for a pool: refused after a trip, recorded as it completes.
+
+        A unit whose pool slot opens after a trip calls ``refuse`` instead
+        (both get the unit's arguments; ``refuse`` returns or raises what the
+        caller reads for a refused unit). A unit that runs is recorded on its
+        own pool thread the moment ``work`` returns -- or raises an exception
+        carrying a result ``payload`` (``ShardError``) -- under the guard's
+        lock, BEFORE that thread takes its next unit: recording later, on a
+        collecting loop, would let a freed thread start the next unit against
+        a ``tripped`` that is one result stale.
+        """
+
+        def run(*args, **kwargs):
+            if self.tripped is not None:
+                return refuse(*args, **kwargs)
+            try:
+                result = work(*args, **kwargs)
+            except Exception as exc:
+                self._record_locked(getattr(exc, "payload", None))
+                raise
+            self._record_locked(result)
+            return result
+
+        return run
+
+    def _record_locked(self, result) -> None:
+        if isinstance(result, dict):
+            with self._lock:
+                self.record(result)
+
     @property
     def breaker(self) -> dict | None:
         """``summary["breaker"]``: the trip, else ``None``."""
@@ -321,9 +352,9 @@ class DispatchGuard:
 def describe(breaker: dict | None, pacing: str | None = None) -> list[str]:
     """Human lines for ``summary["breaker"]`` / ``["dispatch_pacing"]``.
 
-    Shared by the CLI, the notebook view and the run log. ``pacing`` leads
-    when given, so a fan-out the guard did not watch says why (see
-    :func:`pool_width_pacing`) instead of printing nothing.
+    Shared by the CLI, the notebook view and the run log. ``pacing`` (see
+    :func:`guard_pacing`) leads when given, so a clean run still says the
+    breaker watched it.
     """
     lines = [f"Dispatch pacing: {pacing}"] if pacing else []
     if breaker:

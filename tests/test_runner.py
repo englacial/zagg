@@ -87,13 +87,13 @@ class TestDispatchKnob:
 
     @pytest.mark.parametrize(
         ("backend", "invocation", "warns"),
-        [("local", "async", True), ("lambda", "async", True), ("lambda", "event", False)],
+        [("local", "async", True), ("lambda", "async", False), ("lambda", "event", False)],
     )
-    def test_knobs_off_the_event_path_warn_before_the_run(
+    def test_knobs_on_the_local_backend_warn_before_the_run(
         self, monkeypatch, caplog, atl06_config, backend, invocation, warns
     ):
-        # Only the Event poller paces (issue #652, PR #665 review): any other
-        # run says so up front, naming the knob, instead of after the spend.
+        # Every Lambda transport consumes the knobs (issue #652 phase 6); only a
+        # local run, which has no breaker, says it ignores them.
         from zagg import runner
 
         monkeypatch.setattr(runner.SpatialStrategy, "run", lambda self, config, **kw: {})
@@ -102,7 +102,7 @@ class TestDispatchKnob:
         hit = [r for r in caplog.records if "dispatch knobs ignored" in r.getMessage()]
         assert bool(hit) is warns
         if warns:
-            assert "invocation='event'" in hit[0].getMessage()
+            assert "Lambda fan-outs only" in hit[0].getMessage()
 
     def test_a_bad_block_is_refused_for_a_temporal_config(self):
         # Validated in agg before the strategy (issue #652): the temporal
@@ -2409,10 +2409,10 @@ class TestSummaryKeysByteIdentical:
         )
         assert set(summary.keys()) == self._LAMBDA_KEYS
         assert summary["families_sweep"] is None  # flat: nothing was swept
-        assert "ramp" not in summary and summary["breaker"] is None  # async: no guard
+        # The breaker watches the default async transport too (issue #652 phase 6).
+        assert "ramp" not in summary and summary["breaker"] is None
         assert summary["dispatch_pacing"] == (
-            "pool width (invocation='async'): the circuit breaker acts only on "
-            "invocation='event' (issue #652)"
+            "full worker width, circuit breaker on (invocation='async') (issue #652)"
         )
         assert summary["backend"] == "lambda"
         assert summary["cells_with_data"] == 4

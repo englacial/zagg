@@ -189,8 +189,12 @@ class Executor(Protocol):
         """Capacity check before fan-out; returns the clamped worker count."""
         ...
 
-    def submit(self, payload: Any) -> Future:
-        """Run one unit, returning a :class:`~concurrent.futures.Future`."""
+    def submit(self, payload: Any, wrap: Callable[[Callable], Callable] | None = None) -> Future:
+        """Run one unit, returning a :class:`~concurrent.futures.Future`.
+
+        ``wrap`` (issue #652) wraps the per-unit work callable for this submit
+        -- :meth:`zagg.dispatch_guard.DispatchGuard.gate`'s refuse-and-record.
+        """
         ...
 
     def measure_cost(self, result: dict) -> CellCost:
@@ -218,6 +222,8 @@ def dispatch(
     retry: RetryPolicy,
     accumulate: Callable[[RunReport, int, dict], None],
     on_submit_error: Callable[[BaseException], None] | None = None,
+    guard: Any = None,
+    refuse: Callable[[Any], dict] | None = None,
 ) -> RunReport:
     """Fan out ``payloads`` across ``executor``, folding results into a report.
 
@@ -250,13 +256,30 @@ def dispatch(
         Called with an exception raised out of a future before it is re-raised,
         so the caller can convert run-fatal errors (errno-24) into actionable
         guidance.
+    guard : DispatchGuard, optional
+        The circuit breaker (issue #652, :class:`zagg.dispatch_guard.DispatchGuard`):
+        each unit's work is wrapped in :meth:`~zagg.dispatch_guard.DispatchGuard.gate`,
+        so every completed result is recorded on its pool thread as it lands
+        and a unit whose slot opens after a trip returns ``refuse(payload)``
+        instead of running. ``None`` (the local backend; the Event transport,
+        whose poller records and refuses) leaves the loop byte-identical.
+    refuse : Callable[[Any], dict], optional
+        The refused unit's result dict; required with ``guard``.
 
     Returns
     -------
     RunReport
     """
     report = RunReport()
-    futures: dict[Future, Any] = {executor.submit(payload): payload for payload in payloads}
+    if guard is None:
+        futures: dict[Future, Any] = {executor.submit(payload): payload for payload in payloads}
+    else:
+        assert refuse is not None, "dispatch(guard=...) needs refuse="
+
+        def wrap(work):
+            return guard.gate(work, refuse)
+
+        futures = {executor.submit(payload, wrap=wrap): payload for payload in payloads}
 
     for i, future in enumerate(as_completed(futures), 1):
         try:
@@ -312,8 +335,8 @@ class LocalExecutor:
         """Local capacity is just the (already cell-clamped) worker count."""
         return PreflightReport(workers=self._max_workers)
 
-    def submit(self, payload: Any) -> Future:
-        return self._pool.submit(self._work, payload)
+    def submit(self, payload: Any, wrap: Callable[[Callable], Callable] | None = None) -> Future:
+        return self._pool.submit(self._work if wrap is None else wrap(self._work), payload)
 
     def measure_cost(self, result: dict) -> CellCost:
         return CellCost()
@@ -604,10 +627,10 @@ class LambdaExecutor:
         self._pool = self._pool_factory(max_workers=report.workers)
         return report
 
-    def submit(self, payload: Any) -> Future:
+    def submit(self, payload: Any, wrap: Callable[[Callable], Callable] | None = None) -> Future:
         if self._pool is None:
             raise RuntimeError("LambdaExecutor.preflight() must run before submit()")
-        return self._pool.submit(self._work, payload)
+        return self._pool.submit(self._work if wrap is None else wrap(self._work), payload)
 
     def measure_cost(self, result: dict) -> CellCost:
         compute_s = result.get("lambda_duration", 0) or 0.0

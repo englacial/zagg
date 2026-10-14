@@ -21,6 +21,7 @@ import zagg.client_transport as ct
 from zagg import hive
 from zagg.client import Run
 from zagg.config import default_config
+from zagg.dispatch_guard import guard_pacing
 from zagg.pyramid import PYRAMID_SPEC_V2, expand_overviews
 
 
@@ -421,7 +422,7 @@ class TestEventDispatch:
         assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
         assert handle.families_sweep is None and handle.stage_sweep is None
         assert any("circuit breaker tripped (timeout-ratio)" in r for r in handle.tail_sweep_short)
-        assert handle.dispatch_pacing.startswith("guard: circuit breaker")
+        assert handle.dispatch_pacing == guard_pacing("transport='event'")
 
     def test_each_dispatch_tail_reads_its_own_guard(self, catalog, monkeypatch):
         # Two dispatches on one Run: A trips, B (clean) is dispatched before
@@ -452,6 +453,32 @@ class TestEventDispatch:
         assert "icechunk_finalize" not in stub_a.modes()
         assert "icechunk_finalize" in stub_b.modes()
 
+    def test_sync_pool_timeouts_trip_and_stop_invoking(self, catalog, status_store):
+        # Run.dispatch's DEFAULT transport (issue #652 phase 6): the first
+        # shard times out, the breaker trips on its pool thread, and the next
+        # shards raise the not-dispatched ShardError without invoking.
+        from test_client import StubLambdaClient
+
+        stub = StubLambdaClient(timeout=set(_WORDS))
+        handle = _run(catalog, client=stub, max_retries=1).dispatch(
+            transport="sync", dispatch=_TRIP_KNOBS, max_workers=1
+        )
+        handle.wait()
+        assert len(stub.cell_events()) == 1
+        assert handle.breaker == {
+            "tripped": True,
+            "rule": "timeout-ratio",
+            "at_result": 1,
+            "width": 1,
+        }
+        errors = handle.results(return_exceptions=True).values()
+        outcomes = sorted(str(e.payload.get("outcome")) for e in errors)
+        assert outcomes == ["None", "not-dispatched", "not-dispatched"]
+        modes = [m for m in stub.modes() if m]
+        assert "stats" in modes and not any(m in modes for m in ("sweep", "icechunk_finalize"))
+        assert handle.icechunk_finalize == {"skipped": "circuit breaker tripped (timeout-ratio)"}
+        assert handle.dispatch_pacing == guard_pacing("transport='sync'")
+
     def test_handle_carries_no_verdict_without_a_trip(self, catalog, status_store):
         handle = _run(catalog, client=EventStubLambdaClient(status_store)).dispatch(
             transport="event", max_workers=2
@@ -463,7 +490,7 @@ class TestEventDispatch:
         sync = _run(catalog, client=__import__("test_client").StubLambdaClient()).dispatch()
         sync.results()
         assert sync.breaker is None
-        assert "acts only on transport='event'" in sync.dispatch_pacing
+        assert sync.dispatch_pacing == guard_pacing("transport='sync'")
 
     def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):
         # An oversized row set on an EVENT run keeps its run record: the tail
@@ -1110,7 +1137,7 @@ class TestAggEventMode:
         assert any(
             "circuit breaker tripped (timeout-ratio)" in r for r in summary["tail_sweep_short"]
         )
-        assert summary["dispatch_pacing"].startswith("guard: circuit breaker")
+        assert "circuit breaker on (invocation='event')" in summary["dispatch_pacing"]
         modes = [m for m in stub.modes() if m]
         assert "stats" in modes and "coverage" in modes
 
@@ -1123,6 +1150,153 @@ class TestAggEventMode:
                 catalog_file, monkeypatch, stub, "event", dispatch={"breaker": {"store_fatal": 30}}
             )
         assert stub.events == []
+
+    # -- the breaker on the pool transports (issue #652 phase 6) ----------------
+
+    @staticmethod
+    def _tail_recorder(monkeypatch):
+        from zagg import runner
+
+        calls: list[str] = []
+        for name in ("_invoke_lambda_families_sweep", "_invoke_lambda_stage_sweep"):
+            monkeypatch.setattr(
+                runner, name, lambda *a, _n=name, **k: calls.append(_n) or {"fired": 0}
+            )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_icechunk_finalize",
+            lambda *a, **k: calls.append("icechunk_finalize") or {"tag": "t"},
+        )
+        return calls
+
+    @staticmethod
+    def _cell_results(monkeypatch, make):
+        """Route the async channel's per-cell invoke to ``make(shard_key)``; count calls."""
+        from zagg import runner
+
+        calls: list[int] = []
+
+        def fake(client, block, shard_key, *a, **k):
+            calls.append(int(shard_key))
+            return {"shard_key": int(shard_key), "lambda_duration": 1.0, **make(int(shard_key))}
+
+        monkeypatch.setattr(runner, "_invoke_lambda_cell", fake)
+        return calls
+
+    def _assert_tripped_without_a_tail(self, summary, tail, rule):
+        assert summary["breaker"]["tripped"] and summary["breaker"]["rule"] == rule
+        assert summary["breaker"]["at_result"] == 1 and summary["breaker"]["width"] == 1
+        outcomes = sorted(str(r.get("outcome")) for r in summary["results"])
+        assert outcomes == ["None", "not-dispatched", "not-dispatched"]
+        assert summary["cells_error"] == 3 and summary["cells_with_data"] == 0
+        assert tail == []  # no families pass, no staged sweep, no Icechunk finalize
+        assert summary["families_sweep"] is None and summary["stage_sweep"] is None
+        assert summary["icechunk_finalize"] == {"skipped": f"circuit breaker tripped ({rule})"}
+        assert any(f"circuit breaker tripped ({rule})" in r for r in summary["tail_sweep_short"])
+
+    def test_async_timeouts_trip_and_stop_invoking(self, catalog_file, monkeypatch, status_store):
+        # agg's DEFAULT transport (invocation="async", the #151 result-object
+        # channel): the first unit's deadline miss trips; the rest never run.
+        from zagg.dispatch_guard import NO_RESULT_PREFIX
+
+        tail = self._tail_recorder(monkeypatch)
+        calls = self._cell_results(
+            monkeypatch,
+            lambda k: {"status_code": None, "body": {}, "error": f"{NO_RESULT_PREFIX} 990s"},
+        )
+        summary = self._agg(
+            catalog_file,
+            monkeypatch,
+            EventStubLambdaClient(status_store),
+            "async",
+            dispatch=_TRIP_KNOBS,
+            clamp=1,
+        )
+        assert len(calls) == 1
+        self._assert_tripped_without_a_tail(summary, tail, "timeout-ratio")
+        assert summary["dispatch_pacing"] == guard_pacing("invocation='async'")
+
+    def test_async_store_fatal_results_trip_and_stop_invoking(
+        self, catalog_file, monkeypatch, status_store
+    ):
+        tail = self._tail_recorder(monkeypatch)
+        error = "window 2018 failed: HTTP status client error (403 Forbidden)"
+        calls = self._cell_results(
+            monkeypatch,
+            lambda k: {
+                "status_code": 500,
+                "body": {"error": error, "store_error_class": "store-fatal"},
+                "error": error,
+            },
+        )
+        summary = self._agg(
+            catalog_file,
+            monkeypatch,
+            EventStubLambdaClient(status_store),
+            "async",
+            dispatch={"breaker": {"store_fatal": 1, "store_fatal_first": 20}},
+            clamp=1,
+        )
+        assert len(calls) == 1
+        self._assert_tripped_without_a_tail(summary, tail, "store-fatal")
+
+    def test_sync_timeouts_trip_and_stop_invoking(self, catalog_file, monkeypatch, status_store):
+        # invocation="sync" (RequestResponse): Lambda's own "Task timed out".
+        from test_client import StubLambdaClient
+
+        tail = self._tail_recorder(monkeypatch)
+        stub = StubLambdaClient(timeout=set(_WORDS))
+        summary = self._agg(
+            catalog_file, monkeypatch, stub, "sync", dispatch=_TRIP_KNOBS, clamp=1, max_retries=1
+        )
+        assert len(stub.cell_events()) == 1
+        self._assert_tripped_without_a_tail(summary, tail, "timeout-ratio")
+        assert summary["dispatch_pacing"] == guard_pacing("invocation='sync'")
+
+    @pytest.mark.parametrize("invocation", ["async", "sync"])
+    def test_a_healthy_pool_run_is_unchanged(
+        self, catalog_file, monkeypatch, status_store, invocation
+    ):
+        # Same invokes and the same summary apart from ``breaker: None``: the
+        # guarded run against one with the breaker knocked out of the loop.
+        from test_client import StubLambdaClient
+
+        from zagg import dispatch as dispatch_mod
+        from zagg import runner
+
+        loop = dispatch_mod.dispatch
+
+        def unguarded(*a, guard=None, refuse=None, **k):
+            return loop(*a, **k)
+
+        def run(guarded):
+            tail = self._tail_recorder(monkeypatch)
+            calls = None
+            if invocation == "async":  # the sync stub answers RequestResponse itself
+                calls = self._cell_results(
+                    monkeypatch,
+                    lambda k: {"status_code": 200, "body": {"total_obs": 7}, "error": None},
+                )
+            monkeypatch.setattr(runner, "dispatch", loop if guarded else unguarded)
+            stub = StubLambdaClient()
+            summary = self._agg(catalog_file, monkeypatch, stub, invocation)
+            cells = [e["shard_key"] for _, _, e in stub.cell_events()]
+            return summary, sorted(calls if calls is not None else cells), tail
+
+        guarded, invoked_g, tail_g = run(True)
+        bare, invoked_b, tail_b = run(False)
+        assert invoked_g == invoked_b and len(invoked_g) == 3
+        assert guarded["breaker"] is None and bare["breaker"] is None
+        assert tail_g == tail_b
+        for key in (
+            "total_cells",
+            "cells_with_data",
+            "cells_error",
+            "total_obs",
+            "icechunk_finalize",
+        ):
+            assert guarded[key] == bare[key], key
+        assert set(guarded) == set(bare)
 
     def test_windowed_units_resolve_on_both_windows(self, catalog_file, monkeypatch, status_store):
         # The ONE seam where the channel's two halves derive the same object

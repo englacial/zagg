@@ -276,13 +276,50 @@ class TestCostBlockEvents:
         assert cost["actual_cost_usd"] == summary["estimated_cost_usd"]
 
     def test_summary_names_its_pacing(self, lambda_env, monkeypatch):
-        # No status poller on the events path (issue #652, PR #665 review).
+        # The breaker watches the temporal fan-out at dispatch()'s seam (#652).
         summary = self._run(monkeypatch, self._cfg())
+        assert summary["events_with_data"] == 3  # a healthy run: every event invoked
         assert "ramp" not in summary and summary["breaker"] is None
         assert summary["dispatch_pacing"] == (
-            "pool width: the temporal fan-out has no status poller, so the circuit "
-            "breaker does not apply (issue #652)"
+            "full worker width, circuit breaker on (temporal fan-out) (issue #652)"
         )
+
+    def test_early_timeouts_trip_and_stop_invoking(self, lambda_env, monkeypatch):
+        # issue #652 phase 6: a width-1 temporal run whose first event times
+        # out invokes nothing more; the rest resolve not-dispatched.
+        calls: list[str] = []
+
+        def timed_out(client, ev, *a, **k):
+            calls.append(ev["event_key"])
+            return {
+                "status_code": None,
+                "body": {},
+                "error": "Lambda error: Task timed out after 900.00 seconds",
+                "timeout": True,
+                "event_key": ev["event_key"],
+                "lambda_duration": 900.0,
+            }
+
+        monkeypatch.setattr(
+            runner, "compute_available_workers", lambda requested, *a, **k: (1, _report(1))
+        )
+        monkeypatch.setattr(runner, "_invoke_lambda_event", timed_out)
+        monkeypatch.setattr(runner, "_write_tabular_output", lambda *a, **k: "s3://out/x.parquet")
+        summary = runner._run_lambda_events(
+            self._cfg(),
+            self._events(4),
+            "s3://out/x.parquet",
+            max_workers=1,
+            region="us-west-2",
+            function_name="process-shard",
+            invocation="sync",
+            dispatch_knobs={"breaker": {"window": 1, "timeout_ratio": 0.5}},
+        )
+        assert len(calls) == 1
+        assert summary["breaker"]["rule"] == "timeout-ratio"
+        assert summary["events_error"] == 4
+        refused = [f for f in summary["failures"] if "not dispatched" in str(f["error"])]
+        assert len(refused) == 3 and all(f["event_key"] for f in refused)
 
     def test_max_bounds_actual(self, lambda_env, monkeypatch):
         # Even at the worst billed duration (the 900 s timeout), the pre-invoke

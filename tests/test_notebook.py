@@ -767,24 +767,26 @@ class TestCliDispatchFlag:
         assert exc_info.value.code == 2 and seen == {}  # argparse's usage error, no agg
 
     def test_the_pacing_and_trip_lines_print(self, monkeypatch, capsys):
-        from zagg.dispatch_guard import PACING_GUARD, pool_width_pacing
+        from zagg.dispatch_guard import guard_pacing
 
+        pacing = guard_pacing("invocation='async'")
         summary = dict(
             _lambda_summary(),
-            dispatch_pacing=PACING_GUARD,
+            dispatch_pacing=pacing,
             breaker={"tripped": True, "rule": "timeout-ratio", "at_result": 137, "width": 1000},
         )
         cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=summary)
         cli.main()
         out = capsys.readouterr().out
-        assert f"Dispatch pacing: {PACING_GUARD}" in out
+        assert f"Dispatch pacing: {pacing}" in out
         assert "Dispatch ramp" not in out
         assert "Circuit breaker TRIPPED, dispatch stopped: rule timeout-ratio at result 137" in out
-        # An unwatched channel says WHY no breaker reported (question 10).
-        unpaced = dict(_lambda_summary(), dispatch_pacing=pool_width_pacing("invocation", "async"))
-        cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=unpaced)
+        # A clean run still names the seam that watched it.
+        clean = dict(_lambda_summary(), dispatch_pacing=pacing, breaker=None)
+        cli, _ = self._drive(monkeypatch, ["zagg", "--config", "c.yaml"], summary=clean)
         cli.main()
-        assert "acts only on invocation='event'" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert f"Dispatch pacing: {pacing}" in out and "Circuit breaker" not in out
 
 
 class TestRunWrapper:

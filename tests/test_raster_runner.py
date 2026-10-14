@@ -400,6 +400,50 @@ class TestRasterLambdaBackend:
     # the shard event, RequestResponse invoke). The async default is covered by
     # TestRasterLambdaAsyncBackend / TestInvokeLambdaRaster.
 
+    def test_early_timeouts_trip_and_stop_invoking(self, manifest, monkeypatch, tmp_path):
+        # issue #652 phase 6: the raster pool is gated too. Three shards on a
+        # width-1 run: the first times out, the breaker trips, the other two
+        # are refused without an invoke; every shard then counts as failed.
+        import boto3
+
+        cfg, _sm_path, _shard, _data = manifest
+        shards = [_shard_for_raster_at(dx) for dx in (0.0, 20_000.0, 40_000.0)]
+        assert len(set(shards)) == 3
+        entries = [
+            _entry("g0", str(tmp_path / "t0.tif"), T0, "dt-1"),
+            _entry("g1", str(tmp_path / "t1.tif"), T1, "dt-2"),
+        ]
+        grid = from_config(cfg)
+        path = str(tmp_path / "three.json")
+        ShardMap(grid.spatial_signature(), shards, [entries] * 3, {"collection": "s2"}).to_json(
+            path
+        )
+        invoked: list[int] = []
+
+        def responder(event):
+            invoked.append(event["shard_key"])
+            return {
+                "statusCode": 500,
+                "body": json.dumps({"error": "Task timed out after 900.00 seconds"}),
+            }
+
+        monkeypatch.setattr(
+            boto3, "client", lambda *a, **k: _FakeLambdaClient(_lifecycle(responder))
+        )
+        with pytest.raises(
+            RuntimeError, match="all 3 raster shard.*not dispatched: circuit breaker"
+        ):
+            agg(
+                cfg,
+                catalog=path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                max_workers=1,
+                invocation="sync",
+                dispatch={"breaker": {"window": 1, "timeout_ratio": 0.5}},
+            )
+        assert len(invoked) == 1
+
     def test_events_and_summary(self, manifest, monkeypatch, tmp_path):
         import boto3
 
@@ -430,11 +474,10 @@ class TestRasterLambdaBackend:
             dispatch={"breaker": {"window": 20}},
         )
         assert summary["backend"] == "lambda"
-        # No status poller: the guard keys say so (issue #652, PR #665 review).
+        # The breaker watches the raster pool too (issue #652 phase 6).
         assert "ramp" not in summary and summary["breaker"] is None
         assert summary["dispatch_pacing"] == (
-            "pool width: the raster fan-out has no status poller, so the circuit "
-            "breaker does not apply (issue #652)"
+            "full worker width, circuit breaker on (raster fan-out) (issue #652)"
         )
         assert summary["total_cells"] == 1 and summary["cells_with_data"] == 1
         assert summary["cells_error"] == 0

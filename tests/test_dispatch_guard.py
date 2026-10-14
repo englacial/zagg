@@ -244,6 +244,40 @@ class TestRoomAndRefusal:
         assert refusal["status_code"] is None and refusal["body"] == {}
         assert "timeout-ratio" in refusal["error"] and "#652" in refusal["error"]
 
+    def test_gate_records_each_unit_and_refuses_after_a_trip(self):
+        # issue #652 phase 6: the pool wrapper every non-Event fan-out shares.
+        g = _guard(window=1, timeout_ratio=0.5)
+        ran: list[int] = []
+
+        def work(k):
+            ran.append(k)
+            return {**_timeout(), "shard_key": k}
+
+        run = g.gate(work, lambda k: g.refused(shard_key=k))
+        assert run(1)["outcome"] == "failed-unknown"  # recorded on return: the trip
+        refused = run(2)
+        assert ran == [1] and g.tripped["at_result"] == 1
+        assert (refused["shard_key"], refused["outcome"], refused["retries"]) == (
+            2,
+            NOT_DISPATCHED,
+            -1,
+        )
+
+    def test_gate_records_a_raised_payload(self):
+        # The facade's sync work raises ShardError carrying the result dict.
+        class RaisedError(Exception):
+            def __init__(self, payload):
+                self.payload = payload
+
+        g = _guard(store_fatal=1, store_fatal_first=20)
+
+        def work(k):
+            raise RaisedError(_failed(store_error_class="store-fatal"))
+
+        with pytest.raises(RaisedError):
+            g.gate(work, lambda k: None)(1)
+        assert g.tripped["rule"] == RULE_STORE_FATAL
+
     def test_fixed_window_paces_without_recording(self):
         w = FixedWindow(3)
         w.record(_timeout())
@@ -402,13 +436,9 @@ class TestParseKnobs:
 
 class TestPacing:
     def test_describe_leads_with_the_pacing_line(self):
-        from zagg.dispatch_guard import PACING_GUARD, describe, pool_width_pacing
+        from zagg.dispatch_guard import describe, guard_pacing
 
-        why = pool_width_pacing("invocation", "async")
-        assert why == (
-            "pool width (invocation='async'): the circuit breaker acts only on "
-            "invocation='event' (issue #652)"
-        )
-        assert describe(None, why) == [f"Dispatch pacing: {why}"]
-        assert describe(None, PACING_GUARD) == [f"Dispatch pacing: {PACING_GUARD}"]
+        pacing = guard_pacing("invocation='async'")
+        assert pacing == ("full worker width, circuit breaker on (invocation='async') (issue #652)")
+        assert describe(None, pacing) == [f"Dispatch pacing: {pacing}"]
         assert describe(None, None) == []
