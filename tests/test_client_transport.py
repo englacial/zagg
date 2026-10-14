@@ -562,7 +562,10 @@ class TestStatusPoller:
         # not-before stamp spent the WHOLE retry budget in ~0.3 ms, because
         # _dispatch_up_to_window's `while True` re-reads `queued` in the same
         # pass. Each re-fire now waits 2**attempts seconds — enforced by the
-        # clock, not by sleeping on the poller thread.
+        # clock, driven tick by tick rather than by a started poller racing the
+        # test for that clock (the same mechanism as issue #662: this one only
+        # survived on a 50 ms cushion that hid the window instead of closing
+        # it).
         store = MemoryStore()
         now = {"t": 1000.0}
         fired: list[float] = []
@@ -575,20 +578,21 @@ class TestStatusPoller:
             lambda: store, drop_timeout_s=1e6, max_retries=4, clock=lambda: now["t"]
         )
         fut = poller.register(1, "1", dispatch=always_throttled)
-        poller.start()
-        # 2 s, then 4 s, then 8 s: no re-fire until the clock passes the stamp.
-        for expected, t in ((1, 1002.0), (2, 1006.0), (3, 1014.0)):
-            deadline = time.time() + 5
-            while len(fired) < expected and time.time() < deadline:
-                time.sleep(0.005)
-            time.sleep(0.05)  # several ticks INSIDE the backoff
+        entry = poller._entries[ct.shard_status_key(1)]
+        poller._tick()  # attempt 1
+        # 2 s, then 4 s, then 8 s: no re-fire until the clock reaches the stamp.
+        for expected, stamp in ((1, 1002.0), (2, 1006.0), (3, 1014.0)):
             assert len(fired) == expected, fired
-            now["t"] = t
-        result = fut.result(timeout=5)  # attempt 4 == max_retries: terminal
+            assert entry.retry_not_before == stamp
+            now["t"] = stamp - 0.001  # a tick INSIDE the backoff changes nothing
+            poller._tick()
+            assert len(fired) == expected, fired
+            now["t"] = stamp
+            poller._tick()
+        result = fut.result(timeout=1)  # attempt 4 == max_retries: terminal
         assert "TooManyRequestsException" in result["error"]
         assert result["retries"] == 3
         assert fired == [1000.0, 1002.0, 1006.0, 1014.0]
-        poller.shutdown(wait=True)
 
     def test_a_store_fatal_status_is_terminal_and_names_its_class(self):
         # Issue #651: the worker ended its invoke on a refusal the store would
