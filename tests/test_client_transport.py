@@ -546,7 +546,7 @@ class TestStatusPoller:
         # not overslept by up to _POLL_MAX_INTERVAL_S (the guard in _run that
         # driving _tick directly no longer exercises).
         assert poller._next_retry_wait() == 2.0
-        now["t"] = 1001.999  # still INSIDE the backoff: no re-fire
+        now["t"] = entry.retry_not_before - 0.001  # still INSIDE the backoff
         poller._tick()
         assert calls["n"] == 1
         now["t"] = 1002.0  # the 2 s class-(c) backoff expires
