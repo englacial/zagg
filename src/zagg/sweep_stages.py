@@ -1403,8 +1403,11 @@ def run_stage_finisher(
         {
             "spec": STAGE_RECORD_SPEC,
             "role": "finisher",
-            "lambda_memory_mb": _lambda_memory_mb(),
             **summary,
+            # after ``**summary`` so the stamp stays authoritative: the field
+            # says what THIS invoke ran on, so a future summary key of the
+            # same name must not quietly win over it
+            "lambda_memory_mb": _lambda_memory_mb(),
         },
         store_kwargs,
     )
