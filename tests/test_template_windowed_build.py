@@ -21,11 +21,13 @@ proves nothing: a refused write is caught and logged per window (``hive``'s
 ``_emit``) or per column (the leaf-column ``except Exception``), and
 ``runner.agg`` returns normally. The proof is the refuser recording no
 chunk-key delete (``attempted`` empty), ``pyramid_check`` and the per-year
-counts showing every leaf landed. The key-for-key match against a guard-off
-build lives in ``test_template_windowed_twin`` and the refused-write cases
-(issue #651) in ``test_template_windowed_refused``: each module carries its
-own builds so ``pytest --dist loadfile`` runs them on separate workers
-(issue #669).
+counts showing every leaf landed, and a key-for-key match against a
+guard-off permissive build, since a skipped block and a deleted one both
+leave no object. That twin shares the guarded build below instead of
+repeating it, which is why it lives here (issue #669): only the
+refused-write cases (issue #651) need builds of their own, and they are in
+``test_template_windowed_refused``, which ``pytest --dist loadfile`` runs on
+another worker.
 """
 
 from __future__ import annotations
@@ -213,6 +215,10 @@ class _Built(NamedTuple):
     attempted: list
     #: the deletes it allowed (prefix clears, sidecars)
     deletes: list
+    #: the same build with the guard off through a permissive store (zarr's
+    #: own delete-on-all-fill, as before #653), for the key-set match; None
+    #: for the single-digest template, which has no all-fill slab to compare
+    permissive: object
 
 
 @pytest.fixture(scope="module", params=TEMPLATES)
@@ -222,7 +228,19 @@ def built(request, tmp_path_factory):
     with pytest.MonkeyPatch.context() as monkeypatch:
         cfg, root, shards = _build(monkeypatch, tmp_path, request.param, refuse_chunk_deletes=True)
     attempted, deletes = _NoChunkDeletes.attempted, _NoChunkDeletes.deletes
-    return _Built(request.param, cfg, root, shards, attempted, deletes)
+    permissive = None
+    if request.param == TEMPLATES[0]:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            # The pre-#653 writers: the guard off, so every all-fill slab goes
+            # to zarr, which deletes its key. Every call site looks ``all_fill``
+            # up on this module at call time, so one patch reaches them all.
+            import zagg.processing.write
+
+            monkeypatch.setattr(zagg.processing.write, "all_fill", lambda array, values: False)
+            _, permissive, _ = _build(
+                monkeypatch, tmp_path_factory.mktemp("permissive-store"), request.param
+            )
+    return _Built(request.param, cfg, root, shards, attempted, deletes, permissive)
 
 
 def test_every_window_has_its_leaf_and_the_all_row_is_allocated(built):
@@ -413,3 +431,18 @@ def test_the_stub_windows_fill_slab_has_no_object(built):
 
         arr = zarr.open_array(_store(leaf["2021"]), path=f"{base}/h_tdigest_signal", mode="r")
         assert all(v == b"" for v in np.asarray(arr[:]).flat)
+
+
+def test_skipped_blocks_leave_no_object_either_way(built):
+    """A skipped all-fill block and zarr's delete of it both leave no key — and
+    the guard never skipped a block zarr would have written.
+
+    The twin runs with ``all_fill`` patched to ``False``, so it is zarr's own
+    pre-#653 behaviour (delete-on-all-fill); key-set equality therefore means
+    the guard skipped exactly the blocks zarr would have deleted, no more.
+    Strata template only: the single-digest one has nothing to skip, so its
+    twin would match by construction and is not built.
+    """
+    if built.permissive is None:
+        pytest.skip(_NO_FILL_SLAB)
+    assert _objects(built.root) == _objects(built.permissive)
