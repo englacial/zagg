@@ -486,12 +486,14 @@ def test_objects_columns_retained_and_mismatch_dropped():
     # per-merge series' JSON-only keys.
     df = fas.records_to_frame([_record(objects_mismatch="total objects 999 != expected 25")])
     assert list(df.columns) == fas.FULL_AOI_COLUMNS
-    # Appended in order: object counts (phase 3), then layout + parity (phase
-    # 4), then the worker phase split + setup cost (issue #250), then the
-    # #256 write split + finalize cost, then the #272 first-consumer column.
-    assert fas.FULL_AOI_COLUMNS[-11:-1] == [
+    # Appended in order: object counts (phase 3, + the issue #668 Icechunk
+    # companion-repo bucket beside them), then layout + parity (phase 4), then
+    # the worker phase split + setup cost (issue #250), then the #256 write
+    # split + finalize cost, then the #272 first-consumer column.
+    assert fas.FULL_AOI_COLUMNS[-12:-1] == [
         "objects_total",
         "objects_expected",
+        "objects_icechunk",
         "store_layout",
         "parity_ok",
         "phase_read_s",

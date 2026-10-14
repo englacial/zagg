@@ -50,6 +50,7 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "worker_phase_max": {"read", "index", "aggregate", "write"},  # straggler (max) s/phase (#250/#256)
       "objects_total", "objects_expected", "objects_mismatch",  # store object counts (issue #240), record-only
       "objects_telemetry",  # per-run root telemetry, netted out of the audited total (issue #362)
+      "objects_icechunk",   # the §11 companion repo's bucket, netted out too (issue #668)
       "write_throughput": {                                    # leg-5 acceptance signal
         "invoke_retries_total", "invoke_throttle_shards",
         "s3_slowdown_shards", "cells_timeout"
@@ -568,6 +569,7 @@ def run_target(
             objects_total=None,
             objects_expected=None,
             objects_telemetry=None,
+            objects_icechunk=None,
             objects_mismatch=None,
             parity_ok=None,
             parity=None,
@@ -663,6 +665,10 @@ def run_target(
         # release row's total is netted the same way instead of dropping the
         # key on the floor.
         objects_telemetry=objects.get("objects_telemetry"),
+        # The §11 companion repo (issue #668): shard-scaled under the operative
+        # ``commit: "leaf"``, and this leg is record-only, so the column is the
+        # only channel a repo-side step is legible in.
+        objects_icechunk=objects.get("objects_icechunk"),
         objects_mismatch=objects.get("objects_mismatch"),
         parity_ok=(parity or {}).get("parity_ok"),
         parity=parity,

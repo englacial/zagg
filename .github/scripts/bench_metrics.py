@@ -357,6 +357,9 @@ def build_record(
     # Per-run root telemetry (issue #362): JSON-only like per_shard/mismatch —
     # reported so an accumulating shared store is legible, never audited.
     record["objects_telemetry"] = o.get("objects_telemetry")
+    # The §11 Icechunk companion repo (issue #668): carried the same way, so a
+    # gross ``objects_total`` step is reconcilable from the row that records it.
+    record["objects_icechunk"] = o.get("objects_icechunk")
     record["objects_mismatch"] = o.get("objects_mismatch")
     # Streaming-mode + ephemeral axis (issue #272): threaded from the target by
     # run_benchmark. ``ephemeral_cost_usd`` is the /tmp component already folded

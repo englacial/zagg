@@ -147,6 +147,7 @@ def test_build_record_cost_per_100km2():
     assert set(rec) == set(bench_metrics.RECORD_COLUMNS) | {
         "objects_per_shard",
         "objects_telemetry",
+        "objects_icechunk",
         "objects_mismatch",
     }
 
@@ -2491,7 +2492,36 @@ def test_hive_config_expected_counts_root_moc_optional():
         "total_min": 13,
         "total_max": 15,
         "exact": True,
+        # The §11 companion repo is a PRESENCE floor, not a term (issue #668):
+        # this call models the repo-less shape, and the windows above are the
+        # same either way.
+        "icechunk_declared": False,
     }
+
+
+def test_live_hive_arm_declares_the_icechunk_repo():
+    # The arm the Lambda Benchmark actually runs DECLARES the §11 companion
+    # repo, which is what went red from 2026-10-07 once its init stopped
+    # failing open on S3 (issue #606 phase 1): ``measure_objects`` arms the
+    # presence floor off this same knob, and the repo's 16 objects ride
+    # ``objects_icechunk`` instead of the ``other`` bucket that tripped the
+    # finding. Pinned on the REAL config rather than a synthetic one, so
+    # anyone setting ``output.icechunk: false`` on the live arm fails HERE, by
+    # name (issue #668).
+    import bench_objects
+
+    from zagg.config import get_icechunk, load_config
+    from zagg.grids import from_config
+
+    cfg = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9_hive.yaml"))
+    assert get_icechunk(cfg) is True
+    grid = from_config(cfg)
+    exp = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
+    armed = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout="hive", icechunk_declared=get_icechunk(cfg)
+    )
+    # The declaration arms the floor and moves no window (issue #668).
+    assert armed == dict(exp, icechunk_declared=True)
 
 
 def test_matrix_mask_excludes_hive_rows():

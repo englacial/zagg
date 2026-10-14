@@ -56,6 +56,33 @@ written inside the same worker whose object count the issue #215 tripwire
 guards — so it is audited exactly, and a column that goes missing or arrives
 multiplied trips the per-shard assertion.
 
+**The §11 Icechunk companion repo is outside the audited total too** (issue
+#668). A hive store's reserved ``icechunk/`` root child
+(:func:`zagg.icechunk_refs.repo_path`, which :func:`zagg.config.get_icechunk`
+defaults ON for every NON-RASTER hive store since issue #580) holds a
+DERIVED index — ``repo``, ``refs/...``, ``snapshots/<id>``,
+``manifests/<id>``, ``transactions/<id>``, ``overwritten/...`` — written one
+commit per populated leaf under the default ``commit: "leaf"``, which is what
+every benchmark arm runs today: ``zagg.icechunk_refs.ladder_walks`` keys off
+an explicit ``output.sweep: "stages"`` that no config under
+``tests/data/benchmark/configs/`` sets, so ``resolve_options`` resolves
+``commit: "leaf"`` and not ``"ladder"``. The bucket is therefore
+SHARD-SCALED here, the same dimension the write path scales on — what keeps
+it out of a window is not an orthogonal cadence but the object count PER
+COMMIT (a snapshot, N manifests, a transaction log, plus whatever compaction
+does), which is Icechunk's business and not deterministically modelable. Its
+keys ride the ``objects_icechunk`` bucket on the same D9 posture as the
+rollup / overview / telemetry buckets: counted, reported, netted out. What
+stays asserted is the repo's PRESENCE (:func:`object_count_mismatch`), so a
+repo that NEVER STOOD UP AT ALL is a finding rather than a silently empty
+bucket. The floor reaches exactly that far and no further: ``icechunk_init``
+ITSELF commits, so a repo whose init landed and whose every per-leaf commit
+then failed open (``zagg.hive``'s per-shard handler is as fail-open as the
+init's) still holds its own init objects and clears the floor. The wider
+"init fails open" class — the issue #606 story, invisible on S3 until
+``d23d7788`` — is therefore only PARTLY covered; narrowing it further is a
+scope call standing for espg on PR #672.
+
 **The hive model assumes the UNWINDOWED leaf** (review finding), as the flat
 model assumes fullsphere HEALPix (:func:`_require_fullsphere`). One populated
 shard is one leaf and one column; a windowed store writes one of each per
@@ -87,6 +114,7 @@ import re
 import bench_metrics
 
 from zagg.column import COLUMN_SUFFIX
+from zagg.hive import ICECHUNK_DIR_NAME
 
 # Per-shard attribution on the flat layout assumes the 1-D fullsphere HEALPix
 # layout the benchmark manifests use (block index arithmetic on the cells
@@ -98,6 +126,10 @@ from zagg.column import COLUMN_SUFFIX
 #: 0/5-9 digits or letters and ``all`` is the reserved token — which is what
 #: lets the hive walk tell an overview zarr from a stray source leaf.
 _MORTON_ID_RE = re.compile(r"-?[1-6][1-4]*")
+
+#: The store-root prefix the §11 Icechunk companion repo occupies (issue #668),
+#: keyed off the writer's own reserved name rather than a second literal.
+_ICECHUNK_PREFIX = f"{ICECHUNK_DIR_NAME}/"
 
 
 def _column_node(key: str) -> str | None:
@@ -238,13 +270,14 @@ def expected_object_counts(
     store_layout: str = "flat",
     pyramid: dict | None = None,
     leaf_versions: bool = False,
+    icechunk_declared: bool = False,
 ) -> dict:
     """Expected store object counts for ``n_shards`` populated shards.
 
     Returns ``{"metadata", "per_shard_min", "per_shard_max", "total_min",
-    "total_max", "exact"}``. ``metadata`` is the fixed (shard-independent)
-    object count; ``exact`` is True when every per-shard count is
-    deterministic (the flat sharded live matrix), in which case
+    "total_max", "exact", "icechunk_declared"}``. ``metadata`` is the fixed
+    (shard-independent) object count; ``exact`` is True when every per-shard
+    count is deterministic (the flat sharded live matrix), in which case
     ``total_min == total_max`` is the asserted total.
 
     ``pyramid`` is the store manifest's ``pyramid`` block (hive only) — the
@@ -255,6 +288,12 @@ def expected_object_counts(
     spec §1.5): one more object per populated leaf, the pointer root's
     ``zarr.json``, since the version subgroup carries its own stamped root
     beside the group and array metadata the legacy leaf has.
+
+    ``icechunk_declared`` (:func:`zagg.config.get_icechunk`, threaded in by
+    :func:`measure_objects`) is NOT a count term — the §11 companion repo
+    scales with commits, not shards, so it is modeled as the PRESENCE floor
+    :func:`object_count_mismatch` asserts (issue #668) and carried through in
+    the returned dict so the two sides stay single-sourced.
     """
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -311,6 +350,10 @@ def expected_object_counts(
         # rollup/overview buckets already take. This window therefore stays
         # TIGHT (manifest + optional root MOC + optional aggregation.yaml), so
         # real root-metadata drift still trips it.
+        # The §11 Icechunk companion repo (issue #668) is outside this window
+        # for the same reason: its object count scales with COMMITS, not with
+        # the write path, so it rides the unbounded ``objects_icechunk`` bucket
+        # (:func:`_is_icechunk_object`) and only its PRESENCE is asserted.
         metadata_min = 1
         metadata_max = 1 + 1 + 1
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
@@ -346,6 +389,8 @@ def expected_object_counts(
         "total_min": metadata_min + n_shards * lo,
         "total_max": metadata_max + n_shards * hi,
         "exact": lo == hi,
+        # Not a count: the §11 repo's PRESENCE floor (issue #668).
+        "icechunk_declared": icechunk_declared,
     }
 
 
@@ -376,6 +421,20 @@ def _is_root_telemetry(key: str) -> bool:
     than widening the metadata window by a number that can only ever be wrong.
     """
     return _is_run_parquet(key) or _is_sweep_record(key)
+
+
+def _is_icechunk_object(key: str) -> bool:
+    """A key inside the §11 Icechunk companion repo (issue #668).
+
+    The repo is the store-root ``icechunk/`` child
+    (:func:`zagg.icechunk_refs.repo_path`), a derived commit-scaled index and
+    not a write-path artifact — see the module docstring for why it gets its
+    own bucket. Matched on the PREFIX alone: the repo's internal layout is
+    Icechunk's, not zagg's, so enumerating its members here would be a second
+    model to drift. A store-root object merely NAMED ``icechunk`` is not under
+    the prefix and stays a loud ``other``.
+    """
+    return key.startswith(_ICECHUNK_PREFIX)
 
 
 def _is_status_object(key: str) -> bool:
@@ -431,15 +490,16 @@ def store_object_counts(
 
     Returns ``{"objects_total", "objects_metadata", "objects_per_shard",
     "objects_rollups", "objects_overviews", "objects_telemetry",
-    "objects_other", "other_keys"}``. ``objects_overviews`` is the
-    SECOND-PASS SWEEP bucket, of which overview zarrs are one family and
-    ancestor-node stage columns (issue #418) another — the name predates the
-    second family and is load-bearing for the record's readers, so it is
-    described here rather than renamed. ``objects_per_shard`` keys are the
-    dispatched shards' external labels (``grid.shard_label``); a data object
-    whose block resolves to an undispatched shard is keyed ``"block:<n>"`` so
-    a stray write is visible rather than silently pooled. ``other_keys`` is a
-    capped sample of unclassifiable keys.
+    "objects_icechunk", "objects_other", "other_keys"}``.
+    ``objects_overviews`` is the SECOND-PASS SWEEP bucket, of which overview
+    zarrs are one family and ancestor-node stage columns (issue #418) another
+    — the name predates the second family and is load-bearing for the record's
+    readers, so it is described here rather than renamed.
+    ``objects_per_shard`` keys are the dispatched shards' external labels
+    (``grid.shard_label``); a data object whose block resolves to an
+    undispatched shard is keyed ``"block:<n>"`` so a stray write is visible
+    rather than silently pooled. ``other_keys`` is a capped sample of
+    unclassifiable keys.
     """
     keys = [k for k in list_store_keys(store_path, **store_kwargs) if not _is_status_object(k)]
     per_shard: dict[str, int] = {}
@@ -448,6 +508,7 @@ def store_object_counts(
     rollups = 0
     overviews = 0
     telemetry = 0
+    icechunk = 0
 
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -455,6 +516,14 @@ def store_object_counts(
         label_of = {int(grid.block_index(int(k))[0]): grid.shard_label(int(k)) for k in shard_keys}
         group = grid.group_path
         for key in keys:
+            # The companion repo (issue #668) is tallied on this layout too,
+            # though a flat store never stands one up: counting it rather than
+            # letting it fall to ``other`` makes the undeclared-repo finding in
+            # :func:`object_count_mismatch` the one place a stray repo is
+            # reported.
+            if _is_icechunk_object(key):
+                icechunk += 1
+                continue
             if _is_root_telemetry(key):
                 telemetry += 1
                 continue
@@ -512,6 +581,13 @@ def store_object_counts(
             n for n in map(_column_node, keys) if n is not None and n + "/" not in stats_of
         }
         for key in keys:
+            # The companion repo FIRST (issue #668): a key under ``icechunk/``
+            # is the derived index's, never a write-path object, so it must
+            # reach no other arm — least of all ``other``, which is what went
+            # red on main for a week.
+            if _is_icechunk_object(key):
+                icechunk += 1
+                continue
             if _is_root_telemetry(key):
                 telemetry += 1
                 continue
@@ -610,6 +686,7 @@ def store_object_counts(
         "objects_rollups": rollups,
         "objects_overviews": overviews,
         "objects_telemetry": telemetry,
+        "objects_icechunk": icechunk,
         "objects_other": len(other),
         "other_keys": other[:20],
     }
@@ -634,6 +711,11 @@ def measure_objects(
     of shards expected to have written (the dispatch count for the per-merge
     harness, the completed-with-data count for the full-AOI fan-out).
 
+    The §11 Icechunk companion repo's objects are reported in their own
+    bucket (``objects_icechunk``, issue #668) and netted out of
+    ``objects_write_path``; the audit on them is the presence floor in
+    :func:`object_count_mismatch`, not a count.
+
     On hive the pyramid DECLARATION is read from the store's own manifest and
     threaded into the model (issue #418), so the column term needs no new
     argument at the harness call sites: the block is the run's declaration,
@@ -641,14 +723,31 @@ def measure_objects(
     of the write path being audited. A hive store with no readable manifest
     raises here rather than quietly modelling the pre-#384 shape.
     """
+    from zagg.config import get_icechunk
+
     pyramid = None
     leaf_versions = False
+    # The run's §11 declaration (issue #668): ASKED of the run's own config on
+    # both layouts rather than hard-coded False off-hive, then gated on the
+    # layout actually under audit. Both halves are load-bearing. Asking is what
+    # makes the flat answer honest instead of resting on an invariant two
+    # modules away (a non-hive store resolves True only via an explicit
+    # ``output.icechunk: true``, which ``validate_config`` rejects — see
+    # ``zagg.config.get_icechunk``). Gating is what keeps a DIVERGENT pair
+    # right: ``store_layout`` is this call's own argument and need not agree
+    # with ``get_store_layout(grid.config)``, as it does not in
+    # ``test_measure_objects_end_to_end`` (a flat store measured through a
+    # hive-layout grid config), and the layout being audited is the authority
+    # on whether a repo could be there at all. Never read from the store being
+    # measured — that is what makes "declared but absent" a finding at all.
+    icechunk_declared = get_icechunk(grid.config) and store_layout == "hive"
     if store_layout == "hive":
         from zagg.config import get_leaf_versions
         from zagg.hive import read_manifest
 
         pyramid = (read_manifest(store_path, **store_kwargs) or {}).get("pyramid")
-        # The run's knob (issue #582): the harness runs the config it audits.
+        # The run's versioned-leaf knob (issue #582): same posture — the
+        # harness runs the config it audits.
         leaf_versions = get_leaf_versions(grid.config)
     expected = expected_object_counts(
         grid,
@@ -656,6 +755,7 @@ def measure_objects(
         store_layout=store_layout,
         pyramid=pyramid,
         leaf_versions=leaf_versions,
+        icechunk_declared=icechunk_declared,
     )
     measured = store_object_counts(
         store_path,
@@ -676,6 +776,10 @@ def measure_objects(
         # shared store is legible in metrics.json / the run log, never audited
         # (``object_count_mismatch`` nets it out of the total).
         "objects_telemetry": measured["objects_telemetry"],
+        # The §11 companion repo (issue #668): reported for the same reason —
+        # a commit-scaled bucket is worth seeing — and audited only for
+        # presence, never as a count.
+        "objects_icechunk": measured["objects_icechunk"],
         "objects_mismatch": object_count_mismatch(measured, expected),
     }
 
@@ -683,7 +787,7 @@ def measure_objects(
 def write_path_total(measured: dict) -> int:
     """The audited WRITE-PATH object count: the gross total, netted.
 
-    ``objects_total`` is every object under the store prefix. Three buckets are
+    ``objects_total`` is every object under the store prefix. Four buckets are
     not write-path objects and are subtracted here:
 
     * sweep rollups (issue #300) and overview zarrs (issue #201) — second-pass
@@ -691,7 +795,11 @@ def write_path_total(measured: dict) -> int:
       time (fire-and-forget on Lambda);
     * per-run root telemetry (issue #362) — additionally unbounded, since its
       names are per-run unique, so a reused store accumulates it and no fixed
-      expectation could ever hold.
+      expectation could ever hold;
+    * the §11 Icechunk companion repo (issue #668) — a derived index written
+      one commit per populated leaf under the operative ``commit: "leaf"``
+      (so shard-scaled, as the write path is), whose PER-COMMIT object count
+      is Icechunk's own and not deterministically modelable.
 
     This is the number :func:`object_count_mismatch` audits and the one
     ``objects_expected`` is comparable to; ``objects_total`` stays gross
@@ -703,6 +811,7 @@ def write_path_total(measured: dict) -> int:
         - measured.get("objects_rollups", 0)
         - measured.get("objects_overviews", 0)
         - measured.get("objects_telemetry", 0)
+        - measured.get("objects_icechunk", 0)
     )
 
 
@@ -717,6 +826,29 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     optional, fail-open D9 root objects (``coverage.moc``, ``aggregation.yaml``
     — present or absent are both valid). Unclassifiable keys are always a
     finding: the model claims to know every object the run writes.
+
+    The §11 Icechunk companion repo is audited as a PRESENCE floor rather than
+    a count (issue #668): its object count scales with the run's commits, so a
+    declared repo must have landed at least its ``icechunk/repo``, and a store
+    whose config declares none must have landed nothing. What the floor
+    catches is a repo THAT NEVER STOOD UP AT ALL, not the whole fail-open
+    class: ``icechunk_init`` itself commits, so a repo whose init succeeded
+    and whose every per-leaf commit then failed open still holds its init
+    objects and clears ``>= 1``. That much is had without putting a
+    commit-scaled number in a window; reaching the per-leaf half needs either
+    a per-family sub-floor or the run's own per-leaf record, both of which are
+    open questions for espg on PR #672 (review finding).
+
+    The undeclared direction ASSUMES A STORE WHOSE DECLARATION NEVER CHANGED,
+    as the model assumes the unwindowed leaf (module docstring) and the
+    fullsphere flat grid (:func:`_require_fullsphere`). Unlike the per-run
+    telemetry names (issue #362), the repo sits at a FIXED ``icechunk/``
+    prefix and outlives the run that wrote it, so flipping a benchmark
+    target to ``output.icechunk: false`` over a store that already holds one
+    trips this arm on a stale artifact rather than on a regression. The fix
+    then is to empty the prefix or re-point the target at a fresh store — not
+    to widen the finding, which on a fresh store is what catches a writer
+    standing up a repo nobody declared.
     """
     problems = []
     total = write_path_total(measured)
@@ -742,6 +874,18 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
         bad = {k: v for k, v in measured["objects_per_shard"].items() if v != per}
         if bad:
             problems.append(f"per-shard object counts != expected {per}: {bad}")
+    # The §11 companion repo: presence both ways (issue #668). ``.get`` for
+    # the same reason the netted buckets use it in :func:`write_path_total` —
+    # a hand-built ``measured``/``expected`` pair predates the bucket.
+    icechunk = measured.get("objects_icechunk", 0)
+    if expected.get("icechunk_declared") and not icechunk:
+        problems.append("icechunk objects 0 != expected >=1 (declared repo; init failed open?)")
+    elif icechunk and not expected.get("icechunk_declared"):
+        problems.append(
+            f"icechunk objects {icechunk} != expected 0 (no repo declared; "
+            f"a stale repo on a reused store reads the same — empty the "
+            f"icechunk/ prefix or re-point at a fresh store)"
+        )
     if measured["objects_other"]:
         problems.append(
             f"{measured['objects_other']} unrecognized object key(s), "
