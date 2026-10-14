@@ -139,6 +139,23 @@ def test_emit_shard_template_refuses_an_occupied_prefix_without_overwrite():
         grid.emit_shard_template(store, overwrite=True)
 
 
+def test_emit_shard_template_refuses_a_prefix_occupied_without_a_root_doc():
+    """A torn template (chunks and array docs, no root doc) still raises (issue #657).
+
+    ``create_nodes`` PUTs concurrently, so the root doc can be the one that is
+    missing; the probe is prefix emptiness, not the root doc's existence.
+    """
+    grid, _spec = _leaf_spec()
+    store = MemoryStore()
+    with vlen_dtype_warning_suppressed():
+        grid.emit_shard_template(store)
+        sync(store.delete("zarr.json"))
+        assert not sync(store.exists("zarr.json"))
+        assert _documents(store)
+        with pytest.raises(ContainsGroupError, match="A group exists in store"):
+            grid.emit_shard_template(store)
+
+
 def _companion_leaf(sharded: bool):
     """A K=16 leaf carrying every writer branch the handle map must cover.
 

@@ -585,8 +585,9 @@ class HealpixGrid:
         a schema-narrowed rerun would leave the retired members' objects
         behind (e.g. the post-#337 ``cell_ids`` chunk orphans), masquerading
         as data. ``overwrite=False`` on an occupied prefix now RAISES
-        ``ContainsGroupError`` (issue #657) off one root probe, where
-        pydantic-zarr's ``to_zarr`` accepted a structurally identical template.
+        ``ContainsGroupError`` (issue #657) off one emptiness probe of the
+        prefix (any object under it, root doc or not), where pydantic-zarr's
+        ``to_zarr`` accepted a structurally identical template.
         Every leaf writer passes ``overwrite=True``.
 
         Scope of the justification (fold review — the evidence, not more): the
@@ -632,8 +633,11 @@ class HealpixGrid:
         writers write through the handles it returns, so no array is
         re-opened on the data path. ``overwrite`` clears the prefix first (the
         issue #341 semantics documented on :meth:`emit_shard_template`);
-        without it ONE root probe stands in for the per-node check the pass
-        no longer makes, and an occupied prefix raises.
+        without it ONE emptiness probe of the prefix (``is_empty("")`` — a
+        bounded LIST on S3, not a HEAD of the root doc, so a torn template
+        with chunks but no root doc still counts as occupied) stands in for
+        the per-node check the pass no longer makes, and an occupied prefix
+        raises.
         """
         from zarr.core.sync import sync
         from zarr.errors import ContainsGroupError
@@ -647,8 +651,8 @@ class HealpixGrid:
         with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
             if overwrite:
                 sync(store.delete_dir(""))
-            elif sync(store.exists("zarr.json")):
-                raise ContainsGroupError(store, "")
+            elif not sync(store.is_empty("")):
+                raise ContainsGroupError(f"A group exists in store {store!r} at path ''.")
             return emit_hierarchy(store, spec)
 
     def spec(self) -> GroupSpec:
