@@ -517,6 +517,13 @@ class TestStatusPoller:
         poller.shutdown(wait=True)
 
     def test_invoke_fault_burns_an_attempt_and_retries(self):
+        # Driven tick by tick, no thread: the started-poller version raced its
+        # own clock (issue #662). It advanced `now` as soon as the dispatch had
+        # incremented `calls`, but _invoke_faulted reads the clock a few
+        # instructions later, so a preempted poller thread stamped the re-fire
+        # at 1002.0 + 2 s = 1004.0 — a boundary the test never reaches, leaving
+        # `calls` at 1. The clock only moves here between ticks, so the
+        # stamp is read at 1000.0 by construction.
         store = MemoryStore()
         now = {"t": 1000.0}
         calls = {"n": 0}
@@ -530,18 +537,25 @@ class TestStatusPoller:
             lambda: store, drop_timeout_s=1e6, max_retries=3, clock=lambda: now["t"]
         )
         fut = poller.register(1, "1", dispatch=flaky)
-        poller.start()
-        deadline = time.time() + 5
-        while calls["n"] < 1 and time.time() < deadline:
-            time.sleep(0.005)
+        entry = poller._entries[ct.shard_status_key(1)]
+        poller._tick()  # attempt 1 faults: the attempt is burned, 2 s armed
+        assert calls["n"] == 1
+        assert entry.attempts == 1 and entry.queued
+        assert entry.retry_not_before == 1002.0
+        # _run shortens its own interval to the armed stamp, so the re-fire is
+        # not overslept by up to _POLL_MAX_INTERVAL_S (the guard in _run that
+        # driving _tick directly no longer exercises).
+        assert poller._next_retry_wait() == 2.0
+        now["t"] = 1001.999  # still INSIDE the backoff: no re-fire
+        poller._tick()
+        assert calls["n"] == 1
         now["t"] = 1002.0  # the 2 s class-(c) backoff expires
-        deadline = time.time() + 5
-        while calls["n"] < 2 and time.time() < deadline:
-            time.sleep(0.005)
+        assert poller._next_retry_wait() == 0.0
+        poller._tick()
         assert calls["n"] == 2
         _put_status(store, 1)
-        assert fut.result(timeout=5)["retries"] == 1
-        poller.shutdown(wait=True)
+        poller._tick()
+        assert fut.result(timeout=1)["retries"] == 1
 
     def test_throttled_invoke_backs_off_instead_of_bursting(self):
         # The medium-high from the PR #343 review: re-queueing without a
