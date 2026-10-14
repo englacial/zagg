@@ -12,7 +12,9 @@ is held to one tier up:
 - its ``zagg_column`` attrs under the §4.6 carve-out
   (:func:`zagg.pyramid_check_v2._column_attrs_errors` with ``all_time``):
   the full column resolution set, every group ``leaf-column`` at the window
-  members' derived depth **plus one**, the ``source_windows`` counters;
+  members' derived depth **plus one**, the ``source_windows`` counters —
+  and every group's arrays to the §4.6 layout rule (issue #631), as each
+  window column's are;
 - its ``source_windows`` against the window columns committed beside it
   NOW, and its stamp against theirs — a member that folded fewer windows
   than the shard holds, or that is stamped before a column it folds, is
@@ -107,7 +109,7 @@ def all_time_columns_check(
     """
     from zagg.column import COLUMN_ATTR, COLUMN_ROLE, column_resolutions, raw_fold_boundary
     from zagg.pyramid_check_core import _probe_nodes
-    from zagg.pyramid_check_v2 import _as_int, _column_attrs_errors
+    from zagg.pyramid_check_v2 import _as_int, _column_attrs_errors, _column_layout_errors
     from zagg.store import open_object_store
 
     s = harness.shard_order
@@ -203,6 +205,7 @@ def all_time_columns_check(
             stale.append(dec)
         compare = not is_stale and len(held) == folded
         for r in resolutions:
+            findings.extend(_column_layout_errors(sources, dec, s, r))
             _check_node(
                 sources,
                 dec,

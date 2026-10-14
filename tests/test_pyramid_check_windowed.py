@@ -639,6 +639,27 @@ class TestDamage:
         }[damage]
         assert any(f.startswith(want) for f in findings), findings
 
+    def test_a_member_group_laid_out_wrong_fails_by_name(self, store):
+        # The §4.6 layout rule (issue #631) holds the all-time member as it
+        # holds every window column: one whole unsharded chunk at this size.
+        import zarr
+
+        from zagg.store import open_store
+
+        leaf = SHARDS[0]
+        member = store / _rel(leaf[:-1], f"{leaf[-1]}/all.pyramid.zarr")
+        group = zarr.open_group(open_store(str(member)), path="7")
+        old = group["count"]
+        data, attrs, dims = old[:], dict(old.attrs), old.metadata.dimension_names
+        group.create_array(
+            "count", data=data, chunks=(2,), attributes=attrs, dimension_names=dims, overwrite=True
+        )
+        report = validate_pyramid(str(store), full=True)
+        assert _failed(report) == ["all_time"]
+        found = report["checks"]["all_time"]["mismatches"]
+        want = f"{leaf}[7]/count: layout is unsharded, 2 cells per chunk; §4.6 requires"
+        assert any(m.startswith(want) for m in found), found
+
     def test_a_window_column_with_a_wrong_grid_size_fails_by_name(self, store):
         # Every column group's n_cells is 4^(r - order), window members too.
         from zagg.column import COLUMN_ATTR
