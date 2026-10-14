@@ -2020,6 +2020,7 @@ class _LeafUnit:
             chunk_idx=local,
             staged_out=self.staged,
             omit=self.omit,
+            skip_fill=True,
             arrays=self.box.get("arrays"),
         )
         if ragged:

@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from zarr import config, open_array
 from zarr.abc.store import Store
+from zarr.core.buffer import default_buffer_prototype
 
 from zagg.config import (
     PipelineConfig,
@@ -149,6 +150,65 @@ def _carrier_empty(carrier) -> bool:
     return carrier.num_rows == 0
 
 
+def all_fill(array, values) -> bool:
+    """Whether ``values`` is entirely ``array``'s fill value (issue #653).
+
+    Zarr never stores an all-fill chunk: with ``write_empty_chunks`` off (the
+    default) the codec pipeline turns one into a store ``delete`` of its key,
+    and the sharding codec does the same for a shard whose every inner chunk
+    is fill. A fresh leaf, column or overview writes onto a prefix it has just
+    cleared, so that key does not exist and the delete buys nothing — while a
+    bucket answering the bulk ``DeleteObjects`` with an error document fails
+    the write (issue #651). The writers test here and skip the write instead:
+    absence is already the spec's encoding (§4, an inner chunk with no data
+    MUST be absent), so a skipped slab leaves the bytes a delete would have —
+    but only on a key known to be absent. Callers pass it only for a prefix
+    they have just cleared (the hive leaf, the columns, the stage/relay
+    overviews); the flat writers (:func:`write_shard_to_zarr`,
+    :func:`write_ragged_to_zarr`) keep zarr's delete, since a rerun onto an
+    existing flat store must not leave a stale object behind.
+    The comparison is the one zarr makes (``NDBuffer.all_equal`` on the values
+    cast to the array's dtype: NaN equals the NaN fill, signed zeros stay
+    distinct), taken slab-wide: a skipped slab is fill in every chunk it spans,
+    each of which zarr would have deleted. The converse need not hold — a slab
+    mixing data and fill chunks is written, and on a multi-object target zarr
+    still deletes its fill chunks — so the test errs toward an unneeded delete,
+    never a lost write.
+    """
+    fill = array.metadata.fill_value
+    if fill is None:
+        return False
+    values = np.asarray(values, dtype=array.dtype)  # zarr casts before comparing
+    values = default_buffer_prototype().nd_buffer.from_numpy_array(values)
+    return bool(values.all_equal(fill))
+
+
+def populated_runs(array, values, chunk: int) -> list[tuple[int, int]]:
+    """Contiguous ``[lo, hi)`` runs of ``values`` whose chunks are not all fill.
+
+    The per-chunk face of :func:`all_fill` (issue #653) for a row write that
+    spans several chunks of one axis — the raster writers' ``array[t, lo:hi]
+    = row``, where a populated row can still hold all-fill chunks that zarr
+    would DELETE one key at a time. ``values`` is cut at the array's chunk
+    boundaries (``chunk`` cells each, aligned to index 0 of ``values``, which
+    the raster writers place at a chunk boundary), every all-fill piece is
+    dropped and the survivors are merged back into contiguous runs, so a fully
+    populated row stays one write. Same precondition as :func:`all_fill`:
+    only for a prefix the caller has just cleared.
+    """
+    n = len(values)
+    runs: list[tuple[int, int]] = []
+    for lo in range(0, n, chunk):
+        hi = min(lo + chunk, n)
+        if all_fill(array, values[lo:hi]):
+            continue
+        if runs and runs[-1][1] == lo:
+            runs[-1] = (runs[-1][0], hi)
+        else:
+            runs.append((lo, hi))
+    return runs
+
+
 def write_dataframe_to_zarr(
     df_out,
     store: Store,
@@ -157,6 +217,7 @@ def write_dataframe_to_zarr(
     chunk_idx: tuple,
     staged_out: dict | None = None,
     omit: tuple = (),
+    skip_fill: bool = False,
     arrays: dict | None = None,
 ) -> Store:
     """Write a per-shard output carrier to an existing Zarr template.
@@ -193,6 +254,10 @@ def write_dataframe_to_zarr(
         them. A windowed hive leaf passes ``("morton",)`` (issue #586 phase
         3): its template carries no per-cell coordinate, the word being
         derived (:func:`zagg.grids.morton.cell_words`).
+    skip_fill : bool, optional
+        Skip an all-fill block instead of letting zarr DELETE its key
+        (:func:`all_fill`, issue #653). Only the hive leaf passes it — its
+        prefix was just cleared; the flat path keeps zarr's delete.
     arrays : dict, optional
         The leaf template's ``{path: handle}`` map (issue #657); arrays are
         written through these handles instead of being re-opened.
@@ -235,7 +300,9 @@ def write_dataframe_to_zarr(
             block = chunk_value.reshape((1,) * len(chunk_idx) + trailing)
             block_idx = chunk_idx + (0,) * len(trailing)
             with config.set({"async.concurrency": 128}):
-                _leaf_array(store, grid, name, arrays).set_block_selection(block_idx, block)
+                array = _leaf_array(store, grid, name, arrays)
+                if not (skip_fill and all_fill(array, block)):
+                    array.set_block_selection(block_idx, block)
             continue
 
         # Scalar columns reshape to the grid's chunk_shape; a vector column keeps
@@ -262,7 +329,8 @@ def write_dataframe_to_zarr(
                         f"{target_trailing_chunks} must equal trailing shape "
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
-            array.set_block_selection(block_idx, values)
+            if not (skip_fill and all_fill(array, values)):
+                array.set_block_selection(block_idx, values)
             if staged_out is not None:
                 # Stage the leaf-wide slab (issue #342): allocate at fill on
                 # first sight of the array — mirroring write_leaf_to_zarr's
@@ -408,13 +476,15 @@ def write_shard_to_zarr(
     return store
 
 
-def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields, arrays=None):
+def _write_companion_columns(
+    carrier, store, grid, block_index, chunk_res_fields, arrays=None, *, skip_fill: bool = False
+):
     """Write a chunk's ``resolution: chunk`` companion columns (unsharded path).
 
     A ``resolution: chunk`` companion array is shaped at the coarse chunk grid
     (one block per chunk), never sharded, so it keeps the per-chunk write even on
     the sharded path. Reuses the same chunk-uniform collapse + block placement as
-    :func:`write_dataframe_to_zarr`'s companion branch.
+    :func:`write_dataframe_to_zarr`'s companion branch, ``skip_fill`` included.
     """
     block_idx = tuple(int(i) for i in block_index)
     for name, values in _iter_carrier_columns(carrier):
@@ -425,7 +495,9 @@ def _write_companion_columns(carrier, store, grid, block_index, chunk_res_fields
         block = chunk_value.reshape((1,) * len(block_idx) + trailing)
         target = block_idx + (0,) * len(trailing)
         with config.set({"async.concurrency": 128}):
-            _leaf_array(store, grid, name, arrays).set_block_selection(target, block)
+            array = _leaf_array(store, grid, name, arrays)
+            if not (skip_fill and all_fill(array, block)):
+                array.set_block_selection(target, block)
 
 
 def write_ragged_to_zarr(
@@ -540,11 +612,13 @@ def write_ragged_leaf_to_zarr(
     slabs: dict = {}
     for block, ragged in ragged_chunks:
         block = tuple(int(b) for b in block)
-        _write_ragged_companions(ragged, store, grid, block, chunk_res_fields, arrays)
+        _write_ragged_companions(
+            ragged, store, grid, block, chunk_res_fields, arrays, skip_fill=True
+        )
         region = tuple(slice(b * c, (b + 1) * c) for b, c in zip(block, inner_shape))
         _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_fields)
     for name, slab in slabs.items():
-        _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab, arrays)
+        _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab, arrays, skip_fill=True)
     if staged_out is not None:
         staged_out.update({f"{grid.group_path}/{name}": slab for name, slab in slabs.items()})
     return store
@@ -611,8 +685,12 @@ def write_leaf_to_zarr(
         # extent — the ``hive.leaf_block_index`` derivation).
         if chunk_res_fields:
             local = tuple(int(s.start) // c for s, c in zip(region, inner_shape))
-            _write_companion_columns(carrier, store, grid, local, chunk_res_fields, arrays)
-            _write_ragged_companions(ragged, store, grid, local, chunk_res_fields, arrays)
+            _write_companion_columns(
+                carrier, store, grid, local, chunk_res_fields, arrays, skip_fill=True
+            )
+            _write_ragged_companions(
+                ragged, store, grid, local, chunk_res_fields, arrays, skip_fill=True
+            )
         if _carrier_empty(carrier) and not ragged:
             continue
         for name, values in _iter_carrier_columns(carrier):
@@ -643,9 +721,10 @@ def write_leaf_to_zarr(
                         f"{target_trailing_chunks} must equal trailing shape "
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
-            array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
+            if not all_fill(array, slab):  # an all-fill shard would be a DELETE (#653)
+                array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
     for name, slab in ragged_slabs.items():
-        _set_ragged_block(store, grid, name, leaf_block, slab, arrays)
+        _set_ragged_block(store, grid, name, leaf_block, slab, arrays, skip_fill=True)
     if staged_out is not None:
         staged_out.update(
             {f"{grid.group_path}/{name}": slab for name, slab in {**slabs, **ragged_slabs}.items()}
@@ -788,7 +867,7 @@ def _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_
 
 
 def _write_ragged_companions(
-    ragged, store, grid, block_index, chunk_res_fields, arrays=None
+    ragged, store, grid, block_index, chunk_res_fields, arrays=None, *, skip_fill: bool = False
 ) -> None:
     """Write a chunk's ``resolution: chunk`` RAGGED companions (issue #82/#209).
 
@@ -798,7 +877,8 @@ def _write_ragged_companions(
     the chunk-grid vlen array. ``location`` + ``resolution: chunk`` is rejected
     at config validation, but a config built without ``validate_config`` could
     still deliver a located triple here — fail loudly rather than silently
-    dropping the location channel (issue #87).
+    dropping the location channel (issue #87). ``skip_fill`` is
+    :func:`_set_ragged_block`'s.
     """
     if not chunk_res_fields:
         return
@@ -820,13 +900,25 @@ def _write_ragged_companions(
         block[(0,) * len(block_idx)] = _ragged_payload_bytes(
             name, chunk_payload, _ragged_sig(name, grid)
         )
-        _set_ragged_block(store, grid, name, block_idx, block, arrays)
+        _set_ragged_block(store, grid, name, block_idx, block, arrays, skip_fill=skip_fill)
 
 
-def _set_ragged_block(store, grid, name, block_idx, block, arrays=None) -> None:
-    """One block-selection write into a ragged vlen array (issue #209)."""
+def _set_ragged_block(
+    store, grid, name, block_idx, block, arrays=None, *, skip_fill: bool = False
+) -> None:
+    """One block-selection write into a ragged vlen array (issue #209).
+
+    With ``skip_fill`` (the hive leaf, onto its just-cleared prefix), a block
+    whose every cell is the ``b""`` fill — a ``where``-predicated stratum no
+    photon of the window satisfied — is not written: zarr would DELETE its key
+    instead (:func:`all_fill`, issue #653). Without it (the flat path) zarr's
+    delete stands, so a rerun clears a stale object. ``arrays`` is the leaf's
+    handle map (issue #657).
+    """
     with config.set({"async.concurrency": 128}):
-        _leaf_array(store, grid, name, arrays).set_block_selection(tuple(block_idx), block)
+        array = _leaf_array(store, grid, name, arrays)
+        if not (skip_fill and all_fill(array, block)):
+            array.set_block_selection(tuple(block_idx), block)
 
 
 def _chunk_uniform_ragged(name: str, values_list: list):

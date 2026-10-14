@@ -1821,6 +1821,138 @@ class TestRaggedWriteGuards:
             write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(inner=2), chunk_idx=(0,))
 
 
+class _DeleteRecordingStore(MemoryStore):
+    """A ``MemoryStore`` that records every chunk-key ``delete`` zarr issues."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)  # kwargs: zarr's read-only clone (``with_read_only``)
+        self.deleted: list = []
+
+    async def delete(self, key):
+        self.deleted.append(key)
+        await super().delete(key)
+
+
+class TestSkipFillWrites:
+    """Issue #653: an all-fill block on a just-cleared hive leaf prefix is not
+    written (zarr would DELETE its absent key, which a bulk-delete-refusing
+    bucket fails, issue #651), while the flat path — a rerun onto an existing
+    store — keeps zarr's delete so no stale object survives."""
+
+    @staticmethod
+    def _ragged_store():
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=TestRaggedVlenWrite._ragged_cfg())
+        store = _DeleteRecordingStore()
+        grid.emit_template(store)
+        return grid, store
+
+    @staticmethod
+    def _keys(store, grid, field):
+        prefix = f"{grid.group_path}/{field}/c/"
+        return [k for k in store._store_dict if k.startswith(prefix)]
+
+    def test_flat_ragged_block_deletes_a_stale_key(self):
+        from zagg.processing.write import _set_ragged_block
+
+        grid, store = self._ragged_store()
+        write_ragged_to_zarr(
+            {"h_raw": ([np.ones((2, 1), np.float32)], [0])}, store, grid=grid, chunk_idx=(3,)
+        )
+        assert self._keys(store, grid, "h_raw") == [f"{grid.group_path}/h_raw/c/3"]
+        _set_ragged_block(store, grid, "h_raw", (3,), np.full(grid.chunk_shape, b"", dtype=object))
+        assert self._keys(store, grid, "h_raw") == []
+        assert store.deleted == [f"{grid.group_path}/h_raw/c/3"]
+
+    def test_leaf_ragged_block_skips_all_fill(self):
+        from zagg.processing.write import _set_ragged_block
+
+        grid, store = self._ragged_store()
+        block = np.full(grid.chunk_shape, b"", dtype=object)
+        _set_ragged_block(store, grid, "h_raw", (3,), block, skip_fill=True)
+        assert self._keys(store, grid, "h_raw") == []
+        assert store.deleted == []
+
+    def test_all_fill_compares_in_the_array_dtype(self):
+        """zarr casts before its fill test, so a float64 slab that rounds to the
+        float32 fill is all fill (it would have been deleted, not written)."""
+        import zarr
+
+        from zagg.processing.write import all_fill
+
+        arr = zarr.create_array(MemoryStore(), shape=(4,), dtype="f4", fill_value=0.0)
+        assert all_fill(arr, np.full(4, 1e-50))
+        assert not all_fill(arr, np.full(4, 1e-3))
+
+    def test_populated_runs_cuts_at_chunks_and_merges_neighbors(self):
+        """The per-chunk face of ``all_fill`` for a multi-chunk row (issue #653
+        phase 4): fill chunks drop out, adjacent survivors merge, a ragged tail
+        chunk is honored, and a fully populated row stays one run."""
+        import zarr
+
+        from zagg.processing.write import populated_runs
+
+        arr = zarr.create_array(
+            MemoryStore(), shape=(1, 10), chunks=(1, 4), dtype="u2", fill_value=0
+        )
+        row = np.zeros(10, dtype="u2")
+        assert populated_runs(arr, row, 4) == []
+        row[5] = 1  # chunk [4, 8) only
+        assert populated_runs(arr, row, 4) == [(4, 8)]
+        row[9] = 1  # plus the 2-cell tail chunk [8, 10) — merged with its neighbor
+        assert populated_runs(arr, row, 4) == [(4, 10)]
+        row[0] = 1  # chunk [0, 4) joins on: a fully populated row is one run
+        assert populated_runs(arr, row, 4) == [(0, 10)]
+        row[4:8] = 0  # a fill chunk in the middle splits the row
+        assert populated_runs(arr, row, 4) == [(0, 4), (8, 10)]
+
+    @staticmethod
+    def _companion_case():
+        """A dense ``count`` plus a ``resolution: chunk`` companion ``anchor_h``,
+        and a carrier factory filling both with one value per column."""
+        from mortie import geo2mort
+
+        cfg = TestChunkResolutionCompanion._chunk_cfg("atl06")
+        grid = HealpixGrid(2, 4, layout="fullsphere", config=cfg)
+        store = _DeleteRecordingStore()
+        grid.emit_template(store)
+        parent = int(geo2mort(-78.5, -132.0, order=2)[0])
+        n = len(grid.children(parent))
+        fill = open_group(store=store, mode="r", path=grid.group_path)["count"].metadata.fill_value
+
+        def carrier(count, anchor):
+            stats = {
+                "count": np.full(n, count, dtype="float32"),
+                "anchor_h": np.full(n, anchor, dtype="float32"),
+            }
+            return _build_output(
+                stats, get_data_vars(cfg), get_agg_fields(cfg), grid, parent, use_arrow=False
+            )
+
+        return grid, store, grid.block_index(parent), fill, carrier
+
+    def test_leaf_dense_and_companion_skip_all_fill(self):
+        grid, store, chunk_idx, fill, carrier = self._companion_case()
+        all_fill_carrier = carrier(fill, np.nan)
+        write_dataframe_to_zarr(
+            all_fill_carrier, store, grid=grid, chunk_idx=chunk_idx, skip_fill=True
+        )
+        assert self._keys(store, grid, "count") == []
+        assert self._keys(store, grid, "anchor_h") == []
+        assert store.deleted == []
+
+    def test_flat_dense_and_companion_delete_a_stale_key(self):
+        grid, store, chunk_idx, fill, carrier = self._companion_case()
+        write_dataframe_to_zarr(carrier(3, 42.5), store, grid=grid, chunk_idx=chunk_idx)
+        assert len(self._keys(store, grid, "count")) == 1
+        assert len(self._keys(store, grid, "anchor_h")) == 1
+        write_dataframe_to_zarr(carrier(fill, np.nan), store, grid=grid, chunk_idx=chunk_idx)
+        assert self._keys(store, grid, "count") == []
+        assert self._keys(store, grid, "anchor_h") == []
+        assert sorted(store.deleted) == sorted(
+            f"{grid.group_path}/{f}/c/{chunk_idx[0]}" for f in ("anchor_h", "count")
+        )
+
+
 class TestTemporalCompanionSeams:
     """Spec §8.2/§8.3/§9 declaration + write seams (issue #410).
 
