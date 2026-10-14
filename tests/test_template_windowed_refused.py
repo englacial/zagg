@@ -6,7 +6,7 @@ unqualified win it looks like: pytest-xdist orders file scopes by DESCENDING
 item count by default (``--loadscope-reorder``, on since 3.8.0), so this
 two-item module is dispatched last of the suite's 120 scopes and starts when
 the queue is nearly empty, which puts its whole duration on the critical
-path. Inside the build module these same two cases sat at queue position ~89.
+path. Inside the build module these same two cases sat at position 91 of 120.
 PR #670 has the measured walls; this layout is not yet a measured improvement.
 
 Each case builds the strata template through a leaf store that raises on the
