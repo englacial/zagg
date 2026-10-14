@@ -1196,8 +1196,10 @@ attrs record:
   window overviews it consumed. `missing` counts a window known to have data
   beneath the node whose overview was not committed when the fold ran (its
   stage unit failed, or has not landed): the fold then under-covers that
-  window and the next sweep heals it. The key is present **exactly** on this
-  artifact; a reader MUST tolerate it and MUST NOT require it elsewhere;
+  window and the next sweep heals it. The key is present **exactly** on the
+  two all-time artifacts — this one and §4.6's leaf all-time column
+  (`all.pyramid.zarr`) — and never on a window artifact; a reader MUST
+  tolerate it and MUST NOT require it elsewhere;
 - `source_children` — the folded windows' own counters, **summed**: a window
   that under-covered its subtree makes the all-time fold short by the same
   children;
@@ -1841,8 +1843,9 @@ guessed at.
     window the shard is known to have (a leaf or a column beside it) whose
     column was not committed when the fold ran, `unreadable` one whose
     column could not be read or that a group refused (a half companion
-    pair). The key is present exactly on this artifact; a window column
-    MUST NOT carry it.
+    pair). The key is present exactly on the two all-time artifacts — this
+    one and §4.4's `all.zarr` — and a window column or an unwindowed
+    column MUST NOT carry it.
 
   Write discipline and lifecycle: the member is rewritten wholesale (the
   D4 order below) whenever the shard's bulk unit lands a window, from every
