@@ -796,6 +796,25 @@ class TestBulkUnit:
         assert not (_node(root) / "all.pyramid.stats.json").exists()
         assert (_node(root) / "2020.pyramid.zarr").exists()
 
+    def test_a_gate_skipped_fanout_unit_writes_nothing(self, monkeypatch, tmp_path):
+        # PR #666 review finding (2): the gate's "writes NOTHING" contract
+        # holds on the fan-out — a skipped unit neither closes nor clears, so
+        # a bulk-written member stands and a fan-out store stays without one.
+        cfg = emit._digest_cfg()
+        bulk, fan = str(tmp_path / "bulk"), str(tmp_path / "fan")
+        emit._run_bulk(monkeypatch, cfg, bulk, fakes=emit._dense_fakes())
+        emit._run_fanout(monkeypatch, cfg, fan, fakes=emit._dense_fakes())
+        before = {root: emit._tree(root) for root in (bulk, fan)}
+        self._current_for(monkeypatch, set(WINDOWS))
+        for root in (bulk, fan):
+            out = emit._run_fanout(
+                monkeypatch, cfg, root, fakes=emit._dense_fakes(), skip_if_current=True
+            )
+            assert all(m.get("current") for m in out.values())
+            assert not any("all_time_column" in m for m in out.values())
+            assert emit._tree(root) == before[root]
+        assert self._member(bulk) and not self._member(fan)
+
     def test_a_failed_window_defers_the_close_and_clears_the_stale_member(
         self, monkeypatch, tmp_path
     ):

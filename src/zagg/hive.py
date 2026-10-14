@@ -2763,7 +2763,8 @@ def _close_windows(shard_key, grid, store_root, config, units, metas, windows, b
     :func:`zagg.column._clear_column` rule). An invoke that wrote nothing
     (every window current) rewrites the member only when it is absent, short
     or older than a column it folds (:func:`zagg.column_alltime.member_current`),
-    which is what heals a shard whose close once failed.
+    which is what heals a shard whose close once failed — on this unit only:
+    a ``unit: window`` unit never closes (it clears, PR #666 review (1)).
     """
     from zagg.column import _clear_column
     from zagg.dispatch import BENIGN_ERRORS
