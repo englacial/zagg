@@ -80,9 +80,9 @@
 # arm that does not is recorded as the result and re-run with ``unit: window``
 # (or the window groups of issue #596) into its own store.
 #
-# Operator invocation (live AWS -- espg runs it; the runbook is
-# demo/18_schedule_measure_2026-10.ipynb, the readout
-# tools/windowed_emit_measure.py):
+# Operator invocation (live AWS -- espg runs it). This header IS the runbook:
+# the commands below are the whole kit, and the readout is
+# tools/windowed_emit_measure.py:
 #
 #   # 1. catalog: the cell's own diamond shrunk by 1e-3 deg so its edges do not
 #   #    touch the neighbours -- coverage is then exactly the 64 order-9 shards
@@ -99,7 +99,18 @@
 #   uv run python -m zagg --config tools/configs/atl03_windowed_measure_yearly.yaml \
 #       --catalog /tmp/o6_sierra.json --backend lambda --profile \
 #       --store s3://<scratch-bucket>/<prefix>/_measure_yearly.zarr
-#   # 3. readout, all four arms at once
+#   # 3. ONLY if the arm did not fit one invoke per shard (the readout's
+#   #    ``fits_one_invoke`` is ``no``): record THAT as the result, then set
+#   #    ``output.windowing.unit: window`` in a copy of this config -- there is
+#   #    no CLI override for it -- and re-run the arm into its OWN store, so
+#   #    every readout column still reads one run.
+#   uv run python -m zagg --config /tmp/atl03_windowed_measure_yearly_window.yaml \
+#       --catalog /tmp/o6_sierra.json --backend lambda --profile \
+#       --store s3://<scratch-bucket>/<prefix>/_measure_yearly_window.zarr
+#   # 4. readout, all four arms at once. For any arm whose step (3) ran,
+#   #    pass that arm's ``_<arm>_window.zarr`` store in place of the line
+#   #    below -- step (3) abandoned the store named there -- or alongside
+#   #    it, to keep the attempt that did not fit as its own column.
 #   uv run python tools/windowed_emit_measure.py \
 #       s3://<scratch-bucket>/<prefix>/_measure_none.zarr \
 #       s3://<scratch-bucket>/<prefix>/_measure_yearly.zarr \

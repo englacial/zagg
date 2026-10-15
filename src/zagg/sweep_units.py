@@ -50,6 +50,37 @@ UNIT_CLOSE = "close"
 UNIT_KINDS = (UNIT_WINDOW, UNIT_CLOSE)
 
 
+def container_hwm_mb() -> float | None:
+    """The worker process's peak RSS in MB, ``None`` where there is no ``resource``.
+
+    ``ru_maxrss`` is a per-PROCESS high-water, so on a warm Lambda container it
+    carries earlier invokes' peaks too — the same caveat the leaf worker's
+    ``container_hwm_mb`` stamp carries (issue #250). It is therefore an UPPER
+    BOUND on what one tuple needed, which is the direction a memory-tier
+    verdict wants: a tier that looks roomy against the high-water IS roomy
+    (issue #602 reads the staged sweep's headroom against the 8 GB tier to
+    decide whether that tier can come back down). It is NOT a per-unit peak,
+    so it bounds the tuple, not the fold.
+
+    The ``ru_maxrss`` unit branch below is the same conversion as
+    ``zagg.processing.aggregate._rss_mb``'s fallback and the leaf worker's
+    (``deployment/aws/lambda_handler.py``); it is spelled out rather than
+    shared because those two return a float on failure where a stage row
+    needs ``None`` (not measured), and the leaf one lives in the deployment
+    tree. ``container_hwm_mb`` is named in ``docs/specification.md`` §4.7's
+    stage-record field list.
+    """
+    try:
+        import resource
+        import sys
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss / 1e6 if sys.platform == "darwin" else rss / 1024.0  # mac bytes, linux KB
+    except Exception as e:  # no ``resource``, or a platform that refuses the call
+        logger.debug(f"stage sweep: no peak RSS available ({e})")
+        return None
+
+
 def check_unit(unit, window, what: str) -> None:
     """Refuse, by name, a stage invoke whose ``unit`` / ``window`` disagree.
 
@@ -625,6 +656,10 @@ def run_tuple(
         "close_units": ran["close_units"],
         **counts,
         "duration_s": time.perf_counter() - t0,
+        # The tuple's memory high-water (an upper bound — see
+        # :func:`container_hwm_mb`), so the stage record says what the
+        # function tier was asked for and not only what it was given.
+        "container_hwm_mb": container_hwm_mb(),
     }
     if ran["unit_errors"]:
         row["unit_errors"] = ran["unit_errors"]

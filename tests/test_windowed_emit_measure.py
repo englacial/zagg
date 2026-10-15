@@ -139,20 +139,32 @@ def _store(tmp_path, *, windows, versioned_first=False):
         stages = [{k: v for k, v in s.items() if not k.startswith("icechunk_")} for s in stages]
         # the (node, window) unit rows of issue #586 phase 4: one row per
         # invoke, each with its own units, worker seconds and fold peak
-        units = [(1, 0, 30.0, 256), (1, 0, 20.0, 1024), (0, 1, 5.0, 64)]
-        for row, (n_window, n_close, seconds, peak) in zip(stages, units, strict=True):
+        # ... and its memory high-water, which the baseline's rows leave out:
+        # an older worker records none, and that reads ``-``, never 0 MB.
+        units = [
+            (1, 0, 30.0, 256, 1500.0),
+            (1, 0, 20.0, 1024, 2300.5),
+            (0, 1, 5.0, 64, 900.0),
+        ]
+        for row, (n_window, n_close, seconds, peak, hwm) in zip(stages, units, strict=True):
             row.update(
                 window_units=n_window,
                 close_units=n_close,
                 failed=0,
                 duration_s=seconds,
                 fold_peak_cells=peak,
+                container_hwm_mb=hwm,
             )
     (root / "sweep_stats_20260101T000000Z_stages.json").write_text(
         json.dumps({"stages": stages, "barrier_timed_out": False, "short_orders": []})
     )
-    # an older sweep record: kept apart, not mixed into the newest one's sums
-    older = {"stages": [{"dispatch_order": 0, "written": 99, "icechunk_commits": 99}]}
+    # an older sweep record: kept apart, not mixed into the newest one's sums.
+    # Its high-water is the store's highest (the windowed arm's 3,400.0 is above
+    # every newer row on either leg), so dropping it would read as headroom.
+    older_row = {"dispatch_order": 0, "written": 99, "icechunk_commits": 99}
+    if windows:
+        older_row["container_hwm_mb"] = 3400.0
+    older = {"stages": [older_row]}
     (root / "sweep_stats_20251231T000000Z_stages.json").write_text(json.dumps(older))
     _stage_records(root, windows)
     return str(root)
@@ -163,7 +175,7 @@ def _stage_records(root: Path, windows) -> None:
     status = Path(str(root) + ".status") / "run-stage-20260101T000100Z-abcdef"
     status.mkdir(parents=True)
 
-    def rec(dispatch, batch, unit, window, wall, n_nodes, cells, peak, failed=0):
+    def rec(dispatch, batch, unit, window, wall, n_nodes, cells, peak, failed=0, hwm=None):
         return {
             "spec": "zagg-sweep-stage-record/1",
             "role": "stage",
@@ -184,16 +196,19 @@ def _stage_records(root: Path, windows) -> None:
                     "failed": failed,
                     "fold_cells_read": cells,
                     "fold_peak_cells": peak,
+                    # the tuple's memory high-water, absent on a record whose
+                    # worker predates the stamp
+                    **({} if hwm is None else {"container_hwm_mb": hwm}),
                 }
             ],
         }
 
     if windows:
         records = [
-            rec(3, 0, "window", "2019", 12.0, 2, 64, 32),
-            rec(3, 1, "window", "2020", 8.0, 2, 64, 32),
-            rec(3, 2, "close", None, 3.0, 2, 16, 8),
-            rec(0, 0, "window", "2019", 20.0, 1, 128, 128, failed=1),
+            rec(3, 0, "window", "2019", 12.0, 2, 64, 32, hwm=1200.0),
+            rec(3, 1, "window", "2020", 8.0, 2, 64, 32, hwm=1800.0),
+            rec(3, 2, "close", None, 3.0, 2, 16, 8, hwm=1100.0),
+            rec(0, 0, "window", "2019", 20.0, 1, 128, 128, failed=1, hwm=2600.0),
             rec(0, 1, "close", None, 6.0, 1, 32, 32),
         ]
     else:
@@ -210,10 +225,14 @@ def _stage_records(root: Path, windows) -> None:
         "duration_s": 2.0,
     }
     (status / "finisher.json").write_text(json.dumps(finisher))
-    # an older stage run with one record: the newest is what the table prints
+    # an older stage run with one record: the newest is what the table's
+    # per-order rows print, but its cost and its memory high-water still count
+    # (the windowed arm's older run peaked higher than its newest one did)
     older = Path(str(root) + ".status") / "run-stage-20251231T000000Z-000000"
     older.mkdir()
-    (older / "stage-00-0000.json").write_text(json.dumps(rec(0, 0, None, None, 99.0, 1, 1, 1)))
+    (older / "stage-00-0000.json").write_text(
+        json.dumps(rec(0, 0, None, None, 99.0, 1, 1, 1, hwm=3000.0 if windows else None))
+    )
 
 
 @pytest.fixture
@@ -353,6 +372,81 @@ def test_ladder_and_stage_runs(arms):
     assert (o0["dispatch_order"], o0["failed"], o0["whole_invokes"]) == (0, 1, 0)
     b = base["stage_runs"]["latest"]
     assert b["per_order"][0]["whole_invokes"] == 1 and b["barrier_timed_out"] is False
+
+
+def test_the_stage_memory_high_water_and_the_tier_headroom(arms):
+    base, win = arms
+    # the root run record: a HIGH-WATER per dispatch order, never a sum
+    # (order 3 holds 1,500.0 and 2,300.5; order 0 holds 900.0)
+    assert [s["container_hwm_mb"] for s in win["ladder"]["stages"]] == [900.0, 2300.5]
+    assert [s["container_hwm_mb"] for s in base["ladder"]["stages"]] == [None, None]
+    # the fleet's per-invoke records: the same, per order and per run — the
+    # order-0 close carries no high-water and does not drag the max to 0
+    o3, o0 = win["stage_runs"]["latest"]["per_order"]
+    assert (o3["container_hwm_mb"], o0["container_hwm_mb"]) == (1800.0, 2600.0)
+    assert win["stage_runs"]["latest"]["container_hwm_mb"] == 2600.0
+    assert base["stage_runs"]["latest"]["container_hwm_mb"] is None
+    # the headroom: the tier less the largest high-water ANY leg carries, over
+    # EVERY run of both legs — here the older ROOT record's 3,400.0, above the
+    # older fleet run's 3,000.0 and the newest run's 2,600.0
+    mem = win["stage_memory"]
+    assert mem["tier_mb"] == tool.STAGE_TIER_GB * 1024
+    assert mem["peak_mb"] == 3400.0 and mem["headroom_mb"] == mem["tier_mb"] - 3400.0
+    assert mem["peak_fraction"] == pytest.approx(3400.0 / mem["tier_mb"])
+    # the newest root record alone would read 2,300.5, i.e. 2,891.5 MB of
+    # headroom the earlier sweep disproves
+    assert max(s["container_hwm_mb"] for s in win["ladder"]["stages"]) == 2300.5
+    # a run that recorded none measured no memory, which is not "used none"
+    assert base["stage_memory"] == {
+        "tier_mb": tool.STAGE_TIER_GB * 1024,
+        "peak_mb": None,
+        "headroom_mb": None,
+        "peak_fraction": None,
+    }
+
+
+def test_the_table_prints_the_headroom_and_dashes_when_unmeasured(arms, capsys):
+    base, win = arms
+    tool.print_table([base, win])
+    out = capsys.readouterr().out
+    (tier,) = [ln for ln in out.splitlines() if ln.startswith("stage tier MB / container hwm")]
+    assert "8,192.0 / - / -" in tier  # the baseline arm: not measured
+    assert "8,192.0 / 3,400.0 / 4,792.0" in tier
+    # percentage points, not a bare fraction: 3,400 / 8,192 at one decimal
+    (fraction,) = [ln for ln in out.splitlines() if ln.startswith("  container hwm as %")]
+    assert fraction.split()[-2:] == ["-", "41.5"]
+    # and a peak well under 5% of the tier still reads as a number, not 0.0
+    assert tool._pct(300.0 / 8192.0) == "3.7" and tool._pct(None) == "-"
+    # per tuple (root record, finest order first) and per order (fleet records)
+    (per_tuple,) = [
+        ln for ln in out.splitlines() if ln.startswith("stage container hwm MB per tuple")
+    ]
+    assert per_tuple.split()[-3:] == ["2,300.5", "/", "900.0"]
+    (per_order,) = [
+        ln for ln in out.splitlines() if ln.startswith("stage container hwm MB per order")
+    ]
+    assert per_order.split()[-3:] == ["1,800.0", "/", "2,600.0"]
+
+
+def test_every_memory_row_says_which_currency_it_is_in(arms, capsys):
+    """Issue #141: the table prints a CONTAINER-LIFETIME `ru_maxrss` beside the
+    leaf side's SAMPLED per-invocation peak, so no memory label may be bare."""
+    tool.print_table(list(arms))
+    out = capsys.readouterr().out
+    labels = [label for label, _ in tool.table_rows(list(arms))]
+    memory = [lb for lb in labels if "hwm" in lb or "memory_mb" in lb]
+    assert memory == [
+        "max_memory_mb p50/p90/max (sampled per invoke)",
+        "stage container hwm MB per tuple (lifetime)",
+        "stage container hwm MB per order (lifetime)",
+        "stage tier MB / container hwm MB / headroom MB",
+        "  container hwm as % of the tier",
+    ]
+    # and the footnote, which says what each currency is and which way the
+    # upper bound cuts: it can keep the tier, never bring it down
+    assert tool.MEMORY_CURRENCY_NOTE in out
+    assert "SAMPLED per-invocation peak" in out and "CONTAINER's whole lifetime" in out
+    assert "can never show that the tier may come down" in out
 
 
 def test_cost_sums_leaf_and_stage_gb_seconds(arms):
