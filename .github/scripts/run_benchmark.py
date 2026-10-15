@@ -575,9 +575,7 @@ def main(argv: list[str] | None = None) -> int:
     # series row) unnoticed (issue #145). Fail loudly on any real target that
     # came back empty; --dry-run emits empty metrics by design, so it's exempt.
     if args.fail_on_empty and not args.dry_run:
-        empty = [
-            r["target"] for r in records if not r.get("total_obs") or r.get("max_memory_mb") is None
-        ]
+        empty = [r["target"] for r in records if bench_metrics.has_empty_metrics(r)]
         if empty:
             print(
                 "benchmark target(s) returned empty metrics (obs=0 / "
