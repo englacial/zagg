@@ -195,6 +195,11 @@ class TestDataSourceGrammar:
         cfg = PipelineConfig(data_source={"filters": [{"dataset": "/d", "op": "lt"}]})
         with pytest.raises(ValueError, match="op 'lt' requires a scalar 'value'"):
             validate_model(cfg)
+        cfg = PipelineConfig(
+            data_source={"filters": [{"dataset": "/d", "op": "eq", "value": None}]}
+        )
+        with pytest.raises(ValueError, match=r"filters\[0\]: 'value' must be numeric \(got None\)"):
+            validate_model(cfg)
 
     def test_segment_variable_names_on_the_model(self):
         cfg = default_config("atl03_waveform_chunk")

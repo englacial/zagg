@@ -217,6 +217,8 @@ class StructuredFilter(StrictModel):
                 raise ValueError(f"op {self.op!r} requires a 'values' list")
         elif "value" not in self.model_fields_set:
             raise ValueError(f"op {self.op!r} requires a scalar 'value'")
+        elif self.value is None:
+            raise ValueError("'value' must be numeric (got None)")
         return self
 
 
