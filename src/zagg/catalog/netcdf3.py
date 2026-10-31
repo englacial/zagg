@@ -209,7 +209,12 @@ class Header:
     def recsize(self) -> int:
         """Bytes per record across all record variables, per the spec's padding
         rule: each slab is padded to 4 bytes, except when there is exactly one
-        record variable, whose slabs are packed with no padding at all."""
+        record variable, whose slabs are packed with no padding at all.
+
+        Computed from :meth:`slab_bytes`, never from ``vsize``: the header's
+        ``vsize`` is always padded to 4 (netCDF-C writes 8 for a lone
+        ``short x(time, 3)`` packed 6 bytes apart), so it is informational
+        only and must not be used as a stride."""
         recs = self.record_variables
         if len(recs) == 1:
             return self.slab_bytes(recs[0])
@@ -429,7 +434,8 @@ def manifest_rows(hdr: Header, file_size: int | None = None) -> list[tuple]:
     A non-record variable is one contiguous pseudo-chunk (``chunk_idx`` 0,
     ``chunk_shape == shape``, ``nbytes`` the unpadded array bytes). A record
     variable is one row per record: ``chunk_shape = (1, *fixed dims)``,
-    ``byte_offset = begin + rec * recsize`` -- the compiled reader has no
+    ``byte_offset = begin + rec * recsize`` (never ``vsize``, which is
+    informational only -- see :attr:`Header.recsize`) -- the compiled reader has no
     stride, so the interleaved record block is addressed slab by slab. Dtype
     strings are the byte-order-explicit numpy forms (``>i2``, ``>f4``;
     ``char`` -> ``|u1``); ``gzip`` / ``shuffle`` are False (netCDF3 is never

@@ -83,11 +83,13 @@ def _nc3_bytes(version, dims, variables, gattrs=None, *, numrecs=None, streaming
     recs = [v for v in variables if is_rec(v)]
     if numrecs is None:
         numrecs = int(recs[0]["data"].shape[0]) if recs else 0
-    # vsize per the spec: padded to 4, except the lone-record-variable case.
-    vsize = {}
-    for v in variables:
-        vsize[v["name"]] = slab(v) if (is_rec(v) and len(recs) == 1) else _pad4(slab(v))
-    recsize = sum(vsize[v["name"]] for v in recs)
+    # vsize per the spec ("Note on vsize"): ALWAYS padded to 4, even for a
+    # lone record variable -- whose slabs are nonetheless packed unpadded, so
+    # there the record stride (recsize) is smaller than vsize (netCDF-C
+    # ``ncgen`` writes ``short x(time, 3)`` alone as vsize 8, stride 6).
+    vsize = {v["name"]: _pad4(slab(v)) for v in variables}
+    stride = {v["name"]: slab(v) if len(recs) == 1 else vsize[v["name"]] for v in recs}
+    recsize = sum(stride.values())
 
     off_size = 4 if version == 1 else 8
     # Header size is needed for ``begin``; it does not depend on begin values.
@@ -143,7 +145,7 @@ def _nc3_bytes(version, dims, variables, gattrs=None, *, numrecs=None, streaming
     for r in range(numrecs):
         for v in recs:
             raw = np.ascontiguousarray(v["data"][r], dtype=_DTYPE[v["nc_type"]]).tobytes()
-            body += raw + b"\0" * (vsize[v["name"]] - len(raw))
+            body += raw + b"\0" * (stride[v["name"]] - len(raw))
     assert len(body) == (rec_begin - header_len) + numrecs * recsize
     layout = {v["name"]: (begin[v["name"]], vsize[v["name"]]) for v in variables}
     layout["__recsize__"] = recsize
@@ -410,7 +412,9 @@ class TestHeaderLayout:
         data, layout = _nc3_bytes(1, _DIMS, only)
         hdr = parse_header(data)
         assert hdr.recsize == 6 == layout["__recsize__"]
-        assert hdr.variables[0].vsize == 6
+        # vsize stays padded (the netCDF-C layout); the stride does not.
+        assert hdr.variables[0].vsize == 8
+        assert len(data) == layout["__header__"] + 4 * 6
 
     def test_non_record_slab_is_the_whole_array(self):
         hdr = parse_header(fixture()[0])
@@ -446,6 +450,34 @@ class TestOracle:
                 np.testing.assert_array_equal(f.variables["lat"][:], _LAT)
                 assert f.variables["label"][:].tobytes() == b"abcde"
                 assert f.variables["temp"].scale_factor == 0.01
+
+    @pytest.mark.parametrize("kind", ["classic", "64-bit offset"])
+    def test_ncgen_lone_record_variable(self, tmp_path, kind):
+        # netCDF-C (not scipy) is the layout authority for vsize: a lone
+        # record variable carries a padded vsize but an unpadded stride.
+        import shutil
+        import subprocess
+
+        if shutil.which("ncgen") is None:
+            pytest.skip("ncgen (netCDF-C) not installed")
+        cdl = tmp_path / "one.cdl"
+        cdl.write_text(
+            "netcdf one {\ndimensions:\n time = UNLIMITED ; x = 3 ;\nvariables:\n"
+            " short temp(time, x) ;\n float lat(x) ;\n"
+            "data:\n temp = 1,2,3,4,5,6 ;\n lat = 1,2,3 ;\n}\n"
+        )
+        nc = tmp_path / "one.nc"
+        subprocess.run(["ncgen", "-k", kind, "-o", str(nc), str(cdl)], check=True)
+        data = nc.read_bytes()
+        hdr = parse_header(data)
+        temp = next(v for v in hdr.variables if v.name == "temp")
+        assert (temp.vsize, hdr.recsize) == (8, 6)
+        assert len(data) == temp.begin + 2 * 6
+        from zagg.catalog.netcdf3 import build_manifest
+
+        _, out = _reconstruct(build_manifest(data), data)
+        np.testing.assert_array_equal(out["/temp"], [[1, 2, 3], [4, 5, 6]])
+        np.testing.assert_array_equal(out["/lat"], [1.0, 2.0, 3.0])
 
 
 # ---------------------------------------------------------------------------
