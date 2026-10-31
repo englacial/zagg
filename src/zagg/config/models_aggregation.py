@@ -17,7 +17,7 @@ in the read columns, expression identifiers, the location column) need the
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, ClassVar, Literal, Union
 
 import numpy as np
 from pydantic import Field, ValidationInfo, field_validator, model_validator
@@ -75,7 +75,33 @@ def _check_dtype(v: Any) -> Any:
     return v
 
 
-class _Reducer(StrictModel):
+def _no_explicit_null(data: Any, keys: Any) -> Any:
+    """Refuse an explicit ``null`` on ``keys``: consumers read ``.get(key, default)``,
+    which returns ``None`` for an explicit null instead of the default."""
+    if isinstance(data, dict):
+        for key in keys:
+            if key in data and data[key] is None:
+                raise ValueError(f"{key} must not be null (omit the key for the default)")
+    return data
+
+
+class _Block(StrictModel):
+    """A grammar block whose optional keys may be omitted but never set to ``null``."""
+
+    #: Optional keys for which an explicit ``null`` is meaningful (or refused
+    #: by the field's own validator with a sharper message).
+    _NULLABLE: ClassVar[frozenset[str]] = frozenset()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_null(cls, data: Any) -> Any:
+        keys = (
+            k for k, f in cls.model_fields.items() if not f.is_required() and k not in cls._NULLABLE
+        )
+        return _no_explicit_null(data, keys)
+
+
+class _Reducer(_Block):
     """What a field and a chunk precompute share: exactly one of ``function``/``expression``."""
 
     function: str | None = Field(
@@ -129,6 +155,8 @@ class FieldSpec(_Reducer):
     (issue #87), a ``temporal`` companion (spec §8, issue #410), a ``weights``
     declaration and an ``overview_delta`` fold budget (issue #424).
     """
+
+    _NULLABLE = frozenset({"fill_value", "trailing_shape", "inner_shape"})
 
     fill_value: Any = Field(
         default=None,
@@ -367,14 +395,16 @@ class PrecomputeSpec(_Reducer):
     """
 
 
-class CoordinateSpec(StrictModel):
+class CoordinateSpec(_Block):
     """A declared store coordinate (``aggregation.coordinates.<name>``), e.g. ``morton``."""
+
+    _NULLABLE = frozenset({"fill_value"})
 
     dtype: NonEmptyStr = Field(description="Stored numpy dtype, e.g. ``uint64`` for ``morton``.")
     fill_value: Any = Field(default=None, description="Fill for unobserved cells.")
 
 
-class Streaming(StrictModel):
+class Streaming(_Block):
     """Bounded-memory read/aggregate regime (issues #370, #474); absent is the pooled path.
 
     Packaging: every streaming regime shares one product identity under the
@@ -402,7 +432,7 @@ class Streaming(StrictModel):
         return self
 
 
-class Aggregation(StrictModel):
+class Aggregation(_Block):
     """The spatial point-cloud aggregation block."""
 
     handoff: Literal["pandas", "arrow"] | None = Field(
@@ -536,7 +566,7 @@ def _composition_rules(name: str, meta: FieldSpec, variables: dict[str, FieldSpe
 # ---------------------------------------------------------------------------
 
 
-class TemporalFieldSpec(StrictModel):
+class TemporalFieldSpec(_Block):
     """One temporal/event output variable: capability names resolved by the registry at run time.
 
     A typo in a capability name surfaces as ``UnknownCapability`` from
@@ -572,7 +602,7 @@ class TemporalFieldSpec(StrictModel):
     )
 
 
-class TemporalAggregation(StrictModel):
+class TemporalAggregation(_Block):
     """The temporal/event aggregation block: output variables by name."""
 
     variables: dict[str, TemporalFieldSpec] = Field(description="Output variables by name.")

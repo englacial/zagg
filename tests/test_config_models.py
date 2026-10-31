@@ -344,3 +344,34 @@ class TestAggregationGrammar:
             FieldSpec.model_validate(
                 {"function": "min", "kind": "ragged", "inner_shape": [2], "overview_delta": 0}
             )
+
+    @pytest.mark.parametrize(
+        "where, key",
+        [
+            ("field", "params"),
+            ("field", "function"),
+            ("field", "source"),
+            ("field", "dtype"),
+            ("agg", "chunk_precompute"),
+            ("agg", "variables"),
+            ("agg", "coordinates"),
+            ("agg", "handoff"),
+            ("streaming", "mode"),
+            ("streaming", "buffer_granules"),
+        ],
+    )
+    def test_explicit_null_is_refused(self, where, key):
+        cfg = TestPathAddressedRefusals()._cfg()
+        agg = cfg.aggregation
+        target = {"field": agg["variables"]["n"], "agg": agg, "streaming": {}}[where]
+        if where == "streaming":
+            agg["streaming"] = target
+        target[key] = None
+        with pytest.raises(ValueError, match=f"{key} must not be null \\(omit the key"):
+            validate_config(cfg)
+
+    def test_explicit_null_fill_value_stays_valid(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.aggregation["variables"]["n"]["fill_value"] = None
+        cfg.aggregation["coordinates"] = {"morton": {"dtype": "uint64", "fill_value": None}}
+        validate_config(cfg)
