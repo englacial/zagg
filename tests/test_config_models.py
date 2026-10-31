@@ -229,3 +229,13 @@ class TestDataSourceGrammar:
         )
         with pytest.raises(ValueError, match=r"data_source\.bands\.red\.dtype: Field required"):
             validate_config(cfg)
+
+    @pytest.mark.parametrize("key", ["fill_value", "scale", "offset"])
+    def test_raster_band_numbers_refuse_null(self, key):
+        cfg = default_config("sentinel2_l2a")
+        band = next(iter(cfg.data_source["bands"]))
+        cfg.data_source["bands"][band][key] = None
+        with pytest.raises(
+            ValueError, match=rf"data_source\.bands\.{band}: {key} must be a number \(got None\)"
+        ):
+            validate_config(cfg)

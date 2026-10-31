@@ -744,6 +744,17 @@ class Band(StrictModel):
         description="Recorded as the ``add_offset`` array attr for readers; never applied.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _no_null_numbers(cls, data: Any) -> Any:
+        # Optional by absence only: an explicit null would be forwarded as a
+        # None fill or a None scale_factor/add_offset attr.
+        if isinstance(data, dict):
+            for key in ("fill_value", "scale", "offset"):
+                if key in data and data[key] is None:
+                    raise ValueError(f"{key} must be a number (got None)")
+        return data
+
 
 class RasterDataSource(StrictModel):
     """The STAC raster source: ``reader: raster`` (issue #218).
