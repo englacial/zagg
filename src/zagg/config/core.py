@@ -3,7 +3,9 @@
 Phase 0 of issue #677: the ``zagg.config`` package split. This module holds
 what every other config module depends on -- the ``PipelineConfig``
 dataclass, its typed-dict annotations, the load funnels, and the constants the
-validators and accessors share -- so no sibling module imports upward.
+validators and accessors share -- so no sibling module imports upward at
+import time (the two loaders, ``load_config`` and ``default_config``, import
+``validate_config`` from ``zagg.config.validate`` at call time).
 """
 
 import json
