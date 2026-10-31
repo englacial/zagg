@@ -495,8 +495,9 @@ def _vlen_read_group(
         # extent is a real inconsistency (the link over-runs the array) and is
         # reported with the gather map's wording.
         arrays_by_path = {}
-        for path, arr in _read_full(base_paths).items():
-            arr = np.asarray(arr)
+        got = _read_full(base_paths)  # an ``H5Promise`` has no ``.items()``: index by path
+        for path in base_paths:
+            arr = np.asarray(got[path])
             if len(arr) < n_base:
                 raise ValueError(
                     f"dataset {path!r} has {len(arr)} rows, fewer than the record "

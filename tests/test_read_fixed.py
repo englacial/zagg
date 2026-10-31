@@ -16,6 +16,7 @@ import logging
 import numpy as np
 import pandas as pd
 import pytest
+from test_read_vlen import _Promise
 
 from zagg.config import PipelineConfig, validate_config
 from zagg.processing.read import _read_group, link_base_extent
@@ -708,6 +709,18 @@ class TestFixedReadGroup:
         ds["variables"]["flat"] = "/{group}/flat"
         df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 1, _LatGrid())
         assert df["flat"].tolist() == list(range(8, 20))
+
+    def test_full_arm_flat_read_through_an_h5promise(self):
+        # A real h5coro handle returns an ``H5Promise`` (no ``.items()``): the
+        # full arm indexes it by path (PR #680 review).
+        class _PromiseH5(_FakeH5):
+            def readDatasets(self, datasets):  # noqa: N802
+                return _Promise(super().readDatasets(datasets))
+
+        ds = _fx_ds()
+        ds["variables"]["flat"] = "/{group}/flat"
+        df = _read_group(_PromiseH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+        assert df["flat"].tolist() == FX_FLAT.tolist()
 
     def test_index_synthesis_drops_padding_via_expression(self):
         # Records with flag == 1 carry 2 valid samples of 4; the others all 4.

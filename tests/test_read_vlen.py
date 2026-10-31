@@ -8,6 +8,7 @@ all through the public ``_read_group`` dispatch.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from zagg.config import (
@@ -409,6 +410,13 @@ class TestVlenReadGroup:
             df["elevation"].to_numpy(),
             np.concatenate([_expected_elevation(i) for i in range(4)]),
         )
+
+    def test_full_read_through_an_h5promise(self):
+        # The full arm indexes the raw ``readDatasets`` result by path: an
+        # ``H5Promise`` has no ``.items()`` (PR #680 review).
+        df = _read_group(_PromiseH5(_l1b_arrays()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        ref = _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        pd.testing.assert_frame_equal(df, ref)
 
     def test_planned_read_selects_shard_records(self):
         # Shard 1 holds shots 103 + 104 (lat >= 11.5); pad=0 keeps it exact.

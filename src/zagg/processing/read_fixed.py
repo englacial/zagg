@@ -572,8 +572,9 @@ def _read_flat(flat_paths, plan, n_base, global_idx, h5obj, read_fn, workers, re
         return {}
     if plan is None:
         out = {}
-        for path, arr in read_full(flat_paths).items():
-            arr = np.asarray(arr)
+        got = read_full(flat_paths)  # an ``H5Promise`` has no ``.items()``: index by path
+        for path in flat_paths:
+            arr = np.asarray(got[path])
             if len(arr) < n_base:
                 raise ValueError(
                     f"dataset {path!r} has {len(arr)} rows, fewer than the fixed-width "
