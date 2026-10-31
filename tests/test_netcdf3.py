@@ -346,6 +346,50 @@ class TestHeaderBytesOnly:
         assert seen == {"resource": "https://x/y.nc", "credentials": "tok"}
 
 
+class TestSchemeDrivers:
+    """``_fetcher``'s default h5coro driver per URL scheme."""
+
+    @pytest.fixture
+    def drivers(self, monkeypatch):
+        from h5coro import filedriver, s3driver, webdriver
+
+        data, _ = fixture()
+        seen = []
+
+        def fake(kind):
+            class Drv:
+                def __init__(self, resource, credentials):
+                    seen.append((kind, resource, credentials))
+
+                def read(self, pos, size):
+                    return data[pos : pos + size]
+
+            return Drv
+
+        monkeypatch.setattr(s3driver, "S3Driver", fake("s3"))
+        monkeypatch.setattr(webdriver, "HTTPDriver", fake("http"))
+        monkeypatch.setattr(filedriver, "FileDriver", fake("file"))
+        return data, seen
+
+    def test_s3_strips_scheme_and_defaults_to_ambient_session(self, drivers):
+        data, seen = drivers
+        assert describe("s3://bucket/key.nc") == describe(data)
+        assert seen == [("s3", "bucket/key.nc", {})]
+        describe("s3://bucket/key.nc", credentials={"role": True})
+        assert seen[-1] == ("s3", "bucket/key.nc", {"role": True})
+
+    def test_https_keeps_the_url(self, drivers):
+        data, seen = drivers
+        assert describe("https://host/a/b.nc", credentials="tok") == describe(data)
+        assert seen == [("http", "https://host/a/b.nc", "tok")]
+
+    def test_local_path_goes_to_file_driver(self, drivers, tmp_path):
+        data, seen = drivers
+        p = str(tmp_path / "f.nc")
+        assert describe(p) == describe(data)
+        assert seen == [("file", p, None)]
+
+
 class TestRefusals:
     def test_not_netcdf(self):
         with pytest.raises(ValueError, match="not a netCDF3 file"):

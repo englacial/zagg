@@ -358,7 +358,8 @@ def _fetcher(source, driver=None, credentials=None):
     """``(offset, size) -> bytes`` over ``source``: raw bytes, a local path, an
     object with an h5coro-style ``read(pos, size)`` (any h5coro driver), or a
     URL opened through ``driver(source, credentials)`` -- defaulting to
-    h5coro's own drivers by scheme (``s3://`` -> S3Driver, ``http(s)://`` ->
+    h5coro's own drivers by scheme (``s3://`` -> S3Driver, with ``None``
+    credentials meaning the ambient boto3 session ``{}``, ``http(s)://`` ->
     HTTPDriver with an EDL bearer token as ``credentials``, else FileDriver),
     so the catalog's ranged GETs take the same credentialed path the worker's
     reads do."""
@@ -373,6 +374,10 @@ def _fetcher(source, driver=None, credentials=None):
             from h5coro import s3driver
 
             driver, resource = s3driver.S3Driver, resource[len("s3://") :]
+            # h5coro's S3Driver reads ``credentials`` as a dict; ``{}`` is its
+            # ambient session (role chain / env), the in-region default.
+            if credentials is None:
+                credentials = {}
         elif resource.startswith(("http://", "https://")):
             from h5coro import webdriver
 
