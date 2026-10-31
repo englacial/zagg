@@ -53,7 +53,7 @@ def normalize_overviews(raw) -> list[int]:
     """
     # YAML `true`/`yes` is a bool, and bool IS an int in Python — without the
     # explicit rejection a typo'd `overviews: true` would launder into a real
-    # resolution-1 declaration (the repo convention, cf. config.py).
+    # resolution-1 declaration (the repo convention, cf. src/zagg/config/).
     if isinstance(raw, int) and not isinstance(raw, bool):
         raw = [raw]
     if isinstance(raw, list) and any(isinstance(e, dict) for e in raw):

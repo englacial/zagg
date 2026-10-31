@@ -152,7 +152,7 @@ They share `notebooks/viewers.py`, which holds the drawing so the notebooks stay
 zagg/
 ├── src/zagg/              # Main package (cloud-agnostic)
 │   ├── __main__.py        # Local processing runner (python -m zagg)
-│   ├── config.py          # YAML pipeline configuration
+│   ├── config/            # YAML pipeline configuration
 │   ├── processing.py      # Core aggregation pipeline
 │   ├── catalog.py         # CMR query + catalog building
 │   ├── schema.py          # Output schema + Zarr template
