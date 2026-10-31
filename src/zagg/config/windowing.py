@@ -1,13 +1,10 @@
 """``output.windowing``: validation, normalization, and the per-window filters (issue #677 phase 0)."""
 
-import logging
 from datetime import datetime, timedelta, timezone
 
 from zagg.config.accessors import get_store_layout
 from zagg.config.core import PipelineConfig
 from zagg.config.source import _segment_variable_names, filters_from_data_source
-
-logger = logging.getLogger(__name__)
 
 
 def _validate_windowing(config: PipelineConfig) -> None:

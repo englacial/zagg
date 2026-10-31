@@ -1,12 +1,8 @@
 """Per-field ``aggregation.variables`` validators (issue #677 phase 0)."""
 
-import logging
-
 import numpy as np
 
 from zagg.config.expressions import _is_numeric, _validate_expression_columns, resolve_function
-
-logger = logging.getLogger(__name__)
 
 
 def _validate_composition_attrs(name: str, meta: dict, attrs: dict, agg_vars: dict) -> None:

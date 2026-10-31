@@ -1,7 +1,6 @@
 """``validate_config``: the cross-block entry point (issue #677 phase 0)."""
 
 import inspect
-import logging
 
 from zagg.config.core import (
     WORKER_MEMORIES,
@@ -33,8 +32,6 @@ from zagg.config.validate_source import (
     _validate_vlen_source,
 )
 from zagg.config.windowing import _validate_windowing
-
-logger = logging.getLogger(__name__)
 
 
 def validate_config(config: PipelineConfig) -> None:

@@ -1,12 +1,8 @@
 """``data_source`` block validators (issue #677 phase 0)."""
 
-import logging
-
 from zagg.config.core import _SET_OPS, FILTER_OPS, PipelineConfig
 from zagg.config.validate_output import _validate_store_layout_keys
 from zagg.config.windowing import _validate_windowing
-
-logger = logging.getLogger(__name__)
 
 
 def _validate_raster_config(config: PipelineConfig) -> None:

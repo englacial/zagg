@@ -7,7 +7,6 @@ validators and accessors share -- so no sibling module imports upward.
 """
 
 import json
-import logging
 from dataclasses import asdict, dataclass, field
 from importlib import resources
 from typing import NotRequired, TypedDict
@@ -16,8 +15,6 @@ import numpy as np
 import yaml
 
 import zagg.configs
-
-logger = logging.getLogger(__name__)
 
 
 class LinkDict(TypedDict):
