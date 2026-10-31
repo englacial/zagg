@@ -383,7 +383,7 @@ def _fixed_read_group(
     filter_paths = {id(f): f["dataset"].format(group=group) for f in base_structured}
     flat_paths = list(dict.fromkeys(list(var_paths.values()) + list(filter_paths.values())))
     arrays_by_path = _read_flat(
-        flat_paths, plan, n_base, global_idx, h5obj, read_fn, workers, _read_full
+        flat_paths, plan, n_base, width, global_idx, h5obj, read_fn, workers, _read_full
     )
     axes_cols = _read_axes_variables(
         {n: e for n, e in variables.items() if _has_axes(e)},
@@ -564,10 +564,17 @@ def _joined_coordinates(
     return out[0], out[1], matched
 
 
-def _read_flat(flat_paths, plan, n_base, global_idx, h5obj, read_fn, workers, read_full) -> dict:
+def _read_flat(
+    flat_paths, plan, n_base, width, global_idx, h5obj, read_fn, workers, read_full
+) -> dict:
     """Flat base-rate datasets (plain / ``column`` variables, base filters):
-    planned slices by the synthesized link, else full reads trimmed to the
-    link's extent — the vlen route's two arms."""
+    planned slices by the synthesized link, else full reads — the vlen route's
+    two arms. Unlike a strided ragged link, a fixed-width link leaves no slack
+    past its last record, so a full read of any other length than
+    ``n_records * width`` means the declared width is wrong: it raises rather
+    than trims (issue #452), as the ``axes`` arm does. The planned arm cannot
+    see the dataset's length (the ``read_fn`` seam has no metadata query yet —
+    the ``width: auto`` follow-up), so it checks the rows it gets back."""
     if not flat_paths:
         return {}
     if plan is None:
@@ -575,12 +582,13 @@ def _read_flat(flat_paths, plan, n_base, global_idx, h5obj, read_fn, workers, re
         got = read_full(flat_paths)  # an ``H5Promise`` has no ``.items()``: index by path
         for path in flat_paths:
             arr = np.asarray(got[path])
-            if len(arr) < n_base:
+            if len(arr) != n_base:
                 raise ValueError(
-                    f"dataset {path!r} has {len(arr)} rows, fewer than the fixed-width "
-                    f"link's base extent {n_base}; the record link does not tile the dataset"
+                    f"dataset {path!r} has {len(arr)} rows but the fixed-width link "
+                    f"covers {n_base // width} records x width {width} = {n_base}; "
+                    "the record link does not tile the dataset"
                 )
-            out[path] = arr[:n_base]
+            out[path] = arr
         return out
     _base_read_fn = read_fn
     if _base_read_fn is None:

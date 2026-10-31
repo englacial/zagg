@@ -710,6 +710,27 @@ class TestFixedReadGroup:
         df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 1, _LatGrid())
         assert df["flat"].tolist() == list(range(8, 20))
 
+    @pytest.mark.parametrize("n_rows", [N_REC * WIDTH + 5, N_REC * WIDTH - 2])
+    def test_full_arm_flat_length_mismatch_raises(self, n_rows):
+        # A fixed-width link has no slack: a LONGER flat dataset means the
+        # declared width is wrong and must raise, not trim (PR #680 review).
+        arrays = _fx_arrays()
+        arrays["/G/flat"] = np.arange(n_rows, dtype=np.int16)
+        ds = _fx_ds()
+        ds["variables"]["flat"] = "/{group}/flat"
+        with pytest.raises(ValueError, match=f"'/G/flat' has {n_rows} rows but the fixed-width"):
+            _read_group(_FakeH5(arrays), "G", ds, 0, _OneShardGrid())
+
+    def test_planned_arm_flat_short_read_raises(self):
+        # The planned arm cannot see the dataset's length, but a hyperslice off
+        # the end of a truncated dataset comes back short and raises.
+        arrays = _fx_arrays()
+        arrays["/G/flat"] = FX_FLAT[:14]
+        ds = _fx_planned_ds()
+        ds["variables"]["flat"] = "/{group}/flat"
+        with pytest.raises(ValueError, match="returned 6 of 12 planned rows"):
+            _read_group(_FakeH5(arrays), "G", ds, 1, _LatGrid())
+
     def test_full_arm_flat_read_through_an_h5promise(self):
         # A real h5coro handle returns an ``H5Promise`` (no ``.items()``): the
         # full arm indexes it by path (PR #680 review).
