@@ -590,6 +590,18 @@ class TestNormalizeAssets:
         (msg,) = [r.getMessage() for r in caplog.records]
         assert "ftp://f/g.nc" in msg and "'ftp'" in msg
 
+    def test_duplicate_data_asset_last_wins_and_warns(self, caplog):
+        # Pins current last-wins order; choosing the granule asset (e.g. by
+        # item-id match) is an open design question on PR #683.
+        with caplog.at_level(logging.WARNING):
+            out = self._norm(
+                "https://h/g.nc", "s3://b/g.nc", qa={"href": "https://h/g_qa.nc", "roles": ["data"]}
+            )
+        assert out["data"]["href"] == "https://h/g_qa.nc"
+        assert out["data_s3"]["href"] == "s3://b/g.nc"
+        (msg,) = [r.getMessage() for r in caplog.records]
+        assert "several data assets" in msg and "https://h/g.nc" in msg
+
     def test_all_data_assets_dropped_warns(self, caplog):
         # A silent drop surfaces only later as a ShardMap entry with no href.
         with caplog.at_level(logging.WARNING):

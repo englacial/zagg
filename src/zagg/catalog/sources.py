@@ -140,7 +140,8 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     - ``data_s3``  : the S3 data asset,
 
     routed on the lowercased href scheme (``s3`` vs ``http``/``https``); a data
-    asset on any other scheme (``ftp``, ...) is logged and skipped.
+    asset on any other scheme (``ftp``, ...) is logged and skipped. When several
+    data assets map to one key the last in asset order wins, with a warning.
     - ``metadata`` : the metadata-role asset.
 
     A ``data``-role asset counts when its href ends in one of
@@ -162,10 +163,17 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
         href = asset.get("href", "")
         if "data" in roles and href.lower().endswith(_DATA_SUFFIXES):
             scheme = href.split("://", 1)[0].lower()
-            if scheme == "s3":
-                out["data_s3"] = asset
-            elif scheme in ("http", "https"):
-                out["data"] = asset
+            canon = {"s3": "data_s3", "http": "data", "https": "data"}.get(scheme)
+            if canon in out:
+                logging.warning(
+                    "item %s: several %s assets; %s replaces %s",
+                    item.get("id"),
+                    canon,
+                    href,
+                    out[canon]["href"],
+                )
+            if canon:
+                out[canon] = asset
             else:
                 logging.warning(
                     "item %s: skipping data asset %s (scheme %r)", item.get("id"), href, scheme
