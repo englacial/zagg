@@ -569,11 +569,10 @@ class H5DataSource(StrictModel):
             return
         base_level = self.base_level
         if base_level is None:
-            raise ValueError("data_source.base_level is required when levels is present")
+            raise ValueError("base_level is required when levels is present")
         if base_level not in levels:
             raise ValueError(
-                f"data_source.base_level {base_level!r} is not a key in levels "
-                f"(available: {sorted(levels)})"
+                f"base_level {base_level!r} is not a key in levels (available: {sorted(levels)})"
             )
         base_vars = set(self.variables or {})
         seen: set[str] = set()
@@ -624,7 +623,7 @@ class H5DataSource(StrictModel):
             lvl = f.level
             if lvl is not None and lvl not in self.levels:
                 raise ValueError(
-                    f"filter[{i}]: level {lvl!r} is not a key in levels "
+                    f"filters[{i}]: level {lvl!r} is not a key in levels "
                     f"(available: {sorted(self.levels)})"
                 )
 
@@ -636,16 +635,16 @@ class H5DataSource(StrictModel):
         base_level = self.base_level
         if coord_level is not None:
             if levels is None or base_level is None:
-                raise ValueError("data_source.coordinates.level requires 'levels' and 'base_level'")
+                raise ValueError("coordinates.level requires 'levels' and 'base_level'")
             if coord_level not in levels:
                 raise ValueError(
-                    f"data_source.coordinates.level {coord_level!r} is not a key in levels "
+                    f"coordinates.level {coord_level!r} is not a key in levels "
                     f"(available: {sorted(levels)})"
                 )
             link = levels[coord_level].link
             if link is None or link.to != base_level:
                 raise ValueError(
-                    f"data_source.coordinates.level {coord_level!r} must link directly to "
+                    f"coordinates.level {coord_level!r} must link directly to "
                     f"base level {base_level!r}"
                 )
         for name, entry in (self.variables or {}).items():
@@ -653,12 +652,12 @@ class H5DataSource(StrictModel):
                 continue
             if coord_level is None:
                 raise ValueError(
-                    f"data_source.variables['{name}']: synthesize requires the vlen route "
+                    f"variables['{name}']: synthesize requires the vlen route "
                     "(set data_source.coordinates.level)"
                 )
             if entry.level != coord_level:
                 raise ValueError(
-                    f"data_source.variables['{name}'].level {entry.level!r} must equal "
+                    f"variables['{name}'].level {entry.level!r} must equal "
                     f"coordinates.level {coord_level!r} (the within-record index comes "
                     "from that level's link)"
                 )
@@ -669,12 +668,12 @@ class H5DataSource(StrictModel):
                 continue
             if assets is None or asset not in assets:
                 raise ValueError(
-                    f"filter[{i}]: asset {asset!r} is not declared in data_source.assets "
+                    f"filters[{i}]: asset {asset!r} is not declared in data_source.assets "
                     f"(available: {sorted(assets) if assets else []})"
                 )
             if coord_level is None:
                 raise ValueError(
-                    f"filter[{i}]: 'asset' filters require the vlen route "
+                    f"filters[{i}]: 'asset' filters require the vlen route "
                     "(set data_source.coordinates.level)"
                 )
         # Asset-sourced level variables (issue #464): record-level by

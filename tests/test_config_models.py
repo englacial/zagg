@@ -130,6 +130,22 @@ class TestPathAddressedRefusals:
         with pytest.raises(ValueError, match=r"data_source\.variables\.x-config\.column: "):
             validate_config(cfg)
 
+    def test_cross_check_messages_carry_the_path_once(self):
+        # The renderer adds ``data_source``; the cross-checks name only the
+        # key under it, spelled like pydantic's own loc (``filters[i]``).
+        cfg = self._cfg(levels={"p": {"path": "/p"}})
+        with pytest.raises(ValueError, match=r"^data_source: base_level is required when levels"):
+            validate_config(cfg)
+        cfg = self._cfg(
+            levels={"p": {"path": "/p"}},
+            base_level="p",
+            filters=[{"dataset": "/d", "op": "eq", "value": 0, "level": "zz"}],
+        )
+        with pytest.raises(
+            ValueError, match=r"^data_source: filters\[0\]: level 'zz' is not a key in levels"
+        ):
+            validate_config(cfg)
+
     def test_list_index_renders_as_subscript(self):
         cfg = self._cfg(filters=[{"dataset": "/d", "op": "eq", "value": 0, "keeps": True}])
         with pytest.raises(ValueError, match=r"data_source\.filters\[0\]\.keeps: Extra inputs"):
