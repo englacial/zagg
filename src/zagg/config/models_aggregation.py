@@ -17,7 +17,7 @@ in the read columns, expression identifiers, the location column) need the
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 import numpy as np
 from pydantic import Field, ValidationInfo, field_validator, model_validator
@@ -47,7 +47,7 @@ TemporalShape = Literal["per-cell", "per-centroid"]
 WeightsKind = Literal["counts", "flux"]
 
 #: A positive-int shape: ``128`` or ``[16, 2]``.
-Shape = Union[int, list[int]]
+Shape = Union[PosInt, Annotated[list[PosInt], Field(min_length=1)]]
 
 
 def _check_shape(v: Any, key: str) -> Any:
@@ -172,7 +172,7 @@ class FieldSpec(_Reducer):
         "default, integer weights) or ``flux`` (positive reals; requires ``attrs.gain`` with "
         "``name`` and ``version``).",
     )
-    overview_delta: int | None = Field(
+    overview_delta: PosInt | None = Field(
         default=None,
         description="Pyramid-fold centroid budget for a ragged digest (issue #424), split from "
         "the leaf ``params.delta``; packaging, never hashed.",
@@ -188,7 +188,9 @@ class FieldSpec(_Reducer):
     @field_validator("trailing_shape", "inner_shape", mode="before")
     @classmethod
     def _shape(cls, v: Any, info: ValidationInfo) -> Any:
-        return None if v is None else _check_shape(v, str(info.field_name))
+        # No ``None`` short-circuit: pydantic runs no validator for an absent
+        # key, so only an explicit ``null`` reaches here, and it is refused.
+        return _check_shape(v, str(info.field_name))
 
     @field_validator("attrs", mode="before")
     @classmethod

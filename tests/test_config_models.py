@@ -321,3 +321,26 @@ class TestAggregationGrammar:
             ValueError, match=r"Variable 'f': kind 'vector' requires 'trailing_shape'"
         ):
             _validate_output_kind("f", {"function": "min", "kind": "vector"})
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            {"function": "histogram", "kind": "vector", "trailing_shape": None},
+            {"function": "min", "kind": "ragged", "inner_shape": None},
+        ],
+    )
+    def test_explicit_null_shape_is_refused(self, meta):
+        from zagg.config import _validate_output_kind
+
+        with pytest.raises(ValueError, match=r"must be an int or a sequence of ints \(got None\)"):
+            _validate_output_kind("f", meta)
+
+    def test_overview_delta_schema_is_a_positive_int(self):
+        from zagg.config.models_aggregation import FieldSpec
+
+        prop = FieldSpec.model_json_schema()["properties"]["overview_delta"]
+        assert {"type": "integer", "minimum": 1} in prop["anyOf"]
+        with pytest.raises(ValueError, match="overview_delta must be a positive int"):
+            FieldSpec.model_validate(
+                {"function": "min", "kind": "ragged", "inner_shape": [2], "overview_delta": 0}
+            )
