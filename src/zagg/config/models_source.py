@@ -465,8 +465,9 @@ class H5DataSource(StrictModel):
 
     reader: str | None = Field(
         default=None,
-        description="Reader name; ``h5coro`` (default). ``raster`` and the temporal readers "
-        "select the other source grammars.",
+        description="Reader name; ``h5coro`` (default). ``raster`` selects the raster source "
+        "grammar; the collection grammar is selected by ``pipeline.type: temporal|event``, "
+        "not by this key.",
     )
     driver: str | None = Field(
         default=None, description="Granule access driver, ``s3`` (default) or ``https``."
