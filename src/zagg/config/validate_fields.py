@@ -1,8 +1,9 @@
 """Per-field ``aggregation.variables`` validators (issue #677 phase 0)."""
 
-from zagg.config.expressions import _is_numeric, _validate_expression_columns, resolve_function
+from typing import get_args
 
-_TEMPORAL_SPEC_KEYS = ("variable", "collection", "spatial_func", "temporal_reducer")
+from zagg.config.expressions import _is_numeric, _validate_expression_columns, resolve_function
+from zagg.config.models_aggregation import OutputKind, OutputResolution
 
 
 def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
@@ -86,14 +87,10 @@ def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
             _validate_expression_columns(name, meta["expression"], ds_vars)
 
 
-# Recognized per-field output kinds. ``ragged`` is the Tier-2 carrier
-# for variable-length per-cell outputs; see issue #48.
-OUTPUT_KINDS = ("scalar", "vector", "ragged")
-
-# Recognized per-field output resolutions (issue #30 item 2). ``cell`` (default)
-# stores one value per aggregation cell; ``chunk`` stores one value per chunk in a
-# companion array shaped at the chunk grid, indexed by ``grid.block_index``.
-OUTPUT_RESOLUTIONS = ("cell", "chunk")
+# The recognized per-field output kinds and resolutions, derived from the
+# grammar's Literals (``models_aggregation``) so the two cannot drift.
+OUTPUT_KINDS = get_args(OutputKind)
+OUTPUT_RESOLUTIONS = get_args(OutputResolution)
 
 
 def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:

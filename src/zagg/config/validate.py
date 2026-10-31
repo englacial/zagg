@@ -386,14 +386,11 @@ def _validate_worker(config: PipelineConfig) -> None:
 def _validate_temporal_config(config: PipelineConfig) -> None:
     """Validate a temporal/event pipeline config (issue #12, Phase 5).
 
-    Temporal pipelines carry no output grid; the only cross-check is that the
-    ``aggregation.variables`` block names, per variable, the four keys
-    :data:`_TEMPORAL_SPEC_KEYS` that :func:`zagg.temporal.specs_from_config`
-    requires (the rest are optional flags with defaults). Raises ``ValueError``
-    on a missing section or key.
+    Temporal pipelines carry no output grid. The per-variable keys are
+    :class:`~zagg.config.models_aggregation.TemporalFieldSpec`'s (checked by
+    :func:`~zagg.config.models.validate_model`, which runs first); this
+    refuses an empty ``variables`` mapping with ``ValueError``.
     """
-    if not config.aggregation:
-        raise ValueError("Missing required section: aggregation")
     variables = config.aggregation.get("variables")
     if not variables:
         raise ValueError("temporal pipeline requires aggregation.variables")
