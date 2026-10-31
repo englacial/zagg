@@ -21,11 +21,6 @@ def _validate_raster_config(config: PipelineConfig) -> None:
     for section in ("data_source", "output"):
         if not getattr(config, section):
             raise ValueError(f"Missing required section: {section}")
-    if config.aggregation:
-        raise ValueError(
-            "raster pipelines take no aggregation section: pull-NN yields one "
-            "value per cell per timestep (declare bands under data_source.bands)"
-        )
     # ``bands``/``nodata``/``shard_workers``/``write_buffer`` shape is the
     # raster model's (``models_source.RasterDataSource``, issue #677 phase 1).
     grid = config.output.get("grid")

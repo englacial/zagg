@@ -141,7 +141,7 @@ class TestAggValidatesConfig:
     def test_temporal_config_validated_at_the_same_seam(self):
         cfg = _temporal_config()
         del cfg.aggregation["variables"]["max_t2m"]["temporal_reducer"]
-        with pytest.raises(ValueError, match="missing required key.*temporal_reducer"):
+        with pytest.raises(ValueError, match=r"max_t2m\.temporal_reducer: Field required"):
             agg(cfg)
 
     def test_raster_config_validated_at_the_same_seam(self):

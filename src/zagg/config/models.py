@@ -29,8 +29,17 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Discriminator, Field, Tag, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    Discriminator,
+    Field,
+    Tag,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+)
 
+from zagg.config.models_aggregation import Aggregation, TemporalAggregation
 from zagg.config.models_base import TAGS, StrictModel
 from zagg.config.models_source import CollectionDataSource, H5DataSource, RasterDataSource
 
@@ -53,9 +62,6 @@ __all__ = [
 class _RootBase(StrictModel):
     """The four blocks phases 1–3 leave untyped (phase 4 types them)."""
 
-    aggregation: dict[str, Any] = Field(
-        default_factory=dict, description="The aggregation block (typed in issue #677 phase 2)."
-    )
     output: dict[str, Any] = Field(
         default_factory=dict, description="The output block (typed in issue #677 phase 3)."
     )
@@ -80,6 +86,11 @@ class _RootBase(StrictModel):
 class SpatialConfig(_RootBase):
     """A point-cloud → grid pipeline reading HDF5 through h5coro (the default kind)."""
 
+    aggregation: Aggregation = Field(
+        default_factory=Aggregation,
+        description="Per-field reducers over the read columns, chunk precomputes, carrier "
+        "and streaming knobs.",
+    )
     data_source: H5DataSource = Field(
         default_factory=H5DataSource,
         description="The HDF5 point source: groups, coordinates, variables, filters, levels.",
@@ -89,6 +100,22 @@ class SpatialConfig(_RootBase):
 class RasterConfig(_RootBase):
     """A raster (pull-NN) pipeline: ``data_source.reader: raster`` (issue #218)."""
 
+    aggregation: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Must be empty: pull-NN yields exactly one value per cell per timestep, so "
+        "there is nothing to reduce — the band map under ``data_source.bands`` replaces it.",
+    )
+
+    @field_validator("aggregation")
+    @classmethod
+    def _no_aggregation(cls, v: dict[str, Any]) -> dict[str, Any]:
+        if v:
+            raise ValueError(
+                "raster pipelines take no aggregation section: pull-NN yields one "
+                "value per cell per timestep (declare bands under data_source.bands)"
+            )
+        return v
+
     data_source: RasterDataSource = Field(
         description="The STAC-asset raster source: a band map plus source-store knobs."
     )
@@ -97,6 +124,10 @@ class RasterConfig(_RootBase):
 class TemporalConfig(_RootBase):
     """A temporal/event pipeline over gridded collections (issue #12, #213)."""
 
+    aggregation: TemporalAggregation = Field(
+        description="Output variables as registry capability names (spatial reducer, "
+        "temporal reducer, mask, transform)."
+    )
     data_source: CollectionDataSource = Field(
         default_factory=CollectionDataSource,
         description="The collection reader source: named collections with per-collection "

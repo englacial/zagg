@@ -68,6 +68,11 @@ from zagg.config.models import (
     TemporalConfig,
     validate_model,
 )
+from zagg.config.models_aggregation import (
+    Aggregation,
+    FieldSpec,
+    TemporalAggregation,
+)
 from zagg.config.source import (
     _segment_variable_names,
     collection_options,
@@ -86,11 +91,8 @@ from zagg.config.validate_fields import (
     OUTPUT_KINDS,
     OUTPUT_RESOLUTIONS,
     _validate_chunk_precompute,
-    _validate_composition_attrs,
     _validate_output_kind,
     _validate_temporal_producer,
-    _validate_temporal_shape,
-    _validate_trailing_shape,
 )
 from zagg.config.validate_output import (
     _is_nan_fill,
@@ -113,9 +115,12 @@ from zagg.config.windowing import (
 )
 
 __all__ = [
+    "Aggregation",
     "ConfigModel",
+    "FieldSpec",
     "RasterConfig",
     "SpatialConfig",
+    "TemporalAggregation",
     "TemporalConfig",
     "validate_model",
     "FILTER_OPS",
@@ -185,7 +190,6 @@ __all__ = [
     "_is_nan_fill",
     "_segment_variable_names",
     "_validate_chunk_precompute",
-    "_validate_composition_attrs",
     "_validate_json_floats",
     "_validate_output_kind",
     "_validate_pyramid",
@@ -194,10 +198,8 @@ __all__ = [
     "_validate_store_layout_keys",
     "_validate_temporal_config",
     "_validate_temporal_producer",
-    "_validate_temporal_shape",
     "_validate_time_encoding",
     "_validate_time_source",
-    "_validate_trailing_shape",
     "_validate_windowing",
     "_validate_windowing_windows",
     "_validate_worker",

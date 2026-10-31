@@ -11,12 +11,7 @@ from zagg.config.core import (
 from zagg.config.expressions import _is_numeric, _validate_expression_columns, resolve_function
 from zagg.config.models import validate_model
 from zagg.config.source import _segment_variable_names, filters_from_data_source
-from zagg.config.validate_fields import (
-    _TEMPORAL_SPEC_KEYS,
-    _validate_chunk_precompute,
-    _validate_composition_attrs,
-    _validate_output_kind,
-)
+from zagg.config.validate_fields import _validate_chunk_precompute, _validate_temporal_producer
 from zagg.config.validate_output import (
     _validate_store_layout_keys,
     _validate_time_encoding,
@@ -154,13 +149,6 @@ def validate_config(config: PipelineConfig) -> None:
                 f"(D16 — issue #304)"
             )
 
-    # Validate the optional per-cell carrier (issue #132). Mirrors the worker's
-    # ``{"pandas", "arrow"}`` guard (worker.py) so a typo in the aggregation YAML
-    # fails at load, not deep in a worker.
-    handoff = config.aggregation.get("handoff")
-    if handoff is not None and handoff not in ("pandas", "arrow"):
-        raise ValueError(f"aggregation.handoff must be 'pandas' or 'arrow' (got {handoff!r})")
-
     # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
     aoi_mask = config.output.get("aoi_mask")
     if aoi_mask is not None and not isinstance(aoi_mask, bool):
@@ -258,19 +246,14 @@ def validate_config(config: PipelineConfig) -> None:
     precompute_names = set(config.aggregation.get("chunk_precompute", {}).keys())
     expr_vars = ds_vars | precompute_names
 
+    # The per-field grammar — exactly one of function/expression, the output
+    # kind and its shape keys, resolution, the temporal shape, weights,
+    # overview_delta, attrs and the composition cross-check — is the model's
+    # (``models_aggregation``, issue #677 phase 2). What remains needs the read
+    # columns, the grid, or an importable reducer.
     for name, meta in agg_vars.items():
         has_func = "function" in meta
         has_expr = "expression" in meta
-
-        # Mutual exclusivity
-        if has_func and has_expr:
-            raise ValueError(
-                f"Variable '{name}': 'function' and 'expression' are mutually exclusive"
-            )
-
-        # Must have one (count via function:len is allowed)
-        if not has_func and not has_expr:
-            raise ValueError(f"Variable '{name}': must specify 'function' or 'expression'")
 
         # Validate source references
         source = meta.get("source")
@@ -299,8 +282,9 @@ def validate_config(config: PipelineConfig) -> None:
         if has_expr:
             _validate_expression_columns(name, meta["expression"], expr_vars)
 
-        # Validate the output-kind declaration (kind + trailing_shape + dtype)
-        _validate_output_kind(name, meta, config)
+        # A temporal companion needs a producing reducer and the store's clock
+        if meta.get("temporal") is not None:
+            _validate_temporal_producer(name, meta, config)
 
         # Located ragged fields (issue #87): the location column is the
         # per-observation morton the HEALPix read path supplies as ``leaf_id``
@@ -324,15 +308,9 @@ def validate_config(config: PipelineConfig) -> None:
                     f"(the per-observation morton column); got grid type {grid_type!r}"
                 )
             # The location channel is injected as the reducer's ``locations=``
-            # kwarg (aggregate.py), so a params entry of that name would collide
-            # (TypeError deep in the per-cell loop) and a reducer that cannot
-            # accept the kwarg would crash on every populated cell — reject both
-            # at load time instead.
-            if "locations" in meta.get("params", {}):
-                raise ValueError(
-                    f"Variable '{name}': params may not name 'locations' — it is "
-                    f"reserved for the location channel (issue #87)"
-                )
+            # kwarg (aggregate.py): a reducer that cannot accept the kwarg would
+            # crash on every populated cell — reject at load time instead (the
+            # params-name collision is the model's).
             if has_func:
                 func = resolve_function(meta["function"])
                 try:
@@ -349,35 +327,11 @@ def validate_config(config: PipelineConfig) -> None:
                             f"accept a 'locations' keyword, which 'location' requires "
                             f"(use a located reducer, e.g. zagg.stats.tdigest.build_tdigest)"
                         )
-            # The location channel is stored as a SIBLING vlen array named
-            # ``{name}_locations`` (issue #209) — a name the user never wrote.
-            # A field or coordinate already claiming it would silently lose in
-            # the template members dict and interleave into the same object
-            # slab at write time (data corruption), so reject at load
-            # (review, PR #211).
-            from zagg.grids.base import ragged_locations_name
-
-            sibling = ragged_locations_name(name)
-            if sibling in agg_vars or sibling in config.aggregation.get("coordinates", {}):
-                raise ValueError(
-                    f"Variable '{name}': its location channel is stored in a sibling "
-                    f"array named '{sibling}', which collides with the declared "
-                    f"field/coordinate of that name — rename one of them (issue #209)"
-                )
-
-        # The §8.3 per-centroid temporal channel takes the same sibling-name
-        # reservation, for the same corruption reason (issue #410) — plus the
-        # same two reducer-surface checks the location channel gets, because it
-        # rides in the same way: as a reserved ``temporal=`` kwarg injected by
-        # aggregate.py.
+        # The §8.3 per-centroid temporal channel rides the same way: as a
+        # reserved ``temporal=`` kwarg injected by aggregate.py, so the reducer
+        # surface gets the same check (the sibling-name reservation and the
+        # params-name collision are the model's).
         if meta.get("temporal") == "per-centroid":
-            from zagg.grids.base import ragged_times_name
-
-            if "temporal" in meta.get("params", {}):
-                raise ValueError(
-                    f"Variable '{name}': params may not name 'temporal' — it is "
-                    f"reserved for the temporal channel (spec §8.3, issue #410)"
-                )
             if has_func:
                 func = resolve_function(meta["function"])
                 try:
@@ -395,66 +349,6 @@ def validate_config(config: PipelineConfig) -> None:
                             f"requires (use a reducer carrying the channel, e.g. "
                             f"zagg.stats.tdigest.build_tdigest)"
                         )
-            sibling = ragged_times_name(name)
-            if sibling in agg_vars or sibling in config.aggregation.get("coordinates", {}):
-                raise ValueError(
-                    f"Variable '{name}': its temporal channel is stored in a sibling "
-                    f"array named '{sibling}', which collides with the declared "
-                    f"field/coordinate of that name — rename one of them (spec §8.3)"
-                )
-
-        # Field-level store attrs (issue #321): free-form provenance the grid
-        # template merges onto the field's array spec (e.g. the composition
-        # field's lane order and signal threshold), so readers bind to
-        # metadata instead of reconstructing config conventions.
-        attrs = meta.get("attrs")
-        if attrs is not None:
-            if not isinstance(attrs, dict) or not all(isinstance(k, str) for k in attrs):
-                raise ValueError(f"Variable '{name}': attrs must be a mapping with string keys")
-            from zagg.grids.base import (
-                LOCATED_ATTR,
-                RAGGED_ELEMENT_ATTR,
-                TIMES_ATTR,
-                WEIGHTS_ATTR,
-            )
-            from zagg.time_axis import TEMPORAL_ATTR
-
-            if RAGGED_ELEMENT_ATTR in attrs:
-                raise ValueError(
-                    f"Variable '{name}': attrs key {RAGGED_ELEMENT_ATTR!r} is reserved "
-                    f"for the ragged layout block (issue #209)"
-                )
-            # The §2.0 weights key is spec-owned on ragged payload arrays:
-            # the template stamps it from the field-level ``weights:``
-            # declaration, so an attrs transcription could silently disagree.
-            if meta.get("kind") == "ragged" and WEIGHTS_ATTR in attrs:
-                raise ValueError(
-                    f"Variable '{name}': attrs key {WEIGHTS_ATTR!r} is spec-owned on a "
-                    f"ragged payload array — declare the field-level 'weights:' key "
-                    f"instead (spec §2.0, issue #424)"
-                )
-            # Same discipline for the §8/§9 declaration blocks and the §8.3
-            # sibling binding (issue #410): the template stamps all three
-            # from the field-level ``temporal:``/``location:`` declarations,
-            # so an author transcription could disagree with the words the
-            # writer actually stored.
-            for key in (TEMPORAL_ATTR, LOCATED_ATTR, TIMES_ATTR):
-                if key in attrs:
-                    raise ValueError(
-                        f"Variable '{name}': attrs key {key!r} is spec-owned (spec §8/§9) — "
-                        f"declare the field-level 'temporal:'/'location:' key instead "
-                        f"(issue #410)"
-                    )
-            import json
-
-            try:
-                json.dumps(attrs)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Variable '{name}': attrs must be JSON-serializable ({exc})"
-                ) from exc
-
-            _validate_composition_attrs(name, meta, attrs, agg_vars)
 
 
 def _validate_worker(config: PipelineConfig) -> None:
@@ -503,15 +397,3 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
     variables = config.aggregation.get("variables")
     if not variables:
         raise ValueError("temporal pipeline requires aggregation.variables")
-    for name, meta in variables.items():
-        missing = [k for k in _TEMPORAL_SPEC_KEYS if k not in meta]
-        if missing:
-            raise ValueError(
-                f"temporal variable '{name}' is missing required key(s): "
-                f"{', '.join(missing)} (need {', '.join(_TEMPORAL_SPEC_KEYS)})"
-            )
-        params = meta.get("params")
-        if params is not None and not isinstance(params, dict):
-            raise ValueError(
-                f"temporal variable '{name}' params must be a mapping (got {params!r})"
-            )

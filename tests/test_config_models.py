@@ -242,6 +242,16 @@ class TestDataSourceGrammar:
         cfg = PipelineConfig(
             pipeline={"type": "temporal"},
             data_source={"reader": "xarray_s3", "collections": {"m": {"doi": "10.1/x"}}},
+            aggregation={
+                "variables": {
+                    "t": {
+                        "variable": "T",
+                        "collection": "m",
+                        "spatial_func": "max",
+                        "temporal_reducer": "max",
+                    }
+                }
+            },
         )
         model = validate_model(cfg)
         assert model.data_source.collections["m"].model_dump(exclude_unset=True) == {
@@ -265,3 +275,49 @@ class TestDataSourceGrammar:
             ValueError, match=rf"data_source\.bands\.{band}: {key} must be a number \(got None\)"
         ):
             validate_config(cfg)
+
+
+class TestAggregationGrammar:
+    """Phase 2: the per-field grammar is the model's; the typed view is additive."""
+
+    def test_typed_fields(self):
+        model = default_config("atl03_tdigest_strata_healpix").model
+        digest = model.aggregation.variables["h_tdigest_signal"]
+        assert digest.kind == "ragged" and digest.inner_shape == [2]
+        assert digest.location == "leaf_id" and digest.temporal == "per-centroid"
+        assert model.aggregation.streaming.mode == "spill"
+        assert model.aggregation.coordinates["morton"].dtype == "uint64"
+
+    def test_misspelled_field_key_names_its_path(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.aggregation["variables"]["n"]["fil_value"] = 0
+        with pytest.raises(ValueError, match=r"aggregation\.variables\.n\.fil_value: Extra inputs"):
+            validate_config(cfg)
+
+    def test_streaming_block_is_strict(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.aggregation["streaming"] = {"mode": "spill", "arena_backing": "x"}
+        with pytest.raises(ValueError, match=r"streaming\.arena_backing: Extra inputs"):
+            validate_config(cfg)
+        cfg.aggregation["streaming"] = {"block_bytes": 1 << 20}
+        with pytest.raises(ValueError, match="block_bytes only applies to mode: spill"):
+            validate_config(cfg)
+
+    def test_temporal_variables_are_typed(self):
+        model = default_config("merra2_storm").model
+        spec = model.aggregation.variables["anom_tqv_full"]
+        assert spec.spatial_func == "weighted_mean" and spec.anomaly is True
+
+    def test_raster_refuses_an_aggregation_block(self):
+        cfg = default_config("sentinel2_l2a")
+        cfg.aggregation = {"variables": {"x": {"function": "mean"}}}
+        with pytest.raises(ValueError, match="raster pipelines take no aggregation section"):
+            validate_config(cfg)
+
+    def test_field_shim_prefixes_the_name(self):
+        from zagg.config import _validate_output_kind
+
+        with pytest.raises(
+            ValueError, match=r"Variable 'f': kind 'vector' requires 'trailing_shape'"
+        ):
+            _validate_output_kind("f", {"function": "min", "kind": "vector"})

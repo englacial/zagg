@@ -187,7 +187,7 @@ class TestPipelineType:
                 "output": {"store": "."},
             }
         )
-        with pytest.raises(ValueError, match="missing required key"):
+        with pytest.raises(ValueError, match=r"variables\.x\.collection: Field required"):
             validate_config(cfg)
 
     def test_validate_temporal_requires_variables(self):
@@ -308,7 +308,9 @@ class TestCollectionOptions:
     def test_spec_params_must_be_mapping(self):
         cfg = self._cfg(["merra2"])
         cfg.aggregation["variables"]["max_t2m"]["params"] = "knob=7"
-        with pytest.raises(ValueError, match="params must be a mapping"):
+        with pytest.raises(
+            ValueError, match=r"max_t2m\.params: Input should be a valid dictionary"
+        ):
             validate_config(cfg)
 
 
@@ -837,7 +839,9 @@ class TestChunkPrecompute:
 
     def test_non_mapping_block_rejected(self):
         cfg = _cfg_with_precompute(["not", "a", "mapping"])
-        with pytest.raises(ValueError, match="must be a mapping"):
+        with pytest.raises(
+            ValueError, match=r"chunk_precompute: Input should be a valid dictionary"
+        ):
             validate_config(cfg)
 
     def test_name_colliding_with_column_rejected(self):
@@ -1540,7 +1544,9 @@ class TestHandoff:
         validate_config(_cfg_with_handoff())  # should not raise
 
     def test_invalid_handoff_rejected_at_load(self):
-        with pytest.raises(ValueError, match=r"aggregation\.handoff must be 'pandas' or 'arrow'"):
+        with pytest.raises(
+            ValueError, match=r"aggregation\.handoff: Input should be 'pandas' or 'arrow'"
+        ):
             validate_config(_cfg_with_handoff("bogus"))
 
     def test_shipped_atl06_declares_arrow(self):
@@ -1785,7 +1791,9 @@ class TestOutputKind:
 
     def test_unknown_kind_rejected(self):
         cfg = _vector_config({"function": "min", "kind": "matrix"})
-        with pytest.raises(ValueError, match="output kind 'matrix' is not supported"):
+        with pytest.raises(
+            ValueError, match=r"hist\.kind: Input should be 'scalar', 'vector' or 'ragged'"
+        ):
             validate_config(cfg)
 
     def test_ragged_requires_inner_shape(self):
@@ -1810,7 +1818,7 @@ class TestOutputKind:
 
     def test_trailing_shape_rejects_bool(self):
         cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": True})
-        with pytest.raises(ValueError, match="positive"):
+        with pytest.raises(ValueError, match="must be an int or a sequence of ints"):
             validate_config(cfg)
 
     def test_trailing_shape_rejects_empty(self):
@@ -1957,7 +1965,7 @@ class TestResolutionAttribute:
 
     def test_bad_resolution_rejected(self):
         cfg = _cfg_with_field({"function": "min", "resolution": "block"})
-        with pytest.raises(ValueError, match="resolution 'block' is not supported"):
+        with pytest.raises(ValueError, match=r"f\.resolution: Input should be 'cell' or 'chunk'"):
             validate_config(cfg)
 
     def test_vector_field_may_be_resolution_chunk(self):
@@ -2360,14 +2368,16 @@ class TestWeightsDeclaration:
             )
 
     def test_unknown_value_rejected(self):
-        with pytest.raises(ValueError, match="is not one of"):
+        with pytest.raises(ValueError, match=r"weights: Input should be 'counts' or 'flux'"):
             validate_config(_ragged_cfg(inner_shape=[2], weights="photons"))
 
     def test_weights_rejected_on_non_ragged_kinds(self):
         with pytest.raises(ValueError, match="'weights' is only valid for kind 'ragged'"):
             _validate_output_kind("f", {"function": "min", "weights": "counts"})
         with pytest.raises(ValueError, match="'weights' is only valid for kind 'ragged'"):
-            _validate_output_kind("f", {"kind": "vector", "trailing_shape": 4, "weights": "counts"})
+            _validate_output_kind(
+                "f", {"function": "min", "kind": "vector", "trailing_shape": 4, "weights": "counts"}
+            )
 
     def test_attrs_weights_key_is_spec_owned_on_ragged(self):
         # The template stamps the §2.0 key from the field declaration; an
@@ -2512,7 +2522,9 @@ class TestTemporalShapeDeclaration:
         validate_config(_ragged_cfg(inner_shape=[2]))
 
     def test_unknown_shape_rejected(self):
-        with pytest.raises(ValueError, match="is not one of"):
+        with pytest.raises(
+            ValueError, match=r"temporal: Input should be 'per-cell' or 'per-centroid'"
+        ):
             validate_config(_ragged_cfg(inner_shape=[2], temporal="per-photon"))
 
     def test_coordinate_shape_points_at_the_axis_knob(self):
@@ -2985,7 +2997,9 @@ class TestLocationChannel:
 
     def test_location_must_be_string(self):
         cfg = _ragged_cfg(inner_shape=[2], location=29)
-        with pytest.raises(ValueError, match="must be a column name string"):
+        with pytest.raises(
+            ValueError, match=r"h_ph_tdigest\.location: Input should be a valid string"
+        ):
             validate_config(cfg)
 
     def test_location_unknown_column_rejected(self):
