@@ -519,7 +519,7 @@ def _composition_rules(name: str, meta: FieldSpec, variables: dict[str, FieldSpe
             f"zagg.stats.composition, not declared (issue #340)"
         )
     lanes = block.get("lanes")
-    if lanes is not None and list(lanes) != list(LANES):
+    if lanes is not None and (not isinstance(lanes, (list, tuple)) or list(lanes) != list(LANES)):
         raise ValueError(
             f"Variable '{name}': attrs.composition.lanes must be the {COMPOSITION_SPEC} lane "
             f"order {list(LANES)} — pack_composition packs lane i at bits 8i..8i+7 in that "

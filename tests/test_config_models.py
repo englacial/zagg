@@ -375,3 +375,15 @@ class TestAggregationGrammar:
         cfg.aggregation["variables"]["n"]["fill_value"] = None
         cfg.aggregation["coordinates"] = {"morton": {"dtype": "uint64", "fill_value": None}}
         validate_config(cfg)
+
+    def test_non_list_composition_lanes_is_a_value_error(self):
+        from zagg.config.models_aggregation import Aggregation
+
+        comp = {
+            "function": "zagg.stats.composition.pack_composition",
+            "dtype": "uint64",
+            "fill_value": 0,
+            "attrs": {"composition": {"lanes": 5}},
+        }
+        with pytest.raises(ValueError, match=r"attrs\.composition\.lanes must be the"):
+            Aggregation.model_validate({"variables": {"c": comp}})
