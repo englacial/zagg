@@ -1,0 +1,448 @@
+"""netCDF3 header parser (issue #682, phase 2).
+
+Hermetic: the fixture is written here from the netCDF classic format
+specification (no netCDF library in the test env), so the parser is checked
+against the spec, not against another implementation of it. ``_nc3_bytes``
+lays out ``header | non-record arrays | record block`` exactly as the spec's
+``vsize`` / ``begin`` / padding rules say; the on-demand header growth is
+exercised by shrinking the first ranged read below the header size.
+"""
+
+import struct
+
+import numpy as np
+import pytest
+
+from zagg.catalog import netcdf3
+from zagg.catalog.netcdf3 import STREAMING, Header, describe, parse_header
+
+# ---------------------------------------------------------------------------
+# Spec-driven fixture writer
+# ---------------------------------------------------------------------------
+
+NC_BYTE, NC_CHAR, NC_SHORT, NC_INT, NC_FLOAT, NC_DOUBLE = 1, 2, 3, 4, 5, 6
+_ITEMSIZE = {NC_BYTE: 1, NC_CHAR: 1, NC_SHORT: 2, NC_INT: 4, NC_FLOAT: 4, NC_DOUBLE: 8}
+_DTYPE = {
+    NC_BYTE: "|i1",
+    NC_CHAR: "|u1",
+    NC_SHORT: ">i2",
+    NC_INT: ">i4",
+    NC_FLOAT: ">f4",
+    NC_DOUBLE: ">f8",
+}
+
+
+def _pad4(n):
+    return (n + 3) & ~3
+
+
+def _padded(b):
+    return b + b"\0" * (_pad4(len(b)) - len(b))
+
+
+def _name(s):
+    b = s.encode()
+    return struct.pack(">I", len(b)) + _padded(b)
+
+
+def _att_list(attrs):
+    """``attrs``: name -> (nc_type, value); value is str for char, else a
+    scalar or list."""
+    if not attrs:
+        return b"\0" * 8
+    out = struct.pack(">II", 0x0C, len(attrs))
+    for name, (nc_type, value) in attrs.items():
+        if nc_type == NC_CHAR:
+            raw = value.encode()
+            n = len(raw)
+        else:
+            arr = np.atleast_1d(np.asarray(value, dtype=_DTYPE[nc_type]))
+            raw, n = arr.tobytes(), arr.size
+        out += _name(name) + struct.pack(">II", nc_type, n) + _padded(raw)
+    return out
+
+
+def _nc3_bytes(version, dims, variables, gattrs=None, *, numrecs=None, streaming=False):
+    """Serialize a netCDF3 file from the spec.
+
+    ``dims``: list of ``(name, length)``, length 0 = the record dimension.
+    ``variables``: list of dicts ``{name, dimids, nc_type, data, attrs?}``;
+    ``data`` is a numpy array of the full shape (record variables include
+    the record axis first). Returns ``(bytes, layout)`` where ``layout`` maps
+    variable name -> ``(begin, vsize)`` as written, for assertions.
+    """
+    rec_dim = next((i for i, (_, n) in enumerate(dims) if n == 0), None)
+
+    def is_rec(v):
+        return bool(v["dimids"]) and v["dimids"][0] == rec_dim
+
+    def slab(v):
+        fixed = [dims[d][1] for d in v["dimids"][1 if is_rec(v) else 0 :]]
+        return int(np.prod(fixed, dtype=np.int64)) * _ITEMSIZE[v["nc_type"]]
+
+    recs = [v for v in variables if is_rec(v)]
+    if numrecs is None:
+        numrecs = int(recs[0]["data"].shape[0]) if recs else 0
+    # vsize per the spec: padded to 4, except the lone-record-variable case.
+    vsize = {}
+    for v in variables:
+        vsize[v["name"]] = slab(v) if (is_rec(v) and len(recs) == 1) else _pad4(slab(v))
+    recsize = sum(vsize[v["name"]] for v in recs)
+
+    off_size = 4 if version == 1 else 8
+    # Header size is needed for ``begin``; it does not depend on begin values.
+    header_len = 4 + 4
+    header_len += 8 if not dims else 8 + sum(len(_name(n)) + 4 for n, _ in dims)
+    header_len += len(_att_list(gattrs or {}))
+    header_len += 8
+    for v in variables:
+        header_len += (
+            len(_name(v["name"]))
+            + 4
+            + 4 * len(v["dimids"])
+            + len(_att_list(v.get("attrs") or {}))
+            + 4
+            + 4
+            + off_size
+        )
+    begin = {}
+    pos = header_len
+    for v in variables:
+        if not is_rec(v):
+            begin[v["name"]] = pos
+            pos += vsize[v["name"]]
+    rec_begin = pos
+    for v in recs:
+        begin[v["name"]] = pos
+        pos += vsize[v["name"]]
+
+    hdr = b"CDF" + bytes([version])
+    hdr += struct.pack(">I", STREAMING if streaming else numrecs)
+    if dims:
+        hdr += struct.pack(">II", 0x0A, len(dims))
+        for n, length in dims:
+            hdr += _name(n) + struct.pack(">I", length)
+    else:
+        hdr += b"\0" * 8
+    hdr += _att_list(gattrs or {})
+    hdr += struct.pack(">II", 0x0B, len(variables)) if variables else b"\0" * 8
+    for v in variables:
+        hdr += _name(v["name"]) + struct.pack(">I", len(v["dimids"]))
+        hdr += b"".join(struct.pack(">I", d) for d in v["dimids"])
+        hdr += _att_list(v.get("attrs") or {})
+        hdr += struct.pack(">II", v["nc_type"], vsize[v["name"]])
+        hdr += struct.pack(">I" if version == 1 else ">q", begin[v["name"]])
+    assert len(hdr) == header_len
+
+    body = bytearray()
+    for v in variables:
+        if not is_rec(v):
+            assert len(body) + header_len == begin[v["name"]]
+            body += _padded(np.ascontiguousarray(v["data"], dtype=_DTYPE[v["nc_type"]]).tobytes())
+    assert len(body) + header_len == rec_begin
+    for r in range(numrecs):
+        for v in recs:
+            raw = np.ascontiguousarray(v["data"][r], dtype=_DTYPE[v["nc_type"]]).tobytes()
+            body += raw + b"\0" * (vsize[v["name"]] - len(raw))
+    assert len(body) == (rec_begin - header_len) + numrecs * recsize
+    layout = {v["name"]: (begin[v["name"]], vsize[v["name"]]) for v in variables}
+    layout["__recsize__"] = recsize
+    layout["__header__"] = header_len
+    return bytes(hdr) + bytes(body), layout
+
+
+# A GLOBAL-attribute, two non-record + two record variable fixture; the
+# record variables have slabs that need padding (short x 3 = 6 bytes -> 8),
+# and the char variable exercises the ``|u1`` mapping.
+_DIMS = [("time", 0), ("x", 3), ("y", 2), ("strlen", 5)]
+_TIME = np.array([[10.0], [20.0], [30.0], [40.0]], dtype=">f8").reshape(4)
+_TEMP = (np.arange(12, dtype=">i2") * 100 - 300).reshape(4, 3)
+_LAT = np.array([-1.5, 0.0, 1.5], dtype=">f4")
+_GRID = np.arange(6, dtype=">i4").reshape(3, 2)
+_LABEL = np.frombuffer(b"abcde", dtype="|u1")
+_VARS = [
+    {
+        "name": "lat",
+        "dimids": [1],
+        "nc_type": NC_FLOAT,
+        "data": _LAT,
+        "attrs": {"units": (NC_CHAR, "degrees_north"), "_FillValue": (NC_FLOAT, -999.0)},
+    },
+    {"name": "grid", "dimids": [1, 2], "nc_type": NC_INT, "data": _GRID},
+    {"name": "label", "dimids": [3], "nc_type": NC_CHAR, "data": _LABEL},
+    {
+        "name": "time",
+        "dimids": [0],
+        "nc_type": NC_DOUBLE,
+        "data": _TIME,
+        "attrs": {"units": (NC_CHAR, "seconds since 2000-01-01")},
+    },
+    {
+        "name": "temp",
+        "dimids": [0, 1],
+        "nc_type": NC_SHORT,
+        "data": _TEMP,
+        "attrs": {
+            "scale_factor": (NC_DOUBLE, 0.01),
+            "add_offset": (NC_DOUBLE, 273.15),
+            "valid_range": (NC_SHORT, [-400, 900]),
+        },
+    },
+]
+_GATTRS = {"title": (NC_CHAR, "netCDF3 fixture"), "Conventions": (NC_CHAR, "CF-1.6")}
+
+
+def fixture(version=1, **kw):
+    return _nc3_bytes(version, _DIMS, _VARS, _GATTRS, **kw)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestDescribe:
+    @pytest.mark.parametrize("version", [1, 2])
+    def test_dims_attrs_variables(self, version):
+        data, layout = fixture(version)
+        d = describe(data)
+        assert d["version"] == version
+        assert d["format"] == {1: "classic", 2: "64-bit offset"}[version]
+        assert d["numrecs"] == 4
+        assert d["record_dim"] == "time"
+        assert d["dims"] == {"time": 4, "x": 3, "y": 2, "strlen": 5}
+        assert d["attrs"] == {"title": "netCDF3 fixture", "Conventions": "CF-1.6"}
+        assert list(d["variables"]) == ["lat", "grid", "label", "time", "temp"]
+        lat = d["variables"]["lat"]
+        assert lat == {
+            "dtype": ">f4",
+            "nc_type": "float",
+            "dims": ["x"],
+            "shape": [3],
+            "attrs": {"units": "degrees_north", "_FillValue": -999.0},
+            "record": False,
+            "begin": layout["lat"][0],
+            "vsize": layout["lat"][1],
+        }
+        temp = d["variables"]["temp"]
+        assert temp["dtype"] == ">i2" and temp["record"] is True
+        assert temp["shape"] == [4, 3] and temp["dims"] == ["time", "x"]
+        assert temp["attrs"]["scale_factor"] == 0.01
+        assert temp["attrs"]["valid_range"] == [-400, 900]
+        assert d["variables"]["label"]["dtype"] == "|u1"
+        assert d["variables"]["grid"]["shape"] == [3, 2]
+        assert d["header_bytes"] == layout["__header__"]
+
+    def test_begin_offsets_match_the_layout(self):
+        data, layout = fixture(2)
+        d = describe(data)
+        for name, (begin, vsize) in ((k, v) for k, v in layout.items() if not k.startswith("__")):
+            assert d["variables"][name]["begin"] == begin
+            assert d["variables"][name]["vsize"] == vsize
+
+    def test_64bit_offset_reads_8_byte_begin(self):
+        # The only grammar difference between v1 and v2: a v2 header is 4
+        # bytes longer per variable, and parses to the same description.
+        d1, d2 = describe(fixture(1)[0]), describe(fixture(2)[0])
+        assert d2["header_bytes"] - d1["header_bytes"] == 4 * len(_VARS)
+        strip = {k: v for k, v in d1.items() if k not in ("version", "format", "header_bytes")}
+        for name in strip["variables"]:
+            strip["variables"][name].pop("begin")
+            d2["variables"][name].pop("begin")
+        assert strip == {k: v for k, v in d2.items() if k in strip}
+
+    def test_json_ready(self):
+        import json
+
+        json.dumps(describe(fixture()[0]))
+
+    def test_streaming_numrecs(self):
+        d = describe(fixture(streaming=True)[0])
+        assert d["numrecs"] is None
+        assert d["dims"]["time"] is None
+        assert d["variables"]["temp"]["shape"] == [None, 3]
+
+    def test_empty_lists(self):
+        data, _ = _nc3_bytes(1, [], [], {})
+        d = describe(data)
+        assert d["dims"] == {} and d["attrs"] == {} and d["variables"] == {}
+        assert d["record_dim"] is None and d["numrecs"] == 0
+
+
+class TestHeaderBytesOnly:
+    def test_reads_only_the_header_from_a_large_object(self):
+        # Header bytes only: with the default initial window the parse costs
+        # ONE ranged read of INITIAL_HEADER_BYTES, never the data arrays.
+        data, layout = fixture()
+        calls = []
+
+        def fetch(off, n):
+            calls.append((off, n))
+            return data[off : off + n]
+
+        hdr = netcdf3._parse(netcdf3._HeaderBytes(fetch))
+        assert hdr.header_bytes == layout["__header__"]
+        assert calls == [(0, netcdf3.INITIAL_HEADER_BYTES)]
+
+    def test_grows_on_demand(self):
+        data, layout = fixture()
+        calls = []
+
+        def fetch(off, n):
+            calls.append((off, n))
+            return data[off : off + n]
+
+        hdr = netcdf3._parse(netcdf3._HeaderBytes(fetch, initial=16))
+        assert hdr.header_bytes == layout["__header__"]
+        assert len(calls) > 1
+        # Contiguous, doubling windows: each read starts where the last ended.
+        assert all(a[0] + a[1] == b[0] for a, b in zip(calls, calls[1:]))
+        assert all(b[1] >= a[1] for a, b in zip(calls, calls[1:]))
+        # Every read starts inside the header: nothing is fetched because the
+        # data arrays were wanted, only because a header field ran past the window.
+        assert calls[0] == (0, 16)
+        assert all(off < layout["__header__"] for off, _ in calls)
+
+    def test_parse_header_initial_kwarg(self):
+        data, layout = fixture()
+        assert parse_header(data, initial=16).header_bytes == layout["__header__"]
+
+    def test_truncated_header_raises(self):
+        data, layout = fixture()
+        with pytest.raises(ValueError, match="truncated netCDF3 header"):
+            describe(data[: layout["__header__"] - 3])
+
+    def test_local_path_source(self, tmp_path):
+        data, _ = fixture()
+        p = tmp_path / "f.nc"
+        p.write_bytes(data)
+        assert describe(str(p)) == describe(data)
+        assert describe(p) == describe(data)
+
+    def test_driver_object_source(self):
+        # Anything with an h5coro-style read(pos, size) is a source.
+        data, _ = fixture()
+
+        class Drv:
+            def read(self, pos, size):
+                return data[pos : pos + size]
+
+        assert describe(Drv()) == describe(data)
+
+    def test_explicit_driver_class(self):
+        data, _ = fixture()
+        seen = {}
+
+        class Drv:
+            def __init__(self, resource, credentials):
+                seen.update(resource=resource, credentials=credentials)
+
+            def read(self, pos, size):
+                return data[pos : pos + size]
+
+        assert describe("https://x/y.nc", driver=Drv, credentials="tok") == describe(data)
+        assert seen == {"resource": "https://x/y.nc", "credentials": "tok"}
+
+
+class TestRefusals:
+    def test_not_netcdf(self):
+        with pytest.raises(ValueError, match="not a netCDF3 file"):
+            describe(b"\x89HDF\r\n\x1a\n" + b"\0" * 64)
+
+    def test_cdf5_refused(self):
+        with pytest.raises(ValueError, match="CDF-5"):
+            describe(b"CDF\x05" + b"\0" * 64)
+
+    def test_unknown_version(self):
+        with pytest.raises(ValueError, match="unknown version byte 3"):
+            describe(b"CDF\x03" + b"\0" * 64)
+
+    def test_bad_tag(self):
+        data, _ = fixture()
+        bad = bytearray(data)
+        bad[8:12] = struct.pack(">I", 0x0C)  # dim_list tagged as NC_ATTRIBUTE
+        with pytest.raises(ValueError, match="expected dim_list tag"):
+            describe(bytes(bad))
+
+    def test_absent_with_count(self):
+        bad = b"CDF\x01" + struct.pack(">I", 0) + struct.pack(">II", 0, 2) + b"\0" * 32
+        with pytest.raises(ValueError, match="ABSENT dim_list with count 2"):
+            describe(bad)
+
+    def test_dimid_out_of_range(self):
+        data, _ = _nc3_bytes(
+            1, [("x", 2)], [{"name": "v", "dimids": [0], "nc_type": NC_INT, "data": np.zeros(2)}]
+        )
+        bad = bytearray(data)
+        i = data.index(_name("v")) + len(_name("v")) + 4
+        bad[i : i + 4] = struct.pack(">I", 7)
+        with pytest.raises(ValueError, match="dimid 7 out of range"):
+            describe(bytes(bad))
+
+    def test_unsupported_nc_type(self):
+        data, _ = _nc3_bytes(
+            1, [("x", 2)], [{"name": "v", "dimids": [0], "nc_type": NC_INT, "data": np.zeros(2)}]
+        )
+        bad = bytearray(data)
+        i = data.index(_name("v")) + len(_name("v")) + 4 + 4 + 8
+        bad[i : i + 4] = struct.pack(">I", 10)  # NC_INT64 (CDF-5 only)
+        with pytest.raises(ValueError, match="unsupported nc_type 10"):
+            describe(bytes(bad))
+
+    def test_two_record_dims(self):
+        data, _ = _nc3_bytes(1, [("a", 0), ("b", 0)], [])
+        with pytest.raises(ValueError, match="more than one record"):
+            describe(data)
+
+
+class TestHeaderLayout:
+    """The size arithmetic the manifest emitter builds on (phase 3)."""
+
+    def test_recsize_pads_each_slab_to_4(self):
+        data, layout = fixture()
+        hdr = parse_header(data)
+        # time: 8 bytes; temp: 3 x int16 = 6 -> padded to 8.
+        assert hdr.recsize == 16 == layout["__recsize__"]
+        assert [hdr.slab_bytes(v) for v in hdr.record_variables] == [8, 6]
+
+    def test_single_record_variable_is_unpadded(self):
+        only = [v for v in _VARS if v["name"] == "temp"]
+        data, layout = _nc3_bytes(1, _DIMS, only)
+        hdr = parse_header(data)
+        assert hdr.recsize == 6 == layout["__recsize__"]
+        assert hdr.variables[0].vsize == 6
+
+    def test_non_record_slab_is_the_whole_array(self):
+        hdr = parse_header(fixture()[0])
+        by = {v.name: v for v in hdr.variables}
+        assert hdr.slab_bytes(by["grid"]) == 6 * 4
+        assert hdr.slab_bytes(by["label"]) == 5
+        assert by["label"].vsize == 8  # padded on disk
+        assert hdr.shape(by["grid"]) == [3, 2] and not hdr.is_record(by["grid"])
+
+    def test_header_is_frozen_dataclass(self):
+        hdr = parse_header(fixture()[0])
+        assert isinstance(hdr, Header)
+        with pytest.raises(AttributeError):
+            hdr.numrecs = 1  # type: ignore[misc]
+
+
+class TestOracle:
+    """Cross-check the hand-written fixture against a netCDF library when one
+    is installed (never in CI's env: scipy is not a zagg dependency)."""
+
+    def test_scipy_reads_the_fixture(self, tmp_path):
+        nc = pytest.importorskip("scipy.io")
+        for version in (1, 2):
+            data, _ = fixture(version)
+            p = tmp_path / f"v{version}.nc"
+            p.write_bytes(data)
+            with nc.netcdf_file(str(p), "r", mmap=False) as f:
+                assert f.title == b"netCDF3 fixture"
+                assert dict(f.dimensions) == {"time": None, "x": 3, "y": 2, "strlen": 5}
+                np.testing.assert_array_equal(f.variables["temp"][:], _TEMP)
+                np.testing.assert_array_equal(f.variables["time"][:], _TIME)
+                np.testing.assert_array_equal(f.variables["grid"][:], _GRID)
+                np.testing.assert_array_equal(f.variables["lat"][:], _LAT)
+                assert f.variables["label"][:].tobytes() == b"abcde"
+                assert f.variables["temp"].scale_factor == 0.01
