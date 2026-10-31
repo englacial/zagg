@@ -584,7 +584,11 @@ class TemporalFieldSpec(_Block):
     mask: str | None = Field(
         default=None, description="Registered spatial mask name (default ``ais``)."
     )
-    negate: Bool | None = Field(default=None, description="Invert the mask.")
+    negate: Bool | None = Field(
+        default=None,
+        description="Negate the field values (after any transform, before the spatial "
+        "reduction), e.g. for southward-positive fluxes.",
+    )
     anomaly: Bool | None = Field(
         default=None,
         description="Sugar for ``transform: monthly_anomaly`` (subtract the climatology).",
@@ -595,10 +599,13 @@ class TemporalFieldSpec(_Block):
     )
     trigger: str | None = Field(default=None, description="Registered event-trigger predicate.")
     trigger_mask: str | None = Field(
-        default=None, description="Mask the trigger is evaluated under."
+        default=None,
+        description="Static-data mask the trigger tests against (default ``ais_mask``).",
     )
     params: dict[str, Any] | None = Field(
-        default=None, description="Free-form parameters handed to the capabilities."
+        default=None,
+        description="Free-form mapping passed to the mask provider, field transform and event "
+        "trigger (not to spatial funcs or reducers).",
     )
 
 
