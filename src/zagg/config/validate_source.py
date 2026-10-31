@@ -504,8 +504,8 @@ def _validate_vlen_source(data_source: dict) -> None:
       directly at ``base_level`` (the ragged-gather link);
     - ``synthesize:`` variables require the vlen route and their ``level``
       must equal ``coordinates.level`` (the within-record index used by the
-      synthesis comes from that level's link); an ``offsets`` dataset needs
-      the fixed-width link (issue #678);
+      synthesis comes from that level's link); ``offsets`` (either form) and
+      ``index`` need that link to be the fixed-width form (issue #678);
     - ``axes`` variables (issue #678) require ``coordinates.level`` to be the
       fixed-width (``link.width``) level; base-level ``{path, axes}``
       coordinates (the swath form) need a width link and exclude
@@ -571,15 +571,11 @@ def _validate_vlen_source(data_source: dict) -> None:
                 f"coordinates.level {coord_level!r} (the within-record index comes "
                 "from that level's link)"
             )
-        if (
-            entry["synthesize"] == "offsets"
-            and isinstance(entry["offsets"], str)
-            and width_level != coord_level
-        ):
+        if entry["synthesize"] in ("offsets", "index") and width_level != coord_level:
             raise ValueError(
-                f"{where}: an 'offsets' dataset has one entry per sample of a fixed "
-                f"width, so coordinates.level {coord_level!r} must link with 'width' "
-                "(a constant numeric step works on any link)"
+                f"{where}: synthesize {entry['synthesize']!r} is a fixed-width form, so "
+                f"coordinates.level {coord_level!r} must link with 'width' (the ragged "
+                "route synthesizes linspace only)"
             )
     assets = ds.get("assets")
     if assets is not None:

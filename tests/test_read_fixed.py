@@ -215,27 +215,25 @@ class TestSynthesizeKinds:
         del ds["variables"]["range"]["scale"]
         validate_config(_cfg(ds))
 
-    def test_offsets_constant_step_works_on_a_ragged_link(self):
-        # The step form needs no width: it is the old ``arange`` proposal.
+    @pytest.mark.parametrize(
+        "name,step",
+        [("range", None), ("range", -0.15), ("sample_index", None)],
+        ids=["offsets-dataset", "offsets-step", "index"],
+    )
+    def test_fixed_width_kinds_reject_a_ragged_link(self, name, step):
+        # The ragged (vlen) route synthesizes linspace only, so ``offsets``
+        # in either form and ``index`` need the width link.
         ds = _fixed_ds()
         ds["levels"]["shots"]["link"] = {
             "to": "samples",
             "index_beg": "/{group}/beg",
             "count": "/{group}/cnt",
         }
-        ds["variables"]["rx_wf"] = "/{group}/wf"
-        ds["variables"]["range"]["offsets"] = -0.15
-        validate_config(_cfg(ds))
-
-    def test_offsets_dataset_needs_the_width_link(self):
-        ds = _fixed_ds()
-        ds["levels"]["shots"]["link"] = {
-            "to": "samples",
-            "index_beg": "/{group}/beg",
-            "count": "/{group}/cnt",
-        }
-        ds["variables"]["rx_wf"] = "/{group}/wf"
-        _rejects(ds, "an 'offsets' dataset has one entry per sample of a fixed width")
+        ds["variables"] = {"rx_wf": "/{group}/wf", name: ds["variables"][name]}
+        if step is not None:
+            ds["variables"]["range"]["offsets"] = step
+        kind = ds["variables"][name]["synthesize"]
+        _rejects(ds, f"synthesize '{kind}' is a fixed-width form")
 
     @pytest.mark.parametrize("offsets", ["", None, True, [1, 2]])
     def test_offsets_must_be_a_path_or_a_number(self, offsets):
