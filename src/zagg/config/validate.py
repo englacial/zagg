@@ -3,7 +3,6 @@
 import inspect
 import logging
 
-from zagg.config.accessors import get_agg_fields  # noqa: F401 (re-exported for callers)
 from zagg.config.core import (
     WORKER_MEMORIES,
     PipelineConfig,
