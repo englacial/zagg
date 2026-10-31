@@ -400,8 +400,20 @@ class CoordinateSpec(_Block):
 
     _NULLABLE = frozenset({"fill_value"})
 
-    dtype: NonEmptyStr = Field(description="Stored numpy dtype, e.g. ``uint64`` for ``morton``.")
-    fill_value: Any = Field(default=None, description="Fill for unobserved cells.")
+    dtype: NonEmptyStr | None = Field(
+        default=None,
+        description="Stored numpy dtype (default ``float32``), e.g. ``uint64`` for ``morton``.",
+    )
+    fill_value: Any = Field(
+        default=None,
+        description='Fill for unobserved cells (default ``"NaN"``; integer dtypes need an '
+        "explicit integer fill, e.g. ``0`` for ``morton``).",
+    )
+
+    @field_validator("dtype")
+    @classmethod
+    def _dtype(cls, v: str | None) -> str | None:
+        return _check_dtype(v)
 
 
 class Streaming(_Block):

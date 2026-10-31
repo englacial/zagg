@@ -387,3 +387,13 @@ class TestAggregationGrammar:
         }
         with pytest.raises(ValueError, match=r"attrs\.composition\.lanes must be the"):
             Aggregation.model_validate({"variables": {"c": comp}})
+
+    def test_coordinate_dtype_is_optional_and_checked(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.aggregation["coordinates"] = {"x": {}}
+        validate_config(cfg)
+        cfg.aggregation["coordinates"] = {"x": {"dtype": "bogus"}}
+        with pytest.raises(
+            ValueError, match=r"coordinates\.x\.dtype: dtype 'bogus' is not a valid"
+        ):
+            validate_config(cfg)
