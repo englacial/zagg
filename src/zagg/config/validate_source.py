@@ -201,6 +201,74 @@ def _validate_collection_options(config: PipelineConfig) -> None:
             )
 
 
+#: ``synthesize:`` kinds and the keys each form takes beside ``synthesize`` and
+#: ``level`` (issues #425, #678). ``linspace`` interpolates per record between
+#: two per-record endpoints; ``offsets`` is ``start[record] + offsets[sample] *
+#: scale`` with ``offsets`` a 1-D path of length ``width`` or a constant step;
+#: ``index`` is the within-record sample index itself, so the expression filter
+#: can drop a fixed-width row's padding.
+_SYNTHESIZE_KEYS = {
+    "linspace": {"start", "stop"},
+    "offsets": {"start", "offsets", "scale"},
+    "index": set(),
+}
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _validate_axes(where: str, axes) -> None:
+    """Validate an ``axes`` declaration (issue #678).
+
+    One entry per dataset dimension: ``record`` exactly once (the record
+    level's axis), ``sample`` exactly once (the fixed-width axis, length
+    ``link.width``), and otherwise a non-negative integer pick along that
+    dimension (a band). Rank against the dataset is a read-time check.
+    """
+    if not isinstance(axes, list) or not axes:
+        raise ValueError(f"{where}.axes must be a non-empty list (got {axes!r})")
+    for entry in axes:
+        if entry in ("record", "sample"):
+            continue
+        if not isinstance(entry, int) or isinstance(entry, bool) or entry < 0:
+            raise ValueError(
+                f"{where}.axes entries must be 'record', 'sample' or an integer >= 0 "
+                f"(got {entry!r})"
+            )
+    for role in ("record", "sample"):
+        if axes.count(role) != 1:
+            raise ValueError(f"{where}.axes must name {role!r} exactly once (got {axes!r})")
+
+
+def _validate_synthesize_entry(where: str, entry: dict) -> None:
+    """Shape-check one ``synthesize:`` variable entry; cross-checks live in
+    :func:`_validate_vlen_source`."""
+    kind = entry["synthesize"]
+    if kind not in _SYNTHESIZE_KEYS:
+        raise ValueError(
+            f"{where}.synthesize must be one of {sorted(_SYNTHESIZE_KEYS)} (got {kind!r})"
+        )
+    allowed = {"synthesize", "level"} | _SYNTHESIZE_KEYS[kind]
+    extra = set(entry) - allowed
+    if extra:
+        raise ValueError(
+            f"{where}: unknown keys {sorted(extra)} (the {kind!r} form takes {sorted(allowed)})"
+        )
+    required = {"linspace": ("level", "start", "stop"), "offsets": ("level", "start")}
+    for key in required.get(kind, ("level",)):
+        if not isinstance(entry.get(key), str) or not entry[key]:
+            raise ValueError(f"{where}.{key} must be a non-empty string")
+    if kind == "offsets":
+        offsets = entry.get("offsets")
+        if not ((isinstance(offsets, str) and offsets) or _is_number(offsets)):
+            raise ValueError(
+                f"{where}.offsets must be a 1-D dataset path or a numeric step (got {offsets!r})"
+            )
+        if "scale" in entry and not _is_number(entry["scale"]):
+            raise ValueError(f"{where}.scale must be a number (got {entry['scale']!r})")
+
+
 def _validate_ds_variables(data_source: dict) -> None:
     """Validate ``data_source.variables`` entries (issue #321).
 
@@ -208,7 +276,10 @@ def _validate_ds_variables(data_source: dict) -> None:
     mapping ``{path: <str>, column: <int >= 0>}`` selecting one column of a 2-D
     dataset — the variable analogue of the ``column`` key on structured
     filters, so several scalar columns can be declared against one shared
-    dataset path (deduped to a single read).
+    dataset path (deduped to a single read). The mapping may instead carry
+    ``axes`` (issue #678): an explicit per-dimension declaration flattening a
+    fixed-width N-D dataset to the base rate (see :func:`_validate_axes`);
+    ``axes`` and ``column`` are mutually exclusive.
     """
     variables = (data_source or {}).get("variables", {})
     if not isinstance(variables, dict):
@@ -216,46 +287,34 @@ def _validate_ds_variables(data_source: dict) -> None:
     for name, entry in variables.items():
         if isinstance(entry, str):
             continue
+        where = f"data_source.variables['{name}']"
         if not isinstance(entry, dict):
             raise ValueError(
-                f"data_source.variables['{name}'] must be a path string or a "
-                f"{{path, column}} mapping (got {type(entry).__name__})"
+                f"{where} must be a path string or a {{path, column}} / {{path, axes}} "
+                f"mapping (got {type(entry).__name__})"
             )
         # Synthesized-column form (issue #425, vlen grammar): the column is
-        # computed per record — ``linspace(start, stop, count)`` over each
-        # record's samples — never read. Cross-checks against ``levels`` and
-        # ``coordinates.level`` live in ``_validate_vlen_source``.
+        # computed per record — never read. Cross-checks against ``levels``
+        # and ``coordinates.level`` live in ``_validate_vlen_source``.
         if "synthesize" in entry:
-            if entry["synthesize"] != "linspace":
-                raise ValueError(
-                    f"data_source.variables['{name}'].synthesize must be 'linspace' "
-                    f"(got {entry['synthesize']!r})"
-                )
-            extra = set(entry) - {"synthesize", "level", "start", "stop"}
-            if extra:
-                raise ValueError(
-                    f"data_source.variables['{name}']: unknown keys {sorted(extra)} "
-                    "(the synthesize form takes 'synthesize', 'level', 'start', 'stop')"
-                )
-            for key in ("level", "start", "stop"):
-                if not isinstance(entry.get(key), str) or not entry[key]:
-                    raise ValueError(
-                        f"data_source.variables['{name}'].{key} must be a non-empty string"
-                    )
+            _validate_synthesize_entry(where, entry)
             continue
-        extra = set(entry) - {"path", "column"}
+        extra = set(entry) - {"path", "column", "axes"}
         if extra:
             raise ValueError(
-                f"data_source.variables['{name}']: unknown keys {sorted(extra)} "
-                "(the mapping form takes exactly 'path' and 'column')"
+                f"{where}: unknown keys {sorted(extra)} "
+                "(the mapping form takes 'path' plus exactly one of 'column' or 'axes')"
             )
         if not isinstance(entry.get("path"), str):
-            raise ValueError(f"data_source.variables['{name}'].path must be a string")
+            raise ValueError(f"{where}.path must be a string")
+        if ("column" in entry) == ("axes" in entry):
+            raise ValueError(f"{where}: the mapping form takes exactly one of 'column' or 'axes'")
+        if "axes" in entry:
+            _validate_axes(where, entry["axes"])
+            continue
         column = entry.get("column")
         if not isinstance(column, int) or isinstance(column, bool) or column < 0:
-            raise ValueError(
-                f"data_source.variables['{name}'].column must be an integer >= 0 (got {column!r})"
-            )
+            raise ValueError(f"{where}.column must be an integer >= 0 (got {column!r})")
 
 
 def _validate_filters(data_source: dict) -> None:
@@ -338,6 +397,101 @@ def _validate_filters(data_source: dict) -> None:
                 raise ValueError(f"filter[{i}]: 'value' must be numeric (got {f['value']!r})")
 
 
+def _width_level(data_source: dict) -> str | None:
+    """The level whose ``link`` is the fixed-width form (issue #678), or ``None``.
+
+    At most one level may declare ``link.width`` against the base level: it is
+    the record level every ``axes`` declaration flattens along, and the read
+    route synthesizes exactly one link from it.
+    """
+    levels = data_source.get("levels")
+    base_level = data_source.get("base_level")
+    if not isinstance(levels, dict):
+        return None
+    found = [
+        name
+        for name, lvl in levels.items()
+        if isinstance(lvl, dict)
+        and isinstance(lvl.get("link"), dict)
+        and "width" in lvl["link"]
+        and lvl["link"].get("to") == base_level
+    ]
+    if len(found) > 1:
+        raise ValueError(
+            f"levels {found} all declare a 'width' link to base level {base_level!r}; "
+            "only one fixed-width record level is allowed"
+        )
+    return found[0] if found else None
+
+
+def _validate_base_coordinates(data_source: dict, coord_level, width_level) -> None:
+    """``coordinates.latitude``/``longitude`` as ``{path, axes}`` mappings (issue #678).
+
+    The swath form: the base level's coordinates are N-D datasets of the same
+    shape as the science arrays, flattened by the same ``axes`` rule. Both
+    coordinates take the same form, the mapping form needs a width link, and
+    it excludes ``coordinates.level`` (coordinates either live at the base
+    level or expand from a record level — never both).
+    """
+    coords = data_source.get("coordinates")
+    if not isinstance(coords, dict):
+        return
+    mapped = []
+    for key in ("latitude", "longitude"):
+        entry = coords.get(key)
+        if not isinstance(entry, dict):
+            continue
+        where = f"data_source.coordinates.{key}"
+        extra = set(entry) - {"path", "axes"}
+        if extra or not isinstance(entry.get("path"), str) or "axes" not in entry:
+            raise ValueError(f"{where}: the mapping form takes exactly 'path' and 'axes'")
+        _validate_axes(where, entry["axes"])
+        mapped.append(key)
+    if not mapped:
+        return
+    if len(mapped) != 2:
+        raise ValueError(
+            "data_source.coordinates: latitude and longitude must both be plain paths "
+            "or both {path, axes} mappings"
+        )
+    if coord_level is not None:
+        raise ValueError(
+            "data_source.coordinates: {path, axes} coordinates are base-level and "
+            "exclude coordinates.level (record-level expansion)"
+        )
+    if width_level is None:
+        raise ValueError(
+            "data_source.coordinates: {path, axes} coordinates require a level whose "
+            "link declares 'width' to the base level"
+        )
+
+
+def _validate_join_keys(where: str, join: dict) -> None:
+    """``join.left``/``right``: a key path each, or equal-length lists (issue #678)."""
+    unknown = set(join) - {"left", "right"}
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown keys {sorted(unknown)} "
+            "(takes 'left' and 'right' record-key dataset paths)"
+        )
+    sides = {}
+    for side in ("left", "right"):
+        value = join.get(side)
+        if isinstance(value, list):
+            if not value or not all(isinstance(v, str) and v for v in value):
+                raise ValueError(f"{where}.{side} must be a non-empty list of dataset paths")
+        elif not isinstance(value, str) or not value:
+            raise ValueError(f"{where}.{side} must be a non-empty string")
+        sides[side] = value
+    if isinstance(sides["left"], list) != isinstance(sides["right"], list):
+        raise ValueError(f"{where}: left and right must both be strings or both be lists")
+    if isinstance(sides["left"], list) and len(sides["left"]) != len(sides["right"]):
+        raise ValueError(
+            f"{where}: composite keys need equal-length lists "
+            f"(left has {len(sides['left'])}, right has {len(sides['right'])})"
+        )
+
+
 def _validate_vlen_source(data_source: dict) -> None:
     """Cross-validate the vlen grammar surface (issue #425).
 
@@ -348,10 +502,16 @@ def _validate_vlen_source(data_source: dict) -> None:
       directly at ``base_level`` (the ragged-gather link);
     - ``synthesize:`` variables require the vlen route and their ``level``
       must equal ``coordinates.level`` (the within-record index used by the
-      linspace comes from that level's link);
-    - ``data_source.assets`` entries carry a ``join`` block with string
-      ``left``/``right`` key paths; every filter's ``asset`` names a declared
-      entry, and asset filters require the vlen route;
+      synthesis comes from that level's link); an ``offsets`` dataset needs
+      the fixed-width link (issue #678);
+    - ``axes`` variables (issue #678) require ``coordinates.level`` to be the
+      fixed-width (``link.width``) level; base-level ``{path, axes}``
+      coordinates (the swath form) need a width link and exclude
+      ``coordinates.level``;
+    - ``data_source.assets`` entries carry a ``join`` block with
+      ``left``/``right`` key paths (a string each, or equal-length lists for
+      a composite key); every filter's ``asset`` names a declared entry, and
+      asset filters require the vlen route;
     - asset-sourced level variables (issue #464) require the vlen route, live
       on ``coordinates.level`` only (the record-key join aligns that level's
       records), and name a declared asset.
@@ -375,19 +535,43 @@ def _validate_vlen_source(data_source: dict) -> None:
                 f"data_source.coordinates.level {coord_level!r} must link directly to "
                 f"base level {base_level!r}"
             )
+    width_level = _width_level(ds)
+    _validate_base_coordinates(ds, coord_level, width_level)
     for name, entry in (ds.get("variables") or {}).items():
-        if not isinstance(entry, dict) or "synthesize" not in entry:
+        if not isinstance(entry, dict):
+            continue
+        where = f"data_source.variables['{name}']"
+        if "axes" in entry:
+            # Fixed-width flatten (issue #678): the record axis is the
+            # coordinates level's, so ``axes`` needs that level's link to be
+            # the width form — a ragged link has no constant sample axis.
+            if coord_level is None or width_level != coord_level:
+                raise ValueError(
+                    f"{where}: axes requires coordinates.level to name a level whose "
+                    "link declares 'width' (the fixed-width record link)"
+                )
+            continue
+        if "synthesize" not in entry:
             continue
         if coord_level is None:
             raise ValueError(
-                f"data_source.variables['{name}']: synthesize requires the vlen route "
-                "(set data_source.coordinates.level)"
+                f"{where}: synthesize requires the vlen route (set data_source.coordinates.level)"
             )
         if entry["level"] != coord_level:
             raise ValueError(
-                f"data_source.variables['{name}'].level {entry['level']!r} must equal "
+                f"{where}.level {entry['level']!r} must equal "
                 f"coordinates.level {coord_level!r} (the within-record index comes "
                 "from that level's link)"
+            )
+        if (
+            entry["synthesize"] == "offsets"
+            and isinstance(entry["offsets"], str)
+            and width_level != coord_level
+        ):
+            raise ValueError(
+                f"{where}: an 'offsets' dataset has one entry per sample of a fixed "
+                f"width, so coordinates.level {coord_level!r} must link with 'width' "
+                "(a constant numeric step works on any link)"
             )
     assets = ds.get("assets")
     if assets is not None:
@@ -396,18 +580,7 @@ def _validate_vlen_source(data_source: dict) -> None:
         for name, cfg in assets.items():
             if not isinstance(cfg, dict) or not isinstance(cfg.get("join"), dict):
                 raise ValueError(f"data_source.assets['{name}'] requires a 'join' mapping")
-            join = cfg["join"]
-            unknown = set(join) - {"left", "right"}
-            if unknown:
-                raise ValueError(
-                    f"data_source.assets['{name}'].join: unknown keys {sorted(unknown)} "
-                    "(takes 'left' and 'right' record-key dataset paths)"
-                )
-            for side in ("left", "right"):
-                if not isinstance(join.get(side), str) or not join[side]:
-                    raise ValueError(
-                        f"data_source.assets['{name}'].join.{side} must be a non-empty string"
-                    )
+            _validate_join_keys(f"data_source.assets['{name}'].join", cfg["join"])
     for i, f in enumerate(ds.get("filters") or []):
         asset = f.get("asset") if isinstance(f, dict) else None
         if asset is None:
@@ -562,15 +735,42 @@ def _validate_overviews(data_source: dict) -> None:
             continue
         if not isinstance(link, dict):
             raise ValueError(f"levels.{name}.link must be a mapping")
-        for field_name in ("to", "index_beg", "count"):
-            if field_name not in link:
-                raise ValueError(f"levels.{name}.link: '{field_name}' is required")
-        unknown = set(link) - {"to", "index_beg", "count", "index_base", "reference_index"}
+        if "to" not in link:
+            raise ValueError(f"levels.{name}.link: 'to' is required")
+        unknown = set(link) - {
+            "to",
+            "index_beg",
+            "count",
+            "index_base",
+            "reference_index",
+            "width",
+        }
         if unknown:
             raise ValueError(
                 f"levels.{name}.link: unknown fields {sorted(unknown)} "
-                f"(allowed: to, index_beg, count, index_base, reference_index)"
+                f"(allowed: to, index_beg, count, index_base, reference_index, width)"
             )
+        if "width" in link:
+            # Fixed-width link (issue #678): every record owns exactly ``width``
+            # consecutive base rows, so the reader synthesizes ``index_beg =
+            # i * width``, ``count = width`` and no link datasets exist to name.
+            clash = sorted(set(link) & {"index_beg", "count", "index_base", "reference_index"})
+            if clash:
+                raise ValueError(
+                    f"levels.{name}.link: 'width' is mutually exclusive with {clash} "
+                    "(a fixed-width link synthesizes its index_beg/count)"
+                )
+            width = link["width"]
+            if width != "auto" and (
+                not isinstance(width, int) or isinstance(width, bool) or width < 1
+            ):
+                raise ValueError(
+                    f"levels.{name}.link.width must be an integer >= 1 or 'auto' (got {width!r})"
+                )
+        else:
+            for field_name in ("index_beg", "count"):
+                if field_name not in link:
+                    raise ValueError(f"levels.{name}.link: '{field_name}' is required")
         if link.get("to") == name:
             raise ValueError(f"level '{name}': link.to cannot reference the level itself")
         if link["to"] not in level_keys:

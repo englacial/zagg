@@ -1094,7 +1094,7 @@ class TestVlenConfigValidation:
     def test_synthesize_unknown_kind_rejected(self):
         ds = _vlen_ds()
         ds["variables"]["elevation"]["synthesize"] = "logspace"
-        with pytest.raises(ValueError, match="must be 'linspace'"):
+        with pytest.raises(ValueError, match="must be one of"):
             validate_config(_cfg(ds))
 
     def test_asset_filter_requires_declared_asset(self):
