@@ -375,3 +375,8 @@ class TestBaseLevelCoordinateAxes:
             "count": "/c",
         }
         _rejects(ds, "require a level whose link declares 'width'")
+
+    def test_axes_variables_wait_for_the_swath_read_path(self):
+        ds = _swath_ds()
+        ds["variables"]["rx_wf"] = {"path": "/{group}/Radiance", "axes": ["record", "sample"]}
+        _rejects(ds, "axes variables on the swath form .* arrive with the swath read path")

@@ -427,11 +427,13 @@ def _width_level(data_source: dict) -> str | None:
 def _validate_base_coordinates(data_source: dict, coord_level, width_level) -> None:
     """``coordinates.latitude``/``longitude`` as ``{path, axes}`` mappings (issue #678).
 
-    The swath form: the base level's coordinates are N-D datasets of the same
-    shape as the science arrays, flattened by the same ``axes`` rule. Both
-    coordinates take the same form, the mapping form needs a width link, and
-    it excludes ``coordinates.level`` (coordinates either live at the base
-    level or expand from a record level — never both).
+    The swath form: the base level's coordinates are N-D datasets flattened by
+    the ``axes`` rule. Both coordinates take the same form, the mapping form
+    needs a width link, and it excludes ``coordinates.level`` (coordinates
+    either live at the base level or expand from a record level — never both).
+    Science variables on this form stay plain reads for now: an ``axes``
+    variable here is rejected until the swath read path (the issue #678
+    follow-up) lands.
     """
     coords = data_source.get("coordinates")
     if not isinstance(coords, dict):
@@ -545,6 +547,12 @@ def _validate_vlen_source(data_source: dict) -> None:
             # Fixed-width flatten (issue #678): the record axis is the
             # coordinates level's, so ``axes`` needs that level's link to be
             # the width form — a ragged link has no constant sample axis.
+            if isinstance(coords, dict) and isinstance(coords.get("latitude"), dict):
+                raise ValueError(
+                    f"{where}: axes variables on the swath form ({{path, axes}} base-level "
+                    "coordinates) arrive with the swath read path, the issue #678 "
+                    "follow-up; declare a plain path for now"
+                )
             if coord_level is None or width_level != coord_level:
                 raise ValueError(
                     f"{where}: axes requires coordinates.level to name a level whose "
