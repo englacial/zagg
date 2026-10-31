@@ -942,6 +942,15 @@ class TestFilters:
         with pytest.raises(ValueError, match="must be an integer"):
             validate_config(cfg)
 
+    def test_negative_column_rejected(self):
+        # A negative numpy index would silently select the last flag column.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "column": -1, "op": "eq", "value": 0}])
+        with pytest.raises(
+            ValueError,
+            match=r"filters\[0\]\.column: 'column' must be an integer index >= 0 \(got -1\)",
+        ):
+            validate_config(cfg)
+
     def test_set_op_requires_values_list(self):
         cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "in", "value": 3}])
         with pytest.raises(ValueError, match="requires a 'values' list"):

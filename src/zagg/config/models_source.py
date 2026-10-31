@@ -200,6 +200,8 @@ class StructuredFilter(StrictModel):
             return v
         if isinstance(v, bool) or not isinstance(v, int):
             raise ValueError(f"'column' must be an integer index (got {v!r})")
+        if v < 0:
+            raise ValueError(f"'column' must be an integer index >= 0 (got {v!r})")
         return v
 
     @model_validator(mode="after")
