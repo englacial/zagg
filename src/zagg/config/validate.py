@@ -48,7 +48,9 @@ def validate_config(config: PipelineConfig) -> None:
     # Runs before the kind branch because the root union picks the grammar the
     # way this function branches (``pipeline.type``, then ``reader: raster``).
     # The checks below are the genuinely cross-block ones the models cannot
-    # express.
+    # express. The pipeline kind is resolved first so a mistyped
+    # ``pipeline.type`` is named as such, not misread as another kind's grammar.
+    ptype = get_pipeline_type(config)
     validate_model(config)
 
     # The optional top-level worker block (issue #235) selects a
@@ -68,7 +70,6 @@ def validate_config(config: PipelineConfig) -> None:
     # pipeline kind that has none is a typo worth catching at submission.
     _validate_time_source(config)
 
-    ptype = get_pipeline_type(config)
     if ptype != "spatial":
         _validate_temporal_config(config)
         return

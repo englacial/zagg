@@ -142,6 +142,17 @@ class TestPipelineType:
         with pytest.raises(ValueError, match="pipeline.type must be one of"):
             get_pipeline_type(cfg)
 
+    @pytest.mark.parametrize("pipeline", [{"type": "temporl"}, "temporal"])
+    def test_validate_names_a_bad_pipeline_type(self, pipeline):
+        # The kind is resolved before the grammar pass, so a typo on a temporal
+        # template is named as such rather than read as spatial extra keys.
+        cfg = default_config("merra2_storm")
+        cfg.pipeline = pipeline
+        with pytest.raises(
+            ValueError, match=r"^pipeline(\.type must be one of| must be a mapping)"
+        ):
+            validate_config(cfg)
+
     def test_validate_accepts_well_formed_temporal(self):
         # Phase 5: a temporal config with the four required per-variable spec
         # keys validates (the spatial grid cross-checks are skipped entirely).
