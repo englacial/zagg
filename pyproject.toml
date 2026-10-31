@@ -114,7 +114,7 @@ dependencies = [
     # The template grammar (issue #677): pydantic v2 models are the config
     # schema. Already in the lock closure through pydantic-zarr, so a direct
     # pin adds nothing to the Lambda function zip (espg approved 2026-10-31).
-    "pydantic>=2.0",
+    "pydantic>=2.5",
     "zarr>=3.1.5",
     "obstore>=0.8.2",
     "pyyaml",

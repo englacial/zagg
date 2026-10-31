@@ -4358,7 +4358,7 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'lambda'", specifier = "==2.2.3" },
     { name = "pyarrow", marker = "extra == 'benchmark'" },
     { name = "pyarrow", marker = "extra == 'catalog'" },
-    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pydantic", specifier = ">=2.5" },
     { name = "pydantic-zarr", specifier = ">=0.9.1" },
     { name = "pyproj", specifier = ">=3.7.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
