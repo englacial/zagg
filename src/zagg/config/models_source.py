@@ -507,8 +507,9 @@ class H5DataSource(StrictModel):
         default=None,
         description="Virtual chunk-index backend block (issue #160): ``backend`` names a "
         "registered backend (``hierarchical``, ``inline``, or an entry-point backend such as "
-        "``sidecar``); the remaining keys are backend-specific. Absent is the hierarchical "
-        "metadata walk.",
+        "``sidecar``); the remaining keys are backend-specific. Absent resolves to ``inline`` "
+        "(the compiled decode, issue #170), except under ``read_plan.chunk_boundaries``, "
+        "where it is ``hierarchical``; ``{backend: hierarchical}`` pins the pure-h5coro walk.",
     )
     read_plan: ReadPlan | None = Field(
         default=None, description="Planned-read knobs: the spatial index level and its padding."
