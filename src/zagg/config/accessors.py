@@ -1,8 +1,11 @@
 """``aggregation`` and ``output`` accessors (issue #677 phase 0).
 
-Every function here is a one-line read over the raw config dicts; the
-pydantic models of later phases keep these as shims (issue #677, accessor
-ruling 2026-10-31) so no call site churns in the schema PR.
+Two kinds live here (issue #677, accessor ruling 2026-10-31): plain reads
+with a default over the raw config dicts, and the resolvers that encode
+rulings or legacy spellings (``get_sweep_mode``, ``get_store_layout``,
+``get_output_signature``, ``output_field_signature``, ``get_touch_policy``,
+``_declares_ladder``, ``get_pyramid``). The pydantic models of later phases
+keep both as shims over the model so no call site churns in the schema PR.
 """
 
 import logging
