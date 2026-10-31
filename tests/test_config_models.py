@@ -57,11 +57,14 @@ ALL = list(_every_config())
 def test_dump_reproduces_the_raw_blocks(name, cfg):
     # The models inject no defaults and rewrite no values: the exclude_unset
     # dump IS the author's dict, block by block (an absent block dumps absent).
+    # Compared as JSON text so a type rewrite (1 -> 1.0, True -> 1) fails too.
     dump = validate_model(cfg).model_dump(exclude_unset=True, mode="python")
     for block in BLOCKS:
         raw = getattr(cfg, block)
         if block in dump:
-            assert dump[block] == raw, block
+            assert json.dumps(dump[block], sort_keys=True, default=str) == json.dumps(
+                raw, sort_keys=True, default=str
+            ), block
         else:
             assert raw in (None, {}), block
 

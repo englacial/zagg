@@ -438,7 +438,7 @@ class ReadPlan(StrictModel):
         default=1,
         description="Parent records of padding on each side of the spatial selection.",
     )
-    full_read_threshold: float = Field(
+    full_read_threshold: Number = Field(
         default=0.9,
         description="Fraction of a group's records above which the planner reads it whole.",
     )
