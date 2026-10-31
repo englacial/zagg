@@ -96,7 +96,7 @@ class TestRasterConfigValidation:
             validate_config(cfg)
 
     def test_band_requires_dtype(self):
-        with pytest.raises(ValueError, match="requires a string 'dtype'"):
+        with pytest.raises(ValueError, match=r"bands\.red\.dtype: Field required"):
             validate_config(_raster_config(bands={"red": {"asset": "red"}}))
 
     def test_sharded_rejected_permanently(self):
@@ -272,7 +272,7 @@ class TestRasterConfigValidation:
             validate_config(_raster_config(grid=grid))
 
     def test_bool_fill_value_rejected(self):
-        with pytest.raises(ValueError, match="fill_value must be a number"):
+        with pytest.raises(ValueError, match=r"bands\.red\.fill_value: must be numeric"):
             validate_config(
                 _raster_config(
                     bands={"red": {"asset": "red", "dtype": "uint16", "fill_value": True}}

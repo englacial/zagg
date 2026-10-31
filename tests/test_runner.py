@@ -156,7 +156,7 @@ class TestAggValidatesConfig:
                 },
             }
         )
-        with pytest.raises(ValueError, match="requires a string 'dtype'"):
+        with pytest.raises(ValueError, match=r"bands\.red\.dtype: Field required"):
             agg(cfg)
 
 

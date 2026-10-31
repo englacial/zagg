@@ -61,6 +61,13 @@ from zagg.config.expressions import (
     evaluate_filter_expression,
     resolve_function,
 )
+from zagg.config.models import (
+    ConfigModel,
+    RasterConfig,
+    SpatialConfig,
+    TemporalConfig,
+    validate_model,
+)
 from zagg.config.source import (
     _segment_variable_names,
     collection_options,
@@ -93,16 +100,7 @@ from zagg.config.validate_output import (
     _validate_time_encoding,
     _validate_time_source,
 )
-from zagg.config.validate_source import (
-    _validate_collection_options,
-    _validate_ds_variables,
-    _validate_filter_levels,
-    _validate_filters,
-    _validate_index,
-    _validate_overviews,
-    _validate_raster_config,
-    _validate_vlen_source,
-)
+from zagg.config.validate_source import _validate_raster_config
 from zagg.config.windowing import (
     WINDOWING_UNITS,
     _explicit_window_bounds,
@@ -115,6 +113,11 @@ from zagg.config.windowing import (
 )
 
 __all__ = [
+    "ConfigModel",
+    "RasterConfig",
+    "SpatialConfig",
+    "TemporalConfig",
+    "validate_model",
     "FILTER_OPS",
     "OUTPUT_KINDS",
     "OUTPUT_RESOLUTIONS",
@@ -182,15 +185,9 @@ __all__ = [
     "_is_nan_fill",
     "_segment_variable_names",
     "_validate_chunk_precompute",
-    "_validate_collection_options",
     "_validate_composition_attrs",
-    "_validate_ds_variables",
-    "_validate_filter_levels",
-    "_validate_filters",
-    "_validate_index",
     "_validate_json_floats",
     "_validate_output_kind",
-    "_validate_overviews",
     "_validate_pyramid",
     "_validate_pyramid_fold",
     "_validate_raster_config",
@@ -201,7 +198,6 @@ __all__ = [
     "_validate_time_encoding",
     "_validate_time_source",
     "_validate_trailing_shape",
-    "_validate_vlen_source",
     "_validate_windowing",
     "_validate_windowing_windows",
     "_validate_worker",

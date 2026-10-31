@@ -9,6 +9,7 @@ from zagg.config.core import (
     get_pipeline_type,
 )
 from zagg.config.expressions import _is_numeric, _validate_expression_columns, resolve_function
+from zagg.config.models import validate_model
 from zagg.config.source import _segment_variable_names, filters_from_data_source
 from zagg.config.validate_fields import (
     _TEMPORAL_SPEC_KEYS,
@@ -21,16 +22,7 @@ from zagg.config.validate_output import (
     _validate_time_encoding,
     _validate_time_source,
 )
-from zagg.config.validate_source import (
-    _validate_collection_options,
-    _validate_ds_variables,
-    _validate_filter_levels,
-    _validate_filters,
-    _validate_index,
-    _validate_overviews,
-    _validate_raster_config,
-    _validate_vlen_source,
-)
+from zagg.config.validate_source import _validate_raster_config
 from zagg.config.windowing import _validate_windowing
 
 
@@ -51,19 +43,13 @@ def validate_config(config: PipelineConfig) -> None:
     # before the kind branch and its early returns.
     _validate_json_floats(config)
 
-    # Pipeline kind drives which validation branch runs; spatial keeps the
-    # full grid + aggregation cross-checks below. Temporal/event pipelines
-    # validate their own (much smaller) spec shape and return early -- they
-    # carry no output grid and run through the event-streaming engine
-    # (``zagg.temporal.process_event``) rather than the point-cloud path.
-    # Both pipeline kinds honor a provider-selected source-credential fetch
-    # (issue #213 Phase 6), so the key's shape is checked before the branch.
-    provider = (config.data_source or {}).get("credentials_provider")
-    if provider is not None and not isinstance(provider, str):
-        raise ValueError(
-            "data_source.credentials_provider must be a credential-provider "
-            f"registry name string, e.g. 'nsidc' or 'gesdisc' (got {provider!r})"
-        )
+    # The grammar (issue #677): shape, types, unknown keys and the per-block
+    # cross-field rules the models carry, with every refusal path-addressed.
+    # Runs before the kind branch because the root union picks the grammar the
+    # way this function branches (``pipeline.type``, then ``reader: raster``).
+    # The checks below are the genuinely cross-block ones the models cannot
+    # express.
+    validate_model(config)
 
     # The optional top-level worker block (issue #235) selects a
     # pre-provisioned Lambda size variant on any pipeline kind, so it is
@@ -93,6 +79,12 @@ def validate_config(config: PipelineConfig) -> None:
     # one value per cell per timestep, so there is nothing to reduce.
     if (config.data_source or {}).get("reader") == "raster":
         _validate_raster_config(config)
+        # Store layout, root coverage MOC, and temporal windowing ride the
+        # SHARED checks (issue #247: raster + hive is legal). _validate_windowing
+        # resolves the raster time_field/encoding rules (membership is the
+        # acquisition's STAC datetime; the conversion knobs do not apply).
+        _validate_store_layout_keys(config)
+        _validate_windowing(config)
         return
 
     # Required sections
@@ -168,25 +160,6 @@ def validate_config(config: PipelineConfig) -> None:
     if handoff is not None and handoff not in ("pandas", "arrow"):
         raise ValueError(f"aggregation.handoff must be 'pandas' or 'arrow' (got {handoff!r})")
 
-    # Validate the optional read fan-out width (issue #170). Mirrors the read
-    # module's guard (_read_workers) so a config typo is rejected at
-    # submission -- inside the worker the same error would be swallowed into
-    # per-group read_errors and surface as a silently-empty shard.
-    read_workers = (config.data_source or {}).get("read_workers")
-    if read_workers is not None and (
-        isinstance(read_workers, bool) or not isinstance(read_workers, int) or read_workers < 1
-    ):
-        raise ValueError(f"data_source.read_workers must be an integer >= 1 (got {read_workers!r})")
-
-    # Validate the optional granule fan-out width (issue #180). Mirrors the
-    # worker's guard (_granule_workers) with the same rejection rationale as
-    # read_workers above. ``shard_workers`` is the canonical cross-pipeline
-    # name (issue #232 — "source units in flight per shard"); the legacy
-    # ``granule_workers`` key stays honored (canonical wins when both set).
-    for _key in ("shard_workers", "granule_workers"):
-        _w = (config.data_source or {}).get(_key)
-        if _w is not None and (isinstance(_w, bool) or not isinstance(_w, int) or _w < 1):
-            raise ValueError(f"data_source.{_key} must be an integer >= 1 (got {_w!r})")
     # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
     aoi_mask = config.output.get("aoi_mask")
     if aoi_mask is not None and not isinstance(aoi_mask, bool):
@@ -222,26 +195,9 @@ def validate_config(config: PipelineConfig) -> None:
             if "start_date" not in temporal or "end_date" not in temporal:
                 raise ValueError("bounds.temporal requires start_date and end_date")
 
-    # Validate base-level variable entries: plain path string, or the
-    # column-selector mapping form (issue #321)
-    _validate_ds_variables(config.data_source)
-
-    # Validate the structured filter list (issue #43, Phase A)
-    _validate_filters(config.data_source)
-
-    # Validate hierarchical multi-level form (issue #43, Phase B)
-    _validate_overviews(config.data_source)
-
-    # Cross-check: each filter's level field must name a key in levels (issue #43)
-    _validate_filter_levels(config.data_source)
-
-    # Vlen grammar surface (issue #425): coordinates.level, synthesize
-    # variables, sibling-asset declarations + asset filters.
-    _validate_vlen_source(config.data_source)
-
-    # Virtual chunk-index backend block (issue #160)
-    _validate_index(config.data_source)
-
+    # The data_source grammar — variable forms, filters, levels/links, the vlen
+    # surface, the chunk-index block — is the model's (``models_source``, issue
+    # #677 phase 1); only the column cross-references below remain here.
     # Segment-level (non-base) ``variables`` mappings (issue #30) become real
     # per-photon columns in the pooled shard data once broadcast, so they are valid
     # column references everywhere a ``data_source.variables`` column is (agg
@@ -558,4 +514,3 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
             raise ValueError(
                 f"temporal variable '{name}' params must be a mapping (got {params!r})"
             )
-    _validate_collection_options(config)

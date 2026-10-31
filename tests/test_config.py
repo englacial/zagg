@@ -277,7 +277,9 @@ class TestCollectionOptions:
             validate_config(self._cfg({"merra2": {"variables": "PRECLS"}}))
 
     def test_collection_entry_must_be_mapping_or_null(self):
-        with pytest.raises(ValueError, match="mapping of options"):
+        with pytest.raises(
+            ValueError, match=r"collections\.merra2: Input should be a valid dictionary"
+        ):
             validate_config(self._cfg({"merra2": ["time_offset"]}))
 
     def test_coord_round_must_be_nonnegative_int(self):
@@ -486,7 +488,9 @@ class TestValidation:
         cfg = self._config_with_variables(
             {"h_li": "/path", "c": {"path": "/conf", "column": 0, "slice": 1}}
         )
-        with pytest.raises(ValueError, match="unknown keys.*slice"):
+        with pytest.raises(
+            ValueError, match=r"variables\.c\.slice: Extra inputs are not permitted"
+        ):
             validate_config(cfg)
 
     def test_variable_column_form_bad_column_rejected(self):
@@ -494,12 +498,12 @@ class TestValidation:
             cfg = self._config_with_variables(
                 {"h_li": "/path", "c": {"path": "/conf", "column": column}}
             )
-            with pytest.raises(ValueError, match="column must be an integer"):
+            with pytest.raises(ValueError, match=r"variables\.c\.column: must be an integer >= 0"):
                 validate_config(cfg)
 
     def test_variable_non_str_non_dict_rejected(self):
         cfg = self._config_with_variables({"h_li": "/path", "c": 7})
-        with pytest.raises(ValueError, match="path string or a"):
+        with pytest.raises(ValueError, match=r"variables\.c: Input should be a valid dictionary"):
             validate_config(cfg)
 
     def _config_with_field_attrs(self, attrs):
@@ -917,7 +921,7 @@ class TestFilters:
 
     def test_unknown_op_rejected(self):
         cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "between", "value": 1}])
-        with pytest.raises(ValueError, match="unknown op"):
+        with pytest.raises(ValueError, match=r"filters\[0\]\.op: Input should be 'eq', 'ne'"):
             validate_config(cfg)
 
     def test_column_must_be_int(self):
@@ -944,7 +948,7 @@ class TestFilters:
 
     def test_missing_dataset_rejected(self):
         cfg = _cfg_with_filters(filters=[{"op": "eq", "value": 0}])
-        with pytest.raises(ValueError, match="requires 'dataset'"):
+        with pytest.raises(ValueError, match=r"filters\[0\]\.dataset: Field required"):
             validate_config(cfg)
 
     def test_expression_with_level_rejected(self):
@@ -1071,7 +1075,7 @@ class TestLevelsValidation:
             aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
-        with pytest.raises(ValueError, match="'count' is required"):
+        with pytest.raises(ValueError, match=r"levels\.segments\.link\.count: Field required"):
             validate_config(cfg)
 
     def test_link_unknown_field_rejected(self):
@@ -1082,7 +1086,9 @@ class TestLevelsValidation:
             aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
-        with pytest.raises(ValueError, match="unknown fields"):
+        with pytest.raises(
+            ValueError, match=r"levels\.segments\.link\.bogus: Extra inputs are not permitted"
+        ):
             validate_config(cfg)
 
     def test_base_level_without_link_ok(self):
@@ -1240,7 +1246,10 @@ class TestSegmentLevelVariables:
         validate_config(cfg)
 
     def test_empty_path_template_rejected(self):
-        with pytest.raises(ValueError, match="path template must be a"):
+        with pytest.raises(
+            ValueError,
+            match=r"levels\.segments\.variables\.dem_h: String should have at least 1 character",
+        ):
             validate_config(self._cfg({"dem_h": ""}))
 
     def test_mapping_on_base_level_rejected(self):

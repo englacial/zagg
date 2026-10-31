@@ -143,6 +143,19 @@ class PipelineConfig:
     pipeline: dict = field(default_factory=lambda: {"type": "spatial"})
     worker: dict | None = None
 
+    @property
+    def model(self):
+        """The typed view of this config (issue #677): the pydantic grammar tree.
+
+        Validated on every access from the raw blocks (cheap — milliseconds for
+        a packaged template); raises ``ValueError`` with path-addressed messages
+        on a config the grammar refuses. Additive: the dict attributes stay the
+        stored form the accessors and the semantic hash read.
+        """
+        from zagg.config.models import validate_model
+
+        return validate_model(self)
+
 
 def get_pipeline_type(config: PipelineConfig) -> str:
     """Return the pipeline kind, defaulting to ``"spatial"``.
