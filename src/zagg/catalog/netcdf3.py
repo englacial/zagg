@@ -112,7 +112,10 @@ class _HeaderBytes:
         while len(self._buf) < end and not self._eof:
             have = len(self._buf)
             want = max(end, 2 * have, self._initial) - have
-            chunk = bytes(self._fetch(have, want))
+            chunk = self._fetch(have, want)
+            if chunk is None:  # h5coro's S3Driver.read swallows errors into None
+                raise OSError(f"ranged read failed at {have}+{want} (driver returned None)")
+            chunk = bytes(chunk)
             if len(chunk) < want:
                 self._eof = True
             self._buf += chunk

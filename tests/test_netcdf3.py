@@ -314,6 +314,12 @@ class TestHeaderBytesOnly:
         with pytest.raises(ValueError, match="truncated netCDF3 header"):
             describe(data[: layout["__header__"] - 3])
 
+    def test_failed_read_is_an_oserror(self):
+        with pytest.raises(
+            OSError, match=r"ranged read failed at 0\+65536 \(driver returned None\)"
+        ):
+            netcdf3._parse(netcdf3._HeaderBytes(lambda off, n: None))
+
     def test_local_path_source(self, tmp_path):
         data, _ = fixture()
         p = tmp_path / "f.nc"
