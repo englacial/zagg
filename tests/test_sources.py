@@ -23,6 +23,7 @@ from zagg.catalog.sources import (
     Catalog,
     STACQuery,
     STACSource,
+    _normalize_assets,
     _page_search,
     _subset_assets,
 )
@@ -521,6 +522,66 @@ class TestSubsetAssets:
         item = _item("a", _s2_assets("a"))
         _subset_assets(item, ["red"])
         assert set(item["assets"]) == {"red", "nir", "scl", "thumbnail"}
+
+
+class TestNormalizeAssets:
+    """``_normalize_assets`` keeps a data asset by href suffix, case-insensitively
+    (issue #682): ``.nc`` netCDF products and GLAS's uppercase ``.H5`` (issue
+    #678) used to drop silently under the lowercase ``.h5`` match."""
+
+    @staticmethod
+    def _norm(href_https, href_s3, **extra):
+        item = _item(
+            "g",
+            {
+                "https-key": {"href": href_https, "roles": ["data"]},
+                "s3-key": {"href": href_s3, "roles": ["data"]},
+                "meta": {"href": "https://h/g.xml", "roles": ["metadata"]},
+                "browse": {"href": "https://h/g.jpg", "roles": ["browse"]},
+                **extra,
+            },
+        )
+        return _normalize_assets(item, preserve_thumbnails=False)["assets"]
+
+    def test_lowercase_h5_unchanged(self):
+        out = self._norm("https://h/g.h5", "s3://b/g.h5")
+        assert set(out) == {"data", "data_s3", "metadata"}
+        assert out["data"]["href"] == "https://h/g.h5"
+        assert out["data_s3"]["href"] == "s3://b/g.h5"
+
+    @pytest.mark.parametrize("ext", [".nc", ".nc4", ".hdf", ".he5"])
+    def test_other_data_suffixes_survive(self, ext):
+        out = self._norm(f"https://h/g{ext}", f"s3://b/g{ext}")
+        assert out["data"]["href"].endswith(ext)
+        assert out["data_s3"]["href"].endswith(ext)
+
+    @pytest.mark.parametrize("ext", [".H5", ".NC", ".Nc4", ".HDF", ".HE5"])
+    def test_suffix_match_is_case_insensitive(self, ext):
+        # GLAH01 is served as ``GLAH01_033_...H5`` (uppercase), the #678 drop.
+        out = self._norm(f"https://h/g{ext}", f"s3://b/g{ext}")
+        assert out["data"]["href"] == f"https://h/g{ext}"
+        assert out["data_s3"]["href"] == f"s3://b/g{ext}"
+
+    def test_non_data_suffix_still_dropped(self):
+        # A data-role href with an unknown suffix (a sidecar, a tarball) is
+        # not the granule and must not take the canonical key.
+        out = self._norm("https://h/g.tar", "s3://b/g.tar")
+        assert "data" not in out and "data_s3" not in out
+        assert set(out) == {"metadata"}
+
+    def test_non_data_role_with_data_suffix_dropped(self):
+        out = self._norm(
+            "https://h/g.nc",
+            "s3://b/g.nc",
+            qa={"href": "https://h/g_qa.nc", "roles": ["quality"]},
+        )
+        assert set(out) == {"data", "data_s3", "metadata"}
+        assert out["data"]["href"] == "https://h/g.nc"
+
+    def test_original_item_not_mutated(self):
+        item = _item("g", {"k": {"href": "https://h/g.NC", "roles": ["data"]}})
+        _normalize_assets(item, preserve_thumbnails=False)
+        assert set(item["assets"]) == {"k"}
 
 
 def _catalog(items, meta=None):

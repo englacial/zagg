@@ -8,7 +8,7 @@ across many ShardMap builds at different grids.
 Two built-in sources:
 
 - ``CMRSource`` targets NASA's CMR-STAC endpoint (per-granule-unique asset keys,
-  single ``.h5`` data asset -- normalized to canonical ``data``/``data_s3``).
+  single data asset -- normalized to canonical ``data``/``data_s3``).
 - ``STACSource`` targets any STAC API root (issue #218), e.g. Earth Search for
   Sentinel-2. Generic APIs use stable per-collection asset keys (``red``,
   ``nir``, ``scl``), so assets are kept under their own keys, optionally
@@ -122,6 +122,13 @@ def _resolve_bbox(region) -> tuple[float, float, float, float]:
     return tuple(float(x) for x in region)
 
 
+#: Data-asset href suffixes ``_normalize_assets`` keeps (matched on the
+#: lowercased href): HDF5 (``.h5``, ``.he5``), netCDF (``.nc``, ``.nc4``) and
+#: HDF4 (``.hdf``). Which of them the read path can *decode* is the reader's
+#: and index backend's business, not the catalog's (issue #682).
+_DATA_SUFFIXES = (".h5", ".nc", ".nc4", ".hdf", ".he5")
+
+
 def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     """Collapse CMR's per-granule-keyed assets into canonical keys.
 
@@ -129,9 +136,15 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     full object path), which would explode a geoparquet struct schema. We map
     them to stable keys instead, keeping both endpoints:
 
-    - ``data``     : the HTTPS ``.h5`` data asset,
-    - ``data_s3``  : the S3 ``.h5`` data asset,
+    - ``data``     : the HTTPS data asset,
+    - ``data_s3``  : the S3 data asset,
     - ``metadata`` : the metadata-role asset.
+
+    A ``data``-role asset counts when its href ends in one of
+    :data:`_DATA_SUFFIXES`, compared case-insensitively (issue #682): CMR
+    serves netCDF products as ``.nc`` / ``.nc4``, GLAS as uppercase ``.H5``
+    (issue #678), HDF4/HDF-EOS5 as ``.hdf`` / ``.he5`` -- the lowercase
+    ``.h5`` match this started with dropped them all silently.
 
     With ``preserve_thumbnails`` the original ``thumbnail_*``/``browse`` assets
     are kept verbatim (their keys are already stable) for a future
@@ -141,7 +154,7 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     for key, asset in item.get("assets", {}).items():
         roles = asset.get("roles") or []
         href = asset.get("href", "")
-        if "data" in roles and href.endswith(".h5"):
+        if "data" in roles and href.lower().endswith(_DATA_SUFFIXES):
             out["data" if href.startswith("https") else "data_s3"] = asset
         elif "metadata" in roles:
             out["metadata"] = asset
@@ -501,7 +514,7 @@ class Catalog:
     """Fetched granule metadata: a stac-geoparquet table + provenance.
 
     Reusable across many ShardMap builds. Endpoint-neutral -- each granule
-    carries both its S3 and HTTPS ``.h5`` hrefs.
+    carries both its S3 and HTTPS data hrefs.
 
     Parameters
     ----------
