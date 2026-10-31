@@ -74,10 +74,25 @@ Bool = Annotated[bool, BeforeValidator(_check_bool), WithJsonSchema({"type": "bo
 #: A string with at least one character.
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 
-#: Suffixes of the :class:`pydantic.Tag` names the grammar's tagged unions
-#: use. A tag is a member label, not a key the author wrote, so the error
-#: renderer drops any location element carrying one of these suffixes.
-TAG_SUFFIXES = ("-form", "-filter", "-config")
+#: The :class:`pydantic.Tag` names the grammar's tagged unions use. A tag is
+#: a member label, not a key the author wrote, so the error renderer drops a
+#: location element only on exact membership; the angle brackets keep a tag
+#: from colliding with an author's mapping key (e.g. a variable ``x-config``).
+TAGS = frozenset(
+    {
+        "<path-form>",
+        "<column-form>",
+        "<synthesize-form>",
+        "<asset-form>",
+        "<list-form>",
+        "<mapping-form>",
+        "<structured-filter>",
+        "<expression-filter>",
+        "<spatial-config>",
+        "<raster-config>",
+        "<temporal-config>",
+    }
+)
 
 
 def _tag_of(v: Any, model_tags: dict[type, str], dict_tag: Any) -> str:

@@ -118,21 +118,21 @@ class Synthesize(StrictModel):
 def _variable_tag(v: Any) -> str:
     def by_shape(raw: Any) -> str:
         if isinstance(raw, str):
-            return "path-form"
+            return "<path-form>"
         if isinstance(raw, dict) and "synthesize" in raw:
-            return "synthesize-form"
-        return "column-form"
+            return "<synthesize-form>"
+        return "<column-form>"
 
-    return _tag_of(v, {PathColumn: "column-form", Synthesize: "synthesize-form"}, by_shape)
+    return _tag_of(v, {PathColumn: "<column-form>", Synthesize: "<synthesize-form>"}, by_shape)
 
 
 #: A base-level variable: a path-template string (reads the whole dataset),
 #: the ``{path, column}`` column-selector mapping, or the ``synthesize`` form.
 VariableEntry = Annotated[
     Union[
-        Annotated[str, Tag("path-form")],
-        Annotated[PathColumn, Tag("column-form")],
-        Annotated[Synthesize, Tag("synthesize-form")],
+        Annotated[str, Tag("<path-form>")],
+        Annotated[PathColumn, Tag("<column-form>")],
+        Annotated[Synthesize, Tag("<synthesize-form>")],
     ],
     Discriminator(_variable_tag),
 ]
@@ -252,20 +252,22 @@ class ExpressionFilter(StrictModel):
 def _filter_tag(v: Any) -> str:
     def by_shape(raw: Any) -> str:
         return (
-            "expression-filter"
+            "<expression-filter>"
             if isinstance(raw, dict) and "expression" in raw
-            else "structured-filter"
+            else "<structured-filter>"
         )
 
     return _tag_of(
-        v, {ExpressionFilter: "expression-filter", StructuredFilter: "structured-filter"}, by_shape
+        v,
+        {ExpressionFilter: "<expression-filter>", StructuredFilter: "<structured-filter>"},
+        by_shape,
     )
 
 
 Filter = Annotated[
     Union[
-        Annotated[StructuredFilter, Tag("structured-filter")],
-        Annotated[ExpressionFilter, Tag("expression-filter")],
+        Annotated[StructuredFilter, Tag("<structured-filter>")],
+        Annotated[ExpressionFilter, Tag("<expression-filter>")],
     ],
     Discriminator(_filter_tag),
 ]
@@ -339,36 +341,36 @@ class AssetVariable(StrictModel):
 def _level_variable_tag(v: Any) -> str:
     return _tag_of(
         v,
-        {AssetVariable: "asset-form"},
-        lambda r: "path-form" if isinstance(r, str) else "asset-form",
+        {AssetVariable: "<asset-form>"},
+        lambda r: "<path-form>" if isinstance(r, str) else "<asset-form>",
     )
 
 
 LevelVariable = Annotated[
     Union[
-        Annotated[NonEmptyStr, Tag("path-form")],
-        Annotated[AssetVariable, Tag("asset-form")],
+        Annotated[NonEmptyStr, Tag("<path-form>")],
+        Annotated[AssetVariable, Tag("<asset-form>")],
     ],
     Discriminator(_level_variable_tag),
 ]
 
 
 def _list_or_mapping_tag(v: Any) -> str:
-    return "list-form" if isinstance(v, list) else "mapping-form"
+    return "<list-form>" if isinstance(v, list) else "<mapping-form>"
 
 
 LevelCoordinates = Annotated[
     Union[
-        Annotated[list[str], Tag("list-form")],
-        Annotated[dict[str, str], Tag("mapping-form")],
+        Annotated[list[str], Tag("<list-form>")],
+        Annotated[dict[str, str], Tag("<mapping-form>")],
     ],
     Discriminator(_list_or_mapping_tag),
 ]
 
 LevelVariables = Annotated[
     Union[
-        Annotated[list[str], Tag("list-form")],
-        Annotated[dict[NonEmptyStr, LevelVariable], Tag("mapping-form")],
+        Annotated[list[str], Tag("<list-form>")],
+        Annotated[dict[NonEmptyStr, LevelVariable], Tag("<mapping-form>")],
     ],
     Discriminator(_list_or_mapping_tag),
 ]
@@ -866,13 +868,13 @@ class CollectionOptions(BaseModel):
 
 
 def _collections_tag(v: Any) -> str:
-    return "list-form" if isinstance(v, list) else "mapping-form"
+    return "<list-form>" if isinstance(v, list) else "<mapping-form>"
 
 
 Collections = Annotated[
     Union[
-        Annotated[list[str], Tag("list-form")],
-        Annotated[dict[str, CollectionOptions | None], Tag("mapping-form")],
+        Annotated[list[str], Tag("<list-form>")],
+        Annotated[dict[str, CollectionOptions | None], Tag("<mapping-form>")],
     ],
     Discriminator(_collections_tag),
 ]

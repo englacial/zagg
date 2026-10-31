@@ -120,6 +120,13 @@ class TestPathAddressedRefusals:
         with pytest.raises(ValueError, match=r"data_source\.variables\.c\.slice: Extra inputs"):
             validate_config(cfg)
 
+    def test_hyphenated_author_key_stays_in_the_path(self):
+        # Tags are stripped by exact name, so an author key that merely looks
+        # like one (``x-config``) still addresses the refusal.
+        cfg = self._cfg(variables={"h": "/h", "x-config": {"path": "/p", "column": -1}})
+        with pytest.raises(ValueError, match=r"data_source\.variables\.x-config\.column: "):
+            validate_config(cfg)
+
     def test_list_index_renders_as_subscript(self):
         cfg = self._cfg(filters=[{"dataset": "/d", "op": "eq", "value": 0, "keeps": True}])
         with pytest.raises(ValueError, match=r"data_source\.filters\[0\]\.keeps: Extra inputs"):

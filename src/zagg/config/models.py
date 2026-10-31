@@ -31,7 +31,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Discriminator, Field, Tag, TypeAdapter, ValidationError
 
-from zagg.config.models_base import TAG_SUFFIXES, StrictModel
+from zagg.config.models_base import TAGS, StrictModel
 from zagg.config.models_source import CollectionDataSource, H5DataSource, RasterDataSource
 
 __all__ = [
@@ -107,19 +107,19 @@ class TemporalConfig(_RootBase):
 def _config_tag(v: Any) -> str:
     if isinstance(v, BaseModel):
         return {
-            SpatialConfig: "spatial-config",
-            RasterConfig: "raster-config",
-            TemporalConfig: "temporal-config",
+            SpatialConfig: "<spatial-config>",
+            RasterConfig: "<raster-config>",
+            TemporalConfig: "<temporal-config>",
         }[type(v)]
     if not isinstance(v, dict):
-        return "spatial-config"
+        return "<spatial-config>"
     pipeline = v.get("pipeline")
     if isinstance(pipeline, dict) and pipeline.get("type") in ("temporal", "event"):
-        return "temporal-config"
+        return "<temporal-config>"
     ds = v.get("data_source")
     if isinstance(ds, dict) and ds.get("reader") == "raster":
-        return "raster-config"
-    return "spatial-config"
+        return "<raster-config>"
+    return "<spatial-config>"
 
 
 #: The template grammar: exactly one of the three config kinds, discriminated
@@ -128,9 +128,9 @@ def _config_tag(v: Any) -> str:
 #: against the grammar the engine will actually run it under.
 ConfigModel = Annotated[
     Union[
-        Annotated[SpatialConfig, Tag("spatial-config")],
-        Annotated[RasterConfig, Tag("raster-config")],
-        Annotated[TemporalConfig, Tag("temporal-config")],
+        Annotated[SpatialConfig, Tag("<spatial-config>")],
+        Annotated[RasterConfig, Tag("<raster-config>")],
+        Annotated[TemporalConfig, Tag("<temporal-config>")],
     ],
     Discriminator(_config_tag),
 ]
@@ -151,7 +151,7 @@ def _render_loc(loc: tuple) -> str:
                 parts[-1] += f"[{item}]"
             else:
                 parts.append(f"[{item}]")
-        elif isinstance(item, str) and item.endswith(TAG_SUFFIXES):
+        elif item in TAGS:
             continue
         else:
             parts.append(str(item))
