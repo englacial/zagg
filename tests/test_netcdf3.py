@@ -446,3 +446,224 @@ class TestOracle:
                 np.testing.assert_array_equal(f.variables["lat"][:], _LAT)
                 assert f.variables["label"][:].tobytes() == b"abcde"
                 assert f.variables["temp"].scale_factor == 0.01
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: manifest emitter
+# ---------------------------------------------------------------------------
+
+
+def _reconstruct(df, data):
+    """``datasets_from_manifest`` + ``Index.from_chunks`` + ranged reads out of
+    ``data`` -- exactly the sidecar backend's path, minus the driver."""
+    from h5coro_hidefix import Index
+    from h5coro_hidefix.manifest import datasets_from_manifest
+
+    idx = Index.from_chunks("mem", datasets_from_manifest(df))
+    out = {}
+    for name in idx.datasets():
+        addrs, sizes, _ = idx.read_plan(name, None, None)
+        bufs = [data[int(a) : int(a) + int(n)] for a, n in zip(addrs, sizes)]
+        out[name] = idx.read_from_buffers(name, bufs, None, None)
+    return idx, out
+
+
+_EXPECTED = {"/lat": _LAT, "/grid": _GRID, "/label": _LABEL, "/time": _TIME, "/temp": _TEMP}
+
+
+class TestBuildManifest:
+    @pytest.mark.parametrize("version", [1, 2])
+    def test_rows(self, version):
+        from zagg.catalog.netcdf3 import build_manifest
+        from zagg.index.inline import MANIFEST_DTYPES
+
+        data, layout = fixture(version)
+        df = build_manifest(data)
+        assert list(df.columns) == list(MANIFEST_DTYPES)
+        assert dict(df.dtypes.astype(str)) == MANIFEST_DTYPES
+        # One row per non-record variable, one per record for record variables.
+        assert df["dataset"].value_counts().to_dict() == {
+            "/lat": 1,
+            "/grid": 1,
+            "/label": 1,
+            "/time": 4,
+            "/temp": 4,
+        }
+        lat = df[df["dataset"] == "/lat"].iloc[0]
+        assert (lat["byte_offset"], lat["nbytes"]) == (layout["lat"][0], 12)
+        assert (lat["chunk_idx"], lat["elem_start"], lat["elem_end"]) == (0, 0, 3)
+        assert (lat["dtype"], lat["shape"], lat["chunk_shape"]) == (">f4", "[3]", "[3]")
+        assert lat["chunk_offset"] == "[0]" and lat["filter_mask"] == 0
+        assert not lat["gzip"] and not lat["shuffle"]
+        grid = df[df["dataset"] == "/grid"].iloc[0]
+        assert (grid["dtype"], grid["shape"], grid["chunk_shape"]) == (">i4", "[3, 2]", "[3, 2]")
+        assert grid["chunk_offset"] == "[0, 0]" and grid["nbytes"] == 24
+        label = df[df["dataset"] == "/label"].iloc[0]
+        assert label["dtype"] == "|u1" and label["nbytes"] == 5  # unpadded (vsize is 8)
+        temp = df[df["dataset"] == "/temp"].sort_values("chunk_idx")
+        recsize = layout["__recsize__"]
+        assert list(temp["byte_offset"]) == [layout["temp"][0] + r * recsize for r in range(4)]
+        assert list(temp["nbytes"]) == [6] * 4
+        assert list(temp["chunk_idx"]) == [0, 1, 2, 3]
+        assert list(temp["elem_start"]) == [0, 1, 2, 3] and list(temp["elem_end"]) == [1, 2, 3, 4]
+        assert set(temp["shape"]) == {"[4, 3]"} and set(temp["chunk_shape"]) == {"[1, 3]"}
+        assert list(temp["chunk_offset"]) == ["[0, 0]", "[1, 0]", "[2, 0]", "[3, 0]"]
+        assert set(temp["dtype"]) == {">i2"}
+        time = df[df["dataset"] == "/time"].sort_values("chunk_idx")
+        assert list(time["byte_offset"]) == [layout["time"][0] + r * recsize for r in range(4)]
+        assert set(time["chunk_shape"]) == {"[1]"} and set(time["shape"]) == {"[4]"}
+        assert df["dtype"].str.match(r"^[<>|][a-z]\d+$").all()
+        assert df.equals(df.sort_values(["dataset", "chunk_idx"], ignore_index=True))
+
+    @pytest.mark.parametrize("version", [1, 2])
+    def test_reconstructs_every_variable_byte_identically(self, version):
+        # The acceptance bar: the sidecar consumer's reconstruction
+        # (datasets_from_manifest -> Index.from_chunks -> read_plan ->
+        # read_from_buffers) returns every variable's values from the raw
+        # file bytes, record and non-record alike.
+        from zagg.catalog.netcdf3 import build_manifest
+
+        data, _ = fixture(version)
+        idx, out = _reconstruct(build_manifest(data), data)
+        assert set(out) == set(_EXPECTED)
+        for name, exp in _EXPECTED.items():
+            got = out[name]
+            assert got.shape == exp.shape, name
+            assert got.tobytes() == exp.astype(got.dtype).tobytes(), name
+            np.testing.assert_array_equal(got, exp)
+        # Decode is value-identical; the compiled reader hands back native
+        # byte order, so the dtype KIND and width match, not the '>' flag.
+        assert out["/temp"].dtype == np.int16 and out["/time"].dtype == np.float64
+        assert out["/label"].tobytes() == b"abcde"
+
+    def test_partial_record_range_reads_only_those_slabs(self):
+        from h5coro_hidefix import Index
+        from h5coro_hidefix.manifest import datasets_from_manifest
+
+        from zagg.catalog.netcdf3 import build_manifest
+
+        data, layout = fixture()
+        idx = Index.from_chunks("mem", datasets_from_manifest(build_manifest(data)))
+        addrs, sizes, _ = idx.read_plan("/temp", 1, 3)
+        assert list(addrs) == [layout["temp"][0] + r * layout["__recsize__"] for r in (1, 2)]
+        bufs = [data[int(a) : int(a) + int(n)] for a, n in zip(addrs, sizes)]
+        np.testing.assert_array_equal(idx.read_from_buffers("/temp", bufs, 1, 3), _TEMP[1:3])
+
+    def test_single_record_variable_unpadded_layout(self):
+        from zagg.catalog.netcdf3 import build_manifest
+
+        only = [v for v in _VARS if v["name"] in ("lat", "temp")]
+        data, layout = _nc3_bytes(2, _DIMS, only)
+        df = build_manifest(data)
+        temp = df[df["dataset"] == "/temp"].sort_values("chunk_idx")
+        assert list(temp["byte_offset"]) == [layout["temp"][0] + 6 * r for r in range(4)]
+        _, out = _reconstruct(df, data)
+        np.testing.assert_array_equal(out["/temp"], _TEMP)
+        np.testing.assert_array_equal(out["/lat"], _LAT)
+
+    def test_streaming_numrecs_from_file_size(self):
+        from zagg.catalog.netcdf3 import build_manifest
+
+        data, _ = fixture(streaming=True)
+        df = build_manifest(data)  # bytes: file_size is len(data)
+        assert (df["dataset"] == "/temp").sum() == 4
+        _, out = _reconstruct(df, data)
+        np.testing.assert_array_equal(out["/temp"], _TEMP)
+
+        class Drv:
+            def read(self, pos, size):
+                return data[pos : pos + size]
+
+        with pytest.raises(ValueError, match="STREAMING numrecs; pass file_size"):
+            build_manifest(Drv())
+        assert (build_manifest(Drv(), file_size=len(data))["dataset"] == "/temp").sum() == 4
+        # A trailing partial record is not a record.
+        assert (build_manifest(Drv(), file_size=len(data) - 1)["dataset"] == "/temp").sum() == 3
+
+    def test_scalar_and_empty_record_variables_skipped(self, caplog):
+        from zagg.catalog.netcdf3 import build_manifest
+
+        vars_ = [
+            {"name": "s", "dimids": [], "nc_type": NC_DOUBLE, "data": np.array(1.5)},
+            {"name": "x", "dimids": [1], "nc_type": NC_INT, "data": np.arange(3)},
+            {"name": "r", "dimids": [0], "nc_type": NC_INT, "data": np.zeros((0,))},
+        ]
+        data, _ = _nc3_bytes(1, _DIMS, vars_, numrecs=0)
+        with caplog.at_level("INFO", logger="zagg.catalog.netcdf3"):
+            df = build_manifest(data)
+        assert list(df["dataset"]) == ["/x"]
+        assert "skipping scalar variable 's'" in caplog.text
+        assert "skipping record variable 'r' (0 records)" in caplog.text
+        _, out = _reconstruct(df, data)
+        np.testing.assert_array_equal(out["/x"], np.arange(3))
+
+    def test_empty_file_gives_typed_empty_frame(self):
+        from zagg.catalog.netcdf3 import build_manifest
+        from zagg.index.inline import MANIFEST_DTYPES
+
+        df = build_manifest(_nc3_bytes(1, [], [])[0])
+        assert len(df) == 0 and list(df.columns) == list(MANIFEST_DTYPES)
+        assert df["chunk_idx"].dtype == np.int64
+
+    def test_cdf5_refused(self):
+        from zagg.catalog.netcdf3 import build_manifest
+
+        with pytest.raises(ValueError, match="CDF-5"):
+            build_manifest(b"CDF\x05" + b"\0" * 64)
+
+    def test_header_bytes_only(self):
+        # The emitter never fetches past the header window.
+        from zagg.catalog.netcdf3 import build_manifest
+
+        data, layout = fixture()
+        calls = []
+
+        class Drv:
+            def read(self, pos, size):
+                calls.append((pos, size))
+                return data[pos : pos + size]
+
+        build_manifest(Drv(), file_size=len(data))
+        assert calls == [(0, netcdf3.INITIAL_HEADER_BYTES)]
+
+
+class TestIndexGranule:
+    def test_writes_through_the_inline_writer(self, tmp_path):
+        import pandas as pd
+
+        from zagg.catalog.netcdf3 import build_manifest, index_granule
+        from zagg.index.inline import write_manifest
+
+        data, _ = fixture(2)
+        src = tmp_path / "PRODUCT_v1_20200101.nc"
+        src.write_bytes(data)
+        store = tmp_path / "sidecar"
+        key = index_granule(str(src), str(store))
+        assert key == "PRODUCT_v1_20200101.parquet"
+        direct = tmp_path / "direct"
+        write_manifest(build_manifest(data), str(direct), "PRODUCT_v1_20200101")
+        assert (store / key).read_bytes() == (direct / key).read_bytes()
+        df = pd.read_parquet(store / key, engine="fastparquet")
+        _, out = _reconstruct(df, data)
+        np.testing.assert_array_equal(out["/temp"], _TEMP)
+
+    def test_url_source_through_driver(self, tmp_path):
+        from zagg.catalog.netcdf3 import index_granule
+
+        data, _ = fixture()
+
+        class Drv:
+            def __init__(self, resource, credentials):
+                self.resource = resource
+
+            def read(self, pos, size):
+                return data[pos : pos + size]
+
+        key = index_granule("https://x/path/G.nc", str(tmp_path), driver=Drv, credentials="t")
+        assert key == "G.parquet" and (tmp_path / "G.parquet").exists()
+
+    def test_bytes_source_rejected(self, tmp_path):
+        from zagg.catalog.netcdf3 import index_granule
+
+        with pytest.raises(TypeError, match="path or URL"):
+            index_granule(fixture()[0], str(tmp_path))

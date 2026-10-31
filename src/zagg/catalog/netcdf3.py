@@ -6,8 +6,9 @@ dimensions and file offset -- followed by uncompressed big-endian arrays.
 Non-record variables are one contiguous block each; record variables are
 interleaved along the unlimited dimension, one slab per record. That is a
 chunk manifest, so the worker needs no new code: this module parses the
-header (:func:`parse_header`, :func:`describe`) and, in the next phase,
-emits the sidecar manifest the ``sidecar`` index backend already decodes.
+header (:func:`parse_header`, :func:`describe`) and emits the sidecar
+manifest the ``sidecar`` index backend already decodes (:func:`build_manifest`,
+:func:`index_granule`).
 
 The format reference is the netCDF classic format specification (the
 ``netcdf_file`` grammar in the netCDF-C docs, "File Format Specification").
@@ -34,6 +35,8 @@ archive product zagg targets uses it.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import struct
 from dataclasses import dataclass, field
@@ -45,9 +48,13 @@ __all__ = [
     "STREAMING",
     "Header",
     "Variable",
+    "build_manifest",
     "describe",
+    "index_granule",
     "parse_header",
 ]
+
+logger = logging.getLogger(__name__)
 
 #: First ranged read of the header. netCDF3 headers of archive products run
 #: from a few hundred bytes to a few tens of KB (every variable's attributes
@@ -393,3 +400,138 @@ def describe(source, driver=None, credentials=None) -> dict:
     data arrays are never fetched.
     """
     return parse_header(source, driver, credentials).describe()
+
+
+# ---------------------------------------------------------------------------
+# Manifest emitter (issue #682, phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _record_count(hdr: Header, file_size: int | None) -> int:
+    """``numrecs``, derived from the file size for a streaming header."""
+    if hdr.numrecs is not None:
+        return hdr.numrecs
+    recs = hdr.record_variables
+    if not recs:
+        return 0
+    if file_size is None:
+        raise ValueError(
+            "netCDF3 header has STREAMING numrecs; pass file_size= so the record "
+            "count can be derived as (file_size - record block begin) // recsize"
+        )
+    first = min(v.begin for v in recs)
+    return max(0, (int(file_size) - first) // hdr.recsize)
+
+
+def manifest_rows(hdr: Header, file_size: int | None = None) -> list[tuple]:
+    """``MANIFEST_DTYPES``-ordered rows for every decodable variable of ``hdr``.
+
+    A non-record variable is one contiguous pseudo-chunk (``chunk_idx`` 0,
+    ``chunk_shape == shape``, ``nbytes`` the unpadded array bytes). A record
+    variable is one row per record: ``chunk_shape = (1, *fixed dims)``,
+    ``byte_offset = begin + rec * recsize`` -- the compiled reader has no
+    stride, so the interleaved record block is addressed slab by slab. Dtype
+    strings are the byte-order-explicit numpy forms (``>i2``, ``>f4``;
+    ``char`` -> ``|u1``); ``gzip`` / ``shuffle`` are False (netCDF3 is never
+    compressed) and ``filter_mask`` is 0. Dataset paths are ``/<name>``.
+
+    Skipped, with a log line: scalar variables (the compiled reader supports
+    ranks 1-9 only) and record variables of a file with zero records (no
+    chunk to address; the manifest carries dtype/shape per row, so a rowless
+    dataset reads as not covered, which is the truth).
+    """
+    numrecs = _record_count(hdr, file_size)
+    rows: list[tuple] = []
+    for v in hdr.variables:
+        path = f"/{v.name}"
+        if not v.dimids:
+            logger.info(f"  netcdf3 manifest: skipping scalar variable {v.name!r}")
+            continue
+        record = hdr.is_record(v)
+        fixed = [hdr.dims[d][1] for d in v.dimids[1 if record else 0 :]]
+        nbytes = hdr.slab_bytes(v)
+        if record:
+            if numrecs == 0:
+                logger.info(f"  netcdf3 manifest: skipping record variable {v.name!r} (0 records)")
+                continue
+            shape = json.dumps([numrecs, *fixed])
+            chunk_shape = json.dumps([1, *fixed])
+            zeros = [0] * len(fixed)
+            for rec in range(numrecs):
+                rows.append(
+                    (
+                        path,
+                        rec,
+                        rec,
+                        rec + 1,
+                        v.begin + rec * hdr.recsize,
+                        nbytes,
+                        0,
+                        json.dumps([rec, *zeros]),
+                        v.dtype.str,
+                        shape,
+                        chunk_shape,
+                        False,
+                        False,
+                    )
+                )
+        else:
+            shape = json.dumps(fixed)
+            rows.append(
+                (
+                    path,
+                    0,
+                    0,
+                    fixed[0],
+                    v.begin,
+                    nbytes,
+                    0,
+                    json.dumps([0] * len(fixed)),
+                    v.dtype.str,
+                    shape,
+                    shape,
+                    False,
+                    False,
+                )
+            )
+    return rows
+
+
+def build_manifest(source, driver=None, credentials=None, *, file_size=None):
+    """The sidecar manifest of a netCDF3 file as a ``pandas.DataFrame`` in the
+    ``inline`` backend's write-back schema (``MANIFEST_DTYPES``, the columns
+    ``h5coro_hidefix.manifest.MANIFEST_COLUMNS`` consumes).
+
+    Only the header is read (see :func:`parse_header` for the ``source`` /
+    ``driver`` / ``credentials`` forms). ``file_size`` is needed only for a
+    streaming-mode file (``numrecs`` unknown); for raw bytes or a local path
+    it is taken from the source.
+    """
+    import pandas as pd
+
+    from zagg.index.inline import MANIFEST_DTYPES
+
+    if file_size is None:
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            file_size = len(source)
+        elif isinstance(source, (str, os.PathLike)) and os.path.isfile(source):
+            file_size = os.path.getsize(source)
+    hdr = parse_header(source, driver, credentials)
+    rows = manifest_rows(hdr, file_size)
+    cols = list(MANIFEST_DTYPES)
+    df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame({c: [] for c in cols})
+    return df.astype(MANIFEST_DTYPES).sort_values(["dataset", "chunk_idx"], ignore_index=True)
+
+
+def index_granule(source, store: str, driver=None, credentials=None, *, file_size=None) -> str:
+    """Build and persist one granule's manifest to ``<store>/<granule_id>.parquet``
+    through the ``inline`` backend's writer, so the sidecar store layout is
+    identical to a write-back run's. ``granule_id`` is the URL basename minus
+    its extension (the sidecar backend's lookup key); ``source`` must therefore
+    be a path or URL here, not raw bytes. Returns the object key."""
+    from zagg.index.inline import _granule_id, write_manifest
+
+    if not isinstance(source, (str, os.PathLike)):
+        raise TypeError("index_granule needs a path or URL source (the granule id is its basename)")
+    df = build_manifest(source, driver, credentials, file_size=file_size)
+    return write_manifest(df, store, _granule_id(os.fspath(source)))
