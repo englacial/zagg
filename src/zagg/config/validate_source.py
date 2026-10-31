@@ -768,6 +768,12 @@ def _validate_overviews(data_source: dict) -> None:
                     f"levels.{name}.link: 'width' is mutually exclusive with {clash} "
                     "(a fixed-width link synthesizes its index_beg/count)"
                 )
+            if link["to"] != base_level:
+                raise ValueError(
+                    f"levels.{name}.link: a 'width' link must point at base_level "
+                    f"{base_level!r} (got to: {link['to']!r}); its index_beg = i * width "
+                    "indexes base rows"
+                )
             width = link["width"]
             if width != "auto" and (
                 not isinstance(width, int) or isinstance(width, bool) or width < 1

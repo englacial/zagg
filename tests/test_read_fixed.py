@@ -116,6 +116,11 @@ class TestWidthLink:
         ds["levels"]["frames"] = {"path": "/{group}", "link": {"to": "samples", "width": 10}}
         _rejects(ds, "only one fixed-width record level")
 
+    def test_width_link_must_point_at_the_base_level(self):
+        ds = _fixed_ds()
+        ds["levels"]["frames"] = {"path": "/{group}", "link": {"to": "shots", "width": 10}}
+        _rejects(ds, "a 'width' link must point at base_level 'samples'")
+
 
 # ── axes ─────────────────────────────────────────────────────────────────────
 
