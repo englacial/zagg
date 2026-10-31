@@ -373,7 +373,7 @@ def _gather_segment_at_parents(
     return out
 
 
-def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
+def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str | dict]]:
     """Collect declared segment-level (non-base) readable variables (issue #30).
 
     A non-base level may declare ``variables`` as a ``{name: path-template}``
@@ -388,19 +388,24 @@ def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
     Asset-sourced entries (the ``{asset, path}`` mapping form, issue #464) are
     excluded: they read the PAIRED granule via the sibling join, never this
     handle — the vlen route collects them separately
-    (:func:`zagg.processing.read_vlen.asset_variable_specs`).
+    (:func:`zagg.processing.read_vlen.asset_variable_specs`). A ``{path,
+    column}`` entry (issue #678: a record-level table such as GLAH01's
+    ``i_wt_fact_filt [n, 6]``) is kept as its mapping, and the broadcast
+    applies the column selector after the coarse read.
     """
     levels = data_source.get("levels")
     base_level = data_source.get("base_level")
     if not isinstance(levels, dict) or base_level is None:
         return {}
-    out: dict[str, dict[str, str]] = {}
+    out: dict[str, dict[str, str | dict]] = {}
     for name, lvl in levels.items():
         if name == base_level or not isinstance(lvl, dict):
             continue
         lvl_vars = lvl.get("variables")
         if isinstance(lvl_vars, dict) and lvl_vars:
-            plain = {k: v for k, v in lvl_vars.items() if not isinstance(v, dict)}
+            plain = {
+                k: v for k, v in lvl_vars.items() if not isinstance(v, dict) or "asset" not in v
+            }
             if plain:
                 out[name] = plain
     return out
@@ -468,11 +473,13 @@ def _read_segment_broadcasts(
                     f"segment-level variable '{col_name}' on level '{level_key}' "
                     f"collides with a data_source.variables column"
                 )
-            seg_path = tmpl.format(group=group)
+            column = tmpl.get("column") if isinstance(tmpl, dict) else None
+            seg_path = (tmpl["path"] if isinstance(tmpl, dict) else tmpl).format(group=group)
             if read_fn is None:
                 seg_values = np.asarray(h5obj.readDatasets([seg_path])[seg_path])
             else:
                 seg_values = np.asarray(read_fn(seg_path))
+            seg_values = _select_column(seg_values, column, col_name)
             if held is not None:
                 out[col_name] = _gather_segment_at_parents(seg_values, held[0], held[1])
             elif base_rows is None:
@@ -501,7 +508,11 @@ def _variable_specs(variables: dict) -> dict[str, tuple[str, int | None]]:
         if isinstance(entry, str):
             specs[col] = (entry, None)
         else:
-            specs[col] = (entry["path"], int(entry["column"]))
+            # An ``axes`` entry (issue #678) carries no column: the fixed-width
+            # route flattens it itself, and a path-only consumer (the inline
+            # backend's chunk-map prebuild) wants just the path.
+            column = entry.get("column")
+            specs[col] = (entry["path"], None if column is None else int(column))
     return specs
 
 
@@ -1033,7 +1044,26 @@ def _read_group(
     # before the plan-shape branches below — the vlen route owns its own
     # planned/full arms (read_plan.spatial_index must name the record level).
     coords = data_source.get("coordinates")
+    # A fixed-width record level (issue #678) routes to its own module when the
+    # coordinates level links with ``width``; a width link without
+    # ``coordinates.level`` is the swath form, whose read path is a follow-up.
+    from zagg.processing.read_fixed import fixed_width_level
+
+    width_level = fixed_width_level(data_source)
     if isinstance(coords, dict) and coords.get("level") is not None:
+        if width_level is not None and width_level[0] == coords["level"]:
+            from zagg.processing.read_fixed import _fixed_read_group
+
+            return _fixed_read_group(
+                h5obj,
+                group,
+                data_source,
+                shard_key,
+                grid,
+                arrow=arrow,
+                io_stats=io_stats,
+                siblings=siblings,
+            )
         from zagg.processing.read_vlen import _vlen_read_group
 
         return _vlen_read_group(
@@ -1045,6 +1075,11 @@ def _read_group(
             arrow=arrow,
             io_stats=io_stats,
             siblings=siblings,
+        )
+    if width_level is not None:
+        raise ValueError(
+            f"levels.{width_level[0]}.link.width without coordinates.level is the swath "
+            "form, whose read path is not implemented yet (issue #678 follow-up)"
         )
     rp = data_source.get("read_plan")
     # Presence check, not truthiness: an empty/misconfigured ``chunk_boundaries``

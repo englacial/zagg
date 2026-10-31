@@ -3,13 +3,30 @@
 Phase 1: the grammar — ``link.width``, ``axes``, ``synthesize: offsets`` /
 ``index``, base-level ``{path, axes}`` coordinates, and list-form composite
 join keys — through ``validate_config``.
+
+Phase 2: the read route (``processing/read_fixed.py``) over a width-4 mini
+granule behind the ``_FakeH5`` stub (the ``test_read_vlen`` convention):
+synthesized link, ``axes`` layouts, offsets/index synthesis, the composite
+join, asset-sourced record coordinates, and dispatch.
 """
 
 import copy
+import logging
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from zagg.config import PipelineConfig, validate_config
+from zagg.processing.read import _read_group, link_base_extent
+from zagg.processing.read_fixed import (
+    fixed_link_arrays,
+    fixed_width_level,
+    flatten_axes,
+    synthesize_offsets,
+)
+from zagg.processing.read_vlen import _sibling_joined_values
+from zagg.read_plan import plan_read
 
 # ── GLAH01-shaped data_source (the issue #678 implementation spec) ───────────
 
@@ -61,12 +78,12 @@ def _fixed_ds(**extra):
     return ds
 
 
-def _cfg(ds):
+def _cfg(ds, source="rx_wf"):
     return PipelineConfig(
         data_source={"reader": "h5coro", "groups": ["Data_40HZ"], **ds},
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
-            "variables": {"count": {"function": "len", "source": "rx_wf"}},
+            "variables": {"count": {"function": "len", "source": source}},
         },
         output={"grid": {"type": "healpix", "parent_order": 9, "child_order": 18}},
     )
@@ -383,3 +400,587 @@ class TestBaseLevelCoordinateAxes:
         ds = _swath_ds()
         ds["variables"]["rx_wf"] = {"path": "/{group}/Radiance", "axes": ["record", "sample"]}
         _rejects(ds, "axes variables on the swath form .* arrive with the swath read path")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2 — the read route (``processing/read_fixed.py``)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# A five-record, width-4 mini-granule. Record coordinates live on the primary
+# (``_fx_arrays``) or come from a sibling through the composite join
+# (``_fx_sibling_arrays``); the waveform is stored record-first, transposed,
+# and as a two-band cube so every ``axes`` layout is pinned.
+#
+#   record  lat   flag  rng_start  key (a, b)
+#   0       10.0  0     100.0      (1, 0)
+#   1       11.0  0     200.0      (1, 1)
+#   2       12.0  1     300.0      (2, 0)   <- no sibling row
+#   3       13.0  0     400.0      (2, 1)
+#   4       14.0  0     500.0      (3, 0)
+
+WIDTH = 4
+N_REC = 5
+FX_LATS = np.array([10.0, 11.0, 12.0, 13.0, 14.0])
+FX_LONS = np.array([-100.0, -100.1, -100.2, -100.3, -100.4])
+FX_FLAG = np.array([0, 0, 1, 0, 0], dtype=np.uint8)
+FX_START = np.array([100.0, 200.0, 300.0, 400.0, 500.0])
+FX_GATE = np.array([0.0, 1.0, 3.0, 7.0])  # a piecewise offsets table, length WIDTH
+FX_KEY_A = np.array([1, 1, 2, 2, 3], dtype=np.int32)
+FX_KEY_B = np.array([0, 1, 0, 1, 0], dtype=np.int32)
+FX_WF = (np.arange(N_REC * WIDTH, dtype=np.float32) + 1000.0).reshape(N_REC, WIDTH)
+FX_TABLE = np.arange(N_REC * 6, dtype=np.float32).reshape(N_REC, 6)
+FX_FLAT = np.arange(N_REC * WIDTH, dtype=np.int16)
+
+
+class _FakeH5:
+    """Stub h5coro object: hyperslices slice dim 0 (trailing dims whole)."""
+
+    def __init__(self, arrays):
+        self._arrays = arrays
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        out = {}
+        for d in datasets:
+            if isinstance(d, str):
+                out[d] = self._arrays[d]
+                continue
+            path = d["dataset"]
+            arr = self._arrays[path]
+            lo, hi = d["hyperslice"][0]
+            out[path] = arr[lo:hi]
+        return out
+
+
+class _LatGrid:
+    """Shard 1 for lat >= 11.5, else 0 (leaf id == shard id)."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return (np.asarray(lats) >= 11.5).astype(np.uint64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.asarray(leaf_ids).astype(int)
+
+
+class _OneShardGrid:
+    @staticmethod
+    def assign(lats, lons):
+        return np.arange(len(lats), dtype=np.uint64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.zeros(len(leaf_ids), dtype=int)
+
+
+def _fx_arrays(group="G"):
+    return {
+        f"/{group}/wf": FX_WF,
+        f"/{group}/wf_T": np.ascontiguousarray(FX_WF.T),
+        f"/{group}/cube": np.stack([FX_WF, FX_WF + 100.0], axis=-1),
+        f"/{group}/flat": FX_FLAT,
+        f"/{group}/lat": FX_LATS,
+        f"/{group}/lon": FX_LONS,
+        f"/{group}/flag": FX_FLAG,
+        f"/{group}/rng_start": FX_START,
+        f"/{group}/gate": FX_GATE,
+        f"/{group}/table": FX_TABLE,
+        f"/{group}/key_a": FX_KEY_A,
+        f"/{group}/key_b": FX_KEY_B,
+    }
+
+
+def _fx_sibling_arrays(group="G"):
+    # Record 2 (key (2, 0)) has no sibling row; (9, 9) is a sibling-only row.
+    return {
+        f"/{group}/key_a": np.array([3, 1, 2, 1, 9], dtype=np.int32),
+        f"/{group}/key_b": np.array([0, 1, 1, 0, 9], dtype=np.int32),
+        f"/{group}/lat": np.array([14.0, 11.0, 13.0, 10.0, 99.0]),
+        f"/{group}/lon": np.array([-100.4, -100.1, -100.3, -100.0, 0.0]),
+        f"/{group}/qual": np.array([1, 1, 0, 1, 1], dtype=np.uint8),
+    }
+
+
+def _fx_ds(**extra):
+    ds = {
+        "coordinates": {"latitude": "/{group}/lat", "longitude": "/{group}/lon", "level": "recs"},
+        "variables": {
+            "wf": {"path": "/{group}/wf", "axes": ["record", "sample"]},
+            "rng": {
+                "synthesize": "offsets",
+                "level": "recs",
+                "start": "/{group}/rng_start",
+                "offsets": "/{group}/gate",
+                "scale": 0.5,
+            },
+            "sample_index": {"synthesize": "index", "level": "recs"},
+        },
+        "base_level": "samples",
+        "levels": {
+            "samples": {"path": "/{group}", "link": None},
+            "recs": {
+                "path": "/{group}",
+                "link": {"to": "samples", "width": WIDTH},
+                "variables": {"flag": "/{group}/flag"},
+            },
+        },
+    }
+    ds.update(extra)
+    return ds
+
+
+def _fx_planned_ds(**extra):
+    return _fx_ds(read_plan={"spatial_index": "recs", "pad": 0}, **extra)
+
+
+def _expected_rng(records):
+    return np.concatenate([FX_START[r] + FX_GATE * 0.5 for r in records])
+
+
+class TestFixedLinkArrays:
+    def test_extent_is_records_times_width(self):
+        ibeg, cnt = fixed_link_arrays(N_REC, WIDTH)
+        assert ibeg.tolist() == [0, 4, 8, 12, 16]
+        assert cnt.tolist() == [4] * 5
+        assert link_base_extent(ibeg, cnt, 0) == N_REC * WIDTH
+
+    def test_plan_read_slices_record_aligned(self):
+        ibeg, cnt = fixed_link_arrays(N_REC, WIDTH)
+        plan = plan_read(
+            FX_LATS, FX_LONS, ibeg, cnt, N_REC * WIDTH, pad=0, coarse_mask=FX_LATS >= 12.5
+        )
+        assert plan.base_slices == [(12, 20)]
+
+
+class TestFlattenAxes:
+    def test_record_sample_is_row_major(self):
+        np.testing.assert_array_equal(
+            flatten_axes(FX_WF, ["record", "sample"], WIDTH, "wf"), FX_WF.reshape(-1)
+        )
+
+    def test_sample_record_transposes(self):
+        np.testing.assert_array_equal(
+            flatten_axes(FX_WF.T, ["sample", "record"], WIDTH, "wf"), FX_WF.reshape(-1)
+        )
+
+    def test_integer_picks(self):
+        cube = np.stack([FX_WF, FX_WF + 100.0], axis=-1)
+        np.testing.assert_array_equal(
+            flatten_axes(cube, ["record", "sample", 1], WIDTH, "c"), FX_WF.reshape(-1) + 100.0
+        )
+        np.testing.assert_array_equal(
+            flatten_axes(np.moveaxis(cube, -1, 0), [0, "record", "sample"], WIDTH, "c"),
+            FX_WF.reshape(-1),
+        )
+
+    def test_rank_mismatch_raises(self):
+        with pytest.raises(ValueError, match="2-D but axes .* declares 3"):
+            flatten_axes(FX_WF, ["record", "sample", 0], WIDTH, "wf")
+
+    def test_width_mismatch_raises(self):
+        with pytest.raises(ValueError, match="'sample' axis has 4 entries but link.width is 5"):
+            flatten_axes(FX_WF, ["record", "sample"], 5, "wf")
+
+
+class TestSynthesizeOffsets:
+    def test_table_form(self):
+        parent = np.repeat(np.arange(2), WIDTH)
+        within = np.tile(np.arange(WIDTH), 2)
+        out = synthesize_offsets(FX_START, FX_GATE, 0.5, WIDTH, parent, within)
+        np.testing.assert_allclose(out, _expected_rng([0, 1]))
+
+    def test_step_form(self):
+        parent = np.array([0, 0, 0, 0])
+        within = np.arange(4)
+        out = synthesize_offsets(FX_START, -0.15, 1.0, WIDTH, parent, within)
+        np.testing.assert_allclose(out, 100.0 - 0.15 * np.arange(4))
+
+    def test_gap_rows_nan(self):
+        out = synthesize_offsets(FX_START, FX_GATE, 1.0, WIDTH, np.array([0, -1]), np.array([1, 0]))
+        assert out[0] == 101.0 and np.isnan(out[1])
+
+    def test_wrong_table_length_raises(self):
+        with pytest.raises(ValueError, match=r"shape \(3,\); expected a 1-D table of length"):
+            synthesize_offsets(FX_START, FX_GATE[:3], 1.0, WIDTH, np.array([0]), np.array([0]))
+
+
+class TestFixedReadGroup:
+    def test_full_read_gather_expand_synthesis(self):
+        df = _read_group(_FakeH5(_fx_arrays()), "G", _fx_ds(), 0, _OneShardGrid())
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF.reshape(-1))
+        np.testing.assert_allclose(df["rng"].to_numpy(), _expected_rng(range(N_REC)))
+        assert df["sample_index"].tolist() == list(range(WIDTH)) * N_REC
+        assert df["flag"].tolist() == np.repeat(FX_FLAG, WIDTH).tolist()
+        assert df["leaf_id"].tolist() == list(range(N_REC * WIDTH))
+
+    def test_planned_read_selects_shard_records(self):
+        io_stats = {}
+        df = _read_group(
+            _FakeH5(_fx_arrays()), "G", _fx_planned_ds(), 1, _LatGrid(), io_stats=io_stats
+        )
+        # Shard 1 = records 2, 3, 4 (lat >= 11.5); pad 0 -> rows 8..20 only.
+        assert io_stats["obs_read"] == 12
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF[2:].reshape(-1))
+        np.testing.assert_allclose(df["rng"].to_numpy(), _expected_rng([2, 3, 4]))
+
+    def test_planned_read_touches_only_the_shards_rows(self):
+        reads = []
+
+        class _Spy(_FakeH5):
+            def readDatasets(self, datasets):  # noqa: N802
+                for d in datasets:
+                    if isinstance(d, dict):
+                        reads.append((d["dataset"], d["hyperslice"]))
+                return super().readDatasets(datasets)
+
+        _read_group(_Spy(_fx_arrays()), "G", _fx_planned_ds(), 1, _LatGrid())
+        # The 2-D waveform is sliced by RECORD rows (2..5), never read whole.
+        assert ("/G/wf", [(2, 5)]) in reads
+
+    def test_planned_matches_full(self):
+        for shard in (0, 1):
+            full = _read_group(_FakeH5(_fx_arrays()), "G", _fx_ds(), shard, _LatGrid())
+            planned = _read_group(_FakeH5(_fx_arrays()), "G", _fx_planned_ds(), shard, _LatGrid())
+            pd.testing.assert_frame_equal(full, planned)
+
+    def test_empty_shard_returns_none(self):
+        io_stats = {}
+        assert (
+            _read_group(
+                _FakeH5(_fx_arrays()), "G", _fx_planned_ds(), 7, _LatGrid(), io_stats=io_stats
+            )
+            is None
+        )
+        assert io_stats["obs_read"] == 0
+
+    def test_transposed_variable_reads_whole_with_a_notice(self, caplog):
+        ds = _fx_planned_ds()
+        ds["variables"]["wf"] = {"path": "/{group}/wf_T", "axes": ["sample", "record"]}
+        reads = []
+
+        class _Spy(_FakeH5):
+            def readDatasets(self, datasets):  # noqa: N802
+                reads.extend(d if isinstance(d, str) else d["dataset"] for d in datasets)
+                return super().readDatasets(datasets)
+
+        with caplog.at_level(logging.INFO, logger="zagg.processing.read_fixed"):
+            df = _read_group(_Spy(_fx_arrays()), "G", ds, 1, _LatGrid())
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF[2:].reshape(-1))
+        assert "/G/wf_T" in reads  # a whole read, not a hyperslice
+        assert "is read whole" in caplog.text
+
+    def test_band_pick_on_a_cube(self):
+        ds = _fx_ds()
+        ds["variables"]["wf"] = {"path": "/{group}/cube", "axes": ["record", "sample", 1]}
+        ds["variables"]["band0"] = {"path": "/{group}/cube", "axes": ["record", "sample", 0]}
+        df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF.reshape(-1) + 100.0)
+        np.testing.assert_array_equal(df["band0"].to_numpy(), FX_WF.reshape(-1))
+
+    @pytest.mark.parametrize("ds_fn", [_fx_ds, _fx_planned_ds])
+    def test_width_mismatch_raises_before_aggregation(self, ds_fn):
+        ds = ds_fn()
+        ds["levels"]["recs"]["link"]["width"] = 5
+        with pytest.raises(ValueError, match="but link.width is 5"):
+            _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+
+    @pytest.mark.parametrize("ds_fn", [_fx_ds, _fx_planned_ds])
+    def test_rank_mismatch_raises(self, ds_fn):
+        ds = ds_fn()
+        ds["variables"]["wf"]["axes"] = ["record", "sample", 0]
+        with pytest.raises(ValueError, match="2-D but axes"):
+            _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+
+    def test_full_read_record_count_mismatch_raises(self):
+        arrays = _fx_arrays()
+        arrays["/G/wf"] = FX_WF[:3]
+        with pytest.raises(ValueError, match="flattens to 12 rows but the coordinates level has 5"):
+            _read_group(_FakeH5(arrays), "G", _fx_ds(), 0, _OneShardGrid())
+
+    def test_flat_base_rate_variable_rides_the_synthesized_link(self):
+        ds = _fx_planned_ds()
+        ds["variables"]["flat"] = "/{group}/flat"
+        df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 1, _LatGrid())
+        assert df["flat"].tolist() == list(range(8, 20))
+
+    def test_index_synthesis_drops_padding_via_expression(self):
+        # Records with flag == 1 carry 2 valid samples of 4; the others all 4.
+        ds = _fx_ds(filters=[{"expression": "sample_index < np.where(flag == 1, 2, 4)"}])
+        df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+        assert len(df) == 4 * WIDTH + 2
+        assert df["sample_index"][df["flag"] == 1].tolist() == [0, 1]
+
+    def test_record_level_filter_expands(self):
+        ds = _fx_planned_ds(
+            filters=[{"level": "recs", "dataset": "/{group}/flag", "op": "eq", "value": 0}]
+        )
+        df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 1, _LatGrid())
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF[3:].reshape(-1))
+
+    def test_record_level_table_column(self):
+        ds = _fx_ds()
+        ds["levels"]["recs"]["variables"]["wt5"] = {"path": "/{group}/table", "column": 5}
+        df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+        np.testing.assert_array_equal(df["wt5"].to_numpy(), np.repeat(FX_TABLE[:, 5], WIDTH))
+
+    def test_linspace_still_works_under_a_width_link(self):
+        ds = _fx_ds()
+        ds["variables"]["rng"] = {
+            "synthesize": "linspace",
+            "level": "recs",
+            "start": "/{group}/rng_start",
+            "stop": "/{group}/rng_start",
+        }
+        df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+        np.testing.assert_allclose(df["rng"].to_numpy(), np.repeat(FX_START, WIDTH))
+
+    def test_offsets_step_form(self):
+        ds = _fx_ds()
+        ds["variables"]["rng"]["offsets"] = -0.15
+        del ds["variables"]["rng"]["scale"]
+        df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+        np.testing.assert_allclose(
+            df["rng"].to_numpy(), np.concatenate([s - 0.15 * np.arange(WIDTH) for s in FX_START])
+        )
+
+    def test_width_auto_is_refused_at_read_time(self):
+        ds = _fx_ds()
+        ds["levels"]["recs"]["link"]["width"] = "auto"
+        with pytest.raises(ValueError, match="'auto' is not readable yet"):
+            _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+
+    def test_spatial_index_must_name_the_coordinates_level(self):
+        ds = _fx_ds(read_plan={"spatial_index": "samples"})
+        with pytest.raises(ValueError, match="must name the coordinates level"):
+            _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+
+    def test_arrow_output(self):
+        table = _read_group(_FakeH5(_fx_arrays()), "G", _fx_ds(), 0, _OneShardGrid(), arrow=True)
+        assert table.num_rows == N_REC * WIDTH
+
+
+def _fx_join_ds(**extra):
+    return _fx_ds(
+        assets={
+            "sib": {
+                "join": {
+                    "left": ["/{group}/key_a", "/{group}/key_b"],
+                    "right": ["/{group}/key_a", "/{group}/key_b"],
+                }
+            }
+        },
+        **extra,
+    )
+
+
+class TestCompositeJoinRead:
+    def test_asset_filter_joins_on_the_tuple(self):
+        ds = _fx_join_ds(
+            filters=[{"asset": "sib", "dataset": "/{group}/qual", "op": "eq", "value": 1}]
+        )
+        df = _read_group(
+            _FakeH5(_fx_arrays()),
+            "G",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"sib": _FakeH5(_fx_sibling_arrays())},
+        )
+        # Record 2 has no sibling row (fails closed); record 3's qual is 0.
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF[[0, 1, 4]].reshape(-1))
+
+    def test_a_single_key_would_mismatch(self):
+        # key_a alone is NOT unique on the sibling: the composite is what makes
+        # the join a join.
+        ds = _fx_join_ds(
+            filters=[{"asset": "sib", "dataset": "/{group}/qual", "op": "eq", "value": 1}]
+        )
+        ds["assets"]["sib"]["join"] = {"left": "/{group}/key_a", "right": "/{group}/key_a"}
+        with pytest.raises(ValueError, match="duplicate key"):
+            _read_group(
+                _FakeH5(_fx_arrays()),
+                "G",
+                ds,
+                0,
+                _OneShardGrid(),
+                siblings={"sib": _FakeH5(_fx_sibling_arrays())},
+            )
+
+    def test_asset_variable_through_the_composite_join(self):
+        ds = _fx_join_ds()
+        ds["levels"]["recs"]["variables"]["qual"] = {"asset": "sib", "path": "/{group}/qual"}
+        df = _read_group(
+            _FakeH5(_fx_arrays()),
+            "G",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"sib": _FakeH5(_fx_sibling_arrays())},
+        )
+        q = df["qual"].to_numpy()
+        np.testing.assert_array_equal(q[[0, 4, 12, 16]], [1, 1, 0, 1])
+        assert np.isnan(q[8:12]).all()  # record 2: no sibling row
+
+    def test_joined_values_unit(self):
+        values, matched = _sibling_joined_values(
+            _FakeH5(_fx_sibling_arrays()),
+            "G",
+            "sib",
+            _fx_join_ds()["assets"]["sib"],
+            N_REC,
+            ["/G/qual"],
+            lambda paths: {p: _fx_arrays()[p] for p in paths},
+        )
+        assert matched.tolist() == [True, True, False, True, True]
+        assert values["/G/qual"][[0, 1, 3, 4]].tolist() == [1, 1, 0, 1]
+
+    def test_duplicate_composite_keys_raise(self):
+        sib = _fx_sibling_arrays()
+        sib["/G/key_a"][4], sib["/G/key_b"][4] = 1, 0  # duplicates (1, 0)
+        ds = _fx_join_ds(
+            filters=[{"asset": "sib", "dataset": "/{group}/qual", "op": "eq", "value": 1}]
+        )
+        with pytest.raises(ValueError, match="duplicate key"):
+            _read_group(
+                _FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid(), siblings={"sib": _FakeH5(sib)}
+            )
+
+
+def _fx_sibling_coord_ds(**extra):
+    ds = _fx_join_ds(**extra)
+    ds["coordinates"] = {
+        "latitude": {"asset": "sib", "path": "/{group}/lat"},
+        "longitude": {"asset": "sib", "path": "/{group}/lon"},
+        "level": "recs",
+    }
+    return ds
+
+
+class TestAssetSourcedCoordinates:
+    def test_validates(self):
+        validate_config(_cfg(_fx_sibling_coord_ds(), source="wf"))
+
+    def test_requires_a_declared_asset(self):
+        ds = _fx_sibling_coord_ds()
+        ds["coordinates"]["latitude"]["asset"] = "nope"
+        _rejects(ds, "not declared in data_source.assets")
+
+    def test_requires_the_vlen_route(self):
+        ds = _fx_sibling_coord_ds()
+        del ds["coordinates"]["level"]
+        ds["variables"] = {"wf": "/{group}/wf"}
+        _rejects(ds, "require coordinates.level")
+
+    def test_both_coordinates_share_the_form(self):
+        ds = _fx_sibling_coord_ds()
+        ds["coordinates"]["longitude"] = "/{group}/lon"
+        _rejects(ds, "both be plain paths or both")
+
+    def test_full_read_places_records_by_the_sibling(self):
+        df = _read_group(
+            _FakeH5(_fx_arrays()),
+            "G",
+            _fx_sibling_coord_ds(),
+            1,
+            _LatGrid(),
+            siblings={"sib": _FakeH5(_fx_sibling_arrays())},
+        )
+        # Shard 1 = lat >= 11.5 by the SIBLING's lat: records 3 and 4 (record 2
+        # has no sibling row and so no position).
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF[3:].reshape(-1))
+
+    def test_planned_matches_full(self):
+        kw = {"siblings": {"sib": _FakeH5(_fx_sibling_arrays())}}
+        full = _read_group(_FakeH5(_fx_arrays()), "G", _fx_sibling_coord_ds(), 0, _LatGrid(), **kw)
+        planned = _read_group(
+            _FakeH5(_fx_arrays()),
+            "G",
+            _fx_sibling_coord_ds(read_plan={"spatial_index": "recs", "pad": 0}),
+            0,
+            _LatGrid(),
+            **kw,
+        )
+        pd.testing.assert_frame_equal(full, planned)
+        np.testing.assert_array_equal(full["wf"].to_numpy(), FX_WF[:2].reshape(-1))
+
+    def test_missing_sibling_fails_the_group(self):
+        with pytest.raises(ValueError, match="which sources coordinates.latitude"):
+            _read_group(_FakeH5(_fx_arrays()), "G", _fx_sibling_coord_ds(), 0, _OneShardGrid())
+
+    def test_the_join_is_shared_with_other_consumers(self, monkeypatch):
+        import zagg.processing.read_vlen as rv
+
+        calls = []
+        real = rv._sibling_joined_values
+
+        def _spy(*args, **kwargs):
+            calls.append(args[2])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rv, "_sibling_joined_values", _spy)
+        ds = _fx_sibling_coord_ds(
+            filters=[{"asset": "sib", "dataset": "/{group}/qual", "op": "eq", "value": 1}]
+        )
+        ds["levels"]["recs"]["variables"]["qual"] = {"asset": "sib", "path": "/{group}/qual"}
+        _read_group(
+            _FakeH5(_fx_arrays()),
+            "G",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"sib": _FakeH5(_fx_sibling_arrays())},
+        )
+        assert calls == ["sib"]
+
+
+class TestDispatch:
+    def test_gedi_template_never_enters_the_fixed_route(self, monkeypatch):
+        import zagg.processing.read_fixed as rf
+        from zagg.config import default_config
+
+        monkeypatch.setattr(rf, "_fixed_read_group", lambda *a, **k: pytest.fail("fixed route"))
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        assert fixed_width_level(cfg.data_source) is None
+        # The vlen route is reached: its first record-level read fails on the
+        # empty stub, which is the KeyError the ragged route raises.
+        with pytest.raises(KeyError, match="latitude_bin0"):
+            _read_group(_FakeH5({}), "BEAM0000", cfg.data_source, 0, _OneShardGrid())
+
+    def test_windowing_rejects_an_axes_time_field(self):
+        cfg = _cfg(_fx_ds(), source="wf")
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "wf",
+            "epoch": "2003-01-01T00:00:00Z",
+        }
+        with pytest.raises(ValueError, match="is an 'axes' or 'synthesize' variable"):
+            validate_config(cfg)
+
+    def test_the_swath_form_is_refused_at_read_time(self):
+        ds = _swath_ds()
+        with pytest.raises(ValueError, match="swath"):
+            _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
+
+    def test_inline_prebuild_covers_the_fixed_read_set(self, monkeypatch):
+        import zagg.index.inline as inline_mod
+        from zagg.index.inline import InlineIndex
+
+        arrays = _fx_arrays()
+        built = []
+
+        def _spy(h5obj, path):
+            arrays[path]  # a dataset this granule does not hold raises, as a real walk does
+            built.append(path)
+            return object()
+
+        monkeypatch.setattr(inline_mod, "build_chunk_map", _spy)
+        h5obj = _FakeH5(arrays)
+        h5obj.resource = "s3://bucket/GLAH01_granule.H5"
+        idx = InlineIndex(write_back=True, store="s3://bucket/manifests")
+        ds = _fx_sibling_coord_ds(read_plan={"spatial_index": "recs"})
+        idx._prebuild_group_maps(h5obj, "G", ds)
+        assert {"/G/wf", "/G/rng_start", "/G/gate"} <= set(built)
+        # Sibling-sourced coordinates and the join keys live in the paired
+        # granule, which this backend never opens.
+        assert not any("key" in p or p.endswith(("/lat", "/lon")) for p in built)

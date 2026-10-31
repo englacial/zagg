@@ -145,6 +145,17 @@ def _validate_windowing(config: PipelineConfig) -> None:
             f"base-rate data_source column (one of {sorted(declared)}); the "
             f"worker filters per observation on variable columns it reads"
         )
+    entry = (ds.get("variables") or {}).get(time_field)
+    if isinstance(entry, dict) and ("axes" in entry or "synthesize" in entry):
+        # The window predicate is a base-rate structured filter on the
+        # field's dataset (``window_time_filters``); an N-D ``axes`` dataset
+        # or a synthesized column has no such 1-D dataset to filter (issue
+        # #678). A fixed-width product's clock is record-rate, which the
+        # segment-rate rule above already declines.
+        raise ValueError(
+            f"output.windowing.time_field {time_field!r} is an 'axes' or 'synthesize' "
+            f"variable; the window filter needs a flat base-rate dataset path"
+        )
     epoch = block.get("epoch")
     if epoch is None:
         raise ValueError(

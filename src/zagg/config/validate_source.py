@@ -425,37 +425,62 @@ def _width_level(data_source: dict) -> str | None:
 
 
 def _validate_base_coordinates(data_source: dict, coord_level, width_level) -> None:
-    """``coordinates.latitude``/``longitude`` as ``{path, axes}`` mappings (issue #678).
+    """``coordinates.latitude``/``longitude`` mapping forms (issue #678).
 
-    The swath form: the base level's coordinates are N-D datasets flattened by
-    the ``axes`` rule. Both coordinates take the same form, the mapping form
-    needs a width link, and it excludes ``coordinates.level`` (coordinates
-    either live at the base level or expand from a record level — never both).
-    Science variables on this form stay plain reads for now: an ``axes``
-    variable here is rejected until the swath read path (the issue #678
-    follow-up) lands.
+    Two mapping forms, both coordinates always in the same one:
+
+    - ``{path, axes}`` — the swath form: the base level's coordinates are N-D
+      datasets flattened by the ``axes`` rule. Needs a width link and excludes
+      ``coordinates.level`` (coordinates either live at the base level or
+      expand from a record level — never both). Science variables on this
+      form stay plain reads for now: an ``axes`` variable here is rejected
+      until the swath read path (the issue #678 follow-up) lands.
+    - ``{asset, path}`` — record coordinates joined from a sibling asset
+      (GLAH01 carries no 40 Hz geolocation; GLAH05/06 do). Requires
+      ``coordinates.level`` (the join is keyed to its records) and a declared
+      asset.
     """
     coords = data_source.get("coordinates")
     if not isinstance(coords, dict):
         return
-    mapped = []
+    mapped: dict[str, str] = {}
     for key in ("latitude", "longitude"):
         entry = coords.get(key)
         if not isinstance(entry, dict):
             continue
         where = f"data_source.coordinates.{key}"
+        if "asset" in entry:
+            if set(entry) != {"asset", "path"} or not all(
+                isinstance(entry[k], str) and entry[k] for k in ("asset", "path")
+            ):
+                raise ValueError(f"{where}: the asset form takes exactly 'asset' and 'path'")
+            assets = data_source.get("assets")
+            if not isinstance(assets, dict) or entry["asset"] not in assets:
+                raise ValueError(
+                    f"{where}: asset {entry['asset']!r} is not declared in data_source.assets "
+                    f"(available: {sorted(assets) if isinstance(assets, dict) else []})"
+                )
+            mapped[key] = "asset"
+            continue
         extra = set(entry) - {"path", "axes"}
         if extra or not isinstance(entry.get("path"), str) or "axes" not in entry:
             raise ValueError(f"{where}: the mapping form takes exactly 'path' and 'axes'")
         _validate_axes(where, entry["axes"])
-        mapped.append(key)
+        mapped[key] = "axes"
     if not mapped:
         return
-    if len(mapped) != 2:
+    if len(mapped) != 2 or len(set(mapped.values())) != 1:
         raise ValueError(
             "data_source.coordinates: latitude and longitude must both be plain paths "
-            "or both {path, axes} mappings"
+            "or both the same mapping form ({path, axes} or {asset, path})"
         )
+    if set(mapped.values()) == {"asset"}:
+        if coord_level is None:
+            raise ValueError(
+                "data_source.coordinates: {asset, path} coordinates require coordinates.level "
+                "(the sibling join is keyed to that level's records)"
+            )
+        return
     if coord_level is not None:
         raise ValueError(
             "data_source.coordinates: {path, axes} coordinates are base-level and "
@@ -547,7 +572,8 @@ def _validate_vlen_source(data_source: dict) -> None:
             # Fixed-width flatten (issue #678): the record axis is the
             # coordinates level's, so ``axes`` needs that level's link to be
             # the width form — a ragged link has no constant sample axis.
-            if isinstance(coords, dict) and isinstance(coords.get("latitude"), dict):
+            lat = coords.get("latitude") if isinstance(coords, dict) else None
+            if isinstance(lat, dict) and "axes" in lat:
                 raise ValueError(
                     f"{where}: axes variables on the swath form ({{path, axes}} base-level "
                     "coordinates) arrive with the swath read path, the issue #678 "
@@ -608,7 +634,7 @@ def _validate_vlen_source(data_source: dict) -> None:
             if not isinstance(lvl_vars, dict):
                 continue
             for var_name, entry in lvl_vars.items():
-                if not isinstance(entry, dict):
+                if not isinstance(entry, dict) or "asset" not in entry:
                     continue
                 where = f"levels.{lvl_name}.variables['{var_name}']"
                 if coord_level is None:
@@ -682,7 +708,28 @@ def _validate_overviews(data_source: dict) -> None:
                     raise ValueError(
                         f"levels.{name}.variables: variable names must be non-empty strings"
                     )
-                if isinstance(tmpl, dict):
+                if isinstance(tmpl, dict) and "asset" not in tmpl:
+                    # Record-level table column (issue #678): ``{path, column}``
+                    # selects one column of an ``[n_records, k]`` dataset
+                    # (GLAH01 ``i_wt_fact_filt [n, 6]``) — the record-level
+                    # twin of the base-level column form, never ``axes``.
+                    unknown = set(tmpl) - {"path", "column"}
+                    if unknown or "column" not in tmpl:
+                        raise ValueError(
+                            f"levels.{name}.variables.{var_name}: a mapping is either "
+                            f"{{asset, path}} or {{path, column}} (got keys {sorted(tmpl)})"
+                        )
+                    if not isinstance(tmpl.get("path"), str) or not tmpl["path"]:
+                        raise ValueError(
+                            f"levels.{name}.variables.{var_name}.path must be a non-empty string"
+                        )
+                    column = tmpl["column"]
+                    if not isinstance(column, int) or isinstance(column, bool) or column < 0:
+                        raise ValueError(
+                            f"levels.{name}.variables.{var_name}.column must be an integer "
+                            f">= 0 (got {column!r})"
+                        )
+                elif isinstance(tmpl, dict):
                     # Asset-sourced record-level variable (issue #464): the
                     # dataset is read from the named sibling asset's handle and
                     # joined per record on the declared ``assets.<name>.join``
