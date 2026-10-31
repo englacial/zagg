@@ -74,6 +74,31 @@ class _FakeH5:
         return out
 
 
+class _Promise:
+    """An ``h5coro.h5promise.H5Promise`` lookalike: ``keys``, ``__getitem__``
+    and ``__iter__`` only — no ``.values()`` / ``.items()`` (PR #680 review)."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def keys(self):
+        return self._data.keys()
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+
+class _PromiseH5(_FakeH5):
+    """``_FakeH5`` whose ``readDatasets`` returns a :class:`_Promise`, as a real
+    h5coro handle does."""
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        return _Promise(super().readDatasets(datasets))
+
+
 class _LatGrid:
     """Grid stub: shard key 1 for lat >= 11.5, else 0 (leaf id == shard id)."""
 
@@ -504,6 +529,26 @@ class TestSiblingAssetJoin:
         )
         assert sorted(set(df["shot_number"].tolist())) == [101, 104]
         assert len(df) == 9
+
+    def test_join_reads_through_an_h5promise(self):
+        # The hierarchical backend hands the route the raw ``readDatasets``
+        # result, an ``H5Promise`` with no ``.values()``: the left key must be
+        # indexed by path (PR #680 review). Planned arm, so only the join reads
+        # a whole multi-path result.
+        ds = _l2a_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}],
+        )
+        df = _read_group(
+            _PromiseH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _LatGrid(),
+            siblings={"l2a": _PromiseH5(_l2a_arrays())},
+        )
+        # Shard 0 = shots 101 + 102; 102 fails quality_flag.
+        assert df["shot_number"].tolist() == [101] * 5
 
     def test_join_multiple_predicates_anded(self):
         ds = _l2a_ds(

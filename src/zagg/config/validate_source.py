@@ -507,6 +507,8 @@ def _validate_join_keys(where: str, join: dict) -> None:
         if isinstance(value, list):
             if not value or not all(isinstance(v, str) and v for v in value):
                 raise ValueError(f"{where}.{side} must be a non-empty list of dataset paths")
+            if len(set(value)) != len(value):
+                raise ValueError(f"{where}.{side}: composite key paths must be distinct")
         elif not isinstance(value, str) or not value:
             raise ValueError(f"{where}.{side} must be a non-empty string")
         sides[side] = value

@@ -856,7 +856,10 @@ def _sibling_joined_values(
     left_paths = _join_key_paths(join["left"], group)
     right_paths = _join_key_paths(join["right"], group)
     right_path = right_paths[0] if len(right_paths) == 1 else tuple(right_paths)
-    left_keys = _composite_key([np.asarray(a) for a in read_full(left_paths).values()])
+    # Index by path: h5coro's ``H5Promise`` (what ``readDatasets`` returns on a
+    # real handle) has ``__getitem__`` and ``keys`` but no ``.values()``.
+    left_data = read_full(left_paths)
+    left_keys = _composite_key([np.asarray(left_data[p]) for p in left_paths])
     sib_paths = list(right_paths) + list(dataset_paths)
     sib_data = sibling.readDatasets(list(dict.fromkeys(sib_paths)))
     right_keys = _composite_key([np.asarray(sib_data[p]) for p in right_paths])

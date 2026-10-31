@@ -334,6 +334,12 @@ class TestCompositeJoin:
         ds["assets"]["glah05"]["join"]["left"] = bad
         _rejects(ds, "must be a non-empty list of dataset paths")
 
+    @pytest.mark.parametrize("side", ["left", "right"])
+    def test_repeated_key_paths_rejected(self, side):
+        ds = _fixed_ds()
+        ds["assets"]["glah05"]["join"][side] = ["/{group}/Time/i_rec_ndx"] * 2
+        _rejects(ds, f"join.{side}: composite key paths must be distinct")
+
     def test_unknown_join_keys_rejected(self):
         ds = _fixed_ds()
         ds["assets"]["glah05"]["join"]["on"] = "/x"
