@@ -123,10 +123,10 @@ def _resolve_bbox(region) -> tuple[float, float, float, float]:
 
 
 #: Data-asset href suffixes ``_normalize_assets`` keeps (matched on the
-#: lowercased href): HDF5 (``.h5``, ``.he5``), netCDF (``.nc``, ``.nc4``) and
+#: lowercased href): HDF5 (``.h5``, ``.hdf5``, ``.he5``), netCDF (``.nc``, ``.nc4``) and
 #: HDF4 (``.hdf``). Which of them the read path can *decode* is the reader's
 #: and index backend's business, not the catalog's (issue #682).
-_DATA_SUFFIXES = (".h5", ".nc", ".nc4", ".hdf", ".he5")
+_DATA_SUFFIXES = (".h5", ".hdf5", ".nc", ".nc4", ".hdf", ".he5")
 
 
 def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
@@ -144,22 +144,35 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     :data:`_DATA_SUFFIXES`, compared case-insensitively (issue #682): CMR
     serves netCDF products as ``.nc`` / ``.nc4``, GLAS as uppercase ``.H5``
     (issue #678), HDF4/HDF-EOS5 as ``.hdf`` / ``.he5`` -- the lowercase
-    ``.h5`` match this started with dropped them all silently.
+    ``.h5`` match this started with dropped them all silently. An item whose
+    ``data``-role assets all miss the list is logged with their suffixes, so
+    the next unlisted extension shows up at catalog time.
 
     With ``preserve_thumbnails`` the original ``thumbnail_*``/``browse`` assets
     are kept verbatim (their keys are already stable) for a future
     shardmap-vs-footprint viewer; by default they are dropped.
     """
     out: dict = {}
+    missed: list[str] = []
     for key, asset in item.get("assets", {}).items():
         roles = asset.get("roles") or []
         href = asset.get("href", "")
         if "data" in roles and href.lower().endswith(_DATA_SUFFIXES):
             out["data" if href.startswith("https") else "data_s3"] = asset
+        elif "data" in roles:
+            missed.append(href)
         elif "metadata" in roles:
             out["metadata"] = asset
         elif preserve_thumbnails and ("thumbnail" in roles or "browse" in roles):
             out[key] = asset
+    if missed and "data" not in out and "data_s3" not in out:
+        suffixes = sorted({"." + h.rsplit("/", 1)[-1].rpartition(".")[2] for h in missed})
+        logging.warning(
+            "item %s: no data asset kept; data-role hrefs end in %s, none in %s",
+            item.get("id"),
+            suffixes,
+            _DATA_SUFFIXES,
+        )
     item = dict(item)
     item["assets"] = out
     return item

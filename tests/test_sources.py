@@ -549,7 +549,7 @@ class TestNormalizeAssets:
         assert out["data"]["href"] == "https://h/g.h5"
         assert out["data_s3"]["href"] == "s3://b/g.h5"
 
-    @pytest.mark.parametrize("ext", [".nc", ".nc4", ".hdf", ".he5"])
+    @pytest.mark.parametrize("ext", [".hdf5", ".nc", ".nc4", ".hdf", ".he5"])
     def test_other_data_suffixes_survive(self, ext):
         out = self._norm(f"https://h/g{ext}", f"s3://b/g{ext}")
         assert out["data"]["href"].endswith(ext)
@@ -568,6 +568,20 @@ class TestNormalizeAssets:
         out = self._norm("https://h/g.tar", "s3://b/g.tar")
         assert "data" not in out and "data_s3" not in out
         assert set(out) == {"metadata"}
+
+    def test_all_data_assets_dropped_warns(self, caplog):
+        # A silent drop surfaces only later as a ShardMap entry with no href.
+        with caplog.at_level(logging.WARNING):
+            self._norm("https://h/g.tar", "s3://b/g.TAR")
+        (msg,) = [r.getMessage() for r in caplog.records]
+        assert "item g:" in msg and "['.TAR', '.tar']" in msg
+
+    def test_kept_data_asset_does_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            self._norm(
+                "https://h/g.nc", "s3://b/g.nc", side={"href": "s3://b/g.tar", "roles": ["data"]}
+            )
+        assert not caplog.records
 
     def test_non_data_role_with_data_suffix_dropped(self):
         out = self._norm(
