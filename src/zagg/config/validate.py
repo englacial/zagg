@@ -55,7 +55,7 @@ def validate_config(config: PipelineConfig) -> None:
 
     # The optional top-level worker block (issue #235) selects a
     # pre-provisioned Lambda size variant on any pipeline kind, so it is
-    # validated before the kind branch, like credentials_provider above.
+    # validated before the kind branch, like the grammar pass above.
     _validate_worker(config)
 
     # The time coordinate's encoding (spec §8, issue #443) is checked on every
