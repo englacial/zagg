@@ -569,6 +569,27 @@ class TestNormalizeAssets:
         assert "data" not in out and "data_s3" not in out
         assert set(out) == {"metadata"}
 
+    def test_http_asset_does_not_clobber_s3(self):
+        # Plain ``http://`` once fell through to ``data_s3`` and, iterated last,
+        # overwrote the real S3 href.
+        out = self._norm("s3://b/g.nc", "http://h/g.nc")
+        assert out["data_s3"]["href"] == "s3://b/g.nc"
+        assert out["data"]["href"] == "http://h/g.nc"
+
+    def test_scheme_match_is_case_insensitive(self):
+        out = self._norm("HTTPS://h/g.nc", "S3://b/g.nc")
+        assert out["data"]["href"] == "HTTPS://h/g.nc"
+        assert out["data_s3"]["href"] == "S3://b/g.nc"
+
+    def test_unknown_scheme_skipped_and_logged(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            out = self._norm(
+                "https://h/g.nc", "s3://b/g.nc", ftp={"href": "ftp://f/g.nc", "roles": ["data"]}
+            )
+        assert out["data_s3"]["href"] == "s3://b/g.nc"
+        (msg,) = [r.getMessage() for r in caplog.records]
+        assert "ftp://f/g.nc" in msg and "'ftp'" in msg
+
     def test_all_data_assets_dropped_warns(self, caplog):
         # A silent drop surfaces only later as a ShardMap entry with no href.
         with caplog.at_level(logging.WARNING):

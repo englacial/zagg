@@ -136,8 +136,11 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     full object path), which would explode a geoparquet struct schema. We map
     them to stable keys instead, keeping both endpoints:
 
-    - ``data``     : the HTTPS data asset,
+    - ``data``     : the HTTP(S) data asset,
     - ``data_s3``  : the S3 data asset,
+
+    routed on the lowercased href scheme (``s3`` vs ``http``/``https``); a data
+    asset on any other scheme (``ftp``, ...) is logged and skipped.
     - ``metadata`` : the metadata-role asset.
 
     A ``data``-role asset counts when its href ends in one of
@@ -158,7 +161,15 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
         roles = asset.get("roles") or []
         href = asset.get("href", "")
         if "data" in roles and href.lower().endswith(_DATA_SUFFIXES):
-            out["data" if href.startswith("https") else "data_s3"] = asset
+            scheme = href.split("://", 1)[0].lower()
+            if scheme == "s3":
+                out["data_s3"] = asset
+            elif scheme in ("http", "https"):
+                out["data"] = asset
+            else:
+                logging.warning(
+                    "item %s: skipping data asset %s (scheme %r)", item.get("id"), href, scheme
+                )
         elif "data" in roles:
             missed.append(href)
         elif "metadata" in roles:
