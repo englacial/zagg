@@ -968,6 +968,52 @@ class TestDispatch:
         with pytest.raises(ValueError, match="swath"):
             _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
 
+    @staticmethod
+    def _stub_read_fn(monkeypatch, arrays, reads):
+        """Swap InlineIndex's compiled seam for a plain-array ``read_fn``."""
+        from zagg.index.inline import InlineIndex
+
+        def _factory(self, h5obj, *, planned=True):
+            def read_fn(path, hyperslice=None):
+                reads.append((path, hyperslice))
+                arr = arrays[path]
+                return arr if hyperslice is None else arr[slice(*hyperslice[0])]
+
+            read_fn.deferred_lines = set()
+            return read_fn
+
+        monkeypatch.setattr(InlineIndex, "_chunk_aligned_read_fn", _factory)
+
+    @pytest.mark.parametrize("ds_fn", [_fx_ds, _fx_planned_ds])
+    def test_inline_backend_reaches_the_fixed_route(self, monkeypatch, ds_fn):
+        # PR #680 review: InlineIndex.read_group has its own coordinates.level
+        # dispatch, which sent every record-level source to the vlen route
+        # (KeyError 'index_beg' on a width link). It must mirror _read_group's.
+        from zagg.index.inline import InlineIndex
+
+        reads = []
+        self._stub_read_fn(monkeypatch, _fx_arrays(), reads)
+        df = InlineIndex().read_group(_FakeH5(_fx_arrays()), "G", ds_fn(), 1, _LatGrid())
+        ref = _read_group(_FakeH5(_fx_arrays()), "G", ds_fn(), 1, _LatGrid())
+        pd.testing.assert_frame_equal(df, ref)
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF[2:].reshape(-1))
+        if ds_fn is _fx_planned_ds:
+            # The 2-D waveform's record rows go through the compiled seam.
+            assert ("/G/wf", [(2, 5)]) in reads
+
+    def test_inline_backend_keeps_vlen_sources_on_the_vlen_route(self, monkeypatch):
+        import zagg.processing.read_fixed as rf
+        import zagg.processing.read_vlen as rv
+        from zagg.index.inline import InlineIndex
+
+        ds = _fx_ds()
+        ds["levels"]["recs"]["link"] = {"to": "samples", "index_beg": "/x", "count": "/y"}
+        sentinel = object()
+        monkeypatch.setattr(rf, "_fixed_read_group", lambda *a, **k: pytest.fail("fixed route"))
+        monkeypatch.setattr(rv, "_vlen_read_group", lambda *a, **k: sentinel)
+        self._stub_read_fn(monkeypatch, {}, [])
+        assert InlineIndex().read_group(_FakeH5({}), "G", ds, 0, _OneShardGrid()) is sentinel
+
     def test_inline_prebuild_covers_the_fixed_read_set(self, monkeypatch):
         import zagg.index.inline as inline_mod
         from zagg.index.inline import InlineIndex

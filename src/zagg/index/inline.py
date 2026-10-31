@@ -837,9 +837,17 @@ class InlineIndex(VirtualIndex):
         # Vlen-packed sources (issue #425) take their own route, which owns
         # the record-expansion and planned/full arms; the compiled read_fn
         # rides along so the flat base datasets still decode through it.
+        # A fixed-width coordinates level (issue #678) takes the fixed route
+        # instead — the same dispatch as ``zagg.processing.read._read_group``.
         coords = data_source.get("coordinates")
         if isinstance(coords, dict) and coords.get("level") is not None:
-            from zagg.processing.read_vlen import _vlen_read_group
+            from zagg.processing.read_fixed import fixed_width_level
+
+            width_level = fixed_width_level(data_source)
+            if width_level is not None and width_level[0] == coords["level"]:
+                from zagg.processing.read_fixed import _fixed_read_group as route
+            else:
+                from zagg.processing.read_vlen import _vlen_read_group as route
 
             if self.write_back:
                 self._prebuild_group_maps(h5obj, group, data_source)
@@ -847,7 +855,7 @@ class InlineIndex(VirtualIndex):
             # deferred cache lines (issue #460 — see _evict_deferred_lines).
             read_fn = self._chunk_aligned_read_fn(h5obj, planned=True)
             try:
-                return _vlen_read_group(
+                return route(
                     h5obj,
                     group,
                     data_source,
