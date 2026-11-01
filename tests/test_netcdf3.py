@@ -264,6 +264,17 @@ class TestDescribe:
         assert d["dims"]["time"] is None
         assert d["variables"]["temp"]["shape"] == [None, 3]
 
+    def test_char_attribute_trailing_nuls_stripped(self):
+        # nelems counts the NULs (a C writer passing strlen+1, or fixed-width
+        # NUL padding); the value compares equal to the bare string.
+        v = {"name": "lat", "dimids": [0], "nc_type": NC_FLOAT, "data": _LAT}
+        v["attrs"] = {"units": (NC_CHAR, "degrees_north\x00"), "pad": (NC_CHAR, "ab\x00\x00\x00")}
+        data, _ = _nc3_bytes(1, [("x", 3)], [v], {"title": (NC_CHAR, "t\x00")})
+        assert data.count(b"degrees_north\x00") == 1
+        d = describe(data)
+        assert d["variables"]["lat"]["attrs"] == {"units": "degrees_north", "pad": "ab"}
+        assert d["attrs"] == {"title": "t"}
+
     def test_empty_lists(self):
         data, _ = _nc3_bytes(1, [], [], {})
         d = describe(data)

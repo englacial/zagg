@@ -273,10 +273,12 @@ def _read_name(hb: _HeaderBytes) -> str:
 
 
 def _attr_value(nc_type: int, raw: bytes, nelems: int):
-    """Attribute values as plain Python: ``char`` -> ``str``, numeric -> a
-    scalar when ``nelems == 1`` else a list."""
+    """Attribute values as plain Python: ``char`` -> ``str`` with trailing NULs
+    stripped (writers that count the C terminator or NUL-pad fixed-width
+    strings; netCDF4-python strips them too), numeric -> a scalar when
+    ``nelems == 1`` else a list."""
     if nc_type == 2:
-        return raw.decode("utf-8", errors="replace")
+        return raw.rstrip(b"\0").decode("utf-8", errors="replace")
     values = np.frombuffer(raw, dtype=_NC_TYPES[nc_type][1], count=nelems).tolist()
     return values[0] if nelems == 1 else values
 
