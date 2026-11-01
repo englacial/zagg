@@ -3221,7 +3221,9 @@ class TestWorkerBlock:
 
     def test_unprovisioned_memory_rejected_naming_allowed_set(self, atl06_config):
         atl06_config.worker = {"memory": 1024}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of \[2048, 4096, 8192\]"):
+        with pytest.raises(
+            ValueError, match=r"worker\.memory: must be one of \[2048, 4096, 8192\]"
+        ):
             validate_config(atl06_config)
 
     def test_missing_memory_rejected(self, atl06_config):
@@ -3233,18 +3235,18 @@ class TestWorkerBlock:
         # "4096" (a string) is not the provisioned int — the suffix must be
         # built from a validated int, not whatever str() yields.
         atl06_config.worker = {"memory": "4096"}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
             validate_config(atl06_config)
 
     def test_bool_memory_rejected(self, atl06_config):
         atl06_config.worker = {"memory": True}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
             validate_config(atl06_config)
 
     def test_whole_float_memory_rejected(self, atl06_config):
         # 2048.0 would build the suffix -2048.0 (a per-shard ResourceNotFound).
         atl06_config.worker = {"memory": 2048.0}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
             validate_config(atl06_config)
 
     def test_schema_closes_the_memory_set(self):
@@ -3275,7 +3277,9 @@ class TestWorkerBlock:
 
     def test_non_bool_extra_disk_rejected(self, atl06_config):
         atl06_config.worker = {"memory": 4096, "extra_disk": "yes"}
-        with pytest.raises(ValueError, match=r"worker\.extra_disk must be a boolean"):
+        with pytest.raises(
+            ValueError, match=r"worker\.extra_disk: must be a boolean \(got 'yes'\)"
+        ):
             validate_config(atl06_config)
 
     def test_validated_on_temporal_pipeline_too(self):
@@ -3295,7 +3299,7 @@ class TestWorkerBlock:
             pipeline={"type": "temporal"},
             worker={"memory": 512},
         )
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
             validate_config(cfg)
 
 

@@ -69,16 +69,9 @@ class Worker(_Block):
         # the function-name suffix unchanged (``process-shard-2048.0``).
         if type(v) is not int or v not in WORKER_MEMORIES:
             raise ValueError(
-                f"worker.memory must be one of {_MEMORIES} MB — the "
+                f"must be one of {_MEMORIES} MB — the "
                 f"pre-provisioned variant sizes (issue #235) — (got {v!r})"
             )
-        return v
-
-    @field_validator("extra_disk", mode="before")
-    @classmethod
-    def _disk(cls, v: Any) -> Any:
-        if not isinstance(v, bool):
-            raise ValueError(f"worker.extra_disk must be a boolean (got {v!r})")
         return v
 
 

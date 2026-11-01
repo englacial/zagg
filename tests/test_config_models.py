@@ -627,7 +627,9 @@ class TestRunGrammar:
     def test_worker_and_bounds_keep_their_messages(self):
         cfg = TestPathAddressedRefusals()._cfg()
         cfg.worker = {"memory": 512}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of \[2048, 4096, 8192\]"):
+        with pytest.raises(
+            ValueError, match=r"worker\.memory: must be one of \[2048, 4096, 8192\]"
+        ):
             validate_config(cfg)
         cfg.worker = "big"
         with pytest.raises(ValueError, match="worker must be a mapping"):
