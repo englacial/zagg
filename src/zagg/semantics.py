@@ -706,7 +706,7 @@ def _dotted(path: tuple) -> str:
     return out
 
 
-def _put(tree: dict, path: tuple, value) -> None:
+def _put(tree, path: tuple, value) -> None:
     """Set ``path`` in ``tree`` to ``value`` in place, or delete it for ``_MISSING``."""
     node = tree
     for i, tok in enumerate(path[:-1]):
