@@ -8,6 +8,7 @@ all through the public ``_read_group`` dispatch.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from zagg.config import (
@@ -72,6 +73,31 @@ class _FakeH5:
                 arr = arr[lo:hi]
             out[path] = arr
         return out
+
+
+class _Promise:
+    """An ``h5coro.h5promise.H5Promise`` lookalike: ``keys``, ``__getitem__``
+    and ``__iter__`` only — no ``.values()`` / ``.items()`` (PR #680 review)."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def keys(self):
+        return self._data.keys()
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+
+class _PromiseH5(_FakeH5):
+    """``_FakeH5`` whose ``readDatasets`` returns a :class:`_Promise`, as a real
+    h5coro handle does."""
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        return _Promise(super().readDatasets(datasets))
 
 
 class _LatGrid:
@@ -385,6 +411,13 @@ class TestVlenReadGroup:
             np.concatenate([_expected_elevation(i) for i in range(4)]),
         )
 
+    def test_full_read_through_an_h5promise(self):
+        # The full arm indexes the raw ``readDatasets`` result by path: an
+        # ``H5Promise`` has no ``.items()`` (PR #680 review).
+        df = _read_group(_PromiseH5(_l1b_arrays()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        ref = _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        pd.testing.assert_frame_equal(df, ref)
+
     def test_planned_read_selects_shard_records(self):
         # Shard 1 holds shots 103 + 104 (lat >= 11.5); pad=0 keeps it exact.
         ds = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 0})
@@ -504,6 +537,26 @@ class TestSiblingAssetJoin:
         )
         assert sorted(set(df["shot_number"].tolist())) == [101, 104]
         assert len(df) == 9
+
+    def test_join_reads_through_an_h5promise(self):
+        # The hierarchical backend hands the route the raw ``readDatasets``
+        # result, an ``H5Promise`` with no ``.values()``: the left key must be
+        # indexed by path (PR #680 review). Planned arm, so only the join reads
+        # a whole multi-path result.
+        ds = _l2a_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}],
+        )
+        df = _read_group(
+            _PromiseH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _LatGrid(),
+            siblings={"l2a": _PromiseH5(_l2a_arrays())},
+        )
+        # Shard 0 = shots 101 + 102; 102 fails quality_flag.
+        assert df["shot_number"].tolist() == [101] * 5
 
     def test_join_multiple_predicates_anded(self):
         ds = _l2a_ds(
@@ -1094,7 +1147,7 @@ class TestVlenConfigValidation:
     def test_synthesize_unknown_kind_rejected(self):
         ds = _vlen_ds()
         ds["variables"]["elevation"]["synthesize"] = "logspace"
-        with pytest.raises(ValueError, match="must be 'linspace'"):
+        with pytest.raises(ValueError, match="must be one of"):
             validate_config(_cfg(ds))
 
     def test_asset_filter_requires_declared_asset(self):

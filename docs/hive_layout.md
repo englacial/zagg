@@ -480,7 +480,7 @@ configuration.
 
 ### The templates declare the ladder (issue #620)
 
-The three packaged hive templates ship the `/2` ladder rather than
+The packaged hive templates ship the `/2` ladder rather than
 `pyramid: false` (espg's ruling on
 [PR #622](https://github.com/englacial/zagg/pull/622#issuecomment-6116597451)):
 
@@ -489,12 +489,14 @@ The three packaged hive templates ship the `/2` ladder rather than
 | `atl03_tdigest_strata_healpix` | `[16, 15, 14, 13]` — the v4 store's | 19 / 9 | 16 … 9 |
 | `atl03_tdigest_healpix_hive` | `[16, 15, 14, 13]` — follows the strata one | 19 / 9 | 16 … 9 |
 | `gedi01b_waveform_healpix_hive` | `[16, 15, 14, 13]` — the same relation to its shard order | 18 / 9 | 16 … 9 |
+| `glah01_waveform_healpix_hive` | `[16, 15, 14, 13]` — the same relation (issue #678) | 17 / 9 | 16 … 9 |
 
 The coarsest member is the shard order + 4 in each, so the fixed every-order
 ladder above the shard bottoms out at node 0 / cells 4 — the same 13..4 dense
 ladder the v3 ATL03 store declared as `{overviews: 13}`, plus the finer leaf
 members. GEDI's cells are order 18, so its finest member sits two orders above
-the base data where ATL03's sits three; the tier is otherwise identical. The
+the base data where ATL03's sits three, and GLAS's (order 17, the ~70 m
+footprint) one; the tier is otherwise identical. The
 declaration is hash-invisible (D11), so declaring it moved no template's
 `semantic_hash` (`tests/test_live_store_templates.py` pins the digests and
 the ladder).

@@ -113,7 +113,11 @@ def asset_variable_specs(data_source: dict) -> dict[str, dict]:
     lvl_vars = ((data_source.get("levels") or {}).get(coord_level) or {}).get("variables")
     if not isinstance(lvl_vars, dict):
         return {}
-    return {name: entry for name, entry in lvl_vars.items() if isinstance(entry, dict)}
+    return {
+        name: entry
+        for name, entry in lvl_vars.items()
+        if isinstance(entry, dict) and "asset" in entry
+    }
 
 
 def expand_link_indices(
@@ -491,8 +495,9 @@ def _vlen_read_group(
         # extent is a real inconsistency (the link over-runs the array) and is
         # reported with the gather map's wording.
         arrays_by_path = {}
-        for path, arr in _read_full(base_paths).items():
-            arr = np.asarray(arr)
+        got = _read_full(base_paths)  # an ``H5Promise`` has no ``.items()``: index by path
+        for path in base_paths:
+            arr = np.asarray(got[path])
             if len(arr) < n_base:
                 raise ValueError(
                     f"dataset {path!r} has {len(arr)} rows, fewer than the record "
@@ -849,12 +854,16 @@ def _sibling_joined_values(
     another record's row, or raise an ``IndexError`` naming nothing.
     """
     join = cfg["join"]
-    left_path = join["left"].format(group=group)
-    right_path = join["right"].format(group=group)
-    left_keys = np.asarray(read_full([left_path])[left_path])
-    sib_paths = [right_path] + list(dataset_paths)
+    left_paths = _join_key_paths(join["left"], group)
+    right_paths = _join_key_paths(join["right"], group)
+    right_path = right_paths[0] if len(right_paths) == 1 else tuple(right_paths)
+    # Index by path: h5coro's ``H5Promise`` (what ``readDatasets`` returns on a
+    # real handle) has ``__getitem__`` and ``keys`` but no ``.values()``.
+    left_data = read_full(left_paths)
+    left_keys = _composite_key([np.asarray(left_data[p]) for p in left_paths])
+    sib_paths = list(right_paths) + list(dataset_paths)
     sib_data = sibling.readDatasets(list(dict.fromkeys(sib_paths)))
-    right_keys = np.asarray(sib_data[right_path])
+    right_keys = _composite_key([np.asarray(sib_data[p]) for p in right_paths])
     if len(left_keys) != n_records:
         raise ValueError(
             f"assets.{asset}.join.left has {len(left_keys)} records; the "
@@ -905,6 +914,30 @@ def _sibling_joined_values(
     sib_idx = order[pos_clip]
     values_by_path = {p: np.asarray(sib_data[p])[sib_idx] for p in dict.fromkeys(dataset_paths)}
     return values_by_path, matched
+
+
+def _join_key_paths(side, group: str) -> list[str]:
+    """The group-substituted key path(s) of one side of a ``join`` block."""
+    paths = side if isinstance(side, list) else [side]
+    return [p.format(group=group) for p in paths]
+
+
+def _composite_key(arrays: list[np.ndarray]) -> np.ndarray:
+    """One sortable key array from one or more key columns (issue #678).
+
+    A single column is the key itself (the GEDI ``shot_number`` form,
+    unchanged). Several columns pack into a structured array whose fields
+    compare lexicographically, so the argsort / searchsorted / equality join
+    in :func:`_sibling_joined_values` runs on tuples without a second code
+    path: GLAH01 ↔ GLAH05 match on (``i_rec_ndx``, ``i_shot_count``).
+    """
+    if len(arrays) == 1:
+        return arrays[0]
+    n = len(arrays[0])
+    if any(len(a) != n for a in arrays):
+        raise ValueError(f"composite join key columns differ in length: {[len(a) for a in arrays]}")
+    names = ",".join(f"k{i}" for i in range(len(arrays)))
+    return np.rec.fromarrays(arrays, names=names).view(np.ndarray)
 
 
 def _warn_missing_sibling_once(h5obj, asset: str, names: list[str]) -> None:

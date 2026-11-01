@@ -147,6 +147,7 @@ DIGEST_TEMPLATES = [
     "atl03_tdigest_located_healpix",
     "atl03_tdigest_strata_healpix",
     "gedi01b_waveform_healpix_hive",
+    "glah01_waveform_healpix_hive",
 ]
 
 
@@ -219,11 +220,13 @@ def test_template_pins_the_live_orders_and_fold_knobs(name, digests, orders, ove
 #: contiguous from cells 16 down to shard order 9 + 4 — the plain hive
 #: template following it exactly, and GEDI carrying the same relation to its
 #: own shard order (its cells are order 18, so its finest member is two orders
-#: above the base where ATL03's is three).
+#: above the base where ATL03's is three), and GLAS likewise (its cells are
+#: order 17, so its finest member is one order above the base).
 LADDER_TEMPLATES = [
     "atl03_tdigest_strata_healpix",
     "atl03_tdigest_healpix_hive",
     "gedi01b_waveform_healpix_hive",
+    "glah01_waveform_healpix_hive",
 ]
 LADDER = [16, 15, 14, 13]
 

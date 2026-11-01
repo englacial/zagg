@@ -723,10 +723,14 @@ class InlineIndex(VirtualIndex):
         # ``coordinates.level`` names a record LEVEL, not a dataset (the vlen
         # route: the base level has no native coordinates), so it is not a
         # path to map — the record level's own lat/lon are the sibling keys.
+        # A coordinate sourced from a sibling asset (issue #678, the GLAH01 ↔
+        # GLAH05 join) lives in the paired granule, which this backend never
+        # opens; a base-level ``{path, axes}`` coordinate (the swath form) is
+        # a dataset on this one.
         paths = [
-            tmpl.format(group=group)
+            (tmpl["path"] if isinstance(tmpl, dict) else tmpl).format(group=group)
             for key, tmpl in data_source["coordinates"].items()
-            if key != "level"
+            if key != "level" and not (isinstance(tmpl, dict) and "asset" in tmpl)
         ]
         # Variables go through the read path's normalizer: an entry is either a
         # path-template string or the ``{path, column}`` mapping form (issue
@@ -742,7 +746,11 @@ class InlineIndex(VirtualIndex):
             for tmpl, _ in _variable_specs(path_form_variables(variables)).values()
         ]
         for entry in synthesized_specs(variables).values():
-            paths += [entry[k].format(group=group) for k in ("start", "stop") if entry.get(k)]
+            paths += [
+                entry[k].format(group=group)
+                for k in ("start", "stop", "offsets")
+                if isinstance(entry.get(k), str)
+            ]
         base_level = data_source.get("base_level")
         for f in filters_from_data_source(data_source):
             # A sibling-asset predicate reads the OTHER granule (issue #425).
@@ -762,7 +770,11 @@ class InlineIndex(VirtualIndex):
             lvl = (data_source.get("levels") or {}).get(level_key)
             if not isinstance(lvl, dict):
                 continue
-            paths.extend(_level_coord_paths(lvl, group))
+            # A record level whose coordinates come from a sibling asset (issue
+            # #678) declares none of its own; the data_source coordinates above
+            # already covered the primary-held case.
+            if isinstance(lvl.get("coordinates"), dict):
+                paths.extend(_level_coord_paths(lvl, group))
             link = lvl.get("link") or {}
             for key in ("index_beg", "count"):
                 if key in link:
@@ -825,9 +837,17 @@ class InlineIndex(VirtualIndex):
         # Vlen-packed sources (issue #425) take their own route, which owns
         # the record-expansion and planned/full arms; the compiled read_fn
         # rides along so the flat base datasets still decode through it.
+        # A fixed-width coordinates level (issue #678) takes the fixed route
+        # instead — the same dispatch as ``zagg.processing.read._read_group``.
         coords = data_source.get("coordinates")
         if isinstance(coords, dict) and coords.get("level") is not None:
-            from zagg.processing.read_vlen import _vlen_read_group
+            from zagg.processing.read_fixed import fixed_width_level
+
+            width_level = fixed_width_level(data_source)
+            if width_level is not None and width_level[0] == coords["level"]:
+                from zagg.processing.read_fixed import _fixed_read_group as route
+            else:
+                from zagg.processing.read_vlen import _vlen_read_group as route
 
             if self.write_back:
                 self._prebuild_group_maps(h5obj, group, data_source)
@@ -835,7 +855,7 @@ class InlineIndex(VirtualIndex):
             # deferred cache lines (issue #460 — see _evict_deferred_lines).
             read_fn = self._chunk_aligned_read_fn(h5obj, planned=True)
             try:
-                return _vlen_read_group(
+                return route(
                     h5obj,
                     group,
                     data_source,
