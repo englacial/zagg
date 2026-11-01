@@ -2512,7 +2512,7 @@ class TestKnob:
 
         cfg.output["store_layout"] = "hive"
         cfg.output["icechunk"] = "yes"
-        with pytest.raises(ValueError, match="output.icechunk must be a boolean"):
+        with pytest.raises(ValueError, match="output.icechunk: must be a boolean"):
             validate_config(cfg)
         cfg.output["store_layout"] = "flat"
         cfg.output["icechunk"] = True

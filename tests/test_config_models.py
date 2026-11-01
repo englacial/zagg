@@ -573,7 +573,7 @@ class TestOutputGrammar:
     def test_null_grid_is_refused(self):
         cfg = default_config("atl03")
         cfg.output["grid"] = None
-        with pytest.raises(ValueError, match=r"output\.grid must be a mapping"):
+        with pytest.raises(ValueError, match=r"output\.grid: must be a mapping"):
             validate_config(cfg)
         cfg = TestPathAddressedRefusals()._cfg()
         cfg.output["grid"].update(layout=None, cell_ids_encoding=None)  # documented nulls

@@ -1606,7 +1606,7 @@ class TestOutputGridValidation:
             },
             output={"grid": "healpix"},
         )
-        with pytest.raises(ValueError, match="output.grid must be a mapping"):
+        with pytest.raises(ValueError, match="output.grid: must be a mapping"):
             validate_config(cfg)
 
     def test_grid_missing_type(self):
@@ -1675,7 +1675,7 @@ class TestCellIdsKnobs:
         # Any value — including the formerly-valid ones — errors with the
         # migration pointer, never a silent ignore.
         for value in ("nested", "morton", "bogus"):
-            with pytest.raises(ValueError, match="cell_ids_encoding was retired"):
+            with pytest.raises(ValueError, match="cell_ids_encoding: retired"):
                 validate_config(_cfg_with_grid_knobs(cell_ids_encoding=value))
 
     def test_absent_and_null_knob_validate(self):
@@ -1694,7 +1694,7 @@ class TestCellIdsKnobs:
         assert get_emit_cell_ids(cfg) is True
 
     def test_emit_cell_ids_rejects_non_boolean(self):
-        with pytest.raises(ValueError, match="emit_cell_ids must be a boolean"):
+        with pytest.raises(ValueError, match="emit_cell_ids: must be a boolean"):
             validate_config(_cfg_with_grid_knobs(emit_cell_ids="yes"))
 
     def test_emit_cell_ids_rejected_on_rectilinear(self):
@@ -2623,7 +2623,7 @@ class TestTimeSource:
             validate_config(_clocked(_ragged_cfg(inner_shape=[2]), scale="utc"))
 
     def test_unknown_units_refused(self):
-        with pytest.raises(ValueError, match="time_source.units must be one of"):
+        with pytest.raises(ValueError, match="time_source: units must be one of"):
             validate_config(_clocked(_ragged_cfg(inner_shape=[2]), units="ticks"))
 
     def test_field_must_be_a_declared_variable(self):
@@ -2641,7 +2641,7 @@ class TestTimeSource:
     def test_epoch_required_and_parsed(self):
         cfg = _clocked(_ragged_cfg(inner_shape=[2]))
         del cfg.output["time_source"]["epoch"]
-        with pytest.raises(ValueError, match="time_source.epoch is required"):
+        with pytest.raises(ValueError, match="time_source: epoch is required"):
             validate_config(cfg)
         cfg = _clocked(_ragged_cfg(inner_shape=[2]), epoch="not-a-date")
         with pytest.raises(ValueError, match="is not an ISO-8601 datetime"):
@@ -2656,7 +2656,7 @@ class TestTimeSource:
     def test_non_mapping_refused(self):
         cfg = _ragged_cfg(inner_shape=[2])
         cfg.output["time_source"] = "delta_time"
-        with pytest.raises(ValueError, match="time_source must be a mapping"):
+        with pytest.raises(ValueError, match="time_source: must be a mapping"):
             validate_config(cfg)
 
     def test_utc_windowing_is_not_a_fallback(self):
@@ -3174,7 +3174,7 @@ class TestConsolidateMetadataFlag:
 
         cfg = default_config("atl06")
         cfg.output = {**cfg.output, "consolidate_metadata": "yes"}
-        with pytest.raises(ValueError, match="output.consolidate_metadata must be a boolean"):
+        with pytest.raises(ValueError, match="output.consolidate_metadata: must be a boolean"):
             validate_config(cfg)
 
 
@@ -3354,7 +3354,7 @@ class TestTimeEncoding:
             validate_config(self._raster_cfg(encoding))
 
     def test_unknown_value_rejected(self):
-        with pytest.raises(ValueError, match="output.time_encoding must be one of"):
+        with pytest.raises(ValueError, match="output.time_encoding: must be one of"):
             validate_config(self._raster_cfg("datetime64"))
 
     def test_toc_rejected_on_a_non_raster_pipeline(self):
@@ -3605,7 +3605,7 @@ class TestTouchPolicy:
 
         cfg = default_config()
         cfg.output["touch"] = "sometimes"
-        with pytest.raises(ValueError, match="output.touch must be one of"):
+        with pytest.raises(ValueError, match="output.touch: must be one of"):
             validate_config(cfg)
 
     def test_absent_is_legal(self):

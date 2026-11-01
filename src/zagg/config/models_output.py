@@ -159,7 +159,7 @@ class HealpixGrid(_Block):
     @classmethod
     def _emit(cls, v: Any) -> Any:
         if v is not None and not isinstance(v, bool):
-            raise ValueError(f"output.grid.emit_cell_ids must be a boolean (got {v!r})")
+            raise ValueError(f"must be a boolean (got {v!r})")
         return v
 
     @field_validator("indexing_scheme", mode="before")
@@ -167,7 +167,7 @@ class HealpixGrid(_Block):
     def _scheme(cls, v: Any) -> Any:
         if v is not None and v != "nested":
             raise ValueError(
-                f"output.grid.indexing_scheme is descriptive and must be 'nested' (got {v!r}); "
+                f"is descriptive and must be 'nested' (got {v!r}); "
                 f"the store's declared coordinate is morton (D16 — issue #304)"
             )
         return v
@@ -177,7 +177,7 @@ class HealpixGrid(_Block):
     def _retired(cls, v: Any) -> Any:
         if v is not None:
             raise ValueError(
-                "output.grid.cell_ids_encoding was retired (issue #304): morton is the stored "
+                "retired (issue #304): morton is the stored "
                 "cell coordinate and NESTED ids are derived at read; to keep writing the legacy "
                 "NESTED cell_ids array for transition stores set output.grid.emit_cell_ids: true"
             )
@@ -210,18 +210,16 @@ class RectilinearGrid(_Block):
     @classmethod
     def _bounds(cls, v: list) -> list:
         if len(v) != 4:
-            raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
+            raise ValueError("must be [xmin, ymin, xmax, ymax]")
         return v
 
     @field_validator("emit_cell_ids", mode="before")
     @classmethod
     def _emit(cls, v: Any) -> Any:
         if v is not None and not isinstance(v, bool):
-            raise ValueError(f"output.grid.emit_cell_ids must be a boolean (got {v!r})")
+            raise ValueError(f"must be a boolean (got {v!r})")
         if v:
-            raise ValueError(
-                "output.grid.emit_cell_ids only applies to healpix grids (grid type is 'rectilinear')"
-            )
+            raise ValueError("only applies to healpix grids (grid type is 'rectilinear')")
         return v
 
 
@@ -391,10 +389,7 @@ class Windowing(_Block):
     def _schedule(cls, v: Any) -> Any:
         from zagg import windows as _windows
 
-        try:
-            return _windows.check_schedule(v)
-        except ValueError as e:
-            raise ValueError(f"output.windowing.schedule: {e}") from e
+        return _windows.check_schedule(v)
 
     @field_validator("unit", mode="before")
     @classmethod
@@ -403,7 +398,7 @@ class Windowing(_Block):
 
         if v is not None and v not in WINDOWING_UNITS:
             raise ValueError(
-                f"output.windowing.unit must be one of {WINDOWING_UNITS} (got {v!r}): "
+                f"must be one of {WINDOWING_UNITS} (got {v!r}): "
                 f"'shard' emits every window from one invoke per shard, 'window' "
                 f"dispatches one invoke per (shard, window)"
             )
@@ -419,31 +414,28 @@ class Windowing(_Block):
             # so it needs no layout; a stray ``windows`` key is still rejected.
             if self.windows is not None:
                 raise ValueError(
-                    "output.windowing.windows only applies to schedule: explicit "
+                    "windows only applies to schedule: explicit "
                     "(schedule: none produces no windowed output)"
                 )
             return self
         if self.scale is not None and self.scale not in _windows.EPOCH_SCALES:
-            raise ValueError(
-                f"output.windowing.scale must be one of {_windows.EPOCH_SCALES} (got {self.scale!r})"
-            )
+            raise ValueError(f"scale must be one of {_windows.EPOCH_SCALES} (got {self.scale!r})")
         if self.units is not None and self.units not in _windows.UNIT_SECONDS:
             raise ValueError(
-                f"output.windowing.units must be one of {tuple(_windows.UNIT_SECONDS)} "
-                f"(got {self.units!r})"
+                f"units must be one of {tuple(_windows.UNIT_SECONDS)} (got {self.units!r})"
             )
         if self.epoch is not None:
             try:
                 parsed_epoch = _windows.parse_utc(self.epoch)
             except ValueError as e:
-                raise ValueError(f"output.windowing.epoch: {e}") from e
+                raise ValueError(f"epoch: {e}") from e
             # Validate the RENDERED epoch (issue #390): get_windowing renders at
             # timespec="seconds", so a sub-second epoch would be silently
             # truncated at the one place it is consumed.
             rendered_epoch = _windows.iso_utc(parsed_epoch)
             if _windows.parse_utc(rendered_epoch) != parsed_epoch:
                 raise ValueError(
-                    f"output.windowing.epoch {parsed_epoch.isoformat()!r} carries sub-second "
+                    f"epoch {parsed_epoch.isoformat()!r} carries sub-second "
                     f"precision that the canonical whole-second rendering drops: it is "
                     f"recorded as {rendered_epoch!r}, which would shift every window "
                     f"conversion by {parsed_epoch.microsecond} µs — declare the epoch at "
@@ -489,19 +481,16 @@ class TimeSource(_Block):
             unknown = set(data) - {"field", "epoch", "scale", "units"}
             if unknown:
                 raise ValueError(
-                    f"output.time_source has unknown key(s) {sorted(unknown)} "
-                    f"(known: epoch, field, scale, units)"
+                    f"unknown key(s) {sorted(unknown)} (known: epoch, field, scale, units)"
                 )
             field = data.get("field")
             if not isinstance(field, str) or not field:
                 raise ValueError(
-                    "output.time_source.field is required: the per-observation time column "
+                    "field is required: the per-observation time column "
                     "the temporal companion's words are encoded from (issue #410)"
                 )
             if "epoch" not in data:
-                raise ValueError(
-                    "output.time_source.epoch is required: the UTC instant the column counts from"
-                )
+                raise ValueError("epoch is required: the UTC instant the column counts from")
         return data
 
     @model_validator(mode="after")
@@ -511,22 +500,20 @@ class TimeSource(_Block):
 
         if self.field == TOC_WORD_COLUMN:
             raise ValueError(
-                f"output.time_source.field {self.field!r} is the DERIVED toc word column, not a "
+                f"field {self.field!r} is the DERIVED toc word column, not a "
                 f"source — name the dataset-time column it is encoded from (issue #410)"
             )
         parse_utc(self.epoch)  # raises with the offending value named
         scale = self.scale or TOC_SOURCE_SCALES[0]
         if scale not in TOC_SOURCE_SCALES:
             raise ValueError(
-                f"output.time_source.scale must be a continuous timescale {TOC_SOURCE_SCALES} "
+                f"scale must be a continuous timescale {TOC_SOURCE_SCALES} "
                 f"(got {scale!r}); a nominal-UTC column cannot carry the nanosecond-exact "
                 f"instant spec §8.3 requires of a timestamp word"
             )
         units = self.units or "seconds"
         if units not in UNIT_SECONDS:
-            raise ValueError(
-                f"output.time_source.units must be one of {sorted(UNIT_SECONDS)} (got {units!r})"
-            )
+            raise ValueError(f"units must be one of {sorted(UNIT_SECONDS)} (got {units!r})")
         return self
 
 
@@ -565,29 +552,23 @@ class Icechunk(_Block):
             unknown = set(data) - {"commit", "commit_order", "split_order", "retain_runs"}
             if unknown:
                 raise ValueError(
-                    f"output.icechunk has unknown key(s) {sorted(unknown)} (accepts commit, "
+                    f"unknown key(s) {sorted(unknown)} (accepts commit, "
                     f"commit_order, split_order, retain_runs)"
                 )
             retain = data.get("retain_runs")
             if retain is not None and (
                 isinstance(retain, bool) or not isinstance(retain, int) or retain < 0
             ):
-                raise ValueError(
-                    f"output.icechunk.retain_runs must be a non-negative integer (got {retain!r})"
-                )
+                raise ValueError(f"retain_runs must be a non-negative integer (got {retain!r})")
             commit = data.get("commit")
             if commit is not None and commit not in ("ladder", "leaf"):
-                raise ValueError(
-                    f"output.icechunk.commit must be 'ladder' or 'leaf' (got {commit!r})"
-                )
+                raise ValueError(f"commit must be 'ladder' or 'leaf' (got {commit!r})")
             for key in ("commit_order", "split_order"):
                 value = data.get(key)
                 if value is not None and (
                     isinstance(value, bool) or not isinstance(value, int) or value < 0
                 ):
-                    raise ValueError(
-                        f"output.icechunk.{key} must be a non-negative integer (got {value!r})"
-                    )
+                    raise ValueError(f"{key} must be a non-negative integer (got {value!r})")
         return data
 
     @model_validator(mode="after")
@@ -598,7 +579,7 @@ class Icechunk(_Block):
             and self.split_order < self.commit_order
         ):
             raise ValueError(
-                f"output.icechunk.split_order {self.split_order} is finer than commit_order "
+                f"split_order {self.split_order} is finer than commit_order "
                 f"{self.commit_order}: a manifest (one per split_order cell) would be written "
                 f"by more than one commit (spec §11.5)"
             )
@@ -697,28 +678,27 @@ class Pyramid(_Block):
             "summarize",
         }
         if unknown:
-            raise ValueError(f"output.pyramid has unknown keys {sorted(unknown)}")
+            raise ValueError(f"unknown keys {sorted(unknown)}")
         from zagg.sweep_overview import FOLD_SOURCES
 
         fold_source = data.get("fold_source")
         if fold_source is not None and fold_source not in FOLD_SOURCES:
             raise ValueError(
-                f"output.pyramid.fold_source must be one of {list(FOLD_SOURCES)} "
-                f"(got {fold_source!r})"
+                f"fold_source must be one of {list(FOLD_SOURCES)} (got {fold_source!r})"
             )
         exact_levels = data.get("exact_levels")
         if exact_levels is not None and (
             isinstance(exact_levels, bool) or not isinstance(exact_levels, int) or exact_levels < 1
         ):
             raise ValueError(
-                f"output.pyramid.exact_levels must be an int >= 1 — the finest declared "
+                f"exact_levels must be an int >= 1 — the finest declared "
                 f"level has no finer overview to cascade from, so it is always folded from "
                 f"the leaves (got {exact_levels!r})"
             )
         if fold_source == "leaves":
             if exact_levels is not None:
                 raise ValueError(
-                    "output.pyramid.exact_levels is meaningless under fold_source: leaves "
+                    "exact_levels is meaningless under fold_source: leaves "
                     "(every level folds from the leaves there); drop one of the two"
                 )
             # Legal but deprecated (issue #376): warn at config validation, the
@@ -732,62 +712,57 @@ class Pyramid(_Block):
         if spacing is not None and (
             isinstance(spacing, bool) or not isinstance(spacing, int) or spacing < 1
         ):
-            raise ValueError(f"output.pyramid.spacing must be an int >= 1 (got {spacing!r})")
+            raise ValueError(f"spacing must be an int >= 1 (got {spacing!r})")
         if data.get("overviews") is not None and (
             data.get("orders") is not None or spacing is not None
         ):
             raise ValueError(
-                "output.pyramid.overviews is the zagg-pyramid/2 grammar and replaces "
+                "overviews is the zagg-pyramid/2 grammar and replaces "
                 "orders/spacing wholesale — declare overviews OR orders/spacing, never both"
             )
         all_time = data.get("all_time")
         if all_time is not None and not isinstance(all_time, bool):
-            raise ValueError(f"output.pyramid.all_time must be a boolean (got {all_time!r})")
+            raise ValueError(f"all_time must be a boolean (got {all_time!r})")
         summarize = data.get("summarize")
         if summarize is not None:
             if not isinstance(summarize, dict):
-                raise ValueError(f"output.pyramid.summarize must be a mapping (got {summarize!r})")
+                raise ValueError(f"summarize must be a mapping (got {summarize!r})")
             for source, decl in summarize.items():
                 target = (decl or {}).get("as") if isinstance(decl, dict) else None
                 if not isinstance(target, str) or not target:
-                    raise ValueError(
-                        f"output.pyramid.summarize.{source} requires 'as': <new field name>"
-                    )
+                    raise ValueError(f"summarize.{source} requires 'as': <new field name>")
         return data
 
 
 def _pyramid_knob(v: Any) -> Any:
     if v is None or v is False or isinstance(v, (dict, Pyramid)):
         return v
-    raise ValueError(f"output.pyramid must be a mapping or false (got {v!r})")
+    raise ValueError(f"must be a mapping or false (got {v!r})")
 
 
 def _icechunk_knob(v: Any) -> Any:
     if v is None or isinstance(v, (bool, dict, Icechunk)):
         return v
-    raise ValueError(f"output.icechunk must be a boolean or an options block (got {v!r})")
+    raise ValueError(f"must be a boolean or an options block (got {v!r})")
 
 
 def _sweep_knob(v: Any) -> Any:
     if v is None or isinstance(v, bool) or v in SWEEP_MODES:
         return v
-    raise ValueError(f"output.sweep must be a boolean or one of {list(SWEEP_MODES)} (got {v!r})")
+    raise ValueError(f"must be a boolean or one of {list(SWEEP_MODES)} (got {v!r})")
 
 
 def _windowing_knob(v: Any) -> Any:
     if v is None or isinstance(v, (dict, Windowing)):
         return v
-    raise ValueError(
-        f"output.windowing must be a mapping {{schedule, time_field, epoch, ...}} (got {v!r})"
-    )
+    raise ValueError(f"must be a mapping {{schedule, time_field, epoch, ...}} (got {v!r})")
 
 
 def _time_source_knob(v: Any) -> Any:
     if v is None or isinstance(v, (dict, TimeSource)):
         return v
     raise ValueError(
-        f"output.time_source must be a mapping {{field, epoch, scale, units}} "
-        f"(got {v!r}) — spec §8.3, issue #410"
+        f"must be a mapping {{field, epoch, scale, units}} (got {v!r}) — spec §8.3, issue #410"
     )
 
 
@@ -795,7 +770,7 @@ def _grid_knob(v: Any) -> Any:
     # A present ``null`` is refused too: no consumer reads it as absent.
     if isinstance(v, (dict, HealpixGrid, RectilinearGrid)):
         return v
-    raise ValueError("output.grid must be a mapping (e.g. type: healpix, child_order: 12)")
+    raise ValueError("must be a mapping (e.g. type: healpix, child_order: 12)")
 
 
 def _flag_or_block_tag(block_cls: type, flag_tag: str, block_tag: str):
@@ -817,15 +792,6 @@ PyramidKnob = Annotated[
     ],
     Discriminator(_flag_or_block_tag(Pyramid, "<pyramid-off>", "<pyramid-block>")),
 ]
-
-
-def _bool_knob(key: str):
-    def check(v: Any) -> Any:
-        if v is not None and not isinstance(v, bool):
-            raise ValueError(f"output.{key} must be a boolean (got {v!r})")
-        return v
-
-    return check
 
 
 # ---------------------------------------------------------------------------
@@ -880,17 +846,15 @@ class Output(_Block):
         description="Skip-run lifecycle touch policy (issue #501): ``auto`` (default), "
         "``always``, ``never``.",
     )
-    aoi_mask: Annotated[bool, BeforeValidator(_bool_knob("aoi_mask"))] | None = Field(
+    aoi_mask: Bool | None = Field(
         default=None,
         description="Package a per-cell boolean ``aoi_mask`` array (issue #101); default off.",
     )
-    consolidate_metadata: (
-        Annotated[bool, BeforeValidator(_bool_knob("consolidate_metadata"))] | None
-    ) = Field(
+    consolidate_metadata: Bool | None = Field(
         default=None,
         description="Run zarr metadata consolidation at finalize (flat stores only); default off.",
     )
-    coverage_moc: Annotated[bool, BeforeValidator(_bool_knob("coverage_moc"))] | None = Field(
+    coverage_moc: Bool | None = Field(
         default=None,
         description="Write the root ``coverage.moc`` at the end of the run (hive + HEALPix only); "
         "defaults on for hive.",
@@ -905,7 +869,7 @@ class Output(_Block):
         "``stages`` (plus the staged ladder), ``false``/``none``. Absent resolves to ``stages`` "
         "on a hive store declaring a ladder, else ``families``; ``none`` on a flat store.",
     )
-    leaf_versions: Annotated[bool, BeforeValidator(_bool_knob("leaf_versions"))] | None = Field(
+    leaf_versions: Bool | None = Field(
         default=None,
         description="Versioned hive leaves (spec §1.5, issue #582); defaults on for hive.",
     )
@@ -936,8 +900,7 @@ class Output(_Block):
     def _touch(cls, v: Any) -> Any:
         if v is not None and v not in TOUCH_POLICIES:
             raise ValueError(
-                f"output.touch must be one of {', '.join(repr(t) for t in TOUCH_POLICIES)} "
-                f"(got {v!r})"
+                f"must be one of {', '.join(repr(t) for t in TOUCH_POLICIES)} (got {v!r})"
             )
         return v
 
@@ -947,7 +910,7 @@ class Output(_Block):
         from zagg.time_axis import TIME_ENCODINGS
 
         if v is not None and v not in TIME_ENCODINGS:
-            raise ValueError(f"output.time_encoding must be one of {TIME_ENCODINGS} (got {v!r})")
+            raise ValueError(f"must be one of {TIME_ENCODINGS} (got {v!r})")
         return v
 
     @field_validator("product_name")
