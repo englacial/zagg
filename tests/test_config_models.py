@@ -578,3 +578,20 @@ class TestOutputGrammar:
         cfg = TestPathAddressedRefusals()._cfg()
         cfg.output["grid"].update(layout=None, cell_ids_encoding=None)  # documented nulls
         validate_config(cfg)
+
+    def test_closed_vocabularies_export_their_enums(self):
+        from zagg.config.accessors import TOUCH_POLICIES
+        from zagg.config.models_output import Output, Pyramid, TimeSource, Windowing
+        from zagg.sweep_overview import FOLD_SOURCES
+        from zagg.time_axis import TIME_ENCODINGS, TOC_SOURCE_SCALES
+        from zagg.windows import EPOCH_SCALES, UNIT_SECONDS
+
+        def enum(model, key):
+            return model.model_json_schema()["properties"][key]["anyOf"][0]["enum"]
+
+        assert enum(Output, "touch") == list(TOUCH_POLICIES)
+        assert enum(Output, "time_encoding") == list(TIME_ENCODINGS)
+        assert enum(Windowing, "scale") == list(EPOCH_SCALES)
+        assert enum(Windowing, "units") == enum(TimeSource, "units") == list(UNIT_SECONDS)
+        assert enum(TimeSource, "scale") == list(TOC_SOURCE_SCALES)
+        assert enum(Pyramid, "fold_source") == list(FOLD_SOURCES)

@@ -16,6 +16,7 @@ stay in :func:`zagg.config.validate_config` and the per-kind root models.
 
 from __future__ import annotations
 
+import importlib
 import logging
 from datetime import date
 from typing import Annotated, Any, Literal, Union
@@ -32,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from zagg.config.accessors import SWEEP_MODES, TOUCH_POLICIES
 from zagg.config.models_base import (
     Bool,
     NonNegInt,
@@ -56,12 +58,26 @@ __all__ = [
     "Windowing",
 ]
 
-#: The three ``output.sweep`` modes (``accessors.SWEEP_MODES``).
-SweepMode = Literal["none", "families", "stages"]
-#: Legal ``output.touch`` policies (``accessors.TOUCH_POLICIES``).
-TouchPolicy = Literal["auto", "always", "never"]
 #: ``output.windowing.unit`` (``windowing.WINDOWING_UNITS``).
 WindowingUnit = Literal["shard", "window"]
+
+
+class _Enum:
+    """The closed vocabulary a ``str`` knob exports, read off its owning constant.
+
+    Resolved at schema time, so this package keeps importing no other zagg
+    module at import time (``sweep_overview`` imports :mod:`zagg.grids`, which
+    imports this package); the knob's validator still words the refusal.
+    """
+
+    def __init__(self, module: str, name: str):
+        self.module, self.name = module, name
+
+    def __get_pydantic_json_schema__(self, core_schema: Any, handler: Any) -> dict:
+        return {
+            "type": "string",
+            "enum": list(getattr(importlib.import_module(self.module), self.name)),
+        }
 
 
 def _check_instant(v: Any) -> Any:
@@ -352,11 +368,11 @@ class Windowing(_Block):
         description="The dataset's zero time as an ISO-8601 UTC instant at whole-second "
         "precision (ICESat-2 delta_time: ``2018-01-01T00:00:00Z``).",
     )
-    scale: str | None = Field(
+    scale: Annotated[str, _Enum("zagg.windows", "EPOCH_SCALES")] | None = Field(
         default=None,
         description="Timescale of ``time_field``: ``utc`` (default), ``gps``, ``tai``.",
     )
-    units: str | None = Field(
+    units: Annotated[str, _Enum("zagg.windows", "UNIT_SECONDS")] | None = Field(
         default=None, description="Units of ``time_field``: ``seconds`` (default) or ``days``."
     )
     unit: WindowingUnit | None = Field(
@@ -459,8 +475,12 @@ class TimeSource(_Block):
 
     field: str = Field(description="Per-observation time column (a read variable, base rate).")
     epoch: Instant = Field(description="The UTC instant the column counts from.")
-    scale: str | None = Field(default=None, description="``gps`` (default) or ``tai``.")
-    units: str | None = Field(default=None, description="``seconds`` (default) or ``days``.")
+    scale: Annotated[str, _Enum("zagg.time_axis", "TOC_SOURCE_SCALES")] | None = Field(
+        default=None, description="``gps`` (default) or ``tai``."
+    )
+    units: Annotated[str, _Enum("zagg.windows", "UNIT_SECONDS")] | None = Field(
+        default=None, description="``seconds`` (default) or ``days``."
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -646,7 +666,7 @@ class Pyramid(_Block):
         description="Maintain the ``all.zarr`` cross-window fold on a windowed store; resolves "
         "true there when omitted, and ``false`` is refused.",
     )
-    fold_source: str | None = Field(
+    fold_source: Annotated[str, _Enum("zagg.sweep_overview", "FOLD_SOURCES")] | None = Field(
         default=None,
         description="``cascade`` (default: each coarse level folds from the level below) or the "
         "deprecated ``leaves``.",
@@ -749,8 +769,6 @@ def _icechunk_knob(v: Any) -> Any:
 
 
 def _sweep_knob(v: Any) -> Any:
-    from zagg.config.accessors import SWEEP_MODES
-
     if v is None or isinstance(v, bool) or v in SWEEP_MODES:
         return v
     raise ValueError(f"output.sweep must be a boolean or one of {list(SWEEP_MODES)} (got {v!r})")
@@ -857,7 +875,7 @@ class Output(_Block):
         description="``hive`` (one leaf zarr per shard under a morton digit tree; the HEALPix "
         "default) or ``flat`` (one shared store; the rectilinear default).",
     )
-    touch: str | None = Field(
+    touch: Annotated[str, _Enum("zagg.config.accessors", "TOUCH_POLICIES")] | None = Field(
         default=None,
         description="Skip-run lifecycle touch policy (issue #501): ``auto`` (default), "
         "``always``, ``never``.",
@@ -880,7 +898,7 @@ class Output(_Block):
     sweep: Annotated[
         Any,
         BeforeValidator(_sweep_knob),
-        WithJsonSchema({"anyOf": [{"type": "boolean"}, {"enum": ["none", "families", "stages"]}]}),
+        WithJsonSchema({"anyOf": [{"type": "boolean"}, {"enum": list(SWEEP_MODES)}]}),
     ] = Field(
         default=None,
         description="End-of-run sweep (hive only): ``true``/``families`` (the families pass), "
@@ -907,7 +925,7 @@ class Output(_Block):
     time_source: Annotated[TimeSource, BeforeValidator(_time_source_knob)] | None = Field(
         default=None, description="The per-observation clock for temporal companions (spec §8.3)."
     )
-    time_encoding: str | None = Field(
+    time_encoding: Annotated[str, _Enum("zagg.time_axis", "TIME_ENCODINGS")] | None = Field(
         default=None,
         description="Time-coordinate encoding of a raster ``(time, cells)`` product (spec §8): "
         "``microseconds`` (default) or ``toc``.",
@@ -916,8 +934,6 @@ class Output(_Block):
     @field_validator("touch", mode="before")
     @classmethod
     def _touch(cls, v: Any) -> Any:
-        from zagg.config.accessors import TOUCH_POLICIES
-
         if v is not None and v not in TOUCH_POLICIES:
             raise ValueError(
                 f"output.touch must be one of {', '.join(repr(t) for t in TOUCH_POLICIES)} "
