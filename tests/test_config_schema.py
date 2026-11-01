@@ -24,6 +24,8 @@ PACKAGED = sorted(
     if f.name.endswith(".yaml")
 )
 MEASURE_CONFIGS = sorted((REPO / "tools" / "configs").glob("*.yaml"))
+BENCHMARK = sorted((REPO / "tests" / "data" / "benchmark" / "configs").glob("*.yaml"))
+RUN_RECORDS = sorted((REPO / "tests" / "data").glob("*.config.json"))
 
 
 @pytest.fixture(scope="module")
@@ -39,8 +41,14 @@ def test_packaged_templates_validate_under_a_stock_validator(validator, name):
     assert [e.message for e in validator.iter_errors(raw)] == []
 
 
-@pytest.mark.parametrize("path", MEASURE_CONFIGS, ids=[p.name for p in MEASURE_CONFIGS])
-def test_measurement_configs_validate_under_a_stock_validator(validator, path):
+@pytest.mark.parametrize(
+    "path",
+    MEASURE_CONFIGS + BENCHMARK + RUN_RECORDS,
+    ids=[p.name for p in MEASURE_CONFIGS + BENCHMARK + RUN_RECORDS],
+)
+def test_repo_configs_validate_under_a_stock_validator(validator, path):
+    # tools/configs arms, benchmark configs and the vendored run records (JSON
+    # is YAML, so one loader reads both).
     assert [e.message for e in validator.iter_errors(yaml.safe_load(path.read_text()))] == []
 
 

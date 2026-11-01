@@ -6,7 +6,7 @@ form: ``PipelineConfig`` keeps what the author wrote, so
 ``model_dump(exclude_unset=True)`` must reproduce every block key for key,
 and a config rebuilt from that dump must canonicalize to the same semantic
 JSON — on every packaged template, every ``tools/configs`` measurement arm,
-and every vendored run-record config. That pair is what keeps every
+every benchmark config, and every vendored run-record config. That pair is what keeps every
 ``semantic_hash`` pin in ``test_live_store_templates.py`` byte-identical.
 """
 
@@ -38,13 +38,14 @@ PACKAGED = sorted(
 )
 MEASURE_CONFIGS = sorted((REPO / "tools" / "configs").glob("*.yaml"))
 RUN_RECORDS = sorted((REPO / "tests" / "data").glob("*.config.json"))
+BENCHMARK = sorted((REPO / "tests" / "data" / "benchmark" / "configs").glob("*.yaml"))
 BLOCKS = ("data_source", "aggregation", "output", "pipeline", "worker", "catalog", "bounds")
 
 
 def _every_config():
     for name in PACKAGED:
         yield name, default_config(name)
-    for path in MEASURE_CONFIGS:
+    for path in MEASURE_CONFIGS + BENCHMARK:
         yield path.name, load_config_from_dict(yaml.safe_load(path.read_text()))
     for path in RUN_RECORDS:
         yield path.name, load_config_from_dict(json.loads(path.read_text()))
