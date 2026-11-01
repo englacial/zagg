@@ -69,12 +69,33 @@ def _close(driver):
         close()
 
 
-def _peek(driver):
-    """The first four bytes, or ``b""`` when they cannot be read."""
+def _peek(resource, driver):
+    """The first four bytes. A failed read is I/O, never a format verdict:
+    ``None`` (h5coro's ``S3Driver.read`` swallows errors into it), a short
+    read, or a driver exception (chained) raises ``OSError`` instead of
+    falling through to "invalid file signature"."""
     try:
-        return bytes(driver.read(0, 4))
-    except Exception:
-        return b""
+        got = driver.read(0, 4)
+    except Exception as e:
+        raise OSError(f"{resource}: ranged read failed at 0+4 ({e!r})") from e
+    if got is None or len(got) < 4:
+        what = "None" if got is None else f"{len(got)} bytes"
+        raise OSError(f"{resource}: ranged read failed at 0+4 (driver returned {what})")
+    return bytes(got)
+
+
+def _open_ranged(resource, driver_class, credentials):
+    """A :class:`RangedGranule` when the magic is netCDF3, else ``None``; the
+    peek's driver is closed unless the handle keeps it."""
+    driver = driver_class(resource, credentials)
+    try:
+        if _peek(resource, driver) in NETCDF3_MAGICS:
+            return RangedGranule(resource, driver)
+    except BaseException:
+        _close(driver)
+        raise
+    _close(driver)
+    return None
 
 
 def open_granule(resource, driver_class, credentials):
@@ -96,10 +117,9 @@ def open_granule(resource, driver_class, credentials):
     import zagg.processing as _processing
 
     if os.fspath(resource).lower().endswith(NETCDF_SUFFIXES):
-        driver = driver_class(resource, credentials)
-        if _peek(driver) in NETCDF3_MAGICS:
-            return RangedGranule(resource, driver)
-        _close(driver)
+        ranged = _open_ranged(resource, driver_class, credentials)
+        if ranged is not None:
+            return ranged
     try:
         return _processing.h5coro.H5Coro(
             resource,
@@ -111,8 +131,7 @@ def open_granule(resource, driver_class, credentials):
     except RuntimeError as e:  # h5coro's FatalError is a RuntimeError
         if _SIGNATURE_ERROR not in str(e):
             raise
-        driver = driver_class(resource, credentials)
-        if _peek(driver) not in NETCDF3_MAGICS:
-            _close(driver)
+        ranged = _open_ranged(resource, driver_class, credentials)
+        if ranged is None:
             raise
-        return RangedGranule(resource, driver)
+        return ranged

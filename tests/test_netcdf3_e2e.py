@@ -274,6 +274,43 @@ class TestOpenGranule:
         finally:
             h5obj.close()
 
+    @pytest.mark.parametrize("name", ["G.nc", "G.bin"])
+    @pytest.mark.parametrize(
+        "result, match",
+        [
+            (None, r"ranged read failed at 0\+4 \(driver returned None\)"),
+            (b"CD", r"ranged read failed at 0\+4 \(driver returned 2 bytes\)"),
+            (ConnectionError("timed out"), r"ranged read failed at 0\+4 \(ConnectionError"),
+        ],
+    )
+    def test_failed_magic_peek_is_an_io_error(self, granule, tmp_path, name, result, match):
+        # A timed-out / swallowed peek is I/O, never "invalid file signature";
+        # on both routes (the .nc pre-peek and the post-h5coro peek), and the
+        # peek's driver is closed.
+        _, _, data = granule
+        path = tmp_path / name
+        path.write_bytes(data)
+        closed = []
+
+        class Flaky(filedriver.FileDriver):
+            def read(self, pos, size):
+                if (pos, size) != (0, 4):
+                    return super().read(pos, size)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            def close(self):
+                closed.append(self)
+                super().close()
+
+        with pytest.raises(OSError, match=match) as info:
+            open_granule(str(path), Flaky, {})
+        assert "invalid file signature" not in str(info.value)
+        if isinstance(result, Exception):
+            assert info.value.__cause__ is result
+        assert closed
+
     def test_other_files_reraise_h5coro_error(self, tmp_path):
         junk = tmp_path / "junk.bin"
         junk.write_bytes(b"\0" * 64)
