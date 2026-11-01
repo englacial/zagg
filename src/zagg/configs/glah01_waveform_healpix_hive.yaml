@@ -62,12 +62,17 @@ data_source:
     gate_range:
       # Per-sample range synthesized as start[shot] + gate[sample] * scale:
       # the gate-index dimension scale is a 1-D table of length 544
-      # (DS_Gate_Index_544: verified name, location unverified), scaled by the 1 ns gate spacing
-      # (0.15 m one-way). Long waveforms are compressed on board (the first
-      # i_N_val gates at 1 ns, the rest averaged -- i_compRatio_p/q), so the
-      # per-gate OFFSET table, not a uniform spacing, is what makes this right;
-      # whether DS_Gate_Index_544 already encodes the compressed spacing is a
-      # phase 4 check. ``start`` is the per-shot reference range (unverified).
+      # (DS_Gate_Index_544: verified name, location unverified), scaled by
+      # the 1 ns gate spacing (0.15 m one-way). Long waveforms are compressed
+      # on board (the first i_N_val gates at 1 ns, the rest averaged --
+      # i_compRatio_p/q), and those parameters are 1 Hz, so the compressed
+      # spacing can vary from record to record. A single 1-D offsets table
+      # cannot express a per-record spacing: it is right only if the
+      # compression is constant within a granule. Whether DS_Gate_Index_544
+      # is a uniform gate index or the compressed spacing, and whether
+      # per-record compression needs a richer synthesis, are phase 4
+      # questions. (The test fixture's table is ``arange(544)``, a uniform
+      # step.) ``start`` is the per-shot reference range (unverified).
       synthesize: offsets
       level: shots
       start: "/{group}/Waveform/RecWaveform/d_refRng"
