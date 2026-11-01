@@ -7,7 +7,9 @@ lat/lon and the composite shot key, plus a GLAH05-shaped sibling carrying the
 40 Hz lat/lon keyed on (``i_rec_ndx``, ``i_shot_count``). The template's whole
 declared surface is driven through the public ``_read_group`` dispatch, the
 cell statistics, and the real ``process_shard`` → ``process_and_write_hive``
-leaf write, and the planned read is pinned to the shard's rows only.
+leaf write. The 2-D waveform's planned read is pinned to the shard's
+records; record-rate datasets read whole (the shared vlen-route behaviour),
+and the 1 Hz datasets are never read.
 """
 
 import numpy as np
@@ -80,7 +82,8 @@ def _glah01_arrays():
         f"/{G}/Time/i_rec_ndx": REC_NDX,
         f"/{G}/Time/i_shot_count": SHOT_COUNT,
         f"/{G}/Time/d_UTCTime_40": UTC,
-        # 1 Hz predicted geolocation only -- never read by the template.
+        # 1 Hz predicted geolocation only -- never read by the template
+        # (pinned in test_planned_read_touches_only_the_shards_rows).
         "/Data_1HZ/Geolocation/d1_pred_lat": np.array([-78.4, -78.6]),
         "/Data_1HZ/Geolocation/d1_pred_lon": np.array([-132.1, -131.9]),
     }
@@ -187,9 +190,10 @@ class TestGlah01Template:
         attrs = _overview_config(fields).aggregation["variables"]["rx_flux"]["attrs"]
         assert attrs["gain"]["provenance"] == "proposed"
 
-    def test_hash_is_stable(self, cfg):
-        # The GEDI/ATL03 pins live in test_live_store_templates; this template
-        # is new, so pin that its hash is deterministic and distinct.
+    def test_hash_is_deterministic_and_distinct_from_gedi(self, cfg):
+        """The hash survives a reload and differs from GEDI's. No digest is
+        pinned: the GEDI/ATL03 pins in test_live_store_templates guard live
+        stores, and no GLAH01 store exists yet."""
         assert semantic_hash(cfg) == semantic_hash(default_config("glah01_waveform_healpix_hive"))
         assert semantic_hash(cfg) != semantic_hash(default_config("gedi01b_waveform_healpix_hive"))
 
@@ -258,6 +262,8 @@ class TestGlah01Template:
         # The 2-D waveform is sliced by RECORD rows -- shots 0..4 (the padded
         # run), never shot 5 and never a whole-dataset read.
         assert wf_reads == [[(0, 5)]]
+        # The 1 Hz predicted geolocation is never read.
+        assert not [p for p, _ in h5.reads if p.startswith("/Data_1HZ/")]
 
     def test_missing_sibling_fails_the_group(self, cfg, grid):
         with pytest.raises(ValueError, match="no open sibling handle"):
