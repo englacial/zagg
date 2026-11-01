@@ -187,13 +187,18 @@ aggregation:
       overview_delta: 512
       attrs:
         # Provenance (issue #321 field attrs). ``proposed``: the GLAS
-        # noise/gain mapping is a science ruling for the phase 4 card, not
-        # this template (issue #678 question (2)).
+        # noise/gain mapping and the operating point are a science ruling for
+        # the phase 4 card, not this template (issue #678 question (2)). The
+        # top-level marker is leaf-only: the overview ladder rebuilds attrs
+        # from the manifest, which carries ``gain`` alone (pyramid.py
+        # declared_fields), so the marker is repeated inside ``gain`` to reach
+        # every overview level.
         provenance: proposed
         gain:
           name: "unit"
           version: "glah01-v033-placeholder"
           value: 1.0
+          provenance: proposed
         clip: "threshold-to-zero"
         operating_point:
           false_positive_rate: 1.0e-3

@@ -177,6 +177,16 @@ class TestGlah01Template:
         assert flux["weights"] == "flux" and flux["attrs"]["provenance"] == "proposed"
         assert flux["params"]["samples_per_record"] == WIDTH
 
+    def test_proposed_marker_reaches_the_overview_ladder(self, cfg):
+        # The overview config is rebuilt from the manifest's declared fields,
+        # which carry ``gain`` alone; the marker must ride inside it.
+        from zagg.pyramid import declared_fields
+        from zagg.sweep_overview import _overview_config
+
+        fields, _ = declared_fields(cfg)
+        attrs = _overview_config(fields).aggregation["variables"]["rx_flux"]["attrs"]
+        assert attrs["gain"]["provenance"] == "proposed"
+
     def test_hash_is_stable(self, cfg):
         # The GEDI/ATL03 pins live in test_live_store_templates; this template
         # is new, so pin that its hash is deterministic and distinct.
