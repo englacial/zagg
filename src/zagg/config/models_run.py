@@ -12,7 +12,7 @@ from typing import Annotated, Any, ClassVar, Literal
 from pydantic import Field, WithJsonSchema, field_validator, model_validator
 
 from zagg.config.core import WORKER_MEMORIES
-from zagg.config.models_base import StrictModel, _Block
+from zagg.config.models_base import Bool, StrictModel, _Block
 
 __all__ = ["Bounds", "SpatialPipeline", "TemporalBounds", "TemporalPipeline", "Worker"]
 
@@ -45,9 +45,10 @@ class Worker(_Block):
         description=f"Memory in MB, one of {', '.join(map(str, _MEMORIES))} — the "
         "pre-provisioned variant sizes."
     )
-    extra_disk: bool | None = Field(
-        default=None,
-        description="Select the ``-disk`` twin with ``/tmp`` sized memory + 2048 MB (default false).",
+    extra_disk: Bool = Field(
+        default=False,
+        description="Select the ``-disk`` twin with ``/tmp`` at Lambda's 10240 MB ceiling "
+        "(issue #536; default false).",
     )
 
     @model_validator(mode="before")
@@ -76,7 +77,7 @@ class Worker(_Block):
     @field_validator("extra_disk", mode="before")
     @classmethod
     def _disk(cls, v: Any) -> Any:
-        if v is not None and not isinstance(v, bool):
+        if not isinstance(v, bool):
             raise ValueError(f"worker.extra_disk must be a boolean (got {v!r})")
         return v
 

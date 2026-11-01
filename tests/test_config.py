@@ -3253,6 +3253,15 @@ class TestWorkerBlock:
         prop = Worker.model_json_schema()["properties"]["memory"]
         assert prop["type"] == "integer" and prop["enum"] == [2048, 4096, 8192]
 
+    def test_extra_disk_schema_matches_the_null_refusal(self, atl06_config):
+        from zagg.config.models_run import Worker
+
+        prop = Worker.model_json_schema()["properties"]["extra_disk"]
+        assert prop["type"] == "boolean" and "anyOf" not in prop
+        atl06_config.worker = {"memory": 4096, "extra_disk": None}
+        with pytest.raises(ValueError, match="extra_disk must not be null"):
+            validate_config(atl06_config)
+
     def test_non_mapping_block_rejected(self, atl06_config):
         atl06_config.worker = 4096
         with pytest.raises(ValueError, match="worker must be a mapping"):
