@@ -1132,6 +1132,9 @@ class TestDispatch:
         ds = _fx_sibling_coord_ds(read_plan={"spatial_index": "recs"})
         idx._prebuild_group_maps(h5obj, "G", ds)
         assert {"/G/wf", "/G/rng_start", "/G/gate"} <= set(built)
-        # Sibling-sourced coordinates and the join keys live in the paired
-        # granule, which this backend never opens.
+        # The sibling coordinates and the RIGHT join keys live in the paired
+        # granule, which this backend never opens. The LEFT keys are on the
+        # primary, and the prebuild does not map them either: a known gap,
+        # acceptable because the join key is a record-rate read the inline
+        # backend serves from the handle's own B-tree without a chunk map.
         assert not any("key" in p or p.endswith(("/lat", "/lon")) for p in built)
