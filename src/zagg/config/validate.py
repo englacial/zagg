@@ -13,11 +13,10 @@ from zagg.config.models import validate_model
 from zagg.config.source import _segment_variable_names, filters_from_data_source
 from zagg.config.validate_fields import _validate_chunk_precompute, _validate_temporal_producer
 from zagg.config.validate_output import (
-    _validate_store_layout_keys,
-    _validate_time_encoding,
+    _validate_pyramid,
     _validate_time_source,
+    _warn_nan_ambiguous_reductions,
 )
-from zagg.config.validate_source import _validate_raster_config
 from zagg.config.windowing import _validate_windowing
 
 
@@ -58,7 +57,6 @@ def validate_config(config: PipelineConfig) -> None:
     # where a time coordinate exists, so declaring it elsewhere is a typo
     # worth catching at submission rather than a knob that silently does
     # nothing.
-    _validate_time_encoding(config)
     # The per-observation clock the §8.2/§8.3 companions encode from (issue
     # #410) — checked here for the same reason as the block above: the value is
     # only meaningful where a companion is declared, so declaring it on a
@@ -74,12 +72,9 @@ def validate_config(config: PipelineConfig) -> None:
     # aggregation section with a declarative band map: pull-NN yields exactly
     # one value per cell per timestep, so there is nothing to reduce.
     if (config.data_source or {}).get("reader") == "raster":
-        _validate_raster_config(config)
-        # Store layout, root coverage MOC, and temporal windowing ride the
-        # SHARED checks (issue #247: raster + hive is legal). _validate_windowing
-        # resolves the raster time_field/encoding rules (membership is the
-        # acquisition's STAC datetime; the conversion knobs do not apply).
-        _validate_store_layout_keys(config)
+        # The raster kind's shape and couplings are the models' (``RasterConfig``);
+        # the shared store-layout family is ``Output``'s. Only the windowing
+        # time_field/epoch rules (data_source-dependent) and the NaN warning run.
         _validate_windowing(config)
         return
 
@@ -89,83 +84,14 @@ def validate_config(config: PipelineConfig) -> None:
         if not val:
             raise ValueError(f"Missing required section: {section}")
 
-    # Validate output.grid structure
     grid = config.output.get("grid")
-    if grid is not None:
-        if not isinstance(grid, dict):
-            raise ValueError("output.grid must be a mapping (e.g. type: healpix, child_order: 12)")
-        if "type" not in grid:
-            raise ValueError("output.grid.type is required")
-        if grid["type"] == "healpix" and "child_order" not in grid:
-            raise ValueError("output.grid.child_order is required for healpix grid")
-        if grid["type"] == "healpix" and "parent_order" not in grid:
-            raise ValueError("output.grid.parent_order is required for healpix grid")
-        if grid["type"] == "rectilinear":
-            for field in ("crs", "resolution", "bounds"):
-                if field not in grid:
-                    raise ValueError(f"output.grid.{field} is required for rectilinear grid")
-            if len(grid["bounds"]) != 4:
-                raise ValueError("output.grid.bounds must be [xmin, ymin, xmax, ymax]")
-        layout = grid.get("layout")
-        if layout is not None and layout != "fullsphere":
-            raise ValueError(
-                f"output.grid.layout must be 'fullsphere' (got {layout!r}; "
-                "the deprecated 'dense' layout was removed — issue #88)"
-            )
-        # The issue #135 knob is retired (issue #304 phase 3, D16 — #135
-        # inverts): morton is the stored cell coordinate and NESTED ids are
-        # DERIVED at read (moczarr fabrication). A config still carrying the
-        # key gets a pointed error, never a silent ignore.
-        if grid.get("cell_ids_encoding") is not None:
-            raise ValueError(
-                "output.grid.cell_ids_encoding was retired (issue #304): morton is "
-                "the stored cell coordinate and NESTED ids are derived at read; "
-                "to keep writing the legacy NESTED cell_ids array for transition "
-                "stores set output.grid.emit_cell_ids: true"
-            )
-        # Transition escape hatch (issue #304 phase 2): emit the legacy NESTED
-        # cell_ids array ALONGSIDE the morton coordinate. Default off — morton
-        # is the only stored cell coordinate (D16); the hatch exists for
-        # transition stores (browser-direct demos) until the gridlook morton
-        # path lands. HEALPix-only: rectilinear grids have no cell_ids
-        # coordinate, so the flag would silently do nothing there.
-        emit = grid.get("emit_cell_ids")
-        if emit is not None:
-            if not isinstance(emit, bool):
-                raise ValueError(f"output.grid.emit_cell_ids must be a boolean (got {emit!r})")
-            if emit and grid["type"] != "healpix":
-                raise ValueError(
-                    "output.grid.emit_cell_ids only applies to healpix grids "
-                    f"(grid type is {grid['type']!r})"
-                )
-        # The legacy output.grid.indexing_scheme key is descriptive only (the
-        # shipped configs carry "nested"); it never selected an encoding.
-        # Reject any other value so a user reaching for it fails loudly.
-        legacy_scheme = grid.get("indexing_scheme")
-        if legacy_scheme is not None and legacy_scheme != "nested":
-            raise ValueError(
-                f"output.grid.indexing_scheme is descriptive and must be 'nested' "
-                f"(got {legacy_scheme!r}); the store's declared coordinate is morton "
-                f"(D16 — issue #304)"
-            )
 
-    # Optional strict-AOI cell mask (issue #101), default off. Must be a bool.
-    aoi_mask = config.output.get("aoi_mask")
-    if aoi_mask is not None and not isinstance(aoi_mask, bool):
-        raise ValueError(f"output.aoi_mask must be a boolean (got {aoi_mask!r})")
-
-    # Optional zarr metadata consolidation (issue #191), default off. Must be a
-    # bool. No zagg reader depends on the consolidated blob, and building it is a
-    # ~70 s serial-GET finalize tax, so it is opt-in.
-    consolidate_metadata = config.output.get("consolidate_metadata")
-    if consolidate_metadata is not None and not isinstance(consolidate_metadata, bool):
-        raise ValueError(
-            f"output.consolidate_metadata must be a boolean (got {consolidate_metadata!r})"
-        )
-
-    # Store layout + root coverage MOC — shared with the raster branch
-    # (issue #247: raster + hive is legal, so the checks live in one place).
-    _validate_store_layout_keys(config)
+    # The output block's shape and its intra-block couplings (store layout,
+    # hive-only companions, pyramid grammar + orders, windowing layout) are the
+    # model's (``models_output``, issue #677 phase 3); the NaN-fill reduction
+    # warning is per config validation (espg ruling on the PR #344 finding).
+    _warn_nan_ambiguous_reductions(config)
+    _validate_pyramid(config)
 
     # Temporal windowing block (issue #246, morton-hive/2): nested
     # output.windowing declares the window schedule + time encoding. Absent =

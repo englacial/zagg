@@ -73,6 +73,15 @@ from zagg.config.models_aggregation import (
     FieldSpec,
     TemporalAggregation,
 )
+from zagg.config.models_output import (
+    Grid,
+    HealpixGrid,
+    Output,
+    Pyramid,
+    RectilinearGrid,
+    TemporalOutput,
+    Windowing,
+)
 from zagg.config.source import (
     _segment_variable_names,
     collection_options,
@@ -97,12 +106,8 @@ from zagg.config.validate_fields import (
 from zagg.config.validate_output import (
     _is_nan_fill,
     _validate_pyramid,
-    _validate_pyramid_fold,
-    _validate_store_layout_keys,
-    _validate_time_encoding,
     _validate_time_source,
 )
-from zagg.config.validate_source import _validate_raster_config
 from zagg.config.windowing import (
     WINDOWING_UNITS,
     _explicit_window_bounds,
@@ -118,10 +123,16 @@ __all__ = [
     "Aggregation",
     "ConfigModel",
     "FieldSpec",
+    "Grid",
+    "HealpixGrid",
+    "Output",
+    "Pyramid",
+    "RectilinearGrid",
     "RasterConfig",
     "SpatialConfig",
     "TemporalAggregation",
     "TemporalConfig",
+    "TemporalOutput",
     "validate_model",
     "FILTER_OPS",
     "OUTPUT_KINDS",
@@ -132,6 +143,7 @@ __all__ = [
     "SWEEP_STAGES",
     "TOUCH_POLICIES",
     "WINDOWING_UNITS",
+    "Windowing",
     "WORKER_MEMORIES",
     "DataSourceDict",
     "LevelDict",
@@ -193,12 +205,8 @@ __all__ = [
     "_validate_json_floats",
     "_validate_output_kind",
     "_validate_pyramid",
-    "_validate_pyramid_fold",
-    "_validate_raster_config",
-    "_validate_store_layout_keys",
     "_validate_temporal_config",
     "_validate_temporal_producer",
-    "_validate_time_encoding",
     "_validate_time_source",
     "_validate_windowing",
     "_validate_windowing_windows",

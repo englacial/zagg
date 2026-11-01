@@ -91,6 +91,14 @@ TAGS = frozenset(
         "<spatial-config>",
         "<raster-config>",
         "<temporal-config>",
+        "<healpix-grid>",
+        "<rectilinear-grid>",
+        "<point-window>",
+        "<range-window>",
+        "<icechunk-flag>",
+        "<icechunk-block>",
+        "<pyramid-off>",
+        "<pyramid-block>",
     }
 )
 

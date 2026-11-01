@@ -748,7 +748,9 @@ class TestValidation:
 
     def test_missing_required_section(self):
         cfg = PipelineConfig(
-            data_source={}, aggregation={"variables": {}}, output={"grid": {"type": "x"}}
+            data_source={},
+            aggregation={"variables": {}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="Missing required section"):
             validate_config(cfg)
@@ -2786,10 +2788,13 @@ class TestTimeSource:
         with pytest.raises(ValueError, match="carries sub-second precision"):
             validate_config(cfg)
         # A real epoch disagreement still reports both DECLARED spellings — the
-        # cross-check's purpose is untouched, only the value it quotes.
+        # cross-check's purpose is untouched, only the value it quotes. (The
+        # windowing grammar refuses a sub-second epoch before the cross-check
+        # runs, so the disagreeing pair is spelled at whole seconds.)
+        cfg.output["windowing"]["epoch"] = "2018-01-01T00:00:00Z"
         cfg.output["time_source"]["epoch"] = "2020-06-01T00:00:00"
         with pytest.raises(
-            ValueError, match=r"disagrees with output\.windowing .*2018-01-01T00:00:00\.5Z"
+            ValueError, match=r"disagrees with output\.windowing .*2018-01-01T00:00:00Z"
         ):
             validate_config(cfg)
 
@@ -3058,7 +3063,7 @@ class TestLocationChannel:
             location="leaf_id",
             function="zagg.stats.tdigest.build_tdigest",
         )
-        cfg.output = {"store_path": "s3://x"}
+        cfg.output = {"store": "s3://x"}
         validate_config(cfg)
 
     def test_location_requires_healpix_grid(self):
@@ -3596,19 +3601,19 @@ class TestTouchPolicy:
         # collaborator's data expiring.
         import pytest
 
-        from zagg.config import _validate_store_layout_keys, default_config
+        from zagg.config import default_config, validate_config
 
         cfg = default_config()
         cfg.output["touch"] = "sometimes"
         with pytest.raises(ValueError, match="output.touch must be one of"):
-            _validate_store_layout_keys(cfg)
+            validate_config(cfg)
 
     def test_absent_is_legal(self):
-        from zagg.config import _validate_store_layout_keys, default_config
+        from zagg.config import default_config, validate_config
 
         cfg = default_config()
         cfg.output.pop("touch", None)
-        _validate_store_layout_keys(cfg)
+        validate_config(cfg)
 
     def test_unvalidated_typo_warns_before_falling_through_to_auto(self, caplog):
         # validate_config catches a typo at submission, but the worker's own

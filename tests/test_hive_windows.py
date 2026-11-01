@@ -534,7 +534,7 @@ class TestWindowingConfig:
         )
         with pytest.raises(
             ValueError,
-            match=r"output\.windowing\.windows: .*unsupported key\(s\) 3, True; the point form",
+            match=r"output\.windowing\.windows\[0\]: .*unsupported key\(s\) 3, True; the point form",
         ):
             validate_config(cfg)
 

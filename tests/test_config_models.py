@@ -397,3 +397,100 @@ class TestAggregationGrammar:
             ValueError, match=r"coordinates\.x\.dtype: dtype 'bogus' is not a valid"
         ):
             validate_config(cfg)
+
+
+class TestOutputGrammar:
+    """Phase 3: the output block's shape and its intra-block couplings are the model's."""
+
+    def test_typed_output(self):
+        model = default_config("atl03_tdigest_strata_healpix").model
+        out = model.output
+        assert out.grid.type == "healpix" and out.grid.parent_order == 9
+        assert out.windowing.schedule == "yearly" and out.windowing.declares_schedule
+        assert out.pyramid.overviews == [16, 15, 14, 13]
+        assert out.resolved_store_layout == "hive" and out.sweep_enabled is True
+        rect = default_config("atl03").model.output
+        assert rect.grid.type == "rectilinear" and rect.resolved_store_layout == "flat"
+
+    def test_misspelled_output_key_names_its_path(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["stor"] = "."
+        with pytest.raises(ValueError, match=r"output\.stor: Extra inputs are not permitted"):
+            validate_config(cfg)
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["grid"]["chunk_iner"] = 8
+        with pytest.raises(ValueError, match=r"output\.grid\.chunk_iner: Extra inputs"):
+            validate_config(cfg)
+
+    def test_grid_union_follows_type(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["grid"] = {"type": "rectilinear", "crs": "EPSG:3031", "resolution": 100}
+        with pytest.raises(ValueError, match=r"output\.grid\.bounds: Field required"):
+            validate_config(cfg)
+        cfg.output["grid"] = {"child_order": 12}
+        with pytest.raises(ValueError, match=r"output\.grid\.type: Field required"):
+            validate_config(cfg)
+
+    def test_explicit_windows_are_typed_and_point_sugar_rides(self):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        cfg.output["windowing"] = {
+            "schedule": "explicit",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00Z",
+            "scale": "gps",
+            "windows": [
+                {"label": "a", "start": "2019-01-01", "end": "2019-02-01"},
+                {"label": "b", "timestamp": "2019-06-01T12:00:00Z"},
+            ],
+        }
+        validate_config(cfg)
+        windows = cfg.model.output.windowing.windows
+        assert [type(w).__name__ for w in windows] == ["WindowRange", "WindowPoint"]
+        cfg.output["windowing"]["windows"].append({"label": "c", "timestamp": "x", "width": 1})
+        with pytest.raises(
+            ValueError, match=r"windows\[2\]: explicit point window entry carries unsupported key"
+        ):
+            validate_config(cfg)
+
+    def test_raster_couplings_live_on_the_raster_kind(self):
+        cfg = default_config("sentinel2_l2a")
+        cfg.output["grid"]["sharded"] = True
+        with pytest.raises(ValueError, match="read-modify-write"):
+            validate_config(cfg)
+        cfg = default_config("sentinel2_l2a")
+        cfg.output["windowing"] = {"schedule": "yearly", "unit": "shard"}
+        with pytest.raises(ValueError, match="unit does not apply to raster"):
+            validate_config(cfg)
+
+    def test_time_encoding_is_raster_only(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["time_encoding"] = "toc"
+        with pytest.raises(ValueError, match="applies to raster"):
+            validate_config(cfg)
+        cfg.output["time_encoding"] = "microseconds"
+        validate_config(cfg)
+
+    def test_hive_companions_need_hive(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["store_layout"] = "flat"
+        for key in ("coverage_moc", "leaf_versions", "icechunk"):
+            cfg.output[key] = True
+            with pytest.raises(ValueError, match="store_layout: hive"):
+                validate_config(cfg)
+            del cfg.output[key]
+        cfg.output["sweep"] = "none"  # a spelled opt-out on a flat store is legal
+        validate_config(cfg)
+
+    def test_dump_keeps_yaml_datetimes(self):
+        import datetime
+
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "h",
+            "epoch": datetime.datetime(2018, 1, 1),
+        }
+        validate_config(cfg)
+        dump = validate_model(cfg).model_dump(exclude_unset=True, mode="python")
+        assert dump["output"]["windowing"]["epoch"] == datetime.datetime(2018, 1, 1)

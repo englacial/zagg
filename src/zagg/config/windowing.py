@@ -2,7 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 
-from zagg.config.accessors import get_store_layout
 from zagg.config.core import PipelineConfig
 from zagg.config.source import _segment_variable_names, filters_from_data_source
 
@@ -30,84 +29,17 @@ def _validate_windowing(config: PipelineConfig) -> None:
     granules span) or ``window`` (one invoke per ``(shard, window)``); the
     raster path always dispatches per window and rejects the key.
     """
-    from zagg import windows as _windows
-
     block = config.output.get("windowing")
-    if block is None:
+    if block is None or block.get("schedule", "none") == "none":
         return
-    if not isinstance(block, dict):
-        raise ValueError(
-            f"output.windowing must be a mapping "
-            f"{{schedule, time_field, epoch, ...}} (got {block!r})"
-        )
-    try:
-        schedule = _windows.check_schedule(block.get("schedule", "none"))
-    except ValueError as e:
-        raise ValueError(f"output.windowing.schedule: {e}") from e
-    if schedule == "none":
-        # An inert ``schedule: none`` block is equivalent to an absent block
-        # (``get_windowing`` returns ``None``, no windowed output), so it must
-        # NOT require the hive/healpix layout — this early return precedes the
-        # layout guards. A stray ``windows`` key is still rejected, mirroring
-        # the generative-schedule check below (validation symmetry).
-        if block.get("windows") is not None:
-            raise ValueError(
-                "output.windowing.windows only applies to schedule: explicit "
-                "(schedule: none produces no windowed output)"
-            )
-        return
-    grid = config.output.get("grid") or {}
-    if (grid.get("type", "healpix")) != "healpix":
-        raise ValueError(
-            "output.windowing requires a healpix grid (windowed leaves are a "
-            f"morton-hive convention; grid type is {grid.get('type')!r})"
-        )
-    if get_store_layout(config) != "hive":
-        raise ValueError(
-            "output.windowing requires output.store_layout: hive (window leaves "
-            "are hive leaf zarrs; the flat shared store has no leaves to window)"
-        )
-    unit = block.get("unit")
-    if unit is not None and unit not in WINDOWING_UNITS:
-        raise ValueError(
-            f"output.windowing.unit must be one of {WINDOWING_UNITS} (got {unit!r}): "
-            f"'shard' emits every window from one invoke per shard, 'window' "
-            f"dispatches one invoke per (shard, window)"
-        )
-    time_field = block.get("time_field")
+    # Shape, the schedule vocabulary, the hive/healpix requirement, the
+    # sub-second epoch guard and the explicit-windows grammar are the model's
+    # (``models_output.Windowing`` / ``Output``); the raster branch's fixed
+    # time_field and refused conversion knobs are ``RasterConfig``'s. What
+    # remains needs the data_source: the point path's time_field and epoch.
     if (config.data_source or {}).get("reader") == "raster":
-        if unit is not None:
-            raise ValueError(
-                "output.windowing.unit does not apply to raster pipelines: window "
-                "membership is decided per acquisition at dispatch, one unit per "
-                "(shard, window) (drop the key)"
-            )
-        # Raster window membership is the acquisition's STAC ``datetime``,
-        # decided at dispatch (issue #247, ratified): there is no
-        # per-observation timestamp column, so ``time_field`` is optional and
-        # fixed — the manifest records the resolved field, and a property-name
-        # knob (e.g. ``start_datetime`` for interval-typed items) can be added
-        # later without breaking any existing manifest.
-        if time_field is not None and time_field != "datetime":
-            raise ValueError(
-                f"output.windowing.time_field {time_field!r} is not configurable "
-                "on the raster path: window membership is the acquisition's STAC "
-                "datetime (drop the key, or set it to 'datetime')"
-            )
-        # The epoch/scale/units knobs describe a dataset-unit time_field
-        # conversion; STAC datetimes are already ISO-8601 UTC instants, so
-        # there is nothing to configure — reject rather than record a
-        # misleading manifest temporal block (get_windowing resolves the
-        # fixed encoding).
-        knobs = [k for k in ("epoch", "scale", "units") if block.get(k) is not None]
-        if knobs:
-            raise ValueError(
-                f"output.windowing.{knobs[0]} does not apply to raster "
-                "pipelines: STAC datetimes are ISO-8601 UTC instants (drop the "
-                "key)"
-            )
-        _validate_windowing_windows(block, schedule)
         return
+    time_field = block.get("time_field")
     if not isinstance(time_field, str) or not time_field:
         raise ValueError(
             "output.windowing.time_field is required: the per-observation "
@@ -152,42 +84,6 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "ISO-8601 UTC instant (e.g. '2018-01-01T00:00:00Z' for ICESat-2 "
             "delta_time)"
         )
-    try:
-        parsed_epoch = _windows.parse_utc(epoch)
-    except ValueError as e:
-        raise ValueError(f"output.windowing.epoch: {e}") from e
-    # Validate the RENDERED epoch, not the parsed one (issue #390). get_windowing
-    # canonicalizes through windows.iso_utc (timespec="seconds"), so a sub-second
-    # epoch parses clean here and is then silently truncated at the one place it
-    # is consumed — shifting EVERY window conversion by the dropped fraction. The
-    # predicate calls the renderer and round-trips it rather than repeating the
-    # truncation rule, so the two cannot drift (the PR #367 pattern).
-    # The message renders parsed_epoch rather than repr-ing the declared value:
-    # yaml.safe_load types an ISO timestamp scalar as a datetime, which parse_utc
-    # passes through, so repr would hand the author a stdlib constructor call
-    # instead of the value they wrote. The drop is reported in microseconds
-    # because that is exactly what iso_utc discards and nothing else: an integer,
-    # so no scientific notation for the 1 µs case, and never negative.
-    rendered_epoch = _windows.iso_utc(parsed_epoch)
-    if _windows.parse_utc(rendered_epoch) != parsed_epoch:
-        raise ValueError(
-            f"output.windowing.epoch {parsed_epoch.isoformat()!r} carries sub-second "
-            f"precision that the canonical whole-second rendering drops: it is "
-            f"recorded as {rendered_epoch!r}, which would shift every window "
-            f"conversion by {parsed_epoch.microsecond} µs — declare the epoch at "
-            f"second precision"
-        )
-    scale = block.get("scale") or "utc"
-    if scale not in _windows.EPOCH_SCALES:
-        raise ValueError(
-            f"output.windowing.scale must be one of {_windows.EPOCH_SCALES} (got {scale!r})"
-        )
-    units = block.get("units") or "seconds"
-    if units not in _windows.UNIT_SECONDS:
-        raise ValueError(
-            f"output.windowing.units must be one of {tuple(_windows.UNIT_SECONDS)} (got {units!r})"
-        )
-    _validate_windowing_windows(block, schedule)
 
 
 #: Width of the window a ``{label, timestamp}`` point entry desugars to (#355).

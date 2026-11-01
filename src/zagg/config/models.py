@@ -37,10 +37,12 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from zagg.config.models_aggregation import Aggregation, TemporalAggregation
 from zagg.config.models_base import TAGS, StrictModel
+from zagg.config.models_output import HealpixGrid, Output, TemporalOutput
 from zagg.config.models_source import CollectionDataSource, H5DataSource, RasterDataSource
 
 __all__ = [
@@ -62,9 +64,6 @@ __all__ = [
 class _RootBase(StrictModel):
     """The four blocks phases 1–3 leave untyped (phase 4 types them)."""
 
-    output: dict[str, Any] = Field(
-        default_factory=dict, description="The output block (typed in issue #677 phase 3)."
-    )
     pipeline: Any = Field(
         default=None,
         description="The pipeline kind selector, ``{type: spatial|temporal|event}``; absent "
@@ -91,6 +90,16 @@ class SpatialConfig(_RootBase):
         description="Per-field reducers over the read columns, chunk precomputes, carrier "
         "and streaming knobs.",
     )
+    output: Output = Field(
+        default_factory=Output,
+        description="The output grid, store layout and its companions, pyramid, windowing.",
+    )
+
+    @model_validator(mode="after")
+    def _no_time_axis(self) -> SpatialConfig:
+        _refuse_time_encoding(self.output.time_encoding)
+        return self
+
     data_source: H5DataSource = Field(
         default_factory=H5DataSource,
         description="The HDF5 point source: groups, coordinates, variables, filters, levels.",
@@ -106,6 +115,11 @@ class RasterConfig(_RootBase):
         "there is nothing to reduce — the band map under ``data_source.bands`` replaces it.",
     )
 
+    output: Output = Field(
+        default_factory=Output,
+        description="The output grid (HEALPix only, never sharded), store layout, windowing.",
+    )
+
     @field_validator("aggregation")
     @classmethod
     def _no_aggregation(cls, v: dict[str, Any]) -> dict[str, Any]:
@@ -115,6 +129,56 @@ class RasterConfig(_RootBase):
                 "value per cell per timestep (declare bands under data_source.bands)"
             )
         return v
+
+    @model_validator(mode="after")
+    def _raster_output(self) -> RasterConfig:
+        """The raster kind's couplings to the output block (was the output half of
+        ``_validate_raster_config`` and the raster branch of ``_validate_windowing``)."""
+        out = self.output
+        grid = out.grid
+        if not isinstance(grid, HealpixGrid):
+            raise ValueError(
+                "raster pipelines currently require output.grid.type: healpix "
+                "(the rectilinear (time, y, x) template is future work — issue #218)"
+            )
+        if grid.sharded:
+            # Permanent exclusion (espg-ratified on issue #247): per-timestep slab
+            # streaming over a ShardingCodec object would read-modify-write it.
+            raise ValueError(
+                "raster pipelines do not support sharded: true (per-timestep slab "
+                "streaming would read-modify-write each ShardingCodec object; "
+                "chunks stay (1, cells_per_chunk) — one object per timestep-chunk)"
+            )
+        if out.icechunk_enabled:
+            raise ValueError(
+                "output.icechunk is out of scope for raster products (spec §11.6): "
+                "raster leaves are never sharded, so stage 1 records no refs for them"
+            )
+        w = out.windowing
+        if w is not None and w.declares_schedule:
+            if w.unit is not None:
+                raise ValueError(
+                    "output.windowing.unit does not apply to raster pipelines: window "
+                    "membership is decided per acquisition at dispatch, one unit per "
+                    "(shard, window) (drop the key)"
+                )
+            # Raster window membership is the acquisition's STAC ``datetime``
+            # (issue #247): ``time_field`` is fixed and the conversion knobs
+            # (dataset-unit epoch/scale/units) have nothing to configure.
+            if w.time_field is not None and w.time_field != "datetime":
+                raise ValueError(
+                    f"output.windowing.time_field {w.time_field!r} is not configurable "
+                    "on the raster path: window membership is the acquisition's STAC "
+                    "datetime (drop the key, or set it to 'datetime')"
+                )
+            knobs = [k for k in ("epoch", "scale", "units") if getattr(w, k) is not None]
+            if knobs:
+                raise ValueError(
+                    f"output.windowing.{knobs[0]} does not apply to raster "
+                    "pipelines: STAC datetimes are ISO-8601 UTC instants (drop the "
+                    "key)"
+                )
+        return self
 
     data_source: RasterDataSource = Field(
         description="The STAC-asset raster source: a band map plus source-store knobs."
@@ -128,11 +192,33 @@ class TemporalConfig(_RootBase):
         description="Output variables as registry capability names (spatial reducer, "
         "temporal reducer, mask, transform)."
     )
+    output: TemporalOutput = Field(
+        default_factory=TemporalOutput, description="The tabular sink (``format``, ``store``)."
+    )
+
+    @model_validator(mode="after")
+    def _no_time_axis(self) -> TemporalConfig:
+        _refuse_time_encoding(self.output.time_encoding)
+        return self
+
     data_source: CollectionDataSource = Field(
         default_factory=CollectionDataSource,
         description="The collection reader source: named collections with per-collection "
         "reader options, plus static data.",
     )
+
+
+def _refuse_time_encoding(encoding: str | None) -> None:
+    """``output.time_encoding`` (spec §8, issue #443) is raster-only: the spatial
+    and temporal pipelines write no time coordinate, so a non-default value
+    there would be inert — a typo worth catching at submission."""
+    from zagg.time_axis import DEFAULT_TIME_ENCODING
+
+    if encoding not in (None, DEFAULT_TIME_ENCODING):
+        raise ValueError(
+            f"output.time_encoding: {encoding!r} applies to raster (time, cells) "
+            f"products only — this pipeline writes no time coordinate (spec §8)"
+        )
 
 
 def _config_tag(v: Any) -> str:
