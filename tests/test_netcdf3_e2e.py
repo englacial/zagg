@@ -367,3 +367,65 @@ class TestShippedTemplate:
         # 2026-10-31: lat, lon, elev, roughness, peakiness, all non-record).
         assert ds["coordinates"] == {"latitude": "/lat", "longitude": "/lon"}
         assert set(ds["variables"].values()) <= {"/elev", "/roughness", "/peakiness"}
+
+    @pytest.mark.parametrize("handoff", ["pandas", "arrow"])
+    def test_cryosat2_template_aggregates_an_rdwes1b_shaped_granule(self, tmp_path, handoff):
+        # The shipped template end to end: its own aggregation block (nanmean /
+        # nanmin / nanmax, the morton coordinate), >f4 lat/lon into a real
+        # HealpixGrid, and the /lat .. /peakiness paths resolved against a
+        # sidecar manifest of an RDWES1B-shaped file (non-record over x).
+        from zagg.config import default_config
+        from zagg.grids import HealpixGrid
+
+        n = 50
+        rng = np.random.default_rng(0)
+        cols = {
+            "lat": 80 + rng.random(n) * 0.01,
+            "lon": 10 + rng.random(n) * 0.01,
+            "elev": rng.random(n),
+            "roughness": rng.random(n),
+            "peakiness": rng.random(n),
+        }
+        cols = {k: v.astype(">f4") for k, v in cols.items()}
+        cols["elev"][3] = np.nan
+        variables = [
+            {"name": k, "dimids": [0], "nc_type": NC_FLOAT, "data": v} for k, v in cols.items()
+        ]
+        variables.append({"name": "day", "dimids": [0], "nc_type": NC_DOUBLE, "data": np.zeros(n)})
+        data, _ = _nc3_bytes(1, [("x", n)], variables)
+        path = tmp_path / "RDWES1B_CS_OFFL_TEST.nc"
+        path.write_bytes(data)
+        store = tmp_path / "store"
+        index_granule(str(path), str(store))
+
+        cfg = default_config("cryosat2_rdwes1b_healpix")
+        cfg.data_source["index"]["store"] = str(store)
+        g = cfg.output["grid"]
+        grid = HealpixGrid(g["parent_order"], g["child_order"], layout="fullsphere", config=cfg)
+        leaf = grid.assign(cols["lat"].astype("f8"), cols["lon"].astype("f8"))
+        (shard,) = np.unique(grid.shards_of(leaf))
+        df, meta = process_shard(
+            grid,
+            int(shard),
+            [str(path)],
+            s3_credentials={},
+            h5coro_driver=filedriver.FileDriver,
+            config=cfg,
+            handoff=handoff,
+        )
+        assert meta["error"] is None and meta.get("read_errors", 0) == 0
+        assert meta["total_obs"] == n
+        # Output rows are the shard's children in order; map each point to one.
+        row_of = {int(c): i for i, c in enumerate(grid.children(int(shard)))}
+        pos = np.array([row_of[int(c)] for c in grid.cells_of(leaf)])
+        occupied = np.unique(pos)
+        assert len(occupied) > 1 and int(df["count"].sum()) == n
+        for p in occupied:
+            row, sel = df.iloc[int(p)], pos == p
+            assert row["count"] == sel.sum()
+            # The NaN elev is skipped by every statistic but counted by len.
+            for name in ("elev", "roughness", "peakiness"):
+                assert np.isfinite(row[f"{name}_mean"])
+                assert row[f"{name}_mean"] == pytest.approx(np.nanmean(cols[name][sel]), rel=1e-6)
+            assert row["elev_min"] == np.nanmin(cols["elev"][sel])
+            assert row["elev_max"] == np.nanmax(cols["elev"][sel])
