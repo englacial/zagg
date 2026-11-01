@@ -558,3 +558,23 @@ class TestOutputGrammar:
             cfg.output[key] = None
         cfg.output["pyramid"] = cfg.output["windowing"] = None
         validate_config(cfg)
+
+    @pytest.mark.parametrize("key", ["sharded", "chunk_inner", "emit_cell_ids"])
+    def test_explicit_null_on_a_grid_key_is_refused(self, key):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["grid"][key] = None
+        with pytest.raises(ValueError, match=rf"output\.grid: {key} must not be null"):
+            validate_config(cfg)
+        cfg = default_config("atl03")
+        cfg.output["grid"]["chunk_shape"] = None
+        with pytest.raises(ValueError, match=r"output\.grid: chunk_shape must not be null"):
+            validate_config(cfg)
+
+    def test_null_grid_is_refused(self):
+        cfg = default_config("atl03")
+        cfg.output["grid"] = None
+        with pytest.raises(ValueError, match=r"output\.grid must be a mapping"):
+            validate_config(cfg)
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["grid"].update(layout=None, cell_ids_encoding=None)  # documented nulls
+        validate_config(cfg)

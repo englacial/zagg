@@ -85,8 +85,11 @@ Instant = Annotated[
 # ---------------------------------------------------------------------------
 
 
-class HealpixGrid(StrictModel):
+class HealpixGrid(_Block):
     """A HEALPix NESTED grid: cells at ``child_order``, shards at ``parent_order``."""
+
+    #: ``null`` is the documented spelling of both (the one layout; retired).
+    _NULLABLE = frozenset({"layout", "cell_ids_encoding"})
 
     type: Literal["healpix"] = Field(description="Grid family.")
     parent_order: NonNegInt = Field(
@@ -163,7 +166,7 @@ class HealpixGrid(StrictModel):
         return v
 
 
-class RectilinearGrid(StrictModel):
+class RectilinearGrid(_Block):
     """A projected rectilinear grid: ``crs`` + ``resolution`` + ``bounds`` fix the cell geometry."""
 
     type: Literal["rectilinear"] = Field(description="Grid family.")
@@ -769,7 +772,8 @@ def _time_source_knob(v: Any) -> Any:
 
 
 def _grid_knob(v: Any) -> Any:
-    if v is None or isinstance(v, (dict, HealpixGrid, RectilinearGrid)):
+    # A present ``null`` is refused too: no consumer reads it as absent.
+    if isinstance(v, (dict, HealpixGrid, RectilinearGrid)):
         return v
     raise ValueError("output.grid must be a mapping (e.g. type: healpix, child_order: 12)")
 
@@ -843,7 +847,7 @@ class Output(_Block):
         description="D19 product name (issue #299): the run writes under "
         "``{store}/{product_name}/``; absent is the bare single-product layout.",
     )
-    grid: Annotated[Grid, BeforeValidator(_grid_knob)] | None = Field(
+    grid: Annotated[Grid | None, BeforeValidator(_grid_knob)] = Field(
         default=None, description="The output grid: ``type: healpix`` or ``type: rectilinear``."
     )
     store_layout: Literal["flat", "hive"] | None = Field(
