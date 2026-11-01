@@ -17,12 +17,12 @@ in the read columns, expression identifiers, the location column) need the
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, ClassVar, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 import numpy as np
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 
-from zagg.config.models_base import Bool, NonEmptyStr, PosInt, StrictModel
+from zagg.config.models_base import Bool, NonEmptyStr, PosInt, _Block
 
 __all__ = [
     "Aggregation",
@@ -73,32 +73,6 @@ def _check_dtype(v: Any) -> Any:
     except (TypeError, ValueError) as e:
         raise ValueError(f"dtype {v!r} is not a valid numpy dtype ({e})") from e
     return v
-
-
-def _no_explicit_null(data: Any, keys: Any) -> Any:
-    """Refuse an explicit ``null`` on ``keys``: consumers read ``.get(key, default)``,
-    which returns ``None`` for an explicit null instead of the default."""
-    if isinstance(data, dict):
-        for key in keys:
-            if key in data and data[key] is None:
-                raise ValueError(f"{key} must not be null (omit the key for the default)")
-    return data
-
-
-class _Block(StrictModel):
-    """A grammar block whose optional keys may be omitted but never set to ``null``."""
-
-    #: Optional keys for which an explicit ``null`` is meaningful (or refused
-    #: by the field's own validator with a sharper message).
-    _NULLABLE: ClassVar[frozenset[str]] = frozenset()
-
-    @model_validator(mode="before")
-    @classmethod
-    def _no_null(cls, data: Any) -> Any:
-        keys = (
-            k for k, f in cls.model_fields.items() if not f.is_required() and k not in cls._NULLABLE
-        )
-        return _no_explicit_null(data, keys)
 
 
 class _Reducer(_Block):

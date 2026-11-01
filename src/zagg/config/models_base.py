@@ -13,15 +13,48 @@ the canonical JSON the semantic hash reads) of a value the author wrote.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Union
+from typing import Annotated, Any, ClassVar, Union
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, WithJsonSchema
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
     """Base for every grammar model: unknown keys are errors, never ignored."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+def _no_explicit_null(data: Any, keys: Any) -> Any:
+    """Refuse an explicit ``null`` on ``keys``: consumers read ``.get(key, default)``,
+    which returns ``None`` for an explicit null instead of the default."""
+    if isinstance(data, dict):
+        for key in keys:
+            if key in data and data[key] is None:
+                raise ValueError(f"{key} must not be null (omit the key for the default)")
+    return data
+
+
+class _Block(StrictModel):
+    """A grammar block whose optional keys may be omitted but never set to ``null``."""
+
+    #: Optional keys for which an explicit ``null`` is meaningful (or refused
+    #: by the field's own validator with a sharper message).
+    _NULLABLE: ClassVar[frozenset[str]] = frozenset()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_null(cls, data: Any) -> Any:
+        keys = (
+            k for k, f in cls.model_fields.items() if not f.is_required() and k not in cls._NULLABLE
+        )
+        return _no_explicit_null(data, keys)
 
 
 def _check_number(v: Any) -> Any:

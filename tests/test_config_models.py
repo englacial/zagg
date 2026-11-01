@@ -527,3 +527,34 @@ class TestOutputGrammar:
         assert dump["output"]["pyramid"]["summarize"] == {field: decl}
         rebuilt = PipelineConfig(**{k: dump.get(k) for k in BLOCKS})
         validate_config(rebuilt)
+
+    @pytest.mark.parametrize(
+        "block, key",
+        [
+            ("pyramid", "all_time"),
+            ("pyramid", "spacing"),
+            ("windowing", "epoch"),
+            ("icechunk", "commit"),
+            ("time_source", "scale"),
+        ],
+    )
+    def test_explicit_null_in_an_output_block_is_refused(self, block, key):
+        cfg = default_config("atl03_tdigest_strata_healpix")
+        cfg.output.setdefault(block, {})
+        if block == "time_source":
+            cfg.output[block] = {"field": "delta_time", "epoch": "2018-01-01T00:00:00Z"}
+        cfg.output[block][key] = None
+        with pytest.raises(ValueError, match=rf"output\.{block}: {key} must not be null"):
+            validate_config(cfg)
+
+    def test_explicit_null_on_an_output_knob(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["touch"] = None
+        with pytest.raises(ValueError, match=r"^output: touch must not be null"):
+            validate_config(cfg)
+        cfg = TestPathAddressedRefusals()._cfg()
+        # The accessors document a present-but-null key as the default here.
+        for key in ("store_layout", "coverage_moc", "sweep", "leaf_versions", "icechunk"):
+            cfg.output[key] = None
+        cfg.output["pyramid"] = cfg.output["windowing"] = None
+        validate_config(cfg)

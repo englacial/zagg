@@ -32,7 +32,15 @@ from pydantic import (
     model_validator,
 )
 
-from zagg.config.models_base import Bool, NonNegInt, Number, PosInt, StrictModel, _tag_of
+from zagg.config.models_base import (
+    Bool,
+    NonNegInt,
+    Number,
+    PosInt,
+    StrictModel,
+    _Block,
+    _tag_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -310,7 +318,7 @@ WindowEntry = Annotated[
 ]
 
 
-class Windowing(StrictModel):
+class Windowing(_Block):
     """Temporal windowing (issue #246): windowed hive leaves, one per schedule label.
 
     Absent, or ``schedule: none``, is the unwindowed store. A present schedule
@@ -319,6 +327,10 @@ class Windowing(StrictModel):
     on the raster path membership is the acquisition's STAC ``datetime``, so
     ``time_field`` is fixed and the conversion knobs are refused.
     """
+
+    #: Refused by their own checks with the sharper message (the schedule
+    #: grammar; ``explicit`` requires a non-empty ``windows`` list).
+    _NULLABLE = frozenset({"schedule", "windows"})
 
     schedule: str = Field(
         default="none",
@@ -432,7 +444,7 @@ class Windowing(StrictModel):
 # ---------------------------------------------------------------------------
 
 
-class TimeSource(StrictModel):
+class TimeSource(_Block):
     """The per-observation clock a temporal companion's words are encoded from (spec §8.3).
 
     ``field`` must be a base-rate read column (checked against the data source
@@ -498,7 +510,7 @@ class TimeSource(StrictModel):
 # ---------------------------------------------------------------------------
 
 
-class Icechunk(StrictModel):
+class Icechunk(_Block):
     """Options for the Icechunk companion repo (spec §11); ``true`` is this block with defaults.
 
     The shard-order-relative checks run at init (``icechunk_refs.resolve_options``);
@@ -588,7 +600,7 @@ class Summarize(StrictModel):
     )
 
 
-class Pyramid(StrictModel):
+class Pyramid(_Block):
     """The overview pyramid declaration (issue #201); ``false`` declares the family off.
 
     Absent applies the defaults (an every-2-orders schedule below the shard
@@ -797,8 +809,25 @@ def _bool_knob(key: str):
 # ---------------------------------------------------------------------------
 
 
-class Output(StrictModel):
+class Output(_Block):
     """The store side of a spatial or raster pipeline."""
+
+    #: The knobs whose accessor documents a present-but-null key as the default
+    #: (``get_store_layout``, ``get_coverage_moc``, ``get_sweep``,
+    #: ``get_leaf_versions``, ``get_icechunk``, ``get_pyramid``,
+    #: ``get_windowing``); ``grid`` is refused by its own validator.
+    _NULLABLE = frozenset(
+        {
+            "store_layout",
+            "coverage_moc",
+            "sweep",
+            "leaf_versions",
+            "icechunk",
+            "pyramid",
+            "windowing",
+            "grid",
+        }
+    )
 
     store: str | None = Field(
         default=None, description="Store root: a local path or ``s3://bucket/prefix``."
