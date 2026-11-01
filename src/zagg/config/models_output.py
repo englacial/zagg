@@ -586,7 +586,7 @@ class Pyramid(StrictModel):
     spacing: int | None = Field(
         default=None, description="Every-N-orders overview schedule below the shard order (>= 1)."
     )
-    orders: list[int] | None = Field(
+    orders: list[NonNegInt] | None = Field(
         default=None,
         description="Explicit ancestor orders in ``[0, parent_order)``; wins over ``spacing``.",
     )

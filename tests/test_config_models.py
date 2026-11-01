@@ -507,3 +507,12 @@ class TestOutputGrammar:
             ValueError, match=r"output\.windowing\.epoch: must be an ISO-8601 instant string"
         ):
             validate_config(cfg)
+
+    @pytest.mark.parametrize("order", ["3", 3.0, True])
+    def test_pyramid_orders_are_strict_ints(self, order):
+        cfg = default_config("atl03_tdigest_healpix_hive")
+        cfg.output["pyramid"] = {"orders": [order]}
+        with pytest.raises(
+            ValueError, match=r"output\.pyramid\.orders\[0\]: must be a non-negative"
+        ):
+            validate_config(cfg)
