@@ -63,6 +63,12 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+def _worker_knob(v: Any) -> Any:
+    if v is None or isinstance(v, (dict, Worker)):
+        return v
+    raise ValueError(f"worker must be a mapping {{memory, extra_disk?}} (got {v!r})")
+
+
 class _RootBase(StrictModel):
     """The four blocks phases 1–3 leave untyped (phase 4 types them)."""
 
@@ -207,12 +213,6 @@ class TemporalConfig(_RootBase):
         description="The collection reader source: named collections with per-collection "
         "reader options, plus static data.",
     )
-
-
-def _worker_knob(v: Any) -> Any:
-    if v is None or isinstance(v, (dict, Worker)):
-        return v
-    raise ValueError(f"worker must be a mapping {{memory, extra_disk?}} (got {v!r})")
 
 
 def _refuse_time_encoding(encoding: str | None) -> None:

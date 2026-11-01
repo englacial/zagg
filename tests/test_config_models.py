@@ -642,6 +642,18 @@ class TestRunGrammar:
         validate_config(cfg)
         assert validate_model(cfg).model_dump(exclude_unset=True)["bounds"] == cfg.bounds
 
+    def test_root_models_are_complete_at_import(self):
+        # A fresh interpreter: an earlier validate would have rebuilt them lazily.
+        import subprocess
+        import sys
+
+        code = (
+            "from zagg.config.models import RasterConfig, SpatialConfig, TemporalConfig\n"
+            "assert all(m.__pydantic_complete__ for m in "
+            "(SpatialConfig, RasterConfig, TemporalConfig))"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True)
+
     def test_catalog_must_be_a_path_string(self):
         cfg = TestPathAddressedRefusals()._cfg()
         cfg.catalog = 7
