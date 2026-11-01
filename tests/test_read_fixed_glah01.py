@@ -52,10 +52,11 @@ SIB_CNT = np.array([1, 3, 1, 2, 3], dtype=np.int8)
 
 def _waveform():
     """Per-shot amplitude ramps: shot ``i`` reads ``1.0 + i`` volts in its
-    valid gates and a flat near-zero tail beyond (the product zero-fills a
-    short waveform's padding; a value well below the noise floor pins that
-    the padding filter, not the clip, is what drops it)."""
-    wf = np.full((N_SHOTS, WIDTH), 0.001, dtype=np.float32)
+    valid gates and a flat 0.5 V tail beyond. The tail sits well ABOVE the
+    clip threshold (``0.04 + 4.33 * 0.01 ~= 0.083`` for the short shot at the
+    template's operating point) and below every valid amplitude, so only the
+    ``sample_index`` padding filter can drop it -- the clip cannot."""
+    wf = np.full((N_SHOTS, WIDTH), 0.5, dtype=np.float32)
     for i in range(N_SHOTS):
         valid = 200 if WF_TYPE[i] == 2 else WIDTH
         wf[i, :valid] = 1.0 + i
@@ -219,6 +220,23 @@ class TestGlah01Template:
         assert df["sample_index"].max() == WIDTH - 1
         assert df["wt_fact_filt_0"].tolist() == [0] * WIDTH + [6] * 200 + [12] * WIDTH
         assert df["i_waveformType"].tolist() == [1] * WIDTH + [2] * 200 + [1] * WIDTH
+
+    def test_padding_filter_is_what_drops_the_short_tail(self, cfg, grid):
+        # With the padding expression removed, the short shot's 344 tail gates
+        # (0.5 V, above the clip threshold) come through: 3 full shots.
+        cfg.data_source["filters"] = [
+            f for f in cfg.data_source["filters"] if "expression" not in f
+        ]
+        df = _read_group(
+            _FakeH5(_glah01_arrays()),
+            G,
+            cfg.data_source,
+            _shard_key(9),
+            grid,
+            siblings={"glah05": _FakeH5(_glah05_arrays())},
+        )
+        assert len(df) == 3 * WIDTH
+        assert (df.loc[df["utc_time"] == UTC[1], "rx_wf"].to_numpy()[200:] == 0.5).all()
 
     def test_planned_read_touches_only_the_shards_rows(self, cfg, grid):
         shard = _shard_key(cfg.output["grid"]["parent_order"])
