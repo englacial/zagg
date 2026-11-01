@@ -9,12 +9,13 @@
 # primitives the GEDI template uses (planned record gather, expand-by-count,
 # coordinate synthesis) plus the sibling join -- nothing here is sensor code.
 #
-# STATUS: GRAMMAR-PINNED, NOT GRANULE-VERIFIED. The dataset names marked
-# ``verified`` below were read from one introspected granule
-# (GLAH01_033_1102_001_0071_1_02_0001.H5, issue #678 comment of 2026-10-31);
-# the ones marked ``unverified`` are the GLAS data-dictionary names as best
-# known and are what the issue #678 phase 4 real-granule validation
-# (in-region, nsidc credentials) checks first. The test suite drives this
+# STATUS: GRAMMAR-PINNED, NOT GRANULE-VERIFIED. Tags below, against one
+# introspected granule (GLAH01_033_1102_001_0071_1_02_0001.H5, issue #678
+# comment of 2026-10-31): ``verified`` = the full path was read there;
+# ``verified name, location unverified`` = the dataset was named there but
+# not placed, so its group is inferred; ``unverified`` = the GLAS
+# data-dictionary name as best known. The last two are what the issue #678
+# phase 4 real-granule validation (in-region, nsidc credentials) checks first. The test suite drives this
 # template over a synthetic GLAH01-shaped mini-granule keyed off these same
 # strings, so it pins the WIRING, not the product dictionary.
 #
@@ -61,7 +62,7 @@ data_source:
     gate_range:
       # Per-sample range synthesized as start[shot] + gate[sample] * scale:
       # the gate-index dimension scale is a 1-D table of length 544
-      # (verified: DS_Gate_Index_544), scaled by the 1 ns gate spacing
+      # (DS_Gate_Index_544: verified name, location unverified), scaled by the 1 ns gate spacing
       # (0.15 m one-way). Long waveforms are compressed on board (the first
       # i_N_val gates at 1 ns, the rest averaged -- i_compRatio_p/q), so the
       # per-gate OFFSET table, not a uniform spacing, is what makes this right;
@@ -92,12 +93,13 @@ data_source:
         # (verified): 0 missing, 1 long (544 valid gates), 2 short (200 valid,
         # the rest padding).
         i_waveformType: "/{group}/Waveform/Characteristics/i_waveformType"
-        # The shot's UTC instant (verified: d_UTCTime_40, J2000 seconds, UTC
-        # scale -- see the clock note above). Unique per shot, so it is the
+        # The shot's UTC instant (d_UTCTime_40: verified name, location
+        # unverified; J2000 seconds, UTC scale -- see the clock note above). Unique per shot, so it is the
         # record id the shot_count companion keys on: i_rec_ndx alone names a
         # 40-shot record, not a shot.
         utc_time: "/{group}/Time/d_UTCTime_40"
-        # Noise and gain for the flux digest (verified names; the MAPPING to
+        # Noise and gain for the flux digest (verified names, location
+        # unverified: the introspection lists them, not their group; the MAPPING to
         # the digest's noise_mean / noise_stddev / gain is a placeholder --
         # see the rx_flux attrs below).
         noise_mean: "/{group}/Waveform/Characteristics/d_4nsBgMean"
@@ -105,7 +107,8 @@ data_source:
         gain_set: "/{group}/Waveform/Characteristics/i_gainSet1064"
         rx_energy: "/{group}/Waveform/Characteristics/d_RecNrgAll_EU"
         wt_fact_filt_0:
-          # verified: i_wt_fact_filt is [51200, 6] -- a per-record TABLE, not
+          # i_wt_fact_filt: verified name and [51200, 6] shape, location
+          # unverified. A per-record TABLE, not
           # a waveform, so it takes ``column`` on the record level (the issue
           # #678 case for an explicit axis declaration). Column 0 is read as
           # a representative; the table's semantics are a phase 4 question.
@@ -114,7 +117,10 @@ data_source:
   assets:
     # The GLAH05 sibling (one shardmap, {glah01, glah05} per entry), joined
     # on the composite record key -- (i_rec_ndx, i_shot_count) identifies a
-    # shot across the GLAS L1A/L1B/L2 products.
+    # shot across the GLAS L1A/L1B/L2 products. Left (GLAH01): verified
+    # names, location unverified -- /Data_40HZ holds only Time/ and Waveform/,
+    # and the Time/ group is the issue #678 ruling's path, not introspected.
+    # Right (GLAH05): unverified.
     glah05:
       join:
         left: ["/{group}/Time/i_rec_ndx", "/{group}/Time/i_shot_count"]
