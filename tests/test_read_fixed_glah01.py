@@ -321,13 +321,20 @@ class TestGlah01Template:
         leaf_store = open_store(hive.shard_leaf_path(root, shard))
         grp = zarr.open_group(leaf_store, path=grid.group_path, mode="r", zarr_format=3)
         count = np.asarray(grp["count"][:])
-        # Three shots at one footprint land in one or two neighbouring cells;
-        # every kept sample is counted exactly once.
+        # Shots 0..2 share one sibling footprint, so they land in exactly one
+        # cell, and every kept sample is counted there exactly once.
         assert count.sum() == 2 * WIDTH + 200
         occupied = np.flatnonzero(count)
-        shot_count = np.asarray(grp["shot_count"][:])[occupied]
-        assert shot_count.sum() >= 3
-        payload = grp["rx_flux"][int(occupied[0]) : int(occupied[0]) + 1][0]
+        assert len(occupied) == 1
+        cell = int(occupied[0])
+        assert np.asarray(grp["shot_count"][:])[cell] == 3
+        payload = grp["rx_flux"][cell : cell + 1][0]
         centroids = np.frombuffer(payload, "<f4").reshape(-1, 2)
-        assert centroids.shape[0] > 0 and (centroids[:, 1] > 0).all()
+        # Summed weight = sum((amp - noise_mean) * gain) over the kept gates.
+        gain = cfg.aggregation["variables"]["rx_flux"]["params"]["gain"]
+        valid = [WIDTH, 200, WIDTH]
+        expected = sum(float(((WF[i, : valid[i]] - BG_MEAN[i]) * gain).sum()) for i in range(3))
+        assert centroids[:, 1].sum() == pytest.approx(expected, rel=1e-5)
+        assert centroids[:, 0].min() == pytest.approx(REF_RNG[:3].min())
+        assert centroids[:, 0].max() == pytest.approx(REF_RNG[:3].max() + (WIDTH - 1) * 0.15)
         assert hive.read_commit(leaf_store) is not None
