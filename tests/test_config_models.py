@@ -114,8 +114,8 @@ class TestPathAddressedRefusals:
             validate_config(self._cfg(filtres=[]))
 
     def test_misspelled_nested_key_names_its_path(self):
-        cfg = self._cfg(read_plan={"spatial_index": "segments", "padd": 1})
-        with pytest.raises(ValueError, match=r"data_source\.read_plan\.padd: Extra inputs"):
+        cfg = self._cfg(read_plan={"spatial_index": "segments", "padding": 1})
+        with pytest.raises(ValueError, match=r"data_source\.read_plan\.padding: Extra inputs"):
             validate_config(cfg)
 
     def test_union_member_tag_never_leaks_into_the_path(self):

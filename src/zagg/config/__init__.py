@@ -83,6 +83,7 @@ from zagg.config.models_output import (
     Windowing,
 )
 from zagg.config.models_run import Bounds, SpatialPipeline, TemporalPipeline, Worker
+from zagg.config.schema import json_schema
 from zagg.config.source import (
     _segment_variable_names,
     collection_options,
@@ -190,6 +191,7 @@ __all__ = [
     "get_touch_policy",
     "get_windowing",
     "get_windowing_unit",
+    "json_schema",
     "load_config",
     "load_config_from_dict",
     "output_field_signature",

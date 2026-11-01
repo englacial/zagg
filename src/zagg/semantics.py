@@ -666,6 +666,80 @@ def semantic_core(config: PipelineConfig) -> dict:
     return _prune_nulls(core)
 
 
+_BLOCKS = ("data_source", "aggregation", "output", "pipeline", "worker", "catalog", "bounds")
+
+
+def _flatten(node, prefix: str = "", out: dict | None = None) -> dict:
+    """``{dotted.path[i]: leaf}`` over a plain-data tree (lists are positional)."""
+    if out is None:
+        out = {}
+    if isinstance(node, dict):
+        for k, v in node.items():
+            _flatten(v, f"{prefix}.{k}" if prefix else str(k), out)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            _flatten(v, f"{prefix}[{i}]", out)
+    else:
+        out[prefix] = node
+    return out
+
+
+def _changed_paths(a, b) -> list[str]:
+    fa, fb = _flatten(a), _flatten(b)
+    return sorted(p for p in set(fa) | set(fb) if fa.get(p, _MISSING) != fb.get(p, _MISSING))
+
+
+_MISSING = object()
+
+
+def diff(a: PipelineConfig, b: PipelineConfig) -> dict:
+    """Which keys differ between two configs, split by whether the hash sees them.
+
+    Returns ``{"changed_keys": [...], "hash_affecting": [...], "hash_neutral":
+    [...]}``: every dotted path (``output.grid.parent_order``,
+    ``data_source.filters[0].value``) whose leaf value differs between ``a``
+    and ``b``, and the split of that set into the paths whose change moves
+    :func:`semantic_core` (so :func:`semantic_hash`) and the ones that do not.
+
+    The split is decided by :func:`semantic_core` itself — the diff of the two
+    cores, mapped back onto the raw paths — so the exclusion table
+    (:data:`DATA_SOURCE_PACKAGING_KEYS` and friends) stays the single source
+    of truth: nothing here restates which keys are packaging. A raw path is
+    hash-affecting when the core differs under it, or under its resolved
+    counterpart for the knobs the core folds RESOLVED rather than as spelled
+    (``output.windowing`` / ``output.time_source`` / ``output.grid.sharded`` /
+    ``pipeline.type`` — a changed spelling of the same resolved value is
+    neutral, which is the point of resolving them).
+
+    The MCP ``validate`` tool reports this so a template edit says up front
+    whether it starts a new product identity (issue #677).
+    """
+    raw_a = {k: getattr(a, k) for k in _BLOCKS}
+    raw_b = {k: getattr(b, k) for k in _BLOCKS}
+    changed = _changed_paths(raw_a, raw_b)
+    core_changed = _changed_paths(semantic_core(a), semantic_core(b))
+    affecting: list[str] = []
+    neutral: list[str] = []
+    for path in changed:
+        block = path.split(".", 1)[0].split("[", 1)[0]
+        hit = any(
+            c == path or c.startswith(path + ".") or c.startswith(path + "[") for c in core_changed
+        )
+        if not hit and block == "output":
+            # The leaf-shaping output knobs are folded RESOLVED under
+            # ``output.<knob>`` / ``grid.sharded`` / top-level ``time_encoding``;
+            # a changed raw key under them is affecting iff that resolved key moved.
+            knob = path.split(".")[1] if "." in path else ""
+            resolved = {"grid": "grid.", "time_encoding": "time_encoding"}.get(
+                knob, f"output.{knob}"
+            )
+            hit = any(c.startswith(resolved) for c in core_changed)
+        if not hit and block == "pipeline":
+            hit = any(c.startswith("pipeline.") for c in core_changed)
+        (affecting if hit else neutral).append(path)
+    return {"changed_keys": changed, "hash_affecting": affecting, "hash_neutral": neutral}
+
+
 def _canonical_json(core: dict) -> str:
     return json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
