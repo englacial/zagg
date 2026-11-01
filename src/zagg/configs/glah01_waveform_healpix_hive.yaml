@@ -176,8 +176,14 @@ aggregation:
         gain: 1.0                # placeholder: i_gainSet1064 is read as a
                                  # companion but not yet applied
         false_positive_rate: 1.0e-3
-        samples_per_record: 544
-        correlation_length: 4    # 4 ns background window (d_4nsBg*), gates
+        # Operating point: placeholders for the phase 4 science ruling, like
+        # ``gain``. samples_per_record stands in for the per-shot VALID gate
+        # count (544 long, 200 short); one value is applied to both types.
+        # correlation_length stands in for the receiver-noise correlation
+        # length in samples, which threshold_sigma uses for n_eff; the 4 is
+        # not derived (the d_4nsBg* window is a different quantity).
+        samples_per_record: 544  # placeholder
+        correlation_length: 4    # placeholder
       overview_delta: 512
       attrs:
         # Provenance (issue #321 field attrs). ``proposed``: the GLAS
