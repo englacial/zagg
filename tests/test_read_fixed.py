@@ -698,6 +698,18 @@ class TestFixedReadGroup:
         with pytest.raises(ValueError, match="2-D but axes"):
             _read_group(_FakeH5(_fx_arrays()), "G", ds, 0, _OneShardGrid())
 
+    @pytest.mark.parametrize("ds_fn", [_fx_ds, _fx_planned_ds])
+    def test_failed_axes_read_is_reported_as_a_read(self, ds_fn):
+        # h5coro signals a failed read with None: report the read, not a rank
+        # mismatch (PR #680 review).
+        class _Failing(_FakeH5):
+            def readDatasets(self, datasets):  # noqa: N802
+                out = super().readDatasets(datasets)
+                return {p: (None if p == "/G/wf" else a) for p, a in out.items()}
+
+        with pytest.raises(ValueError, match="read returned None for /G/wf"):
+            _read_group(_Failing(_fx_arrays()), "G", ds_fn(), 1, _LatGrid())
+
     def test_full_read_record_count_mismatch_raises(self):
         arrays = _fx_arrays()
         arrays["/G/wf"] = FX_WF[:3]

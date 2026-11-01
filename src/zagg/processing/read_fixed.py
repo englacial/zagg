@@ -67,7 +67,7 @@ from zagg.processing.read_vlen import (
     synthesize_linspace,
     synthesized_specs,
 )
-from zagg.read_plan import execute_read_plan, plan_read
+from zagg.read_plan import _require_read, execute_read_plan, plan_read
 
 logger = logging.getLogger(__name__)
 
@@ -645,8 +645,19 @@ def _read_axes_variables(
             out[name] = cache[key]
             continue
         if axes[0] == "record" and plan is not None:
+            # ``_require_read``: h5coro signals a failed read with ``None``,
+            # which ``flatten_axes`` would report as a rank mismatch.
             parts = [
-                flatten_axes(read_rows(path, s // width, e // width), axes, width, name)
+                flatten_axes(
+                    _require_read(
+                        read_rows(path, s // width, e // width),
+                        path,
+                        [(s // width, e // width)],
+                    ),
+                    axes,
+                    width,
+                    name,
+                )
                 for s, e in plan.base_slices
             ]
             flat = np.concatenate(parts)
@@ -661,7 +672,9 @@ def _read_axes_variables(
                     f"variable {name!r}: axes {axes!r} is not record-first, so {path!r} "
                     "is read whole (per-record row slicing needs the record axis at dim 0)"
                 )
-            flat = flatten_axes(read_full([path])[path], axes, width, name)
+            flat = flatten_axes(
+                _require_read(read_full([path])[path], path, None), axes, width, name
+            )
             if len(flat) != n_base:
                 raise ValueError(
                     f"variable {name!r}: dataset {path!r} flattens to {len(flat)} rows but "
