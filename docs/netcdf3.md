@@ -123,9 +123,10 @@ name tries h5coro first and is peeked only when h5coro rejects the
 signature, which costs that rejected attempt's 4 MiB cache-line read. No
 config key decides this, so one shard map may mix HDF5 and netCDF3
 granules. Any metadata-driven read on
-that handle (the default `inline` backend, `on_miss: fallback`, `on_miss:
-build`) fails loudly per group with a message naming the sidecar route, and
-the shard counts it in `read_errors` rather than decoding garbage. That is
+that handle (the default `inline` backend, or a sidecar miss under
+`on_miss: fallback` / `build`) fails loudly per group with a `TypeError`
+saying the granule needs a manifest in the sidecar store, and the shard
+counts it in `read_errors` rather than decoding garbage. That is
 why the template pins `on_miss: error`.
 
 The end-to-end proof is `tests/test_netcdf3_e2e.py`: a classic and a 64-bit

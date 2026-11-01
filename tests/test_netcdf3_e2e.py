@@ -208,6 +208,29 @@ class TestEndToEnd:
         assert meta["total_obs"] == 0 and meta["read_errors"] == 1
         assert "not an HDF5 file" in caplog.text
 
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+    @pytest.mark.parametrize("on_miss", ["build", "fallback"])
+    def test_sidecar_miss_paths_name_the_real_cause(self, granule, tmp_path, caplog, on_miss):
+        # A granule the store has no manifest for, under the metadata-reading
+        # miss policies: ``build`` walks h5coro internals (``rootAddress``),
+        # ``fallback`` calls ``readDatasets``; both get the same refusal, which
+        # names the missing manifest rather than the backend choice.
+        path, _, _ = granule
+        empty = tmp_path / "empty-store"
+        with caplog.at_level("WARNING"):
+            df, meta = process_shard(
+                _Grid(),
+                1,
+                [str(path)],
+                s3_credentials={},
+                h5coro_driver=filedriver.FileDriver,
+                config=_config({"backend": "sidecar", "store": str(empty), "on_miss": on_miss}),
+            )
+        assert meta["total_obs"] == 0 and meta["read_errors"] == 1
+        assert "not an HDF5 file" in caplog.text
+        assert "sidecar store has no manifest for this granule" in caplog.text
+        assert "AttributeError" not in caplog.text
+
 
 class TestOpenGranule:
     def test_hdf5_opens_as_h5coro(self):
@@ -229,6 +252,12 @@ class TestOpenGranule:
             assert bytes(h5obj.ioRequest(10, 6)) == data[10:16]
             with pytest.raises(TypeError, match="not an HDF5 file"):
                 h5obj.readDatasets(["/lat"])
+            with pytest.raises(TypeError, match=r"not an HDF5 file \(rootAddress\)"):
+                _ = h5obj.rootAddress
+            # getattr/hasattr probes keep their meaning (the refusal is also
+            # an AttributeError); dunder lookups are plain AttributeErrors.
+            assert getattr(h5obj, "cache_locks", None) is None
+            assert not hasattr(h5obj, "__deepcopy__")
         finally:
             h5obj.close()
         with pytest.raises(ValueError, match="closed"):

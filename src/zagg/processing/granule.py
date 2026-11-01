@@ -22,9 +22,10 @@ subset of ``H5Coro`` the index backends touch (``resource``, ``driver``,
 
 No config key decides this, so a shard map mixing HDF5 and netCDF3 granules
 under one ``reader: h5coro`` source reads each through the right handle. A
-``RangedGranule`` refuses every metadata-driven read (``readDatasets``) with a
-message naming the manifest route, so a non-sidecar backend -- or ``on_miss:
-fallback`` -- fails loudly per group rather than decoding garbage.
+``RangedGranule`` refuses every metadata-driven read (``readDatasets``, or any
+h5coro-internal attribute) with :class:`NotHDF5Error` naming the manifest
+route, so a non-sidecar backend -- or a sidecar miss under ``on_miss:
+fallback`` / ``build`` -- fails loudly per group rather than decoding garbage.
 """
 
 from __future__ import annotations
@@ -41,6 +42,15 @@ _SIGNATURE_ERROR = "invalid file signature"
 NETCDF_SUFFIXES = (".nc", ".nc4")
 
 
+class NotHDF5Error(TypeError, AttributeError):
+    """A metadata-driven read reached a :class:`RangedGranule`.
+
+    A ``TypeError`` (the refusal), and also an ``AttributeError`` so that
+    ``getattr(h, name, default)`` / ``hasattr`` probes on the handle keep their
+    usual meaning while a direct h5coro-internal access (``rootAddress``,
+    ``metadataTable``, ...) fails with the actionable message."""
+
+
 class RangedGranule:
     """Open handle for a granule addressed only through a sidecar manifest."""
 
@@ -53,11 +63,24 @@ class RangedGranule:
         """Direct ranged read; the HDF5 cache-line semantics do not apply."""
         return self.driver.read(pos, size)
 
-    def readDatasets(self, *args, **kwargs):  # noqa: N802 (h5coro API)
-        raise TypeError(
-            f"{self.resource} is not an HDF5 file; it can only be read through a "
-            "manifest-addressed index backend (data_source.index.backend: sidecar)"
+    def _refuse(self, what):
+        return NotHDF5Error(
+            f"{self.resource} is not an HDF5 file ({what}): only the sidecar index "
+            "backend can read it, from a manifest in its store; this read reached HDF5 "
+            "metadata because the backend is not sidecar, or the sidecar store has no "
+            "manifest for this granule (on_miss: fallback/build)"
         )
+
+    def readDatasets(self, *args, **kwargs):  # noqa: N802 (h5coro API)
+        raise self._refuse("readDatasets")
+
+    def __getattr__(self, name):
+        # Only reached for attributes the handle does not define: every
+        # h5coro-internal metadata access (e.g. ``on_miss: build``'s walk
+        # reading ``rootAddress``) gets the same refusal as ``readDatasets``.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise self._refuse(name)
 
     def close(self):
         _close(self.driver)
