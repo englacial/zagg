@@ -1274,7 +1274,7 @@ class TestCellIdsEncoding:
 
         cfg = self._cfg()
         cfg.output["grid"]["cell_ids_encoding"] = "morton"
-        with pytest.raises(ValueError, match="cell_ids_encoding was retired"):
+        with pytest.raises(ValueError, match="cell_ids_encoding: retired"):
             validate_config(cfg)
 
 

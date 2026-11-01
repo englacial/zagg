@@ -112,7 +112,7 @@ class TestCoverageMocConfig:
     def test_non_bool_rejected(self):
         from zagg.config import validate_config
 
-        with pytest.raises(ValueError, match="coverage_moc must be a boolean"):
+        with pytest.raises(ValueError, match="coverage_moc: must be a boolean"):
             validate_config(self._cfg(store_layout="hive", coverage_moc="yes"))
 
 

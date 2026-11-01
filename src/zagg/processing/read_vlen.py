@@ -104,7 +104,7 @@ def asset_variable_specs(data_source: dict) -> dict[str, dict]:
     per record on the declared ``assets.<name>.join`` key, and broadcast to
     base rate exactly like a plain record-level companion — so it is an
     ordinary column downstream (expression filters included). Validation
-    (:func:`zagg.config._validate_vlen_source`) pins these to the coordinates
+    (:class:`zagg.config.models_source.H5DataSource`) pins these to the coordinates
     level: the join is keyed to that level's records.
     """
     coord_level = vlen_coordinates_level(data_source)

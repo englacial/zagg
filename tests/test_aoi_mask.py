@@ -322,7 +322,7 @@ class TestConfigFlag:
 
         cfg = default_config("atl06")
         cfg.output = {**cfg.output, "aoi_mask": "yes"}
-        with pytest.raises(ValueError, match="output.aoi_mask must be a boolean"):
+        with pytest.raises(ValueError, match="output.aoi_mask: must be a boolean"):
             validate_config(cfg)
 
 

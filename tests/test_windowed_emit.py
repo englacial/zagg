@@ -250,7 +250,7 @@ class TestUnitKnob:
     def test_bad_unit_rejected(self):
         cfg = _cfg()
         cfg.output["windowing"]["unit"] = "granule"
-        with pytest.raises(ValueError, match="output.windowing.unit must be one of"):
+        with pytest.raises(ValueError, match="output.windowing.unit: must be one of"):
             validate_config(cfg)
 
     def test_raster_rejects_the_key_and_reads_window(self):

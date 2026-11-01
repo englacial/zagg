@@ -93,6 +93,7 @@ content-addressed form) — see the issue #299 thread for the design record.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 
@@ -664,6 +665,145 @@ def semantic_core(config: PipelineConfig) -> dict:
     if encoding not in (None, DEFAULT_TIME_ENCODING):
         core["time_encoding"] = encoding
     return _prune_nulls(core)
+
+
+_BLOCKS = ("data_source", "aggregation", "output", "pipeline", "worker", "catalog", "bounds")
+
+
+def _flatten(node, prefix: tuple = (), out: dict | None = None) -> dict:
+    """``{path tuple: leaf}`` over a plain-data tree (sequences are positional).
+
+    An empty mapping or sequence is a leaf at its own path: the core keeps it
+    (:func:`_prune_nulls` drops only ``None``), so ``params: {}`` added is a
+    change the hash sees.
+    """
+    if out is None:
+        out = {}
+    if isinstance(node, dict) and node:
+        for k, v in node.items():
+            _flatten(v, (*prefix, k), out)
+    elif isinstance(node, (list, tuple)) and node:
+        for i, v in enumerate(node):
+            _flatten(v, (*prefix, i), out)
+    else:
+        out[prefix] = node
+    return out
+
+
+def _leaf_key(value) -> str:
+    """A value as the hash reads it: ``-2`` and ``-2.0``, ``0`` and ``False``
+    differ; a tuple and its list agree. A non-JSON leaf compares by ``repr``."""
+    try:
+        return _canonical_json(value)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _dotted(path: tuple) -> str:
+    out = ""
+    for tok in path:
+        out += f"[{tok}]" if isinstance(tok, int) else (f".{tok}" if out else str(tok))
+    return out
+
+
+def _put(tree, path: tuple, value) -> None:
+    """Set ``path`` in ``tree`` to ``value`` in place, or delete it for ``_MISSING``."""
+    node = tree
+    for i, tok in enumerate(path[:-1]):
+        nxt = path[i + 1]
+        kind = list if isinstance(nxt, int) else dict
+        child = node[tok] if _has(node, tok) else _MISSING
+        if not isinstance(child, kind):
+            if value is _MISSING:
+                return
+            child = kind()
+            _assign(node, tok, child)
+        node = child
+    tok = path[-1]
+    if value is _MISSING:
+        if _has(node, tok):
+            del node[tok]
+    else:
+        _assign(node, tok, copy.deepcopy(value))
+
+
+def _has(node, tok) -> bool:
+    if isinstance(node, dict):
+        return tok in node
+    return isinstance(tok, int) and tok < len(node)
+
+
+def _assign(node, tok, value) -> None:
+    if isinstance(node, list) and tok >= len(node):
+        node.append(value)
+    else:
+        node[tok] = value
+
+
+_MISSING = object()
+
+
+def _core_key(blocks: dict) -> str:
+    try:
+        return _leaf_key(semantic_core(PipelineConfig(**blocks)))
+    except (KeyError, ValueError, TypeError) as exc:
+        # A counterfactual the accessors refuse (a type flipped without its
+        # companion block) cannot share the core; it reads as affecting.
+        return f"refused: {exc!r}"
+
+
+def _raw_blocks(config: PipelineConfig) -> dict:
+    return {k: copy.deepcopy(getattr(config, k)) for k in _BLOCKS}
+
+
+def diff(a: PipelineConfig, b: PipelineConfig) -> dict:
+    """Which keys differ between two configs, split by whether the hash sees them.
+
+    Returns ``{"changed_keys": [...], "hash_affecting": [...], "hash_neutral":
+    [...]}``: every dotted path (``output.grid.parent_order``,
+    ``data_source.filters[0].value``) whose leaf differs between ``a`` and
+    ``b`` as the canonical JSON reads it, and the split of that set into the
+    paths whose change moves :func:`semantic_core` (so :func:`semantic_hash`)
+    and the ones that do not.
+
+    The split is counterfactual, so :func:`semantic_core` stays the single
+    source of truth (nothing here restates which keys are packaging or which
+    knobs are folded resolved): a path is hash-affecting iff moving THAT path
+    alone moves the core, from either side — ``a`` with the path set to
+    ``b``'s value, or ``b`` with it reverted to ``a``'s. Both sides are needed
+    because a key's effect can depend on its siblings: a rectilinear
+    ``resolution`` is invisible on ``a``'s HEALPix grid but defining on
+    ``b``'s rectilinear one. One path changed beside another is attributed on
+    its own, so a packaging key edited together with a semantic one stays
+    neutral. Pure: both configs are deep-copied, never mutated.
+
+    The MCP ``validate`` tool reports this so a template edit says up front
+    whether it starts a new product identity (issue #677).
+    """
+    raw_a, raw_b = _raw_blocks(a), _raw_blocks(b)
+    fa, fb = _flatten(raw_a), _flatten(raw_b)
+    changed = sorted(
+        (
+            p
+            for p in set(fa) | set(fb)
+            if _leaf_key(fa.get(p, _MISSING)) != _leaf_key(fb.get(p, _MISSING))
+        ),
+        key=_dotted,
+    )
+    core_a, core_b = _core_key(raw_a), _core_key(raw_b)
+    affecting: list[str] = []
+    neutral: list[str] = []
+    for path in changed:
+        fwd, back = _raw_blocks(a), _raw_blocks(b)
+        _put(fwd, path, fb.get(path, _MISSING))
+        _put(back, path, fa.get(path, _MISSING))
+        hit = _core_key(fwd) != core_a or _core_key(back) != core_b
+        (affecting if hit else neutral).append(_dotted(path))
+    return {
+        "changed_keys": [_dotted(p) for p in changed],
+        "hash_affecting": affecting,
+        "hash_neutral": neutral,
+    }
 
 
 def _canonical_json(core: dict) -> str:

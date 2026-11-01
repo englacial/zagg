@@ -142,6 +142,17 @@ class TestPipelineType:
         with pytest.raises(ValueError, match="pipeline.type must be one of"):
             get_pipeline_type(cfg)
 
+    @pytest.mark.parametrize("pipeline", [{"type": "temporl"}, "temporal"])
+    def test_validate_names_a_bad_pipeline_type(self, pipeline):
+        # The kind is resolved before the grammar pass, so a typo on a temporal
+        # template is named as such rather than read as spatial extra keys.
+        cfg = default_config("merra2_storm")
+        cfg.pipeline = pipeline
+        with pytest.raises(
+            ValueError, match=r"^pipeline(\.type must be one of| must be a mapping)"
+        ):
+            validate_config(cfg)
+
     def test_validate_accepts_well_formed_temporal(self):
         # Phase 5: a temporal config with the four required per-variable spec
         # keys validates (the spatial grid cross-checks are skipped entirely).
@@ -176,7 +187,7 @@ class TestPipelineType:
                 "output": {"store": "."},
             }
         )
-        with pytest.raises(ValueError, match="missing required key"):
+        with pytest.raises(ValueError, match=r"variables\.x\.collection: Field required"):
             validate_config(cfg)
 
     def test_validate_temporal_requires_variables(self):
@@ -277,7 +288,9 @@ class TestCollectionOptions:
             validate_config(self._cfg({"merra2": {"variables": "PRECLS"}}))
 
     def test_collection_entry_must_be_mapping_or_null(self):
-        with pytest.raises(ValueError, match="mapping of options"):
+        with pytest.raises(
+            ValueError, match=r"collections\.merra2: Input should be a valid dictionary"
+        ):
             validate_config(self._cfg({"merra2": ["time_offset"]}))
 
     def test_coord_round_must_be_nonnegative_int(self):
@@ -295,7 +308,9 @@ class TestCollectionOptions:
     def test_spec_params_must_be_mapping(self):
         cfg = self._cfg(["merra2"])
         cfg.aggregation["variables"]["max_t2m"]["params"] = "knob=7"
-        with pytest.raises(ValueError, match="params must be a mapping"):
+        with pytest.raises(
+            ValueError, match=r"max_t2m\.params: Input should be a valid dictionary"
+        ):
             validate_config(cfg)
 
 
@@ -486,7 +501,9 @@ class TestValidation:
         cfg = self._config_with_variables(
             {"h_li": "/path", "c": {"path": "/conf", "column": 0, "slice": 1}}
         )
-        with pytest.raises(ValueError, match="unknown keys.*slice"):
+        with pytest.raises(
+            ValueError, match=r"variables\.c\.slice: Extra inputs are not permitted"
+        ):
             validate_config(cfg)
 
     def test_variable_column_form_bad_column_rejected(self):
@@ -494,12 +511,12 @@ class TestValidation:
             cfg = self._config_with_variables(
                 {"h_li": "/path", "c": {"path": "/conf", "column": column}}
             )
-            with pytest.raises(ValueError, match="column must be an integer"):
+            with pytest.raises(ValueError, match=r"variables\.c\.column: must be an integer >= 0"):
                 validate_config(cfg)
 
     def test_variable_non_str_non_dict_rejected(self):
         cfg = self._config_with_variables({"h_li": "/path", "c": 7})
-        with pytest.raises(ValueError, match="path string or a"):
+        with pytest.raises(ValueError, match=r"variables\.c: Input should be a valid dictionary"):
             validate_config(cfg)
 
     def _config_with_field_attrs(self, attrs):
@@ -731,7 +748,9 @@ class TestValidation:
 
     def test_missing_required_section(self):
         cfg = PipelineConfig(
-            data_source={}, aggregation={"variables": {}}, output={"grid": {"type": "x"}}
+            data_source={},
+            aggregation={"variables": {}},
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         with pytest.raises(ValueError, match="Missing required section"):
             validate_config(cfg)
@@ -822,7 +841,9 @@ class TestChunkPrecompute:
 
     def test_non_mapping_block_rejected(self):
         cfg = _cfg_with_precompute(["not", "a", "mapping"])
-        with pytest.raises(ValueError, match="must be a mapping"):
+        with pytest.raises(
+            ValueError, match=r"chunk_precompute: Input should be a valid dictionary"
+        ):
             validate_config(cfg)
 
     def test_name_colliding_with_column_rejected(self):
@@ -917,7 +938,7 @@ class TestFilters:
 
     def test_unknown_op_rejected(self):
         cfg = _cfg_with_filters(filters=[{"dataset": "/d", "op": "between", "value": 1}])
-        with pytest.raises(ValueError, match="unknown op"):
+        with pytest.raises(ValueError, match=r"filters\[0\]\.op: Input should be 'eq', 'ne'"):
             validate_config(cfg)
 
     def test_column_must_be_int(self):
@@ -925,6 +946,15 @@ class TestFilters:
             filters=[{"dataset": "/d", "column": "land", "op": "ne", "value": 0}]
         )
         with pytest.raises(ValueError, match="must be an integer"):
+            validate_config(cfg)
+
+    def test_negative_column_rejected(self):
+        # A negative numpy index would silently select the last flag column.
+        cfg = _cfg_with_filters(filters=[{"dataset": "/d", "column": -1, "op": "eq", "value": 0}])
+        with pytest.raises(
+            ValueError,
+            match=r"filters\[0\]\.column: 'column' must be an integer index >= 0 \(got -1\)",
+        ):
             validate_config(cfg)
 
     def test_set_op_requires_values_list(self):
@@ -944,7 +974,7 @@ class TestFilters:
 
     def test_missing_dataset_rejected(self):
         cfg = _cfg_with_filters(filters=[{"op": "eq", "value": 0}])
-        with pytest.raises(ValueError, match="requires 'dataset'"):
+        with pytest.raises(ValueError, match=r"filters\[0\]\.dataset: Field required"):
             validate_config(cfg)
 
     def test_expression_with_level_rejected(self):
@@ -1071,7 +1101,7 @@ class TestLevelsValidation:
             aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
-        with pytest.raises(ValueError, match="'count' is required"):
+        with pytest.raises(ValueError, match=r"levels\.segments\.link\.count: Field required"):
             validate_config(cfg)
 
     def test_link_unknown_field_rejected(self):
@@ -1082,7 +1112,9 @@ class TestLevelsValidation:
             aggregation={"variables": {"c": {"function": "len", "dtype": "int32"}}},
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
-        with pytest.raises(ValueError, match="unknown fields"):
+        with pytest.raises(
+            ValueError, match=r"levels\.segments\.link\.bogus: Extra inputs are not permitted"
+        ):
             validate_config(cfg)
 
     def test_base_level_without_link_ok(self):
@@ -1240,7 +1272,10 @@ class TestSegmentLevelVariables:
         validate_config(cfg)
 
     def test_empty_path_template_rejected(self):
-        with pytest.raises(ValueError, match="path template must be a"):
+        with pytest.raises(
+            ValueError,
+            match=r"levels\.segments\.variables\.dem_h: String should have at least 1 character",
+        ):
             validate_config(self._cfg({"dem_h": ""}))
 
     def test_mapping_on_base_level_rejected(self):
@@ -1511,7 +1546,9 @@ class TestHandoff:
         validate_config(_cfg_with_handoff())  # should not raise
 
     def test_invalid_handoff_rejected_at_load(self):
-        with pytest.raises(ValueError, match=r"aggregation\.handoff must be 'pandas' or 'arrow'"):
+        with pytest.raises(
+            ValueError, match=r"aggregation\.handoff: Input should be 'pandas' or 'arrow'"
+        ):
             validate_config(_cfg_with_handoff("bogus"))
 
     def test_shipped_atl06_declares_arrow(self):
@@ -1569,7 +1606,7 @@ class TestOutputGridValidation:
             },
             output={"grid": "healpix"},
         )
-        with pytest.raises(ValueError, match="output.grid must be a mapping"):
+        with pytest.raises(ValueError, match="output.grid: must be a mapping"):
             validate_config(cfg)
 
     def test_grid_missing_type(self):
@@ -1638,7 +1675,7 @@ class TestCellIdsKnobs:
         # Any value — including the formerly-valid ones — errors with the
         # migration pointer, never a silent ignore.
         for value in ("nested", "morton", "bogus"):
-            with pytest.raises(ValueError, match="cell_ids_encoding was retired"):
+            with pytest.raises(ValueError, match="cell_ids_encoding: retired"):
                 validate_config(_cfg_with_grid_knobs(cell_ids_encoding=value))
 
     def test_absent_and_null_knob_validate(self):
@@ -1657,7 +1694,7 @@ class TestCellIdsKnobs:
         assert get_emit_cell_ids(cfg) is True
 
     def test_emit_cell_ids_rejects_non_boolean(self):
-        with pytest.raises(ValueError, match="emit_cell_ids must be a boolean"):
+        with pytest.raises(ValueError, match="emit_cell_ids: must be a boolean"):
             validate_config(_cfg_with_grid_knobs(emit_cell_ids="yes"))
 
     def test_emit_cell_ids_rejected_on_rectilinear(self):
@@ -1706,7 +1743,7 @@ class TestBoundsValidation:
             "temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"},
             "foo": "bar",
         }
-        with pytest.raises(ValueError, match="Unknown bounds keys"):
+        with pytest.raises(ValueError, match=r"bounds\.foo: Extra inputs are not permitted"):
             validate_config(atl06_config)
 
     def test_temporal_missing_dates(self, atl06_config):
@@ -1714,8 +1751,20 @@ class TestBoundsValidation:
         with pytest.raises(ValueError, match="start_date and end_date"):
             validate_config(atl06_config)
 
+    def test_temporal_dates_must_be_instants(self, atl06_config):
+        atl06_config.bounds = {"temporal": {"start_date": 5, "end_date": "2024-06-01"}}
+        with pytest.raises(
+            ValueError, match=r"bounds\.temporal\.start_date: must be an ISO-8601 instant"
+        ):
+            validate_config(atl06_config)
+
     def test_none_bounds_ok(self, atl06_config):
         atl06_config.bounds = None
+        validate_config(atl06_config)
+
+    def test_null_temporal_bound_ok(self, atl06_config):
+        # A ``temporal:`` key with an empty YAML body: the runner reads it as absent.
+        atl06_config.bounds = {"temporal": None}
         validate_config(atl06_config)
 
 
@@ -1756,7 +1805,9 @@ class TestOutputKind:
 
     def test_unknown_kind_rejected(self):
         cfg = _vector_config({"function": "min", "kind": "matrix"})
-        with pytest.raises(ValueError, match="output kind 'matrix' is not supported"):
+        with pytest.raises(
+            ValueError, match=r"hist\.kind: Input should be 'scalar', 'vector' or 'ragged'"
+        ):
             validate_config(cfg)
 
     def test_ragged_requires_inner_shape(self):
@@ -1781,7 +1832,7 @@ class TestOutputKind:
 
     def test_trailing_shape_rejects_bool(self):
         cfg = _vector_config({"function": "histogram", "kind": "vector", "trailing_shape": True})
-        with pytest.raises(ValueError, match="positive"):
+        with pytest.raises(ValueError, match="must be an int or a sequence of ints"):
             validate_config(cfg)
 
     def test_trailing_shape_rejects_empty(self):
@@ -1928,7 +1979,7 @@ class TestResolutionAttribute:
 
     def test_bad_resolution_rejected(self):
         cfg = _cfg_with_field({"function": "min", "resolution": "block"})
-        with pytest.raises(ValueError, match="resolution 'block' is not supported"):
+        with pytest.raises(ValueError, match=r"f\.resolution: Input should be 'cell' or 'chunk'"):
             validate_config(cfg)
 
     def test_vector_field_may_be_resolution_chunk(self):
@@ -2331,14 +2382,16 @@ class TestWeightsDeclaration:
             )
 
     def test_unknown_value_rejected(self):
-        with pytest.raises(ValueError, match="is not one of"):
+        with pytest.raises(ValueError, match=r"weights: Input should be 'counts' or 'flux'"):
             validate_config(_ragged_cfg(inner_shape=[2], weights="photons"))
 
     def test_weights_rejected_on_non_ragged_kinds(self):
         with pytest.raises(ValueError, match="'weights' is only valid for kind 'ragged'"):
             _validate_output_kind("f", {"function": "min", "weights": "counts"})
         with pytest.raises(ValueError, match="'weights' is only valid for kind 'ragged'"):
-            _validate_output_kind("f", {"kind": "vector", "trailing_shape": 4, "weights": "counts"})
+            _validate_output_kind(
+                "f", {"function": "min", "kind": "vector", "trailing_shape": 4, "weights": "counts"}
+            )
 
     def test_attrs_weights_key_is_spec_owned_on_ragged(self):
         # The template stamps the §2.0 key from the field declaration; an
@@ -2483,7 +2536,9 @@ class TestTemporalShapeDeclaration:
         validate_config(_ragged_cfg(inner_shape=[2]))
 
     def test_unknown_shape_rejected(self):
-        with pytest.raises(ValueError, match="is not one of"):
+        with pytest.raises(
+            ValueError, match=r"temporal: Input should be 'per-cell' or 'per-centroid'"
+        ):
             validate_config(_ragged_cfg(inner_shape=[2], temporal="per-photon"))
 
     def test_coordinate_shape_points_at_the_axis_knob(self):
@@ -2580,7 +2635,7 @@ class TestTimeSource:
             validate_config(_clocked(_ragged_cfg(inner_shape=[2]), scale="utc"))
 
     def test_unknown_units_refused(self):
-        with pytest.raises(ValueError, match="time_source.units must be one of"):
+        with pytest.raises(ValueError, match="time_source: units must be one of"):
             validate_config(_clocked(_ragged_cfg(inner_shape=[2]), units="ticks"))
 
     def test_field_must_be_a_declared_variable(self):
@@ -2598,7 +2653,7 @@ class TestTimeSource:
     def test_epoch_required_and_parsed(self):
         cfg = _clocked(_ragged_cfg(inner_shape=[2]))
         del cfg.output["time_source"]["epoch"]
-        with pytest.raises(ValueError, match="time_source.epoch is required"):
+        with pytest.raises(ValueError, match="time_source: epoch is required"):
             validate_config(cfg)
         cfg = _clocked(_ragged_cfg(inner_shape=[2]), epoch="not-a-date")
         with pytest.raises(ValueError, match="is not an ISO-8601 datetime"):
@@ -2613,7 +2668,7 @@ class TestTimeSource:
     def test_non_mapping_refused(self):
         cfg = _ragged_cfg(inner_shape=[2])
         cfg.output["time_source"] = "delta_time"
-        with pytest.raises(ValueError, match="time_source must be a mapping"):
+        with pytest.raises(ValueError, match="time_source: must be a mapping"):
             validate_config(cfg)
 
     def test_utc_windowing_is_not_a_fallback(self):
@@ -2745,10 +2800,13 @@ class TestTimeSource:
         with pytest.raises(ValueError, match="carries sub-second precision"):
             validate_config(cfg)
         # A real epoch disagreement still reports both DECLARED spellings — the
-        # cross-check's purpose is untouched, only the value it quotes.
+        # cross-check's purpose is untouched, only the value it quotes. (The
+        # windowing grammar refuses a sub-second epoch before the cross-check
+        # runs, so the disagreeing pair is spelled at whole seconds.)
+        cfg.output["windowing"]["epoch"] = "2018-01-01T00:00:00Z"
         cfg.output["time_source"]["epoch"] = "2020-06-01T00:00:00"
         with pytest.raises(
-            ValueError, match=r"disagrees with output\.windowing .*2018-01-01T00:00:00\.5Z"
+            ValueError, match=r"disagrees with output\.windowing .*2018-01-01T00:00:00Z"
         ):
             validate_config(cfg)
 
@@ -2956,7 +3014,9 @@ class TestLocationChannel:
 
     def test_location_must_be_string(self):
         cfg = _ragged_cfg(inner_shape=[2], location=29)
-        with pytest.raises(ValueError, match="must be a column name string"):
+        with pytest.raises(
+            ValueError, match=r"h_ph_tdigest\.location: Input should be a valid string"
+        ):
             validate_config(cfg)
 
     def test_location_unknown_column_rejected(self):
@@ -3015,7 +3075,7 @@ class TestLocationChannel:
             location="leaf_id",
             function="zagg.stats.tdigest.build_tdigest",
         )
-        cfg.output = {"store_path": "s3://x"}
+        cfg.output = {"store": "s3://x"}
         validate_config(cfg)
 
     def test_location_requires_healpix_grid(self):
@@ -3126,7 +3186,7 @@ class TestConsolidateMetadataFlag:
 
         cfg = default_config("atl06")
         cfg.output = {**cfg.output, "consolidate_metadata": "yes"}
-        with pytest.raises(ValueError, match="output.consolidate_metadata must be a boolean"):
+        with pytest.raises(ValueError, match="output.consolidate_metadata: must be a boolean"):
             validate_config(cfg)
 
 
@@ -3173,24 +3233,47 @@ class TestWorkerBlock:
 
     def test_unprovisioned_memory_rejected_naming_allowed_set(self, atl06_config):
         atl06_config.worker = {"memory": 1024}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of \[2048, 4096, 8192\]"):
+        with pytest.raises(
+            ValueError, match=r"worker\.memory: must be one of \[2048, 4096, 8192\]"
+        ):
             validate_config(atl06_config)
 
     def test_missing_memory_rejected(self, atl06_config):
         atl06_config.worker = {"extra_disk": True}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: Field required"):
             validate_config(atl06_config)
 
     def test_string_memory_rejected(self, atl06_config):
         # "4096" (a string) is not the provisioned int — the suffix must be
         # built from a validated int, not whatever str() yields.
         atl06_config.worker = {"memory": "4096"}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
             validate_config(atl06_config)
 
     def test_bool_memory_rejected(self, atl06_config):
         atl06_config.worker = {"memory": True}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
+            validate_config(atl06_config)
+
+    def test_whole_float_memory_rejected(self, atl06_config):
+        # 2048.0 would build the suffix -2048.0 (a per-shard ResourceNotFound).
+        atl06_config.worker = {"memory": 2048.0}
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
+            validate_config(atl06_config)
+
+    def test_schema_closes_the_memory_set(self):
+        from zagg.config.models_run import Worker
+
+        prop = Worker.model_json_schema()["properties"]["memory"]
+        assert prop["type"] == "integer" and prop["enum"] == [2048, 4096, 8192]
+
+    def test_extra_disk_schema_matches_the_null_refusal(self, atl06_config):
+        from zagg.config.models_run import Worker
+
+        prop = Worker.model_json_schema()["properties"]["extra_disk"]
+        assert prop["type"] == "boolean" and "anyOf" not in prop
+        atl06_config.worker = {"memory": 4096, "extra_disk": None}
+        with pytest.raises(ValueError, match="extra_disk must not be null"):
             validate_config(atl06_config)
 
     def test_non_mapping_block_rejected(self, atl06_config):
@@ -3201,12 +3284,14 @@ class TestWorkerBlock:
     def test_unknown_key_rejected(self, atl06_config):
         # The plan's earlier extra_tmp spelling must not be silently ignored.
         atl06_config.worker = {"memory": 4096, "extra_tmp": True}
-        with pytest.raises(ValueError, match=r"Unknown worker keys: \['extra_tmp'\]"):
+        with pytest.raises(ValueError, match=r"worker\.extra_tmp: Extra inputs are not permitted"):
             validate_config(atl06_config)
 
     def test_non_bool_extra_disk_rejected(self, atl06_config):
         atl06_config.worker = {"memory": 4096, "extra_disk": "yes"}
-        with pytest.raises(ValueError, match=r"worker\.extra_disk must be a boolean"):
+        with pytest.raises(
+            ValueError, match=r"worker\.extra_disk: must be a boolean \(got 'yes'\)"
+        ):
             validate_config(atl06_config)
 
     def test_validated_on_temporal_pipeline_too(self):
@@ -3226,7 +3311,7 @@ class TestWorkerBlock:
             pipeline={"type": "temporal"},
             worker={"memory": 512},
         )
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: must be one of"):
             validate_config(cfg)
 
 
@@ -3306,7 +3391,7 @@ class TestTimeEncoding:
             validate_config(self._raster_cfg(encoding))
 
     def test_unknown_value_rejected(self):
-        with pytest.raises(ValueError, match="output.time_encoding must be one of"):
+        with pytest.raises(ValueError, match="output.time_encoding: must be one of"):
             validate_config(self._raster_cfg("datetime64"))
 
     def test_toc_rejected_on_a_non_raster_pipeline(self):
@@ -3553,19 +3638,19 @@ class TestTouchPolicy:
         # collaborator's data expiring.
         import pytest
 
-        from zagg.config import _validate_store_layout_keys, default_config
+        from zagg.config import default_config, validate_config
 
         cfg = default_config()
         cfg.output["touch"] = "sometimes"
-        with pytest.raises(ValueError, match="output.touch must be one of"):
-            _validate_store_layout_keys(cfg)
+        with pytest.raises(ValueError, match="output.touch: must be one of"):
+            validate_config(cfg)
 
     def test_absent_is_legal(self):
-        from zagg.config import _validate_store_layout_keys, default_config
+        from zagg.config import default_config, validate_config
 
         cfg = default_config()
         cfg.output.pop("touch", None)
-        _validate_store_layout_keys(cfg)
+        validate_config(cfg)
 
     def test_unvalidated_typo_warns_before_falling_through_to_auto(self, caplog):
         # validate_config catches a typo at submission, but the worker's own

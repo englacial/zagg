@@ -1,0 +1,356 @@
+"""The exported template grammar (issue #677 phase 5): JSON schema, CLI, docs,
+registry hints, and the semantic-hash diff."""
+
+import json
+import sys
+from importlib import resources
+from pathlib import Path
+
+import jsonschema
+import pytest
+import yaml
+
+import zagg.configs
+from zagg.config import default_config, load_config_from_dict
+from zagg.config.schema import BLOCKS, HINT_KEY, json_schema, schema_json
+from zagg.semantics import diff, semantic_hash
+
+REPO = Path(__file__).parents[1]
+sys.path.insert(0, str(REPO / "tools"))
+
+PACKAGED = sorted(
+    f.name.removesuffix(".yaml")
+    for f in resources.files(zagg.configs).iterdir()
+    if f.name.endswith(".yaml")
+)
+MEASURE_CONFIGS = sorted((REPO / "tools" / "configs").glob("*.yaml"))
+BENCHMARK = sorted((REPO / "tests" / "data" / "benchmark" / "configs").glob("*.yaml"))
+RUN_RECORDS = sorted((REPO / "tests" / "data").glob("*.config.json"))
+
+
+@pytest.fixture(scope="module")
+def validator():
+    schema = json_schema()
+    jsonschema.Draft202012Validator.check_schema(schema)
+    return jsonschema.Draft202012Validator(schema)
+
+
+@pytest.mark.parametrize("name", PACKAGED)
+def test_packaged_templates_validate_under_a_stock_validator(validator, name):
+    raw = yaml.safe_load(resources.files(zagg.configs).joinpath(f"{name}.yaml").read_text())
+    assert [e.message for e in validator.iter_errors(raw)] == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    MEASURE_CONFIGS + BENCHMARK + RUN_RECORDS,
+    ids=[p.name for p in MEASURE_CONFIGS + BENCHMARK + RUN_RECORDS],
+)
+def test_repo_configs_validate_under_a_stock_validator(validator, path):
+    # tools/configs arms, benchmark configs and the vendored run records (JSON
+    # is YAML, so one loader reads both).
+    assert [e.message for e in validator.iter_errors(yaml.safe_load(path.read_text()))] == []
+
+
+def test_schema_refuses_a_misspelled_key(validator):
+    raw = yaml.safe_load(resources.files(zagg.configs).joinpath("atl06.yaml").read_text())
+    raw["data_source"]["filtres"] = []
+    errors = list(validator.iter_errors(raw))
+    assert errors and any("filtres" in e.message for e in errors)
+
+
+@pytest.mark.parametrize("block", sorted(BLOCKS))
+def test_block_export(block):
+    schema = json_schema(block, registry_hints=False)
+    jsonschema.Draft202012Validator.check_schema(schema)
+    assert "$defs" in schema or "properties" in schema
+
+
+def test_unknown_block_is_refused():
+    with pytest.raises(ValueError, match="unknown block"):
+        json_schema("bogus")
+
+
+def test_registry_hints_ride_the_capability_fields():
+    schema = json_schema("aggregation")
+    temporal = schema["$defs"]["TemporalFieldSpec"]["properties"]
+    hinted = temporal["spatial_func"][HINT_KEY]
+    assert {"max", "weighted_mean"} <= {h["name"] for h in hinted}
+    assert "Registered spatial_func names" in temporal["spatial_func"]["description"]
+    # Hints, never a closed set: plugins register more.
+    assert "enum" not in temporal["spatial_func"]
+    plain = json_schema("aggregation", registry_hints=False)
+    assert HINT_KEY not in plain["$defs"]["TemporalFieldSpec"]["properties"]["spatial_func"]
+
+
+def test_trigger_mask_carries_no_registry_hint():
+    # A ``data_source.static_data`` key, not a mask-provider name (temporal.py).
+    prop = json_schema("aggregation")["$defs"]["TemporalFieldSpec"]["properties"]["trigger_mask"]
+    assert HINT_KEY not in prop and "Registered" not in prop["description"]
+
+
+def test_reader_hint_rides_the_collection_source_only():
+    defs = json_schema("data_source")["$defs"]
+    assert HINT_KEY in defs["CollectionDataSource"]["properties"]["reader"]
+    for model in ("H5DataSource", "RasterDataSource"):
+        assert HINT_KEY not in defs[model]["properties"]["reader"]
+        assert HINT_KEY in defs[model]["properties"]["credentials_provider"]
+
+
+#: Optional fields whose ``null`` acceptance depends on a sibling key, which a
+#: per-field schema cannot express: the H5 source's form keys (null is the
+#: other form) and a filter's ``value`` (null is fine beside a set op).
+_NULL_BY_CONTEXT = {
+    ("H5DataSource", f) for f in ("coordinates", "levels", "base_level", "assets")
+} | {("StructuredFilter", "value")}
+
+
+def _seeds() -> dict:
+    """Every model instance the packaged templates build, as its input dict."""
+    from pydantic import BaseModel
+
+    seeds: dict = {}
+
+    def walk(node):
+        if isinstance(node, BaseModel):
+            seeds.setdefault(type(node), []).append(node.model_dump(exclude_unset=True))
+            for key in type(node).model_fields:
+                walk(getattr(node, key))
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                walk(v)
+
+    for name in PACKAGED:
+        walk(default_config(name).model)
+    return seeds
+
+
+def test_schema_and_models_agree_on_explicit_null():
+    from pydantic import ValidationError
+
+    from zagg.config.models_base import _Block
+
+    defs = json_schema(registry_hints=False)["$defs"]
+    seeds = _seeds()
+    by_name = {cls.__name__: cls for cls in [*seeds, *_all_blocks()]}
+    mismatches = []
+    for name, model in defs.items():
+        cls = by_name.get(name)
+        if cls is None:
+            continue
+        for key, info in cls.model_fields.items():
+            if info.is_required() or (name, key) in _NULL_BY_CONTEXT:
+                continue
+            prop = {**model["properties"][key], "$defs": defs}
+            schema_null = jsonschema.Draft202012Validator(prop).is_valid(None)
+            if issubclass(cls, _Block) and schema_null != (key in cls._NULLABLE):
+                mismatches.append((name, key, "rule"))
+            for seed in seeds.get(cls, ()):
+                try:
+                    cls.model_validate({**seed, key: None})
+                    model_null = True
+                except ValidationError:
+                    model_null = False
+                if model_null != schema_null:
+                    mismatches.append((name, key, "probe"))
+    assert sorted(set(mismatches)) == []
+
+
+def _all_blocks():
+    from zagg.config.models_base import _Block
+
+    todo, out = list(_Block.__subclasses__()), []
+    while todo:
+        cls = todo.pop()
+        out.append(cls)
+        todo += cls.__subclasses__()
+    return out
+
+
+def test_typed_any_fields_export_what_the_model_accepts():
+    from zagg.windows import _LABEL_RE
+
+    defs = json_schema(registry_hints=False)["$defs"]
+    for model in ("WindowRange", "WindowPoint"):
+        label = defs[model]["properties"]["label"]
+        assert (label["type"], label["pattern"]) == ("string", _LABEL_RE.pattern)
+    assert defs["QualityFilter"]["properties"]["value"]["type"] == "number"
+    fill = {**defs["FieldSpec"]["properties"]["fill_value"], "$defs": defs}
+    check = jsonschema.Draft202012Validator(fill)
+    assert all(check.is_valid(v) for v in (0, -9999.5, "NaN", None))
+    assert not check.is_valid([0])
+    index = defs["H5DataSource"]["properties"]["index"]["description"]
+    assert "open mapping" in index
+
+
+def test_schema_json_is_stable():
+    assert schema_json() == schema_json()
+    assert json.loads(schema_json("output", registry_hints=False)) == json_schema(
+        "output", registry_hints=False
+    )
+
+
+def test_cli_prints_the_schema(capsys):
+    from zagg.config.__main__ import main
+
+    assert main(["--schema", "--block", "data_source", "--no-registry-hints"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == json_schema("data_source", registry_hints=False)
+    with pytest.raises(SystemExit):
+        main([])
+
+
+def test_docs_page_is_current():
+    import render_schema_docs
+
+    assert render_schema_docs.render() == render_schema_docs.OUT.read_text(), (
+        "docs/template_grammar.md is stale: run tools/render_schema_docs.py"
+    )
+
+
+class TestSemanticDiff:
+    """``semantics.diff``: which changed keys move the product identity."""
+
+    def _pair(self, name="atl03_tdigest_strata_healpix"):
+        return default_config(name), default_config(name)
+
+    def test_identical_configs_diff_empty(self):
+        a, b = self._pair()
+        assert diff(a, b) == {"changed_keys": [], "hash_affecting": [], "hash_neutral": []}
+
+    def test_packaging_keys_are_neutral(self):
+        a, b = self._pair()
+        b.data_source["shard_workers"] = 8
+        b.output["grid"]["parent_order"] = 8
+        b.aggregation["streaming"] = {"mode": "merge"}
+        b.worker = {"memory": 2048, "extra_disk": True}
+        b.aggregation["variables"]["h_tdigest_signal"]["overview_delta"] = 64
+        d = diff(a, b)
+        assert d["hash_affecting"] == []
+        assert set(d["hash_neutral"]) == {
+            "data_source.shard_workers",
+            "output.grid.parent_order",
+            "aggregation.streaming.mode",
+            "worker.memory",
+            "aggregation.variables.h_tdigest_signal.overview_delta",
+        }
+        assert semantic_hash(a) == semantic_hash(b)
+
+    def test_semantic_keys_are_affecting(self):
+        a, b = self._pair()
+        b.aggregation["variables"]["count"]["dtype"] = "int32"
+        b.data_source["filters"][0]["value"] = -1
+        d = diff(a, b)
+        assert set(d["hash_affecting"]) == {
+            "aggregation.variables.count.dtype",
+            "data_source.filters[0].value",
+        }
+        assert d["hash_neutral"] == []
+        assert semantic_hash(a) != semantic_hash(b)
+
+    def test_resolved_output_knobs_follow_the_core(self):
+        # ``output.windowing`` is folded RESOLVED (§8.3): a changed schedule
+        # moves the hash, a changed dispatch ``unit`` under the same block does not.
+        a, b = self._pair()
+        b.output["windowing"]["unit"] = "window"
+        d = diff(a, b)
+        assert d["hash_neutral"] == ["output.windowing.unit"] and d["hash_affecting"] == []
+        c = default_config("atl03_tdigest_strata_healpix")
+        c.output["windowing"]["schedule"] = "monthly"
+        d = diff(a, c)
+        assert d["hash_affecting"] == ["output.windowing.schedule"]
+
+    def test_absent_default_and_explicit_default_are_neutral(self):
+        # The pipeline.type and sharded disciplines: spelling the default is
+        # not a product change.
+        a, b = self._pair("atl06")
+        b.pipeline = {"type": "spatial"}
+        b.output["grid"]["sharded"] = True
+        d = diff(a, b)
+        assert d["hash_affecting"] == []
+        assert set(d["hash_neutral"]) == {"output.grid.sharded"} | (
+            {"pipeline.type"} if a.pipeline != b.pipeline else set()
+        )
+
+    def test_added_and_removed_keys_are_reported(self):
+        a, b = self._pair("atl06")
+        del b.aggregation["variables"]["h_q75"]
+        b.data_source["read_workers"] = 2
+        d = diff(a, b)
+        assert "aggregation.variables.h_q75.function" in d["hash_affecting"]
+        assert d["hash_neutral"] == ["data_source.read_workers"]
+
+    @pytest.mark.parametrize(
+        "name, edit",
+        [
+            (
+                "atl03_tdigest_strata_healpix",
+                lambda c: c.data_source["filters"][0].update(value=-2.0),
+            ),
+            (
+                "atl03_tdigest_strata_healpix",
+                lambda c: c.data_source["filters"][0].update(column=False),
+            ),
+            ("atl06", lambda c: c.data_source.update(filters=[])),
+            ("atl06", lambda c: c.aggregation["variables"]["count"].update(params={})),
+            (
+                "atl03_tdigest_strata_healpix",
+                lambda c: c.aggregation["variables"]["h_tdigest_signal"].update(inner_shape=(2,)),
+            ),
+        ],
+        ids=["int-to-float", "int-to-bool", "absent-to-empty-list", "empty-params", "tuple-shape"],
+    )
+    def test_diff_reads_leaves_as_the_hash_does(self, name, edit):
+        # Leaves compare by canonical JSON (``-2`` vs ``-2.0``, ``0`` vs
+        # ``false``), an empty container is a leaf, a tuple equals its list.
+        a, b = self._pair(name)
+        edit(b)
+        d = diff(a, b)
+        assert bool(d["hash_affecting"]) == (semantic_hash(a) != semantic_hash(b))
+        assert bool(d["changed_keys"]) == (semantic_hash(a) != semantic_hash(b))
+
+    def test_a_packaging_key_changed_beside_a_semantic_one_stays_neutral(self):
+        # Attribution is per path (counterfactual), not per resolved block.
+        a, b = self._pair("atl06")
+        b.output["grid"]["parent_order"] = 5
+        b.output["grid"]["sharded"] = False
+        d = diff(a, b)
+        assert d["hash_affecting"] == ["output.grid.sharded"]
+        assert d["hash_neutral"] == ["output.grid.parent_order"]
+        a, b = self._pair()
+        b.output["windowing"]["unit"] = "window"
+        b.output["windowing"]["schedule"] = "monthly"
+        d = diff(a, b)
+        assert d["hash_affecting"] == ["output.windowing.schedule"]
+        assert d["hash_neutral"] == ["output.windowing.unit"]
+
+    def test_a_grid_family_switch_marks_only_the_spatial_keys(self):
+        a, b = self._pair("atl06")
+        b.output["grid"] = dict(default_config("atl06_polar").output["grid"])
+        d = diff(a, b)
+        affecting = {p.split("[")[0] for p in d["hash_affecting"]}
+        assert affecting == {f"output.grid.{k}" for k in ("type", "crs", "resolution", "bounds")}
+        assert {"output.grid.parent_order", "output.grid.child_order"} <= set(d["hash_neutral"])
+
+    def test_diff_does_not_mutate_its_inputs(self):
+        a, b = self._pair()
+        b.output["windowing"]["schedule"] = "monthly"
+        before = (semantic_hash(a), semantic_hash(b), json.dumps(b.output, default=str))
+        diff(a, b)
+        assert before == (semantic_hash(a), semantic_hash(b), json.dumps(b.output, default=str))
+
+    def test_run_record_config_diffs_against_its_template(self):
+        # The vendored run record vs today's template: count's dtype and the
+        # windowing block are the only hash-affecting differences (issue #626/#638).
+        live = load_config_from_dict(
+            json.loads((REPO / "tests" / "data" / "atl03_tdigest_o9.config.json").read_text())
+        )
+        d = diff(live, default_config("atl03_tdigest_strata_healpix"))
+        affecting = {p.split("[")[0] for p in d["hash_affecting"]}
+        assert "aggregation.variables.count.dtype" in affecting
+        assert all(
+            p.startswith(("output.windowing", "aggregation.variables.count")) for p in affecting
+        )

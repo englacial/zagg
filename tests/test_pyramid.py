@@ -269,9 +269,9 @@ class TestConfigWiring:
             )
 
     def test_missing_child_order_refuses_by_name(self):
-        from zagg.config import _validate_pyramid
+        from zagg.config import validate_config
 
         cfg = self._cfg(store_layout="hive", pyramid={"overviews": [9]})
         cfg.output["grid"] = {"type": "healpix", "parent_order": 6}
-        with pytest.raises(ValueError, match="output.grid.child_order is required"):
-            _validate_pyramid(cfg)
+        with pytest.raises(ValueError, match=r"output\.grid\.child_order: Field required"):
+            validate_config(cfg)

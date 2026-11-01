@@ -1036,7 +1036,9 @@ class TestAssetVariableValidation:
     def test_non_string_path_rejected(self):
         ds = _dem_var_ds()
         ds["levels"]["shots"]["variables"]["dem"] = {"asset": "l2a", "path": ""}
-        with pytest.raises(ValueError, match="variables.dem.path must be a non-empty string"):
+        with pytest.raises(
+            ValueError, match=r"variables\.dem\.path: String should have at least 1 character"
+        ):
             validate_config(_cfg(ds))
 
     def test_collision_with_base_variable_rejected(self):
@@ -1094,7 +1096,7 @@ class TestVlenConfigValidation:
     def test_synthesize_unknown_kind_rejected(self):
         ds = _vlen_ds()
         ds["variables"]["elevation"]["synthesize"] = "logspace"
-        with pytest.raises(ValueError, match="must be 'linspace'"):
+        with pytest.raises(ValueError, match=r"elevation\.synthesize: Input should be 'linspace'"):
             validate_config(_cfg(ds))
 
     def test_asset_filter_requires_declared_asset(self):
@@ -1121,7 +1123,7 @@ class TestVlenConfigValidation:
 
     def test_assets_join_requires_paths(self):
         ds = _vlen_ds(assets={"l2a": {"join": {"left": "/{group}/shot_number"}}})
-        with pytest.raises(ValueError, match="join.right must be a non-empty string"):
+        with pytest.raises(ValueError, match=r"assets\.l2a\.join\.right: Field required"):
             validate_config(_cfg(ds))
 
 

@@ -516,7 +516,7 @@ class TestKnob:
         from zagg.config import validate_config
 
         cfg.output["leaf_versions"] = "yes"
-        with pytest.raises(ValueError, match="leaf_versions must be a boolean"):
+        with pytest.raises(ValueError, match="leaf_versions: must be a boolean"):
             validate_config(cfg)
         cfg.output["leaf_versions"] = True
         cfg.output["store_layout"] = "flat"
