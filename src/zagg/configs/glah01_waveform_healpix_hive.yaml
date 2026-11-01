@@ -94,24 +94,24 @@ data_source:
         # the rest padding).
         i_waveformType: "/{group}/Waveform/Characteristics/i_waveformType"
         # The shot's UTC instant (d_UTCTime_40: verified name, location
-        # unverified; J2000 seconds, UTC scale -- see the clock note above). Unique per shot, so it is the
-        # record id the shot_count companion keys on: i_rec_ndx alone names a
-        # 40-shot record, not a shot.
+        # unverified; J2000 seconds, UTC scale -- see the clock note above).
+        # Unique per shot, so it is the record id the shot_count companion
+        # keys on: i_rec_ndx alone names a 40-shot record, not a shot.
         utc_time: "/{group}/Time/d_UTCTime_40"
         # Noise and gain for the flux digest (verified names, location
-        # unverified: the introspection lists them, not their group; the MAPPING to
-        # the digest's noise_mean / noise_stddev / gain is a placeholder --
-        # see the rx_flux attrs below).
+        # unverified: the introspection lists them, not their group). The
+        # MAPPING to the digest's noise_mean / noise_stddev / gain is a
+        # placeholder -- see the rx_flux attrs below.
         noise_mean: "/{group}/Waveform/Characteristics/d_4nsBgMean"
         noise_stddev: "/{group}/Waveform/Characteristics/d_4nsBgSDEV"
         gain_set: "/{group}/Waveform/Characteristics/i_gainSet1064"
         rx_energy: "/{group}/Waveform/Characteristics/d_RecNrgAll_EU"
         wt_fact_filt_0:
           # i_wt_fact_filt: verified name and [51200, 6] shape, location
-          # unverified. A per-record TABLE, not
-          # a waveform, so it takes ``column`` on the record level (the issue
-          # #678 case for an explicit axis declaration). Column 0 is read as
-          # a representative; the table's semantics are a phase 4 question.
+          # unverified. A per-record TABLE, not a waveform, so it takes
+          # ``column`` on the record level (the issue #678 case for an
+          # explicit axis declaration). Column 0 is read as a representative;
+          # the table's semantics are a phase 4 question.
           path: "/{group}/Waveform/Characteristics/i_wt_fact_filt"
           column: 0
   assets:
