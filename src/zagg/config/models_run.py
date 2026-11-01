@@ -13,6 +13,7 @@ from pydantic import Field, WithJsonSchema, field_validator, model_validator
 
 from zagg.config.core import WORKER_MEMORIES
 from zagg.config.models_base import Bool, StrictModel, _Block
+from zagg.config.models_output import Instant
 
 __all__ = ["Bounds", "SpatialPipeline", "TemporalBounds", "TemporalPipeline", "Worker"]
 
@@ -67,8 +68,8 @@ class Worker(_Block):
 class TemporalBounds(StrictModel):
     """``bounds.temporal``: the run's granule time window."""
 
-    start_date: Any = Field(description="ISO-8601 start of the granule window (inclusive).")
-    end_date: Any = Field(
+    start_date: Instant = Field(description="ISO-8601 start of the granule window (inclusive).")
+    end_date: Instant = Field(
         description="ISO-8601 end of the granule window; a bare ``YYYY-MM-DD`` string is "
         "expanded to the end of that day."
     )

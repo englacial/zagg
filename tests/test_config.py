@@ -1751,6 +1751,13 @@ class TestBoundsValidation:
         with pytest.raises(ValueError, match="start_date and end_date"):
             validate_config(atl06_config)
 
+    def test_temporal_dates_must_be_instants(self, atl06_config):
+        atl06_config.bounds = {"temporal": {"start_date": 5, "end_date": "2024-06-01"}}
+        with pytest.raises(
+            ValueError, match=r"bounds\.temporal\.start_date: must be an ISO-8601 instant"
+        ):
+            validate_config(atl06_config)
+
     def test_none_bounds_ok(self, atl06_config):
         atl06_config.bounds = None
         validate_config(atl06_config)
