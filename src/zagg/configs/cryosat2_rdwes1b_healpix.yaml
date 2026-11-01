@@ -36,6 +36,9 @@ data_source:
     store: s3://your-bucket/zagg-index/RDWES1B/1/
     on_miss: error
 
+# NaN policy: the header declares no ``_FillValue``, so a NaN in a source
+# column is the only missing-value marker; every statistic is NaN-aware
+# (nanmean / nanmin / nanmax), while ``count`` (len) counts the cell's rows.
 aggregation:
   handoff: arrow
   coordinates:
@@ -49,7 +52,7 @@ aggregation:
       dtype: int64
       fill_value: 0
     elev_mean:
-      function: mean
+      function: nanmean
       source: elev
       dtype: float32
     elev_min:
@@ -61,11 +64,11 @@ aggregation:
       source: elev
       dtype: float32
     roughness_mean:
-      function: mean
+      function: nanmean
       source: roughness
       dtype: float32
     peakiness_mean:
-      function: mean
+      function: nanmean
       source: peakiness
       dtype: float32
 
