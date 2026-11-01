@@ -275,6 +275,23 @@ class TestDescribe:
         assert d["variables"]["lat"]["attrs"] == {"units": "degrees_north", "pad": "ab"}
         assert d["attrs"] == {"title": "t"}
 
+    def test_scalar_variable(self):
+        # The CF grid-mapping ``int crs`` every gridded product carries.
+        crs = {"name": "crs", "dimids": [], "nc_type": NC_INT, "data": np.array(7)}
+        crs["attrs"] = {"grid_mapping_name": (NC_CHAR, "polar_stereographic")}
+        data, layout = _nc3_bytes(1, _DIMS, [crs, *_VARS])
+        hdr = parse_header(data)
+        assert hdr.slab_bytes(hdr.variables[0]) == 4
+        v = describe(data)["variables"]["crs"]
+        assert v["dims"] == [] and v["shape"] == [] and v["record"] is False
+        assert (v["begin"], v["vsize"]) == layout["crs"] and v["vsize"] == 4
+        assert v["attrs"] == {"grid_mapping_name": "polar_stereographic"}
+
+    def test_empty_attributes(self):
+        gattrs = {"none": (NC_INT, []), "blank": (NC_CHAR, ""), "after": (NC_SHORT, 3)}
+        data, _ = _nc3_bytes(1, [("x", 3)], [], gattrs)
+        assert describe(data)["attrs"] == {"none": [], "blank": "", "after": 3}
+
     def test_empty_lists(self):
         data, _ = _nc3_bytes(1, [], [], {})
         d = describe(data)
@@ -481,6 +498,39 @@ class TestRefusals:
         i = data.index(_name("v")) + len(_name("v")) + 4 + 4 + 8
         bad[i : i + 4] = struct.pack(">I", 10)  # NC_INT64 (CDF-5 only)
         with pytest.raises(ValueError, match="unsupported nc_type 10"):
+            describe(bytes(bad))
+
+    def test_record_dim_not_first(self):
+        v = {"name": "v", "dimids": [1, 0], "nc_type": NC_INT, "data": np.zeros((2, 0))}
+        data, _ = _nc3_bytes(1, [("time", 0), ("x", 2)], [v], numrecs=0)
+        with pytest.raises(ValueError, match="'v': the record dimension may only be its first"):
+            describe(data)
+
+    @staticmethod
+    def _gatt_at(gattrs=None):
+        """A one-dim, no-variable file and the offset of its gatt_list tag."""
+        data, _ = _nc3_bytes(1, [("x", 2)], [], gattrs or {})
+        return bytearray(data), 8 + 8 + len(_name("x")) + 4
+
+    def test_att_list_bad_tag(self):
+        bad, i = self._gatt_at()
+        bad[i : i + 4] = struct.pack(">I", 0x0B)
+        with pytest.raises(ValueError, match="expected NC_ATTRIBUTE tag, got 0xb"):
+            describe(bytes(bad))
+
+    def test_att_list_absent_with_count(self):
+        bad, i = self._gatt_at()
+        assert bad[i : i + 8] == b"\0" * 8
+        bad[i + 4 : i + 8] = struct.pack(">I", 3)
+        with pytest.raises(ValueError, match="ABSENT att_list with count 3"):
+            describe(bytes(bad))
+
+    def test_attribute_unsupported_nc_type(self):
+        bad, i = self._gatt_at({"a": (NC_INT, 1)})
+        assert struct.unpack(">II", bad[i : i + 8]) == (0x0C, 1)
+        j = i + 8 + len(_name("a"))
+        bad[j : j + 4] = struct.pack(">I", 10)
+        with pytest.raises(ValueError, match="attribute 'a': unsupported nc_type 10"):
             describe(bytes(bad))
 
     def test_two_record_dims(self):
