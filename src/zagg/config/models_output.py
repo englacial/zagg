@@ -22,6 +22,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import (
     BeforeValidator,
+    ConfigDict,
     Discriminator,
     Field,
     PlainValidator,
@@ -570,9 +571,21 @@ class Icechunk(StrictModel):
 class Summarize(StrictModel):
     """One D24 derived-summary declaration: ``{as: <new field name>, ...}``."""
 
-    model_config = {"extra": "allow"}
-
-    as_: str = Field(alias="as", description="Name of the derived overview field (must be new).")
+    # No declared fields, so the dump is the author's keys verbatim (an aliased
+    # ``as_`` field would dump as ``as_``); ``Pyramid._shape`` enforces ``as``.
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "properties": {
+                "as": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Name of the derived overview field (must be new).",
+                }
+            },
+            "required": ["as"],
+        },
+    )
 
 
 class Pyramid(StrictModel):

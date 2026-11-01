@@ -516,3 +516,14 @@ class TestOutputGrammar:
             ValueError, match=r"output\.pyramid\.orders\[0\]: must be a non-negative"
         ):
             validate_config(cfg)
+
+    def test_summarize_dumps_key_for_key(self):
+        cfg = default_config("atl03_tdigest_healpix_hive")
+        field = next(iter(cfg.aggregation["variables"]))
+        decl = {"as": f"{field}_sum", "function": "sum"}
+        cfg.output["pyramid"] = {"summarize": {field: decl}}
+        validate_config(cfg)
+        dump = validate_model(cfg).model_dump(exclude_unset=True)
+        assert dump["output"]["pyramid"]["summarize"] == {field: decl}
+        rebuilt = PipelineConfig(**{k: dump.get(k) for k in BLOCKS})
+        validate_config(rebuilt)
