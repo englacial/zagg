@@ -80,6 +80,11 @@ keys = index_granules(
 )
 ```
 
+`credentials` may also be a zero-argument callable, called once per
+granule, so an hour-long build can refresh the ~1 h NSIDC credentials. A
+failed granule is logged and comes back `None` (a closing line gives the
+failure count); a `TypeError` from bad arguments propagates.
+
 The `s3://` route (NSIDC direct S3 access) works only from inside AWS
 us-west-2; run the build there -- zagg's no-egress policy rules out pulling
 granules out of region.

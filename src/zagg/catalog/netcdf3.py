@@ -586,19 +586,31 @@ def index_granules(
     ``sources`` are paths or URLs (e.g. a shard map's granule hrefs); each
     costs one header read and one small parquet put, so they are pooled
     ``workers`` wide. A repeated source (a granule listed under several
-    shards) is indexed once. A granule that fails to index is logged and
+    shards) is indexed once. ``credentials`` may be a zero-argument callable,
+    called once per granule, so a long build can refresh expiring credentials
+    (NSIDC S3 credentials last about an hour), e.g. one that re-calls
+    ``get_nsidc_s3_credentials()`` shortly before the previous ones expire.
+
+    A granule that fails to index (I/O, a non-netCDF3 file) is logged and
     recorded as ``None`` -- the sidecar backend reports it at read time
-    (``on_miss``), and one bad granule must not abort a catalog-wide build.
-    Returns ``{source: object key | None}`` over the distinct sources, in
-    first-seen order.
+    (``on_miss``), and one bad granule must not abort a catalog-wide build; a
+    closing log line gives the failure count. A ``TypeError`` (a bad argument,
+    e.g. a raw-bytes source) is the caller's error and propagates. There is no
+    per-granule ``file_size``: a streaming-mode granule read from a URL fails
+    here and is indexed with :func:`index_granule` (``file_size=``). Returns
+    ``{source: object key | None}`` over the distinct sources, in first-seen
+    order.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     srcs = list({os.fspath(s): s for s in sources}.values())  # first-seen order
 
     def one(src):
+        creds = credentials() if callable(credentials) else credentials
         try:
-            return index_granule(src, store, driver, credentials)
+            return index_granule(src, store, driver, creds)
+        except TypeError:
+            raise
         except Exception as e:
             logger.warning(f"  netcdf3 index: {src} failed: {e}")
             return None
@@ -608,4 +620,7 @@ def index_granules(
     else:
         with ThreadPoolExecutor(max_workers=min(workers, len(srcs))) as pool:
             keys = list(pool.map(one, srcs))
+    failed = sum(k is None for k in keys)
+    log = logger.warning if failed else logger.info
+    log(f"  netcdf3 index: {len(keys) - failed} of {len(keys)} granules indexed, {failed} failed")
     return dict(zip((os.fspath(s) for s in srcs), keys))

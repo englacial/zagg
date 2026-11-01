@@ -972,6 +972,7 @@ class TestIndexGranules:
         assert out == {**{g: f"G{i}.parquet" for i, g in enumerate(good)}, str(bad): None}
         assert sorted(p.name for p in store.iterdir()) == ["G0.parquet", "G1.parquet", "G2.parquet"]
         assert "junk.nc failed: not a netCDF3 file" in caplog.text
+        assert "3 of 4 granules indexed, 1 failed" in caplog.text
         serial = index_granules(good, str(tmp_path / "serial"), workers=1)
         assert list(serial.values()) == ["G0.parquet", "G1.parquet", "G2.parquet"]
 
@@ -1001,3 +1002,33 @@ class TestIndexGranules:
             out = mod.index_granules(repeated, str(tmp_path / "store"), workers=4)
         assert list(out) == [paths[2], paths[0], paths[1]]
         assert sorted(calls) == sorted(paths)
+
+    @pytest.mark.parametrize("workers", [1, 4])
+    def test_caller_errors_propagate(self, tmp_path, workers):
+        from zagg.catalog.netcdf3 import index_granules
+
+        good = tmp_path / "G.nc"
+        good.write_bytes(fixture()[0])
+        with pytest.raises(TypeError, match="path or URL"):
+            index_granules([str(good), fixture()[0]], str(tmp_path / "s"), workers=workers)
+
+    def test_credentials_callable_is_called_per_granule(self, tmp_path):
+        from zagg.catalog.netcdf3 import index_granules
+
+        data = fixture()[0]
+        seen = []
+
+        class Drv:
+            def __init__(self, resource, credentials):
+                seen.append((resource, credentials))
+
+            def read(self, pos, size):
+                return data[pos : pos + size]
+
+        tokens = iter(["t0", "t1", "t2"])
+        urls = [f"https://x/G{i}.nc" for i in range(3)]
+        out = index_granules(
+            urls, str(tmp_path), driver=Drv, credentials=lambda: next(tokens), workers=1
+        )
+        assert list(out.values()) == ["G0.parquet", "G1.parquet", "G2.parquet"]
+        assert seen == [(u, f"t{i}") for i, u in enumerate(urls)]
