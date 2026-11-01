@@ -45,6 +45,7 @@ from zagg.processing.aggregate import (
     _has_vector_fields,
     _pool_chunk_columns,
 )
+from zagg.processing.granule import open_granule
 from zagg.processing.write import _build_output, _channel_entry
 from zagg.schema import ProcessingMetadata
 
@@ -586,21 +587,11 @@ def process_shard(
         try:
             resource_path = _rewrite_url(s3_url)
 
-            h5obj = _processing.h5coro.H5Coro(
-                resource_path,
-                h5coro_driver,
-                credentials=credentials,
-                errorChecking=True,
-                verbose=False,
-            )
+            # h5coro for HDF5; a manifest-only ranged handle for a netCDF3
+            # granule the sidecar backend addresses (issue #682).
+            h5obj = open_granule(resource_path, h5coro_driver, credentials)
             for name, url in asset_urls.items():
-                siblings[name] = _processing.h5coro.H5Coro(
-                    _rewrite_url(url),
-                    h5coro_driver,
-                    credentials=credentials,
-                    errorChecking=True,
-                    verbose=False,
-                )
+                siblings[name] = open_granule(_rewrite_url(url), h5coro_driver, credentials)
 
             for g in data_source["groups"]:
                 try:
