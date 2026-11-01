@@ -43,7 +43,6 @@ CAPABILITY_FIELDS: dict[str, str] = {
     "spatial_func": "spatial_func",
     "temporal_reducer": "reducer",
     "mask": "mask_provider",
-    "trigger_mask": "mask_provider",
     "transform": "field_transform",
     "trigger": "event_trigger",
     "reader": "reader",

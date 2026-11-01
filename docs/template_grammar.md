@@ -543,7 +543,7 @@ A typo in a capability name surfaces as ``UnknownCapability`` from
 | `anomaly` | `boolean` \| `null` | Sugar for ``transform: monthly_anomaly`` (subtract the climatology). |
 | `transform` | `string` \| `null` | Registered transform applied before reduction; wins over ``anomaly``. |
 | `trigger` | `string` \| `null` | Registered event-trigger predicate. |
-| `trigger_mask` | `string` \| `null` | Static-data mask the trigger tests against (default ``ais_mask``). |
+| `trigger_mask` | `string` \| `null` | Key into ``data_source.static_data`` naming the mask the trigger tests against (default ``ais_mask``); a static field name, not a registered mask provider. |
 | `params` | mapping \| `null` | Free-form mapping passed to the mask provider, field transform and event trigger (not to spatial funcs or reducers). |
 
 ### TemporalOutput

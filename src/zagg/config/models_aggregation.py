@@ -586,7 +586,8 @@ class TemporalFieldSpec(_Block):
     trigger: str | None = Field(default=None, description="Registered event-trigger predicate.")
     trigger_mask: str | None = Field(
         default=None,
-        description="Static-data mask the trigger tests against (default ``ais_mask``).",
+        description="Key into ``data_source.static_data`` naming the mask the trigger tests "
+        "against (default ``ais_mask``); a static field name, not a registered mask provider.",
     )
     params: dict[str, Any] | None = Field(
         default=None,

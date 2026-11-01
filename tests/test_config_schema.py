@@ -75,6 +75,12 @@ def test_registry_hints_ride_the_capability_fields():
     assert HINT_KEY not in plain["$defs"]["TemporalFieldSpec"]["properties"]["spatial_func"]
 
 
+def test_trigger_mask_carries_no_registry_hint():
+    # A ``data_source.static_data`` key, not a mask-provider name (temporal.py).
+    prop = json_schema("aggregation")["$defs"]["TemporalFieldSpec"]["properties"]["trigger_mask"]
+    assert HINT_KEY not in prop and "Registered" not in prop["description"]
+
+
 def test_schema_json_is_stable():
     assert schema_json() == schema_json()
     assert json.loads(schema_json("output", registry_hints=False)) == json_schema(
