@@ -268,6 +268,11 @@ def _fixed_read_group(
         matched = np.ones(n_records, dtype=bool)
     else:
         n_records = _primary_record_count(data_source, coord_assets, group, _read_full)
+    # An empty group returns before any sibling is touched, as on the vlen route.
+    if n_records == 0:
+        _record_obs_read(io_stats, 0)
+        return None
+    if coord_assets is not None:
         # A missing coordinate sibling fails the group here, before the join:
         # through the asset-variable path it would log a NaN-fill warning
         # naming internal keys (and set the warn-once flag) before raising.
@@ -303,9 +308,6 @@ def _fixed_read_group(
         for key, entry in coord_assets.items():
             del asset_var_paths[entry["asset"]][f"__coord_{key}"]
 
-    if n_records == 0:
-        _record_obs_read(io_stats, 0)
-        return None
     ibeg_arr, cnt_arr = fixed_link_arrays(n_records, width)
     n_base = link_base_extent(ibeg_arr, cnt_arr, 0)
 

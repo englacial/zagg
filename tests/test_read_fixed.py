@@ -977,6 +977,28 @@ class TestAssetSourcedCoordinates:
         assert not caplog.records
         assert not hasattr(h5obj, "_zagg_asset_nan_warned")
 
+    def test_empty_primary_returns_none_before_the_join(self):
+        # Zero records: no sibling read and no missing-handle raise, as the
+        # vlen route returns before touching a sibling (PR #680 review).
+        arrays = {p: a[:0] for p, a in _fx_arrays().items()}
+        sib_reads = []
+
+        class _Sib(_FakeH5):
+            def readDatasets(self, datasets):  # noqa: N802
+                sib_reads.append(datasets)
+                return super().readDatasets(datasets)
+
+        ds = _fx_sibling_coord_ds(
+            filters=[{"asset": "sib", "dataset": "/{group}/qual", "op": "eq", "value": 1}]
+        )
+        for siblings in ({"sib": _Sib(_fx_sibling_arrays())}, None):
+            io_stats = {}
+            out = _read_group(
+                _FakeH5(arrays), "G", ds, 0, _OneShardGrid(), io_stats=io_stats, siblings=siblings
+            )
+            assert out is None and io_stats["obs_read"] == 0
+        assert sib_reads == []
+
     def test_the_join_is_shared_with_other_consumers(self, monkeypatch):
         import zagg.processing.read_vlen as rv
 
