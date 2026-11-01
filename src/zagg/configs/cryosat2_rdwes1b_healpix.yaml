@@ -4,10 +4,12 @@
 # RDWES1B granules are ``CDF\x01`` classic files (verified from the first four
 # bytes over the public HTTPS endpoint on 2026-10-31; CMR collection
 # C3205181034-NSIDC_CPRD, ~280 k granules, ~0.1-0.4 MB each): one fixed
-# dimension ``x`` (one row per along-track waveform) and 22 NON-record float
-# variables -- ``lat`` / ``lon`` in degrees, ``elev`` (retracked surface
-# elevation, metres, WGS-84), ``retrack_elev``, ``roughness``, ``peakiness``,
-# ``geophys_corr``, timing (``day``/``sec``), attitude -- all introspectable with
+# dimension ``x`` (one row per along-track waveform) and 22 NON-record
+# variables (16 float, 2 double, 4 int) -- float ``lat`` / ``lon`` in degrees,
+# ``elev`` (retracked surface elevation, metres, WGS-84), ``retrack_elev``,
+# ``roughness``, ``peakiness``, ``geophys_corr``, attitude; timing is two
+# doubles (``day`` / ``sec``), not one float time; the ints are ``i`` / ``j``
+# and ``wf_start_bin`` / ``wf_end_bin`` -- all introspectable with
 # ``zagg.catalog.netcdf3.describe(url, credentials=<EDL token>)`` from header
 # bytes alone. No HDF5 metadata exists, so the worker cannot walk chunk
 # B-trees: the index MUST be the ``sidecar`` backend over a store populated at

@@ -155,7 +155,7 @@ first four bytes of a recent granule over the public HTTPS endpoint:
 
 | collection | provider | magic | layout |
 |---|---|---|---|
-| RDWES1B (CryoSat-2 L1B sea-ice elevation) | NSIDC_CPRD | `CDF\x01` | 22 non-record float variables over `x`; the packaged template |
+| RDWES1B (CryoSat-2 L1B sea-ice elevation) | NSIDC_CPRD | `CDF\x01` | 22 non-record variables (float, double, int) over `x`; the packaged template |
 | IR2HI1B (IceBridge HiCARS 2 L1B echo profiles) | NSIDC_CPRD | `CDF\x01` | record variables over `time` incl. `[time, 3200]` waveforms -- the per-record-slab form |
 | TL2CO2LN (TES/Aura L2 CO2 Lite) | LARC_CLOUD | `\x89HDF` | labelled netCDF-3 in CMR but is HDF5: the magic, not the label, decides |
 
