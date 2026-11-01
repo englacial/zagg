@@ -81,7 +81,8 @@ Manifest rows, per variable:
 | variable kind | rows | `chunk_shape` | `byte_offset` | `nbytes` |
 |---|---|---|---|---|
 | non-record | 1 (`chunk_idx` 0) | `shape` | `begin` | unpadded array bytes |
-| record | one per record | `(1, *fixed dims)` | `begin + rec * recsize` | unpadded slab bytes |
+| the only record variable | 1 (`chunk_idx` 0) | `shape` | `begin` | `numrecs * slab` (packed, no gaps) |
+| one of several record variables | one per record | `(1, *fixed dims)` | `begin + rec * recsize` | unpadded slab bytes |
 
 `dtype` is the byte-order-explicit numpy string (`>i2`, `>f4`, `>f8`; `char`
 → `|u1`, decoded as code points), `gzip` / `shuffle` are false and
@@ -147,6 +148,7 @@ first four bytes of a recent granule over the public HTTPS endpoint:
   issue).
 - A scalar variable is not addressable (rank 0); `char` variables decode as
   `|u1` code points.
-- Record variables cost one manifest row per record: a file with millions of
-  records makes a large manifest (the backend has no stride). Non-record
-  variables are one row regardless of size.
+- When several record variables interleave, each costs one manifest row per
+  record: a file with millions of records makes a large manifest (the backend
+  has no stride). A lone record variable and every non-record variable are
+  one row regardless of size.

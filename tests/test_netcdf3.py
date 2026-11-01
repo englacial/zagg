@@ -655,7 +655,7 @@ class TestBuildManifest:
         df = build_manifest(data)
         assert list(df.columns) == list(MANIFEST_DTYPES)
         assert dict(df.dtypes.astype(str)) == MANIFEST_DTYPES
-        # One row per non-record variable, one per record for record variables.
+        # One row per non-record variable; two interleaved record variables -> one per record.
         assert df["dataset"].value_counts().to_dict() == {
             "/lat": 1,
             "/grid": 1,
@@ -729,11 +729,24 @@ class TestBuildManifest:
         only = [v for v in _VARS if v["name"] in ("lat", "temp")]
         data, layout = _nc3_bytes(2, _DIMS, only)
         df = build_manifest(data)
-        temp = df[df["dataset"] == "/temp"].sort_values("chunk_idx")
-        assert list(temp["byte_offset"]) == [layout["temp"][0] + 6 * r for r in range(4)]
-        _, out = _reconstruct(df, data)
+        # A lone record variable's slabs are packed with no gap: ONE row
+        # spanning the whole record block, not one per record.
+        temp = df[df["dataset"] == "/temp"]
+        assert len(temp) == 1
+        row = temp.iloc[0]
+        assert (row["byte_offset"], row["nbytes"]) == (layout["temp"][0], 4 * 6)
+        assert (row["chunk_idx"], row["elem_start"], row["elem_end"]) == (0, 0, 4)
+        assert row["shape"] == row["chunk_shape"] == "[4, 3]" and row["chunk_offset"] == "[0, 0]"
+        idx, out = _reconstruct(df, data)
         np.testing.assert_array_equal(out["/temp"], _TEMP)
         np.testing.assert_array_equal(out["/lat"], _LAT)
+        # Record ranges still decode exactly out of the one chunk.
+        for lo, hi in ((1, 3), (0, 1), (3, 4)):
+            addrs, sizes, _ = idx.read_plan("/temp", lo, hi)
+            bufs = [data[int(a) : int(a) + int(n)] for a, n in zip(addrs, sizes)]
+            np.testing.assert_array_equal(
+                idx.read_from_buffers("/temp", bufs, lo, hi), _TEMP[lo:hi]
+            )
 
     def test_streaming_numrecs_from_file_size(self):
         from zagg.catalog.netcdf3 import build_manifest

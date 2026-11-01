@@ -40,6 +40,7 @@ import logging
 import os
 import struct
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 
@@ -187,11 +188,16 @@ class Header:
     variables: tuple[Variable, ...]
     header_bytes: int = field(default=0)
 
+    # The layout properties below are ``cached_property``: they are pure
+    # functions of the frozen fields, and the manifest emitter reads them per
+    # variable (a plain property made it O(numrecs x nrecvars^2)). The class
+    # has no ``__slots__``, so the cache lands in the instance ``__dict__``.
+
     @property
     def format(self) -> str:
         return _VERSIONS[self.version]
 
-    @property
+    @cached_property
     def record_dimid(self) -> int | None:
         for i, (_, length) in enumerate(self.dims):
             if length == 0:
@@ -216,11 +222,11 @@ class Header:
         fixed = [self.dims[d][1] for d in var.dimids[1 if self.is_record(var) else 0 :]]
         return int(np.prod(fixed, dtype=np.int64)) * var.dtype.itemsize
 
-    @property
+    @cached_property
     def record_variables(self) -> tuple[Variable, ...]:
         return tuple(v for v in self.variables if self.is_record(v))
 
-    @property
+    @cached_property
     def recsize(self) -> int:
         """Bytes per record across all record variables, per the spec's padding
         rule: each slab is padded to 4 bytes, except when there is exactly one
@@ -454,14 +460,17 @@ def manifest_rows(hdr: Header, file_size: int | None = None) -> list[tuple]:
     """``MANIFEST_DTYPES``-ordered rows for every decodable variable of ``hdr``.
 
     A non-record variable is one contiguous pseudo-chunk (``chunk_idx`` 0,
-    ``chunk_shape == shape``, ``nbytes`` the unpadded array bytes). A record
-    variable is one row per record: ``chunk_shape = (1, *fixed dims)``,
-    ``byte_offset = begin + rec * recsize`` (never ``vsize``, which is
-    informational only -- see :attr:`Header.recsize`) -- the compiled reader has no
-    stride, so the interleaved record block is addressed slab by slab. Dtype
-    strings are the byte-order-explicit numpy forms (``>i2``, ``>f4``;
-    ``char`` -> ``|u1``); ``gzip`` / ``shuffle`` are False (netCDF3 is never
-    compressed) and ``filter_mask`` is 0. Dataset paths are ``/<name>``.
+    ``chunk_shape == shape``, ``nbytes`` the unpadded array bytes). So is a
+    LONE record variable: its slabs are packed with no gap (see
+    :attr:`Header.recsize`), so the whole record block is one chunk of
+    ``numrecs * slab`` bytes at ``begin``. When several record variables
+    interleave, each is one row per record: ``chunk_shape = (1, *fixed
+    dims)``, ``byte_offset = begin + rec * recsize`` (never ``vsize``, which is
+    informational only) -- the compiled reader has no stride, so the
+    interleaved block is addressed slab by slab. Dtype strings are the
+    byte-order-explicit numpy forms (``>i2``, ``>f4``; ``char`` -> ``|u1``);
+    ``gzip`` / ``shuffle`` are False (netCDF3 is never compressed) and
+    ``filter_mask`` is 0. Dataset paths are ``/<name>``.
 
     Skipped, with a log line: scalar variables (the compiled reader supports
     ranks 1-9 only) and record variables of a file with zero records (no
@@ -469,6 +478,8 @@ def manifest_rows(hdr: Header, file_size: int | None = None) -> list[tuple]:
     dataset reads as not covered, which is the truth).
     """
     numrecs = _record_count(hdr, file_size)
+    recsize = hdr.recsize
+    packed = len(hdr.record_variables) == 1
     rows: list[tuple] = []
     for v in hdr.variables:
         path = f"/{v.name}"
@@ -478,13 +489,14 @@ def manifest_rows(hdr: Header, file_size: int | None = None) -> list[tuple]:
         record = hdr.is_record(v)
         fixed = [hdr.dims[d][1] for d in v.dimids[1 if record else 0 :]]
         nbytes = hdr.slab_bytes(v)
-        if record:
-            if numrecs == 0:
-                logger.info(f"  netcdf3 manifest: skipping record variable {v.name!r} (0 records)")
-                continue
+        if record and numrecs == 0:
+            logger.info(f"  netcdf3 manifest: skipping record variable {v.name!r} (0 records)")
+            continue
+        if record and not packed:
             shape = json.dumps([numrecs, *fixed])
             chunk_shape = json.dumps([1, *fixed])
             zeros = [0] * len(fixed)
+            dtype = v.dtype.str
             for rec in range(numrecs):
                 rows.append(
                     (
@@ -492,36 +504,37 @@ def manifest_rows(hdr: Header, file_size: int | None = None) -> list[tuple]:
                         rec,
                         rec,
                         rec + 1,
-                        v.begin + rec * hdr.recsize,
+                        v.begin + rec * recsize,
                         nbytes,
                         0,
                         json.dumps([rec, *zeros]),
-                        v.dtype.str,
+                        dtype,
                         shape,
                         chunk_shape,
                         False,
                         False,
                     )
                 )
-        else:
-            shape = json.dumps(fixed)
-            rows.append(
-                (
-                    path,
-                    0,
-                    0,
-                    fixed[0],
-                    v.begin,
-                    nbytes,
-                    0,
-                    json.dumps([0] * len(fixed)),
-                    v.dtype.str,
-                    shape,
-                    shape,
-                    False,
-                    False,
-                )
+            continue
+        full = [numrecs, *fixed] if record else fixed
+        shape = json.dumps(full)
+        rows.append(
+            (
+                path,
+                0,
+                0,
+                full[0],
+                v.begin,
+                numrecs * nbytes if record else nbytes,
+                0,
+                json.dumps([0] * len(full)),
+                v.dtype.str,
+                shape,
+                shape,
+                False,
+                False,
             )
+        )
     return rows
 
 
