@@ -45,6 +45,7 @@ import numpy as np
 
 __all__ = [
     "INITIAL_HEADER_BYTES",
+    "MAX_HEADER_BYTES",
     "STREAMING",
     "Header",
     "Variable",
@@ -61,6 +62,11 @@ logger = logging.getLogger(__name__)
 #: live in the header); 64 KiB covers them in one GET and costs nothing on a
 #: local file.
 INITIAL_HEADER_BYTES = 64 * 1024
+
+#: Hard ceiling on the header. Real netCDF3 headers run from KB to the low MB
+#: (thousands of variables with long attributes); a field claiming to end past
+#: this is a corrupt length, refused BEFORE any ranged read reaches the data.
+MAX_HEADER_BYTES = 64 * 1024 * 1024
 
 #: ``numrecs`` sentinel: the record count is unknown (file written in
 #: streaming mode); it must be derived from the file size.
@@ -97,8 +103,9 @@ class _HeaderBytes:
 
     ``fetch(offset, size) -> bytes`` may return fewer bytes than asked at end
     of file. The window starts at ``initial`` bytes and doubles whenever a
-    field runs past it; a field that runs past the end of the object is a
-    truncated header.
+    field runs past it, never past :data:`MAX_HEADER_BYTES`; a field that runs
+    past the end of the object is a truncated header, one that runs past the
+    cap a corrupt one.
     """
 
     def __init__(self, fetch, initial: int = INITIAL_HEADER_BYTES):
@@ -109,9 +116,13 @@ class _HeaderBytes:
         self.pos = 0
 
     def _ensure(self, end: int) -> None:
+        if end > MAX_HEADER_BYTES:
+            raise ValueError(
+                f"corrupt netCDF3 header: field runs to byte {end}, past MAX_HEADER_BYTES"
+            )
         while len(self._buf) < end and not self._eof:
             have = len(self._buf)
-            want = max(end, 2 * have, self._initial) - have
+            want = min(max(end, 2 * have, self._initial), MAX_HEADER_BYTES) - have
             chunk = self._fetch(have, want)
             if chunk is None:  # h5coro's S3Driver.read swallows errors into None
                 raise OSError(f"ranged read failed at {have}+{want} (driver returned None)")

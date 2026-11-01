@@ -314,6 +314,37 @@ class TestHeaderBytesOnly:
         with pytest.raises(ValueError, match="truncated netCDF3 header"):
             describe(data[: layout["__header__"] - 3])
 
+    def test_corrupt_length_never_reads_past_the_cap(self):
+        # A bit-flipped name length must not become a multi-GB ranged GET:
+        # the object here is "huge" (zeros past the real bytes), so only the
+        # cap stops the read.
+        data, _ = fixture()
+        bad = bytearray(data)
+        bad[16:20] = struct.pack(">I", 0xFFFFFF00)  # first dim's name length
+        calls = []
+
+        def fetch(off, n):
+            calls.append((off, n))
+            return (bytes(bad) + b"\0" * (off + n))[off : off + n]
+
+        with pytest.raises(ValueError, match="corrupt netCDF3 header: field runs to byte"):
+            netcdf3._parse(netcdf3._HeaderBytes(fetch))
+        assert calls and max(off + n for off, n in calls) <= netcdf3.MAX_HEADER_BYTES
+
+    def test_growth_is_clamped_to_the_cap(self):
+        calls = []
+
+        def fetch(off, n):
+            calls.append((off, n))
+            return b"\0" * n
+
+        # Doubling from just past half the cap would overshoot it; it is clamped.
+        half = netcdf3.MAX_HEADER_BYTES // 2
+        hb = netcdf3._HeaderBytes(fetch)
+        hb._ensure(half + 8)
+        hb._ensure(half + 16)
+        assert calls == [(0, half + 8), (half + 8, half - 8)]
+
     def test_failed_read_is_an_oserror(self):
         with pytest.raises(
             OSError, match=r"ranged read failed at 0\+65536 \(driver returned None\)"
