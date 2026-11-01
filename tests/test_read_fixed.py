@@ -636,13 +636,14 @@ class TestFixedReadGroup:
         class _Spy(_FakeH5):
             def readDatasets(self, datasets):  # noqa: N802
                 for d in datasets:
-                    if isinstance(d, dict):
-                        reads.append((d["dataset"], d["hyperslice"]))
+                    reads.append(
+                        (d, None) if isinstance(d, str) else (d["dataset"], d["hyperslice"])
+                    )
                 return super().readDatasets(datasets)
 
         _read_group(_Spy(_fx_arrays()), "G", _fx_planned_ds(), 1, _LatGrid())
-        # The 2-D waveform is sliced by RECORD rows (2..5), never read whole.
-        assert ("/G/wf", [(2, 5)]) in reads
+        # The 2-D waveform is sliced by RECORD rows (2..5) once, never read whole.
+        assert [r for r in reads if r[0] == "/G/wf"] == [("/G/wf", [(2, 5)])]
 
     def test_planned_matches_full(self):
         for shard in (0, 1):
