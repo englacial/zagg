@@ -47,7 +47,7 @@ d["format"], d["numrecs"], d["dims"]
 d["variables"]["elev"]
 # {'dtype': '>f4', 'nc_type': 'float', 'dims': ['x'], 'shape': [3921],
 #  'attrs': {'units': 'Meters', 'long_name': 'Elevation'}, 'record': False,
-#  'begin': 35316, 'vsize': 15684}
+#  'begin': 35388, 'vsize': 15684}
 ```
 
 Attribute values come back as plain Python (`char` → `str` with trailing
