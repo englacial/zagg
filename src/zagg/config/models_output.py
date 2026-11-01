@@ -99,7 +99,9 @@ class HealpixGrid(_Block):
     chunk_inner: NonNegInt | None = Field(
         default=None,
         description="Inner zarr chunk order between ``parent_order`` and ``child_order`` "
-        "(K = 4^(chunk_inner - parent_order) chunks per shard); absent is one chunk per shard.",
+        "(K = 4^(chunk_inner - parent_order) chunks per shard); absent derives "
+        "``child_order - 6`` (64×64-cell inner chunks, issue #259) when sharded and that lies "
+        "above ``parent_order``, else one chunk per shard (always so for raster).",
     )
     sharded: Bool | None = Field(
         default=None,
@@ -883,7 +885,7 @@ class Output(_Block):
         default=None,
         description="End-of-run sweep (hive only): ``true``/``families`` (the families pass), "
         "``stages`` (plus the staged ladder), ``false``/``none``. Absent resolves to ``stages`` "
-        "on a hive store declaring a ladder, else ``families``.",
+        "on a hive store declaring a ladder, else ``families``; ``none`` on a flat store.",
     )
     leaf_versions: Annotated[bool, BeforeValidator(_bool_knob("leaf_versions"))] | None = Field(
         default=None,
