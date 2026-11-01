@@ -3241,6 +3241,18 @@ class TestWorkerBlock:
         with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
             validate_config(atl06_config)
 
+    def test_whole_float_memory_rejected(self, atl06_config):
+        # 2048.0 would build the suffix -2048.0 (a per-shard ResourceNotFound).
+        atl06_config.worker = {"memory": 2048.0}
+        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+            validate_config(atl06_config)
+
+    def test_schema_closes_the_memory_set(self):
+        from zagg.config.models_run import Worker
+
+        prop = Worker.model_json_schema()["properties"]["memory"]
+        assert prop["type"] == "integer" and prop["enum"] == [2048, 4096, 8192]
+
     def test_non_mapping_block_rejected(self, atl06_config):
         atl06_config.worker = 4096
         with pytest.raises(ValueError, match="worker must be a mapping"):

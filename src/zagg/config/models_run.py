@@ -7,14 +7,16 @@ a temporal config ``temporal``/``event``.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, WithJsonSchema, field_validator, model_validator
 
 from zagg.config.core import WORKER_MEMORIES
 from zagg.config.models_base import StrictModel, _Block
 
 __all__ = ["Bounds", "SpatialPipeline", "TemporalBounds", "TemporalPipeline", "Worker"]
+
+_MEMORIES = sorted(WORKER_MEMORIES)
 
 
 class SpatialPipeline(StrictModel):
@@ -39,8 +41,9 @@ class Worker(_Block):
     Absent is the unsuffixed default function; ignored by the local backend.
     """
 
-    memory: int = Field(
-        description="Memory in MB, one of 2048, 4096, 8192 — the pre-provisioned variant sizes."
+    memory: Annotated[int, WithJsonSchema({"type": "integer", "enum": _MEMORIES})] = Field(
+        description=f"Memory in MB, one of {', '.join(map(str, _MEMORIES))} — the "
+        "pre-provisioned variant sizes."
     )
     extra_disk: bool | None = Field(
         default=None,
@@ -61,9 +64,11 @@ class Worker(_Block):
     @field_validator("memory", mode="before")
     @classmethod
     def _memory(cls, v: Any) -> Any:
-        if isinstance(v, bool) or v not in WORKER_MEMORIES:
+        # ``type(v) is int``: a bool or a whole float (``2048.0``) would reach
+        # the function-name suffix unchanged (``process-shard-2048.0``).
+        if type(v) is not int or v not in WORKER_MEMORIES:
             raise ValueError(
-                f"worker.memory must be one of {sorted(WORKER_MEMORIES)} MB — the "
+                f"worker.memory must be one of {_MEMORIES} MB — the "
                 f"pre-provisioned variant sizes (issue #235) — (got {v!r})"
             )
         return v
