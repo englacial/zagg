@@ -113,12 +113,16 @@ data_source:
     on_miss: error
 ```
 
-The worker opens every granule with h5coro first; when h5coro rejects the
-signature and the first four bytes are a netCDF3 magic, it opens a
-manifest-only ranged handle instead (`zagg.processing.granule.open_granule`)
--- the subset of `H5Coro` the sidecar backend uses (`resource`, `ioRequest`,
-`close`). No config key decides this; the file's own magic does, so one
-shard map may mix HDF5 and netCDF3 granules. Any metadata-driven read on
+The worker decides each granule's handle from its first four bytes
+(`zagg.processing.granule.open_granule`): a netCDF3 magic opens a
+manifest-only ranged handle -- the subset of `H5Coro` the sidecar backend
+uses (`resource`, `ioRequest`, `close`) -- and anything else opens with
+h5coro. The name is only a cost hint: a `.nc` / `.nc4` granule is peeked
+first (one 4-byte GET, then h5coro if the magic is HDF5), while any other
+name tries h5coro first and is peeked only when h5coro rejects the
+signature, which costs that rejected attempt's 4 MiB cache-line read. No
+config key decides this, so one shard map may mix HDF5 and netCDF3
+granules. Any metadata-driven read on
 that handle (the default `inline` backend, `on_miss: fallback`, `on_miss:
 build`) fails loudly per group with a message naming the sidecar route, and
 the shard counts it in `read_errors` rather than decoding garbage. That is
@@ -127,8 +131,7 @@ why the template pins `on_miss: error`.
 The end-to-end proof is `tests/test_netcdf3_e2e.py`: a classic and a 64-bit
 offset file with non-record coordinates and record variables aggregate
 through `process_shard` to the same bytes, and the only reads after the
-rejected superblock attempt and the magic peek are the manifest's byte
-ranges.
+4-byte magic peek are the manifest's byte ranges.
 
 ## Verified collections
 

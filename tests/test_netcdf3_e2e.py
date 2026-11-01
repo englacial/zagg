@@ -1,8 +1,8 @@
 """netCDF3 end to end (issue #682, phase 4): a classic file aggregates through
 ``reader: h5coro`` + ``index: {backend: sidecar, on_miss: error}`` with no
 HDF5 metadata access -- the worker opens it as a manifest-only ranged handle
-(``zagg.processing.granule.open_granule``) and the sidecar backend fetches
-exactly the manifest's byte ranges.
+(``zagg.processing.granule.open_granule``) after one 4-byte magic peek, and the
+sidecar backend fetches exactly the manifest's byte ranges.
 
 The fixture is a point-cloud file written from the spec by
 ``test_netcdf3._nc3_bytes``: ``lat`` / ``lon`` are NON-record variables over
@@ -25,6 +25,8 @@ from zagg.processing import process_shard
 from zagg.processing.granule import RangedGranule, open_granule
 
 FIXTURE_H5 = Path(__file__).parent / "data" / "index" / "atl03_mini.h5"
+#: h5coro's default cache line: the superblock read of an H5Coro open.
+_CACHE_LINE = 4 * 1024 * 1024
 
 _LAT = np.array([0.0, 0.1, 1.0, 0.9, 2.0, 2.1])
 _LON = np.array([10.0, 11.0, 12.0, 13.0, 14.0, 15.0])
@@ -132,22 +134,23 @@ class TestEndToEnd:
 
         # The granule was opened as the manifest-only handle, not H5Coro.
         assert len(handles) == 1
-        # Reads: h5coro's rejected superblock attempt (one cache line at 0),
-        # the magic peek (0, 4), then ONLY manifest byte ranges -- nothing in
-        # the header region after the peek, no HDF5 metadata walk.
+        # Reads: the .nc name's magic peek (0, 4) -- no h5coro superblock
+        # attempt, no cache-line read -- then ONLY manifest byte ranges:
+        # nothing in the header region after the peek, no HDF5 metadata walk.
         reads = _RecordingDriver.reads
-        assert reads[0][0] == 0 and reads[1] == (0, 4)
+        assert reads[0] == (0, 4)
+        assert all(size < _CACHE_LINE for _, size in reads)
         manifest = build_manifest(data)
         lo = int(manifest["byte_offset"].min())
         hi = int((manifest["byte_offset"] + manifest["nbytes"]).max())
-        for pos, size in reads[2:]:
+        for pos, size in reads[1:]:
             assert lo <= pos and pos + size <= hi, (pos, size)
         # Both addressing forms were exercised: the non-record coordinates
         # (one contiguous read each) and the record variable h (per-record
         # slabs, coalesced by the backend into spans inside the record block).
         rec_begin = int(manifest[manifest["dataset"] == "/h"]["byte_offset"].min())
-        assert any(pos < rec_begin for pos, _ in reads[2:])
-        assert any(pos >= rec_begin for pos, _ in reads[2:])
+        assert any(pos < rec_begin for pos, _ in reads[1:])
+        assert any(pos >= rec_begin for pos, _ in reads[1:])
 
     def test_classic_and_64bit_offset_agree(self, tmp_path):
         outs = []
@@ -230,6 +233,46 @@ class TestOpenGranule:
             h5obj.close()
         with pytest.raises(ValueError, match="closed"):
             h5obj.ioRequest(0, 4)
+
+    def test_nc_name_peeks_once_and_skips_h5coro(self, granule):
+        path, _, _ = granule
+        _RecordingDriver.reads = []
+        h5obj = open_granule(str(path), _RecordingDriver, {})
+        try:
+            assert isinstance(h5obj, RangedGranule)
+            assert _RecordingDriver.reads == [(0, 4)]
+        finally:
+            h5obj.close()
+
+    def test_hdf5_under_an_nc_name_still_opens_as_h5coro(self, tmp_path):
+        # netCDF4 (and CMR-mislabelled HDF5, e.g. TES) carries .nc: the peek
+        # costs one 4-byte read, then h5coro opens it as usual.
+        import h5coro
+
+        nc4 = tmp_path / "netcdf4.NC"
+        nc4.write_bytes(FIXTURE_H5.read_bytes())
+        _RecordingDriver.reads = []
+        h5obj = open_granule(str(nc4), _RecordingDriver, {})
+        try:
+            assert isinstance(h5obj, h5coro.H5Coro)
+            assert _RecordingDriver.reads[:2] == [(0, 4), (0, _CACHE_LINE)]
+        finally:
+            h5obj.close()
+
+    def test_netcdf3_under_another_name_pays_the_rejected_h5coro_read(self, granule, tmp_path):
+        # The magic, not the name, decides: a netCDF3 file named .bin is still
+        # recognized, after h5coro's rejected superblock read of one full
+        # cache line. Pinned so a change in h5coro's cache line is visible.
+        _, _, data = granule
+        other = tmp_path / "PC_v2_0001.bin"
+        other.write_bytes(data)
+        _RecordingDriver.reads = []
+        h5obj = open_granule(str(other), _RecordingDriver, {})
+        try:
+            assert isinstance(h5obj, RangedGranule)
+            assert _RecordingDriver.reads == [(0, _CACHE_LINE), (0, 4)]
+        finally:
+            h5obj.close()
 
     def test_other_files_reraise_h5coro_error(self, tmp_path):
         junk = tmp_path / "junk.bin"
