@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from zagg.config.schema import HINT_KEY, json_schema
+from zagg.config.schema import json_schema
 
 OUT = Path(__file__).resolve().parents[1] / "docs" / "template_grammar.md"
 
@@ -77,10 +77,6 @@ def _render_model(name: str, model: dict[str, Any], defs: dict[str, Any]) -> lis
     lines += ["| key | type | description |", "|---|---|---|"]
     for key, prop in props.items():
         desc = (prop.get("description") or "").replace("\n", " ").replace("|", "\\|")
-        hints = prop.get(HINT_KEY)
-        if hints:
-            desc = desc.rsplit(" Registered ", 1)[0]
-            desc += " Registered: " + ", ".join(f"`{h['name']}`" for h in hints) + "."
         req = " *(required)*" if key in required else ""
         lines.append(f"| `{key}`{req} | {_type_of(prop, defs)} | {desc} |")
     return lines + [""]

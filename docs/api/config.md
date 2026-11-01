@@ -19,7 +19,7 @@ The config module loads YAML pipeline configurations that define what data to re
 ## Schema export
 
 The template grammar is a pydantic model tree (issue #677); see the generated [Template grammar](../template_grammar.md) page, or export it with
-`python -m zagg.config --schema [--block data_source|aggregation|output]`.
+`python -m zagg.config --schema [--block data_source|aggregation|output|pipeline|worker|bounds]`.
 
 ::: zagg.config.json_schema
 
