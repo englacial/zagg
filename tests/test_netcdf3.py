@@ -8,6 +8,7 @@ lays out ``header | non-record arrays | record block`` exactly as the spec's
 exercised by shrinking the first ranged read below the header size.
 """
 
+import os
 import struct
 
 import numpy as np
@@ -973,3 +974,30 @@ class TestIndexGranules:
         assert "junk.nc failed: not a netCDF3 file" in caplog.text
         serial = index_granules(good, str(tmp_path / "serial"), workers=1)
         assert list(serial.values()) == ["G0.parquet", "G1.parquet", "G2.parquet"]
+
+    def test_repeated_sources_are_indexed_once_in_first_seen_order(self, tmp_path):
+        # A shard map lists a boundary-straddling granule under every shard
+        # it touches; the build indexes it once and the result has one entry
+        # per distinct href.
+        from pathlib import Path
+
+        from zagg.catalog import netcdf3 as mod
+
+        paths = []
+        for i in range(3):
+            p = tmp_path / f"G{i}.nc"
+            p.write_bytes(fixture()[0])
+            paths.append(str(p))
+        calls = []
+        orig = mod.index_granule
+
+        def spy(src, *a, **k):
+            calls.append(os.fspath(src))
+            return orig(src, *a, **k)
+
+        repeated = [paths[2], paths[0], Path(paths[2]), paths[1], paths[0]]
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(mod, "index_granule", spy)
+            out = mod.index_granules(repeated, str(tmp_path / "store"), workers=4)
+        assert list(out) == [paths[2], paths[0], paths[1]]
+        assert sorted(calls) == sorted(paths)

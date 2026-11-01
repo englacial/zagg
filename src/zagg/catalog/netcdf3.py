@@ -585,14 +585,16 @@ def index_granules(
 
     ``sources`` are paths or URLs (e.g. a shard map's granule hrefs); each
     costs one header read and one small parquet put, so they are pooled
-    ``workers`` wide. A granule that fails to index is logged and recorded as
-    ``None`` -- the sidecar backend reports it at read time (``on_miss``), and
-    one bad granule must not abort a catalog-wide build. Returns
-    ``{source: object key | None}`` in input order.
+    ``workers`` wide. A repeated source (a granule listed under several
+    shards) is indexed once. A granule that fails to index is logged and
+    recorded as ``None`` -- the sidecar backend reports it at read time
+    (``on_miss``), and one bad granule must not abort a catalog-wide build.
+    Returns ``{source: object key | None}`` over the distinct sources, in
+    first-seen order.
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    srcs = list(sources)
+    srcs = list({os.fspath(s): s for s in sources}.values())  # first-seen order
 
     def one(src):
         try:

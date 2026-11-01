@@ -63,18 +63,26 @@ message; it is out of scope.
 `h5coro_hidefix.manifest.MANIFEST_COLUMNS` consumes); `index_granule`
 persists it through the `inline` backend's own `write_manifest`, so the store
 layout is identical to a write-back run's; `index_granules` pools that over a
-list of hrefs (a shard map's granules) and tolerates a bad granule:
+list of hrefs (a shard map's granules), indexes each distinct href once and
+tolerates a bad granule. `ShardMap.granules` is one list per shard of
+`{"id", "s3", "https"}` entries, and a granule that straddles a shard
+boundary appears under each shard, so collect the distinct `s3` hrefs:
 
 ```python
 from zagg.auth import get_nsidc_s3_credentials
 from zagg.catalog.netcdf3 import index_granules
 
+hrefs = list(dict.fromkeys(g["s3"] for shard in shardmap.granules for g in shard))
 keys = index_granules(
-    [entry["url"] for entry in shardmap.granules()],   # s3://... hrefs
+    hrefs,                                          # s3://... hrefs, deduplicated
     "s3://your-bucket/zagg-index/RDWES1B/1/",
     credentials=get_nsidc_s3_credentials(),
 )
 ```
+
+The `s3://` route (NSIDC direct S3 access) works only from inside AWS
+us-west-2; run the build there -- zagg's no-egress policy rules out pulling
+granules out of region.
 
 Manifest rows, per variable:
 
