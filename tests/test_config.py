@@ -1743,7 +1743,7 @@ class TestBoundsValidation:
             "temporal": {"start_date": "2024-01-01", "end_date": "2024-06-01"},
             "foo": "bar",
         }
-        with pytest.raises(ValueError, match="Unknown bounds keys"):
+        with pytest.raises(ValueError, match=r"bounds\.foo: Extra inputs are not permitted"):
             validate_config(atl06_config)
 
     def test_temporal_missing_dates(self, atl06_config):
@@ -3272,7 +3272,7 @@ class TestWorkerBlock:
     def test_unknown_key_rejected(self, atl06_config):
         # The plan's earlier extra_tmp spelling must not be silently ignored.
         atl06_config.worker = {"memory": 4096, "extra_tmp": True}
-        with pytest.raises(ValueError, match=r"Unknown worker keys: \['extra_tmp'\]"):
+        with pytest.raises(ValueError, match=r"worker\.extra_tmp: Extra inputs are not permitted"):
             validate_config(atl06_config)
 
     def test_non_bool_extra_disk_rejected(self, atl06_config):

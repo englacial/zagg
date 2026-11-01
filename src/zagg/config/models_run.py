@@ -51,17 +51,6 @@ class Worker(_Block):
         "(issue #536; default false).",
     )
 
-    @model_validator(mode="before")
-    @classmethod
-    def _shape(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            unknown = set(data) - {"memory", "extra_disk"}
-            if unknown:
-                raise ValueError(
-                    f"Unknown worker keys: {sorted(unknown)} (allowed: 'memory', 'extra_disk')"
-                )
-        return data
-
     @field_validator("memory", mode="before")
     @classmethod
     def _memory(cls, v: Any) -> Any:
@@ -99,14 +88,3 @@ class Bounds(_Block):
 
     temporal: TemporalBounds | None = Field(default=None, description="The granule time window.")
     spatial: Any = Field(default=None, description="Reserved: a spatial bound (unused today).")
-
-    @model_validator(mode="before")
-    @classmethod
-    def _keys(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            unknown = set(data) - {"temporal", "spatial"}
-            if unknown:
-                raise ValueError(
-                    f"Unknown bounds keys: {unknown} (allowed: {{'temporal', 'spatial'}})"
-                )
-        return data
