@@ -36,16 +36,21 @@ BLOCKS: dict[str, Any] = {
     "bounds": Bounds,
 }
 
-#: Grammar field name → registry kind whose entries are the hint list
-#: (:data:`zagg.registry._REGISTRIES` keys).
-CAPABILITY_FIELDS: dict[str, str] = {
-    "credentials_provider": "credential_provider",
-    "spatial_func": "spatial_func",
-    "temporal_reducer": "reducer",
-    "mask": "mask_provider",
-    "transform": "field_transform",
-    "trigger": "event_trigger",
-    "reader": "reader",
+#: ``(model, field)`` → registry kind whose entries are the hint list
+#: (:data:`zagg.registry._REGISTRIES` keys). Keyed by the schema's ``$defs``
+#: name, not the field name alone: ``reader`` resolves through the registry on
+#: the collection source only (h5 reads ``h5coro``, raster reads ``raster``).
+CAPABILITY_FIELDS: dict[tuple[str, str], str] = {
+    **{
+        (model, "credentials_provider"): "credential_provider"
+        for model in ("H5DataSource", "RasterDataSource", "CollectionDataSource")
+    },
+    ("CollectionDataSource", "reader"): "reader",
+    ("TemporalFieldSpec", "spatial_func"): "spatial_func",
+    ("TemporalFieldSpec", "temporal_reducer"): "reducer",
+    ("TemporalFieldSpec", "mask"): "mask_provider",
+    ("TemporalFieldSpec", "transform"): "field_transform",
+    ("TemporalFieldSpec", "trigger"): "event_trigger",
 }
 
 #: The vendor-prefixed key the hints ride under (JSON Schema ignores unknown
@@ -74,29 +79,28 @@ def _registry_hints() -> dict[str, list[dict[str, Any]]]:
     return describe_all()
 
 
-def _annotate(node: Any, hints: dict[str, list[dict[str, Any]]]) -> None:
-    """Walk a schema and attach the registered names to every capability field."""
-    if isinstance(node, dict):
-        props = node.get("properties")
-        if isinstance(props, dict):
-            for name, prop in props.items():
-                kind = CAPABILITY_FIELDS.get(name)
-                if kind is None or not isinstance(prop, dict) or kind not in hints:
-                    continue
-                entries = hints[kind]
-                prop[HINT_KEY] = [
-                    {"name": e["name"], "description": e.get("description", "")} for e in entries
-                ]
-                names = ", ".join(e["name"] for e in entries)
-                if names:
-                    prop["description"] = (
-                        f"{prop.get('description', '')} Registered {kind} names: {names}."
-                    ).strip()
-        for value in node.values():
-            _annotate(value, hints)
-    elif isinstance(node, list):
-        for value in node:
-            _annotate(value, hints)
+def _annotate(schema: dict[str, Any], hints: dict[str, list[dict[str, Any]]]) -> None:
+    """Attach the registered names to every capability field, model by model.
+
+    Models are found by name: the ``$defs`` entries, plus the root when the
+    export is a single model (pydantic titles it with the class name).
+    """
+    models = dict(schema.get("$defs", {}))
+    if "title" in schema:
+        models.setdefault(schema["title"], schema)
+    for (model, field), kind in CAPABILITY_FIELDS.items():
+        prop = models.get(model, {}).get("properties", {}).get(field)
+        if not isinstance(prop, dict) or kind not in hints:
+            continue
+        entries = hints[kind]
+        prop[HINT_KEY] = [
+            {"name": e["name"], "description": e.get("description", "")} for e in entries
+        ]
+        names = ", ".join(e["name"] for e in entries)
+        if names:
+            prop["description"] = (
+                f"{prop.get('description', '')} Registered {kind} names: {names}."
+            ).strip()
 
 
 def json_schema(block: str | None = None, *, registry_hints: bool = True) -> dict[str, Any]:

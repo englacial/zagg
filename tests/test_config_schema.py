@@ -81,6 +81,14 @@ def test_trigger_mask_carries_no_registry_hint():
     assert HINT_KEY not in prop and "Registered" not in prop["description"]
 
 
+def test_reader_hint_rides_the_collection_source_only():
+    defs = json_schema("data_source")["$defs"]
+    assert HINT_KEY in defs["CollectionDataSource"]["properties"]["reader"]
+    for model in ("H5DataSource", "RasterDataSource"):
+        assert HINT_KEY not in defs[model]["properties"]["reader"]
+        assert HINT_KEY in defs[model]["properties"]["credentials_provider"]
+
+
 def test_schema_json_is_stable():
     assert schema_json() == schema_json()
     assert json.loads(schema_json("output", registry_hints=False)) == json_schema(
