@@ -118,6 +118,8 @@ def json_schema(block: str | None = None, *, registry_hints: bool = True) -> dic
         hint-free schema (e.g. a fixture that must not depend on installed
         plugins).
 
+    Notes
+    -----
     The schema is looser than the models in two known ways, and the models
     (``validate_config``) are the authority: JSON Schema counts a whole float
     as an ``integer`` (``9.0`` passes ``"type": "integer"``), where the models
