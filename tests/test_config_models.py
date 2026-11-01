@@ -595,3 +595,9 @@ class TestOutputGrammar:
         assert enum(Windowing, "units") == enum(TimeSource, "units") == list(UNIT_SECONDS)
         assert enum(TimeSource, "scale") == list(TOC_SOURCE_SCALES)
         assert enum(Pyramid, "fold_source") == list(FOLD_SOURCES)
+
+    def test_raster_summarize_is_cross_checked(self):
+        cfg = default_config("sentinel2_l2a")
+        cfg.output["pyramid"] = {"summarize": {"B04": {"as": "b4_mean"}}}
+        with pytest.raises(ValueError, match="summarize names unknown field 'B04'"):
+            validate_config(cfg)

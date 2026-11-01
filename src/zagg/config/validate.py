@@ -52,11 +52,6 @@ def validate_config(config: PipelineConfig) -> None:
     # validated before the kind branch, like the grammar pass above.
     _validate_worker(config)
 
-    # The time coordinate's encoding (spec §8, issue #443) is checked on every
-    # pipeline kind, like the two blocks above: the value is only meaningful
-    # where a time coordinate exists, so declaring it elsewhere is a typo
-    # worth catching at submission rather than a knob that silently does
-    # nothing.
     # The per-observation clock the §8.2/§8.3 companions encode from (issue
     # #410) — checked here for the same reason as the block above: the value is
     # only meaningful where a companion is declared, so declaring it on a
@@ -73,8 +68,10 @@ def validate_config(config: PipelineConfig) -> None:
     # one value per cell per timestep, so there is nothing to reduce.
     if (config.data_source or {}).get("reader") == "raster":
         # The raster kind's shape and couplings are the models' (``RasterConfig``);
-        # the shared store-layout family is ``Output``'s. Only the windowing
-        # time_field/epoch rules (data_source-dependent) and the NaN warning run.
+        # the shared store-layout family is ``Output``'s. Only the cross-block
+        # rules run: ``pyramid.summarize`` against the (empty) aggregation
+        # fields, and the windowing time_field/epoch rules (data_source-dependent).
+        _validate_pyramid(config)
         _validate_windowing(config)
         return
 
