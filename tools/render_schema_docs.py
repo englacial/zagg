@@ -33,6 +33,11 @@ point-cloud grammar. Every block refuses unknown keys. Capability-named
 fields (`credentials_provider`, `spatial_func`, `temporal_reducer`, `mask`, …)
 take registry names — hints in the exported schema, never a closed set.
 
+The models (`validate_config`) are the authority where JSON Schema is looser:
+it counts a whole float as an `integer` (`9.0` passes), which the models
+refuse, so write integer knobs without a decimal point; and
+`data_source.index` is an open mapping its backend validates.
+
 """
 
 

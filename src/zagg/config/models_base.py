@@ -131,6 +131,13 @@ NonNegInt = Annotated[
 Bool = Annotated[bool, BeforeValidator(_check_bool), WithJsonSchema({"type": "boolean"})]
 #: A string with at least one character.
 NonEmptyStr = Annotated[str, Field(min_length=1)]
+#: A fill sentinel as the writer reads it (``np.array(fill, dtype)``): a number,
+#: or a zarr fill token string (``"NaN"``, ``"Infinity"``). ``Any`` in the model,
+#: whose cross-field checks decide; the schema states the shapes that can work.
+FillValue = Annotated[
+    Any,
+    WithJsonSchema({"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "null"}]}),
+]
 
 #: The :class:`pydantic.Tag` names the grammar's tagged unions use. A tag is
 #: a member label, not a key the author wrote, so the error renderer drops a

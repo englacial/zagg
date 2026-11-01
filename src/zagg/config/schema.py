@@ -117,6 +117,12 @@ def json_schema(block: str | None = None, *, registry_hints: bool = True) -> dic
         (:data:`HINT_KEY`, plus a sentence in the description). Off for a
         hint-free schema (e.g. a fixture that must not depend on installed
         plugins).
+
+    The schema is looser than the models in two known ways, and the models
+    (``validate_config``) are the authority: JSON Schema counts a whole float
+    as an ``integer`` (``9.0`` passes ``"type": "integer"``), where the models
+    refuse it, so write integer knobs without a decimal point; and
+    ``data_source.index`` is an open mapping its backend validates.
     """
     if block is None:
         target = ConfigModel

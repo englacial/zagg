@@ -14,6 +14,11 @@ point-cloud grammar. Every block refuses unknown keys. Capability-named
 fields (`credentials_provider`, `spatial_func`, `temporal_reducer`, `mask`, …)
 take registry names — hints in the exported schema, never a closed set.
 
+The models (`validate_config`) are the authority where JSON Schema is looser:
+it counts a whole float as an `integer` (`9.0` passes), which the models
+refuse, so write integer knobs without a decimal point; and
+`data_source.index` is an open mapping its backend validates.
+
 
 ## Config kinds
 
@@ -131,7 +136,7 @@ A declared store coordinate (``aggregation.coordinates.<name>``), e.g. ``morton`
 | key | type | description |
 |---|---|---|
 | `dtype` | `string` | Stored numpy dtype (default ``float32``), e.g. ``uint64`` for ``morton``. |
-| `fill_value` | any | Fill for unobserved cells (default ``"NaN"``; integer dtypes need an explicit integer fill, e.g. ``0`` for ``morton``). |
+| `fill_value` | `number` \| `string` \| `null` | Fill for unobserved cells (default ``"NaN"``; integer dtypes need an explicit integer fill, e.g. ``0`` for ``morton``). |
 
 ### ExpressionFilter
 
@@ -163,7 +168,7 @@ declaration and an ``overview_delta`` fold budget (issue #424).
 | `source` | `string` | The read column (a ``data_source.variables`` name or a broadcast segment-level variable) the reducer takes as its positional argument. |
 | `params` | mapping | Keyword arguments forwarded to the reducer. A string value naming a column (or an expression over columns) is evaluated per cell first; numbers pass through. ``locations``/``temporal`` are reserved for the injected channels. |
 | `dtype` | `string` | Stored numpy dtype of the result (``float32``, ``uint64``…). |
-| `fill_value` | any | Fill for unobserved cells: a number, or the string ``"NaN"`` (YAML ``.nan`` is canonicalized to it at load). Dense default ``"NaN"``. |
+| `fill_value` | `number` \| `string` \| `null` | Fill for unobserved cells: a number, or the string ``"NaN"`` (YAML ``.nan`` is canonicalized to it at load). Dense default ``"NaN"``. |
 | `kind` | `'scalar'` \| `'vector'` \| `'ragged'` | Output carrier: ``scalar`` (default), ``vector``, ``ragged``. |
 | `trailing_shape` | `integer` \| list of `integer` | Per-cell trailing shape of a ``vector`` field (an int or a list of ints). |
 | `inner_shape` | `integer` \| list of `integer` | Per-element shape of a ``ragged`` field's payload rows, e.g. ``[2]`` for ``(mean, weight)`` centroid pairs. |
@@ -195,7 +200,7 @@ per-sample coordinates expand from.
 | `filters` | list of [`StructuredFilter`](#structuredfilter) \| [`ExpressionFilter`](#expressionfilter) \| `null` | Ordered row predicates: structured ``{dataset, op, value\|values, ...}`` entries (pushdown-eligible) or ``{expression}`` escape hatches. When present the flat ``quality_filter`` is ignored. |
 | `levels` | mapping of name → [`Level`](#level) \| `null` | The hierarchical rates of the source, keyed by level name (issue #43 phase B). |
 | `base_level` | `string` \| `null` | The ``levels`` key of the finest rate; required with ``levels``. |
-| `index` | mapping \| `null` | Virtual chunk-index backend block (issue #160): ``backend`` names a registered backend (``hierarchical``, ``inline``, or an entry-point backend such as ``sidecar``); the remaining keys are backend-specific. Absent resolves to ``inline`` (the compiled decode, issue #170), except under ``read_plan.chunk_boundaries``, where it is ``hierarchical``; ``{backend: hierarchical}`` pins the pure-h5coro walk. |
+| `index` | mapping \| `null` | Virtual chunk-index backend block (issue #160): ``backend`` names a registered backend (``hierarchical``, ``inline``, or an entry-point backend such as ``sidecar``); the remaining keys are backend-specific. Absent resolves to ``inline`` (the compiled decode, issue #170), except under ``read_plan.chunk_boundaries``, where it is ``hierarchical``; ``{backend: hierarchical}`` pins the pure-h5coro walk. An open mapping here: the backend validates its own keys, so this is the one block the schema does not close. |
 | `read_plan` | [`ReadPlan`](#readplan) \| `null` | Planned-read knobs: the spatial index level and its padding. |
 | `credentials_provider` | `string` \| `null` | Credential-provider registry name for source S3 reads (``nsidc``, ``gesdisc``, ``lpdaac``, or a plugin); absent is the spatial default (NSIDC). |
 | `shard_workers` | `integer` \| `null` | Source units (granules) in flight per shard (issue #232); default 4. |
@@ -346,7 +351,7 @@ list to set ``op``, ``column``, ``keep`` and the rest.
 | key | type | description |
 |---|---|---|
 | `dataset` *(required)* | `string` | Dataset path template the equality is read from. |
-| `value` *(required)* | any | The value rows must equal to be kept. |
+| `value` *(required)* | `number` | The value rows must equal to be kept (the ``eq`` operand against a numeric dataset). |
 
 ### RasterConfig
 
@@ -587,7 +592,7 @@ column is only good to the leap seconds since its epoch.
 
 | key | type | description |
 |---|---|---|
-| `label` *(required)* | any | Window label in the explicit grammar. |
+| `label` *(required)* | `string` | Window label in the explicit grammar. |
 | `timestamp` *(required)* | `string` | ISO-8601 UTC instant the window starts at. |
 
 ### WindowRange
@@ -596,7 +601,7 @@ column is only good to the leap seconds since its epoch.
 
 | key | type | description |
 |---|---|---|
-| `label` *(required)* | any | Window label in the explicit grammar (``[A-Za-z0-9-]+``). |
+| `label` *(required)* | `string` | Window label in the explicit grammar (``[A-Za-z0-9-]{1,32}``). |
 | `start` *(required)* | `string` | ISO-8601 UTC start (inclusive). |
 | `end` *(required)* | `string` | ISO-8601 UTC end (exclusive). |
 

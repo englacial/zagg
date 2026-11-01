@@ -249,10 +249,18 @@ Grid = Annotated[
 # ---------------------------------------------------------------------------
 
 
+#: An explicit window label: ``Any`` in the model (``validate_label`` refuses
+#: with the grammar named); the schema carries that grammar
+#: (:data:`zagg.windows._LABEL_RE`).
+WindowLabel = Annotated[Any, WithJsonSchema({"type": "string", "pattern": "^[0-9A-Za-z-]{1,32}$"})]
+
+
 class WindowRange(StrictModel):
     """``{label, start, end}``: a half-open ``[start, end)`` window."""
 
-    label: Any = Field(description="Window label in the explicit grammar (``[A-Za-z0-9-]+``).")
+    label: WindowLabel = Field(
+        description="Window label in the explicit grammar (``[A-Za-z0-9-]{1,32}``)."
+    )
     start: Instant = Field(description="ISO-8601 UTC start (inclusive).")
     end: Instant = Field(description="ISO-8601 UTC end (exclusive).")
 
@@ -276,7 +284,7 @@ class WindowRange(StrictModel):
 class WindowPoint(StrictModel):
     """``{label, timestamp}``: sugar for the one-second window ``[t, t + 1s)``."""
 
-    label: Any = Field(description="Window label in the explicit grammar.")
+    label: WindowLabel = Field(description="Window label in the explicit grammar.")
     timestamp: Instant = Field(description="ISO-8601 UTC instant the window starts at.")
 
     @model_validator(mode="before")

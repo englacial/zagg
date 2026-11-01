@@ -22,7 +22,7 @@ from typing import Annotated, Any, Literal, Union
 import numpy as np
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 
-from zagg.config.models_base import Bool, NonEmptyStr, PosInt, _Block
+from zagg.config.models_base import Bool, FillValue, NonEmptyStr, PosInt, _Block
 
 __all__ = [
     "Aggregation",
@@ -133,7 +133,7 @@ class FieldSpec(_Reducer):
     _NULLABLE = frozenset({"fill_value"})
     _NULL_CHECKED = frozenset({"trailing_shape", "inner_shape"})
 
-    fill_value: Any = Field(
+    fill_value: FillValue = Field(
         default=None,
         description='Fill for unobserved cells: a number, or the string ``"NaN"`` '
         '(YAML ``.nan`` is canonicalized to it at load). Dense default ``"NaN"``.',
@@ -379,7 +379,7 @@ class CoordinateSpec(_Block):
         default=None,
         description="Stored numpy dtype (default ``float32``), e.g. ``uint64`` for ``morton``.",
     )
-    fill_value: Any = Field(
+    fill_value: FillValue = Field(
         default=None,
         description='Fill for unobserved cells (default ``"NaN"``; integer dtypes need an '
         "explicit integer fill, e.g. ``0`` for ``morton``).",

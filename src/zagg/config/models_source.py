@@ -30,6 +30,7 @@ from pydantic import (
     Discriminator,
     Field,
     Tag,
+    WithJsonSchema,
     field_validator,
     model_validator,
 )
@@ -152,7 +153,10 @@ class QualityFilter(StrictModel):
     """
 
     dataset: str = Field(description="Dataset path template the equality is read from.")
-    value: Any = Field(description="The value rows must equal to be kept.")
+    value: Annotated[Any, WithJsonSchema({"type": "number"})] = Field(
+        description="The value rows must equal to be kept (the ``eq`` operand against a numeric "
+        "dataset)."
+    )
 
 
 class StructuredFilter(StrictModel):
@@ -513,7 +517,9 @@ class H5DataSource(StrictModel):
         "registered backend (``hierarchical``, ``inline``, or an entry-point backend such as "
         "``sidecar``); the remaining keys are backend-specific. Absent resolves to ``inline`` "
         "(the compiled decode, issue #170), except under ``read_plan.chunk_boundaries``, "
-        "where it is ``hierarchical``; ``{backend: hierarchical}`` pins the pure-h5coro walk.",
+        "where it is ``hierarchical``; ``{backend: hierarchical}`` pins the pure-h5coro walk. "
+        "An open mapping here: the backend validates its own keys, so this is the one block the "
+        "schema does not close.",
     )
     read_plan: ReadPlan | None = Field(
         default=None, description="Planned-read knobs: the spatial index level and its padding."

@@ -162,6 +162,22 @@ def _all_blocks():
     return out
 
 
+def test_typed_any_fields_export_what_the_model_accepts():
+    from zagg.windows import _LABEL_RE
+
+    defs = json_schema(registry_hints=False)["$defs"]
+    for model in ("WindowRange", "WindowPoint"):
+        label = defs[model]["properties"]["label"]
+        assert (label["type"], label["pattern"]) == ("string", _LABEL_RE.pattern)
+    assert defs["QualityFilter"]["properties"]["value"]["type"] == "number"
+    fill = {**defs["FieldSpec"]["properties"]["fill_value"], "$defs": defs}
+    check = jsonschema.Draft202012Validator(fill)
+    assert all(check.is_valid(v) for v in (0, -9999.5, "NaN", None))
+    assert not check.is_valid([0])
+    index = defs["H5DataSource"]["properties"]["index"]["description"]
+    assert "open mapping" in index
+
+
 def test_schema_json_is_stable():
     assert schema_json() == schema_json()
     assert json.loads(schema_json("output", registry_hints=False)) == json_schema(
