@@ -201,6 +201,36 @@ class TestSemanticDiff:
         assert bool(d["hash_affecting"]) == (semantic_hash(a) != semantic_hash(b))
         assert bool(d["changed_keys"]) == (semantic_hash(a) != semantic_hash(b))
 
+    def test_a_packaging_key_changed_beside_a_semantic_one_stays_neutral(self):
+        # Attribution is per path (counterfactual), not per resolved block.
+        a, b = self._pair("atl06")
+        b.output["grid"]["parent_order"] = 5
+        b.output["grid"]["sharded"] = False
+        d = diff(a, b)
+        assert d["hash_affecting"] == ["output.grid.sharded"]
+        assert d["hash_neutral"] == ["output.grid.parent_order"]
+        a, b = self._pair()
+        b.output["windowing"]["unit"] = "window"
+        b.output["windowing"]["schedule"] = "monthly"
+        d = diff(a, b)
+        assert d["hash_affecting"] == ["output.windowing.schedule"]
+        assert d["hash_neutral"] == ["output.windowing.unit"]
+
+    def test_a_grid_family_switch_marks_only_the_spatial_keys(self):
+        a, b = self._pair("atl06")
+        b.output["grid"] = dict(default_config("atl06_polar").output["grid"])
+        d = diff(a, b)
+        affecting = {p.split("[")[0] for p in d["hash_affecting"]}
+        assert affecting == {f"output.grid.{k}" for k in ("type", "crs", "resolution", "bounds")}
+        assert {"output.grid.parent_order", "output.grid.child_order"} <= set(d["hash_neutral"])
+
+    def test_diff_does_not_mutate_its_inputs(self):
+        a, b = self._pair()
+        b.output["windowing"]["schedule"] = "monthly"
+        before = (semantic_hash(a), semantic_hash(b), json.dumps(b.output, default=str))
+        diff(a, b)
+        assert before == (semantic_hash(a), semantic_hash(b), json.dumps(b.output, default=str))
+
     def test_run_record_config_diffs_against_its_template(self):
         # The vendored run record vs today's template: count's dtype and the
         # windowing block are the only hash-affecting differences (issue #626/#638).
