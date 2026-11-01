@@ -757,6 +757,28 @@ class TestFixedReadGroup:
         df = _read_group(_FakeH5(_fx_arrays()), "G", ds, 1, _LatGrid())
         np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF[3:].reshape(-1))
 
+    @pytest.mark.parametrize("ds_fn", [_fx_ds, _fx_planned_ds])
+    def test_third_level_filter_link(self, ds_fn):
+        # A cross-level filter on a link that is NOT the coordinates link:
+        # block 0 = rows 0..9 (flag 0), block 1 = rows 10..19 (flag 1).
+        arrays = _fx_arrays()
+        arrays["/G/blk_beg"] = np.array([0, 10], dtype=np.int64)
+        arrays["/G/blk_cnt"] = np.array([10, 10], dtype=np.int64)
+        arrays["/G/blk_flag"] = np.array([0, 1], dtype=np.uint8)
+        ds = ds_fn(
+            filters=[{"level": "blocks", "dataset": "/{group}/blk_flag", "op": "eq", "value": 1}]
+        )
+        ds["levels"]["blocks"] = {
+            "path": "/{group}",
+            "link": {"to": "samples", "index_beg": "/{group}/blk_beg", "count": "/{group}/blk_cnt"},
+        }
+        df = _read_group(_FakeH5(arrays), "G", ds, 1, _LatGrid())
+        np.testing.assert_array_equal(df["wf"].to_numpy(), FX_WF.reshape(-1)[10:20])
+        # An overlapping third-level link raises, as on the vlen route (PR #680 review).
+        arrays["/G/blk_beg"] = np.array([0, 8], dtype=np.int64)
+        with pytest.raises(ValueError, match="link records on level 'blocks' overlap"):
+            _read_group(_FakeH5(arrays), "G", ds, 1, _LatGrid())
+
     def test_record_level_table_column(self):
         ds = _fx_ds()
         ds["levels"]["recs"]["variables"]["wt5"] = {"path": "/{group}/table", "column": 5}

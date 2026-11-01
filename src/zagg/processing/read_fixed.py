@@ -55,6 +55,7 @@ from zagg.processing.read import (
     _record_obs_read,
     _segment_level_variables,
     _select_column,
+    _validate_link_disjoint,
     _variable_specs,
     link_base_extent,
 )
@@ -421,6 +422,9 @@ def _fixed_read_group(
             cf_ibeg = np.asarray(cf_data[cf_paths[1]])
             cf_cnt = np.asarray(cf_data[cf_paths[2]])
             cf_index_base = int(cf_link.get("index_base", 0))
+            # The planned arm's searchsorted owners and the full arm's paint
+            # agree only on disjoint records (the vlen route's check, issue #452).
+            _validate_link_disjoint(cf_ibeg, cf_cnt, cf_index_base, level=f["level"])
             coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_flag_path]), f)
             expanded = (
                 _expand_mask_at_rows(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, global_idx)
