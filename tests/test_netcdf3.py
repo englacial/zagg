@@ -198,6 +198,48 @@ def fixture(version=1, **kw):
     return _nc3_bytes(version, _DIMS, _VARS, _GATTRS, **kw)
 
 
+# A wide, many-record-variable case: byte, char, short and a [time, 3200]
+# float waveform interleaved with a double, so one record mixes 1-, 5-, 6-,
+# 12800- and 8-byte slabs (padded to 4 each), plus a non-record byte.
+_MDIMS = [("time", 0), ("n", 3200), ("s", 5), ("k", 3)]
+_NREC = 7
+_MULTI = {
+    "b": (NC_BYTE, [0], np.array([1, -2, 3, -4, 5, -6, 7], dtype="|i1")),
+    "name": (NC_CHAR, [0, 2], np.frombuffer(b"abcdefghijklmnopqrstuvwxyzABCDEFGHI", "|u1")),
+    "sh": (NC_SHORT, [0, 3], np.arange(1, 22, dtype=">i2")),
+    "wf": (NC_FLOAT, [0, 1], (np.arange(_NREC * 3200) % 1000).astype(">f4")),
+    "t": (NC_DOUBLE, [0], np.arange(_NREC, dtype=">f8") * 0.5),
+    "fixb": (NC_BYTE, [3], np.array([-128, 0, 127], dtype="|i1")),
+}
+
+
+def _multi_expected():
+    out = {}
+    for name, (_, dimids, flat) in _MULTI.items():
+        shape = [_NREC if d == 0 else _MDIMS[d][1] for d in dimids]
+        out[f"/{name}"] = flat.reshape(shape)
+    return out
+
+
+def _check_multi(data):
+    """Full and partial reconstruction of the ``_MULTI`` layout from ``data``."""
+    from zagg.catalog.netcdf3 import build_manifest
+
+    exp = _multi_expected()
+    idx, out = _reconstruct(build_manifest(data), data)
+    assert set(out) == set(exp)
+    for name, arr in exp.items():
+        assert out[name].tobytes() == arr.astype(out[name].dtype).tobytes(), name
+    assert out["/b"].dtype == np.int8 and out["/fixb"].dtype == np.int8
+    for name in ("/wf", "/name", "/b", "/sh", "/t"):
+        for lo, hi in ((2, 5), (6, 7), (0, 1)):
+            addrs, sizes, _ = idx.read_plan(name, lo, hi)
+            bufs = [data[int(a) : int(a) + int(n)] for a, n in zip(addrs, sizes)]
+            got = idx.read_from_buffers(name, bufs, lo, hi)
+            np.testing.assert_array_equal(got, exp[name][lo:hi], err_msg=f"{name}[{lo}:{hi}]")
+    return idx
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -621,6 +663,45 @@ class TestOracle:
         np.testing.assert_array_equal(out["/temp"], [[1, 2, 3], [4, 5, 6]])
         np.testing.assert_array_equal(out["/lat"], [1.0, 2.0, 3.0])
 
+    @pytest.mark.parametrize("kind", ["classic", "64-bit offset"])
+    def test_ncgen_multi_record_variables(self, tmp_path, kind):
+        # netCDF-C as the layout authority for the PADDED case: five record
+        # variables with 1-, 5-, 6-, 12800- and 8-byte slabs, plus a
+        # non-record byte and a (skipped) scalar.
+        import shutil
+        import subprocess
+
+        if shutil.which("ncgen") is None:
+            pytest.skip("ncgen (netCDF-C) not installed")
+        exp = _multi_expected()
+        ctype = {NC_BYTE: "byte", NC_CHAR: "char", NC_SHORT: "short", NC_FLOAT: "float"}
+        ctype[NC_DOUBLE] = "double"
+        dnames = [n for n, _ in _MDIMS]
+        decl, vals = [], []
+        for name, (t, dimids, _) in _MULTI.items():
+            decl.append(f" {ctype[t]} {name}({', '.join(dnames[d] for d in dimids)}) ;")
+            arr = exp[f"/{name}"]
+            if t == NC_CHAR:
+                body = ", ".join(f'"{r.tobytes().decode()}"' for r in arr)
+            else:
+                body = ", ".join(str(x) for x in arr.ravel().tolist())
+            vals.append(f" {name} = {body} ;")
+        cdl = tmp_path / "multi.cdl"
+        cdl.write_text(
+            "netcdf multi {\ndimensions:\n time = UNLIMITED ; n = 3200 ; s = 5 ; k = 3 ;\n"
+            "variables:\n"
+            + "\n".join(decl)
+            + "\n int sc ;\ndata:\n"
+            + "\n".join(vals)
+            + "\n sc = 42 ;\n}\n"
+        )
+        nc = tmp_path / "multi.nc"
+        subprocess.run(["ncgen", "-k", kind, "-o", str(nc), str(cdl)], check=True)
+        data = nc.read_bytes()
+        hdr = parse_header(data)
+        assert hdr.numrecs == _NREC and hdr.recsize == 4 + 8 + 8 + 12800 + 8
+        _check_multi(data)
+
 
 # ---------------------------------------------------------------------------
 # Phase 3: manifest emitter
@@ -722,6 +803,23 @@ class TestBuildManifest:
         assert list(addrs) == [layout["temp"][0] + r * layout["__recsize__"] for r in (1, 2)]
         bufs = [data[int(a) : int(a) + int(n)] for a, n in zip(addrs, sizes)]
         np.testing.assert_array_equal(idx.read_from_buffers("/temp", bufs, 1, 3), _TEMP[1:3])
+
+    @pytest.mark.parametrize("version", [1, 2])
+    def test_byte_and_wide_record_variables(self, version):
+        # NC_BYTE (|i1) record and non-record, and a wide [time, 3200] record
+        # variable whose slab is one chunk across the trailing axis.
+        exp = _multi_expected()
+        variables = [
+            {"name": n, "nc_type": t, "dimids": d, "data": exp[f"/{n}"]}
+            for n, (t, d, _) in _MULTI.items()
+        ]
+        data, layout = _nc3_bytes(version, _MDIMS, variables)
+        assert layout["__recsize__"] == 4 + 8 + 8 + 12800 + 8
+        idx = _check_multi(data)
+        addrs, sizes, _ = idx.read_plan("/wf", 2, 5)
+        rec = layout["__recsize__"]
+        assert list(addrs) == [layout["wf"][0] + r * rec for r in (2, 3, 4)]
+        assert list(sizes) == [12800] * 3
 
     def test_single_record_variable_unpadded_layout(self):
         from zagg.catalog.netcdf3 import build_manifest
