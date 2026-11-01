@@ -172,6 +172,35 @@ class TestSemanticDiff:
         assert "aggregation.variables.h_q75.function" in d["hash_affecting"]
         assert d["hash_neutral"] == ["data_source.read_workers"]
 
+    @pytest.mark.parametrize(
+        "name, edit",
+        [
+            (
+                "atl03_tdigest_strata_healpix",
+                lambda c: c.data_source["filters"][0].update(value=-2.0),
+            ),
+            (
+                "atl03_tdigest_strata_healpix",
+                lambda c: c.data_source["filters"][0].update(column=False),
+            ),
+            ("atl06", lambda c: c.data_source.update(filters=[])),
+            ("atl06", lambda c: c.aggregation["variables"]["count"].update(params={})),
+            (
+                "atl03_tdigest_strata_healpix",
+                lambda c: c.aggregation["variables"]["h_tdigest_signal"].update(inner_shape=(2,)),
+            ),
+        ],
+        ids=["int-to-float", "int-to-bool", "absent-to-empty-list", "empty-params", "tuple-shape"],
+    )
+    def test_diff_reads_leaves_as_the_hash_does(self, name, edit):
+        # Leaves compare by canonical JSON (``-2`` vs ``-2.0``, ``0`` vs
+        # ``false``), an empty container is a leaf, a tuple equals its list.
+        a, b = self._pair(name)
+        edit(b)
+        d = diff(a, b)
+        assert bool(d["hash_affecting"]) == (semantic_hash(a) != semantic_hash(b))
+        assert bool(d["changed_keys"]) == (semantic_hash(a) != semantic_hash(b))
+
     def test_run_record_config_diffs_against_its_template(self):
         # The vendored run record vs today's template: count's dtype and the
         # windowing block are the only hash-affecting differences (issue #626/#638).

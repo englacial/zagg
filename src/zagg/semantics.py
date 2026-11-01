@@ -670,13 +670,18 @@ _BLOCKS = ("data_source", "aggregation", "output", "pipeline", "worker", "catalo
 
 
 def _flatten(node, prefix: str = "", out: dict | None = None) -> dict:
-    """``{dotted.path[i]: leaf}`` over a plain-data tree (lists are positional)."""
+    """``{dotted.path[i]: leaf}`` over a plain-data tree (sequences are positional).
+
+    An empty mapping or sequence is a leaf at its own path: the core keeps it
+    (:func:`_prune_nulls` drops only ``None``), so ``params: {}`` added is a
+    change the hash sees.
+    """
     if out is None:
         out = {}
-    if isinstance(node, dict):
+    if isinstance(node, dict) and node:
         for k, v in node.items():
             _flatten(v, f"{prefix}.{k}" if prefix else str(k), out)
-    elif isinstance(node, list):
+    elif isinstance(node, (list, tuple)) and node:
         for i, v in enumerate(node):
             _flatten(v, f"{prefix}[{i}]", out)
     else:
@@ -684,9 +689,22 @@ def _flatten(node, prefix: str = "", out: dict | None = None) -> dict:
     return out
 
 
+def _leaf_key(value) -> str:
+    """A value as the hash reads it: ``-2`` and ``-2.0``, ``0`` and ``False``
+    differ; a tuple and its list agree. A non-JSON leaf compares by ``repr``."""
+    try:
+        return _canonical_json(value)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
 def _changed_paths(a, b) -> list[str]:
     fa, fb = _flatten(a), _flatten(b)
-    return sorted(p for p in set(fa) | set(fb) if fa.get(p, _MISSING) != fb.get(p, _MISSING))
+    return sorted(
+        p
+        for p in set(fa) | set(fb)
+        if _leaf_key(fa.get(p, _MISSING)) != _leaf_key(fb.get(p, _MISSING))
+    )
 
 
 _MISSING = object()
@@ -697,8 +715,8 @@ def diff(a: PipelineConfig, b: PipelineConfig) -> dict:
 
     Returns ``{"changed_keys": [...], "hash_affecting": [...], "hash_neutral":
     [...]}``: every dotted path (``output.grid.parent_order``,
-    ``data_source.filters[0].value``) whose leaf value differs between ``a``
-    and ``b``, and the split of that set into the paths whose change moves
+    ``data_source.filters[0].value``) whose leaf differs between ``a`` and
+    ``b`` as the canonical JSON reads it, and the split of that set into the paths whose change moves
     :func:`semantic_core` (so :func:`semantic_hash`) and the ones that do not.
 
     The split is decided by :func:`semantic_core` itself — the diff of the two
