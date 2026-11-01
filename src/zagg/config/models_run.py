@@ -85,7 +85,8 @@ class TemporalBounds(StrictModel):
 class Bounds(_Block):
     """Optional run bounds, recorded per run (never part of the product identity)."""
 
-    _NULLABLE: ClassVar[frozenset[str]] = frozenset({"spatial"})
+    #: ``temporal: null`` reads as absent (the runner's default is ``None``).
+    _NULLABLE: ClassVar[frozenset[str]] = frozenset({"temporal", "spatial"})
 
     temporal: TemporalBounds | None = Field(default=None, description="The granule time window.")
     spatial: Any = Field(default=None, description="Reserved: a spatial bound (unused today).")

@@ -1762,6 +1762,11 @@ class TestBoundsValidation:
         atl06_config.bounds = None
         validate_config(atl06_config)
 
+    def test_null_temporal_bound_ok(self, atl06_config):
+        # A ``temporal:`` key with an empty YAML body: the runner reads it as absent.
+        atl06_config.bounds = {"temporal": None}
+        validate_config(atl06_config)
+
 
 # ---------------------------------------------------------------------------
 # Non-scalar output kind declaration (issue #29, phase 1)
