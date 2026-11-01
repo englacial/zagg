@@ -130,7 +130,8 @@ class FieldSpec(_Reducer):
     declaration and an ``overview_delta`` fold budget (issue #424).
     """
 
-    _NULLABLE = frozenset({"fill_value", "trailing_shape", "inner_shape"})
+    _NULLABLE = frozenset({"fill_value"})
+    _NULL_CHECKED = frozenset({"trailing_shape", "inner_shape"})
 
     fill_value: Any = Field(
         default=None,

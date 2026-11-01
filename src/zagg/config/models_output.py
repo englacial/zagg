@@ -347,9 +347,11 @@ class Windowing(_Block):
     ``time_field`` is fixed and the conversion knobs are refused.
     """
 
-    #: Refused by their own checks with the sharper message (the schedule
-    #: grammar; ``explicit`` requires a non-empty ``windows`` list).
-    _NULLABLE = frozenset({"schedule", "windows"})
+    #: ``windows: null`` reads as absent beside a non-explicit schedule (and
+    #: ``explicit`` refuses it, requiring a non-empty list); ``schedule`` is
+    #: refused by its own grammar check with the sharper message.
+    _NULLABLE = frozenset({"windows"})
+    _NULL_CHECKED = frozenset({"schedule"})
 
     schedule: str = Field(
         default="none",
@@ -815,9 +817,9 @@ class Output(_Block):
             "icechunk",
             "pyramid",
             "windowing",
-            "grid",
         }
     )
+    _NULL_CHECKED = frozenset({"grid"})
 
     store: str | None = Field(
         default=None, description="Store root: a local path or ``s3://bucket/prefix``."
@@ -862,7 +864,9 @@ class Output(_Block):
     sweep: Annotated[
         Any,
         BeforeValidator(_sweep_knob),
-        WithJsonSchema({"anyOf": [{"type": "boolean"}, {"enum": list(SWEEP_MODES)}]}),
+        WithJsonSchema(
+            {"anyOf": [{"type": "boolean"}, {"enum": list(SWEEP_MODES)}, {"type": "null"}]}
+        ),
     ] = Field(
         default=None,
         description="End-of-run sweep (hive only): ``true``/``families`` (the families pass), "

@@ -89,6 +89,79 @@ def test_reader_hint_rides_the_collection_source_only():
         assert HINT_KEY in defs[model]["properties"]["credentials_provider"]
 
 
+#: Optional fields whose ``null`` acceptance depends on a sibling key, which a
+#: per-field schema cannot express: the H5 source's form keys (null is the
+#: other form) and a filter's ``value`` (null is fine beside a set op).
+_NULL_BY_CONTEXT = {
+    ("H5DataSource", f) for f in ("coordinates", "levels", "base_level", "assets")
+} | {("StructuredFilter", "value")}
+
+
+def _seeds() -> dict:
+    """Every model instance the packaged templates build, as its input dict."""
+    from pydantic import BaseModel
+
+    seeds: dict = {}
+
+    def walk(node):
+        if isinstance(node, BaseModel):
+            seeds.setdefault(type(node), []).append(node.model_dump(exclude_unset=True))
+            for key in type(node).model_fields:
+                walk(getattr(node, key))
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                walk(v)
+
+    for name in PACKAGED:
+        walk(default_config(name).model)
+    return seeds
+
+
+def test_schema_and_models_agree_on_explicit_null():
+    from pydantic import ValidationError
+
+    from zagg.config.models_base import _Block
+
+    defs = json_schema(registry_hints=False)["$defs"]
+    seeds = _seeds()
+    by_name = {cls.__name__: cls for cls in [*seeds, *_all_blocks()]}
+    mismatches = []
+    for name, model in defs.items():
+        cls = by_name.get(name)
+        if cls is None:
+            continue
+        for key, info in cls.model_fields.items():
+            if info.is_required() or (name, key) in _NULL_BY_CONTEXT:
+                continue
+            prop = {**model["properties"][key], "$defs": defs}
+            schema_null = jsonschema.Draft202012Validator(prop).is_valid(None)
+            if issubclass(cls, _Block) and schema_null != (key in cls._NULLABLE):
+                mismatches.append((name, key, "rule"))
+            for seed in seeds.get(cls, ()):
+                try:
+                    cls.model_validate({**seed, key: None})
+                    model_null = True
+                except ValidationError:
+                    model_null = False
+                if model_null != schema_null:
+                    mismatches.append((name, key, "probe"))
+    assert sorted(set(mismatches)) == []
+
+
+def _all_blocks():
+    from zagg.config.models_base import _Block
+
+    todo, out = list(_Block.__subclasses__()), []
+    while todo:
+        cls = todo.pop()
+        out.append(cls)
+        todo += cls.__subclasses__()
+    return out
+
+
 def test_schema_json_is_stable():
     assert schema_json() == schema_json()
     assert json.loads(schema_json("output", registry_hints=False)) == json_schema(

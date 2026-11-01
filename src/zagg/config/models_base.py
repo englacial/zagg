@@ -44,17 +44,42 @@ def _no_explicit_null(data: Any, keys: Any) -> Any:
 class _Block(StrictModel):
     """A grammar block whose optional keys may be omitted but never set to ``null``."""
 
-    #: Optional keys for which an explicit ``null`` is meaningful (or refused
-    #: by the field's own validator with a sharper message).
+    #: Optional keys for which an explicit ``null`` is meaningful; the exported
+    #: schema keeps their ``null`` branch.
     _NULLABLE: ClassVar[frozenset[str]] = frozenset()
+    #: Optional keys whose own validator refuses ``null`` with a sharper
+    #: message: exempt from :meth:`_no_null`, but not nullable in the schema.
+    _NULL_CHECKED: ClassVar[frozenset[str]] = frozenset()
 
     @model_validator(mode="before")
     @classmethod
     def _no_null(cls, data: Any) -> Any:
-        keys = (
-            k for k, f in cls.model_fields.items() if not f.is_required() and k not in cls._NULLABLE
-        )
+        skip = cls._NULLABLE | cls._NULL_CHECKED
+        keys = (k for k, f in cls.model_fields.items() if not f.is_required() and k not in skip)
         return _no_explicit_null(data, keys)
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Any:
+        """Export what :meth:`_no_null` enforces: an optional key outside
+        :attr:`_NULLABLE` loses its ``{"type": "null"}`` branch (a one-member
+        ``anyOf`` collapses), so the schema and the model agree on ``null``."""
+        json_schema = handler(core_schema)
+        target = handler.resolve_ref_schema(json_schema)
+        for key, prop in target.get("properties", {}).items():
+            field = cls.model_fields.get(key)
+            if field is None or field.is_required() or key in cls._NULLABLE:
+                continue
+            members = [m for m in prop.get("anyOf", ()) if m != {"type": "null"}]
+            if len(members) == len(prop.get("anyOf", ())):
+                continue
+            del prop["anyOf"]
+            if len(members) == 1:
+                prop.update(members[0])
+            else:
+                prop["anyOf"] = members
+            if "default" in prop and prop["default"] is None:
+                del prop["default"]
+        return json_schema
 
 
 def _check_number(v: Any) -> Any:

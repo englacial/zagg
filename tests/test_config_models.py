@@ -339,7 +339,8 @@ class TestAggregationGrammar:
         from zagg.config.models_aggregation import FieldSpec
 
         prop = FieldSpec.model_json_schema()["properties"]["overview_delta"]
-        assert {"type": "integer", "minimum": 1} in prop["anyOf"]
+        # No null branch: the key is omitted for the default, never null.
+        assert (prop["type"], prop["minimum"]) == ("integer", 1) and "anyOf" not in prop
         with pytest.raises(ValueError, match="overview_delta must be a positive int"):
             FieldSpec.model_validate(
                 {"function": "min", "kind": "ragged", "inner_shape": [2], "overview_delta": 0}
@@ -587,7 +588,7 @@ class TestOutputGrammar:
         from zagg.windows import EPOCH_SCALES, UNIT_SECONDS
 
         def enum(model, key):
-            return model.model_json_schema()["properties"][key]["anyOf"][0]["enum"]
+            return model.model_json_schema()["properties"][key]["enum"]
 
         assert enum(Output, "touch") == list(TOUCH_POLICIES)
         assert enum(Output, "time_encoding") == list(TIME_ENCODINGS)

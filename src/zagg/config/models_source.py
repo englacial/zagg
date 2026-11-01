@@ -41,6 +41,7 @@ from zagg.config.models_base import (
     Number,
     PosInt,
     StrictModel,
+    _Block,
     _tag_of,
 )
 
@@ -730,8 +731,10 @@ class H5DataSource(StrictModel):
 # ---------------------------------------------------------------------------
 
 
-class Band(StrictModel):
+class Band(_Block):
     """One output field sampled pull-NN from a STAC asset's GeoTIFF."""
+
+    _NULL_CHECKED = frozenset({"fill_value", "scale", "offset"})
 
     asset: NonEmptyStr = Field(description="STAC asset key holding this band's GeoTIFF/COG.")
     dtype: NonEmptyStr = Field(

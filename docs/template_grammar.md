@@ -29,11 +29,11 @@ The spatial point-cloud aggregation block.
 
 | key | type | description |
 |---|---|---|
-| `handoff` | `'pandas'` \| `'arrow'` \| `null` | Per-cell carrier (issue #132): ``arrow`` (default; an arro3 Table) or ``pandas`` (tolerates nullable columns). Packaging, never hashed. |
-| `streaming` | [`Streaming`](#streaming) \| `null` | Bounded-memory regime knobs; absent is the pooled path. |
-| `coordinates` | mapping of name → [`CoordinateSpec`](#coordinatespec) \| `null` | Declared store coordinates by name (the HEALPix templates declare ``morton: {dtype: uint64, fill_value: 0}``). |
-| `variables` | mapping of name → [`FieldSpec`](#fieldspec) \| `null` | Output fields by name. |
-| `chunk_precompute` | mapping of name → [`PrecomputeSpec`](#precomputespec) \| `null` | Chunk-level scalars by name, computed once per chunk and exposed to the per-cell expressions (issue #30). |
+| `handoff` | `'pandas'` \| `'arrow'` | Per-cell carrier (issue #132): ``arrow`` (default; an arro3 Table) or ``pandas`` (tolerates nullable columns). Packaging, never hashed. |
+| `streaming` | [`Streaming`](#streaming) | Bounded-memory regime knobs; absent is the pooled path. |
+| `coordinates` | mapping of name → [`CoordinateSpec`](#coordinatespec) | Declared store coordinates by name (the HEALPix templates declare ``morton: {dtype: uint64, fill_value: 0}``). |
+| `variables` | mapping of name → [`FieldSpec`](#fieldspec) | Output fields by name. |
+| `chunk_precompute` | mapping of name → [`PrecomputeSpec`](#precomputespec) | Chunk-level scalars by name, computed once per chunk and exposed to the per-cell expressions (issue #30). |
 
 ### Asset
 
@@ -73,9 +73,9 @@ One output field sampled pull-NN from a STAC asset's GeoTIFF.
 |---|---|---|
 | `asset` *(required)* | `string` | STAC asset key holding this band's GeoTIFF/COG. |
 | `dtype` *(required)* | `string` | Stored dtype — bands keep exact source DNs, so there is no float default. |
-| `fill_value` | `number` \| `null` | Fill for unsampled cells; default 0. |
-| `scale` | `number` \| `null` | Recorded as the ``scale_factor`` array attr for readers; never applied. |
-| `offset` | `number` \| `null` | Recorded as the ``add_offset`` array attr for readers; never applied. |
+| `fill_value` | `number` | Fill for unsampled cells; default 0. |
+| `scale` | `number` | Recorded as the ``scale_factor`` array attr for readers; never applied. |
+| `offset` | `number` | Recorded as the ``add_offset`` array attr for readers; never applied. |
 
 ### Bounds
 
@@ -130,7 +130,7 @@ A declared store coordinate (``aggregation.coordinates.<name>``), e.g. ``morton`
 
 | key | type | description |
 |---|---|---|
-| `dtype` | `string` \| `null` | Stored numpy dtype (default ``float32``), e.g. ``uint64`` for ``morton``. |
+| `dtype` | `string` | Stored numpy dtype (default ``float32``), e.g. ``uint64`` for ``morton``. |
 | `fill_value` | any | Fill for unobserved cells (default ``"NaN"``; integer dtypes need an explicit integer fill, e.g. ``0`` for ``morton``). |
 
 ### ExpressionFilter
@@ -158,21 +158,21 @@ declaration and an ``overview_delta`` fold budget (issue #424).
 
 | key | type | description |
 |---|---|---|
-| `function` | `string` \| `null` | Reducer name: ``len``/``count``, a numpy name (``mean``, ``nanmax``, ``quantile``), or a dotted path (``zagg.stats.tdigest.build_tdigest``) resolved by ``zagg.config.resolve_function`` at validation. |
-| `expression` | `string` \| `null` | Python expression over column names and ``np`` evaluated per cell (mutually exclusive with ``function``). |
-| `source` | `string` \| `null` | The read column (a ``data_source.variables`` name or a broadcast segment-level variable) the reducer takes as its positional argument. |
-| `params` | mapping \| `null` | Keyword arguments forwarded to the reducer. A string value naming a column (or an expression over columns) is evaluated per cell first; numbers pass through. ``locations``/``temporal`` are reserved for the injected channels. |
-| `dtype` | `string` \| `null` | Stored numpy dtype of the result (``float32``, ``uint64``…). |
+| `function` | `string` | Reducer name: ``len``/``count``, a numpy name (``mean``, ``nanmax``, ``quantile``), or a dotted path (``zagg.stats.tdigest.build_tdigest``) resolved by ``zagg.config.resolve_function`` at validation. |
+| `expression` | `string` | Python expression over column names and ``np`` evaluated per cell (mutually exclusive with ``function``). |
+| `source` | `string` | The read column (a ``data_source.variables`` name or a broadcast segment-level variable) the reducer takes as its positional argument. |
+| `params` | mapping | Keyword arguments forwarded to the reducer. A string value naming a column (or an expression over columns) is evaluated per cell first; numbers pass through. ``locations``/``temporal`` are reserved for the injected channels. |
+| `dtype` | `string` | Stored numpy dtype of the result (``float32``, ``uint64``…). |
 | `fill_value` | any | Fill for unobserved cells: a number, or the string ``"NaN"`` (YAML ``.nan`` is canonicalized to it at load). Dense default ``"NaN"``. |
 | `kind` | `'scalar'` \| `'vector'` \| `'ragged'` | Output carrier: ``scalar`` (default), ``vector``, ``ragged``. |
-| `trailing_shape` | `integer` \| list of `integer` \| `null` | Per-cell trailing shape of a ``vector`` field (an int or a list of ints). |
-| `inner_shape` | `integer` \| list of `integer` \| `null` | Per-element shape of a ``ragged`` field's payload rows, e.g. ``[2]`` for ``(mean, weight)`` centroid pairs. |
+| `trailing_shape` | `integer` \| list of `integer` | Per-cell trailing shape of a ``vector`` field (an int or a list of ints). |
+| `inner_shape` | `integer` \| list of `integer` | Per-element shape of a ``ragged`` field's payload rows, e.g. ``[2]`` for ``(mean, weight)`` centroid pairs. |
 | `resolution` | `'cell'` \| `'chunk'` | ``cell`` (default) or ``chunk``: one value per chunk, written to a companion array at the chunk grid (the compact store for a chunk-uniform value). |
-| `location` | `string` \| `null` | Ragged location channel (issue #87): the per-observation morton column — ``leaf_id`` (the HEALPix read path's) or a data column — folded per centroid into a uint64 sibling array; requires a ``function`` reducer that accepts ``locations=``. |
-| `temporal` | `'per-cell'` \| `'per-centroid'` \| `null` | Temporal companion shape (spec §8.2/§8.3): ``per-cell`` (the field's own dense uint64 array holds the words; ``fill_value: 0``) or ``per-centroid`` (a uint64 sibling row-aligned with a ragged payload). Requires a toc-producing reducer and the store's clock (``output.time_source``). |
-| `weights` | `'counts'` \| `'flux'` \| `null` | Ragged payload weight semantics (spec §2.0): ``counts`` (the absent-key default, integer weights) or ``flux`` (positive reals; requires ``attrs.gain`` with ``name`` and ``version``). |
-| `overview_delta` | `integer` \| `null` | Pyramid-fold centroid budget for a ragged digest (issue #424), split from the leaf ``params.delta``; packaging, never hashed. |
-| `attrs` | mapping \| `null` | Free-form JSON provenance merged onto the field's array attrs. Spec-owned keys (the ragged layout block, ``weights`` on ragged, the temporal/located bindings) are stamped by the writer and refused here; a ``composition`` block is cross-checked against the field it describes (issue #321). |
+| `location` | `string` | Ragged location channel (issue #87): the per-observation morton column — ``leaf_id`` (the HEALPix read path's) or a data column — folded per centroid into a uint64 sibling array; requires a ``function`` reducer that accepts ``locations=``. |
+| `temporal` | `'per-cell'` \| `'per-centroid'` | Temporal companion shape (spec §8.2/§8.3): ``per-cell`` (the field's own dense uint64 array holds the words; ``fill_value: 0``) or ``per-centroid`` (a uint64 sibling row-aligned with a ragged payload). Requires a toc-producing reducer and the store's clock (``output.time_source``). |
+| `weights` | `'counts'` \| `'flux'` | Ragged payload weight semantics (spec §2.0): ``counts`` (the absent-key default, integer weights) or ``flux`` (positive reals; requires ``attrs.gain`` with ``name`` and ``version``). |
+| `overview_delta` | `integer` | Pyramid-fold centroid budget for a ragged digest (issue #424), split from the leaf ``params.delta``; packaging, never hashed. |
+| `attrs` | mapping | Free-form JSON provenance merged onto the field's array attrs. Spec-owned keys (the ragged layout block, ``weights`` on ragged, the temporal/located bindings) are stamped by the writer and refused here; a ``composition`` block is cross-checked against the field it describes (issue #321). |
 
 ### H5DataSource
 
@@ -212,11 +212,11 @@ A HEALPix NESTED grid: cells at ``child_order``, shards at ``parent_order``.
 | `type` *(required)* | `'healpix'` | Grid family. |
 | `parent_order` *(required)* | `integer` | Shard / dispatch order: one worker per order-``parent_order`` cell. |
 | `child_order` *(required)* | `integer` | Leaf cell resolution (order of the output cells). |
-| `chunk_inner` | `integer` \| `null` | Inner zarr chunk order between ``parent_order`` and ``child_order`` (K = 4^(chunk_inner - parent_order) chunks per shard); absent derives ``child_order - 6`` (64×64-cell inner chunks, issue #259) when sharded and that lies above ``parent_order``, else one chunk per shard (always so for raster). |
-| `sharded` | `boolean` \| `null` | Bundle a shard's K inner chunks into one ShardingCodec object (issue #108); HEALPix output defaults to true (issue #215). |
+| `chunk_inner` | `integer` | Inner zarr chunk order between ``parent_order`` and ``child_order`` (K = 4^(chunk_inner - parent_order) chunks per shard); absent derives ``child_order - 6`` (64×64-cell inner chunks, issue #259) when sharded and that lies above ``parent_order``, else one chunk per shard (always so for raster). |
+| `sharded` | `boolean` | Bundle a shard's K inner chunks into one ShardingCodec object (issue #108); HEALPix output defaults to true (issue #215). |
 | `layout` | `'fullsphere'` \| `null` | HEALPix array layout; ``fullsphere`` is the only one (the deprecated ``dense`` pack was removed, issue #88). |
-| `emit_cell_ids` | `boolean` \| `null` | Transition hatch (issue #304): also write the legacy NESTED ``cell_ids`` array beside the ``morton`` coordinate. Default off. |
-| `indexing_scheme` | `'nested'` \| `null` | Descriptive only (the shipped templates spell ``nested``); the stored coordinate is morton (D16, issue #304). |
+| `emit_cell_ids` | `boolean` | Transition hatch (issue #304): also write the legacy NESTED ``cell_ids`` array beside the ``morton`` coordinate. Default off. |
+| `indexing_scheme` | `'nested'` | Descriptive only (the shipped templates spell ``nested``); the stored coordinate is morton (D16, issue #304). |
 | `cell_ids_encoding` | `null` | Retired (issue #304): morton is the stored cell coordinate and NESTED ids are derived at read. Must be absent or null. |
 
 ### Icechunk
@@ -229,10 +229,10 @@ manifests — are here.
 
 | key | type | description |
 |---|---|---|
-| `commit` | `'ladder'` \| `'leaf'` \| `null` | Commit regime: ``ladder`` (refs committed up the staged ladder) or ``leaf`` (per leaf). |
-| `commit_order` | `integer` \| `null` | Order a commit covers (default derived from the shard order). |
-| `split_order` | `integer` \| `null` | Order one manifest covers; never finer than ``commit_order``. |
-| `retain_runs` | `integer` \| `null` | Run tags finalize keeps; 0 (default) keeps every run. |
+| `commit` | `'ladder'` \| `'leaf'` | Commit regime: ``ladder`` (refs committed up the staged ladder) or ``leaf`` (per leaf). |
+| `commit_order` | `integer` | Order a commit covers (default derived from the shard order). |
+| `split_order` | `integer` | Order one manifest covers; never finer than ``commit_order``. |
+| `retain_runs` | `integer` | Run tags finalize keeps; 0 (default) keeps every run. |
 
 ### Level
 
@@ -274,24 +274,24 @@ The store side of a spatial or raster pipeline.
 
 | key | type | description |
 |---|---|---|
-| `store` | `string` \| `null` | Store root: a local path or ``s3://bucket/prefix``. |
-| `format` | `string` \| `null` | Store format; ``zarr`` (default). |
-| `endpoint_url` | `string` \| `null` | Non-secret S3-compatible endpoint (R2, MinIO); never credentials. |
-| `region` | `string` \| `null` | AWS region of the output store. |
-| `product_name` | `string` \| `null` | D19 product name (issue #299): the run writes under ``{store}/{product_name}/``; absent is the bare single-product layout. |
-| `grid` | [`HealpixGrid`](#healpixgrid) \| [`RectilinearGrid`](#rectilineargrid) \| `null` | The output grid: ``type: healpix`` or ``type: rectilinear``. |
+| `store` | `string` | Store root: a local path or ``s3://bucket/prefix``. |
+| `format` | `string` | Store format; ``zarr`` (default). |
+| `endpoint_url` | `string` | Non-secret S3-compatible endpoint (R2, MinIO); never credentials. |
+| `region` | `string` | AWS region of the output store. |
+| `product_name` | `string` | D19 product name (issue #299): the run writes under ``{store}/{product_name}/``; absent is the bare single-product layout. |
+| `grid` | [`HealpixGrid`](#healpixgrid) \| [`RectilinearGrid`](#rectilineargrid) | The output grid: ``type: healpix`` or ``type: rectilinear``. |
 | `store_layout` | `'flat'` \| `'hive'` \| `null` | ``hive`` (one leaf zarr per shard under a morton digit tree; the HEALPix default) or ``flat`` (one shared store; the rectilinear default). |
-| `touch` | `'auto'` \| `'always'` \| `'never'` \| `null` | Skip-run lifecycle touch policy (issue #501): ``auto`` (default), ``always``, ``never``. |
-| `aoi_mask` | `boolean` \| `null` | Package a per-cell boolean ``aoi_mask`` array (issue #101); default off. |
-| `consolidate_metadata` | `boolean` \| `null` | Run zarr metadata consolidation at finalize (flat stores only); default off. |
+| `touch` | `'auto'` \| `'always'` \| `'never'` | Skip-run lifecycle touch policy (issue #501): ``auto`` (default), ``always``, ``never``. |
+| `aoi_mask` | `boolean` | Package a per-cell boolean ``aoi_mask`` array (issue #101); default off. |
+| `consolidate_metadata` | `boolean` | Run zarr metadata consolidation at finalize (flat stores only); default off. |
 | `coverage_moc` | `boolean` \| `null` | Write the root ``coverage.moc`` at the end of the run (hive + HEALPix only); defaults on for hive. |
-| `sweep` | `boolean` \| `'none'` \| `'families'` \| `'stages'` | End-of-run sweep (hive only): ``true``/``families`` (the families pass), ``stages`` (plus the staged ladder), ``false``/``none``. Absent resolves to ``stages`` on a hive store declaring a ladder, else ``families``; ``none`` on a flat store. |
+| `sweep` | `boolean` \| `'none'` \| `'families'` \| `'stages'` \| `null` | End-of-run sweep (hive only): ``true``/``families`` (the families pass), ``stages`` (plus the staged ladder), ``false``/``none``. Absent resolves to ``stages`` on a hive store declaring a ladder, else ``families``; ``none`` on a flat store. |
 | `leaf_versions` | `boolean` \| `null` | Versioned hive leaves (spec §1.5, issue #582); defaults on for hive. |
 | `icechunk` | `boolean` \| [`Icechunk`](#icechunk) \| `null` | Icechunk companion repo (spec §11): a boolean, or an options block (an opt-in with knobs). Defaults on for non-raster hive stores. |
 | `pyramid` | `False` \| [`Pyramid`](#pyramid) \| `null` | Overview pyramid: absent (defaults), ``false`` (off), or an options block (hive only). |
 | `windowing` | [`Windowing`](#windowing) \| `null` | Temporal windowing of the hive leaves (issue #246). |
-| `time_source` | [`TimeSource`](#timesource) \| `null` | The per-observation clock for temporal companions (spec §8.3). |
-| `time_encoding` | `'microseconds'` \| `'toc'` \| `null` | Time-coordinate encoding of a raster ``(time, cells)`` product (spec §8): ``microseconds`` (default) or ``toc``. |
+| `time_source` | [`TimeSource`](#timesource) | The per-observation clock for temporal companions (spec §8.3). |
+| `time_encoding` | `'microseconds'` \| `'toc'` | Time-coordinate encoding of a raster ``(time, cells)`` product (spec §8): ``microseconds`` (default) or ``toc``. |
 
 ### PathColumn
 
@@ -312,11 +312,11 @@ Entries are independent (one cannot reference another).
 
 | key | type | description |
 |---|---|---|
-| `function` | `string` \| `null` | Reducer name: ``len``/``count``, a numpy name (``mean``, ``nanmax``, ``quantile``), or a dotted path (``zagg.stats.tdigest.build_tdigest``) resolved by ``zagg.config.resolve_function`` at validation. |
-| `expression` | `string` \| `null` | Python expression over column names and ``np`` evaluated per cell (mutually exclusive with ``function``). |
-| `source` | `string` \| `null` | The read column (a ``data_source.variables`` name or a broadcast segment-level variable) the reducer takes as its positional argument. |
-| `params` | mapping \| `null` | Keyword arguments forwarded to the reducer. A string value naming a column (or an expression over columns) is evaluated per cell first; numbers pass through. ``locations``/``temporal`` are reserved for the injected channels. |
-| `dtype` | `string` \| `null` | Stored numpy dtype of the result (``float32``, ``uint64``…). |
+| `function` | `string` | Reducer name: ``len``/``count``, a numpy name (``mean``, ``nanmax``, ``quantile``), or a dotted path (``zagg.stats.tdigest.build_tdigest``) resolved by ``zagg.config.resolve_function`` at validation. |
+| `expression` | `string` | Python expression over column names and ``np`` evaluated per cell (mutually exclusive with ``function``). |
+| `source` | `string` | The read column (a ``data_source.variables`` name or a broadcast segment-level variable) the reducer takes as its positional argument. |
+| `params` | mapping | Keyword arguments forwarded to the reducer. A string value naming a column (or an expression over columns) is evaluated per cell first; numbers pass through. ``locations``/``temporal`` are reserved for the injected channels. |
+| `dtype` | `string` | Stored numpy dtype of the result (``float32``, ``uint64``…). |
 
 ### Pyramid
 
@@ -328,13 +328,13 @@ order; the all-time fold on a windowed store). ``overviews`` is the
 
 | key | type | description |
 |---|---|---|
-| `spacing` | `integer` \| `null` | Every-N-orders overview schedule below the shard order (>= 1). |
-| `orders` | list of `integer` \| `null` | Explicit ancestor orders in ``[0, parent_order)``; wins over ``spacing``. |
+| `spacing` | `integer` | Every-N-orders overview schedule below the shard order (>= 1). |
+| `orders` | list of `integer` | Explicit ancestor orders in ``[0, parent_order)``; wins over ``spacing``. |
 | `overviews` | `integer` \| list of `integer` | Leaf cell resolutions of the column tier (``zagg-pyramid/2``): an int or a non-empty list of ints, strictly descending and strictly inside the shard's resolution window. |
-| `all_time` | `boolean` \| `null` | Maintain the ``all.zarr`` cross-window fold on a windowed store; resolves true there when omitted, and ``false`` is refused. |
-| `fold_source` | `'cascade'` \| `'leaves'` \| `null` | ``cascade`` (default: each coarse level folds from the level below) or the deprecated ``leaves``. |
-| `exact_levels` | `integer` \| `null` | Under ``cascade``: how many of the finest declared levels fold exactly from the leaves (>= 1). |
-| `summarize` | mapping of name → [`Summarize`](#summarize) \| `null` | D24 derived summaries: ``{source_field: {as: new_name, ...}}``; recorded in the pyramid block, never the semantic core. |
+| `all_time` | `boolean` | Maintain the ``all.zarr`` cross-window fold on a windowed store; resolves true there when omitted, and ``false`` is refused. |
+| `fold_source` | `'cascade'` \| `'leaves'` | ``cascade`` (default: each coarse level folds from the level below) or the deprecated ``leaves``. |
+| `exact_levels` | `integer` | Under ``cascade``: how many of the finest declared levels fold exactly from the leaves (>= 1). |
+| `summarize` | mapping of name → [`Summarize`](#summarize) | D24 derived summaries: ``{source_field: {as: new_name, ...}}``; recorded in the pyramid block, never the semantic core. |
 
 ### QualityFilter
 
@@ -401,10 +401,10 @@ A projected rectilinear grid: ``crs`` + ``resolution`` + ``bounds`` fix the cell
 | `crs` *(required)* | `string` | Coordinate reference system, e.g. ``EPSG:3031``. |
 | `resolution` *(required)* | `number` | Cell size in CRS units. |
 | `bounds` *(required)* | list of `number` | ``[xmin, ymin, xmax, ymax]`` in CRS units. |
-| `chunk_shape` | list of `integer` \| `null` | Shard tile ``[rows, cols]`` in cells (default ``[256, 256]``). |
-| `chunk_inner` | list of `integer` \| `null` | Inner zarr chunk ``[rows, cols]`` within the shard tile (issue #30 item 3); default the shard tile. |
-| `sharded` | `boolean` \| `null` | ShardingCodec bundling of the inner chunks; rect defaults off. |
-| `emit_cell_ids` | `boolean` \| `null` | Not applicable: rectilinear grids have no cell_ids coordinate. |
+| `chunk_shape` | list of `integer` | Shard tile ``[rows, cols]`` in cells (default ``[256, 256]``). |
+| `chunk_inner` | list of `integer` | Inner zarr chunk ``[rows, cols]`` within the shard tile (issue #30 item 3); default the shard tile. |
+| `sharded` | `boolean` | ShardingCodec bundling of the inner chunks; rect defaults off. |
+| `emit_cell_ids` | `boolean` | Not applicable: rectilinear grids have no cell_ids coordinate. |
 
 ### Resample
 
@@ -447,9 +447,9 @@ law-equivalence contract (``zagg.semantics``).
 
 | key | type | description |
 |---|---|---|
-| `mode` | `'merge'` \| `'spill'` \| `null` | ``merge`` (default): fold flushed buffers in memory; ``spill``: write buffers to /tmp partitions and aggregate once after the reads. |
-| `buffer_granules` | `integer` \| `null` | Granules of post-filter rows held before a flush (default 20). |
-| `block_bytes` | `integer` \| `null` | Spill-only cap on a block before it closes and folds. |
+| `mode` | `'merge'` \| `'spill'` | ``merge`` (default): fold flushed buffers in memory; ``spill``: write buffers to /tmp partitions and aggregate once after the reads. |
+| `buffer_granules` | `integer` | Granules of post-filter rows held before a flush (default 20). |
+| `block_bytes` | `integer` | Spill-only cap on a block before it closes and folds. |
 
 ### StructuredFilter
 
@@ -538,13 +538,13 @@ A typo in a capability name surfaces as ``UnknownCapability`` from
 | `collection` *(required)* | `string` | The ``data_source.collections`` entry to read it from. |
 | `spatial_func` *(required)* | `string` | Registered spatial reducer over the masked grid (``max``, ``weighted_mean``…). |
 | `temporal_reducer` *(required)* | `string` | Registered reducer over the event's time window (``max``, ``sum``…). |
-| `mask` | `string` \| `null` | Registered spatial mask name (default ``ais``). |
-| `negate` | `boolean` \| `null` | Negate the field values (after any transform, before the spatial reduction), e.g. for southward-positive fluxes. |
-| `anomaly` | `boolean` \| `null` | Sugar for ``transform: monthly_anomaly`` (subtract the climatology). |
-| `transform` | `string` \| `null` | Registered transform applied before reduction; wins over ``anomaly``. |
-| `trigger` | `string` \| `null` | Registered event-trigger predicate. |
-| `trigger_mask` | `string` \| `null` | Key into ``data_source.static_data`` naming the mask the trigger tests against (default ``ais_mask``); a static field name, not a registered mask provider. |
-| `params` | mapping \| `null` | Free-form mapping passed to the mask provider, field transform and event trigger (not to spatial funcs or reducers). |
+| `mask` | `string` | Registered spatial mask name (default ``ais``). |
+| `negate` | `boolean` | Negate the field values (after any transform, before the spatial reduction), e.g. for southward-positive fluxes. |
+| `anomaly` | `boolean` | Sugar for ``transform: monthly_anomaly`` (subtract the climatology). |
+| `transform` | `string` | Registered transform applied before reduction; wins over ``anomaly``. |
+| `trigger` | `string` | Registered event-trigger predicate. |
+| `trigger_mask` | `string` | Key into ``data_source.static_data`` naming the mask the trigger tests against (default ``ais_mask``); a static field name, not a registered mask provider. |
+| `params` | mapping | Free-form mapping passed to the mask provider, field transform and event trigger (not to spatial funcs or reducers). |
 
 ### TemporalOutput
 
@@ -578,8 +578,8 @@ column is only good to the leap seconds since its epoch.
 |---|---|---|
 | `field` *(required)* | `string` | Per-observation time column (a read variable, base rate). |
 | `epoch` *(required)* | `string` | The UTC instant the column counts from. |
-| `scale` | `'gps'` \| `'tai'` \| `null` | ``gps`` (default) or ``tai``. |
-| `units` | `'seconds'` \| `'days'` \| `null` | ``seconds`` (default) or ``days``. |
+| `scale` | `'gps'` \| `'tai'` | ``gps`` (default) or ``tai``. |
+| `units` | `'seconds'` \| `'days'` | ``seconds`` (default) or ``days``. |
 
 ### WindowPoint
 
@@ -613,11 +613,11 @@ on the raster path membership is the acquisition's STAC ``datetime``, so
 | key | type | description |
 |---|---|---|
 | `schedule` | `string` | ``none`` (default), ``yearly``, ``monthly``, ``daily``, or ``explicit`` (with ``windows``); ``quarterly`` is reserved and not implemented. |
-| `time_field` | `string` \| `null` | Per-observation timestamp column deciding window membership (a base-rate ``data_source.variables`` entry). |
-| `epoch` | `string` \| `null` | The dataset's zero time as an ISO-8601 UTC instant at whole-second precision (ICESat-2 delta_time: ``2018-01-01T00:00:00Z``). |
-| `scale` | `'utc'` \| `'gps'` \| `'tai'` \| `null` | Timescale of ``time_field``: ``utc`` (default), ``gps``, ``tai``. |
-| `units` | `'seconds'` \| `'days'` \| `null` | Units of ``time_field``: ``seconds`` (default) or ``days``. |
-| `unit` | `'shard'` \| `'window'` \| `null` | Dispatch unit (issue #586): ``shard`` (default; one invoke per shard emits every window its granules span) or ``window`` (one invoke per (shard, window)). |
+| `time_field` | `string` | Per-observation timestamp column deciding window membership (a base-rate ``data_source.variables`` entry). |
+| `epoch` | `string` | The dataset's zero time as an ISO-8601 UTC instant at whole-second precision (ICESat-2 delta_time: ``2018-01-01T00:00:00Z``). |
+| `scale` | `'utc'` \| `'gps'` \| `'tai'` | Timescale of ``time_field``: ``utc`` (default), ``gps``, ``tai``. |
+| `units` | `'seconds'` \| `'days'` | Units of ``time_field``: ``seconds`` (default) or ``days``. |
+| `unit` | `'shard'` \| `'window'` | Dispatch unit (issue #586): ``shard`` (default; one invoke per shard emits every window its granules span) or ``window`` (one invoke per (shard, window)). |
 | `windows` | list of [`WindowRange`](#windowrange) \| [`WindowPoint`](#windowpoint) \| `null` | The explicit windows (``schedule: explicit`` only): disjoint half-open ``{label, start, end}`` ranges or ``{label, timestamp}`` one-second points. |
 
 ### Worker
