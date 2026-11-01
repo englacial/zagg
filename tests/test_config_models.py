@@ -642,6 +642,19 @@ class TestRunGrammar:
         validate_config(cfg)
         assert validate_model(cfg).model_dump(exclude_unset=True)["bounds"] == cfg.bounds
 
+    def test_pipeline_literals_match_the_engine_set(self):
+        # Three spellings of one set (no import path joins them without a cycle).
+        from typing import get_args
+
+        from zagg.config.core import _PIPELINE_TYPES
+        from zagg.config.models_run import SpatialPipeline, TemporalPipeline
+
+        literals = {
+            *get_args(SpatialPipeline.model_fields["type"].annotation),
+            *get_args(TemporalPipeline.model_fields["type"].annotation),
+        }
+        assert literals == _PIPELINE_TYPES
+
     def test_root_models_are_complete_at_import(self):
         # A fresh interpreter: an earlier validate would have rebuilt them lazily.
         import subprocess

@@ -27,7 +27,7 @@ the block grammars in ``models_source.py`` (and, per phase, their siblings).
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Union
 
 from pydantic import (
     BaseModel,
@@ -320,8 +320,3 @@ def validate_model(config: Any) -> SpatialConfig | RasterConfig | TemporalConfig
         return _ROOT.validate_python(raw)
     except ValidationError as exc:
         raise ValueError(format_validation_error(exc)) from exc
-
-
-#: The pipeline-type literal the phase 4 model will carry; exported here so
-#: the discriminator and the typed block agree on one spelling.
-PipelineType = Literal["spatial", "temporal", "event"]
