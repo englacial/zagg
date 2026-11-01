@@ -268,6 +268,16 @@ def _fixed_read_group(
         matched = np.ones(n_records, dtype=bool)
     else:
         n_records = _primary_record_count(data_source, coord_assets, group, _read_full)
+        # A missing coordinate sibling fails the group here, before the join:
+        # through the asset-variable path it would log a NaN-fill warning
+        # naming internal keys (and set the warn-once flag) before raising.
+        for key, entry in coord_assets.items():
+            if (siblings or {}).get(entry["asset"]) is None:
+                raise ValueError(
+                    f"granule carries no open sibling handle for asset {entry['asset']!r}, "
+                    f"which sources coordinates.{key}; was the shard map built with the "
+                    "paired-asset join?"
+                )
         for key, entry in coord_assets.items():
             asset_var_paths.setdefault(entry["asset"], {})[f"__coord_{key}"] = entry["path"].format(
                 group=group
@@ -543,22 +553,16 @@ def _joined_coordinates(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Record lat/lon gathered through the sibling join; ``matched`` per record.
 
-    A granule with no open handle for the coordinate asset fails the group:
-    there is nothing to place. Unmatched records get a 0.0 placeholder that
-    ``matched`` keeps out of every mask.
+    The caller has already failed a granule with no open handle for the
+    coordinate asset (there is nothing to place), so every join is present.
+    Unmatched records get a 0.0 placeholder that ``matched`` keeps out of
+    every mask.
     """
     out = []
     matched = None
     for key in ("latitude", "longitude"):
         entry = coord_assets[key]
-        join = joins.get(entry["asset"])
-        if join is None:
-            raise ValueError(
-                f"granule carries no open sibling handle for asset {entry['asset']!r}, "
-                f"which sources coordinates.{key}; was the shard map built with the "
-                "paired-asset join?"
-            )
-        values_by_path, m = join
+        values_by_path, m = joins[entry["asset"]]
         vals = np.asarray(values_by_path[entry["path"].format(group=group)], dtype=np.float64)
         if vals.ndim != 1:
             raise ValueError(f"coordinates.{key}: asset dataset must be 1-D (got {vals.shape})")

@@ -965,9 +965,17 @@ class TestAssetSourcedCoordinates:
         pd.testing.assert_frame_equal(full, planned)
         np.testing.assert_array_equal(full["wf"].to_numpy(), FX_WF[:2].reshape(-1))
 
-    def test_missing_sibling_fails_the_group(self):
-        with pytest.raises(ValueError, match="which sources coordinates.latitude"):
-            _read_group(_FakeH5(_fx_arrays()), "G", _fx_sibling_coord_ds(), 0, _OneShardGrid())
+    def test_missing_sibling_fails_the_group(self, caplog):
+        # Raised before the join: no NaN-fill warning naming internal keys, and
+        # no warn-once flag set on the handle (PR #680 review).
+        h5obj = _FakeH5(_fx_arrays())
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(ValueError, match="asset 'sib', which sources coordinates.latitude"),
+        ):
+            _read_group(h5obj, "G", _fx_sibling_coord_ds(), 0, _OneShardGrid())
+        assert not caplog.records
+        assert not hasattr(h5obj, "_zagg_asset_nan_warned")
 
     def test_the_join_is_shared_with_other_consumers(self, monkeypatch):
         import zagg.processing.read_vlen as rv
