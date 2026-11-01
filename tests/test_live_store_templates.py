@@ -224,6 +224,7 @@ LADDER_TEMPLATES = [
     "atl03_tdigest_strata_healpix",
     "atl03_tdigest_healpix_hive",
     "gedi01b_waveform_healpix_hive",
+    "glah01_waveform_healpix_hive",
 ]
 LADDER = [16, 15, 14, 13]
 

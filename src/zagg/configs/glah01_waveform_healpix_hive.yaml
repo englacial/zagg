@@ -1,0 +1,237 @@
+# ICESat/GLAS GLAH01 received-waveform flux t-digest (HEALPix, hive store
+# layout) -- issue #678.
+#
+# The fixed-width template (issue #678, espg rulings 2026-10-31): GLAH01
+# stores each shot's received waveform as a constant-width row,
+# ``r_rng_wf [n_shots, 544]``, with no index/count link. The record level
+# links with ``width``, the reader synthesizes the link, and every sample is
+# then an ordinary flux-weighted point observation through the same three
+# primitives the GEDI template uses (planned record gather, expand-by-count,
+# coordinate synthesis) plus the sibling join -- nothing here is sensor code.
+#
+# STATUS: GRAMMAR-PINNED, NOT GRANULE-VERIFIED. The dataset names marked
+# ``verified`` below were read from one introspected granule
+# (GLAH01_033_1102_001_0071_1_02_0001.H5, issue #678 comment of 2026-10-31);
+# the ones marked ``unverified`` are the GLAS data-dictionary names as best
+# known and are what the issue #678 phase 4 real-granule validation
+# (in-region, nsidc credentials) checks first. The test suite drives this
+# template over a synthetic GLAH01-shaped mini-granule keyed off these same
+# strings, so it pins the WIRING, not the product dictionary.
+#
+# Geolocation: GLAH01 carries NO 40 Hz lat/lon (only 1 Hz predicted
+# ``/Data_1HZ/Geolocation/d1_pred_lat|lon``); the user guide (section 1.4.1)
+# disables spatial search for it and points at GLAH05/06, which are
+# geolocated to the footprint. So the record coordinates are JOINED from a
+# GLAH05 sibling on the composite key (i_rec_ndx, i_shot_count) -- the
+# paired-asset pattern of the GEDI L1B+L2A template with a tuple key. Catalog
+# build (off-config): provider NSIDC_CPRD, collections GLAH01 v033 (primary) +
+# GLAH05 v033 (sibling), joined at ShardMap.build(..., sibling_catalog=...);
+# note the uppercase ``.H5`` extension (issue #678: the catalog's lowercase
+# ``.h5`` match is a separate fix).
+#
+# Clock: ``d_UTCTime_40`` is seconds since J2000 on the UTC scale -- a
+# nominal-UTC column, which spec section 8.3's nanosecond rule refuses as a
+# ``time_source``. This template therefore declares no ``time_source`` and no
+# temporal companion; a continuous-scale (TAI/GPS) rendering of the GLAS
+# clock is a science question for the phase 4 card.
+data_source:
+  shard_workers: 4
+  reader: h5coro
+  driver: s3
+  # NSIDC's cumulus bucket: nsidc-cumulus-prod-protected/GLAS/GLAH01/033
+  # (CMR collection C2153547306-NSIDC_CPRD); credentials endpoint
+  # https://data.nsidc.earthdatacloud.nasa.gov/s3credentials.
+  credentials_provider: nsidc
+  index:
+    backend: hierarchical      # pinned like GEDI (issue #460): an absent block
+                               # resolves to inline, whose chunk-map walk is
+                               # unmeasured on GLAS's chunked 2-D datasets.
+  groups: [Data_40HZ]
+  coordinates:
+    # Record (shot) coordinates from the GLAH05 sibling via the composite
+    # join below (unverified paths: GLAH05 40 Hz geolocation).
+    latitude: {asset: glah05, path: "/{group}/Geolocation/d_lat"}
+    longitude: {asset: glah05, path: "/{group}/Geolocation/d_lon"}
+    level: shots
+  variables:
+    rx_wf:
+      # verified: [51200, 544] float, the received waveform, fixed width.
+      path: "/{group}/Waveform/RecWaveform/r_rng_wf"
+      axes: [record, sample]
+    gate_range:
+      # Per-sample range synthesized as start[shot] + gate[sample] * scale:
+      # the gate-index dimension scale is a 1-D table of length 544
+      # (verified: DS_Gate_Index_544), scaled by the 1 ns gate spacing
+      # (0.15 m one-way). Long waveforms are compressed on board (the first
+      # i_N_val gates at 1 ns, the rest averaged -- i_compRatio_p/q), so the
+      # per-gate OFFSET table, not a uniform spacing, is what makes this right;
+      # whether DS_Gate_Index_544 already encodes the compressed spacing is a
+      # phase 4 check. ``start`` is the per-shot reference range (unverified).
+      synthesize: offsets
+      level: shots
+      start: "/{group}/Waveform/RecWaveform/d_refRng"
+      offsets: "/{group}/Waveform/RecWaveform/DS_Gate_Index_544"
+      scale: 0.15
+    sample_index:
+      # The within-shot gate index, so the padding filter below can drop the
+      # tail of a short waveform (issue #678 spec (3)).
+      synthesize: index
+      level: shots
+  base_level: samples
+  levels:
+    samples:
+      path: "/{group}/Waveform"
+      link: null
+    shots:
+      path: "/{group}/Waveform"
+      link:
+        to: samples
+        width: 544               # verified: r_rng_wf dim 1
+      variables:
+        # Per-shot pass-throughs, broadcast to sample rate. ``i_waveformType``
+        # (verified): 0 missing, 1 long (544 valid gates), 2 short (200 valid,
+        # the rest padding).
+        i_waveformType: "/{group}/Waveform/Characteristics/i_waveformType"
+        # The shot's UTC instant (verified: d_UTCTime_40, J2000 seconds, UTC
+        # scale -- see the clock note above). Unique per shot, so it is the
+        # record id the shot_count companion keys on: i_rec_ndx alone names a
+        # 40-shot record, not a shot.
+        utc_time: "/{group}/Time/d_UTCTime_40"
+        # Noise and gain for the flux digest (verified names; the MAPPING to
+        # the digest's noise_mean / noise_stddev / gain is a placeholder --
+        # see the rx_flux attrs below).
+        noise_mean: "/{group}/Waveform/Characteristics/d_4nsBgMean"
+        noise_stddev: "/{group}/Waveform/Characteristics/d_4nsBgSDEV"
+        gain_set: "/{group}/Waveform/Characteristics/i_gainSet1064"
+        rx_energy: "/{group}/Waveform/Characteristics/d_RecNrgAll_EU"
+        wt_fact_filt_0:
+          # verified: i_wt_fact_filt is [51200, 6] -- a per-record TABLE, not
+          # a waveform, so it takes ``column`` on the record level (the issue
+          # #678 case for an explicit axis declaration). Column 0 is read as
+          # a representative; the table's semantics are a phase 4 question.
+          path: "/{group}/Waveform/Characteristics/i_wt_fact_filt"
+          column: 0
+  assets:
+    # The GLAH05 sibling (one shardmap, {glah01, glah05} per entry), joined
+    # on the composite record key -- (i_rec_ndx, i_shot_count) identifies a
+    # shot across the GLAS L1A/L1B/L2 products.
+    glah05:
+      join:
+        left: ["/{group}/Time/i_rec_ndx", "/{group}/Time/i_shot_count"]
+        right: ["/{group}/Time/i_rec_ndx", "/{group}/Time/i_shot_count"]
+  filters:
+    # Missing waveforms carry nothing.
+    - level: shots
+      dataset: "/{group}/Waveform/Characteristics/i_waveformType"
+      op: in
+      values: [1, 2]
+    # Padding: a short waveform has 200 valid gates of 544 (issue #678 spec
+    # (3)) -- the within-shot index against the per-shot valid count, through
+    # the existing expression filter; no validity grammar.
+    - expression: "sample_index < np.where(i_waveformType == 2, 200, 544)"
+  read_plan:
+    spatial_index: shots
+    pad: 1
+
+aggregation:
+  streaming:
+    mode: spill
+    buffer_granules: 8
+  coordinates:
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: rx_wf
+      dtype: int64
+      fill_value: 0
+    rx_flux:
+      # Per-cell flux-weighted range digest: (k, 2) ragged payload of
+      # (gate_range, weight) centroids over the shared t-digest compress path.
+      kind: ragged
+      function: "zagg.stats.waveform.build_waveform_digest"
+      source: gate_range
+      inner_shape: [2]
+      dtype: float32
+      fill_value: 0
+      weights: flux
+      params:
+        delta: 4096
+        counts: rx_wf            # params-as-column: per-gate waveform amplitude
+        noise_mean: noise_mean   # placeholder mapping: d_4nsBgMean
+        noise_stddev: noise_stddev  # placeholder mapping: d_4nsBgSDEV
+        gain: 1.0                # placeholder: i_gainSet1064 is read as a
+                                 # companion but not yet applied
+        false_positive_rate: 1.0e-3
+        samples_per_record: 544
+        correlation_length: 4    # 4 ns background window (d_4nsBg*), gates
+      overview_delta: 512
+      attrs:
+        # Provenance (issue #321 field attrs). ``proposed``: the GLAS
+        # noise/gain mapping is a science ruling for the phase 4 card, not
+        # this template (issue #678 question (2)).
+        provenance: proposed
+        gain:
+          name: "unit"
+          version: "glah01-v033-placeholder"
+          value: 1.0
+        clip: "threshold-to-zero"
+        operating_point:
+          false_positive_rate: 1.0e-3
+          samples_per_record: 544
+          correlation_length: 4
+    shot_count:
+      # Distinct shots contributing to the cell; the per-shot companions
+      # below are valid exactly when it is 1.
+      function: "zagg.stats.waveform.shot_count"
+      source: utc_time
+      dtype: int32
+      fill_value: 0
+    utc_time:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: utc_time
+      dtype: float64
+      fill_value: "NaN"
+    noise_mean:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: noise_mean
+      dtype: float32
+      fill_value: "NaN"
+    noise_stddev:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: noise_stddev
+      dtype: float32
+      fill_value: "NaN"
+    gain_set:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: gain_set
+      dtype: float32
+      fill_value: "NaN"
+    rx_energy:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: rx_energy
+      dtype: float32
+      fill_value: "NaN"
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 9
+    chunk_inner: 12
+    sharded: true
+    child_order: 17              # ~40 m cells: the GLAS footprint is ~70 m, so
+                                 # one order coarser than GEDI's 18
+  store_layout: hive
+  sweep: stages
+  pyramid:
+    overviews: [16, 15, 14, 13]  # the zagg-pyramid/2 ladder (issue #620): coarsest
+                                 # member = shard order + 4, the same relation the
+                                 # other hive templates carry; the finest sits one
+                                 # order above these 17-order cells.
+
+worker:
+  memory: 4096
+  extra_disk: true
