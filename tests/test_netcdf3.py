@@ -841,3 +841,24 @@ class TestIndexGranule:
 
         with pytest.raises(TypeError, match="path or URL"):
             index_granule(fixture()[0], str(tmp_path))
+
+
+class TestIndexGranules:
+    def test_pooled_build_records_each_key_and_tolerates_a_bad_granule(self, tmp_path, caplog):
+        from zagg.catalog.netcdf3 import index_granules
+
+        good = []
+        for i in range(3):
+            p = tmp_path / f"G{i}.nc"
+            p.write_bytes(fixture(1 + i % 2)[0])
+            good.append(str(p))
+        bad = tmp_path / "junk.nc"
+        bad.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\0" * 64)
+        store = tmp_path / "store"
+        with caplog.at_level("WARNING", logger="zagg.catalog.netcdf3"):
+            out = index_granules([*good, str(bad)], str(store), workers=4)
+        assert out == {**{g: f"G{i}.parquet" for i, g in enumerate(good)}, str(bad): None}
+        assert sorted(p.name for p in store.iterdir()) == ["G0.parquet", "G1.parquet", "G2.parquet"]
+        assert "junk.nc failed: not a netCDF3 file" in caplog.text
+        serial = index_granules(good, str(tmp_path / "serial"), workers=1)
+        assert list(serial.values()) == ["G0.parquet", "G1.parquet", "G2.parquet"]

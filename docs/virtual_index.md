@@ -48,6 +48,11 @@ does not accept (e.g. `store` under `hierarchical`, or `on_miss` under
 | `inline` | zagg | builds each dataset's chunk map at read time (pure-Python B-tree walk, metadata-only) and issues boundary-safe planned reads; optional `write_back` persists granule manifests to the store |
 | `sidecar` | external (`h5coro-hidefix`) | precomputed granule-keyed sidecar manifests fetched from the store; discovered via the entry-point group below |
 
+A store can also be populated **without** a write-back run: for netCDF3
+products the manifest is emitted from the file header at catalog time
+(`zagg.catalog.netcdf3`, see [netCDF3 ingest](netcdf3.md)) and `sidecar` with
+`on_miss: error` is the only backend that can read them.
+
 `inline` never *reads* the store — it recomputes every granule every run. It
 is the no-store-yet mode and (with `write_back: true`) the store-*population*
 mode; consuming a populated store is the `sidecar` backend's job.

@@ -15,6 +15,7 @@ nav:
   - "quickstart.md"
   - "Strict-AOI mask": "aoi_mask.md"
   - "Virtual index": "virtual_index.md"
+  - "netCDF3 ingest": "netcdf3.md"
   - "API":
       - Config: "api/config.md"
       - Store: "api/store.md"

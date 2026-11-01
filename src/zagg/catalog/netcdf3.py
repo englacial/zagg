@@ -52,6 +52,7 @@ __all__ = [
     "build_manifest",
     "describe",
     "index_granule",
+    "index_granules",
     "parse_header",
 ]
 
@@ -347,8 +348,8 @@ def _parse(hb: _HeaderBytes) -> Header:
     variables = []
     for _ in range(nvars):
         name = _read_name(hb)
-        nd = hb.u32()
-        dimids = tuple(hb.u32() for _ in range(nd))
+        rank = hb.u32()
+        dimids = tuple(hb.u32() for _ in range(rank))
         for d in dimids:
             if d >= ndims:
                 raise ValueError(
@@ -562,3 +563,34 @@ def index_granule(source, store: str, driver=None, credentials=None, *, file_siz
         raise TypeError("index_granule needs a path or URL source (the granule id is its basename)")
     df = build_manifest(source, driver, credentials, file_size=file_size)
     return write_manifest(df, store, _granule_id(os.fspath(source)))
+
+
+def index_granules(
+    sources, store: str, driver=None, credentials=None, *, workers: int = 8
+) -> dict[str, str | None]:
+    """Index many granules into ``store`` (the catalog-time build loop).
+
+    ``sources`` are paths or URLs (e.g. a shard map's granule hrefs); each
+    costs one header read and one small parquet put, so they are pooled
+    ``workers`` wide. A granule that fails to index is logged and recorded as
+    ``None`` -- the sidecar backend reports it at read time (``on_miss``), and
+    one bad granule must not abort a catalog-wide build. Returns
+    ``{source: object key | None}`` in input order.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    srcs = list(sources)
+
+    def one(src):
+        try:
+            return index_granule(src, store, driver, credentials)
+        except Exception as e:
+            logger.warning(f"  netcdf3 index: {src} failed: {e}")
+            return None
+
+    if workers <= 1 or len(srcs) <= 1:
+        keys = [one(s) for s in srcs]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(srcs))) as pool:
+            keys = list(pool.map(one, srcs))
+    return dict(zip((os.fspath(s) for s in srcs), keys))

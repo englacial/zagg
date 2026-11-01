@@ -1,0 +1,77 @@
+# CryoSat-2 L1B sea-ice elevation (NSIDC RDWES1B) -- a netCDF3 CLASSIC product
+# read through the catalog-time sidecar manifest route (issue #682).
+#
+# RDWES1B granules are ``CDF\x01`` classic files (verified from the first four
+# bytes over the public HTTPS endpoint on 2026-10-31; CMR collection
+# C3205181034-NSIDC_CPRD, ~280 k granules, ~0.1-0.4 MB each): one fixed
+# dimension ``x`` (one row per along-track waveform) and 22 NON-record float
+# variables -- ``lat`` / ``lon`` in degrees, ``elev`` (retracked surface
+# elevation, metres, WGS-84), ``retrack_elev``, ``roughness``, ``peakiness``,
+# ``geophys_corr``, timing (``day``/``sec``), attitude -- all introspectable with
+# ``zagg.catalog.netcdf3.describe(url, credentials=<EDL token>)`` from header
+# bytes alone. No HDF5 metadata exists, so the worker cannot walk chunk
+# B-trees: the index MUST be the ``sidecar`` backend over a store populated at
+# catalog time (``zagg.catalog.netcdf3.index_granules``), and ``on_miss`` MUST
+# be ``error`` -- ``fallback`` / ``build`` would hand the granule to an
+# HDF5-metadata read, which the ranged handle refuses per group. See
+# docs/netcdf3.md.
+#
+# The dataset paths are ``/<variable>`` (no groups); ``groups: [root]`` is the
+# single formatting pass the reader runs over them.
+data_source:
+  reader: h5coro
+  driver: s3
+  groups: [root]
+  coordinates:
+    latitude: "/lat"
+    longitude: "/lon"
+  variables:
+    elev: "/elev"
+    roughness: "/roughness"
+    peakiness: "/peakiness"
+  index:
+    backend: sidecar
+    # Populate before dispatch: index_granules(urls, store) writes one
+    # <granule_id>.parquet per granule from a 64 KiB header read each.
+    store: s3://your-bucket/zagg-index/RDWES1B/1/
+    on_miss: error
+
+aggregation:
+  handoff: arrow
+  coordinates:
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: elev
+      dtype: int64
+      fill_value: 0
+    elev_mean:
+      function: mean
+      source: elev
+      dtype: float32
+    elev_min:
+      function: nanmin
+      source: elev
+      dtype: float32
+    elev_max:
+      function: nanmax
+      source: elev
+      dtype: float32
+    roughness_mean:
+      function: mean
+      source: roughness
+      dtype: float32
+    peakiness_mean:
+      function: mean
+      source: peakiness
+      dtype: float32
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 6
+    child_order: 12

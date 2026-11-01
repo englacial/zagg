@@ -241,3 +241,20 @@ class TestOpenGranule:
         sentinel = object()
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: sentinel)
         assert open_granule("anything", filedriver.FileDriver, {}) is sentinel
+
+
+class TestShippedTemplate:
+    def test_cryosat2_template_pins_the_sidecar_route(self):
+        from zagg.config import default_config, validate_config
+
+        cfg = default_config("cryosat2_rdwes1b_healpix")
+        validate_config(cfg)
+        ds = cfg.data_source
+        assert ds["reader"] == "h5coro"
+        # netCDF3 has no HDF5 metadata: only the manifest-addressed backend can
+        # read it, and a miss must be an error, never a metadata fallback.
+        assert ds["index"]["backend"] == "sidecar" and ds["index"]["on_miss"] == "error"
+        # Paths are /<variable> -- the RDWES1B header's names (describe() on
+        # 2026-10-31: lat, lon, elev, roughness, peakiness, all non-record).
+        assert ds["coordinates"] == {"latitude": "/lat", "longitude": "/lon"}
+        assert set(ds["variables"].values()) <= {"/elev", "/roughness", "/peakiness"}
