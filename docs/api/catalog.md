@@ -135,6 +135,18 @@ cannot see.
 
 ::: zagg.catalog.sources.Catalog
 
+## netCDF3 header parser + sidecar manifest (issue #682)
+
+See [netCDF3 ingest](../netcdf3.md) for the route.
+
+::: zagg.catalog.netcdf3.describe
+
+::: zagg.catalog.netcdf3.build_manifest
+
+::: zagg.catalog.netcdf3.index_granule
+
+::: zagg.catalog.netcdf3.index_granules
+
 ## Shard map
 
 ::: zagg.catalog.shardmap.ShardMap

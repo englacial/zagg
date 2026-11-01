@@ -8,7 +8,7 @@ across many ShardMap builds at different grids.
 Two built-in sources:
 
 - ``CMRSource`` targets NASA's CMR-STAC endpoint (per-granule-unique asset keys,
-  single ``.h5`` data asset -- normalized to canonical ``data``/``data_s3``).
+  single data asset -- normalized to canonical ``data``/``data_s3``).
 - ``STACSource`` targets any STAC API root (issue #218), e.g. Earth Search for
   Sentinel-2. Generic APIs use stable per-collection asset keys (``red``,
   ``nir``, ``scl``), so assets are kept under their own keys, optionally
@@ -122,6 +122,13 @@ def _resolve_bbox(region) -> tuple[float, float, float, float]:
     return tuple(float(x) for x in region)
 
 
+#: Data-asset href suffixes ``_normalize_assets`` keeps (matched on the
+#: lowercased href): HDF5 (``.h5``, ``.hdf5``, ``.he5``), netCDF (``.nc``, ``.nc4``) and
+#: HDF4 (``.hdf``). Which of them the read path can *decode* is the reader's
+#: and index backend's business, not the catalog's (issue #682).
+_DATA_SUFFIXES = (".h5", ".hdf5", ".nc", ".nc4", ".hdf", ".he5")
+
+
 def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     """Collapse CMR's per-granule-keyed assets into canonical keys.
 
@@ -129,24 +136,62 @@ def _normalize_assets(item: dict, *, preserve_thumbnails: bool) -> dict:
     full object path), which would explode a geoparquet struct schema. We map
     them to stable keys instead, keeping both endpoints:
 
-    - ``data``     : the HTTPS ``.h5`` data asset,
-    - ``data_s3``  : the S3 ``.h5`` data asset,
+    - ``data``     : the HTTP(S) data asset,
+    - ``data_s3``  : the S3 data asset,
+
+    routed on the lowercased href scheme (``s3`` vs ``http``/``https``); a data
+    asset on any other scheme (``ftp``, ...) is logged and skipped. When several
+    data assets map to one key the last in asset order wins, with a warning.
     - ``metadata`` : the metadata-role asset.
+
+    A ``data``-role asset counts when its href ends in one of
+    :data:`_DATA_SUFFIXES`, compared case-insensitively (issue #682): CMR
+    serves netCDF products as ``.nc`` / ``.nc4``, GLAS as uppercase ``.H5``
+    (issue #678), HDF4/HDF-EOS5 as ``.hdf`` / ``.he5`` -- the lowercase
+    ``.h5`` match this started with dropped them all silently. An item whose
+    ``data``-role assets all miss the list is logged with their suffixes, so
+    the next unlisted extension shows up at catalog time.
 
     With ``preserve_thumbnails`` the original ``thumbnail_*``/``browse`` assets
     are kept verbatim (their keys are already stable) for a future
     shardmap-vs-footprint viewer; by default they are dropped.
     """
     out: dict = {}
+    missed: list[str] = []
     for key, asset in item.get("assets", {}).items():
         roles = asset.get("roles") or []
         href = asset.get("href", "")
-        if "data" in roles and href.endswith(".h5"):
-            out["data" if href.startswith("https") else "data_s3"] = asset
+        if "data" in roles and href.lower().endswith(_DATA_SUFFIXES):
+            scheme = href.split("://", 1)[0].lower()
+            canon = {"s3": "data_s3", "http": "data", "https": "data"}.get(scheme)
+            if canon in out:
+                logging.warning(
+                    "item %s: several %s assets; %s replaces %s",
+                    item.get("id"),
+                    canon,
+                    href,
+                    out[canon]["href"],
+                )
+            if canon:
+                out[canon] = asset
+            else:
+                logging.warning(
+                    "item %s: skipping data asset %s (scheme %r)", item.get("id"), href, scheme
+                )
+        elif "data" in roles:
+            missed.append(href)
         elif "metadata" in roles:
             out["metadata"] = asset
         elif preserve_thumbnails and ("thumbnail" in roles or "browse" in roles):
             out[key] = asset
+    if missed and "data" not in out and "data_s3" not in out:
+        suffixes = sorted({"." + h.rsplit("/", 1)[-1].rpartition(".")[2] for h in missed})
+        logging.warning(
+            "item %s: no data asset kept; data-role hrefs end in %s, none in %s",
+            item.get("id"),
+            suffixes,
+            _DATA_SUFFIXES,
+        )
     item = dict(item)
     item["assets"] = out
     return item
@@ -501,7 +546,7 @@ class Catalog:
     """Fetched granule metadata: a stac-geoparquet table + provenance.
 
     Reusable across many ShardMap builds. Endpoint-neutral -- each granule
-    carries both its S3 and HTTPS ``.h5`` hrefs.
+    carries both its S3 and HTTPS data hrefs.
 
     Parameters
     ----------
