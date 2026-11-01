@@ -601,3 +601,57 @@ class TestOutputGrammar:
         cfg.output["pyramid"] = {"summarize": {"B04": {"as": "b4_mean"}}}
         with pytest.raises(ValueError, match="summarize names unknown field 'B04'"):
             validate_config(cfg)
+
+
+class TestRunGrammar:
+    """Phase 4: ``pipeline``, ``worker``, ``catalog`` and ``bounds`` are typed per kind."""
+
+    def test_typed_run_blocks(self):
+        model = default_config("gedi01b_waveform_healpix_hive").model
+        assert model.pipeline.type == "spatial"
+        assert model.worker.memory == 4096 and model.worker.extra_disk is True
+        temporal = default_config("merra2_storm").model
+        assert temporal.pipeline.type == "temporal"
+
+    def test_pipeline_literal_is_per_kind(self):
+        # The exported union no longer overlaps: a spatial config cannot carry
+        # a temporal pipeline literal and vice versa (phase 1 review finding).
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.pipeline = {"type": "event"}
+        with pytest.raises(ValueError, match=r"aggregation\.variables"):
+            validate_config(cfg)  # the temporal grammar now applies
+        cfg.pipeline = {"type": "spatial", "mode": "x"}
+        with pytest.raises(ValueError, match=r"pipeline\.mode: Extra inputs"):
+            validate_config(cfg)
+
+    def test_worker_and_bounds_keep_their_messages(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.worker = {"memory": 512}
+        with pytest.raises(ValueError, match=r"worker\.memory must be one of \[2048, 4096, 8192\]"):
+            validate_config(cfg)
+        cfg.worker = "big"
+        with pytest.raises(ValueError, match="worker must be a mapping"):
+            validate_config(cfg)
+        cfg.worker = None
+        cfg.bounds = {"temporal": {"start_date": "2019-01-01"}}
+        with pytest.raises(ValueError, match="start_date and end_date"):
+            validate_config(cfg)
+        cfg.bounds = {"spatial": [0, 0, 1, 1], "temporal": {"start_date": "a", "end_date": "b"}}
+        validate_config(cfg)
+        assert validate_model(cfg).model_dump(exclude_unset=True)["bounds"] == cfg.bounds
+
+    def test_catalog_must_be_a_path_string(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.catalog = 7
+        with pytest.raises(ValueError, match=r"catalog: Input should be a valid string"):
+            validate_config(cfg)
+
+    def test_temporal_requires_a_variable(self):
+        cfg = PipelineConfig(
+            pipeline={"type": "temporal"},
+            data_source={"reader": "xarray_s3", "collections": ["m"]},
+            aggregation={"variables": {}},
+            output={"store": "."},
+        )
+        with pytest.raises(ValueError, match="temporal pipeline requires aggregation.variables"):
+            validate_config(cfg)

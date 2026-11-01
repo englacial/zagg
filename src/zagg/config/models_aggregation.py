@@ -599,3 +599,10 @@ class TemporalAggregation(_Block):
     """The temporal/event aggregation block: output variables by name."""
 
     variables: dict[str, TemporalFieldSpec] = Field(description="Output variables by name.")
+
+    @field_validator("variables")
+    @classmethod
+    def _nonempty(cls, v: dict[str, TemporalFieldSpec]) -> dict[str, TemporalFieldSpec]:
+        if not v:
+            raise ValueError("temporal pipeline requires aggregation.variables")
+        return v

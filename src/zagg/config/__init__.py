@@ -82,6 +82,7 @@ from zagg.config.models_output import (
     TemporalOutput,
     Windowing,
 )
+from zagg.config.models_run import Bounds, SpatialPipeline, TemporalPipeline, Worker
 from zagg.config.source import (
     _segment_variable_names,
     collection_options,
@@ -91,11 +92,7 @@ from zagg.config.source import (
     get_levels,
     get_raster_bands,
 )
-from zagg.config.validate import (
-    _validate_temporal_config,
-    _validate_worker,
-    validate_config,
-)
+from zagg.config.validate import validate_config
 from zagg.config.validate_fields import (
     OUTPUT_KINDS,
     OUTPUT_RESOLUTIONS,
@@ -121,6 +118,7 @@ from zagg.config.windowing import (
 
 __all__ = [
     "Aggregation",
+    "Bounds",
     "ConfigModel",
     "FieldSpec",
     "Grid",
@@ -130,9 +128,11 @@ __all__ = [
     "RectilinearGrid",
     "RasterConfig",
     "SpatialConfig",
+    "SpatialPipeline",
     "TemporalAggregation",
     "TemporalConfig",
     "TemporalOutput",
+    "TemporalPipeline",
     "validate_model",
     "FILTER_OPS",
     "OUTPUT_KINDS",
@@ -144,6 +144,7 @@ __all__ = [
     "TOUCH_POLICIES",
     "WINDOWING_UNITS",
     "Windowing",
+    "Worker",
     "WORKER_MEMORIES",
     "DataSourceDict",
     "LevelDict",
@@ -205,10 +206,8 @@ __all__ = [
     "_validate_json_floats",
     "_validate_output_kind",
     "_validate_pyramid",
-    "_validate_temporal_config",
     "_validate_temporal_producer",
     "_validate_time_source",
     "_validate_windowing",
     "_validate_windowing_windows",
-    "_validate_worker",
 ]

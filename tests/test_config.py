@@ -3226,7 +3226,7 @@ class TestWorkerBlock:
 
     def test_missing_memory_rejected(self, atl06_config):
         atl06_config.worker = {"extra_disk": True}
-        with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
+        with pytest.raises(ValueError, match=r"worker\.memory: Field required"):
             validate_config(atl06_config)
 
     def test_string_memory_rejected(self, atl06_config):

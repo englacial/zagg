@@ -31,6 +31,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     Discriminator,
     Field,
     Tag,
@@ -43,6 +44,7 @@ from pydantic import (
 from zagg.config.models_aggregation import Aggregation, TemporalAggregation
 from zagg.config.models_base import TAGS, StrictModel
 from zagg.config.models_output import HealpixGrid, Output, TemporalOutput
+from zagg.config.models_run import Bounds, SpatialPipeline, TemporalPipeline, Worker
 from zagg.config.models_source import CollectionDataSource, H5DataSource, RasterDataSource
 
 __all__ = [
@@ -64,27 +66,22 @@ __all__ = [
 class _RootBase(StrictModel):
     """The four blocks phases 1–3 leave untyped (phase 4 types them)."""
 
-    pipeline: Any = Field(
+    worker: Annotated[Worker, BeforeValidator(_worker_knob)] | None = Field(
         default=None,
-        description="The pipeline kind selector, ``{type: spatial|temporal|event}``; absent "
-        "means ``spatial`` (typed in issue #677 phase 4).",
+        description="Optional Lambda worker-size selector ``{memory, extra_disk?}`` (issue #235).",
     )
-    worker: Any = Field(
-        default=None,
-        description="Optional Lambda worker-size selector ``{memory, extra_disk?}`` "
-        "(typed in issue #677 phase 4).",
-    )
-    catalog: Any = Field(default=None, description="Optional path to the granule catalog.")
-    bounds: Any = Field(
-        default=None,
-        description="Optional ``{temporal: {start_date, end_date}, spatial}`` run bounds "
-        "(typed in issue #677 phase 4).",
+    catalog: str | None = Field(default=None, description="Optional path to the granule catalog.")
+    bounds: Bounds | None = Field(
+        default=None, description="Optional ``{temporal: {start_date, end_date}}`` run bounds."
     )
 
 
 class SpatialConfig(_RootBase):
     """A point-cloud → grid pipeline reading HDF5 through h5coro (the default kind)."""
 
+    pipeline: SpatialPipeline = Field(
+        default_factory=SpatialPipeline, description="``{type: spatial}`` (the default)."
+    )
     aggregation: Aggregation = Field(
         default_factory=Aggregation,
         description="Per-field reducers over the read columns, chunk precomputes, carrier "
@@ -109,6 +106,9 @@ class SpatialConfig(_RootBase):
 class RasterConfig(_RootBase):
     """A raster (pull-NN) pipeline: ``data_source.reader: raster`` (issue #218)."""
 
+    pipeline: SpatialPipeline = Field(
+        default_factory=SpatialPipeline, description="``{type: spatial}`` (the default)."
+    )
     aggregation: dict[str, Any] = Field(
         default_factory=dict,
         description="Must be empty: pull-NN yields exactly one value per cell per timestep, so "
@@ -188,6 +188,7 @@ class RasterConfig(_RootBase):
 class TemporalConfig(_RootBase):
     """A temporal/event pipeline over gridded collections (issue #12, #213)."""
 
+    pipeline: TemporalPipeline = Field(description="``{type: temporal}`` or ``{type: event}``.")
     aggregation: TemporalAggregation = Field(
         description="Output variables as registry capability names (spatial reducer, "
         "temporal reducer, mask, transform)."
@@ -206,6 +207,12 @@ class TemporalConfig(_RootBase):
         description="The collection reader source: named collections with per-collection "
         "reader options, plus static data.",
     )
+
+
+def _worker_knob(v: Any) -> Any:
+    if v is None or isinstance(v, (dict, Worker)):
+        return v
+    raise ValueError(f"worker must be a mapping {{memory, extra_disk?}} (got {v!r})")
 
 
 def _refuse_time_encoding(encoding: str | None) -> None:

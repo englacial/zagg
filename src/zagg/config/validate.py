@@ -3,7 +3,6 @@
 import inspect
 
 from zagg.config.core import (
-    WORKER_MEMORIES,
     PipelineConfig,
     _validate_json_floats,
     get_pipeline_type,
@@ -47,11 +46,6 @@ def validate_config(config: PipelineConfig) -> None:
     ptype = get_pipeline_type(config)
     validate_model(config)
 
-    # The optional top-level worker block (issue #235) selects a
-    # pre-provisioned Lambda size variant on any pipeline kind, so it is
-    # validated before the kind branch, like the grammar pass above.
-    _validate_worker(config)
-
     # The per-observation clock the §8.2/§8.3 companions encode from (issue
     # #410) — checked here for the same reason as the block above: the value is
     # only meaningful where a companion is declared, so declaring it on a
@@ -59,7 +53,8 @@ def validate_config(config: PipelineConfig) -> None:
     _validate_time_source(config)
 
     if ptype != "spatial":
-        _validate_temporal_config(config)
+        # The temporal grammar (collections, capability-named variables) is
+        # the model's; nothing cross-block remains for the event engine.
         return
 
     # Raster pipelines (issue #218) share the spatial grid checks but replace
@@ -95,17 +90,6 @@ def validate_config(config: PipelineConfig) -> None:
     # schedule none = today's behavior; the block itself is hive-only (windowed
     # leaves are a hive-layout convention), mirroring coverage_moc's posture.
     _validate_windowing(config)
-
-    # Validate bounds structure (optional)
-    if config.bounds is not None:
-        allowed_keys = {"temporal", "spatial"}
-        unknown = set(config.bounds.keys()) - allowed_keys
-        if unknown:
-            raise ValueError(f"Unknown bounds keys: {unknown} (allowed: {allowed_keys})")
-        temporal = config.bounds.get("temporal")
-        if temporal is not None:
-            if "start_date" not in temporal or "end_date" not in temporal:
-                raise ValueError("bounds.temporal requires start_date and end_date")
 
     # The data_source grammar — variable forms, filters, levels/links, the vlen
     # surface, the chunk-index block — is the model's (``models_source``, issue
@@ -272,48 +256,3 @@ def validate_config(config: PipelineConfig) -> None:
                             f"requires (use a reducer carrying the channel, e.g. "
                             f"zagg.stats.tdigest.build_tdigest)"
                         )
-
-
-def _validate_worker(config: PipelineConfig) -> None:
-    """Validate the optional top-level ``worker:`` block (issue #235).
-
-    ``{memory, extra_disk?}`` selects one of the pre-provisioned Lambda
-    worker-size variants: ``memory`` (required, one of
-    :data:`WORKER_MEMORIES`) picks the ``-<memory>`` function, and
-    ``extra_disk: true`` (optional, default false) the ``-disk`` twin with
-    ``/tmp`` sized memory + 2048 MB. Fails at load — a typo here would
-    otherwise surface as a per-shard ResourceNotFound after the fan-out
-    starts. Absent block is today's behavior (unsuffixed function).
-    """
-    worker = config.worker
-    if worker is None:
-        return
-    if not isinstance(worker, dict):
-        raise ValueError(f"worker must be a mapping {{memory, extra_disk?}} (got {worker!r})")
-    unknown = set(worker) - {"memory", "extra_disk"}
-    if unknown:
-        raise ValueError(
-            f"Unknown worker keys: {sorted(unknown)} (allowed: 'memory', 'extra_disk')"
-        )
-    memory = worker.get("memory")
-    if isinstance(memory, bool) or memory not in WORKER_MEMORIES:
-        raise ValueError(
-            f"worker.memory must be one of {sorted(WORKER_MEMORIES)} MB — the "
-            f"pre-provisioned variant sizes (issue #235) — (got {memory!r})"
-        )
-    extra_disk = worker.get("extra_disk")
-    if extra_disk is not None and not isinstance(extra_disk, bool):
-        raise ValueError(f"worker.extra_disk must be a boolean (got {extra_disk!r})")
-
-
-def _validate_temporal_config(config: PipelineConfig) -> None:
-    """Validate a temporal/event pipeline config (issue #12, Phase 5).
-
-    Temporal pipelines carry no output grid. The per-variable keys are
-    :class:`~zagg.config.models_aggregation.TemporalFieldSpec`'s (checked by
-    :func:`~zagg.config.models.validate_model`, which runs first); this
-    refuses an empty ``variables`` mapping with ``ValueError``.
-    """
-    variables = config.aggregation.get("variables")
-    if not variables:
-        raise ValueError("temporal pipeline requires aggregation.variables")
