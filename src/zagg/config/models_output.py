@@ -17,13 +17,14 @@ stay in :func:`zagg.config.validate_config` and the per-kind root models.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import (
     BeforeValidator,
     Discriminator,
     Field,
+    PlainValidator,
     Tag,
     WithJsonSchema,
     field_validator,
@@ -52,8 +53,22 @@ SweepMode = Literal["none", "families", "stages"]
 TouchPolicy = Literal["auto", "always", "never"]
 #: ``output.windowing.unit`` (``windowing.WINDOWING_UNITS``).
 WindowingUnit = Literal["shard", "window"]
-#: An ISO-8601 instant as written, or the ``datetime`` YAML already typed it as.
-Instant = Union[str, datetime]
+
+
+def _check_instant(v: Any) -> Any:
+    # Checked, never converted: the dump must stay the author's value (a YAML
+    # ``date`` is not rewritten as a midnight ``datetime``), and pydantic's lax
+    # ``datetime`` would admit an int as a Unix timestamp. ``parse_utc`` runs
+    # in the ``after`` validators.
+    if not isinstance(v, (str, date)):  # a ``datetime`` is a ``date``
+        raise ValueError(f"must be an ISO-8601 instant string (got {v!r})")
+    return v
+
+
+#: An ISO-8601 instant as written, or the ``date``/``datetime`` YAML already typed it as.
+Instant = Annotated[
+    Any, PlainValidator(_check_instant), WithJsonSchema({"type": "string", "format": "date-time"})
+]
 
 
 # ---------------------------------------------------------------------------

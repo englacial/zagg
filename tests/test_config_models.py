@@ -494,3 +494,16 @@ class TestOutputGrammar:
         validate_config(cfg)
         dump = validate_model(cfg).model_dump(exclude_unset=True, mode="python")
         assert dump["output"]["windowing"]["epoch"] == datetime.datetime(2018, 1, 1)
+        cfg.output["windowing"]["epoch"] = datetime.date(2018, 1, 1)  # unquoted YAML date
+        validate_config(cfg)
+        dump = validate_model(cfg).model_dump(exclude_unset=True, mode="python")
+        assert type(dump["output"]["windowing"]["epoch"]) is datetime.date
+
+    def test_numeric_epoch_is_refused_by_path(self):
+        cfg = TestPathAddressedRefusals()._cfg()
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {"schedule": "yearly", "time_field": "h", "epoch": 1514764800}
+        with pytest.raises(
+            ValueError, match=r"output\.windowing\.epoch: must be an ISO-8601 instant string"
+        ):
+            validate_config(cfg)
